@@ -1,0 +1,39 @@
+{
+  "name": "@antigravity-chat/web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p tsconfig.json --noEmit && vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "diff": "^8.0.2",
+    "dompurify": "^3.2.5",
+    "highlight.js": "^11.11.1",
+    "katex": "^0.16.22",
+    "mammoth": "^1.9.1",
+    "mermaid": "^12.3.0",
+    "papaparse": "^5.5.2",
+    "pdfjs-dist": "^5.4.530",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-markdown": "^10.1.0",
+    "read-excel-file": "^9.3.17",
+    "rehype-katex": "^7.0.1",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/diff": "^8.0.0",
+    "@types/dompurify": "^3.2.0",
+    "@types/papaparse": "^5.3.16",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^6.0.0",
+    "typescript": "^5.8.3",
+    "vite": "^8.3.8"
+  }
+}

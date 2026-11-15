@@ -1,0 +1,176 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import cookie from '@fastify/cookie';
+import multipart from '@fastify/multipart';
+import fastifyStatic from '@fastify/static';
+import websocket from '@fastify/websocket';
+import Fastify, { type FastifyInstance } from 'fastify';
+import { AcpClientManager } from './acp/client-manager.js';
+import { QuotaService } from './acp/quota-service.js';
+import { ExecutionScheduler } from './acp/scheduler.js';
+import { AgyAuthManager } from './auth/agy-auth.js';
+import { authenticateRequest } from './auth/session.js';
+import { loadConfig, type AppConfig } from './config.js';
+import { AppDatabase } from './db/database.js';
+import { registerAuthRoutes } from './routes/auth-routes.js';
+import { registerChatRoutes } from './routes/chat-routes.js';
+import { registerFileRoutes } from './routes/file-routes.js';
+import { registerProjectRoutes } from './routes/project-routes.js';
+import { registerQuotaRoutes } from './routes/quota-routes.js';
+import { SyncHub } from './sync/hub.js';
+
+export interface AppContext {
+  app: FastifyInstance;
+  config: AppConfig;
+  db: AppDatabase;
+  hub: SyncHub;
+  acp: AcpClientManager;
+  agyAuth: AgyAuthManager;
+  scheduler: ExecutionScheduler;
+  quotaService: QuotaService;
+  shutdown: () => Promise<void>;
+}
+
+export async function createApp(configOverrides: Partial<AppConfig> = {}): Promise<AppContext> {
+  const config = loadConfig(configOverrides);
+  for (const dir of [
+    config.dataRoot,
+    config.profilesRoot,
+    config.workspacesRoot,
+    config.projectsRoot,
+    config.uploadsRoot,
+    config.artifactsCacheRoot,
+  ]) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  }
+
+  const db = new AppDatabase(config.dbPath);
+  db.recoverInterruptedRuns();
+
+  const hub = new SyncHub(db);
+  const acp = new AcpClientManager(config, db, hub);
+  const agyAuth = new AgyAuthManager(config, db, hub, acp);
+  const scheduler = new ExecutionScheduler(config, db, hub, acp);
+  const quotaService = new QuotaService(config, db, hub);
+
+  const app = Fastify({
+    trustProxy: config.trustProxy,
+    bodyLimit: 10 * 1024 * 1024,
+    logger: config.nodeEnv === 'test' ? false : { level: 'info' },
+  });
+
+  await app.register(cookie);
+  await app.register(multipart, {
+    limits: {
+      fileSize: config.maxUploadBytes,
+      files: 20,
+    },
+  });
+  await app.register(websocket);
+
+  app.get('/api/health', async () => {
+    return {
+      ok: true,
+      agyMode: config.agyMode,
+      uptimeSec: Math.floor(process.uptime()),
+    };
+  });
+
+  await registerAuthRoutes(app, { config, db, hub, agyAuth });
+  await registerProjectRoutes(app, { config, db, hub, agyAuth });
+  await registerChatRoutes(app, { config, db, hub, agyAuth, acp, scheduler });
+  await registerFileRoutes(app, { config, db, hub, agyAuth });
+  await registerQuotaRoutes(app, { config, db, hub, agyAuth, quotaService });
+
+  app.get('/api/ws', { websocket: true }, (socket, req) => {
+    const session = authenticateRequest(req, db);
+    if (!session) {
+      socket.close(4401, 'unauthenticated');
+      return;
+    }
+
+    const query = req.query as { sinceSeq?: string; clientId?: string };
+    const sinceSeq = query.sinceSeq ? Number.parseInt(query.sinceSeq, 10) : 0;
+    const clientId = (query.clientId || crypto.randomUUID()).slice(0, 128);
+
+    const unregister = hub.registerConnection({
+      userId: session.user.id,
+      sessionIdHash: session.sessionIdHash,
+      clientId,
+      ws: socket,
+      sinceSeq: Number.isFinite(sinceSeq) && sinceSeq > 0 ? sinceSeq : 0,
+    });
+
+    const pingInterval = setInterval(() => {
+      if (socket.readyState === 1) {
+        socket.ping();
+      }
+    }, 25_000);
+    pingInterval.unref();
+
+    socket.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(String(raw)) as { kind?: string; sinceSeq?: number };
+        if (msg.kind === 'ping') {
+          socket.send(JSON.stringify({ kind: 'pong', ts: Date.now() }));
+        }
+      } catch {
+        // ignore invalid messages
+      }
+    });
+
+    socket.on('close', () => {
+      clearInterval(pingInterval);
+      unregister();
+    });
+
+    socket.on('error', () => {
+      clearInterval(pingInterval);
+      unregister();
+    });
+  });
+
+  // Serve built frontend bundle when present
+  if (fs.existsSync(config.webDistDir)) {
+    await app.register(fastifyStatic, {
+      root: config.webDistDir,
+      prefix: '/',
+      wildcard: false,
+    });
+
+    app.setNotFoundHandler((req, reply) => {
+      if (req.url.startsWith('/api/')) {
+        return reply.code(404).send({ error: 'NOT_FOUND', message: 'APIルートが見つかりません。' });
+      }
+      const indexFile = path.join(config.webDistDir, 'index.html');
+      if (fs.existsSync(indexFile)) {
+        return reply.type('text/html; charset=utf-8').send(fs.readFileSync(indexFile, 'utf8'));
+      }
+      return reply.code(404).send({ error: 'NOT_FOUND' });
+    });
+  } else {
+    app.setNotFoundHandler((req, reply) => {
+      return reply.code(404).send({ error: 'NOT_FOUND' });
+    });
+  }
+
+  const shutdown = async () => {
+    await agyAuth.shutdown();
+    await acp.shutdown();
+    await app.close();
+    db.close();
+  };
+
+  return {
+    app,
+    config,
+    db,
+    hub,
+    acp,
+    agyAuth,
+    scheduler,
+    quotaService,
+    shutdown,
+  };
+}
