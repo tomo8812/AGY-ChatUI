@@ -267,10 +267,37 @@ export const App: React.FC = () => {
   }, [triggerQuotaRefresh]);
 
   const loadChatDetail = useCallback(async (chatId: string) => {
+    const requestedAt = Date.now();
     const detail = await api.getChat(chatId);
     if (activeChatIdRef.current !== chatId) return;
     seedChatArtifacts(chatId, detail.artifacts);
-    setMessages(detail.messages);
+    setMessages((prev) => {
+      if (prev.length === 0) return detail.messages;
+      const prevById = new Map(prev.map((m) => [m.id, m]));
+      const merged = detail.messages.map((incoming) => {
+        const existing = prevById.get(incoming.id);
+        if (!existing) return incoming;
+        if (existing.updatedAt > incoming.updatedAt) {
+          return existing;
+        }
+        if (
+          existing.updatedAt === incoming.updatedAt &&
+          (existing.contentText.length + existing.thoughtsText.length >
+            incoming.contentText.length + incoming.thoughtsText.length ||
+            (existing.status === 'streaming' && incoming.status === 'queued'))
+        ) {
+          return existing;
+        }
+        return incoming;
+      });
+      const mergedIds = new Set(merged.map((m) => m.id));
+      for (const existing of prev) {
+        if (!mergedIds.has(existing.id) && existing.chatId === chatId && existing.updatedAt >= requestedAt) {
+          merged.push(existing);
+        }
+      }
+      return merged.sort((a, b) => a.createdAt - b.createdAt);
+    });
     setArtifacts(detail.artifacts);
     setViewerArtifact((cur) => {
       if (!cur || cur.chatId !== chatId) return cur;
@@ -280,7 +307,18 @@ export const App: React.FC = () => {
       return latest;
     });
     setPendingPermissions(detail.pendingPermissions);
-    setActiveRun(detail.activeRun);
+    setActiveRun((cur) => {
+      if (
+        cur &&
+        detail.activeRun &&
+        cur.id === detail.activeRun.id &&
+        (cur.status === 'running' || cur.status === 'awaiting_permission') &&
+        detail.activeRun.status === 'queued'
+      ) {
+        return cur;
+      }
+      return detail.activeRun;
+    });
     setSessionOptions(detail.sessionOptions);
     setContextUsage(null);
     setChats((prev) =>
@@ -1124,19 +1162,7 @@ export const App: React.FC = () => {
   const effectiveSessionOptions = activeChat ? (sessionOptions ?? userOptions) : userOptions;
   const mergedAvailableCommands = React.useMemo<AvailableCommandItem[]>(() => {
     const rawSessionCmds = effectiveSessionOptions?.availableCommands ?? [];
-    const disabledOnlySlugs = new Set<string>();
-    const enabledSlugs = new Set<string>(skillsState?.commands.map((c) => c.name.toLowerCase()) ?? []);
-    if (skillsState) {
-      for (const s of [...skillsState.global, ...skillsState.project, ...skillsState.workspace]) {
-        const key = s.slug.toLowerCase();
-        if (!s.enabled && !enabledSlugs.has(key)) {
-          disabledOnlySlugs.add(key);
-        }
-      }
-    }
-    const acpCmds = rawSessionCmds.filter(
-      (c) => c.source !== 'skill' && !disabledOnlySlugs.has(c.name.toLowerCase())
-    );
+    const acpCmds = rawSessionCmds.filter((c) => c.source !== 'skill');
     const liveSkillCmds = skillsState
       ? skillsState.commands
       : rawSessionCmds.filter((c) => c.source === 'skill');
@@ -1146,7 +1172,10 @@ export const App: React.FC = () => {
       byName.set(cmd.name.toLowerCase(), cmd);
     }
     for (const cmd of liveSkillCmds) {
-      byName.set(cmd.name.toLowerCase(), cmd);
+      const key = cmd.name.toLowerCase();
+      if (!byName.has(key)) {
+        byName.set(key, cmd);
+      }
     }
     return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
   }, [effectiveSessionOptions?.availableCommands, skillsState]);

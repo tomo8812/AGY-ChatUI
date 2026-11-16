@@ -26,7 +26,11 @@ import {
 import type { AppConfig } from '../config.js';
 import type { AppDatabase } from '../db/database.js';
 import { decryptSmallSecret } from '../auth/password.js';
-import { captureWorkspaceSnapshot, syncWorkspaceChangesAsArtifacts } from '../files/artifacts.js';
+import {
+  captureWorkspaceSnapshot,
+  syncWorkspaceChangesAsArtifacts,
+  type WorkspaceSnapshot,
+} from '../files/artifacts.js';
 import {
   type BrainSnapshotEntry,
   captureBrainSnapshot,
@@ -54,6 +58,8 @@ import type {
   AvailableCommandItem,
   ChatRecord,
   PendingPermissionRecord,
+  SessionMessageItem,
+  SubagentActivityItem,
   ToolCallItem,
 } from '../types.js';
 import type { SkillService } from '../skills/skill-service.js';
@@ -150,20 +156,6 @@ export function classifySubagentToolCall(params: {
   }
 
   return { isSubagent: false };
-}
-
-function hasBackgroundTaskOutput(tc: ToolCallItem): boolean {
-  const rawIn =
-    tc.rawInput && typeof tc.rawInput === 'object' && !Array.isArray(tc.rawInput)
-      ? (tc.rawInput as Record<string, unknown>)
-      : null;
-  if (rawIn?.IsDaemon === true || rawIn?.isDaemon === true) {
-    return false;
-  }
-  const combinedOut = `${tc.contentText ?? ''} ${
-    tc.rawOutput !== undefined ? JSON.stringify(tc.rawOutput) : ''
-  }`;
-  return /running as a background task with task id:/i.test(combinedOut);
 }
 
 function captureWorkspaceSkillsSignature(workspaceDir: string): string {
@@ -312,6 +304,9 @@ interface TrackedSubagentState {
   description?: string;
   state: 'running' | 'idle' | 'requires_action' | 'unknown';
   stopReason?: string | null;
+  thoughtsText: string;
+  contentText: string;
+  toolCalls: SubagentActivityItem[];
   lastActivityAt: number;
 }
 
@@ -323,8 +318,10 @@ interface ActiveTurnBridge {
   contentText: string;
   thoughtsText: string;
   toolCalls: ToolCallItem[];
+  sessionMessages: SessionMessageItem[];
   lastDbFlushAt: number;
   pendingResolvers: Map<string, (outcome: RequestPermissionResponse) => void>;
+  beforeWorkspaceSnap: WorkspaceSnapshot;
   beforeBrainSnap: Map<string, BrainSnapshotEntry>;
   emittedArtifactIds: Set<string>;
   syncedBrainFiles: Map<string, SyncedBrainFile>;
@@ -336,7 +333,6 @@ interface ActiveTurnBridge {
   parentState: 'running' | 'idle' | 'requires_action' | 'unknown';
   backgroundWorkCount: number;
   parentWakeupStarted: boolean;
-  parentWakeupIdle: boolean;
   receivedWakeupText: boolean;
   lastParentActivityAt: number;
 }
@@ -355,12 +351,11 @@ interface WorkerInstance {
   acpSessionId: string | null;
   parsedOptions: ParsedSessionOptions;
   supportsSystemPrompt: boolean;
-  systemPromptInjectedFallback: boolean;
-  needsTranscriptBridge: boolean;
   inFlight: boolean;
   lastUsedAt: number;
   activeTurn: ActiveTurnBridge | null;
   backgroundBridge: ActiveTurnBridge | null;
+  turnBridges: Map<string, ActiveTurnBridge>;
   lastBackgroundActivityAt: number;
   stderrTail: string[];
 }
@@ -404,7 +399,7 @@ export class AcpClientManager {
   async stopIdleWorkersForUser(userId: string): Promise<void> {
     this.invalidateUserOptionsCache(userId);
     const keys = [...this.workers.values()]
-      .filter((w) => w.userId === userId && !w.inFlight)
+      .filter((w) => w.userId === userId && !this.isWorkerBusy(w))
       .map((w) => w.key);
     await Promise.allSettled(keys.map((k) => this.stopWorkerByKey(k)));
   }
@@ -417,7 +412,7 @@ export class AcpClientManager {
     const key = `${userId}:${chatId}`;
     const w = this.workers.get(key);
     if (!w) return true;
-    if (w.inFlight) return false;
+    if (this.isWorkerBusy(w)) return false;
     await this.stopWorkerByKey(key);
     return true;
   }
@@ -803,7 +798,22 @@ export class AcpClientManager {
     }
 
     const worker = this.workers.get(`${params.userId}:${params.chatId}`);
-    const targetBridge = worker?.activeTurn ?? worker?.backgroundBridge ?? null;
+    let targetBridge: ActiveTurnBridge | null = null;
+    if (worker) {
+      if (worker.activeTurn?.pendingResolvers.has(params.permissionId)) {
+        targetBridge = worker.activeTurn;
+      } else {
+        for (const b of worker.turnBridges.values()) {
+          if (b.pendingResolvers.has(params.permissionId)) {
+            targetBridge = b;
+            break;
+          }
+        }
+        if (!targetBridge && worker.backgroundBridge?.pendingResolvers.has(params.permissionId)) {
+          targetBridge = worker.backgroundBridge;
+        }
+      }
+    }
     const resolver = targetBridge?.pendingResolvers.get(params.permissionId);
     if (resolver && targetBridge) {
       targetBridge.pendingResolvers.delete(params.permissionId);
@@ -897,8 +907,10 @@ export class AcpClientManager {
       contentText: '',
       thoughtsText: '',
       toolCalls: [],
+      sessionMessages: [],
       lastDbFlushAt: nowInit,
       pendingResolvers: new Map(),
+      beforeWorkspaceSnap: beforeSnap,
       beforeBrainSnap,
       emittedArtifactIds: new Set(),
       syncedBrainFiles: new Map(),
@@ -908,7 +920,6 @@ export class AcpClientManager {
       asyncSubagentToolIds: new Set(),
       initialPromptDone: false,
       parentWakeupStarted: false,
-      parentWakeupIdle: false,
       receivedWakeupText: false,
       lastParentActivityAt: nowInit,
       parentState: 'running',
@@ -917,6 +928,8 @@ export class AcpClientManager {
     worker.inFlight = true;
     worker.lastUsedAt = Date.now();
     worker.activeTurn = bridge;
+    worker.turnBridges.set(bridge.runId, bridge);
+    this.pruneOldTurnBridges(worker);
 
     const onAbort = () => {
       this.cancelTurn(params.userId, params.chatId, params.runId).catch(() => {});
@@ -926,31 +939,8 @@ export class AcpClientManager {
     try {
       const promptBlocks: ContentBlock[] = [];
 
-      // If agent does not advertise systemPrompt capability, transparently pass explicit project instructions once
-      let effectiveText = params.userText;
-      if (worker.needsTranscriptBridge) {
-        const prior = this.db
-          .listMessages(params.userId, params.chatId)
-          .filter((m) => m.runId !== params.runId && m.contentText.trim().length > 0)
-          .slice(-10);
-        if (prior.length > 0) {
-          const historyLines = prior.map(
-            (m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.contentText.slice(0, 1200)}`
-          );
-          effectiveText = `[これまでの会話履歴]\n${historyLines.join('\n\n')}\n\n[最新のメッセージ]\n${effectiveText}`;
-        }
-        worker.needsTranscriptBridge = false;
-      }
-      if (!worker.supportsSystemPrompt && !worker.systemPromptInjectedFallback && chat.projectId) {
-        const proj = this.db.getProject(params.userId, chat.projectId);
-        if (proj && proj.instructions.trim()) {
-          effectiveText = `[プロジェクト指示]\n${proj.instructions.trim()}\n\n[ユーザーメッセージ]\n${effectiveText}`;
-          worker.systemPromptInjectedFallback = true;
-        }
-      }
-
-      if (effectiveText.trim()) {
-        promptBlocks.push({ type: 'text', text: effectiveText });
+      if (params.userText.trim()) {
+        promptBlocks.push({ type: 'text', text: params.userText });
       }
 
       for (const att of params.attachments) {
@@ -996,104 +986,6 @@ export class AcpClientManager {
       await new Promise((r) => setImmediate(r));
 
       this.syncBrainDeliverablesMidTurn(worker, bridge);
-
-      const hasPendingWork = () => {
-        const hasRunningSubagents = [...bridge.subagents.values()].some(
-          (s) => s.state === 'running' || s.state === 'requires_action'
-        );
-        const hasBackgroundCommandWork =
-          bridge.backgroundWorkCount > 0 ||
-          bridge.toolCalls.some(
-            (tc) =>
-              (tc.status === 'in_progress' || tc.status === 'pending') &&
-              hasBackgroundTaskOutput(tc)
-          );
-        const hasPendingToolsOrPerms =
-          bridge.pendingResolvers.size > 0 ||
-          bridge.toolCalls.some((tc) => tc.status === 'in_progress' || tc.status === 'pending');
-        const isParentStillActive =
-          bridge.parentState === 'running' || bridge.parentState === 'requires_action';
-        return {
-          hasRunningSubagents,
-          hasBackgroundCommandWork,
-          hasPendingToolsOrPerms,
-          isParentStillActive,
-          anyActive:
-            hasRunningSubagents ||
-            hasBackgroundCommandWork ||
-            hasPendingToolsOrPerms ||
-            isParentStillActive,
-        };
-      };
-
-      // When Antigravity has active subagents, background tasks, pending tools/permissions,
-      // or has not yet reached an idle parent state after reactive wakeup, keep this turn open
-      // until Antigravity explicitly reports completion via ACP notifications.
-      if (
-        response.stopReason === 'end_turn' &&
-        !params.abortSignal.aborted &&
-        hasPendingWork().anyActive
-      ) {
-        let lastBrainPollAt = Date.now();
-        const hadBackgroundSubagentOrTaskAtPromptEnd =
-          hasPendingWork().hasRunningSubagents || hasPendingWork().hasBackgroundCommandWork;
-
-        while (
-          !params.abortSignal.aborted &&
-          !worker.process.killed &&
-          worker.process.exitCode === null
-        ) {
-          const now = Date.now();
-
-          if (now - lastBrainPollAt >= 300) {
-            lastBrainPollAt = now;
-            this.syncBrainDeliverablesMidTurn(worker, bridge);
-          }
-
-          const state = hasPendingWork();
-          const hasActiveNonSubagentTools = bridge.toolCalls.some(
-            (tc) =>
-              !bridge.asyncSubagentToolIds.has(tc.toolCallId) &&
-              !tc.toolCallId.startsWith('subagent:') &&
-              (tc.status === 'in_progress' || tc.status === 'pending')
-          );
-
-          const hasExpectationOfWakeup =
-            hadBackgroundSubagentOrTaskAtPromptEnd ||
-            bridge.parentWakeupStarted ||
-            state.hasRunningSubagents ||
-            state.hasBackgroundCommandWork;
-
-          if (!hasExpectationOfWakeup) {
-            if (
-              !state.hasRunningSubagents &&
-              !hasActiveNonSubagentTools &&
-              bridge.pendingResolvers.size === 0 &&
-              bridge.backgroundWorkCount === 0 &&
-              !state.isParentStillActive
-            ) {
-              break;
-            }
-          } else {
-            // Wait until all child subagents are explicitly idle, no tools/permissions/background work
-            // remain active, and the parent session has completed its reactive wakeup and reported idle.
-            if (
-              bridge.parentWakeupIdle &&
-              bridge.parentState === 'idle' &&
-              !state.hasRunningSubagents &&
-              bridge.backgroundWorkCount === 0 &&
-              !hasActiveNonSubagentTools &&
-              bridge.pendingResolvers.size === 0
-            ) {
-              break;
-            }
-          }
-
-          await new Promise((r) => setTimeout(r, 50));
-        }
-
-        this.syncBrainDeliverablesMidTurn(worker, bridge);
-      }
 
       // Scrub any internal brain/profile paths in toolCalls and contentText into /workspace/generated/...
       bridge.toolCalls = scrubToolCallsInternalPaths(
@@ -1173,6 +1065,7 @@ export class AcpClientManager {
         contentText: bridge.contentText,
         thoughtsText: bridge.thoughtsText,
         toolCalls: bridge.toolCalls,
+        sessionMessages: bridge.sessionMessages,
         artifactIds: newArtifacts.map((a) => a.id),
         status: finalStatus,
       })!;
@@ -1233,6 +1126,7 @@ export class AcpClientManager {
         contentText: bridge.contentText,
         thoughtsText: bridge.thoughtsText,
         toolCalls: bridge.toolCalls,
+        sessionMessages: bridge.sessionMessages,
         status: 'error',
         errorMessage: err instanceof Error ? err.message : String(err),
       });
@@ -1318,6 +1212,7 @@ export class AcpClientManager {
     let workerRef: WorkerInstance | null = null;
     let earlyAvailableCommands: AvailableCommandItem[] | undefined;
     let earlyConfigOptions: SessionConfigOption[] | undefined;
+    const earlyNotifications: SessionNotification[] = [];
 
     const acpClientApp = client({ name: 'antigravity-chat-ui' });
     const internalBuilder = (
@@ -1367,8 +1262,9 @@ export class AcpClientManager {
         }
       })
       .onRequest(methods.client.session.requestPermission, async ({ params, signal }) => {
-        const turn =
-          workerRef?.activeTurn ?? (workerRef ? this.ensureBackgroundBridge(workerRef) : null);
+        const turn = workerRef
+          ? this.resolveBridgeForPermission(workerRef, params.toolCall.toolCallId, (params as { sessionId?: string }).sessionId)
+          : null;
         if (!workerRef || !turn) {
           return { outcome: { outcome: 'cancelled' as const } };
         }
@@ -1442,7 +1338,13 @@ export class AcpClientManager {
           options,
         });
 
-        this.db.updateRun(turn.userId, turn.runId, { status: 'awaiting_permission' });
+        const existingRun = turn.runId ? this.db.getRun(turn.userId, turn.runId) : null;
+        if (
+          existingRun &&
+          (existingRun.status === 'running' || existingRun.status === 'queued')
+        ) {
+          this.db.updateRun(turn.userId, turn.runId, { status: 'awaiting_permission' });
+        }
         this.hub.emitDurable({
           userId: turn.userId,
           type: 'permission.requested',
@@ -1476,6 +1378,8 @@ export class AcpClientManager {
               earlyAvailableCommands = mapAcpAvailableCommands(params.update.availableCommands);
             } else if (params.update?.sessionUpdate === 'config_option_update') {
               earlyConfigOptions = params.update.configOptions;
+            } else {
+              earlyNotifications.push(params);
             }
             return;
           }
@@ -1663,17 +1567,19 @@ export class AcpClientManager {
       acpSessionId,
       parsedOptions,
       supportsSystemPrompt,
-      systemPromptInjectedFallback: Boolean(systemPromptPayload),
-      needsTranscriptBridge: !restoredExistingSession,
       inFlight: false,
       lastUsedAt: Date.now(),
       activeTurn: null,
       backgroundBridge: null,
+      turnBridges: new Map(),
       lastBackgroundActivityAt: 0,
       stderrTail,
     };
 
     this.workers.set(workerKey, workerRef);
+    for (const early of earlyNotifications) {
+      this.handleSessionNotification(workerRef, early);
+    }
     return workerRef;
   }
 
@@ -1897,6 +1803,122 @@ export class AcpClientManager {
     return textParts.length > 0 ? textParts.join('\n').trim() : undefined;
   }
 
+  private pruneOldTurnBridges(worker: WorkerInstance): void {
+    if (worker.turnBridges.size <= 20) return;
+    for (const [runId, b] of worker.turnBridges.entries()) {
+      if (worker.turnBridges.size <= 20) break;
+      if (b === worker.activeTurn || b === worker.backgroundBridge) continue;
+      if (this.isBridgeBusy(b)) continue;
+      worker.turnBridges.delete(runId);
+    }
+  }
+
+  private isBridgeBusy(b: ActiveTurnBridge): boolean {
+    if (b.pendingResolvers.size > 0) return true;
+    if (
+      b.parentState === 'running' ||
+      b.parentState === 'requires_action' ||
+      b.parentState === 'unknown'
+    ) {
+      return true;
+    }
+    if (b.backgroundWorkCount > 0) return true;
+    if (
+      [...b.subagents.values()].some(
+        (s) => s.state === 'running' || s.state === 'requires_action' || s.state === 'unknown'
+      )
+    ) {
+      return true;
+    }
+    if (b.toolCalls.some((tc) => tc.status === 'in_progress' || tc.status === 'pending')) {
+      return true;
+    }
+    return false;
+  }
+
+  private getBridgesNewestFirst(worker: WorkerInstance): ActiveTurnBridge[] {
+    const list: ActiveTurnBridge[] = [];
+    if (worker.activeTurn) list.push(worker.activeTurn);
+    const reversed = [...worker.turnBridges.values()].reverse();
+    for (const b of reversed) {
+      if (b !== worker.activeTurn) list.push(b);
+    }
+    if (worker.backgroundBridge && !list.includes(worker.backgroundBridge)) {
+      list.push(worker.backgroundBridge);
+    }
+    return list;
+  }
+
+  private resolveBridgeForPermission(
+    worker: WorkerInstance,
+    toolCallId?: string,
+    sessionId?: string
+  ): ActiveTurnBridge | null {
+    const bridges = this.getBridgesNewestFirst(worker);
+    if (sessionId && worker.acpSessionId && sessionId !== worker.acpSessionId) {
+      const bySub = bridges.find((b) => b.subagents.has(sessionId));
+      if (bySub) return bySub;
+    }
+    if (toolCallId) {
+      const byTool = bridges.find(
+        (b) =>
+          b.asyncSubagentToolIds.has(toolCallId) ||
+          b.toolCalls.some((tc) => tc.toolCallId === toolCallId)
+      );
+      if (byTool) return byTool;
+    }
+    return worker.activeTurn ?? this.ensureBackgroundBridge(worker);
+  }
+
+  private resolveBridgeForNotification(
+    worker: WorkerInstance,
+    params: SessionNotification
+  ): ActiveTurnBridge | null {
+    const update = params.update;
+    const rawUpdate = update as unknown as Record<string, unknown>;
+    const rawUpdateType = String(rawUpdate.sessionUpdate || '');
+    const bridges = this.getBridgesNewestFirst(worker);
+
+    if (params.sessionId && worker.acpSessionId && params.sessionId !== worker.acpSessionId) {
+      const byChild = bridges.find((b) => b.subagents.has(params.sessionId));
+      if (byChild) return byChild;
+      return worker.activeTurn ?? this.ensureBackgroundBridge(worker);
+    }
+
+    if (rawUpdateType === 'subagent_update') {
+      const subId = typeof rawUpdate.sessionId === 'string' ? rawUpdate.sessionId : null;
+      const tcId = typeof rawUpdate.toolCallId === 'string' ? rawUpdate.toolCallId : null;
+      const bySub = bridges.find(
+        (b) =>
+          (subId && b.subagents.has(subId)) ||
+          (tcId &&
+            (b.asyncSubagentToolIds.has(tcId) || b.toolCalls.some((t) => t.toolCallId === tcId)))
+      );
+      if (bySub) return bySub;
+    }
+
+    if (update.sessionUpdate === 'tool_call_update') {
+      const byTool = bridges.find((b) =>
+        b.toolCalls.some((t) => t.toolCallId === update.toolCallId)
+      );
+      if (byTool) return byTool;
+    }
+
+    if (rawUpdateType === 'session_message' || rawUpdateType === 'session_message_chunk') {
+      const msgId = typeof rawUpdate.messageId === 'string' ? rawUpdate.messageId : null;
+      const senderId =
+        typeof rawUpdate.senderSessionId === 'string' ? rawUpdate.senderSessionId : null;
+      const byMsg = bridges.find(
+        (b) =>
+          (msgId && b.sessionMessages.some((m) => m.messageId === msgId)) ||
+          (senderId && b.subagents.has(senderId))
+      );
+      if (byMsg) return byMsg;
+    }
+
+    return worker.activeTurn ?? this.ensureBackgroundBridge(worker);
+  }
+
   private upsertSubagentToolCall(
     worker: WorkerInstance,
     turn: ActiveTurnBridge,
@@ -1907,7 +1929,9 @@ export class AcpClientManager {
       description?: string | null;
       state?: 'running' | 'idle' | 'requires_action' | 'unknown';
       stopReason?: string | null;
-      activityNote?: string;
+      thoughtsDelta?: string;
+      contentDelta?: string;
+      childToolCall?: SubagentActivityItem;
     }
   ): void {
     const existingTrack = turn.subagents.get(params.subSessionId);
@@ -1934,7 +1958,7 @@ export class AcpClientManager {
       turn.toolCalls = turn.toolCalls.filter((t) => t.toolCallId !== existingTrack.toolCallId);
     }
 
-    const nextState = params.state ?? existingTrack?.state ?? 'running';
+    const nextState = params.state ?? existingTrack?.state ?? 'unknown';
     const nextTitle =
       (params.title && params.title.trim()) ||
       existingTrack?.title ||
@@ -1945,6 +1969,20 @@ export class AcpClientManager {
         ? params.description ?? undefined
         : existingTrack?.description;
 
+    const nextThoughts = (existingTrack?.thoughtsText ?? '') + (params.thoughtsDelta ?? '');
+    const nextContent = (existingTrack?.contentText ?? '') + (params.contentDelta ?? '');
+    const nextChildTools = existingTrack ? [...existingTrack.toolCalls] : [];
+    if (params.childToolCall) {
+      const cIdx = nextChildTools.findIndex(
+        (c) => c.toolCallId === params.childToolCall!.toolCallId
+      );
+      if (cIdx >= 0) {
+        nextChildTools[cIdx] = { ...nextChildTools[cIdx], ...params.childToolCall };
+      } else {
+        nextChildTools.push(params.childToolCall);
+      }
+    }
+
     const tracked: TrackedSubagentState = {
       sessionId: params.subSessionId,
       toolCallId: targetToolCallId,
@@ -1952,16 +1990,12 @@ export class AcpClientManager {
       description: nextDesc,
       state: nextState,
       stopReason: params.stopReason !== undefined ? params.stopReason : existingTrack?.stopReason,
+      thoughtsText: nextThoughts,
+      contentText: nextContent,
+      toolCalls: nextChildTools,
       lastActivityAt: Date.now(),
     };
     turn.subagents.set(params.subSessionId, tracked);
-
-    const mappedStatus: ToolCallItem['status'] =
-      nextState === 'running' || nextState === 'requires_action'
-        ? 'in_progress'
-        : tracked.stopReason === 'error' || tracked.stopReason === 'refusal'
-          ? 'failed'
-          : 'completed';
 
     const label = nextDesc
       ? `サブエージェント (${nextTitle}: ${nextDesc})`
@@ -1970,21 +2004,39 @@ export class AcpClientManager {
     const idx = turn.toolCalls.findIndex((t) => t.toolCallId === targetToolCallId);
     if (idx >= 0) {
       const prev = turn.toolCalls[idx];
+      // Preserve the tool call's native ACP status; track subagent lifecycle in dedicated fields (#5)
       turn.toolCalls[idx] = {
         ...prev,
         isSubagent: true,
         subagentLabel: prev.subagentLabel || label,
-        status: mappedStatus,
-        ...(params.activityNote ? { contentText: params.activityNote } : {}),
+        subagentSessionId: params.subSessionId,
+        subagentState: nextState,
+        ...(tracked.stopReason !== undefined ? { subagentStopReason: tracked.stopReason } : {}),
+        ...(nextThoughts ? { subagentThoughtsText: nextThoughts } : {}),
+        ...(nextContent ? { subagentContentText: nextContent } : {}),
+        ...(nextChildTools.length > 0 ? { subagentToolCalls: nextChildTools } : {}),
       };
     } else {
+      const initialFallbackStatus: ToolCallItem['status'] =
+        nextState === 'running' || nextState === 'requires_action'
+          ? 'in_progress'
+          : nextState === 'idle'
+            ? tracked.stopReason === 'error' || tracked.stopReason === 'refusal'
+              ? 'failed'
+              : 'completed'
+            : 'pending';
       turn.toolCalls.push({
         toolCallId: targetToolCallId,
         title: nextTitle,
         isSubagent: true,
         subagentLabel: label,
-        status: mappedStatus,
-        ...(params.activityNote ? { contentText: params.activityNote } : {}),
+        status: initialFallbackStatus,
+        subagentSessionId: params.subSessionId,
+        subagentState: nextState,
+        ...(tracked.stopReason !== undefined ? { subagentStopReason: tracked.stopReason } : {}),
+        ...(nextThoughts ? { subagentThoughtsText: nextThoughts } : {}),
+        ...(nextContent ? { subagentContentText: nextContent } : {}),
+        ...(nextChildTools.length > 0 ? { subagentToolCalls: nextChildTools } : {}),
       });
     }
 
@@ -2014,7 +2066,7 @@ export class AcpClientManager {
       };
       const resolvedState = hasExplicitNullState
         ? 'idle'
-        : stateObj.state ?? (stateObj.stopReason ? 'idle' : 'running');
+        : stateObj.state ?? (stateObj.stopReason ? 'idle' : 'unknown');
       this.upsertSubagentToolCall(worker, turn, {
         subSessionId: childSessionId,
         state: resolvedState,
@@ -2031,40 +2083,220 @@ export class AcpClientManager {
         (update as { content?: unknown }).content
       );
       this.syncBrainDeliverablesMidTurn(worker, turn);
-      const isFinishedTool =
-        update.sessionUpdate === 'tool_call_update' &&
-        (update.status === 'completed' || update.status === 'failed');
-      const activityNote =
-        contentNote ||
-        (update.title ? (isFinishedTool ? update.title : `実行中: ${update.title}`) : undefined);
+      const existingTrack = turn.subagents.get(childSessionId);
+      const prevChildTool = existingTrack?.toolCalls.find(
+        (c) => c.toolCallId === update.toolCallId
+      );
+      const rawName = (update as { name?: string }).name ?? prevChildTool?.name;
+      const childTool: SubagentActivityItem = {
+        toolCallId: update.toolCallId,
+        title:
+          update.title !== undefined && update.title !== null
+            ? update.title
+            : prevChildTool?.title ?? 'ツール実行',
+        ...(rawName ? { name: rawName } : {}),
+        ...(update.kind !== undefined && update.kind !== null
+          ? { kind: update.kind }
+          : prevChildTool?.kind
+            ? { kind: prevChildTool.kind }
+            : {}),
+        status:
+          update.status !== undefined && update.status !== null
+            ? update.status
+            : prevChildTool?.status ?? 'in_progress',
+        ...(contentNote !== undefined
+          ? { contentText: contentNote }
+          : prevChildTool?.contentText
+            ? { contentText: prevChildTool.contentText }
+            : {}),
+        ...(update.rawInput !== undefined
+          ? { rawInput: update.rawInput }
+          : prevChildTool?.rawInput !== undefined
+            ? { rawInput: prevChildTool.rawInput }
+            : {}),
+        ...(update.rawOutput !== undefined
+          ? { rawOutput: update.rawOutput }
+          : prevChildTool?.rawOutput !== undefined
+            ? { rawOutput: prevChildTool.rawOutput }
+            : {}),
+        ...(update.locations !== undefined && update.locations !== null
+          ? { locations: update.locations.map((l) => ({ path: l.path, line: l.line })) }
+          : prevChildTool?.locations
+            ? { locations: prevChildTool.locations }
+            : {}),
+      };
       this.upsertSubagentToolCall(worker, turn, {
         subSessionId: childSessionId,
-        state: 'running',
-        activityNote,
+        childToolCall: childTool,
       });
       return;
     }
 
-    if (update.sessionUpdate === 'agent_message_chunk') {
-      if (update.content.type === 'image') {
-        this.saveInlineBase64AssetToWorkspace(worker, turn, {
-          data: update.content.data,
-          mimeType: update.content.mimeType,
-        });
-      } else if (update.content.type === 'resource_link') {
-        this.syncBrainDeliverablesMidTurn(worker, turn);
-      } else if (update.content.type === 'text' && update.content.text.trim()) {
+    if (update.sessionUpdate === 'agent_thought_chunk') {
+      if (update.content.type === 'text' && update.content.text) {
         const cleaned = rewriteInternalPathsToWorkspace(
-          update.content.text.trim(),
+          update.content.text,
           worker.profileDir,
           worker.workspaceDir
         );
         this.upsertSubagentToolCall(worker, turn, {
           subSessionId: childSessionId,
-          activityNote: cleaned.slice(0, 300),
+          thoughtsDelta: cleaned,
+        });
+      }
+      return;
+    }
+
+    if (update.sessionUpdate === 'agent_message_chunk') {
+      if (update.content.type === 'image') {
+        const rel = this.saveInlineBase64AssetToWorkspace(worker, turn, {
+          data: update.content.data,
+          mimeType: update.content.mimeType,
+        });
+        if (rel) {
+          this.upsertSubagentToolCall(worker, turn, {
+            subSessionId: childSessionId,
+            contentDelta: `\n\n![生成画像](${rel})\n`,
+          });
+        }
+      } else if (update.content.type === 'resource_link') {
+        this.syncBrainDeliverablesMidTurn(worker, turn);
+        const rewrittenUri = rewriteInternalPathsToWorkspace(
+          update.content.uri,
+          worker.profileDir,
+          worker.workspaceDir
+        );
+        this.upsertSubagentToolCall(worker, turn, {
+          subSessionId: childSessionId,
+          contentDelta: `\n[${update.content.name || path.basename(rewrittenUri)}](${rewrittenUri})\n`,
+        });
+      } else if (update.content.type === 'text' && update.content.text) {
+        const cleaned = rewriteInternalPathsToWorkspace(
+          update.content.text,
+          worker.profileDir,
+          worker.workspaceDir
+        );
+        this.upsertSubagentToolCall(worker, turn, {
+          subSessionId: childSessionId,
+          contentDelta: cleaned,
         });
       }
       this.syncBrainDeliverablesMidTurn(worker, turn);
+    }
+  }
+
+  private extractContentBlocksText(
+    worker: WorkerInstance,
+    turn: ActiveTurnBridge,
+    blocks: ContentBlock[]
+  ): string {
+    const parts: string[] = [];
+    for (const block of blocks) {
+      if (!block || typeof block !== 'object') continue;
+      if (block.type === 'text' && typeof block.text === 'string') {
+        parts.push(rewriteInternalPathsToWorkspace(block.text, worker.profileDir, worker.workspaceDir));
+      } else if (block.type === 'image' && typeof block.data === 'string') {
+        const rel = this.saveInlineBase64AssetToWorkspace(worker, turn, {
+          data: block.data,
+          mimeType: block.mimeType,
+        });
+        if (rel) parts.push(`\n\n![生成画像](${rel})\n`);
+      } else if (block.type === 'resource_link' && typeof block.uri === 'string') {
+        const rewritten = rewriteInternalPathsToWorkspace(
+          block.uri,
+          worker.profileDir,
+          worker.workspaceDir
+        );
+        parts.push(`[${block.name || path.basename(rewritten)}](${rewritten})`);
+      }
+    }
+    return parts.join('');
+  }
+
+  private handleInterSessionMessageNotification(
+    worker: WorkerInstance,
+    turn: ActiveTurnBridge,
+    rawUpdateType: string,
+    rawUpdate: Record<string, unknown>
+  ): void {
+    const messageId =
+      typeof rawUpdate.messageId === 'string' && rawUpdate.messageId.trim()
+        ? rawUpdate.messageId.trim()
+        : null;
+    if (!messageId) return;
+
+    const existingIdx = turn.sessionMessages.findIndex((m) => m.messageId === messageId);
+    const existing = existingIdx >= 0 ? turn.sessionMessages[existingIdx] : null;
+    const now = Date.now();
+
+    if (rawUpdateType === 'session_message') {
+      let nextContent = existing?.contentText ?? '';
+      if ('content' in rawUpdate) {
+        if (rawUpdate.content === null || (Array.isArray(rawUpdate.content) && rawUpdate.content.length === 0)) {
+          nextContent = '';
+        } else if (Array.isArray(rawUpdate.content)) {
+          nextContent = this.extractContentBlocksText(
+            worker,
+            turn,
+            rawUpdate.content as ContentBlock[]
+          );
+        }
+      }
+      const item: SessionMessageItem = {
+        messageId,
+        senderSessionId:
+          rawUpdate.senderSessionId !== undefined
+            ? (rawUpdate.senderSessionId as string | null)
+            : existing?.senderSessionId,
+        recipientSessionId:
+          rawUpdate.recipientSessionId !== undefined
+            ? (rawUpdate.recipientSessionId as string | null)
+            : existing?.recipientSessionId,
+        senderMessageId:
+          rawUpdate.senderMessageId !== undefined
+            ? (rawUpdate.senderMessageId as string | null)
+            : existing?.senderMessageId,
+        recipientMessageId:
+          rawUpdate.recipientMessageId !== undefined
+            ? (rawUpdate.recipientMessageId as string | null)
+            : existing?.recipientMessageId,
+        contentText: nextContent,
+        done: rawUpdate.done !== undefined ? Boolean(rawUpdate.done) : existing?.done ?? true,
+        updatedAt: now,
+      };
+      if (existingIdx >= 0) turn.sessionMessages[existingIdx] = item;
+      else turn.sessionMessages.push(item);
+    } else {
+      // session_message_chunk
+      const chunkBlock = rawUpdate.content as ContentBlock | undefined;
+      const chunkText = chunkBlock
+        ? this.extractContentBlocksText(worker, turn, [chunkBlock])
+        : '';
+      const item: SessionMessageItem = {
+        messageId,
+        senderSessionId: existing?.senderSessionId ?? (typeof rawUpdate.senderSessionId === 'string' ? rawUpdate.senderSessionId : undefined),
+        recipientSessionId: existing?.recipientSessionId,
+        senderMessageId: existing?.senderMessageId,
+        recipientMessageId: existing?.recipientMessageId,
+        contentText: (existing?.contentText ?? '') + chunkText,
+        done: rawUpdate.done === true ? true : existing?.done ?? false,
+        updatedAt: now,
+      };
+      if (existingIdx >= 0) turn.sessionMessages[existingIdx] = item;
+      else turn.sessionMessages.push(item);
+    }
+
+    const updatedMsg = this.db.updateMessage(turn.userId, turn.assistantMessageId, {
+      sessionMessages: turn.sessionMessages,
+    });
+    if (updatedMsg) {
+      this.hub.emitDurable({
+        userId: worker.userId,
+        type: 'message.updated',
+        chatId: worker.chatId,
+        runId: turn.runId || null,
+        payload: { message: updatedMsg },
+      });
     }
   }
 
@@ -2076,6 +2308,7 @@ export class AcpClientManager {
     const latestAssistant = [...messages].reverse().find((m) => m.role === 'assistant');
     if (!latestAssistant) return null;
 
+    const beforeWorkspaceSnap = captureWorkspaceSnapshot(worker.workspaceDir);
     const beforeBrainSnap = captureBrainSnapshot(worker.profileDir, worker.workspaceDir);
     const bridge: ActiveTurnBridge = {
       runId: latestAssistant.runId ?? '',
@@ -2085,8 +2318,10 @@ export class AcpClientManager {
       contentText: latestAssistant.contentText,
       thoughtsText: latestAssistant.thoughtsText,
       toolCalls: [...latestAssistant.toolCalls],
+      sessionMessages: [...(latestAssistant.sessionMessages ?? [])],
       lastDbFlushAt: 0,
       pendingResolvers: new Map(),
+      beforeWorkspaceSnap,
       beforeBrainSnap,
       emittedArtifactIds: new Set(latestAssistant.artifactIds),
       syncedBrainFiles: new Map(),
@@ -2096,21 +2331,53 @@ export class AcpClientManager {
       asyncSubagentToolIds: new Set(),
       initialPromptDone: true,
       parentWakeupStarted: true,
-      parentWakeupIdle: false,
       receivedWakeupText: true,
       lastParentActivityAt: Date.now(),
       parentState: 'idle',
       backgroundWorkCount: 0,
     };
     worker.backgroundBridge = bridge;
+    if (bridge.runId) {
+      worker.turnBridges.set(bridge.runId, bridge);
+    }
     return bridge;
   }
 
+  private syncBackgroundWorkspaceArtifacts(
+    worker: WorkerInstance,
+    bridge: ActiveTurnBridge
+  ): void {
+    const hintPaths = [...bridge.syncedBrainFiles.values()].map((s) => s.workspaceRelPath);
+    const newArtifacts = syncWorkspaceChangesAsArtifacts({
+      db: this.db,
+      userId: worker.userId,
+      chatId: worker.chatId,
+      workspaceDir: worker.workspaceDir,
+      messageId: bridge.assistantMessageId,
+      runId: bridge.runId || null,
+      before: bridge.beforeWorkspaceSnap,
+      hintPaths,
+    });
+    for (const art of newArtifacts) {
+      if (bridge.emittedArtifactIds.has(art.id)) continue;
+      bridge.emittedArtifactIds.add(art.id);
+      this.hub.emitDurable({
+        userId: worker.userId,
+        type: 'artifact.created',
+        chatId: worker.chatId,
+        runId: bridge.runId || null,
+        payload: { artifact: art },
+      });
+    }
+  }
+
   private flushBackgroundBridgeToMessage(worker: WorkerInstance, bridge: ActiveTurnBridge): void {
+    this.syncBackgroundWorkspaceArtifacts(worker, bridge);
     const updated = this.db.updateMessage(worker.userId, bridge.assistantMessageId, {
       contentText: bridge.contentText,
       thoughtsText: bridge.thoughtsText,
       toolCalls: bridge.toolCalls,
+      sessionMessages: bridge.sessionMessages,
       artifactIds: [...bridge.emittedArtifactIds],
     });
     if (updated) {
@@ -2168,8 +2435,8 @@ export class AcpClientManager {
       return;
     }
 
-    const isBackgroundTurn = !worker.activeTurn;
-    const turn = worker.activeTurn ?? this.ensureBackgroundBridge(worker);
+    const turn = this.resolveBridgeForNotification(worker, params);
+    const isBackgroundTurn = !worker.activeTurn || turn !== worker.activeTurn;
 
     if (update.sessionUpdate === 'usage_update') {
       if (turn) {
@@ -2245,10 +2512,8 @@ export class AcpClientManager {
       turn.lastParentActivityAt = now;
       if (Array.isArray(stateObj.background)) {
         turn.backgroundWorkCount = stateObj.background.length;
-        const activeBgSubagentIds = new Set<string>();
         for (const item of stateObj.background) {
           if (item && item.type === 'subagent' && typeof item.sessionId === 'string') {
-            activeBgSubagentIds.add(item.sessionId);
             if (!turn.subagents.has(item.sessionId)) {
               this.upsertSubagentToolCall(worker, turn, {
                 subSessionId: item.sessionId,
@@ -2258,28 +2523,8 @@ export class AcpClientManager {
             }
           }
         }
-        // Any tracked subagent that is no longer present in Antigravity's active `background` list has finished
-        for (const [subSessionId, tracked] of turn.subagents.entries()) {
-          if (
-            (tracked.state === 'running' || tracked.state === 'requires_action') &&
-            !activeBgSubagentIds.has(subSessionId)
-          ) {
-            this.upsertSubagentToolCall(worker, turn, {
-              subSessionId,
-              state: 'idle',
-            });
-          }
-        }
       } else if (stateObj.background === null) {
         turn.backgroundWorkCount = 0;
-        for (const [subSessionId, tracked] of turn.subagents.entries()) {
-          if (tracked.state === 'running' || tracked.state === 'requires_action') {
-            this.upsertSubagentToolCall(worker, turn, {
-              subSessionId,
-              state: 'idle',
-            });
-          }
-        }
       }
       if (stateObj.state) {
         turn.parentState = stateObj.state;
@@ -2289,24 +2534,7 @@ export class AcpClientManager {
         turn.initialPromptDone
       ) {
         turn.parentWakeupStarted = true;
-        turn.parentWakeupIdle = false;
       } else if (stateObj.state === 'idle' && turn.initialPromptDone) {
-        if (turn.parentWakeupStarted && !Array.isArray(stateObj.background)) {
-          for (const [subSessionId, tracked] of turn.subagents.entries()) {
-            if (tracked.state === 'running' || tracked.state === 'requires_action') {
-              this.upsertSubagentToolCall(worker, turn, {
-                subSessionId,
-                state: 'idle',
-              });
-            }
-          }
-        }
-        const anySubagentStillRunning = [...turn.subagents.values()].some(
-          (s) => s.state === 'running' || s.state === 'requires_action'
-        );
-        if (turn.backgroundWorkCount === 0 && !anySubagentStillRunning) {
-          turn.parentWakeupIdle = true;
-        }
         this.syncBrainDeliverablesMidTurn(worker, turn);
       }
       finalizeIfBackground();
@@ -2315,15 +2543,7 @@ export class AcpClientManager {
 
     if (rawUpdateType === 'session_message' || rawUpdateType === 'session_message_chunk') {
       this.syncBrainDeliverablesMidTurn(worker, turn);
-      const senderSessionId =
-        typeof rawUpdate.senderSessionId === 'string' ? rawUpdate.senderSessionId : null;
-      const isFinalChunk = rawUpdateType === 'session_message' || rawUpdate.done !== false;
-      if (isFinalChunk && senderSessionId && senderSessionId !== worker.acpSessionId) {
-        this.upsertSubagentToolCall(worker, turn, {
-          subSessionId: senderSessionId,
-          state: 'idle',
-        });
-      }
+      this.handleInterSessionMessageNotification(worker, turn, rawUpdateType, rawUpdate);
       finalizeIfBackground();
       return;
     }
@@ -2339,7 +2559,6 @@ export class AcpClientManager {
     ) {
       turn.lastParentActivityAt = now;
       turn.parentState = 'running';
-      turn.parentWakeupIdle = false;
       if (!turn.parentWakeupStarted) {
         turn.parentWakeupStarted = true;
         this.syncBrainDeliverablesMidTurn(worker, turn);
@@ -2434,24 +2653,27 @@ export class AcpClientManager {
         }
       }
       const contentText = this.extractToolCallContentAndSaveAssets(worker, turn, rawContent);
-      const isBoundSubagentStillRunning = [...turn.subagents.values()].some(
-        (s) =>
-          s.toolCallId === update.toolCallId &&
-          (s.state === 'running' || s.state === 'requires_action')
+      const boundSubagent = [...turn.subagents.values()].find(
+        (s) => s.toolCallId === update.toolCallId
       );
-      let effectiveStatus: ToolCallItem['status'] = update.status ?? 'in_progress';
-      if (isBoundSubagentStillRunning && effectiveStatus === 'completed') {
-        effectiveStatus = 'in_progress';
-      }
 
       const nextToolRaw: ToolCallItem = {
         toolCallId: update.toolCallId,
         title: update.title,
         ...(rawName ? { name: rawName } : {}),
         kind: update.kind,
-        status: effectiveStatus,
+        status: update.status ?? 'in_progress',
         ...(subagentMeta.isSubagent
           ? { isSubagent: true, subagentLabel: subagentMeta.subagentLabel }
+          : {}),
+        ...(boundSubagent
+          ? {
+              subagentSessionId: boundSubagent.sessionId,
+              subagentState: boundSubagent.state,
+              ...(boundSubagent.stopReason !== undefined
+                ? { subagentStopReason: boundSubagent.stopReason }
+                : {}),
+            }
           : {}),
         rawInput: update.rawInput,
         rawOutput: update.rawOutput,
@@ -2515,18 +2737,8 @@ export class AcpClientManager {
       }
       const contentText = this.extractToolCallContentAndSaveAssets(worker, turn, rawContent);
 
-      // Only keep status as `in_progress` if an active tracked subagent in `turn.subagents` is bound to this toolCallId
-      const isBoundSubagentStillRunning = [...turn.subagents.values()].some(
-        (s) =>
-          s.toolCallId === update.toolCallId &&
-          (s.state === 'running' || s.state === 'requires_action')
-      );
-
-      let effectiveStatus =
+      const effectiveStatus =
         update.status !== undefined && update.status !== null ? update.status : existing.status;
-      if (isBoundSubagentStillRunning && effectiveStatus === 'completed') {
-        effectiveStatus = 'in_progress';
-      }
 
       const mergedRaw: ToolCallItem = {
         ...existing,
@@ -2605,21 +2817,11 @@ export class AcpClientManager {
 
   private isWorkerBusy(w: WorkerInstance): boolean {
     if (w.inFlight || w.activeTurn !== null) return true;
-    const bg = w.backgroundBridge;
-    if (bg) {
-      if (bg.pendingResolvers.size > 0) return true;
-      if (bg.parentState === 'running' || bg.parentState === 'requires_action') return true;
-      if (bg.backgroundWorkCount > 0) return true;
-      if (
-        [...bg.subagents.values()].some(
-          (s) => s.state === 'running' || s.state === 'requires_action'
-        )
-      ) {
-        return true;
-      }
-      if (bg.toolCalls.some((tc) => tc.status === 'in_progress' || tc.status === 'pending')) {
-        return true;
-      }
+    for (const b of w.turnBridges.values()) {
+      if (this.isBridgeBusy(b)) return true;
+    }
+    if (w.backgroundBridge && this.isBridgeBusy(w.backgroundBridge)) {
+      return true;
     }
     return false;
   }
