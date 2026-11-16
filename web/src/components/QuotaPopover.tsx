@@ -92,6 +92,12 @@ export const QuotaPopover: React.FC<QuotaPopoverProps> = ({
   onRefresh,
   onClose,
 }) => {
+  const [, setTick] = React.useState(0);
+  React.useEffect(() => {
+    const id = window.setInterval(() => setTick((n) => n + 1), 30_000);
+    return () => window.clearInterval(id);
+  }, []);
+
   const grouped = React.useMemo(() => {
     if (!quota || quota.buckets.length === 0) return [];
     const groups = new Map<string, QuotaBucket[]>();

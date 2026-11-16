@@ -8,6 +8,12 @@ import type {
   WebUser,
 } from '../types';
 import {
+  HAPTIC_META,
+  isAppleTouchHapticsFallback,
+  isVibrationApiSupported,
+  triggerHaptic,
+} from '../utils/haptics';
+import {
   ensurePushSubscribed,
   getActivePushSubscription,
   isAppleMobileBrowser,
@@ -73,7 +79,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   }, []);
 
   const handlePrefChange = async (
-    patch: Partial<Pick<UserPreferences, 'theme' | 'autoApproveSafeReads' | 'notifyOnResponse'>>
+    patch: Partial<
+      Pick<UserPreferences, 'theme' | 'autoApproveSafeReads' | 'notifyOnResponse' | 'hapticFeedback'>
+    >
   ) => {
     setError(null);
     try {
@@ -401,6 +409,51 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             )}
 
             {notifStatusMsg && <div className="success-box">{notifStatusMsg}</div>}
+          </section>
+
+          <section className="settings-section">
+            <h4>バイブレーション / 触覚フィードバック</h4>
+            <ToggleSwitch
+              checked={preferences.hapticFeedback}
+              label="操作・応答完了を振動で区別して知らせる"
+              description={
+                isAppleTouchHapticsFallback()
+                  ? '送信・停止タップ時の触覚スイッチフィードバックとバックグラウンドPush通知（通知音・バイブ）に対応します。'
+                  : 'メッセージ送信、生成停止、応答完了、エラー、承認要求を異なる振動パターンで伝えます。'
+              }
+              onChange={(next) => void handlePrefChange({ hapticFeedback: next })}
+            />
+
+            {preferences.hapticFeedback && isVibrationApiSupported() && (
+              <div className="haptic-pattern-grid">
+                {HAPTIC_META.map((item) => (
+                  <div key={item.type} className="haptic-pattern-row">
+                    <div>
+                      <div className="haptic-pattern-title">
+                        <span>{item.label}</span>
+                        <span className="haptic-pattern-badge">{item.patternLabel}</span>
+                      </div>
+                      <div className="muted-xs">{item.description}</div>
+                    </div>
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-xs"
+                      onClick={() => triggerHaptic(item.type, true)}
+                    >
+                      試す
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {preferences.hapticFeedback && isAppleTouchHapticsFallback() && (
+              <div className="notif-meta-row">
+                <span className="muted-xs">
+                  iPhone/iPad の Safari / PWA では Web標準の振動API（navigator.vibrate）が OS により非対応のため、送信・停止ボタン直接タップ時のネイティブスイッチ触覚（iOS 17.4+）＋バックグラウンド完了Push通知でのバイブ/通知音による通知となります。
+                </span>
+              </div>
+            )}
           </section>
 
           <section className="settings-section">

@@ -19,6 +19,8 @@ import { registerFileRoutes } from './routes/file-routes.js';
 import { registerNotificationRoutes } from './routes/notification-routes.js';
 import { registerProjectRoutes } from './routes/project-routes.js';
 import { registerQuotaRoutes } from './routes/quota-routes.js';
+import { registerSkillRoutes } from './routes/skill-routes.js';
+import { SkillService } from './skills/skill-service.js';
 import { PushNotificationService } from './notifications/web-push.js';
 import { SyncHub } from './sync/hub.js';
 
@@ -32,6 +34,7 @@ export interface AppContext {
   scheduler: ExecutionScheduler;
   quotaService: QuotaService;
   pushService: PushNotificationService;
+  skillService: SkillService;
   shutdown: () => Promise<void>;
 }
 
@@ -78,10 +81,11 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
 
   const hub = new SyncHub(db, buildId);
   const pushService = new PushNotificationService(config, db);
-  const acp = new AcpClientManager(config, db, hub);
-  const agyAuth = new AgyAuthManager(config, db, hub, acp);
-  const scheduler = new ExecutionScheduler(config, db, hub, acp, pushService);
   const quotaService = new QuotaService(config, db, hub);
+  const skillService = new SkillService(config, db, hub);
+  const acp = new AcpClientManager(config, db, hub, skillService);
+  const agyAuth = new AgyAuthManager(config, db, hub, acp);
+  const scheduler = new ExecutionScheduler(config, db, hub, acp, pushService, quotaService);
 
   const app = Fastify({
     trustProxy: config.trustProxy,
@@ -109,10 +113,11 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
 
   await registerAuthRoutes(app, { config, db, hub, agyAuth, buildId });
   await registerProjectRoutes(app, { config, db, hub, agyAuth });
-  await registerChatRoutes(app, { config, db, hub, agyAuth, acp, scheduler });
+  await registerChatRoutes(app, { config, db, hub, agyAuth, acp, scheduler, skillService });
   await registerFileRoutes(app, { config, db, hub, agyAuth });
   await registerQuotaRoutes(app, { config, db, hub, agyAuth, quotaService });
   await registerNotificationRoutes(app, { config, db, hub, agyAuth, pushService });
+  await registerSkillRoutes(app, { config, db, hub, agyAuth, skillService, acp });
 
   app.get('/api/ws', { websocket: true }, (socket, req) => {
     const session = authenticateRequest(req, db);
@@ -201,6 +206,7 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
   }
 
   const shutdown = async () => {
+    await quotaService.shutdown();
     await agyAuth.shutdown();
     await acp.shutdown();
     await app.close();
@@ -217,6 +223,7 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
     scheduler,
     quotaService,
     pushService,
+    skillService,
     shutdown,
   };
 }

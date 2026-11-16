@@ -106,7 +106,7 @@ export function ensureUserDirs(baseRoots: {
   }
 
   // Isolate XDG/tmp subdirs inside profileDir
-  for (const sub of ['.config', '.local/share', '.local/state', '.cache', '.tmp', '.gemini']) {
+  for (const sub of ['.config', '.local/share', '.local/state', '.cache', '.tmp', '.gemini', '.gemini/config/skills']) {
     fs.mkdirSync(path.join(profileDir, sub), { recursive: true, mode: 0o700 });
   }
 
@@ -213,6 +213,7 @@ export function listWorkspaceFiles(workspaceDir: string, includeProjectContext =
   const walk = (dir: string, prefix = '') => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       if (entry.name === '.git' || entry.name === 'node_modules') continue;
+      if (prefix === '' && (entry.name === '.agents' || entry.name === '.agent')) continue;
       if (!includeProjectContext && prefix === '' && entry.name === '.project-context') continue;
       if (entry.isSymbolicLink()) continue; // never traverse symlinks
       const full = path.join(dir, entry.name);

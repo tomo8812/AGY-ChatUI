@@ -1,13 +1,20 @@
 import hljs from 'highlight.js';
 import DOMPurify from 'dompurify';
 import React, { useEffect, useId, useRef, useState } from 'react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import rehypeKatex from 'rehype-katex';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import { api } from '../api/client';
-import type { ArtifactRecord } from '../types';
+import type { ArtifactRecord, MessageRecord } from '../types';
 import { CheckIcon, CopyIcon, DownloadIcon } from './Icons';
+
+const markdownUrlTransform = (url: string): string => {
+  if (/^file:\/\//i.test(url.trim())) {
+    return url.trim();
+  }
+  return defaultUrlTransform(url);
+};
 
 function getEffectiveTheme(): 'light' | 'dark' {
   return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
@@ -284,32 +291,69 @@ const WorkspaceImage: React.FC<{
   chatId?: string;
   src: string;
   alt?: string;
+  messageStatus?: MessageRecord['status'];
   onOpenArtifact?: (artifact: ArtifactRecord) => void;
-}> = ({ chatId, src, alt, onOpenArtifact }) => {
+}> = ({ chatId, src, alt, messageStatus, onOpenArtifact }) => {
   const [resolved, setResolved] = useState<{ url: string; artifact: ArtifactRecord } | null>(null);
   const [failed, setFailed] = useState(false);
+  const [retryToken, setRetryToken] = useState(0);
+  const prevStatusRef = useRef<MessageRecord['status'] | undefined>(messageStatus);
 
   const isDirect = /^https?:|^data:|^blob:|^\/api\/files\//i.test(src);
 
   useEffect(() => {
-    if (isDirect || !chatId) return;
+    setResolved(null);
+    setFailed(false);
+    setRetryToken(0);
+  }, [chatId, src, isDirect]);
+
+  useEffect(() => {
+    const prev = prevStatusRef.current;
+    prevStatusRef.current = messageStatus;
+    if (prev !== 'completed' && messageStatus === 'completed' && !resolved) {
+      setFailed(false);
+      setRetryToken((t) => t + 1);
+    }
+  }, [messageStatus, resolved]);
+
+  useEffect(() => {
+    if (isDirect || !chatId || !src || resolved) return;
     let active = true;
-    api
-      .resolveLink(chatId, src)
-      .then((res) => {
-        if (!active) return;
-        setResolved({ url: res.previewUrl, artifact: res.artifact });
-      })
-      .catch(() => {
-        if (active) setFailed(true);
-      });
+    let retryTimer: number | undefined;
+
+    const attemptResolve = (allowRetry: boolean) => {
+      api
+        .resolveLink(chatId, src)
+        .then((res) => {
+          if (!active) return;
+          setFailed(false);
+          setResolved({ url: res.previewUrl, artifact: res.artifact });
+        })
+        .catch(() => {
+          if (!active) return;
+          if (allowRetry) {
+            retryTimer = window.setTimeout(() => {
+              if (active) attemptResolve(false);
+            }, 500);
+          } else {
+            setFailed(true);
+          }
+        });
+    };
+
+    attemptResolve(true);
+
     return () => {
       active = false;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
     };
-  }, [chatId, src, isDirect]);
+  }, [chatId, src, isDirect, retryToken, resolved]);
 
   if (isDirect) {
     return <img src={src} alt={alt ?? ''} className="md-inline-img" loading="lazy" />;
+  }
+  if (!src) {
+    return <span className="muted-xs">[画像リンク解決不可: {alt || '空のパス'}]</span>;
   }
   if (failed) {
     return <span className="muted-xs">[画像リンク解決不可: {alt || src}]</span>;
@@ -331,13 +375,18 @@ const WorkspaceImage: React.FC<{
 export interface MarkdownContentProps {
   content: string;
   chatId?: string;
+  messageStatus?: MessageRecord['status'];
   onOpenArtifact?: (artifact: ArtifactRecord) => void;
   onResolveError?: (message: string) => void;
 }
 
 export const MarkdownContent: React.FC<MarkdownContentProps> = React.memo(
-  ({ content, chatId, onOpenArtifact, onResolveError }) => {
+  ({ content, chatId, messageStatus, onOpenArtifact, onResolveError }) => {
     const handleWorkspaceHref = async (href: string) => {
+      if (!href.trim()) {
+        onResolveError?.('参照されたファイルパスが空のため開けませんでした。');
+        return;
+      }
       if (!chatId || !onOpenArtifact) return;
       try {
         const res = await api.resolveLink(chatId, href);
@@ -350,6 +399,7 @@ export const MarkdownContent: React.FC<MarkdownContentProps> = React.memo(
     return (
       <div className="md-body">
         <ReactMarkdown
+          urlTransform={markdownUrlTransform}
           remarkPlugins={[remarkGfm, remarkMath]}
           rehypePlugins={[rehypeKatex]}
           components={{
@@ -377,7 +427,7 @@ export const MarkdownContent: React.FC<MarkdownContentProps> = React.memo(
             table: ({ children }) => <CopyableTable>{children}</CopyableTable>,
             blockquote: ({ children }) => <CopyableBlockquote>{children}</CopyableBlockquote>,
             a: ({ href, children }) => {
-              const rawHref = href ?? '';
+              const rawHref = (href ?? '').trim();
               const isExternal = /^https?:\/\/|^mailto:/i.test(rawHref);
               if (isExternal) {
                 return (
@@ -391,7 +441,7 @@ export const MarkdownContent: React.FC<MarkdownContentProps> = React.memo(
                   type="button"
                   className="md-link workspace-file-link"
                   onClick={() => void handleWorkspaceHref(rawHref)}
-                  title={`ワークスペース内のファイルをプレビュー: ${rawHref}`}
+                  title={rawHref ? `ファイルをプレビュー: ${rawHref}` : '空のリンク'}
                 >
                   {children}
                 </button>
@@ -402,6 +452,7 @@ export const MarkdownContent: React.FC<MarkdownContentProps> = React.memo(
                 chatId={chatId}
                 src={src ?? ''}
                 alt={alt}
+                messageStatus={messageStatus}
                 onOpenArtifact={onOpenArtifact}
               />
             ),

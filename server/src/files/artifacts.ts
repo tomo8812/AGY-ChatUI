@@ -40,6 +40,7 @@ export function captureWorkspaceSnapshot(workspaceDir: string): WorkspaceSnapsho
   const walk = (dir: string, prefix = '') => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       if (entry.name === '.git' || entry.name === 'node_modules') continue;
+      if (prefix === '' && (entry.name === '.agents' || entry.name === '.agent')) continue;
       if (entry.isSymbolicLink()) continue;
       const full = path.join(dir, entry.name);
       const real = fs.realpathSync(full);

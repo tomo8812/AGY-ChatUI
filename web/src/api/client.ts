@@ -14,6 +14,9 @@ import type {
   QuotaSnapshotRecord,
   RunRecord,
   SandboxStatus,
+  SkillDetail,
+  SkillScope,
+  SkillsListResponse,
   UserPreferences,
   WebUser,
   WorkspaceFileEntry,
@@ -116,7 +119,12 @@ export const api = {
     patch: Partial<
       Pick<
         UserPreferences,
-        'theme' | 'autoApproveSafeReads' | 'notifyOnResponse' | 'defaultModelId' | 'defaultEffortValue'
+        | 'theme'
+        | 'autoApproveSafeReads'
+        | 'notifyOnResponse'
+        | 'hapticFeedback'
+        | 'defaultModelId'
+        | 'defaultEffortValue'
       >
     >
   ) =>
@@ -261,6 +269,145 @@ export const api = {
       { method: 'POST', body: { projectId } }
     ),
 
+  // Agent Skills
+  listSkills: (params?: { projectId?: string | null; chatId?: string | null }) => {
+    const qs = new URLSearchParams();
+    if (params?.projectId) qs.set('projectId', params.projectId);
+    if (params?.chatId) qs.set('chatId', params.chatId);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    return apiFetch<SkillsListResponse>(`/api/skills${suffix}`);
+  },
+
+  getSkill: (scope: SkillScope, slug: string, params?: { projectId?: string | null; chatId?: string | null }) => {
+    const qs = new URLSearchParams();
+    if (params?.projectId) qs.set('projectId', params.projectId);
+    if (params?.chatId) qs.set('chatId', params.chatId);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    return apiFetch<{ skill: SkillDetail }>(
+      `/api/skills/${encodeURIComponent(scope)}/${encodeURIComponent(slug)}${suffix}`
+    );
+  },
+
+  createSkill: (payload: {
+    scope: SkillScope;
+    projectId?: string | null;
+    chatId?: string | null;
+    slug: string;
+    name?: string;
+    description?: string;
+    instructions?: string;
+    rawSkillMd?: string;
+    disableModelInvocation?: boolean;
+    enabled?: boolean;
+  }) =>
+    apiFetch<{ skill: SkillDetail }>('/api/skills', { method: 'POST', body: payload }),
+
+  saveSkill: (
+    scope: SkillScope,
+    slug: string,
+    payload: {
+      projectId?: string | null;
+      chatId?: string | null;
+      name?: string;
+      description?: string;
+      instructions?: string;
+      rawSkillMd?: string;
+      disableModelInvocation?: boolean;
+      enabled?: boolean;
+    }
+  ) =>
+    apiFetch<{ skill: SkillDetail }>(
+      `/api/skills/${encodeURIComponent(scope)}/${encodeURIComponent(slug)}`,
+      { method: 'PUT', body: payload }
+    ),
+
+  toggleSkill: (
+    scope: SkillScope,
+    slug: string,
+    enabled: boolean,
+    params?: { projectId?: string | null; chatId?: string | null }
+  ) =>
+    apiFetch<{ skill: SkillDetail }>(
+      `/api/skills/${encodeURIComponent(scope)}/${encodeURIComponent(slug)}`,
+      {
+        method: 'PUT',
+        body: {
+          enabled,
+          projectId: params?.projectId ?? null,
+          chatId: params?.chatId ?? null,
+        },
+      }
+    ),
+
+  deleteSkill: (scope: SkillScope, slug: string, params?: { projectId?: string | null; chatId?: string | null }) => {
+    const qs = new URLSearchParams();
+    if (params?.projectId) qs.set('projectId', params.projectId);
+    if (params?.chatId) qs.set('chatId', params.chatId);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    return apiFetch<{ ok: boolean }>(
+      `/api/skills/${encodeURIComponent(scope)}/${encodeURIComponent(slug)}${suffix}`,
+      { method: 'DELETE' }
+    );
+  },
+
+  uploadSkillFiles: (
+    scope: SkillScope,
+    slug: string,
+    files: File[],
+    params?: { projectId?: string | null; chatId?: string | null; folder?: string }
+  ) => {
+    const fd = new FormData();
+    for (const f of files) fd.append('files', f, f.name);
+    const qs = new URLSearchParams();
+    if (params?.projectId) qs.set('projectId', params.projectId);
+    if (params?.chatId) qs.set('chatId', params.chatId);
+    if (params?.folder) qs.set('folder', params.folder);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    return apiFetch<{ skill: SkillDetail }>(
+      `/api/skills/${encodeURIComponent(scope)}/${encodeURIComponent(slug)}/files${suffix}`,
+      { method: 'POST', formData: fd }
+    );
+  },
+
+  saveSkillTextFile: (
+    scope: SkillScope,
+    slug: string,
+    payload: { relPath: string; content: string; projectId?: string | null; chatId?: string | null }
+  ) =>
+    apiFetch<{ skill: SkillDetail }>(
+      `/api/skills/${encodeURIComponent(scope)}/${encodeURIComponent(slug)}/files`,
+      { method: 'POST', body: payload }
+    ),
+
+  readSkillFile: (
+    scope: SkillScope,
+    slug: string,
+    filePath: string,
+    params?: { projectId?: string | null; chatId?: string | null }
+  ) => {
+    const qs = new URLSearchParams({ path: filePath });
+    if (params?.projectId) qs.set('projectId', params.projectId);
+    if (params?.chatId) qs.set('chatId', params.chatId);
+    return apiFetch<{ relPath: string; content: string }>(
+      `/api/skills/${encodeURIComponent(scope)}/${encodeURIComponent(slug)}/files?${qs.toString()}`
+    );
+  },
+
+  deleteSkillFile: (
+    scope: SkillScope,
+    slug: string,
+    filePath: string,
+    params?: { projectId?: string | null; chatId?: string | null }
+  ) => {
+    const qs = new URLSearchParams({ path: filePath });
+    if (params?.projectId) qs.set('projectId', params.projectId);
+    if (params?.chatId) qs.set('chatId', params.chatId);
+    return apiFetch<{ skill: SkillDetail }>(
+      `/api/skills/${encodeURIComponent(scope)}/${encodeURIComponent(slug)}/files?${qs.toString()}`,
+      { method: 'DELETE' }
+    );
+  },
+
   // Health & version detection
   getHealth: () =>
     apiFetch<{ ok: boolean; agyMode: 'real' | 'mock'; buildId?: string; uptimeSec: number }>('/api/health'),
@@ -274,10 +421,13 @@ export const api = {
   // Quota
   getQuota: () => apiFetch<{ quota: QuotaSnapshotRecord }>('/api/quota'),
 
-  refreshQuota: (auto = false) =>
+  refreshQuota: (auto = false, minAgeMs?: number) =>
     apiFetch<{ quota: QuotaSnapshotRecord }>('/api/quota/refresh', {
       method: 'POST',
-      body: auto ? { auto: true } : {},
+      body: {
+        ...(auto ? { auto: true } : {}),
+        ...(minAgeMs !== undefined ? { minAgeMs } : {}),
+      },
     }),
 
   // Web Push Notifications

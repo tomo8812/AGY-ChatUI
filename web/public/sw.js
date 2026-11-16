@@ -1,4 +1,4 @@
-const CACHE_NAME = 'antigravity-chat-shell-v3';
+const CACHE_NAME = 'antigravity-chat-shell-v4';
 const SHELL_ASSETS = ['/manifest.webmanifest', '/icon.svg'];
 
 self.addEventListener('install', (event) => {
@@ -63,6 +63,7 @@ self.addEventListener('push', (event) => {
       badge: '/icon.svg',
       tag,
       renotify: true,
+      ...(Array.isArray(data.vibrate) ? { vibrate: data.vibrate } : {}),
       data: { chatId, url },
     })
   );

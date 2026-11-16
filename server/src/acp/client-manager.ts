@@ -10,6 +10,7 @@ import {
   ndJsonStream,
   PROTOCOL_VERSION,
   RequestError,
+  type AvailableCommand,
   type ClientConnection,
   type ContentBlock,
   type InitializeResponse,
@@ -26,17 +27,74 @@ import type { AppConfig } from '../config.js';
 import type { AppDatabase } from '../db/database.js';
 import { decryptSmallSecret } from '../auth/password.js';
 import { captureWorkspaceSnapshot, syncWorkspaceChangesAsArtifacts } from '../files/artifacts.js';
+import {
+  extractCandidatePathsFromText,
+  extractCandidatePathsFromToolCalls,
+  importAuthorizedBrainFileToWorkspace,
+  resolveAuthorizedBrainFile,
+} from '../files/link-resolver.js';
 import { resolveContainedExistingPath, resolveContainedWriteTarget } from '../files/workspace.js';
 import type { SyncHub } from '../sync/hub.js';
 import type {
   AcpConfigOption,
   AcpSelectOption,
   AttachmentRef,
+  AvailableCommandItem,
   ChatRecord,
   PendingPermissionRecord,
   ToolCallItem,
 } from '../types.js';
+import type { SkillService } from '../skills/skill-service.js';
 import { buildAgyCommandSpec, probeBwrapSandbox } from './env-isolation.js';
+
+function captureWorkspaceSkillsSignature(workspaceDir: string): string {
+  const roots = [
+    path.join(workspaceDir, '.agents', 'skills'),
+    path.join(workspaceDir, '.agent', 'skills'),
+  ];
+  const parts: string[] = [];
+  for (const root of roots) {
+    if (!fs.existsSync(root)) continue;
+    try {
+      const entries = fs.readdirSync(root, { withFileTypes: true });
+      entries.sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of entries) {
+        if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+        const skillMd = path.join(root, entry.name, 'SKILL.md');
+        if (fs.existsSync(skillMd)) {
+          const st = fs.statSync(skillMd);
+          parts.push(`${root}:${entry.name}:${st.size}:${Math.floor(st.mtimeMs)}`);
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return parts.join('|');
+}
+
+export function mapAcpAvailableCommands(raw: unknown): AvailableCommandItem[] {
+  if (!Array.isArray(raw)) return [];
+  const out: AvailableCommandItem[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue;
+    const item = entry as AvailableCommand;
+    const name = typeof item.name === 'string' ? item.name.trim().replace(/^\//, '') : '';
+    if (!name) continue;
+    const description = typeof item.description === 'string' ? item.description.trim() : '';
+    const inputHint =
+      item.input && typeof item.input === 'object' && typeof item.input.hint === 'string'
+        ? item.input.hint
+        : null;
+    out.push({
+      name,
+      description: description || name,
+      ...(inputHint ? { inputHint } : {}),
+      source: 'acp',
+    });
+  }
+  return out;
+}
 
 export function toHostWorkspacePath(
   workerWorkspaceDir: string,
@@ -69,9 +127,13 @@ export interface ParsedSessionOptions {
   effortOptionId: string | null;
   currentModelId: string | null;
   currentEffortValue: string | null;
+  availableCommands?: AvailableCommandItem[];
 }
 
-export function normalizeConfigOptions(rawList: SessionConfigOption[] | null | undefined): ParsedSessionOptions {
+export function normalizeConfigOptions(
+  rawList: SessionConfigOption[] | null | undefined,
+  availableCommands?: AvailableCommandItem[]
+): ParsedSessionOptions {
   const normalized: AcpConfigOption[] = [];
   if (Array.isArray(rawList)) {
     for (const item of rawList) {
@@ -120,6 +182,7 @@ export function normalizeConfigOptions(rawList: SessionConfigOption[] | null | u
     effortOptionId: effortOpt?.id ?? null,
     currentModelId: modelOpt?.currentValue ?? null,
     currentEffortValue: effortOpt?.currentValue ?? null,
+    ...(availableCommands ? { availableCommands } : {}),
   };
 }
 
@@ -167,7 +230,8 @@ export class AcpClientManager {
   constructor(
     private readonly config: AppConfig,
     private readonly db: AppDatabase,
-    private readonly hub: SyncHub
+    private readonly hub: SyncHub,
+    private readonly skillService?: SkillService
   ) {
     this.cleanupTimer = setInterval(() => this.evictIdleWorkers(), 30_000);
     this.cleanupTimer.unref();
@@ -192,13 +256,66 @@ export class AcpClientManager {
     await Promise.allSettled(keys.map((k) => this.stopWorkerByKey(k)));
   }
 
+  async stopIdleWorkersForUser(userId: string): Promise<void> {
+    this.invalidateUserOptionsCache(userId);
+    const keys = [...this.workers.values()]
+      .filter((w) => w.userId === userId && !w.inFlight)
+      .map((w) => w.key);
+    await Promise.allSettled(keys.map((k) => this.stopWorkerByKey(k)));
+  }
+
   async stopChatWorker(userId: string, chatId: string): Promise<void> {
     await this.stopWorkerByKey(`${userId}:${chatId}`);
   }
 
+  async stopChatWorkerIfIdle(userId: string, chatId: string): Promise<boolean> {
+    const key = `${userId}:${chatId}`;
+    const w = this.workers.get(key);
+    if (!w) return true;
+    if (w.inFlight) return false;
+    await this.stopWorkerByKey(key);
+    return true;
+  }
+
+  private mergeAvailableCommands(
+    userId: string,
+    acpCommands: AvailableCommandItem[] | undefined,
+    ctx: { projectId?: string | null; chatId?: string | null }
+  ): AvailableCommandItem[] {
+    const skillCommands = this.skillService
+      ? this.skillService.listAvailableSkillCommands(userId, ctx)
+      : [];
+    const byName = new Map<string, AvailableCommandItem>();
+
+    for (const cmd of acpCommands ?? []) {
+      byName.set(cmd.name.toLowerCase(), cmd);
+    }
+    for (const sk of skillCommands) {
+      byName.set(sk.name.toLowerCase(), sk);
+    }
+    return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  private enrichParsedOptions(
+    userId: string,
+    parsed: ParsedSessionOptions,
+    ctx: { projectId?: string | null; chatId?: string | null },
+    acpCommandsOverride?: AvailableCommandItem[]
+  ): ParsedSessionOptions {
+    const baseCommands =
+      acpCommandsOverride ??
+      (parsed.availableCommands ?? []).filter((c) => c.source !== 'skill');
+    const merged = this.mergeAvailableCommands(userId, baseCommands, ctx);
+    return {
+      ...parsed,
+      availableCommands: merged,
+    };
+  }
+
   async getOrProbeUserOptions(
     userId: string,
-    desiredModelId: string | null = null
+    desiredModelId: string | null = null,
+    ctx: { projectId?: string | null; chatId?: string | null } = {}
   ): Promise<ParsedSessionOptions | null> {
     const profile = this.db.getAgyProfile(userId);
     if (!profile || profile.authStatus !== 'authenticated') {
@@ -213,31 +330,37 @@ export class AcpClientManager {
         (!desiredModelId || worker.parsedOptions.currentModelId === desiredModelId)
       ) {
         this.cacheUserOptions(userId, worker.parsedOptions);
-        return worker.parsedOptions;
+        return this.enrichParsedOptions(userId, worker.parsedOptions, ctx);
       }
     }
 
     const cacheKey = `${userId}:${desiredModelId ?? ''}`;
     const cached = this.userOptionsCache.get(cacheKey);
     if (cached && Date.now() - cached.cachedAt < 15 * 60 * 1000) {
-      return cached.options;
+      return this.enrichParsedOptions(userId, cached.options, ctx);
     }
 
     const inFlight = this.userOptionProbes.get(cacheKey);
-    if (inFlight) return inFlight;
+    if (inFlight) {
+      const res = await inFlight;
+      return res ? this.enrichParsedOptions(userId, res, ctx) : null;
+    }
 
     const promise = this.probeUserOptionsOnce(userId, profile.profileDir, desiredModelId).finally(() => {
       this.userOptionProbes.delete(cacheKey);
     });
     this.userOptionProbes.set(cacheKey, promise);
-    return promise;
+    const res = await promise;
+    return res ? this.enrichParsedOptions(userId, res, ctx) : null;
   }
 
   private cacheUserOptions(userId: string, options: ParsedSessionOptions): void {
     const now = Date.now();
-    this.userOptionsCache.set(`${userId}:`, { options, cachedAt: now });
+    const acpOnly = (options.availableCommands ?? []).filter((c) => c.source !== 'skill');
+    const baseOptions: ParsedSessionOptions = { ...options, availableCommands: acpOnly };
+    this.userOptionsCache.set(`${userId}:`, { options: baseOptions, cachedAt: now });
     if (options.currentModelId) {
-      this.userOptionsCache.set(`${userId}:${options.currentModelId}`, { options, cachedAt: now });
+      this.userOptionsCache.set(`${userId}:${options.currentModelId}`, { options: baseOptions, cachedAt: now });
     }
   }
 
@@ -265,7 +388,15 @@ export class AcpClientManager {
     });
 
     try {
-      const app = client({ name: 'antigravity-chat-options-probe' });
+      let capturedCommands: AvailableCommandItem[] = [];
+      const app = client({ name: 'antigravity-chat-options-probe' }).onNotification(
+        methods.client.session.update,
+        async ({ params }) => {
+          if (params.update.sessionUpdate === 'available_commands_update') {
+            capturedCommands = mapAcpAvailableCommands(params.update.availableCommands);
+          }
+        }
+      );
       const stream = ndJsonStream(
         Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>,
         Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>
@@ -284,7 +415,7 @@ export class AcpClientManager {
         cwd: tempProbeCwd,
         mcpServers: [],
       })) as NewSessionResponse;
-      let parsed = normalizeConfigOptions(created.configOptions);
+      let parsed = normalizeConfigOptions(created.configOptions, capturedCommands);
 
       if (desiredModelId && parsed.modelOptionId && parsed.currentModelId !== desiredModelId) {
         const updated = await conn.agent
@@ -295,7 +426,7 @@ export class AcpClientManager {
           })
           .catch(() => null);
         if (updated) {
-          parsed = normalizeConfigOptions(updated.configOptions);
+          parsed = normalizeConfigOptions(updated.configOptions, capturedCommands);
         }
       }
 
@@ -308,7 +439,7 @@ export class AcpClientManager {
         this.userOptionsCache.set(`${userId}:${desiredModelId ?? ''}`, { options: parsed, cachedAt: Date.now() });
         this.cacheUserOptions(userId, parsed);
       }
-      return parsed;
+      return this.enrichParsedOptions(userId, parsed, {}, capturedCommands);
     } catch {
       return null;
     } finally {
@@ -429,11 +560,17 @@ export class AcpClientManager {
   }
 
   async ensureSessionOptions(userId: string, chatId: string): Promise<ParsedSessionOptions> {
+    const chat = this.db.getChat(userId, chatId);
     const worker = await this.getOrStartWorker(userId, chatId);
     if (worker.parsedOptions.configOptions.length > 0) {
       this.cacheUserOptions(userId, worker.parsedOptions);
     }
-    return worker.parsedOptions;
+    const enriched = this.enrichParsedOptions(userId, worker.parsedOptions, {
+      projectId: chat?.projectId ?? null,
+      chatId,
+    });
+    worker.parsedOptions = enriched;
+    return enriched;
   }
 
   async setChatConfig(
@@ -448,21 +585,37 @@ export class AcpClientManager {
     if (!worker.acpSessionId) throw new Error('ACP session not initialized');
 
     if (patch.modelId && worker.parsedOptions.modelOptionId) {
+      const prevAcpCommands = (worker.parsedOptions.availableCommands ?? []).filter(
+        (c) => c.source !== 'skill'
+      );
       const res = await worker.conn.agent.request(methods.agent.session.setConfigOption, {
         sessionId: worker.acpSessionId,
         configId: worker.parsedOptions.modelOptionId,
         value: patch.modelId,
       });
-      worker.parsedOptions = normalizeConfigOptions(res.configOptions);
+      worker.parsedOptions = this.enrichParsedOptions(
+        userId,
+        normalizeConfigOptions(res.configOptions),
+        { projectId: chat.projectId, chatId },
+        prevAcpCommands
+      );
     }
 
     if (patch.effortValue && worker.parsedOptions.effortOptionId) {
+      const prevAcpCommands = (worker.parsedOptions.availableCommands ?? []).filter(
+        (c) => c.source !== 'skill'
+      );
       const res = await worker.conn.agent.request(methods.agent.session.setConfigOption, {
         sessionId: worker.acpSessionId,
         configId: worker.parsedOptions.effortOptionId,
         value: patch.effortValue,
       });
-      worker.parsedOptions = normalizeConfigOptions(res.configOptions);
+      worker.parsedOptions = this.enrichParsedOptions(
+        userId,
+        normalizeConfigOptions(res.configOptions),
+        { projectId: chat.projectId, chatId },
+        prevAcpCommands
+      );
     }
 
     if (worker.parsedOptions.configOptions.length > 0) {
@@ -566,6 +719,10 @@ export class AcpClientManager {
     const chat = this.db.getChat(params.userId, params.chatId);
     if (!chat) throw new Error('Chat not found');
 
+    if (chat.projectId && this.skillService) {
+      this.skillService.syncProjectSkillsToChat(params.userId, chat.projectId, chat.workspaceDir);
+    }
+
     const worker = await this.getOrStartWorker(params.userId, params.chatId);
     if (worker.userId !== params.userId || !worker.acpSessionId) {
       throw new Error('ACP session mismatch or unavailable');
@@ -582,6 +739,7 @@ export class AcpClientManager {
       }).catch(() => {});
     }
 
+    const beforeSkillsSig = captureWorkspaceSkillsSignature(chat.workspaceDir);
     const beforeSnap = captureWorkspaceSnapshot(chat.workspaceDir);
     const bridge: ActiveTurnBridge = {
       runId: params.runId,
@@ -670,12 +828,37 @@ export class AcpClientManager {
         prompt: promptBlocks,
       });
 
-      // Collect tool-referenced locations as hint paths
+      // Collect tool-referenced locations and any authorized profile brain assets mentioned by the agent
       const hintPaths: string[] = [];
+      const candidatePaths = new Set<string>();
       for (const tc of bridge.toolCalls) {
         for (const loc of tc.locations ?? []) {
+          candidatePaths.add(loc.path);
           const hostHint = toHostWorkspacePath(worker.workspaceDir, worker.sandboxWorkspaceRoot, loc.path);
           if (hostHint) hintPaths.push(hostHint);
+        }
+      }
+      for (const extracted of extractCandidatePathsFromToolCalls(bridge.toolCalls)) {
+        candidatePaths.add(extracted);
+      }
+      for (const extracted of extractCandidatePathsFromText(bridge.contentText)) {
+        candidatePaths.add(extracted);
+      }
+
+      for (const candidatePath of candidatePaths) {
+        const brainFile = resolveAuthorizedBrainFile({
+          profileDir: worker.profileDir,
+          candidatePath,
+        });
+        if (!brainFile) continue;
+        try {
+          const imported = importAuthorizedBrainFileToWorkspace({
+            workspaceDir: chat.workspaceDir,
+            sourceAbsPath: brainFile.absPath,
+          });
+          hintPaths.push(imported.relPath);
+        } catch {
+          // ignore unreadable brain asset
         }
       }
 
@@ -716,6 +899,35 @@ export class AcpClientManager {
         runId: params.runId,
         payload: { message: updatedMsg },
       });
+
+      const afterSkillsSig = captureWorkspaceSkillsSignature(chat.workspaceDir);
+      if (afterSkillsSig !== beforeSkillsSig && this.skillService) {
+        const refreshed = this.enrichParsedOptions(params.userId, worker.parsedOptions, {
+          projectId: chat.projectId,
+          chatId: params.chatId,
+        });
+        worker.parsedOptions = refreshed;
+        this.hub.emitDurable({
+          userId: params.userId,
+          type: 'skills.updated',
+          projectId: chat.projectId,
+          chatId: params.chatId,
+          payload: {
+            scope: 'workspace',
+            projectId: chat.projectId,
+            chatId: params.chatId,
+          },
+        });
+        this.hub.emitDurable({
+          userId: params.userId,
+          type: 'chat.commands_updated',
+          chatId: params.chatId,
+          payload: {
+            availableCommands: refreshed.availableCommands ?? [],
+            sessionOptions: refreshed,
+          },
+        });
+      }
 
       return { stopReason: response.stopReason };
     } catch (err) {
@@ -769,6 +981,9 @@ export class AcpClientManager {
     this.evictOneIdleIfFull();
 
     fs.mkdirSync(chat.workspaceDir, { recursive: true, mode: 0o700 });
+    if (chat.projectId && this.skillService) {
+      this.skillService.syncProjectSkillsToChat(userId, chat.projectId, chat.workspaceDir);
+    }
     const sandboxStatus = probeBwrapSandbox(this.config);
     if (this.config.agyMode === 'real' && this.config.sandboxMode === 'strict' && !sandboxStatus.active) {
       throw new Error(
@@ -803,6 +1018,8 @@ export class AcpClientManager {
     });
 
     let workerRef: WorkerInstance | null = null;
+    let earlyAvailableCommands: AvailableCommandItem[] | undefined;
+    let earlyConfigOptions: SessionConfigOption[] | undefined;
 
     const acpClientApp = client({ name: 'antigravity-chat-ui' })
       .onRequest(methods.client.fs.readTextFile, async ({ params }) => {
@@ -917,7 +1134,14 @@ export class AcpClientManager {
         });
       })
       .onNotification(methods.client.session.update, async ({ params }) => {
-        if (!workerRef) return;
+        if (!workerRef) {
+          if (params.update.sessionUpdate === 'available_commands_update') {
+            earlyAvailableCommands = mapAcpAvailableCommands(params.update.availableCommands);
+          } else if (params.update.sessionUpdate === 'config_option_update') {
+            earlyConfigOptions = params.update.configOptions;
+          }
+          return;
+        }
         this.handleSessionNotification(workerRef, params);
       });
 
@@ -985,7 +1209,10 @@ export class AcpClientManager {
           })) as LoadSessionResponse | undefined;
           acpSessionId = chat.acpSessionId;
           restoredExistingSession = true;
-          parsedOptions = normalizeConfigOptions(loadRes?.configOptions);
+          parsedOptions = normalizeConfigOptions(
+            loadRes?.configOptions ?? earlyConfigOptions,
+            earlyAvailableCommands
+          );
         } else if (init.agentCapabilities?.sessionCapabilities?.resume) {
           const resumeRes = (await conn.agent.request(methods.agent.session.resume, {
             sessionId: chat.acpSessionId,
@@ -995,7 +1222,10 @@ export class AcpClientManager {
           })) as ResumeSessionResponse | undefined;
           acpSessionId = chat.acpSessionId;
           restoredExistingSession = true;
-          parsedOptions = normalizeConfigOptions(resumeRes?.configOptions);
+          parsedOptions = normalizeConfigOptions(
+            resumeRes?.configOptions ?? earlyConfigOptions,
+            earlyAvailableCommands
+          );
         }
       } catch {
         acpSessionId = null;
@@ -1010,7 +1240,10 @@ export class AcpClientManager {
           ...(systemPromptPayload ? { systemPrompt: systemPromptPayload } : {}),
         })) as NewSessionResponse;
         acpSessionId = newRes.sessionId;
-        parsedOptions = normalizeConfigOptions(newRes.configOptions);
+        parsedOptions = normalizeConfigOptions(
+          newRes.configOptions ?? earlyConfigOptions,
+          earlyAvailableCommands
+        );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes('-32000') || /authentication required/i.test(msg)) {
@@ -1039,7 +1272,7 @@ export class AcpClientManager {
         })
         .catch(() => null);
       if (res) {
-        parsedOptions = normalizeConfigOptions(res.configOptions);
+        parsedOptions = normalizeConfigOptions(res.configOptions, earlyAvailableCommands);
       }
     }
 
@@ -1056,9 +1289,16 @@ export class AcpClientManager {
         })
         .catch(() => null);
       if (res) {
-        parsedOptions = normalizeConfigOptions(res.configOptions);
+        parsedOptions = normalizeConfigOptions(res.configOptions, earlyAvailableCommands);
       }
     }
+
+    parsedOptions = this.enrichParsedOptions(
+      userId,
+      parsedOptions,
+      { projectId: chat.projectId, chatId: chat.id },
+      earlyAvailableCommands
+    );
 
     this.db.updateChat(userId, chatId, {
       acpSessionId,
@@ -1097,12 +1337,42 @@ export class AcpClientManager {
     const turn = worker.activeTurn;
 
     if (update.sessionUpdate === 'config_option_update') {
-      worker.parsedOptions = normalizeConfigOptions(update.configOptions);
+      const chat = this.db.getChat(worker.userId, worker.chatId);
+      const prevAcpCommands = (worker.parsedOptions.availableCommands ?? []).filter(
+        (c) => c.source !== 'skill'
+      );
+      worker.parsedOptions = this.enrichParsedOptions(
+        worker.userId,
+        normalizeConfigOptions(update.configOptions),
+        { projectId: chat?.projectId ?? null, chatId: worker.chatId },
+        prevAcpCommands
+      );
       this.hub.emitDurable({
         userId: worker.userId,
         type: 'chat.config_updated',
         chatId: worker.chatId,
         payload: { sessionOptions: worker.parsedOptions },
+      });
+      return;
+    }
+
+    if (update.sessionUpdate === 'available_commands_update') {
+      const chat = this.db.getChat(worker.userId, worker.chatId);
+      const acpCmds = mapAcpAvailableCommands(update.availableCommands);
+      worker.parsedOptions = this.enrichParsedOptions(
+        worker.userId,
+        worker.parsedOptions,
+        { projectId: chat?.projectId ?? null, chatId: worker.chatId },
+        acpCmds
+      );
+      this.hub.emitDurable({
+        userId: worker.userId,
+        type: 'chat.commands_updated',
+        chatId: worker.chatId,
+        payload: {
+          availableCommands: worker.parsedOptions.availableCommands ?? [],
+          sessionOptions: worker.parsedOptions,
+        },
       });
       return;
     }

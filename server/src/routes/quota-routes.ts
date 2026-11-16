@@ -18,10 +18,20 @@ export async function registerQuotaRoutes(app: FastifyInstance, deps: QuotaRoute
   app.post('/api/quota/refresh', async (req, reply) => {
     const session = requireAuth(req, reply, db);
     if (!session) return;
-    const query = (req.query ?? {}) as { auto?: string };
-    const body = (req.body ?? {}) as { auto?: boolean };
+    const query = (req.query ?? {}) as { auto?: string; minAgeMs?: string };
+    const body = (req.body ?? {}) as { auto?: boolean; minAgeMs?: number };
     const auto = query.auto === '1' || query.auto === 'true' || body.auto === true;
-    const quota = await quotaService.refreshOnDemand(session.user.id, { auto });
+    const rawMinAge =
+      typeof body.minAgeMs === 'number'
+        ? body.minAgeMs
+        : query.minAgeMs
+          ? Number(query.minAgeMs)
+          : undefined;
+    const minAgeMs =
+      typeof rawMinAge === 'number' && Number.isFinite(rawMinAge) && rawMinAge > 0
+        ? Math.max(5_000, Math.min(15 * 60 * 1000, Math.round(rawMinAge)))
+        : undefined;
+    const quota = await quotaService.refreshOnDemand(session.user.id, { auto, minAgeMs });
     return { quota };
   });
 }

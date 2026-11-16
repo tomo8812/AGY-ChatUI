@@ -5,6 +5,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AcpClientManager } from '../acp/client-manager.js';
 import type { ExecutionScheduler } from '../acp/scheduler.js';
+import type { SkillService } from '../skills/skill-service.js';
 import {
   detectMimeAndPreviewKind,
   resolveContainedWriteTarget,
@@ -18,6 +19,7 @@ import { requireAuth, type RouteDeps } from './auth-routes.js';
 export interface ChatRouteDeps extends RouteDeps {
   acp: AcpClientManager;
   scheduler: ExecutionScheduler;
+  skillService?: SkillService;
 }
 
 const createChatSchema = z.object({
@@ -46,7 +48,7 @@ const permissionActionSchema = z.object({
 });
 
 export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDeps): Promise<void> {
-  const { config, db, hub, acp, scheduler } = deps;
+  const { config, db, hub, acp, scheduler, skillService } = deps;
 
   const ensureAgyAuthenticated = (userId: string) => {
     const prof = db.getAgyProfile(userId);
@@ -124,6 +126,7 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
           relPaths: files.map((f) => f.relPath),
         });
       }
+      skillService?.syncProjectSkillsToChat(session.user.id, project.id, workspaceDir);
     }
 
     const prefs = db.getPreferences(session.user.id);
@@ -275,8 +278,9 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
       workspaceDir: chat.workspaceDir,
       relPaths: files.map((f) => f.relPath),
     });
+    skillService?.syncProjectSkillsToChat(session.user.id, project.id, chat.workspaceDir);
 
-    // Reset ACP worker so next turn loads refreshed project instructions if changed
+    // Reset ACP worker so next turn loads refreshed project instructions & skills if changed
     await acp.stopChatWorker(session.user.id, chatId);
 
     const updated = db.updateChat(session.user.id, chatId, {

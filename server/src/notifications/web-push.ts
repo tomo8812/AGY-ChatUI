@@ -10,6 +10,7 @@ export interface NotificationPayload {
   chatId?: string;
   runId?: string;
   url?: string;
+  vibrate?: number[];
 }
 
 interface StoredVapidKeys {
@@ -317,6 +318,9 @@ export class PushNotificationService {
     const chatTitle = chat?.title || 'Antigravity Chat';
     const cleanTitle = chatTitle.length > 60 ? `${chatTitle.slice(0, 59)}…` : chatTitle;
 
+    const vibrateComplete = prefs.hapticFeedback ? [14, 55, 16, 55, 42] : undefined;
+    const vibrateError = prefs.hapticFeedback ? [65, 65, 65, 65, 65] : undefined;
+
     const payload: NotificationPayload =
       params.status === 'error'
         ? {
@@ -326,6 +330,7 @@ export class PushNotificationService {
             chatId: params.chatId,
             runId: params.runId,
             url: `/?chatId=${encodeURIComponent(params.chatId)}`,
+            ...(vibrateError ? { vibrate: vibrateError } : {}),
           }
         : {
             title: cleanTitle,
@@ -334,6 +339,7 @@ export class PushNotificationService {
             chatId: params.chatId,
             runId: params.runId,
             url: `/?chatId=${encodeURIComponent(params.chatId)}`,
+            ...(vibrateComplete ? { vibrate: vibrateComplete } : {}),
           };
 
     await this.sendToUser(params.userId, payload);

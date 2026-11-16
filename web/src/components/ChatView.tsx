@@ -3,6 +3,7 @@ import { ApiError, api } from '../api/client';
 import type {
   ArtifactRecord,
   AttachmentRef,
+  AvailableCommandItem,
   ChatRecord,
   MessageRecord,
   ParsedSessionOptions,
@@ -11,6 +12,7 @@ import type {
   RunRecord,
   ToolCallItem,
 } from '../types';
+import { isAppleTouchHapticsFallback, triggerHaptic } from '../utils/haptics';
 import { EffortBar } from './EffortBar';
 import {
   CheckIcon,
@@ -23,6 +25,8 @@ import {
   RefreshIcon,
   SendIcon,
   ShieldIcon,
+  SlashIcon,
+  SparklesIcon,
   StopIcon,
 } from './Icons';
 import { MarkdownContent } from './MarkdownContent';
@@ -36,10 +40,12 @@ interface ChatViewProps {
   pendingPermissions: PendingPermissionRecord[];
   activeRun: RunRecord | null;
   sessionOptions: ParsedSessionOptions | null;
+  availableCommands?: AvailableCommandItem[];
   selectedModelId: string;
   selectedEffortValue: string;
   draftResetToken?: number;
   clientId: string;
+  hapticEnabled?: boolean;
   onChangeModel: (modelId: string) => void;
   onChangeEffort: (effortValue: string) => void;
   onDraftChange?: (hasDraft: boolean) => void;
@@ -49,6 +55,8 @@ interface ChatViewProps {
   onSyncProject: () => Promise<void>;
   onOpenArtifact: (artifact: ArtifactRecord) => void;
   onPermissionUpdated: (perm: PendingPermissionRecord) => void;
+  onOpenSkills?: () => void;
+  externalDraftCommand?: { slug: string; token: number } | null;
 }
 
 const ThoughtsAccordion: React.FC<{ text: string; streaming?: boolean }> = ({ text, streaming }) => {
@@ -211,10 +219,12 @@ export const ChatView: React.FC<ChatViewProps> = ({
   pendingPermissions,
   activeRun,
   sessionOptions,
+  availableCommands = [],
   selectedModelId,
   selectedEffortValue,
   draftResetToken = 0,
   clientId,
+  hapticEnabled = true,
   onChangeModel,
   onChangeEffort,
   onDraftChange,
@@ -224,6 +234,8 @@ export const ChatView: React.FC<ChatViewProps> = ({
   onSyncProject,
   onOpenArtifact,
   onPermissionUpdated,
+  onOpenSkills,
+  externalDraftCommand,
 }) => {
   const [inputText, setInputText] = useState('');
   const [stagedAttachments, setStagedAttachments] = useState<AttachmentRef[]>([]);
@@ -233,10 +245,14 @@ export const ChatView: React.FC<ChatViewProps> = ({
   const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
   const [uiNotice, setUiNotice] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  const [slashForceOpen, setSlashForceOpen] = useState(false);
+  const [slashDismissed, setSlashDismissed] = useState(false);
+  const [slashActiveIdx, setSlashActiveIdx] = useState(0);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const composerInnerRef = useRef<HTMLDivElement>(null);
 
   const artifactsById = React.useMemo(() => {
     const map = new Map<string, ArtifactRecord>();
@@ -251,6 +267,8 @@ export const ChatView: React.FC<ChatViewProps> = ({
     if (prev !== undefined && prev !== chat?.id) {
       setStagedAttachments([]);
       setUiNotice(null);
+      setSlashForceOpen(false);
+      setSlashDismissed(false);
     }
   }, [chat?.id]);
 
@@ -259,8 +277,25 @@ export const ChatView: React.FC<ChatViewProps> = ({
     setInputText('');
     setStagedAttachments([]);
     setUiNotice(null);
+    setSlashForceOpen(false);
+    setSlashDismissed(false);
     textareaRef.current?.focus();
   }, [draftResetToken]);
+
+  useEffect(() => {
+    if (!externalDraftCommand) return;
+    const prefix = `/${externalDraftCommand.slug} `;
+    setInputText((prev) => {
+      const trimmed = prev.trimStart();
+      if (!trimmed || trimmed.startsWith('/')) {
+        return prefix;
+      }
+      return `${prefix}${trimmed}`;
+    });
+    setSlashForceOpen(false);
+    setSlashDismissed(false);
+    window.setTimeout(() => textareaRef.current?.focus(), 30);
+  }, [externalDraftCommand?.token, externalDraftCommand?.slug]);
 
   useEffect(() => {
     onDraftChange?.(inputText.trim().length > 0 || stagedAttachments.length > 0);
@@ -279,6 +314,58 @@ export const ChatView: React.FC<ChatViewProps> = ({
     el.style.height = 'auto';
     el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
   }, [inputText]);
+
+  const slashMatch = /^\/([a-zA-Z0-9_-]*)$/.exec(inputText);
+  const slashQuery = slashMatch ? slashMatch[1].toLowerCase() : '';
+  const slashOpen = slashForceOpen || (Boolean(slashMatch) && !slashDismissed);
+
+  const filteredCommands = React.useMemo(() => {
+    if (!slashOpen) return [];
+    const list = [...availableCommands];
+    if (!slashQuery) return list;
+    return list
+      .filter(
+        (cmd) =>
+          cmd.name.toLowerCase().includes(slashQuery) ||
+          cmd.description.toLowerCase().includes(slashQuery)
+      )
+      .sort((a, b) => {
+        const aStarts = a.name.toLowerCase().startsWith(slashQuery) ? 0 : 1;
+        const bStarts = b.name.toLowerCase().startsWith(slashQuery) ? 0 : 1;
+        if (aStarts !== bStarts) return aStarts - bStarts;
+        return a.name.localeCompare(b.name);
+      });
+  }, [slashOpen, slashQuery, availableCommands]);
+
+  useEffect(() => {
+    setSlashActiveIdx(0);
+  }, [slashQuery, slashOpen]);
+
+  useEffect(() => {
+    if (!slashOpen) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if (composerInnerRef.current && !composerInnerRef.current.contains(e.target as Node)) {
+        setSlashForceOpen(false);
+        setSlashDismissed(true);
+      }
+    };
+    window.addEventListener('pointerdown', onPointerDown);
+    return () => window.removeEventListener('pointerdown', onPointerDown);
+  }, [slashOpen]);
+
+  const acceptSlashCommand = (cmd: AvailableCommandItem) => {
+    const token = `/${cmd.name} `;
+    setInputText((prev) => {
+      if (/^\/[a-zA-Z0-9_-]*$/.test(prev)) {
+        return token;
+      }
+      const cleaned = prev.trimStart();
+      return cleaned ? `${token}${cleaned}` : token;
+    });
+    setSlashForceOpen(false);
+    setSlashDismissed(false);
+    window.setTimeout(() => textareaRef.current?.focus(), 10);
+  };
 
   const modelOption = sessionOptions?.configOptions.find(
     (o) => o.id === sessionOptions.modelOptionId || o.category === 'model'
@@ -302,6 +389,8 @@ export const ChatView: React.FC<ChatViewProps> = ({
         activeRun.status === 'awaiting_permission')
   );
   const configBusy = sending || uploading || isRunBusy;
+  const canSend = !(sending || uploading || (!inputText.trim() && stagedAttachments.length === 0));
+  const useIosSwitchOverlay = isAppleTouchHapticsFallback() && hapticEnabled;
 
   const handleFilesSelected = async (files: File[]) => {
     if (files.length === 0) return;
@@ -328,6 +417,8 @@ export const ChatView: React.FC<ChatViewProps> = ({
     setUiNotice(null);
     setInputText('');
     setStagedAttachments([]);
+    setSlashForceOpen(false);
+    setSlashDismissed(false);
 
     try {
       await onSendPrompt(savedInput, toSendAttachments);
@@ -341,6 +432,41 @@ export const ChatView: React.FC<ChatViewProps> = ({
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (slashOpen) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setSlashForceOpen(false);
+        setSlashDismissed(true);
+        return;
+      }
+      if (filteredCommands.length > 0) {
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          setSlashActiveIdx((idx) => (idx + 1) % filteredCommands.length);
+          return;
+        }
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          setSlashActiveIdx((idx) => (idx - 1 + filteredCommands.length) % filteredCommands.length);
+          return;
+        }
+        if (e.key === 'Tab') {
+          e.preventDefault();
+          const chosen = filteredCommands[slashActiveIdx] ?? filteredCommands[0];
+          if (chosen) acceptSlashCommand(chosen);
+          return;
+        }
+        if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229) {
+          if (slashMatch) {
+            e.preventDefault();
+            const chosen = filteredCommands[slashActiveIdx] ?? filteredCommands[0];
+            if (chosen) acceptSlashCommand(chosen);
+            return;
+          }
+        }
+      }
+    }
+
     if (e.key !== 'Enter') return;
     if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     const isMobileTouch = 'ontouchstart' in window && window.innerWidth <= 860;
@@ -505,6 +631,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
                         <MarkdownContent
                           content={msg.contentText}
                           chatId={chat?.id}
+                          messageStatus={msg.status}
                           onOpenArtifact={onOpenArtifact}
                           onResolveError={(m) => setUiNotice(m)}
                         />
@@ -559,13 +686,89 @@ export const ChatView: React.FC<ChatViewProps> = ({
       </div>
 
       <div className="composer-dock">
-        <div className="composer-inner">
+        <div className="composer-inner" ref={composerInnerRef}>
           {uiNotice && (
             <div className="composer-notice">
               <span>{uiNotice}</span>
               <button type="button" className="icon-btn-sm" onClick={() => setUiNotice(null)}>
                 <CloseIcon size={14} />
               </button>
+            </div>
+          )}
+
+          {slashOpen && (
+            <div className="slash-palette" role="listbox" aria-label="スキル・スラッシュコマンド候補">
+              <div className="slash-palette-head">
+                <span className="row-actions">
+                  <SparklesIcon size={13} />
+                  <span>スキル / コマンド</span>
+                </span>
+                {onOpenSkills && (
+                  <button
+                    type="button"
+                    className="chip-btn"
+                    onClick={() => {
+                      setSlashForceOpen(false);
+                      setSlashDismissed(true);
+                      onOpenSkills();
+                    }}
+                  >
+                    スキル管理
+                  </button>
+                )}
+              </div>
+              {filteredCommands.length === 0 ? (
+                <div className="slash-palette-empty">
+                  <span>
+                    {availableCommands.length === 0
+                      ? '登録されたスキル・コマンドはまだありません'
+                      : '一致するコマンドが見つかりません'}
+                  </span>
+                  {onOpenSkills && (
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-xs"
+                      onClick={() => {
+                        setSlashForceOpen(false);
+                        setSlashDismissed(true);
+                        onOpenSkills();
+                      }}
+                    >
+                      スキルを作成・有効化
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <div className="slash-palette-list">
+                  {filteredCommands.map((cmd, idx) => (
+                    <button
+                      key={`${cmd.name}-${cmd.scope ?? cmd.source ?? 'cmd'}`}
+                      type="button"
+                      role="option"
+                      aria-selected={idx === slashActiveIdx}
+                      className={`slash-palette-item ${idx === slashActiveIdx ? 'active' : ''}`}
+                      onMouseEnter={() => setSlashActiveIdx(idx)}
+                      onClick={() => acceptSlashCommand(cmd)}
+                    >
+                      <div className="slash-item-top">
+                        <span className="slash-item-name">/{cmd.name}</span>
+                        <span className="slash-item-badge">
+                          {cmd.scope === 'global'
+                            ? 'グローバル'
+                            : cmd.scope === 'project'
+                              ? 'プロジェクト'
+                              : cmd.scope === 'workspace'
+                                ? 'このチャット'
+                                : 'ACP'}
+                        </span>
+                      </div>
+                      {cmd.description && (
+                        <div className="slash-item-desc">{cmd.description}</div>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
@@ -609,10 +812,13 @@ export const ChatView: React.FC<ChatViewProps> = ({
               ref={textareaRef}
               rows={1}
               value={inputText}
-              onChange={(e) => setInputText(e.target.value)}
+              onChange={(e) => {
+                setInputText(e.target.value);
+                setSlashDismissed(false);
+              }}
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
-              placeholder={uploading ? 'ファイルをアップロード中...' : 'Antigravity に聞く'}
+              placeholder={uploading ? 'ファイルをアップロード中...' : 'Antigravity に聞く（/ でスキル呼出）'}
               disabled={uploading}
             />
 
@@ -627,6 +833,20 @@ export const ChatView: React.FC<ChatViewProps> = ({
                   aria-label="ファイルを添付"
                 >
                   <PlusIcon size={19} />
+                </button>
+
+                <button
+                  type="button"
+                  className={`composer-icon-btn ${slashOpen ? 'active' : ''}`}
+                  onClick={() => {
+                    setSlashForceOpen((v) => !v);
+                    setSlashDismissed(false);
+                    textareaRef.current?.focus();
+                  }}
+                  title="スキル / スラッシュコマンド一覧"
+                  aria-label="スキル・コマンド一覧"
+                >
+                  <SlashIcon size={16} />
                 </button>
 
                 {modelOption && modelOption.options.length > 0 && (
@@ -650,24 +870,51 @@ export const ChatView: React.FC<ChatViewProps> = ({
                 )}
 
                 {isRunBusy && activeRun && (
-                  <button
-                    type="button"
-                    className="stop-btn"
-                    onClick={() => void onCancelRun(activeRun.id)}
-                    title="生成・キューを停止"
-                  >
-                    <StopIcon size={14} />
-                  </button>
+                  <div className="haptic-btn-shell">
+                    <button
+                      type="button"
+                      className="stop-btn"
+                      onClick={() => {
+                        triggerHaptic('stop', hapticEnabled);
+                        void onCancelRun(activeRun.id);
+                      }}
+                      title="生成・キューを停止"
+                    >
+                      <StopIcon size={14} />
+                    </button>
+                    {useIosSwitchOverlay && (
+                      <label className="ios-haptic-switch-overlay" title="生成・キューを停止">
+                        <input
+                          type="checkbox"
+                          {...({ switch: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
+                          aria-label="生成・キューを停止"
+                          onChange={() => void onCancelRun(activeRun.id)}
+                        />
+                      </label>
+                    )}
+                  </div>
                 )}
 
-                <button
-                  type="submit"
-                  className="send-btn"
-                  disabled={sending || uploading || (!inputText.trim() && stagedAttachments.length === 0)}
-                  title="送信"
-                >
-                  <SendIcon size={17} />
-                </button>
+                <div className="haptic-btn-shell">
+                  <button
+                    type="submit"
+                    className="send-btn"
+                    disabled={!canSend}
+                    title="送信"
+                  >
+                    <SendIcon size={17} />
+                  </button>
+                  {useIosSwitchOverlay && canSend && (
+                    <label className="ios-haptic-switch-overlay" title="送信">
+                      <input
+                        type="checkbox"
+                        {...({ switch: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
+                        aria-label="送信"
+                        onChange={() => void handleSubmit()}
+                      />
+                    </label>
+                  )}
+                </div>
               </div>
             </div>
           </form>

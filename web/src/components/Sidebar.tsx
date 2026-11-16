@@ -8,6 +8,7 @@ import {
   SearchIcon,
   SettingsIcon,
   ShieldIcon,
+  SparklesIcon,
   TrashIcon,
 } from './Icons';
 
@@ -18,12 +19,14 @@ interface SidebarProps {
   chats: ChatRecord[];
   projects: ProjectRecord[];
   activeChatId: string | null;
+  skillCount?: number;
   onCloseMobile: () => void;
   onNewChat: (projectId?: string | null) => void;
   onSelectChat: (chatId: string) => void;
   onRenameChat: (chatId: string, title: string) => void;
   onDeleteChat: (chatId: string) => void;
   onOpenProjectModal: (project: ProjectRecord | null) => void;
+  onOpenSkills: () => void;
   onOpenSettings: () => void;
 }
 
@@ -34,12 +37,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
   chats,
   projects,
   activeChatId,
+  skillCount = 0,
   onCloseMobile,
   onNewChat,
   onSelectChat,
   onRenameChat,
   onDeleteChat,
   onOpenProjectModal,
+  onOpenSkills,
   onOpenSettings,
 }) => {
   const [searchOpen, setSearchOpen] = useState(false);
@@ -148,6 +153,23 @@ export const Sidebar: React.FC<SidebarProps> = ({
         )}
 
         <div className="sidebar-scroll">
+          <div className="sidebar-section">
+            <button
+              type="button"
+              className="sidebar-nav-btn"
+              onClick={() => {
+                onOpenSkills();
+                onCloseMobile();
+              }}
+            >
+              <span className="sidebar-nav-left">
+                <SparklesIcon size={15} />
+                <span>スキル管理</span>
+              </span>
+              {skillCount > 0 && <span className="count-tag">{skillCount}</span>}
+            </button>
+          </div>
+
           <div className="sidebar-section">
             <div className="sidebar-section-head">
               <span>プロジェクト</span>

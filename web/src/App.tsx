@@ -12,7 +12,9 @@ import { HeaderBar } from './components/HeaderBar';
 import { ProjectModal } from './components/ProjectModal';
 import { SettingsModal } from './components/SettingsModal';
 import { Sidebar } from './components/Sidebar';
+import { SkillsModal } from './components/SkillsModal';
 import { WorkspaceDrawer } from './components/WorkspaceDrawer';
+import { triggerHaptic, VIBRATION_PATTERNS } from './utils/haptics';
 import {
   ensurePushSubscribed,
   getActivePushSubscription,
@@ -25,6 +27,7 @@ import type {
   AgyProfile,
   ArtifactRecord,
   AttachmentRef,
+  AvailableCommandItem,
   BootstrapResponse,
   ChatRecord,
   MessageRecord,
@@ -34,6 +37,7 @@ import type {
   QuotaSnapshotRecord,
   RunRecord,
   SandboxStatus,
+  SkillsListResponse,
   SyncEventEnvelope,
   ToolCallItem,
   UserPreferences,
@@ -109,6 +113,11 @@ export const App: React.FC = () => {
   const [sidebarMobileOpen, setSidebarMobileOpen] = useState(false);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [skillsOpen, setSkillsOpen] = useState(false);
+  const [skillsState, setSkillsState] = useState<SkillsListResponse | null>(null);
+  const [externalDraftCommand, setExternalDraftCommand] = useState<{ slug: string; token: number } | null>(
+    null
+  );
   const [projectModalTarget, setProjectModalTarget] = useState<ProjectRecord | null | undefined>(
     undefined
   );
@@ -124,8 +133,10 @@ export const App: React.FC = () => {
   activeRunRef.current = activeRun;
   const draftCreatedChatRef = useRef<ChatRecord | null>(null);
   draftCreatedChatRef.current = draftCreatedChat;
+  const effectiveProjectIdRef = useRef<string | null>(null);
   const skipNextLoadChatIdRef = useRef<string | null>(null);
   const localNotifiedRunsRef = useRef<Set<string>>(new Set());
+  const locallyCancelledRunIdsRef = useRef<Set<string>>(new Set());
 
   const initialBuildIdRef = useRef<string | null>(null);
   const lastHealthCheckRef = useRef<number>(0);
@@ -140,6 +151,7 @@ export const App: React.FC = () => {
 
   const wsRef = useRef<SyncSocketClient | null>(null);
   const resyncDebounceRef = useRef<number | null>(null);
+  const isReplayingHelloRef = useRef(false);
 
   const cleanupEmptyDraftChat = useCallback(() => {
     const draftChat = draftCreatedChatRef.current;
@@ -165,25 +177,37 @@ export const App: React.FC = () => {
     }
   }, []);
 
-  const triggerQuotaRefresh = useCallback(async (auto: boolean) => {
+  const triggerQuotaRefresh = useCallback(async (auto: boolean, minAgeMs = 5 * 60 * 1000) => {
     if (quotaRefreshingRef.current) return;
     if (auto) {
       const cur = quotaRef.current;
-      if (cur && cur.fetchedAt > 0 && cur.status === 'ok' && Date.now() - cur.fetchedAt < 5 * 60 * 1000) {
+      if (cur && cur.fetchedAt > 0 && cur.status === 'ok' && Date.now() - cur.fetchedAt < minAgeMs) {
         return;
       }
     }
     quotaRefreshingRef.current = true;
-    if (!auto) setQuotaRefreshing(true);
+    setQuotaRefreshing(true);
     try {
-      const res = await api.refreshQuota(auto);
+      const res = await api.refreshQuota(auto, auto ? minAgeMs : undefined);
       quotaRef.current = res.quota;
       setQuota(res.quota);
     } catch {
       // Ignore silent auto-refresh failures; manual errors can propagate only if needed
     } finally {
       quotaRefreshingRef.current = false;
-      if (!auto) setQuotaRefreshing(false);
+      setQuotaRefreshing(false);
+    }
+  }, []);
+
+  const loadSkillsList = useCallback(async (projectId?: string | null, chatId?: string | null) => {
+    try {
+      const res = await api.listSkills({
+        projectId: projectId ?? null,
+        chatId: chatId ?? null,
+      });
+      setSkillsState(res);
+    } catch {
+      // ignore transient skill fetch failure
     }
   }, []);
 
@@ -199,9 +223,9 @@ export const App: React.FC = () => {
     setQuota(quotaRes.quota);
     if (
       agyAuthRef.current &&
-      (!quotaRes.quota.fetchedAt || Date.now() - quotaRes.quota.fetchedAt >= 10 * 60 * 1000)
+      (!quotaRes.quota.fetchedAt || Date.now() - quotaRes.quota.fetchedAt >= 10_000)
     ) {
-      void triggerQuotaRefresh(true);
+      void triggerQuotaRefresh(true, 10_000);
     }
   }, [triggerQuotaRefresh]);
 
@@ -217,6 +241,64 @@ export const App: React.FC = () => {
     setChats((prev) =>
       prev.map((c) => (c.id === chatId ? { ...detail.chat, activeRun: detail.activeRun } : c))
     );
+  }, []);
+
+  // Sync CSS --app-vh & data-keyboard-open with iPhone / mobile visualViewport
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    let baseHeight = Math.max(window.innerHeight, window.visualViewport?.height ?? 0);
+    let blurTimer: number | undefined;
+
+    const updateViewport = () => {
+      const vv = window.visualViewport;
+      const vvHeight = vv ? Math.round(vv.height) : window.innerHeight;
+      const activeEl = document.activeElement;
+      const isTextFocused =
+        activeEl instanceof HTMLElement &&
+        (activeEl.tagName === 'TEXTAREA' ||
+          (activeEl.tagName === 'INPUT' &&
+            !['checkbox', 'radio', 'file', 'button', 'submit', 'reset'].includes(
+              (activeEl as HTMLInputElement).type
+            )));
+      if (!isTextFocused) {
+        baseHeight = Math.max(window.innerHeight, vvHeight);
+      }
+      document.documentElement.style.setProperty('--app-vh', `${vvHeight}px`);
+      const heightDrop = Math.max(window.innerHeight - vvHeight, baseHeight - vvHeight);
+      const keyboardOpen = window.innerWidth <= 860 && (heightDrop > 120 || isTextFocused);
+      if (keyboardOpen) {
+        document.documentElement.dataset.keyboardOpen = 'true';
+        if (vv && vv.offsetTop > 0) {
+          window.scrollTo(0, 0);
+        }
+      } else {
+        delete document.documentElement.dataset.keyboardOpen;
+      }
+    };
+
+    const onFocusOut = () => {
+      if (blurTimer !== undefined) window.clearTimeout(blurTimer);
+      blurTimer = window.setTimeout(updateViewport, 60);
+    };
+
+    updateViewport();
+    const vv = window.visualViewport;
+    vv?.addEventListener('resize', updateViewport);
+    vv?.addEventListener('scroll', updateViewport);
+    window.addEventListener('resize', updateViewport);
+    window.addEventListener('focusin', updateViewport);
+    window.addEventListener('focusout', onFocusOut);
+
+    return () => {
+      if (blurTimer !== undefined) window.clearTimeout(blurTimer);
+      vv?.removeEventListener('resize', updateViewport);
+      vv?.removeEventListener('scroll', updateViewport);
+      window.removeEventListener('resize', updateViewport);
+      window.removeEventListener('focusin', updateViewport);
+      window.removeEventListener('focusout', onFocusOut);
+      document.documentElement.style.removeProperty('--app-vh');
+      delete document.documentElement.dataset.keyboardOpen;
+    };
   }, []);
 
   // Theme sync
@@ -393,7 +475,7 @@ export const App: React.FC = () => {
     void ensurePushSubscribed();
   }, [user?.id, preferences?.notifyOnResponse]);
 
-  // Probe default model/effort options for welcome screen & run low-frequency quota background refresh
+  // Probe default model/effort options for welcome screen & run balanced visible quota refresh
   const isAgyAuthenticated = agyProfile?.authStatus === 'authenticated';
   useEffect(() => {
     const justAuthenticated = !prevAgyAuthRef.current && isAgyAuthenticated;
@@ -414,24 +496,27 @@ export const App: React.FC = () => {
       })
       .catch(() => {});
 
-    if (justAuthenticated && quotaRef.current && quotaRef.current.status !== 'ok') {
-      void triggerQuotaRefresh(true);
+    if (justAuthenticated) {
+      void triggerQuotaRefresh(true, 10_000);
     }
 
-    const maybeRefreshQuota = () => {
+    const onVisibilityOrFocus = () => {
       if (document.visibilityState !== 'visible') return;
-      const cur = quotaRef.current;
-      if (cur && (!cur.fetchedAt || Date.now() - cur.fetchedAt >= 15 * 60 * 1000)) {
-        void triggerQuotaRefresh(true);
-      }
+      void triggerQuotaRefresh(true, 20_000);
     };
 
-    const interval = window.setInterval(maybeRefreshQuota, 5 * 60 * 1000);
-    document.addEventListener('visibilitychange', maybeRefreshQuota);
+    const interval = window.setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      void triggerQuotaRefresh(true, 55_000);
+    }, 60_000);
+
+    document.addEventListener('visibilitychange', onVisibilityOrFocus);
+    window.addEventListener('focus', onVisibilityOrFocus);
     return () => {
       active = false;
       clearInterval(interval);
-      document.removeEventListener('visibilitychange', maybeRefreshQuota);
+      document.removeEventListener('visibilitychange', onVisibilityOrFocus);
+      window.removeEventListener('focus', onVisibilityOrFocus);
     };
   }, [user?.id, isAgyAuthenticated, triggerQuotaRefresh]);
 
@@ -540,6 +625,22 @@ export const App: React.FC = () => {
         }
         break;
       }
+      case 'chat.commands_updated': {
+        const nextCmds = p.availableCommands as AvailableCommandItem[] | undefined;
+        const opts = p.sessionOptions as ParsedSessionOptions | undefined;
+        if (evt.chatId === curChatId) {
+          if (opts) {
+            setSessionOptions(opts);
+          } else if (nextCmds) {
+            setSessionOptions((prev) => (prev ? { ...prev, availableCommands: nextCmds } : prev));
+          }
+        }
+        break;
+      }
+      case 'skills.updated': {
+        void loadSkillsList(effectiveProjectIdRef.current, curChatId);
+        break;
+      }
       case 'chat.deleted': {
         const chatId = p.chatId as string | undefined;
         if (chatId) {
@@ -629,6 +730,28 @@ export const App: React.FC = () => {
             );
           }
         }
+
+        const hapticOn = Boolean(preferencesRef.current?.hapticFeedback ?? true);
+        const isForegroundLive =
+          !isReplayingHelloRef.current &&
+          document.visibilityState === 'visible' &&
+          Math.abs(Date.now() - evt.createdAt) < 60_000;
+
+        if (run) {
+          if (isForegroundLive) {
+            if (run.status === 'cancelled') {
+              if (!locallyCancelledRunIdsRef.current.has(run.id)) {
+                triggerHaptic('stop', hapticOn);
+              }
+            } else if (run.status === 'error') {
+              triggerHaptic('error', hapticOn);
+            } else {
+              triggerHaptic('complete', hapticOn);
+            }
+          }
+          locallyCancelledRunIdsRef.current.delete(run.id);
+        }
+
         if (
           run &&
           run.status !== 'cancelled' &&
@@ -652,6 +775,9 @@ export const App: React.FC = () => {
               ? run.errorMessage || '応答の生成中にエラーが発生しました。'
               : preview || '応答が完了しました。';
           const title = run.status === 'error' ? `エラーで終了 — ${chatTitle}` : chatTitle;
+          const vibrate = hapticOn
+            ? VIBRATION_PATTERNS[run.status === 'error' ? 'error' : 'complete']
+            : undefined;
 
           void getActivePushSubscription().then((sub) => {
             if (!sub) {
@@ -660,13 +786,13 @@ export const App: React.FC = () => {
                 body,
                 tag: `run-${run.id}`,
                 chatId: run.chatId,
+                vibrate,
               });
             }
           });
         }
-        const curQuota = quotaRef.current;
-        if (!curQuota?.fetchedAt || Date.now() - curQuota.fetchedAt >= 5 * 60 * 1000) {
-          void triggerQuotaRefresh(true);
+        if (run && run.status !== 'cancelled') {
+          void triggerQuotaRefresh(true, 5_000);
         }
         break;
       }
@@ -684,6 +810,13 @@ export const App: React.FC = () => {
             setPendingPermissions((prev) =>
               prev.some((x) => x.id === perm.id) ? prev : [...prev, perm]
             );
+          }
+          if (
+            !isReplayingHelloRef.current &&
+            document.visibilityState === 'visible' &&
+            Math.abs(Date.now() - evt.createdAt) < 60_000
+          ) {
+            triggerHaptic('permission', Boolean(preferencesRef.current?.hapticFeedback ?? true));
           }
         }
         break;
@@ -720,7 +853,7 @@ export const App: React.FC = () => {
         break;
       }
     }
-  }, [triggerQuotaRefresh]);
+  }, [triggerQuotaRefresh, loadSkillsList]);
 
   const handleEphemeralEvent = useCallback(
     (evt: Extract<WsIncomingMessage, { kind: 'ephemeral' }>['event']) => {
@@ -797,8 +930,13 @@ export const App: React.FC = () => {
           void loadWorkspaceLists();
           if (activeChatIdRef.current) void loadChatDetail(activeChatIdRef.current);
         } else {
-          for (const evt of msg.events) {
-            handleDurableEvent(evt);
+          isReplayingHelloRef.current = true;
+          try {
+            for (const evt of msg.events) {
+              handleDurableEvent(evt);
+            }
+          } finally {
+            isReplayingHelloRef.current = false;
           }
           // If an active chat exists, verify it caught up cleanly across background wake
           if (activeChatIdRef.current && msg.events.length === 0) {
@@ -815,6 +953,8 @@ export const App: React.FC = () => {
         setUserOptions(null);
         setSessionOptions(null);
         setQuota(null);
+        setSkillsState(null);
+        setSkillsOpen(false);
         draftCreatedChatRef.current = null;
         setDraftCreatedChat(null);
         setDraftProjectId(null);
@@ -836,10 +976,52 @@ export const App: React.FC = () => {
     chats.find((c) => c.id === activeChatId) ??
     (draftCreatedChat?.id === activeChatId ? draftCreatedChat : null);
   const effectiveProjectId = activeChat ? activeChat.projectId : draftProjectId;
+  effectiveProjectIdRef.current = effectiveProjectId;
   const activeProject =
     effectiveProjectId ? projects.find((p) => p.id === effectiveProjectId) ?? null : null;
 
+  useEffect(() => {
+    if (!user) {
+      setSkillsState(null);
+      return;
+    }
+    void loadSkillsList(effectiveProjectId, activeChatId);
+  }, [user?.id, effectiveProjectId, activeChatId, loadSkillsList]);
+
   const effectiveSessionOptions = activeChat ? (sessionOptions ?? userOptions) : userOptions;
+  const mergedAvailableCommands = React.useMemo<AvailableCommandItem[]>(() => {
+    const rawSessionCmds = effectiveSessionOptions?.availableCommands ?? [];
+    const disabledOnlySlugs = new Set<string>();
+    const enabledSlugs = new Set<string>(skillsState?.commands.map((c) => c.name.toLowerCase()) ?? []);
+    if (skillsState) {
+      for (const s of [...skillsState.global, ...skillsState.project, ...skillsState.workspace]) {
+        const key = s.slug.toLowerCase();
+        if (!s.enabled && !enabledSlugs.has(key)) {
+          disabledOnlySlugs.add(key);
+        }
+      }
+    }
+    const acpCmds = rawSessionCmds.filter(
+      (c) => c.source !== 'skill' && !disabledOnlySlugs.has(c.name.toLowerCase())
+    );
+    const liveSkillCmds = skillsState
+      ? skillsState.commands
+      : rawSessionCmds.filter((c) => c.source === 'skill');
+
+    const byName = new Map<string, AvailableCommandItem>();
+    for (const cmd of acpCmds) {
+      byName.set(cmd.name.toLowerCase(), cmd);
+    }
+    for (const cmd of liveSkillCmds) {
+      byName.set(cmd.name.toLowerCase(), cmd);
+    }
+    return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }, [effectiveSessionOptions?.availableCommands, skillsState]);
+
+  const openAndTrackArtifact = useCallback((art: ArtifactRecord) => {
+    setViewerArtifact(art);
+    setArtifacts((prev) => (prev.some((x) => x.id === art.id) ? prev : [art, ...prev]));
+  }, []);
   const activeModelOption = effectiveSessionOptions?.configOptions.find(
     (o) => o.id === effectiveSessionOptions.modelOptionId || o.category === 'model'
   );
@@ -987,6 +1169,7 @@ export const App: React.FC = () => {
   };
 
   const handleSendPrompt = async (text: string, files: AttachmentRef[]): Promise<void> => {
+    triggerHaptic('send', Boolean(preferencesRef.current?.hapticFeedback ?? true));
     const existingId = activeChatIdRef.current;
     const wasDraft = !existingId || draftCreatedChatRef.current?.id === existingId;
     const chatId = existingId || (await createDraftBackedChat()).id;
@@ -1021,10 +1204,15 @@ export const App: React.FC = () => {
       return copy;
     });
     setActiveRun(res.run);
+    void triggerQuotaRefresh(true, 5_000);
   };
 
   const handleCancelRun = async (runId: string) => {
     if (!activeChatId) return;
+    if (locallyCancelledRunIdsRef.current.size > 200) {
+      locallyCancelledRunIdsRef.current.clear();
+    }
+    locallyCancelledRunIdsRef.current.add(runId);
     await api.cancelRun(activeChatId, runId);
   };
 
@@ -1043,6 +1231,8 @@ export const App: React.FC = () => {
     setUserOptions(null);
     setSessionOptions(null);
     setQuota(null);
+    setSkillsState(null);
+    setSkillsOpen(false);
     setHasComposerDraft(false);
     draftCreatedChatRef.current = null;
     setDraftCreatedChat(null);
@@ -1112,6 +1302,7 @@ export const App: React.FC = () => {
         chats={chats}
         projects={projects}
         activeChatId={activeChatId}
+        skillCount={skillsState?.commands.length ?? 0}
         onCloseMobile={() => setSidebarMobileOpen(false)}
         onNewChat={(projId) => handleStartDraftChat(projId ?? null)}
         onSelectChat={(id) => {
@@ -1132,6 +1323,7 @@ export const App: React.FC = () => {
           if (activeChatId === chatId) setActiveChatId(null);
         }}
         onOpenProjectModal={(proj) => setProjectModalTarget(proj)}
+        onOpenSkills={() => setSkillsOpen(true)}
         onOpenSettings={() => setSettingsOpen(true)}
       />
 
@@ -1149,6 +1341,7 @@ export const App: React.FC = () => {
           onOpenSidebar={() => setSidebarMobileOpen(true)}
           onNewChat={() => handleStartDraftChat(null)}
           onRefreshQuota={() => void triggerQuotaRefresh(false)}
+          onOpenQuotaPopover={() => void triggerQuotaRefresh(true, 10_000)}
           onToggleWorkspace={() => setWorkspaceOpen((o) => !o)}
         />
 
@@ -1174,10 +1367,12 @@ export const App: React.FC = () => {
             pendingPermissions={pendingPermissions}
             activeRun={activeRun}
             sessionOptions={effectiveSessionOptions}
+            availableCommands={mergedAvailableCommands}
             selectedModelId={selectedModelId}
             selectedEffortValue={selectedEffortValue}
             draftResetToken={draftResetToken}
             clientId={wsRef.current?.getClientId() ?? 'local'}
+            hapticEnabled={preferences?.hapticFeedback ?? true}
             onChangeModel={(modelId) => void handleChangeModel(modelId)}
             onChangeEffort={(effortValue) => void handleChangeEffort(effortValue)}
             onDraftChange={setHasComposerDraft}
@@ -1193,10 +1388,12 @@ export const App: React.FC = () => {
               );
               await loadChatDetail(activeChat.id);
             }}
-            onOpenArtifact={(art) => setViewerArtifact(art)}
+            onOpenArtifact={openAndTrackArtifact}
             onPermissionUpdated={(perm) => {
               setPendingPermissions((prev) => prev.filter((x) => x.id !== perm.id));
             }}
+            onOpenSkills={() => setSkillsOpen(true)}
+            externalDraftCommand={externalDraftCommand}
           />
 
           {workspaceOpen && activeChat && (
@@ -1204,7 +1401,7 @@ export const App: React.FC = () => {
               chatId={activeChat.id}
               artifacts={artifacts}
               onClose={() => setWorkspaceOpen(false)}
-              onOpenArtifact={(art) => setViewerArtifact(art)}
+              onOpenArtifact={openAndTrackArtifact}
             />
           )}
         </div>
@@ -1225,6 +1422,21 @@ export const App: React.FC = () => {
             if (nextFlow !== undefined) setLoginFlow(nextFlow);
           }}
           onLogout={(all) => void handleLogout(all)}
+        />
+      )}
+
+      {skillsOpen && (
+        <SkillsModal
+          activeChatId={activeChatId}
+          activeProjectId={effectiveProjectId}
+          projects={projects}
+          onClose={() => setSkillsOpen(false)}
+          onSkillsChanged={() => {
+            void loadSkillsList(effectiveProjectIdRef.current, activeChatIdRef.current);
+          }}
+          onInsertSlashCommand={(slug) => {
+            setExternalDraftCommand({ slug, token: Date.now() });
+          }}
         />
       )}
 

@@ -5,6 +5,7 @@ import type { PushNotificationService } from '../notifications/web-push.js';
 import type { SyncHub } from '../sync/hub.js';
 import type { AttachmentRef, ChatRecord, MessageRecord, RunRecord } from '../types.js';
 import type { AcpClientManager } from './client-manager.js';
+import type { QuotaService } from './quota-service.js';
 
 interface QueuedTurnJob {
   runId: string;
@@ -30,7 +31,8 @@ export class ExecutionScheduler {
     private readonly db: AppDatabase,
     private readonly hub: SyncHub,
     private readonly acp: AcpClientManager,
-    private readonly pushService?: PushNotificationService
+    private readonly pushService?: PushNotificationService,
+    private readonly quotaService?: QuotaService
   ) {}
 
   enqueueTurn(params: {
@@ -313,6 +315,7 @@ export class ExecutionScheduler {
           status,
           previewText: finalMsg.contentText,
         });
+        void this.quotaService?.refreshOnDemand(job.userId, { auto: true, minAgeMs: 5_000 }).catch(() => {});
       }
     } catch (err) {
       const finishedAt = Date.now();
@@ -345,6 +348,7 @@ export class ExecutionScheduler {
           status: 'error',
           errorMessage: errorMsg,
         });
+        void this.quotaService?.refreshOnDemand(job.userId, { auto: true, minAgeMs: 5_000 }).catch(() => {});
       }
     } finally {
       this.activeJobs.delete(job.runId);

@@ -198,12 +198,18 @@ export function parseUsageOutput(stdout: string): { buckets: QuotaBucket[]; rawS
  */
 export class QuotaService {
   private readonly inFlight = new Map<string, Promise<QuotaSnapshotRecord>>();
+  private shuttingDown = false;
 
   constructor(
     private readonly config: AppConfig,
     private readonly db: AppDatabase,
     private readonly hub: SyncHub
   ) {}
+
+  async shutdown(): Promise<void> {
+    this.shuttingDown = true;
+    await Promise.allSettled([...this.inFlight.values()]);
+  }
 
   getCachedOrUnavailable(userId: string): QuotaSnapshotRecord {
     return (
@@ -222,13 +228,28 @@ export class QuotaService {
     userId: string,
     opts: { auto?: boolean; minAgeMs?: number } = {}
   ): Promise<QuotaSnapshotRecord> {
+    if (this.shuttingDown) {
+      return this.getCachedOrUnavailable(userId);
+    }
+
     if (opts.auto) {
-      const cached = this.db.getQuotaSnapshot(userId);
+      let cached: QuotaSnapshotRecord | null = null;
+      try {
+        cached = this.db.getQuotaSnapshot(userId);
+      } catch {
+        return this.getCachedOrUnavailable(userId);
+      }
       if (cached && cached.fetchedAt > 0) {
+        const clampedCustomMin =
+          typeof opts.minAgeMs === 'number' && Number.isFinite(opts.minAgeMs)
+            ? Math.max(5_000, Math.min(15 * 60 * 1000, Math.round(opts.minAgeMs)))
+            : null;
         const minAge =
           cached.status === 'ok'
-            ? (opts.minAgeMs ?? DEFAULT_AUTO_MIN_AGE_MS)
-            : Math.min(opts.minAgeMs ?? DEFAULT_AUTO_MIN_AGE_MS, ERROR_AUTO_MIN_AGE_MS);
+            ? (clampedCustomMin ?? DEFAULT_AUTO_MIN_AGE_MS)
+            : clampedCustomMin !== null
+              ? Math.max(30_000, clampedCustomMin)
+              : Math.min(DEFAULT_AUTO_MIN_AGE_MS, ERROR_AUTO_MIN_AGE_MS);
         if (Date.now() - cached.fetchedAt < minAge) {
           return cached;
         }
@@ -266,7 +287,47 @@ export class QuotaService {
   }
 
   private async doRefresh(userId: string): Promise<QuotaSnapshotRecord> {
-    const profile = this.db.getAgyProfile(userId);
+    if (this.shuttingDown) {
+      return {
+        userId,
+        status: 'unavailable',
+        buckets: [],
+        rawSummary: null,
+        errorMessage: 'シャットダウン中',
+        fetchedAt: 0,
+      };
+    }
+
+    const persistSnapshot = (snap: QuotaSnapshotRecord, emitHub: boolean) => {
+      if (this.shuttingDown) return;
+      try {
+        this.db.saveQuotaSnapshot(snap);
+        if (emitHub) {
+          this.hub.emitDurable({
+            userId,
+            type: 'quota.updated',
+            payload: { quota: snap },
+          });
+        }
+      } catch {
+        // Ignore DB-closed race on rapid shutdown
+      }
+    };
+
+    let profile;
+    try {
+      profile = this.db.getAgyProfile(userId);
+    } catch {
+      return {
+        userId,
+        status: 'unavailable',
+        buckets: [],
+        rawSummary: null,
+        errorMessage: 'DB未利用',
+        fetchedAt: 0,
+      };
+    }
+
     const now = Date.now();
     if (!profile || profile.authStatus !== 'authenticated') {
       const snap: QuotaSnapshotRecord = {
@@ -277,18 +338,22 @@ export class QuotaService {
         errorMessage: 'Antigravity未認証のため取得できません',
         fetchedAt: now,
       };
-      this.db.saveQuotaSnapshot(snap);
+      persistSnapshot(snap, false);
       return snap;
     }
 
     let apiKey: string | null = null;
-    const enc = this.db.getAgyEncryptedApiKey(userId);
-    if (enc) {
-      try {
-        apiKey = decryptSmallSecret(enc, this.config.sessionSecret);
-      } catch {
-        apiKey = null;
+    try {
+      const enc = this.db.getAgyEncryptedApiKey(userId);
+      if (enc) {
+        try {
+          apiKey = decryptSmallSecret(enc, this.config.sessionSecret);
+        } catch {
+          apiKey = null;
+        }
       }
+    } catch {
+      apiKey = null;
     }
 
     fs.mkdirSync(profile.profileDir, { recursive: true, mode: 0o700 });
@@ -324,12 +389,7 @@ export class QuotaService {
             : null,
         fetchedAt: now,
       };
-      this.db.saveQuotaSnapshot(snap);
-      this.hub.emitDurable({
-        userId,
-        type: 'quota.updated',
-        payload: { quota: snap },
-      });
+      persistSnapshot(snap, true);
       return snap;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -341,12 +401,7 @@ export class QuotaService {
         errorMessage: `取得不可 (${msg.slice(0, 120)})`,
         fetchedAt: now,
       };
-      this.db.saveQuotaSnapshot(snap);
-      this.hub.emitDurable({
-        userId,
-        type: 'quota.updated',
-        payload: { quota: snap },
-      });
+      persistSnapshot(snap, true);
       return snap;
     }
   }

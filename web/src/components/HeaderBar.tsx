@@ -22,6 +22,7 @@ interface HeaderBarProps {
   onOpenSidebar: () => void;
   onNewChat: () => void;
   onRefreshQuota: () => void;
+  onOpenQuotaPopover?: () => void;
   onToggleWorkspace: () => void;
 }
 
@@ -63,6 +64,7 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
   onOpenSidebar,
   onNewChat,
   onRefreshQuota,
+  onOpenQuotaPopover,
   onToggleWorkspace,
 }) => {
   const [quotaOpen, setQuotaOpen] = useState(false);
@@ -124,7 +126,13 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
           <button
             type="button"
             className={`pill-btn ${quotaOpen ? 'active' : ''}`}
-            onClick={() => setQuotaOpen((o) => !o)}
+            onClick={() => {
+              setQuotaOpen((prev) => {
+                const next = !prev;
+                if (next) onOpenQuotaPopover?.();
+                return next;
+              });
+            }}
             aria-expanded={quotaOpen}
             title="アカウント別の利用枠を確認"
           >

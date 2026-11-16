@@ -192,3 +192,17 @@ export const GaugeIcon: React.FC<IconProps> = ({ size = 16, className }) => (
     <path d="M12 14l4-4M3.34 19a10 10 0 1117.32 0" />
   </svg>
 );
+
+export const SparklesIcon: React.FC<IconProps> = ({ size = 16, className }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" className={className}>
+    <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z" />
+    <path d="M19 3v3M20.5 4.5h-3M5 17v4M7 19H3" />
+  </svg>
+);
+
+export const SlashIcon: React.FC<IconProps> = ({ size = 16, className }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+    <rect x="3" y="4" width="18" height="16" rx="4" />
+    <path d="M14.5 8l-5 8" />
+  </svg>
+);

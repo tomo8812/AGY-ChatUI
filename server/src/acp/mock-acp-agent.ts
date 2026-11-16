@@ -160,6 +160,82 @@ function buildConfigOptions(modelId: string, effortValue: string): SessionConfig
   ];
 }
 
+interface MockDiscoveredSkill {
+  slug: string;
+  name: string;
+  description: string;
+  instructions: string;
+  scope: 'global' | 'workspace';
+}
+
+function parseMockSkillFile(raw: string, fallbackSlug: string): { name: string; description: string; instructions: string } {
+  const normalized = raw.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
+  const match = /^---\n([\s\S]*?)\n---(?:\n([\s\S]*))?$/.exec(normalized);
+  if (!match) {
+    return { name: fallbackSlug, description: fallbackSlug, instructions: normalized.trim() };
+  }
+  const fm = match[1];
+  const body = (match[2] ?? '').trim();
+  const nameMatch = /^name\s*:\s*(.+)$/m.exec(fm);
+  const descMatch = /^description\s*:\s*(.+)$/m.exec(fm);
+  const unquote = (s: string) => s.trim().replace(/^["']|["']$/g, '');
+  return {
+    name: nameMatch ? unquote(nameMatch[1]) : fallbackSlug,
+    description: descMatch ? unquote(descMatch[1]) : fallbackSlug,
+    instructions: body,
+  };
+}
+
+function discoverMockActiveSkills(home: string, cwd: string): MockDiscoveredSkill[] {
+  const bySlug = new Map<string, MockDiscoveredSkill>();
+  const scanRoots: Array<{ dir: string; scope: 'global' | 'workspace' }> = [
+    { dir: path.join(home, '.gemini', 'skills'), scope: 'global' },
+    { dir: path.join(home, '.gemini', 'antigravity', 'skills'), scope: 'global' },
+    { dir: path.join(home, '.gemini', 'config', 'skills'), scope: 'global' },
+    { dir: path.join(cwd, '.agent', 'skills'), scope: 'workspace' },
+    { dir: path.join(cwd, '.agents', 'skills'), scope: 'workspace' },
+  ];
+
+  for (const root of scanRoots) {
+    if (!fs.existsSync(root.dir)) continue;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(root.dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      const skillMd = path.join(root.dir, entry.name, 'SKILL.md');
+      if (!fs.existsSync(skillMd)) continue;
+      try {
+        const parsed = parseMockSkillFile(fs.readFileSync(skillMd, 'utf8'), entry.name);
+        bySlug.set(entry.name, {
+          slug: entry.name,
+          name: parsed.name,
+          description: parsed.description,
+          instructions: parsed.instructions,
+          scope: root.scope,
+        });
+      } catch {
+        // ignore unreadable skill
+      }
+    }
+  }
+  return [...bySlug.values()].sort((a, b) => a.slug.localeCompare(b.slug));
+}
+
+function buildAvailableCommandsForSession(home: string, cwd: string) {
+  const skills = discoverMockActiveSkills(home, cwd);
+  const cmds: Array<{ name: string; description: string }> = [
+    { name: 'compact', description: '会話履歴を圧縮してコンテキストを節約' },
+  ];
+  for (const s of skills) {
+    cmds.push({ name: s.slug, description: s.description || s.name });
+  }
+  return cmds;
+}
+
 function runAcpServer(): void {
   const sessions = new Map<string, SessionState>();
   let seqCounter = 0;
@@ -208,7 +284,7 @@ function runAcpServer(): void {
       if (fs.existsSync(authMarkerFile)) fs.unlinkSync(authMarkerFile);
       return {};
     })
-    .onRequest(methods.agent.session.new, async ({ params }) => {
+    .onRequest(methods.agent.session.new, async ({ params, client }) => {
       requireAuthenticated();
       seqCounter += 1;
       const id = `mock-sess-${seqCounter}-${Date.now()}`;
@@ -228,12 +304,19 @@ function runAcpServer(): void {
         cancelled: false,
       };
       sessions.set(id, state);
+      await client.notify(methods.client.session.update, {
+        sessionId: id,
+        update: {
+          sessionUpdate: 'available_commands_update',
+          availableCommands: buildAvailableCommandsForSession(homeDir, state.cwd),
+        },
+      });
       return {
         sessionId: id,
         configOptions: buildConfigOptions(state.modelId, state.effortValue),
       };
     })
-    .onRequest(methods.agent.session.load, async ({ params }) => {
+    .onRequest(methods.agent.session.load, async ({ params, client }) => {
       requireAuthenticated();
       let state = sessions.get(params.sessionId);
       if (!state) {
@@ -252,11 +335,18 @@ function runAcpServer(): void {
         };
         sessions.set(params.sessionId, state);
       }
+      await client.notify(methods.client.session.update, {
+        sessionId: state.id,
+        update: {
+          sessionUpdate: 'available_commands_update',
+          availableCommands: buildAvailableCommandsForSession(homeDir, state.cwd),
+        },
+      });
       return {
         configOptions: buildConfigOptions(state.modelId, state.effortValue),
       };
     })
-    .onRequest(methods.agent.session.resume, async ({ params }) => {
+    .onRequest(methods.agent.session.resume, async ({ params, client }) => {
       requireAuthenticated();
       let state = sessions.get(params.sessionId);
       if (!state) {
@@ -274,6 +364,13 @@ function runAcpServer(): void {
         };
         sessions.set(params.sessionId, state);
       }
+      await client.notify(methods.client.session.update, {
+        sessionId: state.id,
+        update: {
+          sessionUpdate: 'available_commands_update',
+          availableCommands: buildAvailableCommandsForSession(homeDir, state.cwd),
+        },
+      });
       return {
         configOptions: buildConfigOptions(state.modelId, state.effortValue),
       };
@@ -328,12 +425,23 @@ function runAcpServer(): void {
         await ctx.client.notify(methods.client.session.update, update as never);
       };
 
+      const activeSkills = discoverMockActiveSkills(homeDir, state.cwd);
+      const slashMatch = /^\/([a-z0-9][a-z0-9-]{0,63})(?:\s+([\s\S]*))?$/i.exec(promptText);
+      const matchedSkill = slashMatch
+        ? activeSkills.find((s) => s.slug === slashMatch[1].toLowerCase()) ?? null
+        : null;
+
       // Emit thought chunk
       await sendUpdate({
         sessionId: state.id,
         update: {
           sessionUpdate: 'agent_thought_chunk',
-          content: { type: 'text', text: `モデル ${state.modelId} (effort=${state.effortValue}) でリクエストを確認しています...\n` },
+          content: {
+            type: 'text',
+            text: matchedSkill
+              ? `[Skill Active: /${matchedSkill.slug} (${matchedSkill.scope})] ${matchedSkill.instructions.slice(0, 120)}\nモデル ${state.modelId} (effort=${state.effortValue}) でリクエストを確認しています...\n`
+              : `モデル ${state.modelId} (effort=${state.effortValue}) でリクエストを確認しています...\n`,
+          },
         },
       });
 
@@ -438,6 +546,48 @@ function runAcpServer(): void {
         );
       }
 
+      // Simulate Antigravity CLI generated brain image stored under $HOME/.gemini/antigravity-cli/brain/<session>/
+      let brainImageNotes = '';
+      if (promptText.includes('[BRAIN_IMAGE]')) {
+        const brainSessionDir = path.join(homeDir, '.gemini', 'antigravity-cli', 'brain', state.id);
+        fs.mkdirSync(brainSessionDir, { recursive: true, mode: 0o700 });
+        const brainImgPath = path.join(brainSessionDir, 'mock-brain-art.jpg');
+        const minimalJpeg = Buffer.from([
+          0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01,
+          0x01, 0x01, 0x00, 0x48, 0x00, 0x48, 0x00, 0x00, 0xff, 0xd9,
+        ]);
+        fs.writeFileSync(brainImgPath, minimalJpeg);
+
+        const imgToolId = `tc-img-${Date.now()}`;
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: imgToolId,
+            title: `File ${brainImgPath}`,
+            kind: 'edit',
+            status: 'in_progress',
+            rawInput: { Path: brainImgPath },
+            locations: [{ path: brainImgPath }],
+          },
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: imgToolId,
+            status: 'completed',
+            rawOutput: { path: brainImgPath },
+          },
+        });
+
+        brainImageNotes = [
+          '\nイラストを生成しました！',
+          `\n\n![生成イラスト](${brainImgPath})`,
+          `\n\n保存先: [mock-brain-art.jpg](file://${brainImgPath})`,
+        ].join('');
+      }
+
       // Inspect project context files cleanly if [CONTEXT_CHECK] is requested
       let contextNotes = '';
       if (promptText.includes('[CONTEXT_CHECK]')) {
@@ -447,14 +597,20 @@ function runAcpServer(): void {
         contextNotes = `\n\n### プロジェクト共有参照確認\n- Instructions: ${state.systemPromptText ?? '(none)'}\n- Shared files:\n${samples.map((s) => `  - ${s}`).join('\n')}`;
       }
 
+      const skillNote = matchedSkill
+        ? `\nスキル \`/${matchedSkill.slug}\` (${matchedSkill.scope}) を適用しました: ${matchedSkill.instructions.split('\n')[0] || matchedSkill.name}`
+        : '';
+
       const reply = [
         `[${auth?.label ?? 'mock'} | ${state.modelId}/${state.effortValue}] 受信メッセージ: "${promptText}"`,
+        skillNote,
         promptText.includes('[ARTIFACT]')
           ? '\n生成物を作成しました: [summary.md](summary.md), [metrics.csv](metrics.csv), [widget.html](widget.html)'
           : '',
         promptText.includes('[PERMISSION]')
           ? '\n許可されたファイル [created-by-tool.md](created-by-tool.md) を作成しました。'
           : '',
+        brainImageNotes,
         contextNotes,
         '\n\n```ts\nexport const status = "ok";\n```',
       ].join('');

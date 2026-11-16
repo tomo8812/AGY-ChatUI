@@ -46,12 +46,67 @@ export interface AcpConfigOption {
   options: AcpSelectOption[];
 }
 
+export interface AvailableCommandItem {
+  name: string;
+  description: string;
+  inputHint?: string | null;
+  source?: 'acp' | 'skill' | 'builtin';
+  scope?: SkillScope;
+}
+
+export type SkillScope = 'global' | 'project' | 'workspace';
+
+export interface SkillResourceFile {
+  relPath: string;
+  name: string;
+  sizeBytes: number;
+  updatedAt: number;
+}
+
+export interface SkillSummary {
+  slug: string;
+  name: string;
+  description: string;
+  scope: SkillScope;
+  projectId: string | null;
+  chatId: string | null;
+  enabled: boolean;
+  disableModelInvocation: boolean;
+  resourceCount: number;
+  updatedAt: number;
+  storageKind?: 'canonical' | 'legacy';
+}
+
+export interface SkillDetail extends SkillSummary {
+  instructions: string;
+  rawSkillMd: string;
+  resources: SkillResourceFile[];
+}
+
+export interface SkillTemplate {
+  slug: string;
+  name: string;
+  description: string;
+  instructions: string;
+}
+
+export interface SkillsListResponse {
+  global: SkillSummary[];
+  project: SkillSummary[];
+  workspace: SkillSummary[];
+  projectId: string | null;
+  chatId: string | null;
+  templates: SkillTemplate[];
+  commands: AvailableCommandItem[];
+}
+
 export interface ParsedSessionOptions {
   configOptions: AcpConfigOption[];
   modelOptionId: string | null;
   effortOptionId: string | null;
   currentModelId: string | null;
   currentEffortValue: string | null;
+  availableCommands?: AvailableCommandItem[];
 }
 
 export interface ProjectFileRecord {
@@ -237,6 +292,7 @@ export interface UserPreferences {
   theme: 'system' | 'light' | 'dark';
   autoApproveSafeReads: boolean;
   notifyOnResponse: boolean;
+  hapticFeedback: boolean;
   defaultModelId: string | null;
   defaultEffortValue: string | null;
   updatedAt: number;
