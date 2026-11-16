@@ -1121,6 +1121,8 @@ export class AcpClientManager {
 
       return { stopReason: response.stopReason };
     } catch (err) {
+      bridge.initialPromptDone = true;
+      bridge.parentState = 'idle';
       // Flush partial work even on error so nothing streamed so far is lost
       this.db.updateMessage(params.userId, params.assistantMessageId, {
         contentText: bridge.contentText,
@@ -2547,9 +2549,10 @@ export class AcpClientManager {
         }
         for (const item of activeBg) {
           if (item && item.type === 'subagent' && typeof item.sessionId === 'string') {
-            if (!turn.subagents.has(item.sessionId)) {
+            const subId = item.sessionId;
+            if (!allBridges.some((b) => b.subagents.has(subId))) {
               this.upsertSubagentToolCall(worker, turn, {
-                subSessionId: item.sessionId,
+                subSessionId: subId,
                 toolCallId: typeof item.toolCallId === 'string' ? item.toolCallId : null,
                 state: 'running',
               });
