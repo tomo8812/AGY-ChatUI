@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Auto-updater for Antigravity Chat UI on Ubuntu (invoked by antigravity-chat-updater.timer).
-# Prefers pre-built GitHub Actions Release bundle (latest versioned Release by default,
-# falling back gracefully to legacy "latest" mirror tag or git pull + local build).
+# Updates strictly from SemVer versioned GitHub Releases (vX.Y.Z tags):
+#   - RELEASE_TAG=auto (default): resolves the highest SemVer tag (vX.Y.Z) release
+#   - RELEASE_TAG=vX.Y.Z: pins/rolls back to that exact release tag
+# Falls back to git pull + local build only when RELEASE_TAG=auto and prebuilt bundles are unavailable.
 
 set -euo pipefail
 
@@ -13,6 +15,7 @@ RELEASE_TAG="${RELEASE_TAG:-auto}"
 SERVICE_NAME="${SERVICE_NAME:-antigravity-chat.service}"
 ENV_FILE="${ENV_FILE:-/etc/antigravity-chat/env}"
 LOCK_FILE="${LOCK_FILE:-/run/antigravity-chat-updater.lock}"
+CURL_BIN="${CURL_BIN:-curl}"
 
 export PATH="/usr/local/bin:/usr/bin:/bin:${PATH}"
 
@@ -21,6 +24,11 @@ if [[ -r "${ENV_FILE}" ]]; then
   # shellcheck disable=SC1090
   source "${ENV_FILE}"
   set +a
+fi
+
+RELEASE_TAG="${RELEASE_TAG:-auto}"
+if [[ "${RELEASE_TAG}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  RELEASE_TAG="v${RELEASE_TAG}"
 fi
 
 if [[ ! -d "${APP_DIR}" ]]; then
@@ -70,6 +78,30 @@ infer_github_repo() {
   return 1
 }
 
+list_remote_semver_tags() {
+  local gh_repo="$1"
+  local raw_tags=""
+  if [[ -d "${APP_DIR}/.git" ]]; then
+    raw_tags="$(git_repo ls-remote --tags --refs "${REMOTE_NAME}" 'refs/tags/v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null || true)"
+  fi
+  if [[ -z "${raw_tags}" ]]; then
+    raw_tags="$(git ls-remote --tags --refs "https://github.com/${gh_repo}.git" 'refs/tags/v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null || true)"
+  fi
+  python3 -c '
+import re, sys
+tags = []
+for line in sys.stdin:
+    parts = line.strip().split()
+    if len(parts) < 2:
+        continue
+    m = re.match(r"^refs/tags/(v(\d+)\.(\d+)\.(\d+))$", parts[1])
+    if m:
+        tags.append(((int(m.group(2)), int(m.group(3)), int(m.group(4))), m.group(1)))
+for _, name in sorted(tags, key=lambda x: x[0], reverse=True):
+    print(name)
+' <<< "${raw_tags}"
+}
+
 try_prebuilt_release_update() {
   local gh_repo token tmp_dir
   gh_repo="$(infer_github_repo || true)"
@@ -82,78 +114,119 @@ try_prebuilt_release_update() {
   tmp_dir="$(mktemp -d /tmp/acy-release-XXXXXX)"
   trap 'rm -rf "${tmp_dir}"' RETURN
 
-  local info_url="" bundle_url="" sha_url=""
+  local selected_tag="" info_url="" bundle_url="" sha_url=""
   if [[ -n "${token}" ]]; then
     local release_json="${tmp_dir}/release.json"
-    local api_urls=()
-    if [[ "${RELEASE_TAG}" == "auto" ]] || [[ -z "${RELEASE_TAG}" ]]; then
-      api_urls+=(
-        "https://api.github.com/repos/${gh_repo}/releases/latest"
-        "https://api.github.com/repos/${gh_repo}/releases/tags/latest"
-      )
-    else
-      api_urls+=("https://api.github.com/repos/${gh_repo}/releases/tags/${RELEASE_TAG}")
-    fi
+    local parsed_release=""
 
-    local fetched=0
-    for api_url in "${api_urls[@]}"; do
-      if curl -fsSL \
+    if [[ "${RELEASE_TAG}" == "auto" ]]; then
+      if ! "${CURL_BIN}" -fsSL \
         -H "Authorization: Bearer ${token}" \
         -H "Accept: application/vnd.github+json" \
         -H "X-GitHub-Api-Version: 2022-11-28" \
-        "${api_url}" \
+        "https://api.github.com/repos/${gh_repo}/releases?per_page=30" \
         -o "${release_json}" 2>/dev/null; then
-        fetched=1
-        break
+        echo "[auto-update] Authenticated release list lookup failed."
+        return 1
       fi
-    done
-
-    if [[ "${fetched}" -eq 0 ]]; then
-      echo "[auto-update] Authenticated release lookup failed; falling back if possible."
-      return 1
-    fi
-
-    local urls
-    urls="$(python3 -c '
+      parsed_release="$(python3 -c '
+import json, re, sys
+releases = json.load(open(sys.argv[1]))
+if not isinstance(releases, list):
+    sys.exit(0)
+req = ("BUILD_INFO.json", "antigravity-chat-bundle.tar.gz", "antigravity-chat-bundle.tar.gz.sha256")
+candidates = []
+for rel in releases:
+    if rel.get("draft") or rel.get("prerelease"):
+        continue
+    tag = str(rel.get("tag_name") or "")
+    m = re.match(r"^v(\d+)\.(\d+)\.(\d+)$", tag)
+    if not m:
+        continue
+    assets = {a["name"]: a["url"] for a in rel.get("assets", [])}
+    if all(assets.get(k) for k in req):
+        ver = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        candidates.append((ver, tag, assets[req[0]], assets[req[1]], assets[req[2]]))
+if not candidates:
+    sys.exit(0)
+candidates.sort(key=lambda x: x[0], reverse=True)
+_, tag, u0, u1, u2 = candidates[0]
+print(tag)
+print(u0)
+print(u1)
+print(u2)
+' "${release_json}")"
+    else
+      if ! "${CURL_BIN}" -fsSL \
+        -H "Authorization: Bearer ${token}" \
+        -H "Accept: application/vnd.github+json" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        "https://api.github.com/repos/${gh_repo}/releases/tags/${RELEASE_TAG}" \
+        -o "${release_json}" 2>/dev/null; then
+        echo "[auto-update] Release tag ${RELEASE_TAG} lookup failed."
+        return 1
+      fi
+      parsed_release="$(python3 -c '
 import json, sys
 data = json.load(open(sys.argv[1]))
 assets = {a["name"]: a["url"] for a in data.get("assets", [])}
+print(str(data.get("tag_name") or sys.argv[2]))
 for name in ("BUILD_INFO.json", "antigravity-chat-bundle.tar.gz", "antigravity-chat-bundle.tar.gz.sha256"):
     print(assets.get(name, ""))
-' "${release_json}")"
+' "${release_json}" "${RELEASE_TAG}")"
+    fi
 
-    info_url="$(printf '%s\n' "${urls}" | sed -n '1p')"
-    bundle_url="$(printf '%s\n' "${urls}" | sed -n '2p')"
-    sha_url="$(printf '%s\n' "${urls}" | sed -n '3p')"
+    selected_tag="$(printf '%s\n' "${parsed_release}" | sed -n '1p')"
+    info_url="$(printf '%s\n' "${parsed_release}" | sed -n '2p')"
+    bundle_url="$(printf '%s\n' "${parsed_release}" | sed -n '3p')"
+    sha_url="$(printf '%s\n' "${parsed_release}" | sed -n '4p')"
 
-    if [[ -z "${info_url}" ]] || [[ -z "${bundle_url}" ]] || [[ -z "${sha_url}" ]]; then
-      echo "[auto-update] Prebuilt release assets incomplete; falling back."
+    if [[ -z "${selected_tag}" ]] || [[ -z "${info_url}" ]] || [[ -z "${bundle_url}" ]] || [[ -z "${sha_url}" ]]; then
+      echo "[auto-update] No complete SemVer release bundle found."
       return 1
     fi
 
-    curl -fsSL \
+    "${CURL_BIN}" -fsSL \
       -H "Authorization: Bearer ${token}" \
       -H "Accept: application/octet-stream" \
       "${info_url}" -o "${tmp_dir}/BUILD_INFO.json" || return 1
   else
-    # Public repo fast path (uses GitHub Release CDN directly, no API rate limit or PAT needed)
-    local base_candidates=()
-    if [[ "${RELEASE_TAG}" == "auto" ]] || [[ -z "${RELEASE_TAG}" ]]; then
-      base_candidates+=(
-        "https://github.com/${gh_repo}/releases/latest/download"
-        "https://github.com/${gh_repo}/releases/download/latest"
-      )
-    else
-      base_candidates+=("https://github.com/${gh_repo}/releases/download/${RELEASE_TAG}")
-    fi
-
+    # Public repo fast path: resolve SemVer version tags (vX.Y.Z) directly
     local matched_base=""
-    for base_dl in "${base_candidates[@]}"; do
-      if curl -fsSL "${base_dl}/BUILD_INFO.json" -o "${tmp_dir}/BUILD_INFO.json" 2>/dev/null; then
-        matched_base="${base_dl}"
-        break
+    if [[ "${RELEASE_TAG}" == "auto" ]]; then
+      local tag_list
+      tag_list="$(list_remote_semver_tags "${gh_repo}")"
+      local tried=0
+      while IFS= read -r candidate_tag; do
+        [[ -z "${candidate_tag}" ]] && continue
+        local candidate_base="https://github.com/${gh_repo}/releases/download/${candidate_tag}"
+        if "${CURL_BIN}" -fsSL "${candidate_base}/BUILD_INFO.json" -o "${tmp_dir}/BUILD_INFO.json" 2>/dev/null; then
+          selected_tag="${candidate_tag}"
+          matched_base="${candidate_base}"
+          break
+        fi
+        tried=$((tried + 1))
+        [[ "${tried}" -ge 3 ]] && break
+      done <<< "${tag_list}"
+
+      # Fallback if git ls-remote could not enumerate tags, accepting only SemVer-tagged releases
+      if [[ -z "${matched_base}" ]]; then
+        if "${CURL_BIN}" -fsSL "https://github.com/${gh_repo}/releases/latest/download/BUILD_INFO.json" -o "${tmp_dir}/BUILD_INFO.json" 2>/dev/null; then
+          local latest_meta_tag
+          latest_meta_tag="$(python3 -c 'import json,re,sys; t=str(json.load(open(sys.argv[1])).get("tag","")); print(t if re.match(r"^v\d+\.\d+\.\d+$", t) else "")' "${tmp_dir}/BUILD_INFO.json" 2>/dev/null || true)"
+          if [[ -n "${latest_meta_tag}" ]]; then
+            selected_tag="${latest_meta_tag}"
+            matched_base="https://github.com/${gh_repo}/releases/download/${selected_tag}"
+          fi
+        fi
       fi
-    done
+    else
+      local pinned_base="https://github.com/${gh_repo}/releases/download/${RELEASE_TAG}"
+      if "${CURL_BIN}" -fsSL "${pinned_base}/BUILD_INFO.json" -o "${tmp_dir}/BUILD_INFO.json" 2>/dev/null; then
+        selected_tag="${RELEASE_TAG}"
+        matched_base="${pinned_base}"
+      fi
+    fi
 
     if [[ -z "${matched_base}" ]]; then
       return 1
@@ -164,10 +237,17 @@ for name in ("BUILD_INFO.json", "antigravity-chat-bundle.tar.gz", "antigravity-c
     sha_url="${matched_base}/antigravity-chat-bundle.tar.gz.sha256"
   fi
 
-  local remote_meta remote_sha remote_version local_sha="" local_version=""
-  remote_meta="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("commitSha","")); print(d.get("version",""))' "${tmp_dir}/BUILD_INFO.json" 2>/dev/null || true)"
+  local remote_meta remote_sha remote_version remote_tag local_sha="" local_version=""
+  remote_meta="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("commitSha","")); print(d.get("version","")); print(d.get("tag",""))' "${tmp_dir}/BUILD_INFO.json" 2>/dev/null || true)"
   remote_sha="$(printf '%s\n' "${remote_meta}" | sed -n '1p')"
   remote_version="$(printf '%s\n' "${remote_meta}" | sed -n '2p')"
+  remote_tag="$(printf '%s\n' "${remote_meta}" | sed -n '3p')"
+  remote_tag="${remote_tag:-${selected_tag}}"
+
+  if [[ "${RELEASE_TAG}" == "auto" ]] && [[ ! "${remote_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "[auto-update] Ignoring non-SemVer release tag '${remote_tag}'."
+    return 1
+  fi
 
   if [[ -f "${APP_DIR}/BUILD_INFO.json" ]]; then
     local local_meta
@@ -189,21 +269,21 @@ for name in ("BUILD_INFO.json", "antigravity-chat-bundle.tar.gz", "antigravity-c
 
   local local_desc remote_desc
   local_desc="${local_version:+v${local_version} }(${local_sha:0:8})"
-  remote_desc="${remote_version:+v${remote_version} }(${remote_sha:0:8})"
-  echo "[auto-update] Prebuilt Actions bundle update detected: ${local_desc} -> ${remote_desc}"
+  remote_desc="${remote_tag:-${remote_version:+v${remote_version}}} (${remote_sha:0:8})"
+  echo "[auto-update] Release update detected [${selected_tag}]: ${local_desc} -> ${remote_desc}"
 
   if [[ -n "${token}" ]]; then
-    curl -fsSL \
+    "${CURL_BIN}" -fsSL \
       -H "Authorization: Bearer ${token}" \
       -H "Accept: application/octet-stream" \
-      "${sha_url}" -o "${tmp_dir}/antigravity-chat-bundle.tar.gz.sha256"
-    curl -fsSL \
+      "${sha_url}" -o "${tmp_dir}/antigravity-chat-bundle.tar.gz.sha256" || return 1
+    "${CURL_BIN}" -fsSL \
       -H "Authorization: Bearer ${token}" \
       -H "Accept: application/octet-stream" \
-      "${bundle_url}" -o "${tmp_dir}/antigravity-chat-bundle.tar.gz"
+      "${bundle_url}" -o "${tmp_dir}/antigravity-chat-bundle.tar.gz" || return 1
   else
-    curl -fsSL "${sha_url}" -o "${tmp_dir}/antigravity-chat-bundle.tar.gz.sha256"
-    curl -fsSL "${bundle_url}" -o "${tmp_dir}/antigravity-chat-bundle.tar.gz"
+    "${CURL_BIN}" -fsSL "${sha_url}" -o "${tmp_dir}/antigravity-chat-bundle.tar.gz.sha256" || return 1
+    "${CURL_BIN}" -fsSL "${bundle_url}" -o "${tmp_dir}/antigravity-chat-bundle.tar.gz" || return 1
   fi
 
   local apply_flags=()
@@ -220,9 +300,9 @@ for name in ("BUILD_INFO.json", "antigravity-chat-bundle.tar.gz", "antigravity-c
   bash "${APP_DIR}/deploy/apply-bundle.sh" \
     "${tmp_dir}/antigravity-chat-bundle.tar.gz" \
     --sha256 "${tmp_dir}/antigravity-chat-bundle.tar.gz.sha256" \
-    "${apply_flags[@]}"
+    "${apply_flags[@]}" || return 1
 
-  echo "[auto-update] Applied prebuilt Actions bundle ${remote_desc}."
+  echo "[auto-update] Applied release bundle ${remote_desc}."
   return 0
 }
 
@@ -231,9 +311,15 @@ if [[ "${DEPLOY_MODE:-auto}" != "git" ]] && try_prebuilt_release_update; then
   exit 0
 fi
 
-# 2. Fallback: git pull + local build (when GITHUB_READ_TOKEN isn't configured)
+# Do not bypass a pinned RELEASE_TAG by falling back to main branch HEAD
+if [[ "${RELEASE_TAG}" != "auto" ]]; then
+  echo "[auto-update] Skip: pinned release tag ${RELEASE_TAG} bundle is not available."
+  exit 0
+fi
+
+# 2. Fallback: git pull + local build (when prebuilt SemVer releases are not yet available)
 if [[ ! -d "${APP_DIR}/.git" ]]; then
-  echo "[auto-update] Skip: neither prebuilt release nor .git checkout is available in ${APP_DIR}."
+  echo "[auto-update] Skip: neither prebuilt SemVer release nor .git checkout is available in ${APP_DIR}."
   exit 0
 fi
 
