@@ -2538,6 +2538,14 @@ export class AcpClientManager {
       }
       if (stateObj.state) {
         turn.parentState = stateObj.state;
+        if (stateObj.state === 'idle') {
+          for (const b of worker.turnBridges.values()) {
+            if (b.initialPromptDone) b.parentState = 'idle';
+          }
+          if (worker.backgroundBridge && worker.backgroundBridge.initialPromptDone) {
+            worker.backgroundBridge.parentState = 'idle';
+          }
+        }
       }
       if (
         (stateObj.state === 'running' || stateObj.state === 'requires_action') &&
@@ -2560,8 +2568,14 @@ export class AcpClientManager {
 
     // Parent session activity arriving after the initial session/prompt resolved means
     // Antigravity's native Reactive Wakeup has resumed the parent session.
+    const isTerminalToolUpdate =
+      update.sessionUpdate === 'tool_call_update' &&
+      (update.status === 'completed' || update.status === 'failed');
+    const anotherForegroundTurnActive = Boolean(worker.activeTurn && turn !== worker.activeTurn);
     if (
       turn.initialPromptDone &&
+      !isTerminalToolUpdate &&
+      !anotherForegroundTurnActive &&
       (update.sessionUpdate === 'agent_message_chunk' ||
         update.sessionUpdate === 'agent_thought_chunk' ||
         update.sessionUpdate === 'tool_call' ||
