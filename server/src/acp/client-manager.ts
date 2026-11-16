@@ -2001,12 +2001,23 @@ export class AcpClientManager {
       ? `サブエージェント (${nextTitle}: ${nextDesc})`
       : `サブエージェント (${nextTitle})`;
 
+    const syntheticStatus: ToolCallItem['status'] =
+      nextState === 'running' || nextState === 'requires_action'
+        ? 'in_progress'
+        : nextState === 'idle'
+          ? tracked.stopReason === 'error' || tracked.stopReason === 'refusal'
+            ? 'failed'
+            : 'completed'
+          : 'pending';
+
     const idx = turn.toolCalls.findIndex((t) => t.toolCallId === targetToolCallId);
     if (idx >= 0) {
       const prev = turn.toolCalls[idx];
-      // Preserve the tool call's native ACP status; track subagent lifecycle in dedicated fields (#5)
+      const isSynthetic = prev.toolCallId.startsWith('subagent:');
+      // Preserve native ACP tool_call status; synthetic subagent fallback items follow child lifecycle
       turn.toolCalls[idx] = {
         ...prev,
+        ...(isSynthetic ? { status: syntheticStatus } : {}),
         isSubagent: true,
         subagentLabel: prev.subagentLabel || label,
         subagentSessionId: params.subSessionId,
@@ -2017,20 +2028,12 @@ export class AcpClientManager {
         ...(nextChildTools.length > 0 ? { subagentToolCalls: nextChildTools } : {}),
       };
     } else {
-      const initialFallbackStatus: ToolCallItem['status'] =
-        nextState === 'running' || nextState === 'requires_action'
-          ? 'in_progress'
-          : nextState === 'idle'
-            ? tracked.stopReason === 'error' || tracked.stopReason === 'refusal'
-              ? 'failed'
-              : 'completed'
-            : 'pending';
       turn.toolCalls.push({
         toolCallId: targetToolCallId,
         title: nextTitle,
         isSubagent: true,
         subagentLabel: label,
-        status: initialFallbackStatus,
+        status: syntheticStatus,
         subagentSessionId: params.subSessionId,
         subagentState: nextState,
         ...(tracked.stopReason !== undefined ? { subagentStopReason: tracked.stopReason } : {}),
@@ -2348,6 +2351,10 @@ export class AcpClientManager {
     bridge: ActiveTurnBridge
   ): void {
     const hintPaths = [...bridge.syncedBrainFiles.values()].map((s) => s.workspaceRelPath);
+    const anotherTurnActive = Boolean(worker.activeTurn && worker.activeTurn !== bridge);
+    if (anotherTurnActive && hintPaths.length === 0) {
+      return;
+    }
     const newArtifacts = syncWorkspaceChangesAsArtifacts({
       db: this.db,
       userId: worker.userId,
@@ -2355,8 +2362,11 @@ export class AcpClientManager {
       workspaceDir: worker.workspaceDir,
       messageId: bridge.assistantMessageId,
       runId: bridge.runId || null,
-      before: bridge.beforeWorkspaceSnap,
+      before: anotherTurnActive
+        ? captureWorkspaceSnapshot(worker.workspaceDir)
+        : bridge.beforeWorkspaceSnap,
       hintPaths,
+      skipIfAlreadyOwnedByOtherMessage: true,
     });
     for (const art of newArtifacts) {
       if (bridge.emittedArtifactIds.has(art.id)) continue;

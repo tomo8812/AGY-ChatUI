@@ -234,11 +234,11 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     });
     expect(skillRes.status).toBe(201);
 
-    // Immediately send Turn B while Turn A's background subagent is still running
+    // Immediately send Turn B (creating artifacts) while Turn A's background subagent is still running
     const turnBRes = await alice.request<{ run: { id: string } }>(
       'POST',
       `/api/chats/${chatId}/messages`,
-      { text: 'ターンB通常応答' }
+      { text: 'ターンB通常応答 [ARTIFACT]' }
     );
     const turnBRunId = turnBRes.data.run.id;
 
@@ -271,10 +271,13 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
 
     const detail = await alice.request<{
       messages: Array<{
+        id: string;
         role: string;
         contentText: string;
+        artifactIds?: string[];
         toolCalls: Array<{ subagentContentText?: string; subagentState?: string }>;
       }>;
+      artifacts: Array<{ id: string; relPath: string; messageId: string | null }>;
     }>('GET', `/api/chats/${chatId}`);
 
     const assistants = detail.data.messages.filter((m) => m.role === 'assistant');
@@ -289,6 +292,12 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     expect(turnBAssistant.contentText).toContain('ターンB通常応答');
     expect(turnBAssistant.contentText).not.toContain('ターンA子の遅延出力');
     expect(turnBAssistant.toolCalls).toHaveLength(0);
+
+    // Turn B's artifacts must remain owned by Turn B (not stolen by Turn A's background sync)
+    const summaryArt = detail.data.artifacts.find((a) => a.relPath === 'summary.md');
+    expect(summaryArt).toBeTruthy();
+    expect(summaryArt?.messageId).toBe(turnBAssistant.id);
+    expect(turnAAssistant.artifactIds ?? []).not.toContain(summaryArt?.id);
 
     alice.closeWs();
   });
