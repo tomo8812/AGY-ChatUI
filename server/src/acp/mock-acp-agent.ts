@@ -576,7 +576,17 @@ function runAcpServer(): void {
             },
           });
 
-          // Parent session reactive wakeup streams the continuation response
+          // Parent session reactive wakeup starts (`state_update: running`), streams continuation response,
+          // and reports `state_update: idle` when done
+          await sendUpdate({
+            sessionId: state.id,
+            update: {
+              sessionUpdate: 'state_update',
+              state: 'running',
+              background: [],
+            },
+          });
+
           await sendUpdate({
             sessionId: state.id,
             update: {
@@ -585,6 +595,16 @@ function runAcpServer(): void {
                 type: 'text',
                 text: `サブエージェントによる画像生成が完了しました！\n\n![生成イラスト](${subagentImgPath})`,
               },
+            },
+          });
+
+          await sendUpdate({
+            sessionId: state.id,
+            update: {
+              sessionUpdate: 'state_update',
+              state: 'idle',
+              stopReason: 'end_turn',
+              background: [],
             },
           });
         })();

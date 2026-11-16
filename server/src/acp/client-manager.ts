@@ -333,6 +333,8 @@ interface ActiveTurnBridge {
   subagents: Map<string, TrackedSubagentState>;
   asyncSubagentToolIds: Set<string>;
   initialPromptDone: boolean;
+  parentState: 'running' | 'idle' | 'requires_action' | 'unknown';
+  backgroundWorkCount: number;
   parentWakeupStarted: boolean;
   parentWakeupIdle: boolean;
   receivedWakeupText: boolean;
@@ -909,6 +911,8 @@ export class AcpClientManager {
       parentWakeupIdle: false,
       receivedWakeupText: false,
       lastParentActivityAt: nowInit,
+      parentState: 'running',
+      backgroundWorkCount: 0,
     };
     worker.inFlight = true;
     worker.lastUsedAt = Date.now();
@@ -986,28 +990,51 @@ export class AcpClientManager {
         prompt: promptBlocks,
       });
 
-      // Allow any trailing session/update notifications flushed in the same stdio chunk to be processed
-      await new Promise((r) => setTimeout(r, 25));
       bridge.initialPromptDone = true;
+      bridge.parentState = 'idle';
+      // Yield to macrotask queue so any notifications queued in the same stdio frame are processed
+      await new Promise((r) => setImmediate(r));
 
       this.syncBrainDeliverablesMidTurn(worker, bridge);
 
-      const hasAsyncSubagentWork =
-        bridge.asyncSubagentToolIds.size > 0 || bridge.subagents.size > 0;
-      const hasBackgroundCommandWork = bridge.toolCalls.some((tc) => hasBackgroundTaskOutput(tc));
-      const hasPendingToolsOrPerms =
-        bridge.pendingResolvers.size > 0 ||
-        bridge.toolCalls.some((tc) => tc.status === 'in_progress' || tc.status === 'pending');
+      const hasPendingWork = () => {
+        const hasRunningSubagents = [...bridge.subagents.values()].some(
+          (s) => s.state === 'running' || s.state === 'requires_action'
+        );
+        const hasAsyncSubagentWork =
+          bridge.asyncSubagentToolIds.size > 0 ||
+          bridge.subagents.size > 0 ||
+          hasRunningSubagents;
+        const hasBackgroundCommandWork =
+          bridge.backgroundWorkCount > 0 ||
+          bridge.toolCalls.some((tc) => hasBackgroundTaskOutput(tc));
+        const hasPendingToolsOrPerms =
+          bridge.pendingResolvers.size > 0 ||
+          bridge.toolCalls.some((tc) => tc.status === 'in_progress' || tc.status === 'pending');
+        const isParentStillActive =
+          bridge.parentState === 'running' || bridge.parentState === 'requires_action';
+        return {
+          hasRunningSubagents,
+          hasAsyncSubagentWork,
+          hasBackgroundCommandWork,
+          hasPendingToolsOrPerms,
+          isParentStillActive,
+          anyActive:
+            hasAsyncSubagentWork ||
+            hasBackgroundCommandWork ||
+            hasPendingToolsOrPerms ||
+            isParentStillActive,
+        };
+      };
 
-      // When an async subagent (`invoke_subagent` / `subagent_update`), background task (`run_command`),
-      // or pending tool/permission is active when the initial `session/prompt` returns `end_turn`,
-      // keep this turn alive until Antigravity itself finishes the work or the user cancels.
+      // When Antigravity has active subagents, background tasks, pending tools/permissions,
+      // or has not yet reached an idle parent state after reactive wakeup, keep this turn open
+      // until Antigravity explicitly reports completion via ACP notifications.
       if (
         response.stopReason === 'end_turn' &&
         !params.abortSignal.aborted &&
-        (hasAsyncSubagentWork || hasBackgroundCommandWork || hasPendingToolsOrPerms)
+        hasPendingWork().anyActive
       ) {
-        const wakeupSettleMs = this.config.agyMode === 'mock' ? 180 : 1_500;
         let lastBrainPollAt = Date.now();
 
         while (
@@ -1022,12 +1049,7 @@ export class AcpClientManager {
             this.syncBrainDeliverablesMidTurn(worker, bridge);
           }
 
-          const allTrackedIdle =
-            bridge.subagents.size > 0 &&
-            [...bridge.subagents.values()].every(
-              (s) => s.state === 'idle' || s.state === 'unknown'
-            );
-
+          const state = hasPendingWork();
           const hasActiveNonSubagentTools = bridge.toolCalls.some(
             (tc) =>
               !bridge.asyncSubagentToolIds.has(tc.toolCallId) &&
@@ -1036,34 +1058,29 @@ export class AcpClientManager {
           );
 
           const hasExpectationOfWakeup =
-            hasAsyncSubagentWork ||
-            bridge.subagents.size > 0 ||
-            hasBackgroundCommandWork ||
-            bridge.toolCalls.some((tc) => hasBackgroundTaskOutput(tc));
+            state.hasAsyncSubagentWork || state.hasBackgroundCommandWork;
 
           if (!hasExpectationOfWakeup) {
-            if (!hasActiveNonSubagentTools && bridge.pendingResolvers.size === 0) {
-              break;
-            }
-          } else {
-            // 1. Parent explicitly reported state_update: idle after reactive wakeup
             if (
-              bridge.parentWakeupStarted &&
-              bridge.parentWakeupIdle &&
+              !state.hasRunningSubagents &&
               !hasActiveNonSubagentTools &&
-              bridge.pendingResolvers.size === 0
+              bridge.pendingResolvers.size === 0 &&
+              bridge.backgroundWorkCount === 0 &&
+              !state.isParentStillActive
             ) {
               break;
             }
-
-            // 2. Parent streamed reactive wakeup response text and stream has settled
+          } else {
+            // Wait until all child subagents are explicitly idle, no tools/permissions/background work
+            // remain active, and the parent session has completed its reactive wakeup and reported idle.
             if (
               bridge.parentWakeupStarted &&
-              bridge.receivedWakeupText &&
-              (bridge.subagents.size === 0 || allTrackedIdle) &&
+              bridge.parentWakeupIdle &&
+              bridge.parentState === 'idle' &&
+              !state.hasRunningSubagents &&
+              bridge.backgroundWorkCount === 0 &&
               !hasActiveNonSubagentTools &&
-              bridge.pendingResolvers.size === 0 &&
-              now - bridge.lastParentActivityAt >= wakeupSettleMs
+              bridge.pendingResolvers.size === 0
             ) {
               break;
             }
@@ -1072,7 +1089,6 @@ export class AcpClientManager {
           await new Promise((r) => setTimeout(r, 50));
         }
 
-        this.finalizePendingToolCalls(worker, bridge);
         this.syncBrainDeliverablesMidTurn(worker, bridge);
       }
 
@@ -1830,32 +1846,6 @@ export class AcpClientManager {
     return newlySynced;
   }
 
-  private finalizePendingToolCalls(worker: WorkerInstance, turn: ActiveTurnBridge): void {
-    let changed = false;
-    for (let i = 0; i < turn.toolCalls.length; i++) {
-      const tc = turn.toolCalls[i];
-      if (tc.status === 'in_progress' || tc.status === 'pending') {
-        turn.toolCalls[i] = { ...tc, status: 'completed' };
-        changed = true;
-      }
-    }
-    if (changed) {
-      turn.toolCalls = scrubToolCallsInternalPaths(
-        turn.toolCalls,
-        worker.profileDir,
-        worker.workspaceDir
-      );
-      this.db.updateMessage(turn.userId, turn.assistantMessageId, { toolCalls: turn.toolCalls });
-      this.hub.emitEphemeral({
-        userId: worker.userId,
-        type: 'run.tool_update',
-        chatId: worker.chatId,
-        runId: turn.runId,
-        payload: { messageId: turn.assistantMessageId, toolCalls: turn.toolCalls },
-      });
-    }
-  }
-
   private extractToolCallContentAndSaveAssets(
     worker: WorkerInstance,
     turn: ActiveTurnBridge,
@@ -1902,37 +1892,6 @@ export class AcpClientManager {
       }
     }
     return textParts.length > 0 ? textParts.join('\n').trim() : undefined;
-  }
-
-  private markAsyncSubagentsCompleted(worker: WorkerInstance, turn: ActiveTurnBridge): void {
-    let changed = false;
-    for (const sub of turn.subagents.values()) {
-      if (sub.state === 'running' || sub.state === 'requires_action') {
-        sub.state = 'idle';
-      }
-    }
-    for (let i = 0; i < turn.toolCalls.length; i++) {
-      const tc = turn.toolCalls[i];
-      if (
-        (turn.asyncSubagentToolIds.has(tc.toolCallId) ||
-          tc.toolCallId.startsWith('subagent:') ||
-          tc.isSubagent) &&
-        (tc.status === 'in_progress' || tc.status === 'pending')
-      ) {
-        turn.toolCalls[i] = { ...tc, status: 'completed' };
-        changed = true;
-      }
-    }
-    if (changed) {
-      this.db.updateMessage(turn.userId, turn.assistantMessageId, { toolCalls: turn.toolCalls });
-      this.hub.emitEphemeral({
-        userId: worker.userId,
-        type: 'run.tool_update',
-        chatId: worker.chatId,
-        runId: turn.runId,
-        payload: { messageId: turn.assistantMessageId, toolCalls: turn.toolCalls },
-      });
-    }
   }
 
   private upsertSubagentToolCall(
@@ -2111,6 +2070,8 @@ export class AcpClientManager {
       parentWakeupIdle: false,
       receivedWakeupText: true,
       lastParentActivityAt: Date.now(),
+      parentState: 'idle',
+      backgroundWorkCount: 0,
     };
     worker.backgroundBridge = bridge;
     return bridge;
@@ -2244,15 +2205,36 @@ export class AcpClientManager {
       const stateObj = rawUpdate as {
         state?: 'running' | 'idle' | 'requires_action' | 'unknown';
         stopReason?: string | null;
+        background?: Array<{ type?: string; sessionId?: string; toolCallId?: string }> | null;
       };
       turn.lastParentActivityAt = now;
-      if (stateObj.state === 'running' && turn.initialPromptDone) {
+      if (Array.isArray(stateObj.background)) {
+        turn.backgroundWorkCount = stateObj.background.length;
+        for (const item of stateObj.background) {
+          if (
+            item &&
+            item.type === 'subagent' &&
+            typeof item.sessionId === 'string' &&
+            !turn.subagents.has(item.sessionId)
+          ) {
+            this.upsertSubagentToolCall(worker, turn, {
+              subSessionId: item.sessionId,
+              state: 'running',
+            });
+          }
+        }
+      }
+      if (stateObj.state) {
+        turn.parentState = stateObj.state;
+      }
+      if (
+        (stateObj.state === 'running' || stateObj.state === 'requires_action') &&
+        turn.initialPromptDone
+      ) {
         turn.parentWakeupStarted = true;
         turn.parentWakeupIdle = false;
-        this.markAsyncSubagentsCompleted(worker, turn);
       } else if (stateObj.state === 'idle' && turn.initialPromptDone) {
         turn.parentWakeupIdle = true;
-        this.markAsyncSubagentsCompleted(worker, turn);
         this.syncBrainDeliverablesMidTurn(worker, turn);
       }
       finalizeIfBackground();
@@ -2287,9 +2269,10 @@ export class AcpClientManager {
         update.sessionUpdate === 'tool_call_update')
     ) {
       turn.lastParentActivityAt = now;
+      turn.parentState = 'running';
+      turn.parentWakeupIdle = false;
       if (!turn.parentWakeupStarted) {
         turn.parentWakeupStarted = true;
-        this.markAsyncSubagentsCompleted(worker, turn);
         this.syncBrainDeliverablesMidTurn(worker, turn);
       }
     }
@@ -2445,10 +2428,9 @@ export class AcpClientManager {
       const contentText = this.extractToolCallContentAndSaveAssets(worker, turn, rawContent);
 
       // For `invoke_subagent`, `tool_call_update: completed` during the launch turn only means the
-      // background subagent was spawned. Keep status as `in_progress` until the subagent finishes!
+      // background subagent was spawned. Keep status as `in_progress` until the subagent itself reports idle!
       const isAsyncStillRunning =
         turn.asyncSubagentToolIds.has(update.toolCallId) &&
-        !turn.parentWakeupStarted &&
         (turn.subagents.size === 0 ||
           [...turn.subagents.values()].some(
             (s) => s.toolCallId === update.toolCallId && s.state !== 'idle'
@@ -2539,6 +2521,8 @@ export class AcpClientManager {
     const bg = w.backgroundBridge;
     if (bg) {
       if (bg.pendingResolvers.size > 0) return true;
+      if (bg.parentState === 'running' || bg.parentState === 'requires_action') return true;
+      if (bg.backgroundWorkCount > 0) return true;
       if (
         [...bg.subagents.values()].some(
           (s) => s.state === 'running' || s.state === 'requires_action'
@@ -2561,7 +2545,7 @@ export class AcpClientManager {
         oldestIdle = w;
       }
     }
-    if (oldestIdle) {
+    if (oldestIdle && !this.isWorkerBusy(oldestIdle)) {
       void this.stopWorkerByKey(oldestIdle.key);
     }
   }
