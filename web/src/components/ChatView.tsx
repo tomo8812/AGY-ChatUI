@@ -100,12 +100,18 @@ const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ too
       {toolCalls.map((tc) => {
         const isOpen = Boolean(openIds[tc.toolCallId]);
         const subagent = isSubagentTool(tc);
-        const isRunning = tc.status === 'in_progress' || tc.status === 'pending';
+        const isSubagentActive =
+          tc.subagentState === 'running' || tc.subagentState === 'requires_action';
+        const isRunning =
+          tc.status === 'in_progress' || tc.status === 'pending' || isSubagentActive;
         const isFailed = tc.status === 'failed';
         const displayTitle = tc.subagentLabel || tc.title;
         const hasDetails =
           Boolean(tc.locations && tc.locations.length > 0) ||
           Boolean(tc.contentText) ||
+          Boolean(tc.subagentThoughtsText) ||
+          Boolean(tc.subagentContentText) ||
+          Boolean(tc.subagentToolCalls && tc.subagentToolCalls.length > 0) ||
           tc.rawInput !== undefined ||
           tc.rawOutput !== undefined;
 
@@ -135,6 +141,11 @@ const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ too
               <span className="owui-tool-title truncate">
                 {isRunning ? `実行中: ${displayTitle}` : displayTitle}
               </span>
+              {tc.subagentState && tc.subagentState !== 'idle' && (
+                <span className="muted-xs" style={{ marginLeft: 6 }}>
+                  ({tc.subagentState})
+                </span>
+              )}
               {isFailed && <span className="owui-tool-fail-label">失敗</span>}
               {hasDetails && (
                 <ChevronIcon size={13} dir={isOpen ? 'down' : 'right'} className="owui-disclosure-chevron" />
@@ -148,6 +159,29 @@ const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ too
                   </div>
                 )}
                 {tc.contentText && <pre className="tool-json">{tc.contentText}</pre>}
+                {tc.subagentThoughtsText && (
+                  <div style={{ marginTop: 6 }}>
+                    <div className="muted-xs">Subagent Thoughts</div>
+                    <pre className="tool-json">{tc.subagentThoughtsText}</pre>
+                  </div>
+                )}
+                {tc.subagentToolCalls && tc.subagentToolCalls.length > 0 && (
+                  <div style={{ marginTop: 6 }}>
+                    <div className="muted-xs">Subagent Tools ({tc.subagentToolCalls.length})</div>
+                    {tc.subagentToolCalls.map((stc) => (
+                      <div key={stc.toolCallId} className="muted-xs" style={{ marginTop: 2 }}>
+                        [{stc.status}] {stc.title}
+                        {stc.contentText ? `: ${stc.contentText}` : ''}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {tc.subagentContentText && (
+                  <div style={{ marginTop: 6 }}>
+                    <div className="muted-xs">Subagent Output</div>
+                    <pre className="tool-json">{tc.subagentContentText}</pre>
+                  </div>
+                )}
                 {tc.rawInput !== undefined && (
                   <pre className="tool-json">{JSON.stringify(tc.rawInput, null, 2)}</pre>
                 )}
@@ -328,6 +362,22 @@ const MessageRow: React.FC<{
           />
 
           <ToolCallsList toolCalls={msg.toolCalls} />
+
+          {msg.sessionMessages && msg.sessionMessages.length > 0 && (
+            <div className="owui-tools-list" aria-label="セッション間メッセージ">
+              {msg.sessionMessages.map((sm) => (
+                <div key={sm.messageId} className="owui-tool-item">
+                  <div className="owui-tool-body" style={{ display: 'block' }}>
+                    <div className="muted-xs">
+                      セッション間メッセージ{sm.senderSessionId ? ` (${sm.senderSessionId})` : ''}
+                      {!sm.done ? ' [受信中]' : ''}
+                    </div>
+                    {sm.contentText && <pre className="tool-json">{sm.contentText}</pre>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
 
           {msgPerms.map((perm) => (
             <PermissionCard

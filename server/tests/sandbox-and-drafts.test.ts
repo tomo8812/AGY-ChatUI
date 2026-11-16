@@ -278,7 +278,7 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
     }
   });
 
-  it('auto-syncs subagent brain images into generated/ and waits for native Reactive Wakeup continuation', async () => {
+  it('auto-syncs subagent brain images into generated/ and delivers native Reactive Wakeup continuation asynchronously after end_turn', async () => {
     const srv = await createTestServer();
     cleanups.push(srv.cleanup);
 
@@ -293,12 +293,23 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
     const chatId = chatRes.data.chat.id;
     const workspaceDir = chatRes.data.chat.workspaceDir;
 
-    // Native subagent brain image generation must sync to /workspace/generated/, mark isSubagent, and wait for Reactive Wakeup continuation
+    // Native subagent brain image generation must finish foreground turn on end_turn and
+    // sync background Reactive Wakeup continuation + generated/ artifact asynchronously
     await alice.request('POST', `/api/chats/${chatId}/messages`, {
       text: 'Generate cyber cat [SUBAGENT_IMAGE]',
     });
     await alice.waitForFrame(
       (f) => f.kind === 'event' && (f.event as { type: string }).type === 'run.finished'
+    );
+    await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { message?: { contentText?: string } } }).type ===
+          'message.updated' &&
+        Boolean(
+          (f.event as { payload?: { message?: { contentText?: string } } }).payload?.message
+            ?.contentText?.includes('サブエージェントによる画像生成が完了しました')
+        )
     );
 
     const detailAfterSubagent = await alice.request<{

@@ -18,6 +18,7 @@ import type {
   QuotaBucket,
   QuotaSnapshotRecord,
   RunRecord,
+  SessionMessageItem,
   SyncEventEnvelope,
   ToolCallItem,
   UserPreferences,
@@ -161,6 +162,7 @@ export class AppDatabase {
         content_text TEXT NOT NULL DEFAULT '',
         thoughts_text TEXT NOT NULL DEFAULT '',
         tool_calls_json TEXT NOT NULL DEFAULT '[]',
+        session_messages_json TEXT NOT NULL DEFAULT '[]',
         attachments_json TEXT NOT NULL DEFAULT '[]',
         artifact_refs_json TEXT NOT NULL DEFAULT '[]',
         status TEXT NOT NULL DEFAULT 'completed',
@@ -255,6 +257,10 @@ export class AppDatabase {
     }
     if (!prefCols.some((col) => col.name === 'haptic_feedback')) {
       this.db.exec('ALTER TABLE user_preferences ADD COLUMN haptic_feedback INTEGER NOT NULL DEFAULT 1;');
+    }
+    const msgCols = this.db.prepare('PRAGMA table_info(messages)').all() as Array<{ name: string }>;
+    if (!msgCols.some((col) => col.name === 'session_messages_json')) {
+      this.db.exec("ALTER TABLE messages ADD COLUMN session_messages_json TEXT NOT NULL DEFAULT '[]';");
     }
   }
 
@@ -922,6 +928,7 @@ export class AppDatabase {
     contentText?: string;
     thoughtsText?: string;
     toolCalls?: ToolCallItem[];
+    sessionMessages?: SessionMessageItem[];
     attachments?: AttachmentRef[];
     artifactIds?: string[];
     status: 'queued' | 'streaming' | 'completed' | 'cancelled' | 'error';
@@ -933,8 +940,8 @@ export class AppDatabase {
       .prepare(
         `INSERT INTO messages (
            id, chat_id, user_id, client_message_id, role, content_text, thoughts_text,
-           tool_calls_json, attachments_json, artifact_refs_json, status, run_id, error_message, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
+           tool_calls_json, session_messages_json, attachments_json, artifact_refs_json, status, run_id, error_message, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
       )
       .run(
         params.id,
@@ -945,6 +952,7 @@ export class AppDatabase {
         params.contentText ?? '',
         params.thoughtsText ?? '',
         JSON.stringify(params.toolCalls ?? []),
+        JSON.stringify(params.sessionMessages ?? []),
         JSON.stringify(params.attachments ?? []),
         JSON.stringify(params.artifactIds ?? []),
         params.status,
@@ -962,6 +970,7 @@ export class AppDatabase {
       contentText?: string;
       thoughtsText?: string;
       toolCalls?: ToolCallItem[];
+      sessionMessages?: SessionMessageItem[];
       artifactIds?: string[];
       status?: 'queued' | 'streaming' | 'completed' | 'cancelled' | 'error';
       runId?: string | null;
@@ -974,7 +983,7 @@ export class AppDatabase {
     this.db
       .prepare(
         `UPDATE messages
-         SET content_text = ?, thoughts_text = ?, tool_calls_json = ?, artifact_refs_json = ?,
+         SET content_text = ?, thoughts_text = ?, tool_calls_json = ?, session_messages_json = ?, artifact_refs_json = ?,
              status = ?, run_id = ?, error_message = ?, updated_at = ?
          WHERE id = ? AND user_id = ?`
       )
@@ -982,6 +991,7 @@ export class AppDatabase {
         patch.contentText ?? cur.contentText,
         patch.thoughtsText ?? cur.thoughtsText,
         JSON.stringify(patch.toolCalls ?? cur.toolCalls),
+        JSON.stringify(patch.sessionMessages ?? cur.sessionMessages ?? []),
         JSON.stringify(patch.artifactIds ?? cur.artifactIds),
         patch.status ?? cur.status,
         patch.runId !== undefined ? patch.runId : cur.runId,
@@ -1000,6 +1010,7 @@ export class AppDatabase {
   }
 
   private mapMessage(r: Record<string, unknown>): MessageRecord {
+    const rawSessionMessages = r.session_messages_json ? String(r.session_messages_json) : '[]';
     return {
       id: String(r.id),
       chatId: String(r.chat_id),
@@ -1009,6 +1020,7 @@ export class AppDatabase {
       contentText: String(r.content_text),
       thoughtsText: String(r.thoughts_text),
       toolCalls: JSON.parse(String(r.tool_calls_json)) as ToolCallItem[],
+      sessionMessages: JSON.parse(rawSessionMessages) as SessionMessageItem[],
       attachments: JSON.parse(String(r.attachments_json)) as AttachmentRef[],
       artifactIds: JSON.parse(String(r.artifact_refs_json)) as string[],
       status: r.status as MessageRecord['status'],
@@ -1087,6 +1099,14 @@ export class AppDatabase {
   ): RunRecord | null {
     const cur = this.getRun(userId, runId);
     if (!cur) return null;
+    const isTerminal =
+      cur.status === 'completed' || cur.status === 'cancelled' || cur.status === 'error';
+    const nextStatus =
+      isTerminal &&
+      patch.status &&
+      (patch.status === 'queued' || patch.status === 'running' || patch.status === 'awaiting_permission')
+        ? cur.status
+        : (patch.status ?? cur.status);
     this.db
       .prepare(
         `UPDATE runs
@@ -1094,7 +1114,7 @@ export class AppDatabase {
          WHERE id = ? AND user_id = ?`
       )
       .run(
-        patch.status ?? cur.status,
+        nextStatus,
         patch.queuePosition ?? cur.queuePosition,
         patch.stopReason !== undefined ? patch.stopReason : cur.stopReason,
         patch.errorMessage !== undefined ? patch.errorMessage : cur.errorMessage,

@@ -612,6 +612,225 @@ function runAcpServer(): void {
         return { stopReason: 'end_turn' as const };
       }
 
+      // [DELAYED_SUBAGENT]: invoke_subagent completes BEFORE subagent_update(running) arrives (#18, #5, #6, #13)
+      if (promptText.includes('[DELAYED_SUBAGENT]')) {
+        const subToolId = `tc-delayed-sub-${Date.now()}`;
+        const childSessionId = `${state.id}-delayed-sub-1`;
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: subToolId,
+            title: 'invoke_subagent',
+            kind: 'other',
+            status: 'in_progress',
+            rawInput: {
+              Subagents: [{ TypeName: 'research', Role: 'Delayed Worker', Prompt: 'Research' }],
+            },
+          },
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: subToolId,
+            status: 'completed',
+            rawOutput: { conversationId: childSessionId },
+          },
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: '非同期サブエージェントを起動しました。' },
+          },
+        });
+
+        void (async () => {
+          await delay(60);
+          if (state.cancelled) return;
+          await sendUpdate({
+            sessionId: state.id,
+            update: {
+              sessionUpdate: 'subagent_update',
+              sessionId: childSessionId,
+              toolCallId: subToolId,
+              title: 'Delayed Worker',
+              state: { state: 'running' },
+            },
+          });
+          await sendUpdate({
+            sessionId: childSessionId,
+            update: {
+              sessionUpdate: 'agent_thought_chunk',
+              content: { type: 'text', text: '子セッション思考ログ: 詳細解析中...' },
+            },
+          });
+          await sendUpdate({
+            sessionId: childSessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: `${childSessionId}-tc-1`,
+              title: 'child_read_file',
+              kind: 'read',
+              status: 'completed',
+            },
+          });
+          const longChildText = '子セッション出力テスト: ' + 'A'.repeat(350);
+          await sendUpdate({
+            sessionId: childSessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: longChildText },
+            },
+          });
+          fs.writeFileSync(path.join(state.cwd, 'delayed-output.txt'), 'created in background\n', 'utf8');
+          await sendUpdate({
+            sessionId: childSessionId,
+            update: {
+              sessionUpdate: 'state_update',
+              state: 'idle',
+              stopReason: 'end_turn',
+            },
+          });
+        })();
+
+        return { stopReason: 'end_turn' as const };
+      }
+
+      // [BG_PERMISSION]: requestPermission arrives after end_turn (#3)
+      if (promptText.includes('[BG_PERMISSION]')) {
+        const bgToolId = `tc-bg-perm-${Date.now()}`;
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'バックグラウンド処理を開始しました。' },
+          },
+        });
+
+        void (async () => {
+          await delay(50);
+          if (state.cancelled) return;
+          const permRes = await ctx.client.request(methods.client.session.requestPermission, {
+            sessionId: state.id,
+            toolCall: {
+              toolCallId: bgToolId,
+              title: '背景ファイル bg-permitted.txt の作成許可',
+              kind: 'edit',
+              status: 'pending',
+              locations: [{ path: path.join(state.cwd, 'bg-permitted.txt') }],
+            },
+            options: [
+              { optionId: 'allow_once', name: '許可', kind: 'allow_once' },
+              { optionId: 'reject_once', name: '拒否', kind: 'reject_once' },
+            ],
+          });
+          if (permRes.outcome.outcome === 'selected') {
+            fs.writeFileSync(path.join(state.cwd, 'bg-permitted.txt'), 'bg permitted\n', 'utf8');
+            await sendUpdate({
+              sessionId: state.id,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: '背景Permissionが承認され完了しました。' },
+              },
+            });
+          }
+        })();
+
+        return { stopReason: 'end_turn' as const };
+      }
+
+      // [SESSION_MESSAGE_TEST]: session_message and session_message_chunk (#7)
+      if (promptText.includes('[SESSION_MESSAGE_TEST]')) {
+        const interId = `inter-msg-${Date.now()}`;
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'session_message',
+            messageId: interId,
+            senderSessionId: `${state.id}-worker-a`,
+            recipientSessionId: state.id,
+            content: [{ type: 'text', text: '初期本文:' }],
+          } as never,
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'session_message_chunk',
+            messageId: interId,
+            content: { type: 'text', text: 'チャンク追記完了' },
+            done: true,
+          } as never,
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'セッション間メッセージを受信しました。' },
+          },
+        });
+        return { stopReason: 'end_turn' as const };
+      }
+
+      // [MULTI_TURN_BG]: Turn A background subagent finishes after Turn B starts (#2)
+      if (promptText.includes('[MULTI_TURN_BG]')) {
+        const subToolId = `tc-turn-a-${Date.now()}`;
+        const childSessionId = `${state.id}-turn-a-sub`;
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: subToolId,
+            title: 'invoke_subagent',
+            kind: 'other',
+            status: 'completed',
+            rawInput: { Subagents: [{ TypeName: 'research', Role: 'TurnA Worker', Prompt: 'A' }] },
+          },
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'subagent_update',
+            sessionId: childSessionId,
+            toolCallId: subToolId,
+            title: 'TurnA Worker',
+            state: { state: 'running' },
+          },
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'ターンA初期応答' },
+          },
+        });
+
+        void (async () => {
+          await delay(150);
+          if (state.cancelled) return;
+          await sendUpdate({
+            sessionId: childSessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'ターンA子の遅延出力' },
+            },
+          });
+          await sendUpdate({
+            sessionId: state.id,
+            update: {
+              sessionUpdate: 'subagent_update',
+              sessionId: childSessionId,
+              toolCallId: subToolId,
+              title: 'TurnA Worker',
+              state: { state: 'idle', stopReason: 'end_turn' },
+            },
+          });
+        })();
+
+        return { stopReason: 'end_turn' as const };
+      }
+
       // Tool call & interactive permission check
       if (promptText.includes('[PERMISSION]')) {
         const toolCallId = `tc-${Date.now()}`;

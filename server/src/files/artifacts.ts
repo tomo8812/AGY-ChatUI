@@ -72,6 +72,7 @@ export function syncWorkspaceChangesAsArtifacts(params: {
   runId: string | null;
   before: WorkspaceSnapshot;
   hintPaths?: string[];
+  skipIfAlreadyOwnedByOtherMessage?: boolean;
 }): ArtifactRecord[] {
   const registered: ArtifactRecord[] = [];
   if (!fs.existsSync(params.workspaceDir)) return registered;
@@ -86,6 +87,10 @@ export function syncWorkspaceChangesAsArtifacts(params: {
     }
   }
 
+  const existingByRelPath = params.skipIfAlreadyOwnedByOtherMessage
+    ? new Map(params.db.listArtifactsForChat(params.userId, params.chatId).map((a) => [a.relPath, a]))
+    : null;
+
   const currentMap = captureWorkspaceSnapshot(rootReal);
   for (const [relPath, after] of currentMap.entries()) {
     const prev = params.before.get(relPath);
@@ -96,6 +101,17 @@ export function syncWorkspaceChangesAsArtifacts(params: {
     }
     if (isInitialProjectCopy && !changed && !hintSet.has(relPath)) {
       continue;
+    }
+    if (existingByRelPath && !hintSet.has(relPath)) {
+      const existing = existingByRelPath.get(relPath);
+      if (
+        existing &&
+        existing.messageId &&
+        existing.messageId !== params.messageId &&
+        existing.sha256 === after.sha256
+      ) {
+        continue;
+      }
     }
 
     const absPath = path.join(rootReal, relPath);

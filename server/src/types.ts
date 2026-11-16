@@ -86,6 +86,29 @@ export interface ChatRecord {
   lastMessageAt: number;
 }
 
+export interface SubagentActivityItem {
+  toolCallId: string;
+  title: string;
+  name?: string;
+  kind?: string;
+  status: string;
+  contentText?: string;
+  rawInput?: unknown;
+  rawOutput?: unknown;
+  locations?: Array<{ path: string; line?: number | null }>;
+}
+
+export interface SessionMessageItem {
+  messageId: string;
+  senderSessionId?: string | null;
+  recipientSessionId?: string | null;
+  senderMessageId?: string | null;
+  recipientMessageId?: string | null;
+  contentText: string;
+  done: boolean;
+  updatedAt: number;
+}
+
 export interface ToolCallItem {
   toolCallId: string;
   title: string;
@@ -94,6 +117,12 @@ export interface ToolCallItem {
   status: 'pending' | 'in_progress' | 'completed' | 'failed' | string;
   isSubagent?: boolean;
   subagentLabel?: string;
+  subagentSessionId?: string;
+  subagentState?: 'running' | 'idle' | 'requires_action' | 'unknown';
+  subagentStopReason?: string | null;
+  subagentThoughtsText?: string;
+  subagentContentText?: string;
+  subagentToolCalls?: SubagentActivityItem[];
   rawInput?: unknown;
   rawOutput?: unknown;
   locations?: Array<{ path: string; line?: number | null }>;
@@ -134,6 +163,7 @@ export interface MessageRecord {
   contentText: string;
   thoughtsText: string;
   toolCalls: ToolCallItem[];
+  sessionMessages?: SessionMessageItem[];
   attachments: AttachmentRef[];
   artifactIds: string[];
   status: 'queued' | 'streaming' | 'completed' | 'cancelled' | 'error';
