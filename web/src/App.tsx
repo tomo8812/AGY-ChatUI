@@ -737,8 +737,16 @@ export const App: React.FC = () => {
             setDraftCreatedChat(null);
           }
           setChats((prev) => {
+            const existing = prev.find((c) => c.id === chat.id);
+            const effectiveRun =
+              existing?.activeRun &&
+              (existing.activeRun.status === 'running' ||
+                existing.activeRun.status === 'awaiting_permission') &&
+              run?.status === 'queued'
+                ? existing.activeRun
+                : (run ?? null);
             const others = prev.filter((c) => c.id !== chat.id);
-            return [{ ...chat, activeRun: run ?? null }, ...others];
+            return [{ ...chat, activeRun: effectiveRun }, ...others];
           });
         }
         if (evt.chatId === curChatId) {
@@ -749,7 +757,15 @@ export const App: React.FC = () => {
             }
             return copy;
           });
-          if (run) setActiveRun(run);
+          if (run) {
+            setActiveRun((cur) =>
+              cur &&
+              (cur.status === 'running' || cur.status === 'awaiting_permission') &&
+              run.status === 'queued'
+                ? cur
+                : run
+            );
+          }
         }
         break;
       }
@@ -787,10 +803,13 @@ export const App: React.FC = () => {
       case 'run.finished': {
         const run = p.run as RunRecord | undefined;
         const msg = p.message as MessageRecord | undefined;
+        const nextActiveRun = (p.nextActiveRun as RunRecord | null | undefined) ?? null;
         if (run) {
           setChats((prev) =>
             prev.map((c) =>
-              c.id === run.chatId && c.activeRun?.id === run.id ? { ...c, activeRun: null } : c
+              c.id === run.chatId && c.activeRun?.id === run.id
+                ? { ...c, activeRun: nextActiveRun }
+                : c
             )
           );
         }
@@ -799,7 +818,7 @@ export const App: React.FC = () => {
         }
         if (evt.chatId === curChatId) {
           if (run) {
-            setActiveRun((cur) => (cur?.id === run.id ? null : cur));
+            setActiveRun((cur) => (cur?.id === run.id ? nextActiveRun : cur));
             setPendingPermissions((prev) => prev.filter((perm) => perm.runId !== run.id));
           }
           if (msg) {
@@ -1339,10 +1358,20 @@ export const App: React.FC = () => {
       }
       const promotedChat = res.chat ?? (wasDraft && draftSnap?.id === chatId ? draftSnap : undefined);
       if (promotedChat) {
-        setChats((prev) => [
-          { ...promotedChat, activeRun: res.run },
-          ...prev.filter((c) => c.id !== promotedChat.id),
-        ]);
+        setChats((prev) => {
+          const existing = prev.find((c) => c.id === promotedChat.id);
+          const effectiveRun =
+            existing?.activeRun &&
+            (existing.activeRun.status === 'running' ||
+              existing.activeRun.status === 'awaiting_permission') &&
+            res.run.status === 'queued'
+              ? existing.activeRun
+              : res.run;
+          return [
+            { ...promotedChat, activeRun: effectiveRun },
+            ...prev.filter((c) => c.id !== promotedChat.id),
+          ];
+        });
       }
 
       setMessages((prev) => {
@@ -1351,7 +1380,13 @@ export const App: React.FC = () => {
         if (!copy.some((m) => m.id === res.assistantMessage.id)) copy.push(res.assistantMessage);
         return copy;
       });
-      setActiveRun(res.run);
+      setActiveRun((cur) =>
+        cur &&
+        (cur.status === 'running' || cur.status === 'awaiting_permission') &&
+        res.run.status === 'queued'
+          ? cur
+          : res.run
+      );
       void triggerQuotaRefresh(true, 5_000);
     },
     [createDraftBackedChat, triggerQuotaRefresh]

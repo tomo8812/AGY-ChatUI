@@ -7,7 +7,9 @@ import {
   buildAgyCommandSpec,
   buildIsolatedAgyEnv,
   clearSandboxProbeCache,
+  getChatBrainHostDir,
   probeBwrapSandbox,
+  SANDBOX_HOME_MOUNT,
   SANDBOX_WORKSPACE_MOUNT,
 } from '../src/acp/env-isolation.js';
 import { loadConfig } from '../src/config.js';
@@ -238,8 +240,9 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
       expect(spec.sandboxed).toBe(true);
       expect(spec.sandboxWorkspaceRoot).toBe(SANDBOX_WORKSPACE_MOUNT);
       expect(spec.command).toBe('/usr/bin/bwrap');
-      // Must NOT mount host root `/`
+      // Must NOT mount host root `/` or expose host profileDir path
       expect(hasContiguousSlice(spec.args, ['--ro-bind', '/', '/'])).toBe(false);
+      expect(hasContiguousSlice(spec.args, ['--bind', profileDir, profileDir])).toBe(false);
       // Namespace isolation, cap drop, and workspace bind at /workspace
       expect(hasContiguousSlice(spec.args, ['--unshare-pid'])).toBe(true);
       expect(hasContiguousSlice(spec.args, ['--unshare-ipc'])).toBe(true);
@@ -250,7 +253,16 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
       expect(hasContiguousSlice(spec.args, ['--dir', '/home'])).toBe(true);
       expect(hasContiguousSlice(spec.args, ['--dir', '/root'])).toBe(true);
       expect(hasContiguousSlice(spec.args, ['--bind', workspaceDir, '/workspace'])).toBe(true);
-      expect(hasContiguousSlice(spec.args, ['--bind', profileDir, profileDir])).toBe(true);
+      expect(hasContiguousSlice(spec.args, ['--bind', profileDir, SANDBOX_HOME_MOUNT])).toBe(true);
+      const chatBrainHostDir = getChatBrainHostDir(profileDir, workspaceDir);
+      expect(
+        hasContiguousSlice(spec.args, [
+          '--bind',
+          chatBrainHostDir,
+          `${SANDBOX_HOME_MOUNT}/.gemini/antigravity-cli/brain`,
+        ])
+      ).toBe(true);
+      expect(spec.env.HOME).toBe(SANDBOX_HOME_MOUNT);
       expect(hasContiguousSlice(spec.args, ['--chdir', '/workspace'])).toBe(true);
       expect(hasContiguousSlice(spec.args, ['--ro-bind', fs.realpathSync(extBin), '/opt/agy/agy'])).toBe(
         true
@@ -264,6 +276,61 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
       const hostPasswd = spec.args[passwdIdx - 1];
       expect(fs.readFileSync(hostPasswd, 'utf8')).toContain(`:${SANDBOX_WORKSPACE_MOUNT}:/bin/bash`);
     }
+  });
+
+  it('auto-syncs subagent brain images into generated/ and waits for native Reactive Wakeup continuation', async () => {
+    const srv = await createTestServer();
+    cleanups.push(srv.cleanup);
+
+    const { client: alice } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+    await alice.connectWs();
+
+    const chatRes = await alice.request<{ chat: { id: string; workspaceDir: string } }>(
+      'POST',
+      '/api/chats',
+      { title: 'Subagent Native Continuation' }
+    );
+    const chatId = chatRes.data.chat.id;
+    const workspaceDir = chatRes.data.chat.workspaceDir;
+
+    // Native subagent brain image generation must sync to /workspace/generated/, mark isSubagent, and wait for Reactive Wakeup continuation
+    await alice.request('POST', `/api/chats/${chatId}/messages`, {
+      text: 'Generate cyber cat [SUBAGENT_IMAGE]',
+    });
+    await alice.waitForFrame(
+      (f) => f.kind === 'event' && (f.event as { type: string }).type === 'run.finished'
+    );
+
+    const detailAfterSubagent = await alice.request<{
+      messages: Array<{
+        role: string;
+        contentText: string;
+        toolCalls: Array<{
+          title: string;
+          status: string;
+          isSubagent?: boolean;
+          subagentLabel?: string;
+        }>;
+      }>;
+      artifacts: Array<{ id: string; filename: string; relPath: string }>;
+    }>('GET', `/api/chats/${chatId}`);
+
+    const assistantMsgs = detailAfterSubagent.data.messages.filter((m) => m.role === 'assistant');
+    const latestAssistant = assistantMsgs[assistantMsgs.length - 1];
+    expect(latestAssistant).toBeTruthy();
+    expect(latestAssistant.toolCalls).toHaveLength(1);
+    expect(latestAssistant.toolCalls[0].isSubagent).toBe(true);
+    expect(latestAssistant.toolCalls[0].status).toBe('completed');
+    // Automatic continuation response and generated/ link should be present
+    expect(latestAssistant.contentText).toContain('サブエージェントによる画像生成が完了しました');
+    expect(latestAssistant.contentText).toContain('subagent-art.png');
+    // File exists in workspace/generated/subagent-art.png and is registered as an artifact
+    expect(fs.existsSync(path.join(workspaceDir, 'generated', 'subagent-art.png'))).toBe(true);
+    expect(
+      detailAfterSubagent.data.artifacts.some((a) => a.relPath === 'generated/subagent-art.png')
+    ).toBe(true);
+
+    alice.closeWs();
   });
 
   it('reports sandbox status cleanly via probeBwrapSandbox and authenticated bootstrap endpoints', async () => {

@@ -89,8 +89,11 @@ export interface ChatRecord {
 export interface ToolCallItem {
   toolCallId: string;
   title: string;
+  name?: string;
   kind?: string;
   status: 'pending' | 'in_progress' | 'completed' | 'failed' | string;
+  isSubagent?: boolean;
+  subagentLabel?: string;
   rawInput?: unknown;
   rawOutput?: unknown;
   locations?: Array<{ path: string; line?: number | null }>;

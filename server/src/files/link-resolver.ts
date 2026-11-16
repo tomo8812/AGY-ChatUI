@@ -1,7 +1,11 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { SANDBOX_WORKSPACE_MOUNT } from '../acp/env-isolation.js';
+import {
+  getChatBrainHostDir,
+  SANDBOX_HOME_MOUNT,
+  SANDBOX_WORKSPACE_MOUNT,
+} from '../acp/env-isolation.js';
 import type { AppDatabase } from '../db/database.js';
 import type { ArtifactRecord, ToolCallItem } from '../types.js';
 import {
@@ -23,10 +27,26 @@ const ALLOWED_BRAIN_ROOT_REL_PATHS = [
   path.join('.gemini', 'antigravity-cli', 'brain'),
   path.join('.gemini', 'antigravity', 'brain'),
   path.join('.gemini', 'jetski', 'brain'),
+  path.join('.gemini', 'brain'),
 ] as const;
 
-export function getAllowedBrainRoots(profileDir: string): string[] {
-  return ALLOWED_BRAIN_ROOT_REL_PATHS.map((rel) => path.resolve(profileDir, rel));
+const INTERNAL_BRAIN_EXCLUDED_EXTENSIONS = new Set([
+  '.jsonl',
+  '.lock',
+  '.pid',
+  '.tmp',
+  '.part',
+]);
+
+export function getAllowedBrainRoots(profileDir: string, workspaceDir?: string | null): string[] {
+  const roots: string[] = [];
+  if (workspaceDir) {
+    roots.push(getChatBrainHostDir(profileDir, workspaceDir));
+  }
+  for (const rel of ALLOWED_BRAIN_ROOT_REL_PATHS) {
+    roots.push(path.resolve(profileDir, rel));
+  }
+  return roots;
 }
 
 export function normalizeLinkCandidatePath(rawReference: string): string | null {
@@ -51,6 +71,7 @@ export function normalizeLinkCandidatePath(rawReference: string): string | null 
 
 export function resolveAuthorizedBrainFile(params: {
   profileDir: string;
+  workspaceDir?: string | null;
   candidatePath: string;
 }): { absPath: string; relUnderBrain: string } | null {
   let normalized = params.candidatePath.trim();
@@ -62,7 +83,38 @@ export function resolveAuthorizedBrainFile(params: {
     return null;
   }
 
-  for (const brainRoot of getAllowedBrainRoots(params.profileDir)) {
+  const candidateVariants = new Set<string>([normalized]);
+  if (normalized.startsWith(`${SANDBOX_HOME_MOUNT}/`)) {
+    const relFromHome = normalized.slice(SANDBOX_HOME_MOUNT.length + 1);
+    candidateVariants.add(path.join(params.profileDir, relFromHome));
+    if (params.workspaceDir) {
+      for (const brainRel of ALLOWED_BRAIN_ROOT_REL_PATHS) {
+        const prefix = `${brainRel.split(path.sep).join('/')}/`;
+        if (relFromHome.startsWith(prefix)) {
+          const underBrain = relFromHome.slice(prefix.length);
+          candidateVariants.add(
+            path.join(getChatBrainHostDir(params.profileDir, params.workspaceDir), underBrain)
+          );
+        }
+      }
+    }
+  } else if (params.workspaceDir) {
+    const profileAbs = path.resolve(params.profileDir);
+    if (normalized.startsWith(`${profileAbs}/`)) {
+      const relFromHome = normalized.slice(profileAbs.length + 1).split(path.sep).join('/');
+      for (const brainRel of ALLOWED_BRAIN_ROOT_REL_PATHS) {
+        const prefix = `${brainRel.split(path.sep).join('/')}/`;
+        if (relFromHome.startsWith(prefix)) {
+          const underBrain = relFromHome.slice(prefix.length);
+          candidateVariants.add(
+            path.join(getChatBrainHostDir(params.profileDir, params.workspaceDir), underBrain)
+          );
+        }
+      }
+    }
+  }
+
+  for (const brainRoot of getAllowedBrainRoots(params.profileDir, params.workspaceDir)) {
     if (!fs.existsSync(brainRoot)) continue;
     let brainReal: string;
     try {
@@ -70,21 +122,232 @@ export function resolveAuthorizedBrainFile(params: {
     } catch {
       continue;
     }
-    try {
-      const resolved = resolveContainedExistingPath(brainReal, normalized);
-      // Never expose internal dot-directories / metadata files inside brain (e.g. .system_generated)
-      const segments = resolved.relPath.split('/');
-      if (segments.some((seg) => seg.startsWith('.'))) {
-        continue;
+    for (const variant of candidateVariants) {
+      try {
+        const resolved = resolveContainedExistingPath(brainReal, variant);
+        // Never expose internal dot-directories / metadata files inside brain (e.g. .system_generated)
+        const segments = resolved.relPath.split('/');
+        if (segments.some((seg) => seg.startsWith('.'))) {
+          continue;
+        }
+        const stat = fs.statSync(resolved.absPath);
+        if (!stat.isFile()) continue;
+        return { absPath: resolved.absPath, relUnderBrain: resolved.relPath };
+      } catch {
+        // Not contained inside this brainRoot
       }
-      const stat = fs.statSync(resolved.absPath);
-      if (!stat.isFile()) continue;
-      return { absPath: resolved.absPath, relUnderBrain: resolved.relPath };
-    } catch {
-      // Not contained inside this brainRoot
     }
   }
   return null;
+}
+
+export interface BrainSnapshotEntry {
+  absPath: string;
+  relUnderBrain: string;
+  sizeBytes: number;
+  mtimeMs: number;
+}
+
+function isDeliverableBrainFile(relUnderBrain: string): boolean {
+  const segments = relUnderBrain.split('/');
+  if (segments.some((seg) => !seg || seg.startsWith('.'))) {
+    return false;
+  }
+  const base = segments[segments.length - 1] ?? '';
+  const ext = path.extname(base).toLowerCase();
+  if (INTERNAL_BRAIN_EXCLUDED_EXTENSIONS.has(ext)) {
+    return false;
+  }
+  return true;
+}
+
+export function captureBrainSnapshot(
+  profileDir: string,
+  workspaceDir?: string | null
+): Map<string, BrainSnapshotEntry> {
+  const snap = new Map<string, BrainSnapshotEntry>();
+  const roots = getAllowedBrainRoots(profileDir, workspaceDir);
+
+  const walk = (rootReal: string, currentDir: string) => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(currentDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue;
+      if (entry.isSymbolicLink()) continue;
+      const fullPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        walk(rootReal, fullPath);
+      } else if (entry.isFile()) {
+        try {
+          const real = fs.realpathSync(fullPath);
+          const rel = path.relative(rootReal, real).split(path.sep).join('/');
+          if (!isDeliverableBrainFile(rel)) continue;
+          const st = fs.statSync(real);
+          snap.set(real, {
+            absPath: real,
+            relUnderBrain: rel,
+            sizeBytes: st.size,
+            mtimeMs: st.mtimeMs,
+          });
+        } catch {
+          // ignore transient files
+        }
+      }
+    }
+  };
+
+  for (const root of roots) {
+    if (!fs.existsSync(root)) continue;
+    try {
+      const rootReal = fs.realpathSync(root);
+      walk(rootReal, rootReal);
+    } catch {
+      // ignore
+    }
+  }
+  return snap;
+}
+
+export interface SyncedBrainFile {
+  brainAbsPath: string;
+  relUnderBrain: string;
+  workspaceAbsPath: string;
+  workspaceRelPath: string;
+  filename: string;
+}
+
+export function syncNewBrainFilesToWorkspace(params: {
+  profileDir: string;
+  workspaceDir: string;
+  beforeSnap: Map<string, BrainSnapshotEntry>;
+}): SyncedBrainFile[] {
+  const afterSnap = captureBrainSnapshot(params.profileDir, params.workspaceDir);
+  const synced: SyncedBrainFile[] = [];
+
+  for (const [absPath, entry] of afterSnap.entries()) {
+    if (entry.sizeBytes <= 0) continue;
+    const prev = params.beforeSnap.get(absPath);
+    if (prev && prev.sizeBytes === entry.sizeBytes && prev.mtimeMs === entry.mtimeMs) {
+      continue;
+    }
+    try {
+      const imported = importAuthorizedBrainFileToWorkspace({
+        workspaceDir: params.workspaceDir,
+        sourceAbsPath: absPath,
+      });
+      synced.push({
+        brainAbsPath: absPath,
+        relUnderBrain: entry.relUnderBrain,
+        workspaceAbsPath: imported.absPath,
+        workspaceRelPath: imported.relPath,
+        filename: path.basename(imported.relPath),
+      });
+    } catch {
+      // ignore failed import
+    }
+  }
+
+  return synced;
+}
+
+export function rewriteInternalPathsToWorkspace(
+  text: string,
+  profileDir: string,
+  workspaceDir?: string | null
+): string {
+  if (!text) return text;
+  const profileAbs = path.resolve(profileDir);
+
+  return text.replace(/(file:\/\/)?(\/[^\s"'`<>)\]」』】》〉、。]+)/g, (fullMatch, filePrefix: string | undefined, rawPath: string) => {
+    const trailingMatch = /([.,;:!?]+)$/.exec(rawPath);
+    const trailing = trailingMatch ? trailingMatch[1] : '';
+    const cleanRaw = trailing ? rawPath.slice(0, -trailing.length) : rawPath;
+    const normalized = normalizeLinkCandidatePath(cleanRaw);
+
+    if (normalized) {
+      const brainResolved = resolveAuthorizedBrainFile({
+        profileDir: profileAbs,
+        workspaceDir,
+        candidatePath: normalized,
+      });
+      if (brainResolved && workspaceDir) {
+        try {
+          const imported = importAuthorizedBrainFileToWorkspace({
+            workspaceDir,
+            sourceAbsPath: brainResolved.absPath,
+          });
+          const replacementPath = `${SANDBOX_WORKSPACE_MOUNT}/${imported.relPath}`;
+          return `${filePrefix ?? ''}${replacementPath}${trailing}`;
+        } catch {
+          // fallback below
+        }
+      }
+      if (brainResolved) {
+        const fname = sanitizeFileName(path.basename(brainResolved.absPath));
+        return `${filePrefix ?? ''}${SANDBOX_WORKSPACE_MOUNT}/generated/${fname}${trailing}`;
+      }
+    }
+
+    const isInternalPath =
+      cleanRaw.startsWith(`${profileAbs}/`) ||
+      cleanRaw === profileAbs ||
+      cleanRaw.startsWith(`${SANDBOX_HOME_MOUNT}/`) ||
+      cleanRaw === SANDBOX_HOME_MOUNT ||
+      cleanRaw.startsWith('/var/lib/antigravity-chat/');
+
+    if (isInternalPath) {
+      const base = path.basename(cleanRaw.replace(/\/+$/, ''));
+      const ext = path.extname(base);
+      if (ext && !INTERNAL_BRAIN_EXCLUDED_EXTENSIONS.has(ext.toLowerCase())) {
+        return `${filePrefix ?? ''}${SANDBOX_WORKSPACE_MOUNT}/generated/${sanitizeFileName(base)}${trailing}`;
+      }
+      return `${filePrefix ?? ''}${SANDBOX_WORKSPACE_MOUNT}/generated/${trailing}`;
+    }
+
+    return fullMatch;
+  });
+}
+
+export function scrubToolCallsInternalPaths(
+  toolCalls: ToolCallItem[],
+  profileDir: string,
+  workspaceDir?: string | null
+): ToolCallItem[] {
+  const scrubValue = (val: unknown, depth = 0): unknown => {
+    if (depth > 5 || val == null) return val;
+    if (typeof val === 'string') {
+      return rewriteInternalPathsToWorkspace(val, profileDir, workspaceDir);
+    }
+    if (Array.isArray(val)) {
+      return val.map((item) => scrubValue(item, depth + 1));
+    }
+    if (typeof val === 'object') {
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+        out[k] = scrubValue(v, depth + 1);
+      }
+      return out;
+    }
+    return val;
+  };
+
+  return toolCalls.map((tc) => ({
+    ...tc,
+    title: rewriteInternalPathsToWorkspace(tc.title, profileDir, workspaceDir),
+    contentText: tc.contentText
+      ? rewriteInternalPathsToWorkspace(tc.contentText, profileDir, workspaceDir)
+      : tc.contentText,
+    locations: tc.locations?.map((loc) => ({
+      ...loc,
+      path: rewriteInternalPathsToWorkspace(loc.path, profileDir, workspaceDir),
+    })),
+    rawInput: scrubValue(tc.rawInput),
+    rawOutput: scrubValue(tc.rawOutput),
+  }));
 }
 
 export function importAuthorizedBrainFileToWorkspace(params: {
@@ -293,6 +556,7 @@ export function resolveAuthorizedChatFileReference(params: {
   if (!profile) return null;
   const brainFile = resolveAuthorizedBrainFile({
     profileDir: profile.profileDir,
+    workspaceDir: chat.workspaceDir,
     candidatePath: candidate,
   });
   if (!brainFile) return null;

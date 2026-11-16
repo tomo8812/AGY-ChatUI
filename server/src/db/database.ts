@@ -1067,7 +1067,7 @@ export class AppDatabase {
       .prepare(
         `SELECT * FROM runs
          WHERE chat_id = ? AND user_id = ? AND status IN ('queued', 'running', 'awaiting_permission')
-         ORDER BY created_at DESC LIMIT 1`
+         ORDER BY CASE WHEN status IN ('running', 'awaiting_permission') THEN 0 ELSE 1 END ASC, created_at ASC LIMIT 1`
       )
       .get(chatId, userId) as Record<string, unknown> | undefined;
     return row ? this.mapRun(row) : null;

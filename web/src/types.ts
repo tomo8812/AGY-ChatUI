@@ -195,8 +195,11 @@ export interface AttachmentRef {
 export interface ToolCallItem {
   toolCallId: string;
   title: string;
+  name?: string;
   kind?: string;
   status: string;
+  isSubagent?: boolean;
+  subagentLabel?: string;
   rawInput?: unknown;
   rawOutput?: unknown;
   locations?: Array<{ path: string; line?: number | null }>;

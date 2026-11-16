@@ -28,12 +28,24 @@ import type { AppDatabase } from '../db/database.js';
 import { decryptSmallSecret } from '../auth/password.js';
 import { captureWorkspaceSnapshot, syncWorkspaceChangesAsArtifacts } from '../files/artifacts.js';
 import {
+  type BrainSnapshotEntry,
+  captureBrainSnapshot,
   extractCandidatePathsFromText,
   extractCandidatePathsFromToolCalls,
   importAuthorizedBrainFileToWorkspace,
   resolveAuthorizedBrainFile,
+  rewriteInternalPathsToWorkspace,
+  scrubToolCallsInternalPaths,
+  type SyncedBrainFile,
+  syncNewBrainFilesToWorkspace,
 } from '../files/link-resolver.js';
-import { resolveContainedExistingPath, resolveContainedWriteTarget } from '../files/workspace.js';
+import {
+  detectMimeAndPreviewKind,
+  resolveContainedExistingPath,
+  resolveContainedWriteTarget,
+  sanitizeFileName,
+  sha256File,
+} from '../files/workspace.js';
 import type { SyncHub } from '../sync/hub.js';
 import type {
   AcpConfigOption,
@@ -45,7 +57,114 @@ import type {
   ToolCallItem,
 } from '../types.js';
 import type { SkillService } from '../skills/skill-service.js';
-import { buildAgyCommandSpec, probeBwrapSandbox } from './env-isolation.js';
+import {
+  buildAgyCommandSpec,
+  probeBwrapSandbox,
+  SANDBOX_HOME_MOUNT,
+  SANDBOX_WORKSPACE_MOUNT,
+} from './env-isolation.js';
+
+export function classifySubagentToolCall(params: {
+  name?: string;
+  title?: string;
+  kind?: string;
+  rawInput?: unknown;
+  rawContent?: unknown;
+}): { isSubagent: boolean; isAsyncSubagentLaunch?: boolean; subagentLabel?: string } {
+  const nameStr = (params.name ?? '').trim();
+  const titleStr = (params.title ?? '').trim();
+  const combined = `${nameStr} ${titleStr}`;
+
+  const rawObj =
+    params.rawInput && typeof params.rawInput === 'object' && !Array.isArray(params.rawInput)
+      ? (params.rawInput as Record<string, unknown>)
+      : null;
+
+  const isImageGen =
+    /generate_image|image_gen|画像生成/i.test(combined) ||
+    Boolean(
+      rawObj &&
+        ('ImageName' in rawObj || 'image_name' in rawObj) &&
+        ('Prompt' in rawObj || 'prompt' in rawObj)
+    );
+
+  if (isImageGen) {
+    const imgName =
+      (rawObj && typeof rawObj.ImageName === 'string' && rawObj.ImageName.trim()) ||
+      (rawObj && typeof rawObj.image_name === 'string' && rawObj.image_name.trim()) ||
+      titleStr ||
+      'generate_image';
+    return {
+      isSubagent: true,
+      isAsyncSubagentLaunch: false,
+      subagentLabel: `画像生成サブエージェント (${imgName})`,
+    };
+  }
+
+  const hasSubagentsArray = Boolean(
+    rawObj && Array.isArray(rawObj.Subagents) && rawObj.Subagents.length > 0
+  );
+  const hasSessionRefContent =
+    Array.isArray(params.rawContent) &&
+    params.rawContent.some(
+      (c) =>
+        c &&
+        typeof c === 'object' &&
+        ((c as { type?: string }).type === 'session' || (c as { type?: string }).type === 'subagent')
+    );
+  const isAsyncLaunch =
+    hasSubagentsArray ||
+    hasSessionRefContent ||
+    /\binvoke_subagent\b|\bspawn_agent\b|\bdelegate_agent\b/i.test(combined);
+
+  const isSubagentTool =
+    isAsyncLaunch ||
+    /define_subagent|manage_subagents|subagent|teamwork|サブエージェント/i.test(combined);
+
+  if (isSubagentTool) {
+    if (hasSubagentsArray && rawObj && Array.isArray(rawObj.Subagents)) {
+      const roles = rawObj.Subagents.map((s) => {
+        if (s && typeof s === 'object') {
+          const item = s as Record<string, unknown>;
+          return (
+            (typeof item.Role === 'string' && item.Role.trim()) ||
+            (typeof item.TypeName === 'string' && item.TypeName.trim()) ||
+            ''
+          );
+        }
+        return '';
+      }).filter(Boolean);
+      if (roles.length > 0) {
+        return {
+          isSubagent: true,
+          isAsyncSubagentLaunch: isAsyncLaunch,
+          subagentLabel: `サブエージェント (${roles.join(', ')})`,
+        };
+      }
+    }
+    return {
+      isSubagent: true,
+      isAsyncSubagentLaunch: isAsyncLaunch,
+      subagentLabel: `サブエージェント (${titleStr || nameStr || '実行'})`,
+    };
+  }
+
+  return { isSubagent: false };
+}
+
+function hasBackgroundTaskOutput(tc: ToolCallItem): boolean {
+  const rawIn =
+    tc.rawInput && typeof tc.rawInput === 'object' && !Array.isArray(tc.rawInput)
+      ? (tc.rawInput as Record<string, unknown>)
+      : null;
+  if (rawIn?.IsDaemon === true || rawIn?.isDaemon === true) {
+    return false;
+  }
+  const combinedOut = `${tc.contentText ?? ''} ${
+    tc.rawOutput !== undefined ? JSON.stringify(tc.rawOutput) : ''
+  }`;
+  return /running as a background task with task id:/i.test(combinedOut);
+}
 
 function captureWorkspaceSkillsSignature(workspaceDir: string): string {
   const roots = [
@@ -186,6 +305,16 @@ export function normalizeConfigOptions(
   };
 }
 
+interface TrackedSubagentState {
+  sessionId: string;
+  toolCallId: string;
+  title: string;
+  description?: string;
+  state: 'running' | 'idle' | 'requires_action' | 'unknown';
+  stopReason?: string | null;
+  lastActivityAt: number;
+}
+
 interface ActiveTurnBridge {
   runId: string;
   userId: string;
@@ -196,6 +325,18 @@ interface ActiveTurnBridge {
   toolCalls: ToolCallItem[];
   lastDbFlushAt: number;
   pendingResolvers: Map<string, (outcome: RequestPermissionResponse) => void>;
+  beforeBrainSnap: Map<string, BrainSnapshotEntry>;
+  emittedArtifactIds: Set<string>;
+  syncedBrainFiles: Map<string, SyncedBrainFile>;
+  textAfterLastToolCall: string;
+  lastActivityAt: number;
+  subagents: Map<string, TrackedSubagentState>;
+  asyncSubagentToolIds: Set<string>;
+  initialPromptDone: boolean;
+  parentWakeupStarted: boolean;
+  parentWakeupIdle: boolean;
+  receivedWakeupText: boolean;
+  lastParentActivityAt: number;
 }
 
 interface WorkerInstance {
@@ -217,6 +358,8 @@ interface WorkerInstance {
   inFlight: boolean;
   lastUsedAt: number;
   activeTurn: ActiveTurnBridge | null;
+  backgroundBridge: ActiveTurnBridge | null;
+  lastBackgroundActivityAt: number;
   stderrTail: string[];
 }
 
@@ -658,9 +801,10 @@ export class AcpClientManager {
     }
 
     const worker = this.workers.get(`${params.userId}:${params.chatId}`);
-    const resolver = worker?.activeTurn?.pendingResolvers.get(params.permissionId);
-    if (resolver) {
-      worker!.activeTurn!.pendingResolvers.delete(params.permissionId);
+    const targetBridge = worker?.activeTurn ?? worker?.backgroundBridge ?? null;
+    const resolver = targetBridge?.pendingResolvers.get(params.permissionId);
+    if (resolver && targetBridge) {
+      targetBridge.pendingResolvers.delete(params.permissionId);
       if (params.cancel || !params.selectedOptionId) {
         resolver({ outcome: { outcome: 'cancelled' } });
       } else {
@@ -741,6 +885,8 @@ export class AcpClientManager {
 
     const beforeSkillsSig = captureWorkspaceSkillsSignature(chat.workspaceDir);
     const beforeSnap = captureWorkspaceSnapshot(chat.workspaceDir);
+    const beforeBrainSnap = captureBrainSnapshot(worker.profileDir, chat.workspaceDir);
+    const nowInit = Date.now();
     const bridge: ActiveTurnBridge = {
       runId: params.runId,
       userId: params.userId,
@@ -749,8 +895,20 @@ export class AcpClientManager {
       contentText: '',
       thoughtsText: '',
       toolCalls: [],
-      lastDbFlushAt: Date.now(),
+      lastDbFlushAt: nowInit,
       pendingResolvers: new Map(),
+      beforeBrainSnap,
+      emittedArtifactIds: new Set(),
+      syncedBrainFiles: new Map(),
+      textAfterLastToolCall: '',
+      lastActivityAt: nowInit,
+      subagents: new Map(),
+      asyncSubagentToolIds: new Set(),
+      initialPromptDone: false,
+      parentWakeupStarted: false,
+      parentWakeupIdle: false,
+      receivedWakeupText: false,
+      lastParentActivityAt: nowInit,
     };
     worker.inFlight = true;
     worker.lastUsedAt = Date.now();
@@ -781,7 +939,7 @@ export class AcpClientManager {
       }
       if (!worker.supportsSystemPrompt && !worker.systemPromptInjectedFallback && chat.projectId) {
         const proj = this.db.getProject(params.userId, chat.projectId);
-        if (proj?.instructions.trim()) {
+        if (proj && proj.instructions.trim()) {
           effectiveText = `[プロジェクト指示]\n${proj.instructions.trim()}\n\n[ユーザーメッセージ]\n${effectiveText}`;
           worker.systemPromptInjectedFallback = true;
         }
@@ -828,8 +986,125 @@ export class AcpClientManager {
         prompt: promptBlocks,
       });
 
+      // Allow any trailing session/update notifications flushed in the same stdio chunk to be processed
+      await new Promise((r) => setTimeout(r, 25));
+      bridge.initialPromptDone = true;
+
+      this.syncBrainDeliverablesMidTurn(worker, bridge);
+
+      const hasAsyncSubagentWork =
+        bridge.asyncSubagentToolIds.size > 0 || bridge.subagents.size > 0;
+      const hasBackgroundCommandWork = bridge.toolCalls.some((tc) => hasBackgroundTaskOutput(tc));
+      const hasPendingToolsOrPerms =
+        bridge.pendingResolvers.size > 0 ||
+        bridge.toolCalls.some((tc) => tc.status === 'in_progress' || tc.status === 'pending');
+
+      // When an async subagent (`invoke_subagent` / `subagent_update`), background task (`run_command`),
+      // or pending tool/permission is active when the initial `session/prompt` returns `end_turn`,
+      // keep this turn alive until Antigravity itself finishes the work or the user cancels.
+      if (
+        response.stopReason === 'end_turn' &&
+        !params.abortSignal.aborted &&
+        (hasAsyncSubagentWork || hasBackgroundCommandWork || hasPendingToolsOrPerms)
+      ) {
+        const wakeupSettleMs = this.config.agyMode === 'mock' ? 180 : 1_500;
+        let lastBrainPollAt = Date.now();
+
+        while (
+          !params.abortSignal.aborted &&
+          !worker.process.killed &&
+          worker.process.exitCode === null
+        ) {
+          const now = Date.now();
+
+          if (now - lastBrainPollAt >= 300) {
+            lastBrainPollAt = now;
+            this.syncBrainDeliverablesMidTurn(worker, bridge);
+          }
+
+          const allTrackedIdle =
+            bridge.subagents.size > 0 &&
+            [...bridge.subagents.values()].every(
+              (s) => s.state === 'idle' || s.state === 'unknown'
+            );
+
+          const hasActiveNonSubagentTools = bridge.toolCalls.some(
+            (tc) =>
+              !bridge.asyncSubagentToolIds.has(tc.toolCallId) &&
+              !tc.toolCallId.startsWith('subagent:') &&
+              (tc.status === 'in_progress' || tc.status === 'pending')
+          );
+
+          const hasExpectationOfWakeup =
+            hasAsyncSubagentWork ||
+            bridge.subagents.size > 0 ||
+            hasBackgroundCommandWork ||
+            bridge.toolCalls.some((tc) => hasBackgroundTaskOutput(tc));
+
+          if (!hasExpectationOfWakeup) {
+            if (!hasActiveNonSubagentTools && bridge.pendingResolvers.size === 0) {
+              break;
+            }
+          } else {
+            // 1. Parent explicitly reported state_update: idle after reactive wakeup
+            if (
+              bridge.parentWakeupStarted &&
+              bridge.parentWakeupIdle &&
+              !hasActiveNonSubagentTools &&
+              bridge.pendingResolvers.size === 0
+            ) {
+              break;
+            }
+
+            // 2. Parent streamed reactive wakeup response text and stream has settled
+            if (
+              bridge.parentWakeupStarted &&
+              bridge.receivedWakeupText &&
+              (bridge.subagents.size === 0 || allTrackedIdle) &&
+              !hasActiveNonSubagentTools &&
+              bridge.pendingResolvers.size === 0 &&
+              now - bridge.lastParentActivityAt >= wakeupSettleMs
+            ) {
+              break;
+            }
+          }
+
+          await new Promise((r) => setTimeout(r, 50));
+        }
+
+        this.finalizePendingToolCalls(worker, bridge);
+        this.syncBrainDeliverablesMidTurn(worker, bridge);
+      }
+
+      // Scrub any internal brain/profile paths in toolCalls and contentText into /workspace/generated/...
+      bridge.toolCalls = scrubToolCallsInternalPaths(
+        bridge.toolCalls,
+        worker.profileDir,
+        chat.workspaceDir
+      );
+      bridge.contentText = rewriteInternalPathsToWorkspace(
+        bridge.contentText,
+        worker.profileDir,
+        chat.workspaceDir
+      );
+
+      // Ensure every newly synced brain deliverable is referenced in the assistant message
+      for (const synced of bridge.syncedBrainFiles.values()) {
+        if (
+          !bridge.contentText.includes(synced.filename) &&
+          !bridge.contentText.includes(synced.workspaceRelPath)
+        ) {
+          const { previewKind } = detectMimeAndPreviewKind(synced.filename);
+          const snippet =
+            previewKind === 'image' || previewKind === 'svg'
+              ? `\n\n![${synced.filename}](${synced.workspaceRelPath})\n\n保存先: [${synced.filename}](file://${SANDBOX_WORKSPACE_MOUNT}/${synced.workspaceRelPath})`
+              : `\n\n成果物を保存しました: [${synced.filename}](file://${SANDBOX_WORKSPACE_MOUNT}/${synced.workspaceRelPath})`;
+          this.appendTurnContentChunk(worker, bridge, snippet);
+        }
+      }
+
       // Collect tool-referenced locations and any authorized profile brain assets mentioned by the agent
-      const hintPaths: string[] = [];
+      const hintPaths: string[] = [...bridge.syncedBrainFiles.values()].map((s) => s.workspaceRelPath);
       const candidatePaths = new Set<string>();
       for (const tc of bridge.toolCalls) {
         for (const loc of tc.locations ?? []) {
@@ -848,6 +1123,7 @@ export class AcpClientManager {
       for (const candidatePath of candidatePaths) {
         const brainFile = resolveAuthorizedBrainFile({
           profileDir: worker.profileDir,
+          workspaceDir: chat.workspaceDir,
           candidatePath,
         });
         if (!brainFile) continue;
@@ -883,6 +1159,8 @@ export class AcpClientManager {
       })!;
 
       for (const art of newArtifacts) {
+        if (bridge.emittedArtifactIds.has(art.id)) continue;
+        bridge.emittedArtifactIds.add(art.id);
         this.hub.emitDurable({
           userId: params.userId,
           type: 'artifact.created',
@@ -942,6 +1220,7 @@ export class AcpClientManager {
       throw err;
     } finally {
       params.abortSignal.removeEventListener('abort', onAbort);
+      worker.backgroundBridge = bridge;
       worker.activeTurn = null;
       worker.inFlight = false;
       worker.lastUsedAt = Date.now();
@@ -1021,7 +1300,19 @@ export class AcpClientManager {
     let earlyAvailableCommands: AvailableCommandItem[] | undefined;
     let earlyConfigOptions: SessionConfigOption[] | undefined;
 
-    const acpClientApp = client({ name: 'antigravity-chat-ui' })
+    const acpClientApp = client({ name: 'antigravity-chat-ui' });
+    const internalBuilder = (
+      acpClientApp as unknown as {
+        builder?: { handlers?: Array<{ describe?: () => string }> };
+      }
+    ).builder;
+    if (Array.isArray(internalBuilder?.handlers)) {
+      internalBuilder.handlers = internalBuilder.handlers.filter(
+        (h) => h.describe?.() !== 'client-session-update-router'
+      );
+    }
+
+    acpClientApp
       .onRequest(methods.client.fs.readTextFile, async ({ params }) => {
         if (!workerRef) throw new RequestError(-32603, 'Worker uninitialized');
         try {
@@ -1057,10 +1348,17 @@ export class AcpClientManager {
         }
       })
       .onRequest(methods.client.session.requestPermission, async ({ params, signal }) => {
-        if (!workerRef || !workerRef.activeTurn) {
+        const turn =
+          workerRef?.activeTurn ?? (workerRef ? this.ensureBackgroundBridge(workerRef) : null);
+        if (!workerRef || !turn) {
           return { outcome: { outcome: 'cancelled' as const } };
         }
-        const turn = workerRef.activeTurn;
+        workerRef.lastUsedAt = Date.now();
+        workerRef.lastBackgroundActivityAt = Date.now();
+
+        // First sync any newly generated brain files into /workspace/generated/
+        this.syncBrainDeliverablesMidTurn(workerRef, turn);
+
         const prefs = this.db.getPreferences(turn.userId);
 
         // Optional user preference: auto-approve strictly read-only workspace reads
@@ -1085,14 +1383,31 @@ export class AcpClientManager {
         }
 
         const permId = crypto.randomUUID();
-        const toolCall: ToolCallItem = {
+        const subagentMeta = classifySubagentToolCall({
+          name: (params.toolCall as { name?: string }).name,
+          title: params.toolCall.title ?? undefined,
+          kind: params.toolCall.kind ?? undefined,
+          rawInput: params.toolCall.rawInput,
+        });
+        const rawToolCall: ToolCallItem = {
           toolCallId: params.toolCall.toolCallId,
           title: params.toolCall.title ?? 'ツール実行の許可',
+          ...((params.toolCall as { name?: string }).name
+            ? { name: (params.toolCall as { name?: string }).name }
+            : {}),
           kind: params.toolCall.kind ?? undefined,
           status: params.toolCall.status ?? 'pending',
+          ...(subagentMeta.isSubagent
+            ? { isSubagent: true, subagentLabel: subagentMeta.subagentLabel }
+            : {}),
           rawInput: params.toolCall.rawInput,
           locations: (params.toolCall.locations ?? []).map((l) => ({ path: l.path, line: l.line })),
         };
+        const [toolCall] = scrubToolCallsInternalPaths(
+          [rawToolCall],
+          workerRef.profileDir,
+          workerRef.workspaceDir
+        );
         const options = params.options.map((o) => ({
           optionId: o.optionId,
           name: o.name,
@@ -1133,17 +1448,21 @@ export class AcpClientManager {
           signal.addEventListener('abort', onCancelSignal, { once: true });
         });
       })
-      .onNotification(methods.client.session.update, async ({ params }) => {
-        if (!workerRef) {
-          if (params.update.sessionUpdate === 'available_commands_update') {
-            earlyAvailableCommands = mapAcpAvailableCommands(params.update.availableCommands);
-          } else if (params.update.sessionUpdate === 'config_option_update') {
-            earlyConfigOptions = params.update.configOptions;
+      .onNotification(
+        methods.client.session.update as unknown as `_${string}`,
+        (rawParams: unknown) => rawParams as SessionNotification,
+        async ({ params }) => {
+          if (!workerRef) {
+            if (params.update?.sessionUpdate === 'available_commands_update') {
+              earlyAvailableCommands = mapAcpAvailableCommands(params.update.availableCommands);
+            } else if (params.update?.sessionUpdate === 'config_option_update') {
+              earlyConfigOptions = params.update.configOptions;
+            }
+            return;
           }
-          return;
+          this.handleSessionNotification(workerRef, params);
         }
-        this.handleSessionNotification(workerRef, params);
-      });
+      );
 
     const stream = ndJsonStream(
       Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>,
@@ -1157,20 +1476,25 @@ export class AcpClientManager {
       }
     });
 
-    const init = await conn.agent.request(methods.agent.initialize, {
-      protocolVersion: PROTOCOL_VERSION,
-      clientCapabilities: {
-        fs: { readTextFile: true, writeTextFile: true },
-        terminal: false,
-        session: { configOptions: { boolean: {} } },
-        auth: { terminal: true },
-      },
-      clientInfo: {
-        name: 'antigravity-chat-ui',
-        title: 'Antigravity Chat UI',
-        version: this.config.appVersion,
-      },
-    });
+    const init = (await (conn.agent.request as (method: string, params: unknown) => Promise<unknown>)(
+      methods.agent.initialize,
+      {
+        protocolVersion: PROTOCOL_VERSION,
+        clientCapabilities: {
+          fs: { readTextFile: true, writeTextFile: true },
+          terminal: false,
+          session: { configOptions: { boolean: {} } },
+          subagents: {},
+          plan: {},
+          auth: { terminal: true },
+        },
+        clientInfo: {
+          name: 'antigravity-chat-ui',
+          title: 'Antigravity Chat UI',
+          version: this.config.appVersion,
+        },
+      }
+    )) as InitializeResponse;
 
     const supportsSystemPrompt = Boolean(init.agentCapabilities?.sessionCapabilities?.systemPrompt);
     let systemPromptPayload:
@@ -1325,6 +1649,8 @@ export class AcpClientManager {
       inFlight: false,
       lastUsedAt: Date.now(),
       activeTurn: null,
+      backgroundBridge: null,
+      lastBackgroundActivityAt: 0,
       stderrTail,
     };
 
@@ -1332,9 +1658,484 @@ export class AcpClientManager {
     return workerRef;
   }
 
+  private appendTurnContentChunk(
+    worker: WorkerInstance,
+    turn: ActiveTurnBridge,
+    rawChunk: string
+  ): void {
+    if (!rawChunk) return;
+    const chunk = rewriteInternalPathsToWorkspace(
+      rawChunk,
+      worker.profileDir,
+      worker.workspaceDir
+    );
+    const offset = turn.contentText.length;
+    turn.contentText += chunk;
+    turn.textAfterLastToolCall += chunk;
+    turn.lastActivityAt = Date.now();
+    this.hub.emitEphemeral({
+      userId: worker.userId,
+      type: 'run.delta',
+      chatId: worker.chatId,
+      runId: turn.runId,
+      payload: {
+        messageId: turn.assistantMessageId,
+        field: 'content',
+        offset,
+        chunk,
+      },
+    });
+    this.maybeFlushTurnProgress(turn);
+  }
+
+  private saveInlineBase64AssetToWorkspace(
+    worker: WorkerInstance,
+    turn: ActiveTurnBridge,
+    params: { data: string; mimeType: string; suggestedName?: string }
+  ): string | null {
+    try {
+      const buf = Buffer.from(params.data, 'base64');
+      if (buf.length === 0) return null;
+      const extFromMime =
+        params.mimeType === 'image/png'
+          ? '.png'
+          : params.mimeType === 'image/jpeg'
+            ? '.jpg'
+            : params.mimeType === 'image/webp'
+              ? '.webp'
+              : params.mimeType === 'image/gif'
+                ? '.gif'
+                : params.mimeType === 'image/svg+xml'
+                  ? '.svg'
+                  : '.bin';
+      const baseName = sanitizeFileName(
+        params.suggestedName || `generated-${Date.now()}${extFromMime}`
+      );
+      const finalName = path.extname(baseName) ? baseName : `${baseName}${extFromMime}`;
+      const relPath = `generated/${finalName}`;
+      const target = resolveContainedWriteTarget(worker.workspaceDir, relPath);
+      fs.mkdirSync(path.dirname(target.absPath), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(target.absPath, buf);
+      this.registerAndEmitSyncedWorkspaceFile(worker, turn, {
+        brainAbsPath: target.absPath,
+        relUnderBrain: finalName,
+        workspaceAbsPath: target.absPath,
+        workspaceRelPath: target.relPath,
+        filename: path.basename(target.relPath),
+      });
+      return target.relPath;
+    } catch {
+      return null;
+    }
+  }
+
+  private registerAndEmitSyncedWorkspaceFile(
+    worker: WorkerInstance,
+    turn: ActiveTurnBridge,
+    item: SyncedBrainFile
+  ): void {
+    turn.syncedBrainFiles.set(item.workspaceRelPath, item);
+    try {
+      const stat = fs.statSync(item.workspaceAbsPath);
+      if (!stat.isFile()) return;
+      const fileSha = sha256File(item.workspaceAbsPath);
+      const { mimeType, previewKind } = detectMimeAndPreviewKind(item.filename);
+      const existing = this.db.findArtifactByRelPath(
+        worker.userId,
+        worker.chatId,
+        item.workspaceRelPath
+      );
+      const artifact = this.db.upsertArtifact({
+        id: existing?.id ?? crypto.randomUUID(),
+        userId: worker.userId,
+        chatId: worker.chatId,
+        messageId: turn.assistantMessageId,
+        runId: turn.runId,
+        relPath: item.workspaceRelPath,
+        filename: item.filename,
+        mimeType,
+        sizeBytes: stat.size,
+        sha256: fileSha,
+        source: 'generated',
+        previewKind,
+        diffPatch: null,
+        minUpdatedAt: stat.mtimeMs,
+      });
+      if (!turn.emittedArtifactIds.has(artifact.id)) {
+        turn.emittedArtifactIds.add(artifact.id);
+        this.hub.emitDurable({
+          userId: worker.userId,
+          type: 'artifact.created',
+          chatId: worker.chatId,
+          runId: turn.runId,
+          payload: { artifact },
+        });
+      }
+    } catch {
+      // ignore transient stat error
+    }
+  }
+
+  private syncBrainDeliverablesMidTurn(
+    worker: WorkerInstance,
+    turn: ActiveTurnBridge
+  ): SyncedBrainFile[] {
+    const newlySynced = syncNewBrainFilesToWorkspace({
+      profileDir: worker.profileDir,
+      workspaceDir: worker.workspaceDir,
+      beforeSnap: turn.beforeBrainSnap,
+    });
+
+    for (const item of newlySynced) {
+      this.registerAndEmitSyncedWorkspaceFile(worker, turn, item);
+    }
+
+    // Also inspect any explicit paths mentioned in toolCalls so far
+    const candidates = new Set<string>([
+      ...extractCandidatePathsFromToolCalls(turn.toolCalls),
+      ...extractCandidatePathsFromText(turn.contentText),
+    ]);
+    for (const tc of turn.toolCalls) {
+      for (const loc of tc.locations ?? []) {
+        if (loc.path) candidates.add(loc.path);
+      }
+    }
+
+    for (const candidatePath of candidates) {
+      const brainFile = resolveAuthorizedBrainFile({
+        profileDir: worker.profileDir,
+        workspaceDir: worker.workspaceDir,
+        candidatePath,
+      });
+      if (!brainFile) continue;
+      try {
+        const imported = importAuthorizedBrainFileToWorkspace({
+          workspaceDir: worker.workspaceDir,
+          sourceAbsPath: brainFile.absPath,
+        });
+        const item: SyncedBrainFile = {
+          brainAbsPath: brainFile.absPath,
+          relUnderBrain: brainFile.relUnderBrain,
+          workspaceAbsPath: imported.absPath,
+          workspaceRelPath: imported.relPath,
+          filename: path.basename(imported.relPath),
+        };
+        this.registerAndEmitSyncedWorkspaceFile(worker, turn, item);
+        newlySynced.push(item);
+      } catch {
+        // ignore
+      }
+    }
+
+    return newlySynced;
+  }
+
+  private finalizePendingToolCalls(worker: WorkerInstance, turn: ActiveTurnBridge): void {
+    let changed = false;
+    for (let i = 0; i < turn.toolCalls.length; i++) {
+      const tc = turn.toolCalls[i];
+      if (tc.status === 'in_progress' || tc.status === 'pending') {
+        turn.toolCalls[i] = { ...tc, status: 'completed' };
+        changed = true;
+      }
+    }
+    if (changed) {
+      turn.toolCalls = scrubToolCallsInternalPaths(
+        turn.toolCalls,
+        worker.profileDir,
+        worker.workspaceDir
+      );
+      this.db.updateMessage(turn.userId, turn.assistantMessageId, { toolCalls: turn.toolCalls });
+      this.hub.emitEphemeral({
+        userId: worker.userId,
+        type: 'run.tool_update',
+        chatId: worker.chatId,
+        runId: turn.runId,
+        payload: { messageId: turn.assistantMessageId, toolCalls: turn.toolCalls },
+      });
+    }
+  }
+
+  private extractToolCallContentAndSaveAssets(
+    worker: WorkerInstance,
+    turn: ActiveTurnBridge,
+    rawContent: unknown
+  ): string | undefined {
+    if (!Array.isArray(rawContent) || rawContent.length === 0) return undefined;
+    const textParts: string[] = [];
+    for (const item of rawContent) {
+      if (!item || typeof item !== 'object') continue;
+      const entry = item as Record<string, unknown>;
+      if (entry.type === 'content' && entry.content && typeof entry.content === 'object') {
+        const block = entry.content as Record<string, unknown>;
+        if (block.type === 'text' && typeof block.text === 'string') {
+          textParts.push(
+            rewriteInternalPathsToWorkspace(block.text, worker.profileDir, worker.workspaceDir)
+          );
+        } else if (
+          block.type === 'image' &&
+          typeof block.data === 'string' &&
+          typeof block.mimeType === 'string'
+        ) {
+          const rel = this.saveInlineBase64AssetToWorkspace(worker, turn, {
+            data: block.data,
+            mimeType: block.mimeType,
+          });
+          if (rel) {
+            textParts.push(`![生成画像](${rel})`);
+          }
+        } else if (block.type === 'resource_link' && typeof block.uri === 'string') {
+          const rewritten = rewriteInternalPathsToWorkspace(
+            block.uri,
+            worker.profileDir,
+            worker.workspaceDir
+          );
+          textParts.push(rewritten);
+        }
+      } else if (entry.type === 'diff' && typeof entry.path === 'string') {
+        const cleanPath = rewriteInternalPathsToWorkspace(
+          entry.path,
+          worker.profileDir,
+          worker.workspaceDir
+        );
+        textParts.push(`Diff: ${cleanPath}`);
+      }
+    }
+    return textParts.length > 0 ? textParts.join('\n').trim() : undefined;
+  }
+
+  private markAsyncSubagentsCompleted(worker: WorkerInstance, turn: ActiveTurnBridge): void {
+    let changed = false;
+    for (const sub of turn.subagents.values()) {
+      if (sub.state === 'running' || sub.state === 'requires_action') {
+        sub.state = 'idle';
+      }
+    }
+    for (let i = 0; i < turn.toolCalls.length; i++) {
+      const tc = turn.toolCalls[i];
+      if (
+        (turn.asyncSubagentToolIds.has(tc.toolCallId) ||
+          tc.toolCallId.startsWith('subagent:') ||
+          tc.isSubagent) &&
+        (tc.status === 'in_progress' || tc.status === 'pending')
+      ) {
+        turn.toolCalls[i] = { ...tc, status: 'completed' };
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.db.updateMessage(turn.userId, turn.assistantMessageId, { toolCalls: turn.toolCalls });
+      this.hub.emitEphemeral({
+        userId: worker.userId,
+        type: 'run.tool_update',
+        chatId: worker.chatId,
+        runId: turn.runId,
+        payload: { messageId: turn.assistantMessageId, toolCalls: turn.toolCalls },
+      });
+    }
+  }
+
+  private upsertSubagentToolCall(
+    worker: WorkerInstance,
+    turn: ActiveTurnBridge,
+    params: {
+      subSessionId: string;
+      title?: string | null;
+      description?: string | null;
+      state?: 'running' | 'idle' | 'requires_action' | 'unknown';
+      stopReason?: string | null;
+      activityNote?: string;
+    }
+  ): void {
+    const existingTrack = turn.subagents.get(params.subSessionId);
+    let targetToolCallId = existingTrack?.toolCallId;
+
+    if (!targetToolCallId) {
+      const boundToolIds = new Set([...turn.subagents.values()].map((s) => s.toolCallId));
+      const unboundAsyncId = [...turn.asyncSubagentToolIds].find((id) => !boundToolIds.has(id));
+      targetToolCallId = unboundAsyncId ?? `subagent:${params.subSessionId}`;
+    }
+
+    const nextState = params.state ?? existingTrack?.state ?? 'running';
+    const nextTitle =
+      (params.title && params.title.trim()) ||
+      existingTrack?.title ||
+      (params.description && params.description.trim()) ||
+      'サブエージェント';
+    const nextDesc =
+      params.description !== undefined
+        ? params.description ?? undefined
+        : existingTrack?.description;
+
+    const tracked: TrackedSubagentState = {
+      sessionId: params.subSessionId,
+      toolCallId: targetToolCallId,
+      title: nextTitle,
+      description: nextDesc,
+      state: nextState,
+      stopReason: params.stopReason !== undefined ? params.stopReason : existingTrack?.stopReason,
+      lastActivityAt: Date.now(),
+    };
+    turn.subagents.set(params.subSessionId, tracked);
+
+    const mappedStatus: ToolCallItem['status'] =
+      nextState === 'running' || nextState === 'requires_action'
+        ? 'in_progress'
+        : tracked.stopReason === 'error' || tracked.stopReason === 'refusal'
+          ? 'failed'
+          : 'completed';
+
+    const label = nextDesc
+      ? `サブエージェント (${nextTitle}: ${nextDesc})`
+      : `サブエージェント (${nextTitle})`;
+
+    const idx = turn.toolCalls.findIndex((t) => t.toolCallId === targetToolCallId);
+    if (idx >= 0) {
+      const prev = turn.toolCalls[idx];
+      turn.toolCalls[idx] = {
+        ...prev,
+        isSubagent: true,
+        subagentLabel: prev.subagentLabel || label,
+        status: mappedStatus,
+        ...(params.activityNote ? { contentText: params.activityNote } : {}),
+      };
+    } else {
+      turn.toolCalls.push({
+        toolCallId: targetToolCallId,
+        title: nextTitle,
+        isSubagent: true,
+        subagentLabel: label,
+        status: mappedStatus,
+        ...(params.activityNote ? { contentText: params.activityNote } : {}),
+      });
+    }
+
+    this.db.updateMessage(turn.userId, turn.assistantMessageId, { toolCalls: turn.toolCalls });
+    this.hub.emitEphemeral({
+      userId: worker.userId,
+      type: 'run.tool_update',
+      chatId: worker.chatId,
+      runId: turn.runId,
+      payload: { messageId: turn.assistantMessageId, toolCalls: turn.toolCalls },
+    });
+  }
+
+  private handleChildSessionNotification(
+    worker: WorkerInstance,
+    turn: ActiveTurnBridge,
+    childSessionId: string,
+    update: SessionUpdate
+  ): void {
+    const rawUpdateType = (update as { sessionUpdate: string }).sessionUpdate;
+    if (rawUpdateType === 'state_update') {
+      const stateObj = update as unknown as {
+        state?: 'running' | 'idle' | 'requires_action' | 'unknown';
+        stopReason?: string | null;
+      };
+      this.upsertSubagentToolCall(worker, turn, {
+        subSessionId: childSessionId,
+        state: stateObj.state ?? 'running',
+        stopReason: stateObj.stopReason,
+      });
+      this.syncBrainDeliverablesMidTurn(worker, turn);
+      return;
+    }
+
+    if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
+      const contentNote = this.extractToolCallContentAndSaveAssets(
+        worker,
+        turn,
+        (update as { content?: unknown }).content
+      );
+      this.syncBrainDeliverablesMidTurn(worker, turn);
+      const activityNote = contentNote || (update.title ? `実行中: ${update.title}` : undefined);
+      this.upsertSubagentToolCall(worker, turn, {
+        subSessionId: childSessionId,
+        state: 'running',
+        activityNote,
+      });
+      return;
+    }
+
+    if (update.sessionUpdate === 'agent_message_chunk') {
+      if (update.content.type === 'image') {
+        this.saveInlineBase64AssetToWorkspace(worker, turn, {
+          data: update.content.data,
+          mimeType: update.content.mimeType,
+        });
+      } else if (update.content.type === 'resource_link') {
+        this.syncBrainDeliverablesMidTurn(worker, turn);
+      } else if (update.content.type === 'text' && update.content.text.trim()) {
+        const cleaned = rewriteInternalPathsToWorkspace(
+          update.content.text.trim(),
+          worker.profileDir,
+          worker.workspaceDir
+        );
+        this.upsertSubagentToolCall(worker, turn, {
+          subSessionId: childSessionId,
+          activityNote: cleaned.slice(0, 300),
+        });
+      }
+      this.syncBrainDeliverablesMidTurn(worker, turn);
+    }
+  }
+
+  private ensureBackgroundBridge(worker: WorkerInstance): ActiveTurnBridge | null {
+    if (worker.backgroundBridge) {
+      return worker.backgroundBridge;
+    }
+    const messages = this.db.listMessages(worker.userId, worker.chatId);
+    const latestAssistant = [...messages].reverse().find((m) => m.role === 'assistant');
+    if (!latestAssistant) return null;
+
+    const beforeBrainSnap = captureBrainSnapshot(worker.profileDir, worker.workspaceDir);
+    const bridge: ActiveTurnBridge = {
+      runId: latestAssistant.runId ?? '',
+      userId: worker.userId,
+      chatId: worker.chatId,
+      assistantMessageId: latestAssistant.id,
+      contentText: latestAssistant.contentText,
+      thoughtsText: latestAssistant.thoughtsText,
+      toolCalls: [...latestAssistant.toolCalls],
+      lastDbFlushAt: 0,
+      pendingResolvers: new Map(),
+      beforeBrainSnap,
+      emittedArtifactIds: new Set(latestAssistant.artifactIds),
+      syncedBrainFiles: new Map(),
+      textAfterLastToolCall: '',
+      lastActivityAt: Date.now(),
+      subagents: new Map(),
+      asyncSubagentToolIds: new Set(),
+      initialPromptDone: true,
+      parentWakeupStarted: true,
+      parentWakeupIdle: false,
+      receivedWakeupText: true,
+      lastParentActivityAt: Date.now(),
+    };
+    worker.backgroundBridge = bridge;
+    return bridge;
+  }
+
+  private flushBackgroundBridgeToMessage(worker: WorkerInstance, bridge: ActiveTurnBridge): void {
+    const updated = this.db.updateMessage(worker.userId, bridge.assistantMessageId, {
+      contentText: bridge.contentText,
+      thoughtsText: bridge.thoughtsText,
+      toolCalls: bridge.toolCalls,
+      artifactIds: [...bridge.emittedArtifactIds],
+    });
+    if (updated) {
+      this.hub.emitDurable({
+        userId: worker.userId,
+        type: 'message.updated',
+        chatId: worker.chatId,
+        runId: bridge.runId || null,
+        payload: { message: updated },
+      });
+    }
+  }
+
   private handleSessionNotification(worker: WorkerInstance, params: SessionNotification): void {
     const update: SessionUpdate = params.update;
-    const turn = worker.activeTurn;
 
     if (update.sessionUpdate === 'config_option_update') {
       const chat = this.db.getChat(worker.userId, worker.chatId);
@@ -1377,7 +2178,14 @@ export class AcpClientManager {
       return;
     }
 
+    const isBackgroundTurn = !worker.activeTurn;
+    const turn = worker.activeTurn ?? this.ensureBackgroundBridge(worker);
+
     if (update.sessionUpdate === 'usage_update') {
+      if (turn) {
+        turn.lastActivityAt = Date.now();
+        turn.lastParentActivityAt = Date.now();
+      }
       this.hub.emitEphemeral({
         userId: worker.userId,
         type: 'chat.context_usage',
@@ -1388,34 +2196,152 @@ export class AcpClientManager {
       return;
     }
 
-    if (!turn) return;
+    if (!turn) {
+      return;
+    }
+
+    const now = Date.now();
+    turn.lastActivityAt = now;
+    worker.lastUsedAt = now;
+    if (isBackgroundTurn) {
+      worker.lastBackgroundActivityAt = now;
+    }
+
+    const finalizeIfBackground = () => {
+      if (isBackgroundTurn) {
+        this.flushBackgroundBridgeToMessage(worker, turn);
+      }
+    };
+
+    // Route child subagent session notifications cleanly without mixing child scratch output into parent text
+    if (params.sessionId && worker.acpSessionId && params.sessionId !== worker.acpSessionId) {
+      this.handleChildSessionNotification(worker, turn, params.sessionId, update);
+      finalizeIfBackground();
+      return;
+    }
+
+    const rawUpdate = update as unknown as Record<string, unknown>;
+    const rawUpdateType = String(rawUpdate.sessionUpdate || '');
+
+    if (rawUpdateType === 'subagent_update') {
+      const subStateObj = rawUpdate.state as
+        | { state?: 'running' | 'idle' | 'requires_action' | 'unknown'; stopReason?: string | null }
+        | null
+        | undefined;
+      this.upsertSubagentToolCall(worker, turn, {
+        subSessionId: typeof rawUpdate.sessionId === 'string' ? rawUpdate.sessionId : 'subagent',
+        title: typeof rawUpdate.title === 'string' ? rawUpdate.title : null,
+        description: typeof rawUpdate.description === 'string' ? rawUpdate.description : null,
+        state: subStateObj?.state ?? undefined,
+        stopReason: subStateObj?.stopReason,
+      });
+      this.syncBrainDeliverablesMidTurn(worker, turn);
+      finalizeIfBackground();
+      return;
+    }
+
+    if (rawUpdateType === 'state_update') {
+      const stateObj = rawUpdate as {
+        state?: 'running' | 'idle' | 'requires_action' | 'unknown';
+        stopReason?: string | null;
+      };
+      turn.lastParentActivityAt = now;
+      if (stateObj.state === 'running' && turn.initialPromptDone) {
+        turn.parentWakeupStarted = true;
+        turn.parentWakeupIdle = false;
+        this.markAsyncSubagentsCompleted(worker, turn);
+      } else if (stateObj.state === 'idle' && turn.initialPromptDone) {
+        turn.parentWakeupIdle = true;
+        this.markAsyncSubagentsCompleted(worker, turn);
+        this.syncBrainDeliverablesMidTurn(worker, turn);
+      }
+      finalizeIfBackground();
+      return;
+    }
+
+    if (rawUpdateType === 'session_message' || rawUpdateType === 'session_message_chunk') {
+      this.syncBrainDeliverablesMidTurn(worker, turn);
+      const senderSessionId =
+        typeof rawUpdate.senderSessionId === 'string' ? rawUpdate.senderSessionId : null;
+      if (
+        rawUpdateType === 'session_message' &&
+        senderSessionId &&
+        senderSessionId !== worker.acpSessionId
+      ) {
+        this.upsertSubagentToolCall(worker, turn, {
+          subSessionId: senderSessionId,
+          state: 'idle',
+        });
+      }
+      finalizeIfBackground();
+      return;
+    }
+
+    // Parent session activity arriving after the initial session/prompt resolved means
+    // Antigravity's native Reactive Wakeup has resumed the parent session.
+    if (
+      turn.initialPromptDone &&
+      (update.sessionUpdate === 'agent_message_chunk' ||
+        update.sessionUpdate === 'agent_thought_chunk' ||
+        update.sessionUpdate === 'tool_call' ||
+        update.sessionUpdate === 'tool_call_update')
+    ) {
+      turn.lastParentActivityAt = now;
+      if (!turn.parentWakeupStarted) {
+        turn.parentWakeupStarted = true;
+        this.markAsyncSubagentsCompleted(worker, turn);
+        this.syncBrainDeliverablesMidTurn(worker, turn);
+      }
+    }
 
     if (update.sessionUpdate === 'agent_message_chunk') {
-      if (update.content.type === 'text') {
-        const offset = turn.contentText.length;
-        const chunk = update.content.text;
-        turn.contentText += chunk;
-        this.hub.emitEphemeral({
-          userId: worker.userId,
-          type: 'run.delta',
-          chatId: worker.chatId,
-          runId: turn.runId,
-          payload: {
-            messageId: turn.assistantMessageId,
-            field: 'content',
-            offset,
-            chunk,
-          },
-        });
-        this.maybeFlushTurnProgress(turn);
+      if (turn.initialPromptDone && !turn.receivedWakeupText) {
+        turn.receivedWakeupText = true;
+        if (turn.contentText.trim().length > 0 && !turn.contentText.endsWith('\n\n')) {
+          this.appendTurnContentChunk(
+            worker,
+            turn,
+            turn.contentText.endsWith('\n') ? '\n' : '\n\n'
+          );
+        }
       }
+      if (update.content.type === 'text') {
+        this.appendTurnContentChunk(worker, turn, update.content.text);
+      } else if (update.content.type === 'image') {
+        const rel = this.saveInlineBase64AssetToWorkspace(worker, turn, {
+          data: update.content.data,
+          mimeType: update.content.mimeType,
+        });
+        if (rel) {
+          this.appendTurnContentChunk(worker, turn, `\n\n![生成画像](${rel})\n`);
+        }
+      } else if (update.content.type === 'resource_link') {
+        this.syncBrainDeliverablesMidTurn(worker, turn);
+        const rewrittenUri = rewriteInternalPathsToWorkspace(
+          update.content.uri,
+          worker.profileDir,
+          worker.workspaceDir
+        );
+        const rel = rewrittenUri.replace(/^file:\/\//, '').replace(/^\/workspace\//, '');
+        const { previewKind } = detectMimeAndPreviewKind(update.content.name || rel);
+        const md =
+          previewKind === 'image' || previewKind === 'svg'
+            ? `\n\n![${update.content.name || path.basename(rel)}](${rel})\n`
+            : `\n\n[${update.content.name || path.basename(rel)}](${rewrittenUri})\n`;
+        this.appendTurnContentChunk(worker, turn, md);
+      }
+      finalizeIfBackground();
       return;
     }
 
     if (update.sessionUpdate === 'agent_thought_chunk') {
       if (update.content.type === 'text') {
         const offset = turn.thoughtsText.length;
-        const chunk = update.content.text;
+        const chunk = rewriteInternalPathsToWorkspace(
+          update.content.text,
+          worker.profileDir,
+          worker.workspaceDir
+        );
         turn.thoughtsText += chunk;
         this.hub.emitEphemeral({
           userId: worker.userId,
@@ -1431,22 +2357,54 @@ export class AcpClientManager {
         });
         this.maybeFlushTurnProgress(turn);
       }
+      finalizeIfBackground();
       return;
     }
 
     if (update.sessionUpdate === 'tool_call') {
-      const nextTool: ToolCallItem = {
-        toolCallId: update.toolCallId,
+      const rawName = (update as { name?: string }).name;
+      const rawContent = (update as { content?: unknown }).content;
+      const subagentMeta = classifySubagentToolCall({
+        name: rawName,
         title: update.title,
         kind: update.kind,
-        status: update.status ?? 'pending',
+        rawInput: update.rawInput,
+        rawContent,
+      });
+      if (subagentMeta.isAsyncSubagentLaunch) {
+        turn.asyncSubagentToolIds.add(update.toolCallId);
+      }
+      const contentText = this.extractToolCallContentAndSaveAssets(worker, turn, rawContent);
+      const effectiveStatus: ToolCallItem['status'] =
+        subagentMeta.isAsyncSubagentLaunch && !turn.parentWakeupStarted
+          ? 'in_progress'
+          : (update.status ?? 'in_progress');
+
+      const nextToolRaw: ToolCallItem = {
+        toolCallId: update.toolCallId,
+        title: update.title,
+        ...(rawName ? { name: rawName } : {}),
+        kind: update.kind,
+        status: effectiveStatus,
+        ...(subagentMeta.isSubagent
+          ? { isSubagent: true, subagentLabel: subagentMeta.subagentLabel }
+          : {}),
         rawInput: update.rawInput,
         rawOutput: update.rawOutput,
         locations: update.locations?.map((l) => ({ path: l.path, line: l.line })),
+        ...(contentText ? { contentText } : {}),
       };
+      const [nextTool] = scrubToolCallsInternalPaths(
+        [nextToolRaw],
+        worker.profileDir,
+        worker.workspaceDir
+      );
       const idx = turn.toolCalls.findIndex((t) => t.toolCallId === nextTool.toolCallId);
       if (idx >= 0) turn.toolCalls[idx] = nextTool;
       else turn.toolCalls.push(nextTool);
+
+      turn.textAfterLastToolCall = '';
+      this.syncBrainDeliverablesMidTurn(worker, turn);
 
       this.db.updateMessage(turn.userId, turn.assistantMessageId, { toolCalls: turn.toolCalls });
       this.hub.emitEphemeral({
@@ -1456,6 +2414,7 @@ export class AcpClientManager {
         runId: turn.runId,
         payload: { messageId: turn.assistantMessageId, toolCalls: turn.toolCalls },
       });
+      finalizeIfBackground();
       return;
     }
 
@@ -1466,19 +2425,67 @@ export class AcpClientManager {
           ? turn.toolCalls[idx]
           : { toolCallId: update.toolCallId, title: update.title ?? 'ツール実行', status: 'in_progress' };
 
-      const merged: ToolCallItem = {
+      const rawName = (update as { name?: string }).name ?? existing.name;
+      const mergedTitle =
+        update.title !== undefined && update.title !== null ? update.title : existing.title;
+      const mergedKind =
+        update.kind !== undefined && update.kind !== null ? update.kind : existing.kind;
+      const mergedRawInput = update.rawInput !== undefined ? update.rawInput : existing.rawInput;
+      const rawContent = (update as { content?: unknown }).content;
+      const subagentMeta = classifySubagentToolCall({
+        name: rawName,
+        title: mergedTitle,
+        kind: mergedKind,
+        rawInput: mergedRawInput,
+        rawContent,
+      });
+      if (subagentMeta.isAsyncSubagentLaunch) {
+        turn.asyncSubagentToolIds.add(update.toolCallId);
+      }
+      const contentText = this.extractToolCallContentAndSaveAssets(worker, turn, rawContent);
+
+      // For `invoke_subagent`, `tool_call_update: completed` during the launch turn only means the
+      // background subagent was spawned. Keep status as `in_progress` until the subagent finishes!
+      const isAsyncStillRunning =
+        turn.asyncSubagentToolIds.has(update.toolCallId) &&
+        !turn.parentWakeupStarted &&
+        (turn.subagents.size === 0 ||
+          [...turn.subagents.values()].some(
+            (s) => s.toolCallId === update.toolCallId && s.state !== 'idle'
+          ));
+
+      let effectiveStatus =
+        update.status !== undefined && update.status !== null ? update.status : existing.status;
+      if (isAsyncStillRunning && effectiveStatus === 'completed') {
+        effectiveStatus = 'in_progress';
+      }
+
+      const mergedRaw: ToolCallItem = {
         ...existing,
-        ...(update.title !== undefined && update.title !== null ? { title: update.title } : {}),
-        ...(update.kind !== undefined && update.kind !== null ? { kind: update.kind } : {}),
-        ...(update.status !== undefined && update.status !== null ? { status: update.status } : {}),
+        title: mergedTitle,
+        ...(rawName ? { name: rawName } : {}),
+        ...(mergedKind !== undefined ? { kind: mergedKind } : {}),
+        status: effectiveStatus,
+        ...(subagentMeta.isSubagent
+          ? { isSubagent: true, subagentLabel: subagentMeta.subagentLabel }
+          : {}),
         ...(update.rawInput !== undefined ? { rawInput: update.rawInput } : {}),
         ...(update.rawOutput !== undefined ? { rawOutput: update.rawOutput } : {}),
         ...(update.locations !== undefined && update.locations !== null
           ? { locations: update.locations.map((l) => ({ path: l.path, line: l.line })) }
           : {}),
+        ...(contentText ? { contentText } : {}),
       };
+      const [merged] = scrubToolCallsInternalPaths(
+        [mergedRaw],
+        worker.profileDir,
+        worker.workspaceDir
+      );
       if (idx >= 0) turn.toolCalls[idx] = merged;
       else turn.toolCalls.push(merged);
+
+      turn.textAfterLastToolCall = '';
+      this.syncBrainDeliverablesMidTurn(worker, turn);
 
       this.db.updateMessage(turn.userId, turn.assistantMessageId, { toolCalls: turn.toolCalls });
       this.hub.emitEphemeral({
@@ -1488,6 +2495,7 @@ export class AcpClientManager {
         runId: turn.runId,
         payload: { messageId: turn.assistantMessageId, toolCalls: turn.toolCalls },
       });
+      finalizeIfBackground();
     }
   }
 
@@ -1526,11 +2534,30 @@ export class AcpClientManager {
     }
   }
 
+  private isWorkerBusy(w: WorkerInstance): boolean {
+    if (w.inFlight || w.activeTurn !== null) return true;
+    const bg = w.backgroundBridge;
+    if (bg) {
+      if (bg.pendingResolvers.size > 0) return true;
+      if (
+        [...bg.subagents.values()].some(
+          (s) => s.state === 'running' || s.state === 'requires_action'
+        )
+      ) {
+        return true;
+      }
+      if (bg.toolCalls.some((tc) => tc.status === 'in_progress' || tc.status === 'pending')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private evictOneIdleIfFull(): void {
     if (this.workers.size < this.config.maxConcurrentAcp) return;
     let oldestIdle: WorkerInstance | null = null;
     for (const w of this.workers.values()) {
-      if (!w.inFlight && (!oldestIdle || w.lastUsedAt < oldestIdle.lastUsedAt)) {
+      if (!this.isWorkerBusy(w) && (!oldestIdle || w.lastUsedAt < oldestIdle.lastUsedAt)) {
         oldestIdle = w;
       }
     }
@@ -1542,7 +2569,7 @@ export class AcpClientManager {
   private evictIdleWorkers(): void {
     const cutoff = Date.now() - this.config.idleWorkerMs;
     for (const w of this.workers.values()) {
-      if (!w.inFlight && w.lastUsedAt < cutoff) {
+      if (!this.isWorkerBusy(w) && w.lastUsedAt < cutoff) {
         void this.stopWorkerByKey(w.key);
       }
     }

@@ -9,6 +9,13 @@ import type { SandboxStatus } from '../types.js';
 const require = createRequire(import.meta.url);
 
 export const SANDBOX_WORKSPACE_MOUNT = '/workspace';
+export const SANDBOX_HOME_MOUNT = '/home/sandbox';
+
+export function getChatBrainHostDir(profileDir: string, workspaceDir?: string | null): string {
+  const profileAbs = path.resolve(profileDir);
+  const wsKey = workspaceDir ? path.basename(path.resolve(workspaceDir)) : 'default';
+  return path.join(profileAbs, '.chat-brains', wsKey || 'default');
+}
 
 export interface IsolatedEnvOptions {
   profileDir: string;
@@ -447,6 +454,14 @@ export function buildAgyCommandSpec(params: {
       profileDir: profileAbs,
       geminiApiKey: params.geminiApiKey,
       sandboxTmpDir: '/tmp',
+      extraEnv: {
+        HOME: SANDBOX_HOME_MOUNT,
+        USERPROFILE: SANDBOX_HOME_MOUNT,
+        XDG_CONFIG_HOME: `${SANDBOX_HOME_MOUNT}/.config`,
+        XDG_DATA_HOME: `${SANDBOX_HOME_MOUNT}/.local/share`,
+        XDG_STATE_HOME: `${SANDBOX_HOME_MOUNT}/.local/state`,
+        XDG_CACHE_HOME: `${SANDBOX_HOME_MOUNT}/.cache`,
+      },
     });
 
     const { args: rootArgs, mountedSystemDirs } = buildCoreBwrapRootfsArgs();
@@ -475,10 +490,34 @@ export function buildAgyCommandSpec(params: {
       }
     }
 
+    const chatBrainHostDir = getChatBrainHostDir(profileAbs, workspaceAbs);
+    fs.mkdirSync(chatBrainHostDir, { recursive: true, mode: 0o700 });
+    const brainSubdirs = [
+      ['.gemini', 'antigravity-cli', 'brain'],
+      ['.gemini', 'antigravity', 'brain'],
+      ['.gemini', 'jetski', 'brain'],
+      ['.gemini', 'brain'],
+    ] as const;
+    for (const rel of brainSubdirs) {
+      fs.mkdirSync(path.join(profileAbs, ...rel), { recursive: true, mode: 0o700 });
+    }
+
     bwrapArgs.push(
       '--bind',
       profileAbs,
-      profileAbs,
+      SANDBOX_HOME_MOUNT,
+      '--bind',
+      chatBrainHostDir,
+      `${SANDBOX_HOME_MOUNT}/.gemini/antigravity-cli/brain`,
+      '--bind',
+      chatBrainHostDir,
+      `${SANDBOX_HOME_MOUNT}/.gemini/antigravity/brain`,
+      '--bind',
+      chatBrainHostDir,
+      `${SANDBOX_HOME_MOUNT}/.gemini/jetski/brain`,
+      '--bind',
+      chatBrainHostDir,
+      `${SANDBOX_HOME_MOUNT}/.gemini/brain`,
       '--bind',
       workspaceAbs,
       SANDBOX_WORKSPACE_MOUNT,

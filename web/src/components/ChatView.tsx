@@ -78,6 +78,26 @@ const ThoughtsAccordion: React.FC<{ text: string; streaming?: boolean }> = React
   );
 });
 
+function isSubagentTool(tc: ToolCallItem): boolean {
+  if (tc.isSubagent) return true;
+  return /subagent|invoke_subagent|define_subagent|manage_subagents|generate_image|image_gen|画像生成|サブエージェント/i.test(
+    `${tc.name ?? ''} ${tc.title ?? ''}`
+  );
+}
+
+function formatToolStatusLabel(tc: ToolCallItem, subagent: boolean): string {
+  if (tc.status === 'completed') {
+    return subagent ? 'サブエージェント完了' : '完了';
+  }
+  if (tc.status === 'failed') {
+    return subagent ? 'サブエージェント失敗' : '失敗';
+  }
+  if (tc.status === 'in_progress' || tc.status === 'pending') {
+    return subagent ? 'サブエージェント応答中...' : '実行中...';
+  }
+  return tc.status;
+}
+
 const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ toolCalls }) => {
   const [openIds, setOpenIds] = useState<Record<string, boolean>>({});
   if (!toolCalls || toolCalls.length === 0) return null;
@@ -86,14 +106,23 @@ const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ too
     <div className="tools-list">
       {toolCalls.map((tc) => {
         const isOpen = Boolean(openIds[tc.toolCallId]);
+        const subagent = isSubagentTool(tc);
+        const isRunning = tc.status === 'in_progress' || tc.status === 'pending';
         const badgeCls =
           tc.status === 'completed'
             ? 'ok'
             : tc.status === 'failed'
               ? 'danger'
               : 'pending';
+        const displayTitle = tc.subagentLabel || tc.title;
+        const statusLabel = formatToolStatusLabel(tc, subagent);
         return (
-          <div key={tc.toolCallId} className="tool-chip-card">
+          <div
+            key={tc.toolCallId}
+            className={`tool-chip-card ${subagent ? 'subagent-chip-card' : ''} ${
+              isRunning ? 'is-running' : ''
+            }`}
+          >
             <button
               type="button"
               className="tool-chip-head"
@@ -101,9 +130,10 @@ const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ too
                 setOpenIds((prev) => ({ ...prev, [tc.toolCallId]: !prev[tc.toolCallId] }))
               }
             >
-              <span className={`status-dot ${badgeCls}`} />
-              <span className="tool-title truncate">{tc.title}</span>
-              <span className="muted-xs">{tc.status}</span>
+              <span className={`status-dot ${badgeCls} ${isRunning ? 'pulse' : ''}`} />
+              {subagent && <span className="subagent-tag">Subagent</span>}
+              <span className="tool-title truncate">{displayTitle}</span>
+              <span className={`tool-status-label muted-xs ${badgeCls}`}>{statusLabel}</span>
               <ChevronIcon size={13} dir={isOpen ? 'down' : 'right'} />
             </button>
             {isOpen && (
@@ -113,6 +143,7 @@ const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ too
                     対象: {tc.locations.map((l) => l.path).join(', ')}
                   </div>
                 )}
+                {tc.contentText && <pre className="tool-json">{tc.contentText}</pre>}
                 {tc.rawInput !== undefined && (
                   <pre className="tool-json">{JSON.stringify(tc.rawInput, null, 2)}</pre>
                 )}
@@ -272,6 +303,12 @@ const MessageRow: React.FC<{
       );
     }
 
+    const activeToolCall =
+      msg.status === 'streaming'
+        ? [...msg.toolCalls].reverse().find((t) => t.status === 'in_progress' || t.status === 'pending')
+        : undefined;
+    const activeToolIsSubagent = activeToolCall ? isSubagentTool(activeToolCall) : false;
+
     return (
       <div className="msg-row assistant">
         <div className="assistant-body">
@@ -309,13 +346,24 @@ const MessageRow: React.FC<{
               />
               {msg.status === 'streaming' && <span className="stream-cursor" />}
             </div>
-          ) : msg.status === 'streaming' ? (
+          ) : msg.status === 'streaming' && !activeToolCall ? (
             <div className="streaming-placeholder">
               <span className="pulse-dot" /> 応答を生成中...
             </div>
           ) : msg.status === 'cancelled' ? (
             <div className="muted-sm">（生成がキャンセルされました）</div>
           ) : null}
+
+          {activeToolCall && (
+            <div className="streaming-placeholder subagent-live-banner">
+              <span className="pulse-dot" />
+              <span>
+                {activeToolIsSubagent
+                  ? `${activeToolCall.subagentLabel || activeToolCall.title} が応答中...`
+                  : `${activeToolCall.title} を実行中...`}
+              </span>
+            </div>
+          )}
 
           {msg.errorMessage && <div className="error-box">{msg.errorMessage}</div>}
 
@@ -375,6 +423,7 @@ interface ChatComposerProps {
   onUploadFiles: (files: File[]) => Promise<AttachmentRef[]>;
   onCancelRun: (runId: string) => Promise<void>;
   onOpenSkills?: () => void;
+  onPromptSubmitting?: () => void;
 }
 
 const ChatComposer = React.memo(
@@ -399,6 +448,7 @@ const ChatComposer = React.memo(
         onUploadFiles,
         onCancelRun,
         onOpenSkills,
+        onPromptSubmitting,
       },
       ref
     ) => {
@@ -556,12 +606,25 @@ const ChatComposer = React.memo(
 
       const configBusy = sending || uploading || isRunBusy;
       const canSend = !(sending || uploading || (!inputText.trim() && stagedAttachments.length === 0));
+      const showStopInsteadOfSend = isRunBusy && Boolean(activeRunId) && !hasDraft && !sending;
+      const isFollowupSendMode = isRunBusy && (hasDraft || sending);
       const useIosSwitchOverlay = isAppleTouchHapticsFallback() && hapticEnabled;
 
       const handleSubmit = async (e?: React.FormEvent) => {
         e?.preventDefault();
         const trimmed = inputText.trim();
         if ((!trimmed && stagedAttachments.length === 0) || sending || uploading) return;
+
+        // Immediately dismiss smartphone soft keyboard and lock scroll to follow latest response
+        textareaRef.current?.blur();
+        if (
+          typeof document !== 'undefined' &&
+          document.activeElement instanceof HTMLElement &&
+          composerInnerRef.current?.contains(document.activeElement)
+        ) {
+          document.activeElement.blur();
+        }
+        onPromptSubmitting?.();
 
         const toSendAttachments = stagedAttachments;
         const savedInput = inputText;
@@ -771,7 +834,13 @@ const ChatComposer = React.memo(
                 }}
                 onKeyDown={handleKeyDown}
                 onPaste={handlePaste}
-                placeholder={uploading ? 'ファイルをアップロード中...' : 'Antigravity に聞く（/ でスキル呼出）'}
+                placeholder={
+                  uploading
+                    ? 'ファイルをアップロード中...'
+                    : isRunBusy
+                      ? 'フォローアップを入力（/ でスキル呼出）'
+                      : 'Antigravity に聞く（/ でスキル呼出）'
+                }
                 disabled={uploading}
               />
 
@@ -822,7 +891,13 @@ const ChatComposer = React.memo(
                     />
                   )}
 
-                  {isRunBusy && activeRunId && (
+                  {isFollowupSendMode && (
+                    <span className="followup-mode-badge" aria-hidden="true">
+                      フォローアップ
+                    </span>
+                  )}
+
+                  {showStopInsteadOfSend && activeRunId ? (
                     <div className="haptic-btn-shell">
                       <button
                         type="button"
@@ -832,6 +907,7 @@ const ChatComposer = React.memo(
                           void onCancelRun(activeRunId);
                         }}
                         title="生成・キューを停止"
+                        aria-label="生成・キューを停止"
                       >
                         <StopIcon size={14} />
                       </button>
@@ -846,28 +922,32 @@ const ChatComposer = React.memo(
                         </label>
                       )}
                     </div>
+                  ) : (
+                    <div className="haptic-btn-shell">
+                      <button
+                        type="submit"
+                        className={`send-btn ${isFollowupSendMode ? 'followup-btn' : ''}`}
+                        disabled={!canSend}
+                        title={isFollowupSendMode ? 'フォローアップとして送信' : '送信'}
+                        aria-label={isFollowupSendMode ? 'フォローアップとして送信' : '送信'}
+                      >
+                        <SendIcon size={17} />
+                      </button>
+                      {useIosSwitchOverlay && canSend && (
+                        <label
+                          className="ios-haptic-switch-overlay"
+                          title={isFollowupSendMode ? 'フォローアップとして送信' : '送信'}
+                        >
+                          <input
+                            type="checkbox"
+                            {...({ switch: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
+                            aria-label={isFollowupSendMode ? 'フォローアップとして送信' : '送信'}
+                            onChange={() => void handleSubmit()}
+                          />
+                        </label>
+                      )}
+                    </div>
                   )}
-
-                  <div className="haptic-btn-shell">
-                    <button
-                      type="submit"
-                      className="send-btn"
-                      disabled={!canSend}
-                      title="送信"
-                    >
-                      <SendIcon size={17} />
-                    </button>
-                    {useIosSwitchOverlay && canSend && (
-                      <label className="ios-haptic-switch-overlay" title="送信">
-                        <input
-                          type="checkbox"
-                          {...({ switch: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
-                          aria-label="送信"
-                          onChange={() => void handleSubmit()}
-                        />
-                      </label>
-                    )}
-                  </div>
                 </div>
               </div>
             </form>
@@ -912,9 +992,11 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
 
   const chatViewRef = useRef<HTMLDivElement>(null);
   const messagesScrollRef = useRef<HTMLDivElement>(null);
+  const messagesRailRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<ChatComposerHandle>(null);
 
   const isNearBottomRef = useRef(true);
+  const followLockUntilRef = useRef<number>(0);
   const scrollRafRef = useRef<number | null>(null);
   const prevScrollChatIdRef = useRef<string | undefined>(chat?.id);
   const prevMsgCountRef = useRef<number>(messages.length);
@@ -979,26 +1061,9 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
     return grouped;
   }, [pendingPermissions]);
 
-  const handleMessagesScroll = useCallback(() => {
-    const el = messagesScrollRef.current;
-    if (!el) return;
-    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
-    isNearBottomRef.current = distance < 96;
-  }, []);
-
-  const lastMsg = messages[messages.length - 1];
-  useEffect(() => {
-    const chatChanged = prevScrollChatIdRef.current !== chat?.id;
-    prevScrollChatIdRef.current = chat?.id;
-    const newMsgAdded = messages.length > prevMsgCountRef.current;
-    prevMsgCountRef.current = messages.length;
-
-    if (chatChanged || (newMsgAdded && lastMsg?.role === 'user')) {
-      isNearBottomRef.current = true;
-    }
+  const scheduleScrollToBottom = useCallback(() => {
     if (!isNearBottomRef.current) return;
     if (scrollRafRef.current !== null) return;
-
     scrollRafRef.current = window.requestAnimationFrame(() => {
       scrollRafRef.current = null;
       const el = messagesScrollRef.current;
@@ -1006,14 +1071,87 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
         el.scrollTop = el.scrollHeight;
       }
     });
+  }, []);
+
+  const handlePromptSubmitting = useCallback(() => {
+    followLockUntilRef.current = Date.now() + 1200;
+    isNearBottomRef.current = true;
+    const el = messagesScrollRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+    scheduleScrollToBottom();
+  }, [scheduleScrollToBottom]);
+
+  const handleMessagesScroll = useCallback(() => {
+    const el = messagesScrollRef.current;
+    if (!el) return;
+    if (Date.now() < followLockUntilRef.current) {
+      isNearBottomRef.current = true;
+      return;
+    }
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    isNearBottomRef.current = distance < 120;
+  }, []);
+
+  const lastMsg = messages[messages.length - 1];
+  const lastMsgToolSummary = useMemo(
+    () => (lastMsg?.toolCalls ?? []).map((t) => `${t.toolCallId}:${t.status}`).join('|'),
+    [lastMsg?.toolCalls]
+  );
+
+  useEffect(() => {
+    const chatChanged = prevScrollChatIdRef.current !== chat?.id;
+    prevScrollChatIdRef.current = chat?.id;
+    const newMsgAdded = messages.length > prevMsgCountRef.current;
+    prevMsgCountRef.current = messages.length;
+
+    if (chatChanged || (newMsgAdded && lastMsg?.role === 'user')) {
+      followLockUntilRef.current = Date.now() + 1200;
+      isNearBottomRef.current = true;
+    }
+    scheduleScrollToBottom();
   }, [
     chat?.id,
     messages.length,
     lastMsg?.role,
+    lastMsg?.status,
     lastMsg?.contentText.length,
     lastMsg?.thoughtsText.length,
+    lastMsg?.artifactIds.length,
+    lastMsgToolSummary,
     pendingPermissions.length,
+    scheduleScrollToBottom,
   ]);
+
+  useEffect(() => {
+    const scrollEl = messagesScrollRef.current;
+    const railEl = messagesRailRef.current;
+    if (!scrollEl || typeof ResizeObserver === 'undefined') return;
+
+    const ro = new ResizeObserver(() => {
+      if (Date.now() < followLockUntilRef.current) {
+        isNearBottomRef.current = true;
+      }
+      scheduleScrollToBottom();
+    });
+    ro.observe(scrollEl);
+    if (railEl) ro.observe(railEl);
+
+    const vv = typeof window !== 'undefined' ? window.visualViewport : null;
+    const onVvResize = () => {
+      if (Date.now() < followLockUntilRef.current) {
+        isNearBottomRef.current = true;
+      }
+      scheduleScrollToBottom();
+    };
+    vv?.addEventListener('resize', onVvResize);
+
+    return () => {
+      ro.disconnect();
+      vv?.removeEventListener('resize', onVvResize);
+    };
+  }, [scheduleScrollToBottom]);
 
   useEffect(() => {
     return () => {
@@ -1130,7 +1268,7 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
       )}
 
       <div ref={messagesScrollRef} className="messages-scroll" onScroll={handleMessagesScroll}>
-        <div className="messages-rail">
+        <div ref={messagesRailRef} className="messages-rail">
           {messages.length === 0 ? (
             <div className="welcome-empty">
               {project ? (
@@ -1190,6 +1328,7 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
         onUploadFiles={onUploadFiles}
         onCancelRun={onCancelRun}
         onOpenSkills={onOpenSkills}
+        onPromptSubmitting={handlePromptSubmitting}
       />
     </div>
   );

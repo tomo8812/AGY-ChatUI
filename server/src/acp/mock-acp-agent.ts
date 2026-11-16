@@ -473,6 +473,125 @@ function runAcpServer(): void {
         return { stopReason: 'cancelled' as const };
       }
 
+      // Simulate out-of-workspace permission request (must be auto-rejected by client without prompting user)
+      let outsidePermissionNotes = '';
+      if (promptText.includes('[OUTSIDE_PERMISSION]')) {
+        const outsidePath = path.join(homeDir, '.gemini', 'antigravity-cli', 'brain', state.id, 'outside-secret.txt');
+        const permRes = await ctx.client.request(methods.client.session.requestPermission, {
+          sessionId: state.id,
+          toolCall: {
+            toolCallId: `tc-outside-${Date.now()}`,
+            title: `Read ${outsidePath}`,
+            kind: 'read',
+            status: 'pending',
+            locations: [{ path: outsidePath }],
+          },
+          options: [
+            { optionId: 'allow_once', name: '許可', kind: 'allow_once' },
+            { optionId: 'reject_once', name: '拒否', kind: 'reject_once' },
+          ],
+        });
+        const allowed =
+          permRes.outcome.outcome === 'selected' && permRes.outcome.optionId.startsWith('allow');
+        outsidePermissionNotes = allowed
+          ? '\n[OUTSIDE_ALLOWED_UNEXPECTED]'
+          : '\n[OUTSIDE_BLOCKED_AUTOMATICALLY] `/workspace` 外へのアクセスは拒否されました。';
+      }
+
+      // Simulate native Antigravity invoke_subagent ("完了したらお知らせします" -> end_turn -> background subagent -> reactive wakeup)
+      if (promptText.includes('[SUBAGENT_IMAGE]')) {
+        const subToolId = `tc-subagent-${Date.now()}`;
+        const childSessionId = `${state.id}-subagent-1`;
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: subToolId,
+            title: 'invoke_subagent',
+            kind: 'other',
+            status: 'in_progress',
+            rawInput: {
+              Subagents: [
+                {
+                  TypeName: 'media',
+                  Role: 'Image Generator',
+                  Prompt: 'Generate a cute cyber cat',
+                },
+              ],
+            },
+          },
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'subagent_update',
+            sessionId: childSessionId,
+            title: 'Image Generator',
+            description: 'media',
+            state: { state: 'running' },
+          },
+        });
+        // invoke_subagent returns immediately once the background subagent is spawned
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: subToolId,
+            status: 'completed',
+            rawOutput: { conversationId: childSessionId },
+          },
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: '画像生成サブエージェントを起動しました。完了したらお知らせします。',
+            },
+          },
+        });
+
+        // Background subagent runs asynchronously after initial session/prompt returns end_turn,
+        // writes image to brain directory, and triggers native Reactive Wakeup on parent session
+        void (async () => {
+          await delay(80);
+          if (state.cancelled) return;
+          const brainSessionDir = path.join(homeDir, '.gemini', 'antigravity-cli', 'brain', childSessionId);
+          fs.mkdirSync(brainSessionDir, { recursive: true, mode: 0o700 });
+          const subagentImgPath = path.join(brainSessionDir, 'subagent-art.png');
+          const minimalPng = Buffer.from(
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+            'base64'
+          );
+          fs.writeFileSync(subagentImgPath, minimalPng);
+
+          await sendUpdate({
+            sessionId: state.id,
+            update: {
+              sessionUpdate: 'subagent_update',
+              sessionId: childSessionId,
+              title: 'Image Generator',
+              state: { state: 'idle', stopReason: 'end_turn' },
+            },
+          });
+
+          // Parent session reactive wakeup streams the continuation response
+          await sendUpdate({
+            sessionId: state.id,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: {
+                type: 'text',
+                text: `サブエージェントによる画像生成が完了しました！\n\n![生成イラスト](${subagentImgPath})`,
+              },
+            },
+          });
+        })();
+
+        return { stopReason: 'end_turn' as const };
+      }
+
       // Tool call & interactive permission check
       if (promptText.includes('[PERMISSION]')) {
         const toolCallId = `tc-${Date.now()}`;
@@ -621,6 +740,7 @@ function runAcpServer(): void {
         promptText.includes('[PERMISSION]')
           ? '\n許可されたファイル [created-by-tool.md](created-by-tool.md) を作成しました。'
           : '',
+        outsidePermissionNotes,
         brainImageNotes,
         contextNotes,
         '\n\n```ts\nexport const status = "ok";\n```',

@@ -182,12 +182,13 @@ export class ExecutionScheduler {
         finishedAt: now,
       })!;
       const nextMsg = this.db.updateMessage(userId, removed.assistantMessageId, { status: 'cancelled' })!;
+      const nextActiveRun = this.db.getActiveRunForChat(userId, chatId);
       this.hub.emitDurable({
         userId,
         type: 'run.finished',
         chatId,
         runId,
-        payload: { run: nextRun, message: nextMsg },
+        payload: { run: nextRun, message: nextMsg, nextActiveRun },
       });
       this.notifyQueuePositions();
       return nextRun;
@@ -298,13 +299,14 @@ export class ExecutionScheduler {
         finishedAt,
       })!;
       const finalMsg = this.db.getMessage(job.userId, job.assistantMessageId)!;
+      const nextActiveRun = this.db.getActiveRunForChat(job.userId, job.chatId);
 
       this.hub.emitDurable({
         userId: job.userId,
         type: 'run.finished',
         chatId: job.chatId,
         runId: job.runId,
-        payload: { run: finalRun, message: finalMsg },
+        payload: { run: finalRun, message: finalMsg, nextActiveRun },
       });
 
       if (status !== 'cancelled') {
@@ -331,13 +333,14 @@ export class ExecutionScheduler {
         status: isCancelled ? 'cancelled' : 'error',
         errorMessage: isCancelled ? null : errorMsg,
       })!;
+      const nextActiveRun = this.db.getActiveRunForChat(job.userId, job.chatId);
 
       this.hub.emitDurable({
         userId: job.userId,
         type: 'run.finished',
         chatId: job.chatId,
         runId: job.runId,
-        payload: { run: finalRun, message: finalMsg },
+        payload: { run: finalRun, message: finalMsg, nextActiveRun },
       });
 
       if (!isCancelled) {
