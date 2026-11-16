@@ -14,7 +14,7 @@ async function main(): Promise<void> {
 
   await ctx.app.listen({ host: ctx.config.host, port: ctx.config.port });
   console.log(
-    `Antigravity Chat UI listening on http://${ctx.config.host}:${ctx.config.port} (agyMode=${ctx.config.agyMode})`
+    `Antigravity Chat UI v${ctx.buildInfo.version}${ctx.buildInfo.shortSha ? ` (${ctx.buildInfo.shortSha})` : ''} listening on http://${ctx.config.host}:${ctx.config.port} (agyMode=${ctx.config.agyMode})`
   );
 }
 

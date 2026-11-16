@@ -16,4 +16,7 @@ __pycache__/
 *.pyc
 BUILD_INFO.json
 .bundle-lock-sha256
+.bundle-stage/
 antigravity-chat-bundle.tar.gz*
+generated_notes.md
+release_notes.md

@@ -8,10 +8,26 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump override (auto, patch, minor, major)'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+          - major
+      version:
+        description: 'Explicit SemVer override (e.g. 1.2.0, optional)'
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: ci-deploy-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   ci:
@@ -21,8 +37,11 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repository with full history & tags
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Setup Node.js 24 LTS
         uses: actions/setup-node@v4
@@ -33,11 +52,39 @@ jobs:
       - name: Install workspace dependencies
         run: npm ci
 
+      - name: Resolve semantic release version
+        id: ver
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          INPUT_BUMP: ${{ github.event_name == 'workflow_dispatch' && inputs.bump || 'auto' }}
+          INPUT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            node scripts/version.mjs resolve \
+              --sha "${GITHUB_SHA}" \
+              --pr "${PR_NUMBER}" \
+              --github-output "${GITHUB_OUTPUT}"
+          else
+            node scripts/version.mjs resolve \
+              --sha "${GITHUB_SHA}" \
+              --bump "${INPUT_BUMP}" \
+              --version "${INPUT_VERSION}" \
+              --github-output "${GITHUB_OUTPUT}"
+          fi
+
       - name: Typecheck server & web
         run: npm run typecheck
 
       - name: Build production bundles (web + server)
-        run: npm run build
+        env:
+          VITE_APP_VERSION: ${{ steps.ver.outputs.version }}
+          VITE_APP_COMMIT_SHA: ${{ steps.ver.outputs.short_sha }}
+        run: |
+          npm run build
+          node scripts/version.mjs stamp-sw \
+            --file web/dist/sw.js \
+            --version "${{ steps.ver.outputs.version }}" \
+            --sha "${{ steps.ver.outputs.short_sha }}"
 
       - name: Run automated test suite
         run: npm test
@@ -45,11 +92,12 @@ jobs:
       - name: Package self-contained runtime bundle
         run: |
           rm -rf .bundle-stage antigravity-chat-bundle.tar.gz antigravity-chat-bundle.tar.gz.sha256 BUILD_INFO.json
-          mkdir -p .bundle-stage/server .bundle-stage/web
+          mkdir -p .bundle-stage/server .bundle-stage/web .bundle-stage/scripts
 
           cp package.json package-lock.json .bundle-stage/
           cp server/package.json .bundle-stage/server/
           cp web/package.json .bundle-stage/web/
+          cp scripts/version.mjs .bundle-stage/scripts/
           cp -r server/dist .bundle-stage/server/
           cp -r server/scripts .bundle-stage/server/
           cp -r web/dist .bundle-stage/web/
@@ -58,29 +106,23 @@ jobs:
           # Install ONLY pure-JS production deps for server (~41MB, zero native C++ addons)
           npm --prefix .bundle-stage ci --omit=dev --workspace=server --no-audit --no-fund
 
-          BUILD_ID="$(node -e '
-            const fs = require("fs"), crypto = require("crypto");
-            const h = crypto.createHash("sha256");
-            h.update(process.env.GITHUB_SHA || "");
-            for (const f of [".bundle-stage/web/dist/index.html", ".bundle-stage/web/dist/sw.js", ".bundle-stage/server/dist/app.js"]) {
-              h.update(fs.readFileSync(f));
-            }
-            console.log(h.digest("hex").slice(0, 16));
-          ')"
+          # Stamp resolved release version into packaged manifests & BUILD_INFO.json
+          node scripts/version.mjs stamp-manifests \
+            --dir .bundle-stage \
+            --version "${{ steps.ver.outputs.version }}"
 
-          cat > .bundle-stage/BUILD_INFO.json <<EOF
-          {
-            "commitSha": "${GITHUB_SHA}",
-            "shortSha": "${GITHUB_SHA::8}",
-            "buildId": "${BUILD_ID}",
-            "builtAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          }
-          EOF
+          node scripts/version.mjs write-build-info \
+            --out .bundle-stage/BUILD_INFO.json \
+            --version "${{ steps.ver.outputs.version }}" \
+            --tag "${{ steps.ver.outputs.release_tag }}" \
+            --sha "${GITHUB_SHA}" \
+            --files ".bundle-stage/web/dist/index.html,.bundle-stage/web/dist/sw.js,.bundle-stage/server/dist/app.js"
 
           cp .bundle-stage/BUILD_INFO.json BUILD_INFO.json
           tar -czf antigravity-chat-bundle.tar.gz -C .bundle-stage .
           sha256sum antigravity-chat-bundle.tar.gz > antigravity-chat-bundle.tar.gz.sha256
           ls -lh antigravity-chat-bundle.tar.gz
+          cat BUILD_INFO.json
 
       - name: Upload workflow bundle artifact
         uses: actions/upload-artifact@v4
@@ -93,40 +135,70 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-      - name: Publish prebuilt bundle to rolling GitHub Release "latest"
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Publish versioned GitHub Release
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.ver.outputs.release_tag }}
+          RELEASE_VERSION: ${{ steps.ver.outputs.version }}
+          PREV_TAG: ${{ steps.ver.outputs.prev_tag }}
         run: |
-          if gh release view latest >/dev/null 2>&1; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git tag -f latest "${GITHUB_SHA}"
-            git push -f origin refs/tags/latest
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-            gh release edit latest \
+          BUILD_ID="$(node -e 'console.log(JSON.parse(require("fs").readFileSync("BUILD_INFO.json","utf8")).buildId)')"
+
+          # Create & push annotated SemVer git tag (vX.Y.Z)
+          if ! git ls-remote --tags origin "refs/tags/${RELEASE_TAG}" | grep -q "refs/tags/${RELEASE_TAG}"; then
+            git tag -a "${RELEASE_TAG}" "${GITHUB_SHA}" -m "Release ${RELEASE_TAG}"
+            git push origin "refs/tags/${RELEASE_TAG}"
+          fi
+
+          rm -f generated_notes.md release_notes.md
+          if [ -n "${PREV_TAG}" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+              -f tag_name="${RELEASE_TAG}" \
+              -f target_commitish="${GITHUB_SHA}" \
+              -f previous_tag_name="${PREV_TAG}" \
+              --jq '.body' > generated_notes.md || true
+          fi
+
+          node scripts/version.mjs notes \
+            --version "${RELEASE_VERSION}" \
+            --tag "${RELEASE_TAG}" \
+            --prev-tag "${PREV_TAG}" \
+            --sha "${GITHUB_SHA}" \
+            --build-id "${BUILD_ID}" \
+            --generated-file generated_notes.md \
+            --out release_notes.md
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" \
               --target "${GITHUB_SHA}" \
-              --title "Latest Prebuilt Bundle" \
-              --notes "Prebuilt pure-JS server & Vite bundle from ${GITHUB_SHA}"
-            gh release upload latest \
+              --title "${RELEASE_TAG}" \
+              --notes-file release_notes.md \
+              --latest
+            gh release upload "${RELEASE_TAG}" \
               antigravity-chat-bundle.tar.gz \
               antigravity-chat-bundle.tar.gz.sha256 \
               BUILD_INFO.json \
               --clobber
           else
-            gh release create latest \
+            gh release create "${RELEASE_TAG}" \
               antigravity-chat-bundle.tar.gz \
               antigravity-chat-bundle.tar.gz.sha256 \
               BUILD_INFO.json \
-              --target "${GITHUB_SHA}" \
-              --title "Latest Prebuilt Bundle" \
-              --notes "Prebuilt pure-JS server & Vite bundle from ${GITHUB_SHA}"
+              --verify-tag \
+              --title "${RELEASE_TAG}" \
+              --notes-file release_notes.md \
+              --latest
           fi
 
   deploy-tailscale:
     name: Push Deploy to Oracle VM via Tailscale
     needs: ci
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.ENABLE_TAILSCALE_DEPLOY == 'true'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.ENABLE_TAILSCALE_DEPLOY == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read

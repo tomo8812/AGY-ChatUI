@@ -84,6 +84,9 @@ export function buildIsolatedAgyEnv(opts: IsolatedEnvOptions): NodeJS.ProcessEnv
   if (opts.includeMockVars && process.env.MOCK_ALLOW_UNAUTH !== undefined) {
     env.MOCK_ALLOW_UNAUTH = process.env.MOCK_ALLOW_UNAUTH;
   }
+  if (opts.includeMockVars && process.env.MOCK_CLIENT_INFO_PATH !== undefined) {
+    env.MOCK_CLIENT_INFO_PATH = process.env.MOCK_CLIENT_INFO_PATH;
+  }
 
   const profileAbs = path.resolve(opts.profileDir);
   const xdgConfig = path.join(profileAbs, '.config');

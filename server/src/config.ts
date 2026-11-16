@@ -1,8 +1,10 @@
 import path from 'node:path';
+import { resolvePackageVersion } from './version.js';
 
 export type SandboxMode = 'auto' | 'strict' | 'off';
 
 export interface AppConfig {
+  appVersion: string;
   nodeEnv: string;
   host: string;
   port: number;
@@ -73,6 +75,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   }
 
   const base: AppConfig = {
+    appVersion: overrides.appVersion ?? resolvePackageVersion(),
     nodeEnv: process.env.NODE_ENV ?? 'development',
     host: process.env.HOST ?? '127.0.0.1',
     port: parsePositiveInt(process.env.PORT, 3000),

@@ -311,6 +311,9 @@ export interface BootstrapResponse {
   allowPublicSignup: boolean;
   agyMode: 'real' | 'mock';
   buildId?: string;
+  version?: string;
+  shortSha?: string | null;
+  builtAt?: string | null;
   authenticated: boolean;
   user: WebUser | null;
   agyProfile: AgyProfile | null;
@@ -347,6 +350,7 @@ export type WsIncomingMessage =
       userId: string;
       clientId: string;
       buildId?: string;
+      version?: string;
       latestSeq: number;
       resyncRequired: boolean;
       events: SyncEventEnvelope[];

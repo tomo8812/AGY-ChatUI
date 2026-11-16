@@ -14,6 +14,7 @@ import {
 } from '../auth/session.js';
 import { ensureUserDirs } from '../files/workspace.js';
 import type { SyncHub } from '../sync/hub.js';
+import type { AppBuildInfo } from '../version.js';
 
 export interface RouteDeps {
   config: AppConfig;
@@ -21,6 +22,7 @@ export interface RouteDeps {
   hub: SyncHub;
   agyAuth: AgyAuthManager;
   buildId?: string;
+  buildInfo?: AppBuildInfo;
 }
 
 const registerSchema = z.object({
@@ -57,7 +59,10 @@ export function requireAuth(req: FastifyRequest, reply: FastifyReply, db: AppDat
 }
 
 export async function registerAuthRoutes(app: FastifyInstance, deps: RouteDeps): Promise<void> {
-  const { config, db, hub, agyAuth, buildId = 'dev' } = deps;
+  const { config, db, hub, agyAuth, buildId = 'dev', buildInfo } = deps;
+  const version = buildInfo?.version ?? config.appVersion;
+  const shortSha = buildInfo?.shortSha ?? null;
+  const builtAt = buildInfo?.builtAt ?? null;
 
   app.get('/api/auth/bootstrap', async (req) => {
     const userCount = db.countUsers();
@@ -68,6 +73,9 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: RouteDeps):
         allowPublicSignup: config.allowPublicSignup,
         agyMode: config.agyMode,
         buildId,
+        version,
+        shortSha,
+        builtAt,
         authenticated: false,
         user: null,
         agyProfile: null,
@@ -82,6 +90,9 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: RouteDeps):
       allowPublicSignup: config.allowPublicSignup,
       agyMode: config.agyMode,
       buildId,
+      version,
+      shortSha,
+      builtAt,
       authenticated: true,
       user: session.user,
       agyProfile: db.getAgyProfile(session.user.id),

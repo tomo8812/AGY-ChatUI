@@ -7,6 +7,7 @@ interface AuthScreenProps {
   userCount: number;
   allowPublicSignup: boolean;
   agyMode: 'real' | 'mock';
+  version?: string;
   onAuthenticated: (payload: {
     user: WebUser;
     agyProfile: AgyProfile;
@@ -20,6 +21,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
   userCount,
   allowPublicSignup,
   agyMode,
+  version,
   onAuthenticated,
 }) => {
   const isInitialSetup = userCount === 0;
@@ -160,7 +162,10 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
         </form>
 
         <div className="auth-footnote">
-          <span>バックエンドモード: {agyMode === 'mock' ? 'ACP Mock' : 'Official Antigravity CLI'}</span>
+          <span>
+            バックエンドモード: {agyMode === 'mock' ? 'ACP Mock' : 'Official Antigravity CLI'}
+            {version ? ` • v${version}` : ''}
+          </span>
         </div>
       </div>
     </div>

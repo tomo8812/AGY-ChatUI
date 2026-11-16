@@ -127,6 +127,7 @@ if [[ "${RUNTIME_ONLY}" -eq 0 ]]; then
     mv -f "${STAGE_DIR}/web/package.json" "${APP_DIR}/web/package.json"
   fi
   swap_dir "${STAGE_DIR}/server/scripts" "${APP_DIR}/server/scripts"
+  swap_dir "${STAGE_DIR}/scripts" "${APP_DIR}/scripts"
   swap_dir "${STAGE_DIR}/deploy" "${APP_DIR}/deploy"
 fi
 
@@ -154,7 +155,7 @@ if [[ -d "${APP_DIR}/deploy" ]]; then
 fi
 
 if [[ "$(id -u)" -eq 0 ]] && [[ -n "${REPO_OWNER}" ]] && id "${REPO_OWNER}" >/dev/null 2>&1; then
-  chown -R "${REPO_OWNER}:${REPO_OWNER}" "${APP_DIR}/web" "${APP_DIR}/server" 2>/dev/null || true
+  chown -R "${REPO_OWNER}:${REPO_OWNER}" "${APP_DIR}/web" "${APP_DIR}/server" "${APP_DIR}/scripts" 2>/dev/null || true
   chown "${REPO_OWNER}:${REPO_OWNER}" "${APP_DIR}/BUILD_INFO.json" "${APP_DIR}/.bundle-lock-sha256" 2>/dev/null || true
 fi
 

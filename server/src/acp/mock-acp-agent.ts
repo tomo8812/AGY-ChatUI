@@ -250,6 +250,17 @@ function runAcpServer(): void {
 
   const app = agent({ name: 'mock-agy-acp' })
     .onRequest(methods.agent.initialize, async ({ params }) => {
+      if (process.env.MOCK_CLIENT_INFO_PATH) {
+        try {
+          fs.writeFileSync(
+            process.env.MOCK_CLIENT_INFO_PATH,
+            JSON.stringify(params.clientInfo ?? null),
+            'utf8'
+          );
+        } catch {
+          // ignore
+        }
+      }
       return {
         protocolVersion: Math.min(params.protocolVersion, PROTOCOL_VERSION),
         agentCapabilities: {
