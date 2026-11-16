@@ -1212,6 +1212,7 @@ export class AcpClientManager {
     });
 
     let workerRef: WorkerInstance | null = null;
+    let isRestoringSession = false;
     let earlyAvailableCommands: AvailableCommandItem[] | undefined;
     let earlyConfigOptions: SessionConfigOption[] | undefined;
     const earlyNotifications: SessionNotification[] = [];
@@ -1380,7 +1381,7 @@ export class AcpClientManager {
               earlyAvailableCommands = mapAcpAvailableCommands(params.update.availableCommands);
             } else if (params.update?.sessionUpdate === 'config_option_update') {
               earlyConfigOptions = params.update.configOptions;
-            } else {
+            } else if (!isRestoringSession) {
               earlyNotifications.push(params);
             }
             return;
@@ -1448,6 +1449,7 @@ export class AcpClientManager {
 
     // Try load / resume existing ACP session seamlessly
     if (chat.acpSessionId) {
+      isRestoringSession = true;
       try {
         if (init.agentCapabilities?.loadSession) {
           const loadRes = (await conn.agent.request(methods.agent.session.load, {
@@ -1478,6 +1480,8 @@ export class AcpClientManager {
         }
       } catch {
         acpSessionId = null;
+      } finally {
+        isRestoringSession = false;
       }
     }
 
@@ -2383,8 +2387,14 @@ export class AcpClientManager {
     }
   }
 
-  private flushBackgroundBridgeToMessage(worker: WorkerInstance, bridge: ActiveTurnBridge): void {
-    this.syncBackgroundWorkspaceArtifacts(worker, bridge);
+  private flushBackgroundBridgeToMessage(
+    worker: WorkerInstance,
+    bridge: ActiveTurnBridge,
+    syncArtifacts = false
+  ): void {
+    if (syncArtifacts) {
+      this.syncBackgroundWorkspaceArtifacts(worker, bridge);
+    }
     const updated = this.db.updateMessage(worker.userId, bridge.assistantMessageId, {
       contentText: bridge.contentText,
       thoughtsText: bridge.thoughtsText,
@@ -2476,16 +2486,22 @@ export class AcpClientManager {
       worker.lastBackgroundActivityAt = now;
     }
 
-    const finalizeIfBackground = () => {
+    const finalizeIfBackground = (syncArtifacts = false) => {
       if (isBackgroundTurn) {
-        this.flushBackgroundBridgeToMessage(worker, turn);
+        this.flushBackgroundBridgeToMessage(worker, turn, syncArtifacts);
       }
     };
 
     // Route child subagent session notifications cleanly without mixing child scratch output into parent text
     if (params.sessionId && worker.acpSessionId && params.sessionId !== worker.acpSessionId) {
       this.handleChildSessionNotification(worker, turn, params.sessionId, update);
-      finalizeIfBackground();
+      const childRawType = String((update as unknown as Record<string, unknown>).sessionUpdate || '');
+      const shouldSyncChildArtifacts =
+        childRawType === 'state_update' ||
+        (update.sessionUpdate === 'tool_call_update' &&
+          (update.status === 'completed' || update.status === 'failed')) ||
+        (update.sessionUpdate === 'agent_message_chunk' && update.content.type !== 'text');
+      finalizeIfBackground(shouldSyncChildArtifacts);
       return;
     }
 
@@ -2511,7 +2527,7 @@ export class AcpClientManager {
         stopReason: subStateObj?.stopReason,
       });
       this.syncBrainDeliverablesMidTurn(worker, turn);
-      finalizeIfBackground();
+      finalizeIfBackground(resolvedSubState === 'idle');
       return;
     }
 
@@ -2587,14 +2603,14 @@ export class AcpClientManager {
       } else if (stateObj.state === 'idle' && turn.initialPromptDone) {
         this.syncBrainDeliverablesMidTurn(worker, turn);
       }
-      finalizeIfBackground();
+      finalizeIfBackground(stateObj.state === 'idle');
       return;
     }
 
     if (rawUpdateType === 'session_message' || rawUpdateType === 'session_message_chunk') {
       this.syncBrainDeliverablesMidTurn(worker, turn);
       this.handleInterSessionMessageNotification(worker, turn, rawUpdateType, rawUpdate);
-      finalizeIfBackground();
+      finalizeIfBackground(rawUpdateType === 'session_message' || Boolean(rawUpdate.done));
       return;
     }
 
@@ -2657,7 +2673,7 @@ export class AcpClientManager {
             : `\n\n[${update.content.name || path.basename(rel)}](${rewrittenUri})\n`;
         this.appendTurnContentChunk(worker, turn, md);
       }
-      finalizeIfBackground();
+      finalizeIfBackground(update.content.type !== 'text');
       return;
     }
 
@@ -2832,7 +2848,7 @@ export class AcpClientManager {
         runId: turn.runId,
         payload: { messageId: turn.assistantMessageId, toolCalls: turn.toolCalls },
       });
-      finalizeIfBackground();
+      finalizeIfBackground(isTerminalToolUpdate);
     }
   }
 
