@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
+import { probeBwrapSandbox } from '../acp/env-isolation.js';
 import type { AppConfig } from '../config.js';
 import type { AppDatabase } from '../db/database.js';
 import type { AgyAuthManager } from '../auth/agy-auth.js';
@@ -71,6 +72,7 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: RouteDeps):
         agyProfile: null,
         preferences: null,
         loginFlow: null,
+        sandbox: null,
       };
     }
 
@@ -84,6 +86,7 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: RouteDeps):
       agyProfile: db.getAgyProfile(session.user.id),
       preferences: db.getPreferences(session.user.id),
       loginFlow: agyAuth.getFlowState(session.user.id),
+      sandbox: probeBwrapSandbox(config),
     };
   });
 
@@ -133,6 +136,7 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: RouteDeps):
       agyProfile: db.getAgyProfile(user.id),
       preferences: db.getPreferences(user.id),
       loginFlow: agyAuth.getFlowState(user.id),
+      sandbox: probeBwrapSandbox(config),
     });
   });
 
@@ -169,6 +173,7 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: RouteDeps):
       agyProfile: db.getAgyProfile(stored.id),
       preferences: db.getPreferences(stored.id),
       loginFlow: agyAuth.getFlowState(stored.id),
+      sandbox: probeBwrapSandbox(config),
     };
   });
 
@@ -204,6 +209,7 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: RouteDeps):
       preferences: db.getPreferences(session.user.id),
       loginFlow: agyAuth.getFlowState(session.user.id),
       agyMode: config.agyMode,
+      sandbox: probeBwrapSandbox(config),
     };
   });
 

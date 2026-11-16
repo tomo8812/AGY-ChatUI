@@ -36,7 +36,32 @@ import type {
   PendingPermissionRecord,
   ToolCallItem,
 } from '../types.js';
-import { buildAgyCommandSpec } from './env-isolation.js';
+import { buildAgyCommandSpec, probeBwrapSandbox } from './env-isolation.js';
+
+export function toHostWorkspacePath(
+  workerWorkspaceDir: string,
+  sandboxWorkspaceRoot: string,
+  acpPath: string
+): string {
+  let cleaned = acpPath.trim();
+  if (cleaned.startsWith('file://')) {
+    try {
+      cleaned = decodeURIComponent(new URL(cleaned).pathname);
+    } catch {
+      // Keep raw string so path containment check rejects malformed URIs
+    }
+  }
+  if (!cleaned) return '';
+  if (sandboxWorkspaceRoot !== workerWorkspaceDir) {
+    if (cleaned === sandboxWorkspaceRoot) {
+      return workerWorkspaceDir;
+    }
+    if (cleaned.startsWith(`${sandboxWorkspaceRoot}/`)) {
+      return cleaned.slice(sandboxWorkspaceRoot.length + 1);
+    }
+  }
+  return cleaned;
+}
 
 export interface ParsedSessionOptions {
   configOptions: AcpConfigOption[];
@@ -116,6 +141,8 @@ interface WorkerInstance {
   chatId: string;
   profileDir: string;
   workspaceDir: string;
+  sandboxed: boolean;
+  sandboxWorkspaceRoot: string;
   process: ChildProcessWithoutNullStreams;
   conn: ClientConnection;
   init: InitializeResponse;
@@ -608,14 +635,17 @@ export class AcpClientManager {
 
       for (const att of params.attachments) {
         try {
-          const { absPath } = resolveContainedExistingPath(chat.workspaceDir, att.relPath);
+          const { absPath, relPath } = resolveContainedExistingPath(chat.workspaceDir, att.relPath);
+          const acpFilePath = worker.sandboxed
+            ? path.posix.join(worker.sandboxWorkspaceRoot, relPath)
+            : absPath;
           if (att.previewKind === 'image' && worker.init.agentCapabilities?.promptCapabilities?.image) {
             const b64 = fs.readFileSync(absPath).toString('base64');
             promptBlocks.push({
               type: 'image',
               mimeType: att.mimeType,
               data: b64,
-              uri: `file://${absPath}`,
+              uri: `file://${acpFilePath}`,
             });
           } else {
             promptBlocks.push({
@@ -623,7 +653,7 @@ export class AcpClientManager {
               name: att.filename,
               mimeType: att.mimeType,
               size: att.sizeBytes,
-              uri: `file://${absPath}`,
+              uri: `file://${acpFilePath}`,
             });
           }
         } catch {
@@ -644,7 +674,8 @@ export class AcpClientManager {
       const hintPaths: string[] = [];
       for (const tc of bridge.toolCalls) {
         for (const loc of tc.locations ?? []) {
-          hintPaths.push(loc.path);
+          const hostHint = toHostWorkspacePath(worker.workspaceDir, worker.sandboxWorkspaceRoot, loc.path);
+          if (hostHint) hintPaths.push(hostHint);
         }
       }
 
@@ -738,6 +769,15 @@ export class AcpClientManager {
     this.evictOneIdleIfFull();
 
     fs.mkdirSync(chat.workspaceDir, { recursive: true, mode: 0o700 });
+    const sandboxStatus = probeBwrapSandbox(this.config);
+    if (this.config.agyMode === 'real' && this.config.sandboxMode === 'strict' && !sandboxStatus.active) {
+      throw new Error(
+        `${sandboxStatus.reason ?? 'サンドボックス環境を初期化できません。'}${
+          sandboxStatus.remediation ? ` (${sandboxStatus.remediation})` : ''
+        }`
+      );
+    }
+
     const apiKey = this.loadApiKeyForUser(userId);
     const spec = buildAgyCommandSpec({
       config: this.config,
@@ -745,7 +785,7 @@ export class AcpClientManager {
       profileDir: profile.profileDir,
       workspaceDir: chat.workspaceDir,
       geminiApiKey: apiKey,
-      enableSandboxBwrap: true,
+      enableSandboxBwrap: sandboxStatus.active,
     });
 
     const child = spawn(spec.command, spec.args, {
@@ -768,7 +808,12 @@ export class AcpClientManager {
       .onRequest(methods.client.fs.readTextFile, async ({ params }) => {
         if (!workerRef) throw new RequestError(-32603, 'Worker uninitialized');
         try {
-          const { absPath } = resolveContainedExistingPath(workerRef.workspaceDir, params.path);
+          const hostCandidate = toHostWorkspacePath(
+            workerRef.workspaceDir,
+            workerRef.sandboxWorkspaceRoot,
+            params.path
+          );
+          const { absPath } = resolveContainedExistingPath(workerRef.workspaceDir, hostCandidate);
           const raw = fs.readFileSync(absPath, 'utf8');
           const lines = raw.split(/\r?\n/);
           const start = params.line && params.line > 0 ? params.line - 1 : 0;
@@ -781,7 +826,12 @@ export class AcpClientManager {
       .onRequest(methods.client.fs.writeTextFile, async ({ params }) => {
         if (!workerRef) throw new RequestError(-32603, 'Worker uninitialized');
         try {
-          const { absPath } = resolveContainedWriteTarget(workerRef.workspaceDir, params.path);
+          const hostCandidate = toHostWorkspacePath(
+            workerRef.workspaceDir,
+            workerRef.sandboxWorkspaceRoot,
+            params.path
+          );
+          const { absPath } = resolveContainedWriteTarget(workerRef.workspaceDir, hostCandidate);
           fs.mkdirSync(path.dirname(absPath), { recursive: true, mode: 0o700 });
           fs.writeFileSync(absPath, params.content, 'utf8');
           return {};
@@ -800,7 +850,12 @@ export class AcpClientManager {
         if (prefs.autoApproveSafeReads && params.toolCall.kind === 'read') {
           const allContained = (params.toolCall.locations ?? []).every((loc) => {
             try {
-              resolveContainedExistingPath(workerRef!.workspaceDir, loc.path);
+              const hostCandidate = toHostWorkspacePath(
+                workerRef!.workspaceDir,
+                workerRef!.sandboxWorkspaceRoot,
+                loc.path
+              );
+              resolveContainedExistingPath(workerRef!.workspaceDir, hostCandidate);
               return true;
             } catch {
               return false;
@@ -924,7 +979,7 @@ export class AcpClientManager {
         if (init.agentCapabilities?.loadSession) {
           const loadRes = (await conn.agent.request(methods.agent.session.load, {
             sessionId: chat.acpSessionId,
-            cwd: chat.workspaceDir,
+            cwd: spec.sandboxWorkspaceRoot,
             mcpServers: [],
             ...(systemPromptPayload ? { systemPrompt: systemPromptPayload } : {}),
           })) as LoadSessionResponse | undefined;
@@ -934,7 +989,7 @@ export class AcpClientManager {
         } else if (init.agentCapabilities?.sessionCapabilities?.resume) {
           const resumeRes = (await conn.agent.request(methods.agent.session.resume, {
             sessionId: chat.acpSessionId,
-            cwd: chat.workspaceDir,
+            cwd: spec.sandboxWorkspaceRoot,
             mcpServers: [],
             ...(systemPromptPayload ? { systemPrompt: systemPromptPayload } : {}),
           })) as ResumeSessionResponse | undefined;
@@ -950,7 +1005,7 @@ export class AcpClientManager {
     if (!acpSessionId) {
       try {
         const newRes = (await conn.agent.request(methods.agent.session.new, {
-          cwd: chat.workspaceDir,
+          cwd: spec.sandboxWorkspaceRoot,
           mcpServers: [],
           ...(systemPromptPayload ? { systemPrompt: systemPromptPayload } : {}),
         })) as NewSessionResponse;
@@ -1017,6 +1072,8 @@ export class AcpClientManager {
       chatId,
       profileDir: profile.profileDir,
       workspaceDir: chat.workspaceDir,
+      sandboxed: spec.sandboxed,
+      sandboxWorkspaceRoot: spec.sandboxWorkspaceRoot,
       process: child,
       conn,
       init,

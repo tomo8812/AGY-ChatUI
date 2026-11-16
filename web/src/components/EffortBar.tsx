@@ -68,6 +68,19 @@ export const EffortBar: React.FC<EffortBarProps> = ({
         ? 1
         : committedIndex / maxIndex;
 
+  const iconRatio = (() => {
+    if (safeOptions.length > 1) return ratio;
+    const singleVal = safeOptions[0]?.value.trim().toLowerCase() ?? '';
+    if (singleVal === 'none' || singleVal === 'off' || singleVal === 'minimal' || singleVal === 'min' || singleVal === 'low') {
+      return 0;
+    }
+    if (singleVal === 'medium' || singleVal === 'med') return 0.5;
+    if (singleVal === 'high' || singleVal === 'max' || singleVal === 'maximum' || singleVal === 'xhigh') {
+      return 1;
+    }
+    return 0.5;
+  })();
+
   useEffect(() => {
     if (!open) {
       setDragRatio(null);
@@ -157,7 +170,10 @@ export const EffortBar: React.FC<EffortBarProps> = ({
               aria-label="推論レベル (Effort)"
               onClick={(e) => e.stopPropagation()}
             >
-              <div className="effort-overlay-label">{previewLabel}</div>
+              <div className="effort-overlay-label-row">
+                <EffortDialIcon size={21} ratio={iconRatio} animated={dragRatio === null} />
+                <span className="effort-overlay-label">{previewLabel}</span>
+              </div>
 
               <div className="effort-pill-shell">
                 <div
@@ -240,7 +256,7 @@ export const EffortBar: React.FC<EffortBarProps> = ({
         aria-haspopup="dialog"
         title={`推論レベル: ${committedLabel}`}
       >
-        <EffortDialIcon size={17} />
+        <EffortDialIcon size={17} ratio={iconRatio} animated={dragRatio === null} />
         <span className="effort-trigger-label">{committedLabel}</span>
       </button>
 

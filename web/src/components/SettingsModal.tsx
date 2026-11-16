@@ -1,6 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import { ApiError, api } from '../api/client';
-import type { AgyLoginFlowState, AgyProfile, UserPreferences, WebUser } from '../types';
+import type {
+  AgyLoginFlowState,
+  AgyProfile,
+  SandboxStatus,
+  UserPreferences,
+  WebUser,
+} from '../types';
 import {
   ensurePushSubscribed,
   getActivePushSubscription,
@@ -21,6 +27,7 @@ interface SettingsModalProps {
   loginFlow: AgyLoginFlowState | null;
   preferences: UserPreferences;
   agyMode: 'real' | 'mock';
+  sandbox: SandboxStatus | null;
   onClose: () => void;
   onUpdatePreferences: (prefs: UserPreferences) => void;
   onUpdateAgy: (payload: { profile: AgyProfile; loginFlow?: AgyLoginFlowState | null }) => void;
@@ -33,6 +40,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   loginFlow,
   preferences,
   agyMode,
+  sandbox,
   onClose,
   onUpdatePreferences,
   onUpdateAgy,
@@ -404,6 +412,41 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               onChange={(next) => void handlePrefChange({ autoApproveSafeReads: next })}
             />
           </section>
+
+          {sandbox && (
+            <section className="settings-section">
+              <h4>実行環境サンドボックス</h4>
+              <div className="settings-kv">
+                <div>
+                  <div className="kv-value">
+                    <span className={`status-dot ${sandbox.active ? 'ok' : 'warn'}`} />
+                    <span>
+                      {sandbox.active
+                        ? '有効 — 作業フォルダのみ可視 (bubblewrap / /workspace)'
+                        : sandbox.backend === 'mock'
+                          ? 'モックモード（AGY_MODE=mock）'
+                          : sandbox.mode === 'off'
+                            ? '無効（SANDBOX_MODE=off）'
+                            : '未有効化（ホスト環境で実行中）'}
+                    </span>
+                  </div>
+                  <div className="muted-xs" style={{ marginTop: 2 }}>
+                    モード: {sandbox.mode} / チャットの作業フォルダ以外はカーネル名前空間で隠蔽されます
+                  </div>
+                </div>
+              </div>
+              {sandbox.reason && !sandbox.active && (
+                <div className="notif-meta-row">
+                  <div className="muted-xs">
+                    <div>{sandbox.reason}</div>
+                    {sandbox.remediation && (
+                      <div style={{ marginTop: 4 }}>{sandbox.remediation}</div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </section>
+          )}
 
           {user.role === 'admin' && (
             <section className="settings-section">

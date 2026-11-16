@@ -7,14 +7,15 @@ Google の公式 CLI（[`agy`](https://antigravity.google)）を **無改変の�
 - **公式バイナリ＆プロトコル完全準拠**
   - 無改変の `agy acp` を stdio (`@agentclientprotocol/sdk` v1/stable) で実行。
   - トークンファイルの直接読取・復号・外部内部 API の直叩きは一切行いません。
-- **Webログイン ⇔ サーバー上 `agy` アカウントの 1:1 紐付け**
+- **Webログイン ⇔ サーバー上 `agy` アカウントの 1:1 紐付け ＆ 作業フォルダ専用サンドボックス**
   - Web 側はサーバー管理の軽量認証（`scrypt` + `HttpOnly` セッション Cookie + CSRF 検証）。
   - ログインした Web ユーザーごとに完全に分離された専用プロファイル（`DATA_ROOT/profiles/<userId>/agy-home`）を持ち、初回チャット前に **認証コード貼り付け**（`agy acp --login` の PTY 出力から Google OAuth URL を発行し、ブラウザ認証後にコードを貼り付ける方式）または任意の `GEMINI_API_KEY` で公式認証を完了します。
-  - 複数ユーザーが異なる Antigravity / Google アカウントで同時に独立してチャット実行可能です。
+  - Linux (`Ubuntu`) ではデフォルト `SANDBOX_MODE=auto` で `bubblewrap` (`bwrap`) のホワイトリスト rootfs コンテナが自動有効化され、内部 `agy` およびシェルコマンドからは対象チャットの作業フォルダ (`/workspace`) と最小システムライブラリ以外（`/home`・`/root`・`/etc/antigravity-chat`・SQLite DB・他ユーザー領域・ホスト PID）をカーネル名前空間レベルで隠蔽します（設定モーダルで状態確認可能）。
 - **ChatGPT ライクな集中 UI ＆ モバイル/PWA 対応**
   - 標準ニュートラル配色ベースの Vanilla CSS（ライト / ダーク / システム追従テーマ）、レスポンシブ設計（iPhone Safari「ホーム画面に追加」PWA 対応・ノッチ領域対応）。
-  - 入力欄ツールバーにモデル選択リストと、ACP `configOptions` に連動した段階式 **Effort（推論レベル）スライダーバー** を配置（新規チャット送信前から切替可能）。
-  - 利用枠（Quota）モニター（公式 `agy -p /usage` の 4列 TSV / JSON 出力をモデル系統別のグループ見出し＋見やすい残量バーとして可視化し、5分クールダウン付きの低頻度自動更新＋手動更新に対応）。
+  - 入力欄ツールバーにカプセル型 **モデル選択ポップオーバー（モバイルではボトムシート）** と、ACP `configOptions` に連動し選択値・ドラッグに追従して針が回転する **Effort（推論レベル）スライダーバー** を配置（新規チャット送信前から切替可能）。
+  - 「新しいチャット」を押しただけでは空チャットを履歴に増やさず、最初のメッセージ送信／応答が確定してからサイドバーへ永続表示します。
+  - コンパクト化された利用枠（Quota）モニター（公式 `agy -p /usage` の 4列 TSV / JSON 出力をモデル系統別のグループ見出し＋見やすい残量バーとして可視化し、5分クールダウン付きの低頻度自動更新＋手動更新に対応）。
   - **応答完了通知（Web Push + ブラウザ通知）**: 設定モーダルのスライド式トグルスイッチからオン/オフでき、PC ブラウザのバックグラウンドタブや iPhone ホーム画面追加 PWA のロック画面でも応答完了通知を受け取れます（純粋 Node 24 暗号化実装・VAPID 鍵は SQLite 永続化・テスト通知ボタン付き）。
 - **アップデート検知 ＆ 高速デプロイ（GitHub Actions 事前ビルド）**
   - **GitHub Actions**（[`.github/workflows/ci-deploy.yml`](.github/workflows/ci-deploy.yml)）が `typecheck`・`npm test`・`npm run build` を実行し、純粋 JS サーバー実行依存のみ（約 41 MB・ネイティブバイナリ無し・ARM64/x64 共通）のバンドル `antigravity-chat-bundle.tar.gz` を作成して GitHub Release `latest` に公開します。Oracle 側 2 コア VM で重い Vite/TypeScript ビルドを走らせる必要がありません。

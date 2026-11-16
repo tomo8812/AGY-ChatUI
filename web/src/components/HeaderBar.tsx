@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import type { WsConnectionStatus } from '../api/ws';
 import type {
   AgyProfile,
@@ -66,6 +66,25 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
   onToggleWorkspace,
 }) => {
   const [quotaOpen, setQuotaOpen] = useState(false);
+  const quotaAnchorRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!quotaOpen) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if (quotaAnchorRef.current && !quotaAnchorRef.current.contains(e.target as Node)) {
+        setQuotaOpen(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setQuotaOpen(false);
+    };
+    window.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [quotaOpen]);
 
   const primaryBucket = pickSummaryBucket(quota, selectedModelId);
   const primaryPct = primaryBucket?.remainingPercent ?? null;
@@ -101,11 +120,12 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
           </span>
         )}
 
-        <div className="quota-anchor">
+        <div className="quota-anchor" ref={quotaAnchorRef}>
           <button
             type="button"
             className={`pill-btn ${quotaOpen ? 'active' : ''}`}
             onClick={() => setQuotaOpen((o) => !o)}
+            aria-expanded={quotaOpen}
             title="アカウント別の利用枠を確認"
           >
             <GaugeIcon size={14} />

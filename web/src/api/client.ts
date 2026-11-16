@@ -13,6 +13,7 @@ import type {
   ProjectRecord,
   QuotaSnapshotRecord,
   RunRecord,
+  SandboxStatus,
   UserPreferences,
   WebUser,
   WorkspaceFileEntry,
@@ -95,6 +96,7 @@ export const api = {
       agyProfile: AgyProfile;
       preferences: UserPreferences;
       loginFlow: AgyLoginFlowState;
+      sandbox?: SandboxStatus | null;
     }>('/api/auth/register', { method: 'POST', body: payload }),
 
   login: (payload: { username: string; password: string }) =>
@@ -103,6 +105,7 @@ export const api = {
       agyProfile: AgyProfile;
       preferences: UserPreferences;
       loginFlow: AgyLoginFlowState;
+      sandbox?: SandboxStatus | null;
     }>('/api/auth/login', { method: 'POST', body: payload }),
 
   logout: () => apiFetch<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
@@ -222,6 +225,7 @@ export const api = {
       userMessage: MessageRecord;
       assistantMessage: MessageRecord;
       run: RunRecord;
+      chat?: ChatRecord;
       deduplicated: boolean;
     }>(`/api/chats/${chatId}/messages`, { method: 'POST', body: payload }),
 

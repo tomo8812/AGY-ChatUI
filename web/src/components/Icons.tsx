@@ -25,11 +25,55 @@ export const ComposeIcon: React.FC<IconProps> = ({ size = 18, className }) => (
   </svg>
 );
 
-export const EffortDialIcon: React.FC<IconProps> = ({ size = 18, className }) => (
-  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" className={className}>
-    <path d="M5.636 18.364a9 9 0 1112.728 0" />
-    <path d="M12 13L8.8 8.8" />
-    <circle cx="12" cy="13.2" r="1.4" fill="currentColor" stroke="none" />
+export const EffortDialIcon: React.FC<IconProps & { ratio?: number; animated?: boolean }> = ({
+  size = 18,
+  className,
+  ratio = 0.5,
+  animated = true,
+}) => {
+  const clamped = Math.max(0, Math.min(1, Number.isFinite(ratio) ? ratio : 0.5));
+  const angleDeg = -105 + clamped * 210;
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.9"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+    >
+      <path d="M5.636 18.364a9 9 0 1112.728 0" />
+      <g
+        style={{
+          transform: `rotate(${angleDeg}deg)`,
+          transformOrigin: '12px 12px',
+          transition: animated ? 'transform 220ms cubic-bezier(0.2, 0.85, 0.3, 1)' : 'none',
+        }}
+      >
+        <line x1="12" y1="12" x2="12" y2="6.2" />
+        <circle cx="12" cy="12" r="1.45" fill="currentColor" stroke="none" />
+      </g>
+    </svg>
+  );
+};
+
+export const ModelIcon: React.FC<IconProps> = ({ size = 15, className }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.85"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+  >
+    <path d="M12 3l1.9 5.6L19.5 10.5l-5.6 1.9L12 18l-1.9-5.6L4.5 10.5l5.6-1.9L12 3z" />
+    <path d="M19 3v4M21 5h-4" />
   </svg>
 );
 
@@ -117,12 +161,19 @@ export const RefreshIcon: React.FC<IconProps> = ({ size = 15, className }) => (
   </svg>
 );
 
-export const ChevronIcon: React.FC<IconProps & { dir?: 'down' | 'right' | 'left' }> = ({
+export const ChevronIcon: React.FC<IconProps & { dir?: 'down' | 'up' | 'right' | 'left' }> = ({
   size = 15,
   className,
   dir = 'down',
 }) => {
-  const rot = dir === 'right' ? 'rotate(-90deg)' : dir === 'left' ? 'rotate(90deg)' : 'none';
+  const rot =
+    dir === 'up'
+      ? 'rotate(180deg)'
+      : dir === 'right'
+        ? 'rotate(-90deg)'
+        : dir === 'left'
+          ? 'rotate(90deg)'
+          : 'none';
   return (
     <svg
       width={size}

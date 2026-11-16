@@ -242,6 +242,14 @@ export interface UserPreferences {
   updatedAt: number;
 }
 
+export interface SandboxStatus {
+  mode: 'auto' | 'strict' | 'off';
+  active: boolean;
+  backend: 'bwrap' | 'mock' | 'none';
+  reason: string | null;
+  remediation: string | null;
+}
+
 export interface BootstrapResponse {
   userCount: number;
   allowPublicSignup: boolean;
@@ -252,6 +260,7 @@ export interface BootstrapResponse {
   agyProfile: AgyProfile | null;
   preferences: UserPreferences | null;
   loginFlow: AgyLoginFlowState | null;
+  sandbox?: SandboxStatus | null;
 }
 
 export interface ChatDetailResponse {

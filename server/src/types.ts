@@ -236,6 +236,14 @@ export interface PushSubscriptionRecord {
   updatedAt: number;
 }
 
+export interface SandboxStatus {
+  mode: 'auto' | 'strict' | 'off';
+  active: boolean;
+  backend: 'bwrap' | 'mock' | 'none';
+  reason: string | null;
+  remediation: string | null;
+}
+
 export interface SyncEventEnvelope {
   seq: number;
   eventId: string;

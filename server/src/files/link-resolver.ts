@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { SANDBOX_WORKSPACE_MOUNT } from '../acp/env-isolation.js';
 import type { AppDatabase } from '../db/database.js';
 import type { ArtifactRecord } from '../types.js';
 import {
@@ -46,6 +47,13 @@ export function resolveAuthorizedChatFileReference(params: {
   }
   // Strip optional line suffix (e.g. path/to/file.ts#L10 or path/to/file.ts:10)
   candidate = candidate.replace(/#L\d+(?:-L?\d+)?$/i, '').replace(/:\d+(?::\d+)?$/, '');
+
+  if (candidate === SANDBOX_WORKSPACE_MOUNT) {
+    return null;
+  }
+  if (candidate.startsWith(`${SANDBOX_WORKSPACE_MOUNT}/`)) {
+    candidate = candidate.slice(SANDBOX_WORKSPACE_MOUNT.length + 1);
+  }
 
   // Check by artifact ID first (must match both userId and chatId!)
   const byId = params.db.getArtifact(params.userId, candidate);

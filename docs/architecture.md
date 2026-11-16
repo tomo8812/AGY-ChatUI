@@ -33,12 +33,12 @@ Unlike macOS Keychain or Windows Credential Manager, headless Ubuntu Server has 
 
 To safely isolate Web users **without touching `agy` internals**:
 - Each Web user receives an isolated directory `DATA_ROOT/profiles/<userId>/agy-home` (`chmod 0700`).
-- Every spawned `agy` child process (`agy acp`, `agy acp --login`, `agy auth logout`, `agy -p /usage`) receives a sanitized environment where:
-  - `HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, and `TMPDIR` point strictly inside that user's `agy-home`.
-  - `DBUS_SESSION_BUS_ADDRESS`, `GNOME_KEYRING_CONTROL`, `DISPLAY`, `WAYLAND_DISPLAY`, and `XAUTHORITY` are stripped so no fallback keyring or display prompt is used.
-  - `SSH_CONNECTION=127.0.0.1` and `NO_BROWSER=1` nudge headless terminal/code-paste mode cleanly.
-  - `AGY_CLI_DISABLE_AUTO_UPDATE=true` prevents unpredictable background self-modification while serving.
-- On Linux when `bwrap` (`bubblewrap`) is installed and `ENABLE_BWRAP=true` is configured, chat ACP tool execution runs inside a mount namespace exposing the chat's dedicated workspace read-write and that user's `agy-home` cleanly while hiding other users' profile/workspace directories at the kernel filesystem level.
+- Every spawned `agy` child process (`agy acp`, `agy acp --login`, `agy auth logout`, `agy -p /usage`) receives a strict **allowlist** environment (forwarding only safe locale/CA/proxy/terminal vars such as `PATH`, `LANG`, `LC_*`, `TZ`, `SSL_CERT_*`, `HTTP_PROXY`/`HTTPS_PROXY`, while stripping `SESSION_SECRET`, `GITHUB_READ_TOKEN`, `SSH_*`, `DBUS_SESSION_BUS_ADDRESS`, `GNOME_KEYRING_CONTROL`, `DISPLAY`, `WAYLAND_DISPLAY`, and `XAUTHORITY`). `HOME` / `XDG_*` point to that user's `agy-home`, `AGY_CLI_DISABLE_AUTO_UPDATE=true`, `SSH_CONNECTION=127.0.0.1`, and `NO_BROWSER=1`.
+- On Linux, `SANDBOX_MODE=auto` (default; also configurable as `strict` or `off`, with legacy `ENABLE_BWRAP` fallback) wraps chat ACP workers inside a strict whitelist `bubblewrap` (`bwrap`) container — verified at startup/spawn via `probeBwrapSandbox()`:
+  - **No host `/` mount**: Specifically avoids `--ro-bind / /`. Builds a minimal read-only rootfs (`/usr`, `/bin`, `/sbin`, `/lib*`, whitelisted `/etc/ssl`, `/etc/ca-certificates`, `/etc/resolv.conf`, synthetic 2-line `/etc/passwd` & `/etc/group`) with empty `/home`, `/root`, `/run`, private `/tmp` (`--tmpfs`), and mounts `/opt/antigravity-chat`, `/etc/antigravity-chat`, `/var/lib/antigravity-chat` database, and sibling users' directories **completely invisible**.
+  - **Namespace & capability lockdown**: Uses `--unshare-pid`, `--unshare-ipc`, `--unshare-uts`, `--cap-drop ALL`, `--new-session`, `--die-with-parent`.
+  - **Workspace mapping**: Binds only the active `(userId, chatId)` chat workspace read-write at `/workspace` (`--chdir /workspace`) and that user's own `agy-home` read-write (required so official `agy` OAuth credentials and session state function cleanly). `toHostWorkspacePath()` and markdown link resolution translate `/workspace/...` back to the host workspace with `realpath` containment checks.
+  - **Ubuntu 24.04 AppArmor**: Because Ubuntu 24.04+ restricts unprivileged `userns`, `deploy/ubuntu-setup.sh` and `deploy/apply-bundle.sh` automatically configure `/etc/apparmor.d/bwrap` and set `NoNewPrivileges=false` on `antigravity-chat.service` when `bwrap` is present. Note that outbound network remains open inside `bwrap` so official `agy` can reach Google endpoints (Web UI still enforces session + CSRF on `127.0.0.1:3000`).
 
 ---
 

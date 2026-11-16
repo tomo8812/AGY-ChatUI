@@ -33,6 +33,7 @@ import type {
   ProjectRecord,
   QuotaSnapshotRecord,
   RunRecord,
+  SandboxStatus,
   SyncEventEnvelope,
   ToolCallItem,
   UserPreferences,
@@ -81,10 +82,14 @@ export const App: React.FC = () => {
   const [agyProfile, setAgyProfile] = useState<AgyProfile | null>(null);
   const [loginFlow, setLoginFlow] = useState<AgyLoginFlowState | null>(null);
   const [preferences, setPreferences] = useState<UserPreferences | null>(null);
+  const [sandboxStatus, setSandboxStatus] = useState<SandboxStatus | null>(null);
 
   const [chats, setChats] = useState<ChatRecord[]>([]);
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [draftProjectId, setDraftProjectId] = useState<string | null>(null);
+  const [draftCreatedChat, setDraftCreatedChat] = useState<ChatRecord | null>(null);
+  const [draftResetToken, setDraftResetToken] = useState(0);
 
   const [messages, setMessages] = useState<MessageRecord[]>([]);
   const [artifacts, setArtifacts] = useState<ArtifactRecord[]>([]);
@@ -113,6 +118,13 @@ export const App: React.FC = () => {
   activeChatIdRef.current = activeChatId;
   const chatsRef = useRef<ChatRecord[]>([]);
   chatsRef.current = chats;
+  const messagesRef = useRef<MessageRecord[]>([]);
+  messagesRef.current = messages;
+  const activeRunRef = useRef<RunRecord | null>(null);
+  activeRunRef.current = activeRun;
+  const draftCreatedChatRef = useRef<ChatRecord | null>(null);
+  draftCreatedChatRef.current = draftCreatedChat;
+  const skipNextLoadChatIdRef = useRef<string | null>(null);
   const localNotifiedRunsRef = useRef<Set<string>>(new Set());
 
   const initialBuildIdRef = useRef<string | null>(null);
@@ -128,6 +140,19 @@ export const App: React.FC = () => {
 
   const wsRef = useRef<SyncSocketClient | null>(null);
   const resyncDebounceRef = useRef<number | null>(null);
+
+  const cleanupEmptyDraftChat = useCallback(() => {
+    const draftChat = draftCreatedChatRef.current;
+    if (!draftChat) return;
+    draftCreatedChatRef.current = null;
+    setDraftCreatedChat(null);
+    if (
+      activeChatIdRef.current !== draftChat.id ||
+      (messagesRef.current.length === 0 && !activeRunRef.current)
+    ) {
+      void api.deleteChat(draftChat.id).catch(() => {});
+    }
+  }, []);
 
   const notifyDetectedBuild = useCallback((nextBuildId?: string | null) => {
     if (!nextBuildId) return;
@@ -227,6 +252,9 @@ export const App: React.FC = () => {
           setAgyProfile(res.agyProfile);
           setPreferences(res.preferences);
           setLoginFlow(res.loginFlow);
+          setSandboxStatus(res.sandbox ?? null);
+        } else {
+          setSandboxStatus(null);
         }
       } finally {
         if (active) setBootstrapping(false);
@@ -318,17 +346,21 @@ export const App: React.FC = () => {
     const params = new URLSearchParams(window.location.search);
     const targetChatId = params.get('chatId');
     if (targetChatId) {
+      cleanupEmptyDraftChat();
+      setDraftProjectId(null);
       setActiveChatId(targetChatId);
       setWorkspaceOpen(false);
       setSidebarMobileOpen(false);
       window.history.replaceState({}, '', window.location.pathname);
     }
-  }, [user?.id]);
+  }, [user?.id, cleanupEmptyDraftChat]);
 
   useEffect(() => {
     const onOpenChat = (e: Event) => {
       const chatId = (e as CustomEvent<{ chatId?: string }>).detail?.chatId;
       if (chatId) {
+        cleanupEmptyDraftChat();
+        setDraftProjectId(null);
         setActiveChatId(chatId);
         setWorkspaceOpen(false);
         setSidebarMobileOpen(false);
@@ -339,6 +371,8 @@ export const App: React.FC = () => {
     const sw = typeof navigator !== 'undefined' ? navigator.serviceWorker : undefined;
     const onSwMessage = (event: MessageEvent) => {
       if (event.data && event.data.type === 'OPEN_CHAT' && typeof event.data.chatId === 'string') {
+        cleanupEmptyDraftChat();
+        setDraftProjectId(null);
         setActiveChatId(event.data.chatId);
         setWorkspaceOpen(false);
         setSidebarMobileOpen(false);
@@ -350,7 +384,7 @@ export const App: React.FC = () => {
       window.removeEventListener('agy:open-chat', onOpenChat);
       sw?.removeEventListener('message', onSwMessage);
     };
-  }, []);
+  }, [cleanupEmptyDraftChat]);
 
   // Automatically sync browser Push subscription if notifyOnResponse is ON and permission is already granted
   useEffect(() => {
@@ -410,6 +444,10 @@ export const App: React.FC = () => {
       setActiveRun(null);
       setSessionOptions(null);
       setContextUsage(null);
+      return;
+    }
+    if (skipNextLoadChatIdRef.current === activeChatId) {
+      skipNextLoadChatIdRef.current = null;
       return;
     }
     void loadChatDetail(activeChatId);
@@ -475,14 +513,12 @@ export const App: React.FC = () => {
           setChats((prev) =>
             prev.map((c) => (c.projectId === projectId ? { ...c, projectId: null } : c))
           );
+          setDraftProjectId((prev) => (prev === projectId ? null : prev));
         }
         break;
       }
       case 'chat.created': {
-        const chat = p.chat as ChatRecord | undefined;
-        if (chat) {
-          setChats((prev) => (prev.some((c) => c.id === chat.id) ? prev : [chat, ...prev]));
-        }
+        // Un-sent 0-message chats stay out of sidebar history until the first message is sent
         break;
       }
       case 'chat.updated': {
@@ -490,6 +526,7 @@ export const App: React.FC = () => {
         const opts = p.sessionOptions as ParsedSessionOptions | undefined;
         if (chat) {
           setChats((prev) => prev.map((c) => (c.id === chat.id ? { ...c, ...chat } : c)));
+          setDraftCreatedChat((prev) => (prev && prev.id === chat.id ? { ...prev, ...chat } : prev));
         }
         if (opts && evt.chatId === curChatId) {
           setSessionOptions(opts);
@@ -507,6 +544,7 @@ export const App: React.FC = () => {
         const chatId = p.chatId as string | undefined;
         if (chatId) {
           setChats((prev) => prev.filter((c) => c.id !== chatId));
+          setDraftCreatedChat((prev) => (prev && prev.id === chatId ? null : prev));
           if (curChatId === chatId) setActiveChatId(null);
         }
         break;
@@ -516,6 +554,10 @@ export const App: React.FC = () => {
         const run = p.run as RunRecord | undefined;
         const chat = p.chat as ChatRecord | undefined;
         if (chat) {
+          if (draftCreatedChatRef.current?.id === chat.id) {
+            draftCreatedChatRef.current = null;
+            setDraftCreatedChat(null);
+          }
           setChats((prev) => {
             const others = prev.filter((c) => c.id !== chat.id);
             return [{ ...chat, activeRun: run ?? null }, ...others];
@@ -769,9 +811,13 @@ export const App: React.FC = () => {
       onAuthLost: () => {
         setUser(null);
         setAgyProfile(null);
+        setSandboxStatus(null);
         setUserOptions(null);
         setSessionOptions(null);
         setQuota(null);
+        draftCreatedChatRef.current = null;
+        setDraftCreatedChat(null);
+        setDraftProjectId(null);
         setActiveChatId(null);
         setChats([]);
         setProjects([]);
@@ -786,9 +832,12 @@ export const App: React.FC = () => {
     };
   }, [user?.id, loadWorkspaceLists, loadChatDetail, handleDurableEvent, handleEphemeralEvent, notifyDetectedBuild]);
 
-  const activeChat = chats.find((c) => c.id === activeChatId) ?? null;
+  const activeChat =
+    chats.find((c) => c.id === activeChatId) ??
+    (draftCreatedChat?.id === activeChatId ? draftCreatedChat : null);
+  const effectiveProjectId = activeChat ? activeChat.projectId : draftProjectId;
   const activeProject =
-    activeChat?.projectId ? projects.find((p) => p.id === activeChat.projectId) ?? null : null;
+    effectiveProjectId ? projects.find((p) => p.id === effectiveProjectId) ?? null : null;
 
   const effectiveSessionOptions = activeChat ? (sessionOptions ?? userOptions) : userOptions;
   const activeModelOption = effectiveSessionOptions?.configOptions.find(
@@ -812,15 +861,35 @@ export const App: React.FC = () => {
       ? rawEffortValue
       : activeEffortOption?.currentValue || activeEffortOption?.options[0]?.value || rawEffortValue;
 
-  const handleCreateChat = async (projectId: string | null = null) => {
+  const handleStartDraftChat = (projectId: string | null = null) => {
+    cleanupEmptyDraftChat();
+    activeChatIdRef.current = null;
+    setActiveChatId(null);
+    setDraftProjectId(projectId);
+    setMessages([]);
+    setArtifacts([]);
+    setPendingPermissions([]);
+    setActiveRun(null);
+    setSessionOptions(null);
+    setContextUsage(null);
+    setWorkspaceOpen(false);
+    setHasComposerDraft(false);
+    setDraftResetToken((t) => t + 1);
+  };
+
+  const createDraftBackedChat = async (): Promise<ChatRecord> => {
     const res = await api.createChat({
-      projectId,
+      projectId: draftProjectId,
       modelId: selectedModelId || null,
       effortValue: selectedEffortValue || null,
     });
-    setChats((prev) => [res.chat, ...prev.filter((c) => c.id !== res.chat.id)]);
-    setActiveChatId(res.chat.id);
+    draftCreatedChatRef.current = res.chat;
+    setDraftCreatedChat(res.chat);
+    setDraftProjectId(null);
     if (res.sessionOptions) setSessionOptions(res.sessionOptions);
+    skipNextLoadChatIdRef.current = res.chat.id;
+    activeChatIdRef.current = res.chat.id;
+    setActiveChatId(res.chat.id);
     return res.chat;
   };
 
@@ -828,6 +897,9 @@ export const App: React.FC = () => {
     if (activeChat) {
       const res = await api.patchChat(activeChat.id, { modelId });
       setChats((prev) => prev.map((c) => (c.id === activeChat.id ? { ...c, ...res.chat } : c)));
+      setDraftCreatedChat((prev) =>
+        prev && prev.id === activeChat.id ? { ...prev, ...res.chat } : prev
+      );
       if (res.sessionOptions) setSessionOptions(res.sessionOptions);
       return;
     }
@@ -863,6 +935,9 @@ export const App: React.FC = () => {
     if (activeChat) {
       const res = await api.patchChat(activeChat.id, { effortValue });
       setChats((prev) => prev.map((c) => (c.id === activeChat.id ? { ...c, ...res.chat } : c)));
+      setDraftCreatedChat((prev) =>
+        prev && prev.id === activeChat.id ? { ...prev, ...res.chat } : prev
+      );
       if (res.sessionOptions) setSessionOptions(res.sessionOptions);
       return;
     }
@@ -901,7 +976,7 @@ export const App: React.FC = () => {
 
   const ensureActiveChatForAction = async (): Promise<string> => {
     if (activeChatIdRef.current) return activeChatIdRef.current;
-    const created = await handleCreateChat(null);
+    const created = await createDraftBackedChat();
     return created.id;
   };
 
@@ -912,7 +987,9 @@ export const App: React.FC = () => {
   };
 
   const handleSendPrompt = async (text: string, files: AttachmentRef[]): Promise<void> => {
-    const chatId = await ensureActiveChatForAction();
+    const existingId = activeChatIdRef.current;
+    const wasDraft = !existingId || draftCreatedChatRef.current?.id === existingId;
+    const chatId = existingId || (await createDraftBackedChat()).id;
     const clientMessageId =
       typeof crypto !== 'undefined' && crypto.randomUUID
         ? crypto.randomUUID()
@@ -923,6 +1000,19 @@ export const App: React.FC = () => {
       attachmentIds: files.map((f) => f.artifactId),
       clientMessageId,
     });
+
+    const draftSnap = draftCreatedChatRef.current;
+    if (draftSnap?.id === chatId) {
+      draftCreatedChatRef.current = null;
+      setDraftCreatedChat(null);
+    }
+    const promotedChat = res.chat ?? (wasDraft && draftSnap?.id === chatId ? draftSnap : undefined);
+    if (promotedChat) {
+      setChats((prev) => [
+        { ...promotedChat, activeRun: res.run },
+        ...prev.filter((c) => c.id !== promotedChat.id),
+      ]);
+    }
 
     setMessages((prev) => {
       const copy = [...prev];
@@ -949,10 +1039,14 @@ export const App: React.FC = () => {
     wsRef.current?.stop();
     setUser(null);
     setAgyProfile(null);
+    setSandboxStatus(null);
     setUserOptions(null);
     setSessionOptions(null);
     setQuota(null);
     setHasComposerDraft(false);
+    draftCreatedChatRef.current = null;
+    setDraftCreatedChat(null);
+    setDraftProjectId(null);
     setActiveChatId(null);
     setChats([]);
     setProjects([]);
@@ -986,6 +1080,7 @@ export const App: React.FC = () => {
           setAgyProfile(payload.agyProfile);
           setPreferences(payload.preferences);
           setLoginFlow(payload.loginFlow);
+          setSandboxStatus(payload.sandbox ?? null);
         }}
       />
     );
@@ -1018,8 +1113,12 @@ export const App: React.FC = () => {
         projects={projects}
         activeChatId={activeChatId}
         onCloseMobile={() => setSidebarMobileOpen(false)}
-        onNewChat={(projId) => void handleCreateChat(projId ?? null)}
+        onNewChat={(projId) => handleStartDraftChat(projId ?? null)}
         onSelectChat={(id) => {
+          if (draftCreatedChatRef.current?.id !== id) {
+            cleanupEmptyDraftChat();
+          }
+          setDraftProjectId(null);
           setActiveChatId(id);
           setWorkspaceOpen(false);
         }}
@@ -1048,7 +1147,7 @@ export const App: React.FC = () => {
           workspaceCount={artifacts.length}
           workspaceOpen={workspaceOpen}
           onOpenSidebar={() => setSidebarMobileOpen(true)}
-          onNewChat={() => void handleCreateChat(null)}
+          onNewChat={() => handleStartDraftChat(null)}
           onRefreshQuota={() => void triggerQuotaRefresh(false)}
           onToggleWorkspace={() => setWorkspaceOpen((o) => !o)}
         />
@@ -1077,6 +1176,7 @@ export const App: React.FC = () => {
             sessionOptions={effectiveSessionOptions}
             selectedModelId={selectedModelId}
             selectedEffortValue={selectedEffortValue}
+            draftResetToken={draftResetToken}
             clientId={wsRef.current?.getClientId() ?? 'local'}
             onChangeModel={(modelId) => void handleChangeModel(modelId)}
             onChangeEffort={(effortValue) => void handleChangeEffort(effortValue)}
@@ -1088,6 +1188,9 @@ export const App: React.FC = () => {
               if (!activeChat) return;
               const res = await api.syncChatProject(activeChat.id);
               setChats((prev) => prev.map((c) => (c.id === activeChat.id ? { ...c, ...res.chat } : c)));
+              setDraftCreatedChat((prev) =>
+                prev && prev.id === activeChat.id ? { ...prev, ...res.chat } : prev
+              );
               await loadChatDetail(activeChat.id);
             }}
             onOpenArtifact={(art) => setViewerArtifact(art)}
@@ -1114,6 +1217,7 @@ export const App: React.FC = () => {
           loginFlow={loginFlow}
           preferences={preferences}
           agyMode={bootstrapMeta.agyMode}
+          sandbox={sandboxStatus}
           onClose={() => setSettingsOpen(false)}
           onUpdatePreferences={(next) => setPreferences(next)}
           onUpdateAgy={({ profile, loginFlow: nextFlow }) => {
@@ -1143,7 +1247,7 @@ export const App: React.FC = () => {
             setProjects((prev) => prev.filter((p) => p.id !== projectId));
           }}
           onStartChatInProject={(projectId) => {
-            void handleCreateChat(projectId);
+            handleStartDraftChat(projectId);
           }}
         />
       )}

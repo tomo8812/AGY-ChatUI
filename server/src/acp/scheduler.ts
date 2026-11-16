@@ -3,7 +3,7 @@ import type { AppConfig } from '../config.js';
 import type { AppDatabase } from '../db/database.js';
 import type { PushNotificationService } from '../notifications/web-push.js';
 import type { SyncHub } from '../sync/hub.js';
-import type { AttachmentRef, MessageRecord, RunRecord } from '../types.js';
+import type { AttachmentRef, ChatRecord, MessageRecord, RunRecord } from '../types.js';
 import type { AcpClientManager } from './client-manager.js';
 
 interface QueuedTurnJob {
@@ -43,6 +43,7 @@ export class ExecutionScheduler {
     userMessage: MessageRecord;
     assistantMessage: MessageRecord;
     run: RunRecord;
+    chat: ChatRecord;
     deduplicated: boolean;
   } {
     // Idempotency across reconnects / dual device taps
@@ -52,11 +53,13 @@ export class ExecutionScheduler {
         const existingRun = this.db.getRun(params.userId, existingUserMsg.runId);
         if (existingRun) {
           const existingAssistant = this.db.getMessage(params.userId, existingRun.assistantMessageId);
-          if (existingAssistant) {
+          const existingChat = this.db.getChat(params.userId, params.chatId);
+          if (existingAssistant && existingChat) {
             return {
               userMessage: existingUserMsg,
               assistantMessage: existingAssistant,
               run: existingRun,
+              chat: existingChat,
               deduplicated: true,
             };
           }
@@ -153,6 +156,7 @@ export class ExecutionScheduler {
       userMessage,
       assistantMessage: this.db.getMessage(params.userId, assistantMessageId)!,
       run: this.db.getRun(params.userId, runId)!,
+      chat: updatedChat,
       deduplicated: false,
     };
   }

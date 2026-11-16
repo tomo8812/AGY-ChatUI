@@ -158,6 +158,42 @@ if [[ "$(id -u)" -eq 0 ]] && [[ -n "${REPO_OWNER}" ]] && id "${REPO_OWNER}" >/de
   chown "${REPO_OWNER}:${REPO_OWNER}" "${APP_DIR}/BUILD_INFO.json" "${APP_DIR}/.bundle-lock-sha256" 2>/dev/null || true
 fi
 
+if [[ "$(id -u)" -eq 0 ]]; then
+  if command -v bwrap >/dev/null 2>&1; then
+    if [[ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] \
+      && [[ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" == "1" ]] \
+      && [[ -f /etc/apparmor.d/abi/4.0 ]] \
+      && ! grep -RqsE '/usr/bin/bwrap' /etc/apparmor.d/ 2>/dev/null; then
+      echo "[apply-bundle] Installing Ubuntu 24.04+ AppArmor userns profile for /usr/bin/bwrap..."
+      cat <<'EOF' > /etc/apparmor.d/bwrap
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/bwrap>
+}
+EOF
+      if command -v apparmor_parser >/dev/null 2>&1; then
+        apparmor_parser -r -W /etc/apparmor.d/bwrap 2>/dev/null || true
+      fi
+    fi
+
+    UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}"
+    if [[ -f "${UNIT_FILE}" ]] && grep -qE '^NoNewPrivileges=true$' "${UNIT_FILE}"; then
+      echo "[apply-bundle] Updating ${UNIT_FILE} (NoNewPrivileges=false) for bubblewrap userns transition..."
+      sed -i 's/^NoNewPrivileges=true$/NoNewPrivileges=false/' "${UNIT_FILE}"
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload || true
+      fi
+    fi
+  else
+    echo "[apply-bundle] INFO: 'bwrap' (bubblewrap) is not installed; SANDBOX_MODE=auto will fall back cleanly until installed."
+  fi
+fi
+
 if [[ "${NO_RESTART}" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
   if systemctl cat "${SERVICE_NAME}" >/dev/null 2>&1; then
     echo "[apply-bundle] Restarting ${SERVICE_NAME}..."

@@ -1,5 +1,7 @@
 import path from 'node:path';
 
+export type SandboxMode = 'auto' | 'strict' | 'off';
+
 export interface AppConfig {
   nodeEnv: string;
   host: string;
@@ -19,6 +21,7 @@ export interface AppConfig {
   pythonBin: string;
   ptyHelperPath: string;
   libreOfficeBin: string;
+  sandboxMode: SandboxMode;
   enableBwrap: boolean;
   bwrapBin: string;
   sessionTtlMs: number;
@@ -54,6 +57,21 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   const secureCookies: 'auto' | 'always' | 'never' =
     secureRaw === 'always' || secureRaw === 'never' ? secureRaw : 'auto';
 
+  const sandboxModeRaw = process.env.SANDBOX_MODE?.trim().toLowerCase();
+  let envSandboxMode: SandboxMode = 'auto';
+  if (sandboxModeRaw === 'strict' || sandboxModeRaw === 'auto' || sandboxModeRaw === 'off') {
+    envSandboxMode = sandboxModeRaw;
+  } else if (process.env.ENABLE_BWRAP !== undefined) {
+    envSandboxMode = parseBool(process.env.ENABLE_BWRAP, false) ? 'strict' : 'off';
+  }
+
+  let resolvedSandboxMode: SandboxMode = envSandboxMode;
+  if (overrides.sandboxMode !== undefined) {
+    resolvedSandboxMode = overrides.sandboxMode;
+  } else if (overrides.enableBwrap !== undefined) {
+    resolvedSandboxMode = overrides.enableBwrap ? 'strict' : 'off';
+  }
+
   const base: AppConfig = {
     nodeEnv: process.env.NODE_ENV ?? 'development',
     host: process.env.HOST ?? '127.0.0.1',
@@ -75,7 +93,8 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     pythonBin: process.env.PYTHON_BIN ?? 'python3',
     ptyHelperPath: path.resolve(path.join(repoRoot, 'server', 'scripts', 'agy_pty_login.py')),
     libreOfficeBin: process.env.LIBREOFFICE_BIN ?? 'libreoffice',
-    enableBwrap: parseBool(process.env.ENABLE_BWRAP, false),
+    sandboxMode: resolvedSandboxMode,
+    enableBwrap: overrides.enableBwrap ?? resolvedSandboxMode !== 'off',
     bwrapBin: process.env.BWRAP_BIN ?? 'bwrap',
     sessionTtlMs: parsePositiveInt(process.env.SESSION_TTL_DAYS, 30) * 24 * 60 * 60 * 1000,
     sessionSecret: process.env.SESSION_SECRET ?? 'dev-ephemeral-session-secret-change-in-prod',
@@ -89,6 +108,8 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   };
 
   const merged = { ...base, ...overrides };
+  merged.sandboxMode = resolvedSandboxMode;
+  merged.enableBwrap = overrides.enableBwrap ?? resolvedSandboxMode !== 'off';
   if (!overrides.profilesRoot) merged.profilesRoot = path.join(merged.dataRoot, 'profiles');
   if (!overrides.workspacesRoot) merged.workspacesRoot = path.join(merged.dataRoot, 'workspaces');
   if (!overrides.projectsRoot) merged.projectsRoot = path.join(merged.dataRoot, 'projects');

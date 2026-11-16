@@ -28,6 +28,28 @@ if [[ "${INSTALL_LIBREOFFICE}" == "1" ]]; then
   apt-get install -y --no-install-recommends libreoffice-impress libreoffice-writer libreoffice-calc libreoffice-common fonts-noto-cjk
 fi
 
+if command -v bwrap >/dev/null 2>&1 \
+  && [[ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] \
+  && [[ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" == "1" ]] \
+  && [[ -f /etc/apparmor.d/abi/4.0 ]] \
+  && ! grep -RqsE '/usr/bin/bwrap' /etc/apparmor.d/ 2>/dev/null; then
+  echo "==> Configuring Ubuntu 24.04+ AppArmor userns profile for /usr/bin/bwrap..."
+  cat <<'EOF' > /etc/apparmor.d/bwrap
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/bwrap>
+}
+EOF
+  if command -v apparmor_parser >/dev/null 2>&1; then
+    apparmor_parser -r -W /etc/apparmor.d/bwrap || true
+  fi
+fi
+
 echo "==> [2/6] Checking Node.js 24 LTS..."
 if ! command -v node >/dev/null 2>&1 || [[ "$(node -v | sed 's/v//' | cut -d. -f1)" -lt 24 ]]; then
   curl -fsSL https://deb.nodesource.com/setup_24.x | bash -

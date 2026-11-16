@@ -26,6 +26,7 @@ import {
   StopIcon,
 } from './Icons';
 import { MarkdownContent } from './MarkdownContent';
+import { ModelSelector } from './ModelSelector';
 
 interface ChatViewProps {
   chat: ChatRecord | null;
@@ -37,6 +38,7 @@ interface ChatViewProps {
   sessionOptions: ParsedSessionOptions | null;
   selectedModelId: string;
   selectedEffortValue: string;
+  draftResetToken?: number;
   clientId: string;
   onChangeModel: (modelId: string) => void;
   onChangeEffort: (effortValue: string) => void;
@@ -211,6 +213,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
   sessionOptions,
   selectedModelId,
   selectedEffortValue,
+  draftResetToken = 0,
   clientId,
   onChangeModel,
   onChangeEffort,
@@ -241,10 +244,23 @@ export const ChatView: React.FC<ChatViewProps> = ({
     return map;
   }, [artifacts]);
 
+  const prevChatIdRef = useRef<string | undefined>(chat?.id);
   useEffect(() => {
+    const prev = prevChatIdRef.current;
+    prevChatIdRef.current = chat?.id;
+    if (prev !== undefined && prev !== chat?.id) {
+      setStagedAttachments([]);
+      setUiNotice(null);
+    }
+  }, [chat?.id]);
+
+  useEffect(() => {
+    if (!draftResetToken) return;
+    setInputText('');
     setStagedAttachments([]);
     setUiNotice(null);
-  }, [chat?.id]);
+    textareaRef.current?.focus();
+  }, [draftResetToken]);
 
   useEffect(() => {
     onDraftChange?.(inputText.trim().length > 0 || stagedAttachments.length > 0);
@@ -614,20 +630,12 @@ export const ChatView: React.FC<ChatViewProps> = ({
                 </button>
 
                 {modelOption && modelOption.options.length > 0 && (
-                  <select
-                    aria-label="モデル選択"
-                    className="composer-model-select"
+                  <ModelSelector
+                    options={modelOption.options}
                     value={currentModelValue}
                     disabled={configBusy}
-                    onChange={(e) => onChangeModel(e.target.value)}
-                    title="使用モデルを選択"
-                  >
-                    {modelOption.options.map((opt) => (
-                      <option key={opt.value} value={opt.value}>
-                        {opt.name}
-                      </option>
-                    ))}
-                  </select>
+                    onChange={onChangeModel}
+                  />
                 )}
               </div>
 

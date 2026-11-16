@@ -1,38 +1,88 @@
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { AppConfig } from '../config.js';
+import type { SandboxStatus } from '../types.js';
 
 const require = createRequire(import.meta.url);
+
+export const SANDBOX_WORKSPACE_MOUNT = '/workspace';
 
 export interface IsolatedEnvOptions {
   profileDir: string;
   geminiApiKey?: string | null;
+  includeMockVars?: boolean;
+  sandboxTmpDir?: string | null;
   extraEnv?: Record<string, string | undefined>;
 }
 
-const GUI_AND_KEYRING_VARS = [
-  'DBUS_SESSION_BUS_ADDRESS',
-  'GNOME_KEYRING_CONTROL',
-  'GNOME_KEYRING_PID',
-  'DISPLAY',
-  'WAYLAND_DISPLAY',
-  'XAUTHORITY',
-  'SESSION_MANAGER',
-  'GPG_AGENT_INFO',
-  'SSH_ASKPASS',
-  'BROWSER',
-  'GOOGLE_CLOUD_ACCESS_TOKEN',
-  'GOOGLE_APPLICATION_CREDENTIALS',
-  'GEMINI_API_KEY',
-  'GOOGLE_API_KEY',
-];
+const SAFE_HOST_ENV_ALLOWLIST = [
+  'PATH',
+  'LANG',
+  'LC_ALL',
+  'LC_CTYPE',
+  'TZ',
+  'COLORTERM',
+  'FORCE_COLOR',
+  'NO_COLOR',
+  'SSL_CERT_FILE',
+  'SSL_CERT_DIR',
+  'NODE_EXTRA_CA_CERTS',
+  'REQUESTS_CA_BUNDLE',
+  'CURL_CA_BUNDLE',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'NO_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'no_proxy',
+] as const;
+
+const SYSTEM_MOUNT_ROOTS = ['/usr', '/bin', '/sbin', '/lib', '/lib64', '/lib32'] as const;
+
+const ETC_WHITELIST_DIRS = [
+  '/etc/ssl',
+  '/etc/ca-certificates',
+  '/etc/pki',
+  '/etc/ld.so.conf.d',
+  '/etc/alternatives',
+  '/etc/terminfo',
+] as const;
+
+const ETC_WHITELIST_FILES = [
+  '/etc/resolv.conf',
+  '/etc/hosts',
+  '/etc/nsswitch.conf',
+  '/etc/gai.conf',
+  '/etc/host.conf',
+  '/etc/services',
+  '/etc/protocols',
+  '/etc/ca-certificates.conf',
+  '/etc/ld.so.cache',
+  '/etc/ld.so.conf',
+  '/etc/localtime',
+  '/etc/timezone',
+  '/etc/os-release',
+  '/etc/lsb-release',
+  '/etc/mime.types',
+] as const;
 
 export function buildIsolatedAgyEnv(opts: IsolatedEnvOptions): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  for (const key of GUI_AND_KEYRING_VARS) {
-    delete env[key];
+  const env: NodeJS.ProcessEnv = {};
+
+  for (const key of SAFE_HOST_ENV_ALLOWLIST) {
+    const val = process.env[key];
+    if (typeof val === 'string' && val.length > 0) {
+      env[key] = val;
+    }
+  }
+  if (!env.PATH) {
+    env.PATH = '/usr/local/bin:/usr/bin:/bin';
+  }
+  if (opts.includeMockVars && process.env.MOCK_ALLOW_UNAUTH !== undefined) {
+    env.MOCK_ALLOW_UNAUTH = process.env.MOCK_ALLOW_UNAUTH;
   }
 
   const profileAbs = path.resolve(opts.profileDir);
@@ -40,11 +90,13 @@ export function buildIsolatedAgyEnv(opts: IsolatedEnvOptions): NodeJS.ProcessEnv
   const xdgData = path.join(profileAbs, '.local', 'share');
   const xdgState = path.join(profileAbs, '.local', 'state');
   const xdgCache = path.join(profileAbs, '.cache');
-  const tmpDir = path.join(profileAbs, '.tmp');
+  const hostTmpDir = path.join(profileAbs, '.tmp');
 
-  for (const dir of [profileAbs, xdgConfig, xdgData, xdgState, xdgCache, tmpDir]) {
+  for (const dir of [profileAbs, xdgConfig, xdgData, xdgState, xdgCache, hostTmpDir]) {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
+
+  const effectiveTmpDir = opts.sandboxTmpDir || hostTmpDir;
 
   env.HOME = profileAbs;
   env.USERPROFILE = profileAbs;
@@ -52,9 +104,12 @@ export function buildIsolatedAgyEnv(opts: IsolatedEnvOptions): NodeJS.ProcessEnv
   env.XDG_DATA_HOME = xdgData;
   env.XDG_STATE_HOME = xdgState;
   env.XDG_CACHE_HOME = xdgCache;
-  env.TMPDIR = tmpDir;
-  env.TEMP = tmpDir;
-  env.TMP = tmpDir;
+  env.TMPDIR = effectiveTmpDir;
+  env.TEMP = effectiveTmpDir;
+  env.TMP = effectiveTmpDir;
+  env.USER = 'sandbox';
+  env.LOGNAME = 'sandbox';
+  env.SHELL = '/bin/bash';
   env.AGY_CLI_DISABLE_AUTO_UPDATE = 'true';
   env.NO_BROWSER = '1';
   env.SSH_CONNECTION = '127.0.0.1 0 127.0.0.1 22';
@@ -73,10 +128,272 @@ export function buildIsolatedAgyEnv(opts: IsolatedEnvOptions): NodeJS.ProcessEnv
   return env;
 }
 
+export function resolveHostExecutable(bin: string, searchPath = process.env.PATH): string | null {
+  const trimmed = bin.trim();
+  if (!trimmed) return null;
+
+  const tryCandidate = (candidate: string): string | null => {
+    try {
+      const st = fs.statSync(candidate);
+      if (!st.isFile()) return null;
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return fs.realpathSync(candidate);
+    } catch {
+      return null;
+    }
+  };
+
+  if (trimmed.includes('/')) {
+    return tryCandidate(path.resolve(trimmed));
+  }
+
+  for (const dir of (searchPath || '/usr/local/bin:/usr/bin:/bin').split(path.delimiter)) {
+    if (!dir) continue;
+    const hit = tryCandidate(path.join(dir, trimmed));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function isInsideSystemMountTree(targetPath: string, mountedDirs: Set<string>): boolean {
+  for (const dir of mountedDirs) {
+    if (targetPath === dir || targetPath.startsWith(`${dir}/`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function ensureSyntheticSandboxPasswdFiles(profileAbs: string): { passwdPath: string; groupPath: string } {
+  const sandboxEtcDir = path.join(path.dirname(profileAbs), '.sandbox-etc');
+  fs.mkdirSync(sandboxEtcDir, { recursive: true, mode: 0o700 });
+
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 1000;
+  const gid = typeof process.getgid === 'function' ? process.getgid() : 1000;
+
+  const passwdPath = path.join(sandboxEtcDir, 'passwd');
+  const groupPath = path.join(sandboxEtcDir, 'group');
+
+  const passwdContent = `root:x:0:0:root:/root:/bin/sh\nsandbox:x:${uid}:${gid}:Sandbox:${SANDBOX_WORKSPACE_MOUNT}:/bin/bash\n`;
+  const groupContent = `root:x:0:\nsandbox:x:${gid}:\n`;
+
+  fs.writeFileSync(passwdPath, passwdContent, { mode: 0o644 });
+  fs.writeFileSync(groupPath, groupContent, { mode: 0o644 });
+
+  return { passwdPath, groupPath };
+}
+
+function buildCoreBwrapRootfsArgs(): { args: string[]; mountedSystemDirs: Set<string> } {
+  const args: string[] = [
+    '--die-with-parent',
+    '--new-session',
+    '--unshare-pid',
+    '--unshare-ipc',
+    '--unshare-uts',
+    '--hostname',
+    'agy-sandbox',
+    '--cap-drop',
+    'ALL',
+  ];
+
+  const mountedSystemDirs = new Set<string>();
+  for (const sysPath of SYSTEM_MOUNT_ROOTS) {
+    try {
+      const lst = fs.lstatSync(sysPath);
+      if (lst.isSymbolicLink()) {
+        const linkTarget = fs.readlinkSync(sysPath);
+        args.push('--symlink', linkTarget, sysPath);
+      } else if (lst.isDirectory()) {
+        args.push('--ro-bind', sysPath, sysPath);
+        mountedSystemDirs.add(sysPath);
+      }
+    } catch {
+      // Skip absent system paths (e.g. /lib32 on arm64)
+    }
+  }
+
+  args.push(
+    '--proc',
+    '/proc',
+    '--dev',
+    '/dev',
+    '--tmpfs',
+    '/tmp',
+    '--dir',
+    '/var',
+    '--tmpfs',
+    '/var/tmp',
+    '--dir',
+    '/run',
+    '--dir',
+    '/home',
+    '--dir',
+    '/root',
+    '--dir',
+    '/etc'
+  );
+
+  const mountedEtcDirs: string[] = [];
+  for (const dirPath of ETC_WHITELIST_DIRS) {
+    try {
+      const real = fs.realpathSync(dirPath);
+      if (fs.statSync(real).isDirectory()) {
+        args.push('--ro-bind', real, dirPath);
+        mountedEtcDirs.push(dirPath);
+      }
+    } catch {
+      // Ignore absent optional /etc subdirectories
+    }
+  }
+
+  const mountEtcFile = (filePath: string) => {
+    if (mountedEtcDirs.some((d) => filePath.startsWith(`${d}/`))) {
+      return;
+    }
+    try {
+      const real = fs.realpathSync(filePath);
+      if (fs.statSync(real).isFile()) {
+        args.push('--ro-bind', real, filePath);
+      }
+    } catch {
+      // Ignore absent optional /etc files
+    }
+  };
+
+  for (const filePath of ETC_WHITELIST_FILES) {
+    mountEtcFile(filePath);
+  }
+  for (const envVar of ['SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE']) {
+    const val = process.env[envVar];
+    if (val && path.isAbsolute(val) && val.startsWith('/etc/')) {
+      mountEtcFile(val);
+    }
+  }
+
+  return { args, mountedSystemDirs };
+}
+
 export interface SpawnCommandSpec {
   command: string;
   args: string[];
   env: NodeJS.ProcessEnv;
+  sandboxed: boolean;
+  sandboxWorkspaceRoot: string;
+}
+
+const sandboxProbeCache = new Map<string, SandboxStatus>();
+
+export function clearSandboxProbeCache(): void {
+  sandboxProbeCache.clear();
+}
+
+export function probeBwrapSandbox(config: AppConfig, useCache = true): SandboxStatus {
+  if (config.agyMode === 'mock') {
+    return {
+      mode: config.sandboxMode,
+      active: false,
+      backend: 'mock',
+      reason: 'モックモード（AGY_MODE=mock）で動作中です。',
+      remediation: null,
+    };
+  }
+  if (config.sandboxMode === 'off') {
+    return {
+      mode: 'off',
+      active: false,
+      backend: 'none',
+      reason: '設定（SANDBOX_MODE=off）によりOSレベルの隔離が無効化されています。',
+      remediation: '/etc/antigravity-chat/env から SANDBOX_MODE=off / ENABLE_BWRAP=false を外して再起動してください。',
+    };
+  }
+  if (process.platform !== 'linux') {
+    return {
+      mode: config.sandboxMode,
+      active: false,
+      backend: 'none',
+      reason: `bubblewrap サンドボックスは Linux 専用です（現在: ${process.platform}）。`,
+      remediation: null,
+    };
+  }
+
+  const cacheKey = `${config.sandboxMode}|${config.agyMode}|${config.bwrapBin}`;
+  if (useCache) {
+    const cached = sandboxProbeCache.get(cacheKey);
+    if (cached) return cached;
+  }
+
+  const bwrapResolved = resolveHostExecutable(config.bwrapBin);
+  if (!bwrapResolved) {
+    const res: SandboxStatus = {
+      mode: config.sandboxMode,
+      active: false,
+      backend: 'none',
+      reason: `bubblewrap (${config.bwrapBin}) が見つかりません。`,
+      remediation: 'Ubuntu サーバーで sudo apt-get update && sudo apt-get install -y bubblewrap を実行してください。',
+    };
+    sandboxProbeCache.set(cacheKey, res);
+    return res;
+  }
+
+  const trueBin = resolveHostExecutable('true');
+  const shBin = trueBin ? null : resolveHostExecutable('sh');
+  const probeExec = trueBin ?? shBin;
+  if (!probeExec) {
+    const res: SandboxStatus = {
+      mode: config.sandboxMode,
+      active: false,
+      backend: 'none',
+      reason: 'サンドボックス検証用バイナリ（true / sh）が見つかりません。',
+      remediation: null,
+    };
+    sandboxProbeCache.set(cacheKey, res);
+    return res;
+  }
+
+  const { args: rootArgs } = buildCoreBwrapRootfsArgs();
+  const probeArgs = [
+    ...rootArgs,
+    '--tmpfs',
+    SANDBOX_WORKSPACE_MOUNT,
+    '--chdir',
+    SANDBOX_WORKSPACE_MOUNT,
+    '--',
+    probeExec,
+    ...(trueBin ? [] : ['-c', 'exit 0']),
+  ];
+
+  let res: SandboxStatus;
+  try {
+    execFileSync(bwrapResolved, probeArgs, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 3000,
+    });
+    res = {
+      mode: config.sandboxMode,
+      active: true,
+      backend: 'bwrap',
+      reason: null,
+      remediation: null,
+    };
+  } catch (err) {
+    const e = err as { stderr?: Buffer | string; message?: string };
+    const stderr = (e.stderr ? String(e.stderr) : e.message ?? '').trim();
+    const isPermissionIssue = /permission denied|operation not permitted|uid map|uid_map|apparmor|userns/i.test(stderr);
+    res = {
+      mode: config.sandboxMode,
+      active: false,
+      backend: 'none',
+      reason: isPermissionIssue
+        ? 'Ubuntu AppArmor またはカーネル名前空間の制限により bubblewrap の起動が拒否されました。'
+        : `bubblewrap の起動テストに失敗しました: ${stderr.slice(0, 180) || 'unknown error'}`,
+      remediation: isPermissionIssue
+        ? 'Ubuntu サーバーで最新の sudo bash deploy/ubuntu-setup.sh を実行し、/etc/apparmor.d/bwrap の作成と systemd の NoNewPrivileges=false を反映してください。'
+        : 'sudo systemctl restart antigravity-chat と bubblewrap の動作を確認してください。',
+    };
+  }
+
+  sandboxProbeCache.set(cacheKey, res);
+  return res;
 }
 
 function getTsxImportUrl(): string {
@@ -92,12 +409,14 @@ export function buildAgyCommandSpec(params: {
   geminiApiKey?: string | null;
   enableSandboxBwrap?: boolean;
 }): SpawnCommandSpec {
-  const env = buildIsolatedAgyEnv({
-    profileDir: params.profileDir,
-    geminiApiKey: params.geminiApiKey,
-  });
+  const workspaceFallback = path.resolve(params.workspaceDir ?? params.profileDir);
 
   if (params.config.agyMode === 'mock') {
+    const env = buildIsolatedAgyEnv({
+      profileDir: params.profileDir,
+      geminiApiKey: params.geminiApiKey,
+      includeMockVars: true,
+    });
     const mockArgs = params.config.mockAgentPath.endsWith('.ts')
       ? ['--import', getTsxImportUrl(), params.config.mockAgentPath, ...params.subcommandArgs]
       : [params.config.mockAgentPath, ...params.subcommandArgs];
@@ -105,54 +424,87 @@ export function buildAgyCommandSpec(params: {
       command: process.execPath,
       args: mockArgs,
       env,
+      sandboxed: false,
+      sandboxWorkspaceRoot: workspaceFallback,
     };
   }
 
-  // Real unmodified official `agy` binary
-  if (
-    params.enableSandboxBwrap &&
-    params.config.enableBwrap &&
+  const wantsSandbox =
+    Boolean(params.enableSandboxBwrap) &&
+    params.config.sandboxMode !== 'off' &&
     process.platform === 'linux' &&
-    params.workspaceDir
-  ) {
+    Boolean(params.workspaceDir);
+
+  if (wantsSandbox) {
     const profileAbs = path.resolve(params.profileDir);
-    const workspaceAbs = path.resolve(params.workspaceDir);
+    const workspaceAbs = path.resolve(params.workspaceDir!);
+    const bwrapCommand = resolveHostExecutable(params.config.bwrapBin) ?? params.config.bwrapBin;
+
+    const env = buildIsolatedAgyEnv({
+      profileDir: profileAbs,
+      geminiApiKey: params.geminiApiKey,
+      sandboxTmpDir: '/tmp',
+    });
+
+    const { args: rootArgs, mountedSystemDirs } = buildCoreBwrapRootfsArgs();
+    const { passwdPath, groupPath } = ensureSyntheticSandboxPasswdFiles(profileAbs);
+
     const bwrapArgs: string[] = [
-      '--die-with-parent',
+      ...rootArgs,
       '--ro-bind',
-      '/',
-      '/',
-      '--dev',
-      '/dev',
-      '--proc',
-      '/proc',
-      '--tmpfs',
-      '/tmp',
-      // Mask DATA_ROOT parent so peer users' profiles/workspaces are inaccessible even if permissions drift
-      '--tmpfs',
-      path.resolve(params.config.dataRoot),
-      '--bind',
-      profileAbs,
-      profileAbs,
-      '--bind',
-      workspaceAbs,
-      workspaceAbs,
-      '--chdir',
-      workspaceAbs,
-      '--',
-      params.config.agyBin,
-      ...params.subcommandArgs,
+      passwdPath,
+      '/etc/passwd',
+      '--ro-bind',
+      groupPath,
+      '/etc/group',
     ];
+
+    const resolvedAgy = resolveHostExecutable(params.config.agyBin, env.PATH);
+    let sandboxAgyCommand = params.config.agyBin;
+
+    if (resolvedAgy) {
+      if (isInsideSystemMountTree(resolvedAgy, mountedSystemDirs)) {
+        sandboxAgyCommand = resolvedAgy;
+      } else {
+        bwrapArgs.push('--dir', '/opt', '--dir', '/opt/agy', '--ro-bind', resolvedAgy, '/opt/agy/agy');
+        env.PATH = `/opt/agy:${env.PATH || '/usr/local/bin:/usr/bin:/bin'}`;
+        sandboxAgyCommand = '/opt/agy/agy';
+      }
+    }
+
+    bwrapArgs.push(
+      '--bind',
+      profileAbs,
+      profileAbs,
+      '--bind',
+      workspaceAbs,
+      SANDBOX_WORKSPACE_MOUNT,
+      '--chdir',
+      SANDBOX_WORKSPACE_MOUNT,
+      '--',
+      sandboxAgyCommand,
+      ...params.subcommandArgs
+    );
+
     return {
-      command: params.config.bwrapBin,
+      command: bwrapCommand,
       args: bwrapArgs,
       env,
+      sandboxed: true,
+      sandboxWorkspaceRoot: SANDBOX_WORKSPACE_MOUNT,
     };
   }
+
+  const env = buildIsolatedAgyEnv({
+    profileDir: params.profileDir,
+    geminiApiKey: params.geminiApiKey,
+  });
 
   return {
     command: params.config.agyBin,
     args: params.subcommandArgs,
     env,
+    sandboxed: false,
+    sandboxWorkspaceRoot: workspaceFallback,
   };
 }

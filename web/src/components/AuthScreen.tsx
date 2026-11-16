@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { ApiError, api } from '../api/client';
-import type { AgyLoginFlowState, AgyProfile, UserPreferences, WebUser } from '../types';
+import type { AgyLoginFlowState, AgyProfile, SandboxStatus, UserPreferences, WebUser } from '../types';
 import { ShieldIcon } from './Icons';
 
 interface AuthScreenProps {
@@ -12,6 +12,7 @@ interface AuthScreenProps {
     agyProfile: AgyProfile;
     preferences: UserPreferences;
     loginFlow: AgyLoginFlowState;
+    sandbox?: SandboxStatus | null;
   }) => void;
 }
 

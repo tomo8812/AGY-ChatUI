@@ -745,7 +745,7 @@ export class AppDatabase {
         .prepare(
           `SELECT DISTINCT c.*
            FROM chats c
-           LEFT JOIN messages m ON m.chat_id = c.id
+           INNER JOIN messages m ON m.chat_id = c.id AND m.user_id = c.user_id
            WHERE c.user_id = ? AND (c.title LIKE ? OR m.content_text LIKE ?)
            ORDER BY c.last_message_at DESC, c.created_at DESC`
         )
@@ -754,12 +754,24 @@ export class AppDatabase {
     }
     if (opts.projectId) {
       const rows = this.db
-        .prepare('SELECT * FROM chats WHERE user_id = ? AND project_id = ? ORDER BY last_message_at DESC, created_at DESC')
+        .prepare(
+          `SELECT c.*
+           FROM chats c
+           WHERE c.user_id = ? AND c.project_id = ?
+             AND EXISTS (SELECT 1 FROM messages m WHERE m.chat_id = c.id AND m.user_id = c.user_id)
+           ORDER BY c.last_message_at DESC, c.created_at DESC`
+        )
         .all(userId, opts.projectId) as Array<Record<string, unknown>>;
       return rows.map((r) => this.mapChat(r));
     }
     const rows = this.db
-      .prepare('SELECT * FROM chats WHERE user_id = ? ORDER BY last_message_at DESC, created_at DESC')
+      .prepare(
+        `SELECT c.*
+         FROM chats c
+         WHERE c.user_id = ?
+           AND EXISTS (SELECT 1 FROM messages m WHERE m.chat_id = c.id AND m.user_id = c.user_id)
+         ORDER BY c.last_message_at DESC, c.created_at DESC`
+      )
       .all(userId) as Array<Record<string, unknown>>;
     return rows.map((r) => this.mapChat(r));
   }
