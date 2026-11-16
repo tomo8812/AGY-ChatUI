@@ -600,11 +600,22 @@ export function buildAgyCommandSpec(params: {
     for (const rel of [...brainSubdirs, ...scratchSubdirs, ...playgroundSubdirs]) {
       fs.mkdirSync(path.join(profileAbs, ...rel), { recursive: true, mode: 0o700 });
     }
+    for (const hiddenDir of ['.chat-brains', '.chat-homes', '.chat-scratch', '.chat-playground']) {
+      fs.mkdirSync(path.join(profileAbs, hiddenDir), { recursive: true, mode: 0o700 });
+    }
 
     bwrapArgs.push(
       '--bind',
       profileAbs,
       SANDBOX_HOME_MOUNT,
+      '--tmpfs',
+      `${SANDBOX_HOME_MOUNT}/.chat-brains`,
+      '--tmpfs',
+      `${SANDBOX_HOME_MOUNT}/.chat-homes`,
+      '--tmpfs',
+      `${SANDBOX_HOME_MOUNT}/.chat-scratch`,
+      '--tmpfs',
+      `${SANDBOX_HOME_MOUNT}/.chat-playground`,
       '--bind',
       chatBrainHostDir,
       `${SANDBOX_HOME_MOUNT}/.gemini/antigravity-cli/brain`,

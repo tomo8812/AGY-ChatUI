@@ -70,22 +70,29 @@ describe('Brain Image Resolution, Haptics & Push Vibrate, Quota minAgeMs, and Ag
     const aliceProfile = srv.ctx.db.getAgyProfile(aliceId)!;
     const bobProfile = srv.ctx.db.getAgyProfile(bobId)!;
 
-    // Seed authorized brain artifacts for Alice across multiple .gemini brain roots
-    const cliBrainDir = path.join(aliceProfile.profileDir, '.gemini', 'antigravity-cli', 'brain', 'sess-1');
-    const jetskiBrainDir = path.join(aliceProfile.profileDir, '.gemini', 'jetski', 'brain', 'sess-2');
-    const dotBrainDir = path.join(aliceProfile.profileDir, '.gemini', 'antigravity-cli', 'brain', '.system_generated');
+    const { getChatBrainHostDir } = await import('../src/acp/env-isolation.js');
+    const chatRes = await alice.request<{ chat: { id: string; workspaceDir: string } }>('POST', '/api/chats', {
+      title: '画像リンク解決テスト',
+    });
+    const chatId = chatRes.data.chat.id;
+    const chatBrainDir = getChatBrainHostDir(aliceProfile.profileDir, chatRes.data.chat.workspaceDir);
+
+    // Seed authorized brain artifacts for Alice's chat inside its isolated brain root
+    const cliBrainDir = path.join(chatBrainDir, 'sess-1');
+    const jetskiBrainDir = path.join(chatBrainDir, 'sess-2');
+    const dotBrainDir = path.join(chatBrainDir, '.system_generated');
     fs.mkdirSync(cliBrainDir, { recursive: true });
     fs.mkdirSync(jetskiBrainDir, { recursive: true });
     fs.mkdirSync(dotBrainDir, { recursive: true });
 
     const sampleJpg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0xff, 0xd9]);
     const samplePng = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x00]);
-    const aliceBrainJpg = path.join(cliBrainDir, 'miffy_custom.jpg');
+    const aliceBrainJpg = path.join(aliceProfile.profileDir, '.gemini', 'antigravity-cli', 'brain', 'sess-1', 'miffy_custom.jpg');
     const aliceBrainPng = path.join(jetskiBrainDir, 'diagram.png');
     const dotSecret = path.join(dotBrainDir, 'internal.txt');
     const oauthSecret = path.join(aliceProfile.profileDir, '.gemini', 'oauth_creds.json');
 
-    fs.writeFileSync(aliceBrainJpg, sampleJpg);
+    fs.writeFileSync(path.join(cliBrainDir, 'miffy_custom.jpg'), sampleJpg);
     fs.writeFileSync(aliceBrainPng, samplePng);
     fs.writeFileSync(dotSecret, 'internal metadata');
     fs.writeFileSync(oauthSecret, '{"token":"secret"}');
@@ -95,11 +102,6 @@ describe('Brain Image Resolution, Haptics & Push Vibrate, Quota minAgeMs, and Ag
     fs.mkdirSync(bobBrainDir, { recursive: true });
     const bobBrainJpg = path.join(bobBrainDir, 'bob_only.jpg');
     fs.writeFileSync(bobBrainJpg, sampleJpg);
-
-    const chatRes = await alice.request<{ chat: { id: string } }>('POST', '/api/chats', {
-      title: '画像リンク解決テスト',
-    });
-    const chatId = chatRes.data.chat.id;
 
     // 1) Raw path inside .gemini/antigravity-cli/brain/ resolves and serves exact bytes
     const resRaw = await alice.request<{

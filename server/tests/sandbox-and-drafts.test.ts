@@ -377,4 +377,85 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
     const meRes = await alice.request<{ sandbox: { backend: string } | null }>('GET', '/api/auth/me');
     expect(meRes.data.sandbox?.backend).toBe('mock');
   });
+
+  it('strictly isolates per-chat brain roots, bwrap hidden dirs, and empty chat workspace API', async () => {
+    const { getAllowedBrainRoots, resolveAuthorizedBrainFile } = await import(
+      '../src/files/link-resolver.js'
+    );
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-isolation-'));
+    cleanups.push(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+    const profileDir = path.join(tmpDir, 'profile');
+    const ws1 = path.join(tmpDir, 'workspaces', 'chat-1');
+    const ws2 = path.join(tmpDir, 'workspaces', 'chat-2');
+    fs.mkdirSync(ws1, { recursive: true });
+    fs.mkdirSync(ws2, { recursive: true });
+
+    // Shared legacy brain file and chat-1 brain file
+    const sharedBrainFile = path.join(profileDir, '.gemini', 'antigravity', 'brain', 'sess-x', 'old.png');
+    fs.mkdirSync(path.dirname(sharedBrainFile), { recursive: true });
+    fs.writeFileSync(sharedBrainFile, 'shared-old');
+
+    const chat1BrainFile = path.join(getChatBrainHostDir(profileDir, ws1), 'sess-1', 'miffy.jpg');
+    fs.mkdirSync(path.dirname(chat1BrainFile), { recursive: true });
+    fs.writeFileSync(chat1BrainFile, 'chat1-img');
+
+    // getAllowedBrainRoots with workspaceDir must only include that chat's brain dir
+    expect(getAllowedBrainRoots(profileDir, ws2)).toEqual([getChatBrainHostDir(profileDir, ws2)]);
+
+    // chat-2 must NOT resolve shared legacy brain or chat-1 brain files
+    expect(
+      resolveAuthorizedBrainFile({
+        profileDir,
+        workspaceDir: ws2,
+        candidatePath: sharedBrainFile,
+      })
+    ).toBeNull();
+    expect(
+      resolveAuthorizedBrainFile({
+        profileDir,
+        workspaceDir: ws2,
+        candidatePath: chat1BrainFile,
+      })
+    ).toBeNull();
+
+    // Real bwrap command spec masks .chat-brains / .chat-homes / .chat-scratch / .chat-playground
+    const realCfg = loadConfig({ agyMode: 'real', sandboxMode: 'auto', agyBin: 'echo' });
+    const spec = buildAgyCommandSpec({
+      config: realCfg,
+      subcommandArgs: ['acp'],
+      profileDir,
+      workspaceDir: ws2,
+      enableSandboxBwrap: true,
+    });
+    if (spec.sandboxed) {
+      expect(hasContiguousSlice(spec.args, ['--tmpfs', `${SANDBOX_HOME_MOUNT}/.chat-brains`])).toBe(true);
+      expect(hasContiguousSlice(spec.args, ['--tmpfs', `${SANDBOX_HOME_MOUNT}/.chat-homes`])).toBe(true);
+      expect(hasContiguousSlice(spec.args, ['--tmpfs', `${SANDBOX_HOME_MOUNT}/.chat-scratch`])).toBe(true);
+      expect(hasContiguousSlice(spec.args, ['--tmpfs', `${SANDBOX_HOME_MOUNT}/.chat-playground`])).toBe(true);
+    }
+
+    // API workspace check: chat-1 has generated artifact, chat-2 has none
+    const srv = await createTestServer();
+    cleanups.push(srv.cleanup);
+    const { client: alice } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+    await alice.connectWs({ clientId: 'alice-ws-iso' });
+
+    const c1 = (await alice.request<{ chat: { id: string; workspaceDir: string } }>('POST', '/api/chats', { title: 'Chat 1' })).data.chat;
+    const c2 = (await alice.request<{ chat: { id: string; workspaceDir: string } }>('POST', '/api/chats', { title: 'Chat 2' })).data.chat;
+
+    const genDir = path.join(c1.workspaceDir, 'generated');
+    fs.mkdirSync(genDir, { recursive: true });
+    fs.writeFileSync(path.join(genDir, 'miffy.jpg'), 'img-bytes');
+
+    const wsRes1 = await alice.request<{ files: Array<{ relPath: string }> }>('GET', `/api/chats/${c1.id}/workspace`);
+    expect(wsRes1.data.files.map((f) => f.relPath)).toEqual(['generated/miffy.jpg']);
+
+    const wsRes2 = await alice.request<{ files: unknown[]; artifacts: unknown[] }>('GET', `/api/chats/${c2.id}/workspace`);
+    expect(wsRes2.data.files).toEqual([]);
+    expect(wsRes2.data.artifacts).toEqual([]);
+
+    alice.closeWs();
+  });
 });

@@ -610,6 +610,11 @@ export const App: React.FC = () => {
       skipNextLoadChatIdRef.current = null;
       return;
     }
+    setMessages([]);
+    setArtifacts([]);
+    setPendingPermissions([]);
+    setActiveRun(null);
+    setContextUsage(null);
     void loadChatDetail(activeChatId);
   }, [user?.id, activeChatId, loadChatDetail]);
 
@@ -1715,6 +1720,7 @@ export const App: React.FC = () => {
 
           {workspaceOpen && activeChat && (
             <WorkspaceDrawer
+              key={activeChat.id}
               chatId={activeChat.id}
               artifacts={artifacts}
               workspaceSyncToken={workspaceSyncToken}

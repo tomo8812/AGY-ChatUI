@@ -39,10 +39,10 @@ const INTERNAL_BRAIN_EXCLUDED_EXTENSIONS = new Set([
 ]);
 
 export function getAllowedBrainRoots(profileDir: string, workspaceDir?: string | null): string[] {
-  const roots: string[] = [];
   if (workspaceDir) {
-    roots.push(getChatBrainHostDir(profileDir, workspaceDir));
+    return [getChatBrainHostDir(profileDir, workspaceDir)];
   }
+  const roots: string[] = [];
   for (const rel of ALLOWED_BRAIN_ROOT_REL_PATHS) {
     roots.push(path.resolve(profileDir, rel));
   }
