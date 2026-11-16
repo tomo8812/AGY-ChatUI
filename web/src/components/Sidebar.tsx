@@ -1,7 +1,8 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import type { AgyProfile, ChatRecord, ProjectRecord, WebUser } from '../types';
 import {
   CloseIcon,
+  ComposeIcon,
   FolderIcon,
   PlusIcon,
   SearchIcon,
@@ -41,9 +42,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onOpenProjectModal,
   onOpenSettings,
 }) => {
+  const [searchOpen, setSearchOpen] = useState(false);
   const [search, setSearch] = useState('');
   const [editingChatId, setEditingChatId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState('');
+  const searchInputRef = useRef<HTMLInputElement>(null);
 
   const projectById = useMemo(() => {
     const map = new Map<string, ProjectRecord>();
@@ -83,6 +86,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
     if (clean) onRenameChat(chatId, clean);
   };
 
+  const toggleSearch = () => {
+    setSearchOpen((prev) => {
+      const next = !prev;
+      if (next) {
+        setTimeout(() => searchInputRef.current?.focus(), 20);
+      } else {
+        setSearch('');
+      }
+      return next;
+    });
+  };
+
+  const initials = user.displayName.trim().slice(0, 2).toUpperCase() || 'U';
+
   return (
     <>
       {openMobile && <div className="sidebar-backdrop" onClick={onCloseMobile} />}
@@ -94,36 +111,41 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <div className="row-actions">
             <button
               type="button"
-              className="btn btn-primary btn-xs"
-              onClick={() => {
-                onNewChat(null);
-                onCloseMobile();
-              }}
-              title="新しいチャットを開始"
+              className={`circle-icon-btn ${searchOpen ? 'active' : ''}`}
+              onClick={toggleSearch}
+              aria-label="履歴を検索"
+              title="履歴を検索"
             >
-              <PlusIcon size={15} />
-              <span>新規</span>
-            </button>
-            <button
-              type="button"
-              className="icon-btn mobile-only"
-              onClick={onCloseMobile}
-              aria-label="サイドバーを閉じる"
-            >
-              <CloseIcon size={18} />
+              <SearchIcon size={16} />
             </button>
           </div>
         </div>
 
-        <div className="sidebar-search">
-          <SearchIcon size={14} />
-          <input
-            type="search"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="チャット履歴を検索..."
-          />
-        </div>
+        {searchOpen && (
+          <div className="sidebar-search">
+            <SearchIcon size={14} />
+            <input
+              ref={searchInputRef}
+              type="search"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') toggleSearch();
+              }}
+              placeholder="チャット履歴を検索..."
+            />
+            {search && (
+              <button
+                type="button"
+                className="icon-btn-sm"
+                onClick={() => setSearch('')}
+                aria-label="検索をクリア"
+              >
+                <CloseIcon size={13} />
+              </button>
+            )}
+          </div>
+        )}
 
         <div className="sidebar-scroll">
           <div className="sidebar-section">
@@ -159,7 +181,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       }}
                       title={`"${p.name}" で新規チャットを開始`}
                     >
-                      <FolderIcon size={14} />
+                      <FolderIcon size={15} />
                       <span className="truncate">{p.name}</span>
                       {p.files.length > 0 && <span className="count-tag">{p.files.length}</span>}
                     </button>
@@ -276,18 +298,30 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </div>
 
         <div className="sidebar-footer">
-          <button type="button" className="user-pill-btn" onClick={onOpenSettings}>
-            <div className="user-avatar">{user.displayName.slice(0, 1).toUpperCase()}</div>
-            <div className="user-meta">
-              <div className="user-name truncate">{user.displayName}</div>
-              <div className="muted-xs truncate">
-                <span
-                  className={`status-dot ${agyProfile?.authStatus === 'authenticated' ? 'ok' : 'warn'}`}
-                />
-                {agyProfile?.accountLabel || 'Antigravity連携済'}
-              </div>
-            </div>
-            <SettingsIcon size={16} />
+          <button
+            type="button"
+            className="sidebar-new-chat-pill"
+            onClick={() => {
+              onNewChat(null);
+              onCloseMobile();
+            }}
+          >
+            <ComposeIcon size={17} />
+            <span>チャット</span>
+          </button>
+
+          <button
+            type="button"
+            className="sidebar-avatar-btn"
+            onClick={onOpenSettings}
+            aria-label="設定を開く"
+            title={`${user.displayName}（${agyProfile?.accountLabel || '設定'}）`}
+          >
+            <span>{initials}</span>
+            <span
+              className={`avatar-status-badge ${agyProfile?.authStatus === 'authenticated' ? 'ok' : 'warn'}`}
+              aria-hidden="true"
+            />
           </button>
         </div>
       </aside>

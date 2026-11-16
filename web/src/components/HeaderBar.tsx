@@ -6,7 +6,7 @@ import type {
   QuotaBucket,
   QuotaSnapshotRecord,
 } from '../types';
-import { FolderIcon, GaugeIcon, MenuIcon } from './Icons';
+import { ComposeIcon, FolderIcon, GaugeIcon, MenuIcon } from './Icons';
 import { QuotaPopover } from './QuotaPopover';
 
 interface HeaderBarProps {
@@ -20,6 +20,7 @@ interface HeaderBarProps {
   workspaceCount: number;
   workspaceOpen: boolean;
   onOpenSidebar: () => void;
+  onNewChat: () => void;
   onRefreshQuota: () => void;
   onToggleWorkspace: () => void;
 }
@@ -60,6 +61,7 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
   workspaceCount,
   workspaceOpen,
   onOpenSidebar,
+  onNewChat,
   onRefreshQuota,
   onToggleWorkspace,
 }) => {
@@ -80,28 +82,22 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
       <div className="header-left">
         <button
           type="button"
-          className="icon-btn mobile-only"
+          className="circle-icon-btn mobile-only"
           onClick={onOpenSidebar}
           aria-label="メニューを開く"
         >
-          <MenuIcon size={20} />
+          <MenuIcon size={18} />
         </button>
 
-        <div className="header-title-fallback truncate">
-          {activeChat ? activeChat.title : 'Antigravity Chat'}
+        <div className="header-title-fallback truncate hide-xs">
+          {activeChat ? activeChat.title : 'Antigravity'}
         </div>
       </div>
 
-      <div className="header-right">
+      <div className="header-center">
         {wsStatus !== 'connected' && (
           <span className="sync-badge warn" title="リアルタイム同期再接続中">
-            {wsStatus === 'reconnecting' ? '同期再接続中...' : '接続中...'}
-          </span>
-        )}
-
-        {contextUsage && contextUsage.size > 0 && (
-          <span className="context-pill hide-xs" title="現在の会話コンテキスト使用量">
-            {Math.round((contextUsage.used / contextUsage.size) * 100)}% ctx
+            {wsStatus === 'reconnecting' ? '再接続中...' : '接続中...'}
           </span>
         )}
 
@@ -134,6 +130,14 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
             />
           )}
         </div>
+      </div>
+
+      <div className="header-right">
+        {contextUsage && contextUsage.size > 0 && (
+          <span className="context-pill hide-xs" title="現在の会話コンテキスト使用量">
+            {Math.round((contextUsage.used / contextUsage.size) * 100)}% ctx
+          </span>
+        )}
 
         {activeChat && (
           <button
@@ -147,6 +151,16 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
             {workspaceCount > 0 && <span className="count-tag">{workspaceCount}</span>}
           </button>
         )}
+
+        <button
+          type="button"
+          className="circle-icon-btn"
+          onClick={onNewChat}
+          aria-label="新しいチャット"
+          title="新しいチャットを開始"
+        >
+          <ComposeIcon size={17} />
+        </button>
       </div>
     </header>
   );

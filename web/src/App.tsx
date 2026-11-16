@@ -47,7 +47,7 @@ function applyThemeToDocument(theme: 'system' | 'light' | 'dark'): void {
   document.documentElement.dataset.theme = effective;
   const metaTheme = document.querySelector('meta[name="theme-color"]');
   if (metaTheme) {
-    metaTheme.setAttribute('content', effective === 'dark' ? '#212121' : '#ffffff');
+    metaTheme.setAttribute('content', effective === 'dark' ? '#000000' : '#ffffff');
   }
 }
 
@@ -1048,6 +1048,7 @@ export const App: React.FC = () => {
           workspaceCount={artifacts.length}
           workspaceOpen={workspaceOpen}
           onOpenSidebar={() => setSidebarMobileOpen(true)}
+          onNewChat={() => void handleCreateChat(null)}
           onRefreshQuota={() => void triggerQuotaRefresh(false)}
           onToggleWorkspace={() => setWorkspaceOpen((o) => !o)}
         />

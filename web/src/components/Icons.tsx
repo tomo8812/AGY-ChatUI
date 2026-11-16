@@ -12,10 +12,24 @@ export const PlusIcon: React.FC<IconProps> = ({ size = 18, className }) => (
 );
 
 export const MenuIcon: React.FC<IconProps> = ({ size = 20, className }) => (
-  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
-    <line x1="3" y1="6" x2="21" y2="6" />
-    <line x1="3" y1="12" x2="21" y2="12" />
-    <line x1="3" y1="18" x2="21" y2="18" />
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" className={className}>
+    <line x1="4" y1="9" x2="20" y2="9" />
+    <line x1="4" y1="15" x2="14" y2="15" />
+  </svg>
+);
+
+export const ComposeIcon: React.FC<IconProps> = ({ size = 18, className }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" className={className}>
+    <path d="M12 3H6a3 3 0 00-3 3v12a3 3 0 003 3h12a3 3 0 003-3v-6" />
+    <path d="M18.375 2.625a2.121 2.121 0 113 3L12 15l-4 1 1-4 9.375-9.375z" />
+  </svg>
+);
+
+export const EffortDialIcon: React.FC<IconProps> = ({ size = 18, className }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" className={className}>
+    <path d="M5.636 18.364a9 9 0 1112.728 0" />
+    <path d="M12 13L8.8 8.8" />
+    <circle cx="12" cy="13.2" r="1.4" fill="currentColor" stroke="none" />
   </svg>
 );
 

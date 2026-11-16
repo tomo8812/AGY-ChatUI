@@ -19,7 +19,7 @@ import {
   CopyIcon,
   FileIcon,
   FolderIcon,
-  PaperclipIcon,
+  PlusIcon,
   RefreshIcon,
   SendIcon,
   ShieldIcon,
@@ -412,12 +412,16 @@ export const ChatView: React.FC<ChatViewProps> = ({
         <div className="messages-rail">
           {messages.length === 0 ? (
             <div className="welcome-empty">
-              <h2>{project ? project.name : 'お手伝いできることはありますか？'}</h2>
-              {project && (project.description || project.files.length > 0) && (
-                <p className="muted-sm">
-                  {project.description || `共有資料 (${project.files.length}件) が参照可能です。`}
-                </p>
-              )}
+              {project ? (
+                <>
+                  <h2>{project.name}</h2>
+                  {(project.description || project.files.length > 0) && (
+                    <p className="muted-sm">
+                      {project.description || `共有資料 (${project.files.length}件) が参照可能です。`}
+                    </p>
+                  )}
+                </>
+              ) : null}
             </div>
           ) : (
             messages.map((msg) => {
@@ -592,7 +596,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
               onChange={(e) => setInputText(e.target.value)}
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
-              placeholder={uploading ? 'ファイルをアップロード中...' : 'メッセージを入力...'}
+              placeholder={uploading ? 'ファイルをアップロード中...' : 'Antigravity に聞く'}
               disabled={uploading}
             />
 
@@ -604,8 +608,9 @@ export const ChatView: React.FC<ChatViewProps> = ({
                   onClick={() => fileInputRef.current?.click()}
                   disabled={uploading}
                   title="ファイルを添付（複数・画像ペースト・ドロップ対応）"
+                  aria-label="ファイルを添付"
                 >
-                  <PaperclipIcon size={18} />
+                  <PlusIcon size={19} />
                 </button>
 
                 {modelOption && modelOption.options.length > 0 && (
@@ -624,7 +629,9 @@ export const ChatView: React.FC<ChatViewProps> = ({
                     ))}
                   </select>
                 )}
+              </div>
 
+              <div className="composer-toolbar-right">
                 {effortOption && effortOption.options.length > 0 && (
                   <EffortBar
                     options={effortOption.options}
@@ -633,9 +640,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
                     onChange={onChangeEffort}
                   />
                 )}
-              </div>
 
-              <div className="composer-toolbar-right">
                 {isRunBusy && activeRun && (
                   <button
                     type="button"
