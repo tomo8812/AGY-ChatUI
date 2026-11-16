@@ -75,26 +75,28 @@ try_prebuilt_release_update() {
   gh_repo="$(infer_github_repo || true)"
   token="${GITHUB_READ_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
 
-  if [[ -z "${gh_repo}" ]] || [[ -z "${token}" ]]; then
+  if [[ -z "${gh_repo}" ]]; then
     return 1
   fi
 
   tmp_dir="$(mktemp -d /tmp/acy-release-XXXXXX)"
   trap 'rm -rf "${tmp_dir}"' RETURN
 
-  local release_json="${tmp_dir}/release.json"
-  if ! curl -fsSL \
-    -H "Authorization: Bearer ${token}" \
-    -H "Accept: application/vnd.github+json" \
-    -H "X-GitHub-Api-Version: 2022-11-28" \
-    "https://api.github.com/repos/${gh_repo}/releases/tags/${RELEASE_TAG}" \
-    -o "${release_json}"; then
-    echo "[auto-update] Release lookup failed; falling back if possible."
-    return 1
-  fi
+  local info_url="" bundle_url="" sha_url=""
+  if [[ -n "${token}" ]]; then
+    local release_json="${tmp_dir}/release.json"
+    if ! curl -fsSL \
+      -H "Authorization: Bearer ${token}" \
+      -H "Accept: application/vnd.github+json" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      "https://api.github.com/repos/${gh_repo}/releases/tags/${RELEASE_TAG}" \
+      -o "${release_json}"; then
+      echo "[auto-update] Authenticated release lookup failed; falling back if possible."
+      return 1
+    fi
 
-  local urls
-  urls="$(python3 -c '
+    local urls
+    urls="$(python3 -c '
 import json, sys
 data = json.load(open(sys.argv[1]))
 assets = {a["name"]: a["url"] for a in data.get("assets", [])}
@@ -102,23 +104,33 @@ for name in ("BUILD_INFO.json", "antigravity-chat-bundle.tar.gz", "antigravity-c
     print(assets.get(name, ""))
 ' "${release_json}")"
 
-  local info_url bundle_url sha_url
-  info_url="$(printf '%s\n' "${urls}" | sed -n '1p')"
-  bundle_url="$(printf '%s\n' "${urls}" | sed -n '2p')"
-  sha_url="$(printf '%s\n' "${urls}" | sed -n '3p')"
+    info_url="$(printf '%s\n' "${urls}" | sed -n '1p')"
+    bundle_url="$(printf '%s\n' "${urls}" | sed -n '2p')"
+    sha_url="$(printf '%s\n' "${urls}" | sed -n '3p')"
 
-  if [[ -z "${info_url}" ]] || [[ -z "${bundle_url}" ]] || [[ -z "${sha_url}" ]]; then
-    echo "[auto-update] Prebuilt release assets incomplete; falling back."
-    return 1
+    if [[ -z "${info_url}" ]] || [[ -z "${bundle_url}" ]] || [[ -z "${sha_url}" ]]; then
+      echo "[auto-update] Prebuilt release assets incomplete; falling back."
+      return 1
+    fi
+
+    curl -fsSL \
+      -H "Authorization: Bearer ${token}" \
+      -H "Accept: application/octet-stream" \
+      "${info_url}" -o "${tmp_dir}/BUILD_INFO.json" || return 1
+  else
+    # Public repo fast path (uses GitHub Release CDN directly, no API rate limit or PAT needed)
+    local base_dl="https://github.com/${gh_repo}/releases/download/${RELEASE_TAG}"
+    info_url="${base_dl}/BUILD_INFO.json"
+    bundle_url="${base_dl}/antigravity-chat-bundle.tar.gz"
+    sha_url="${base_dl}/antigravity-chat-bundle.tar.gz.sha256"
+
+    if ! curl -fsSL "${info_url}" -o "${tmp_dir}/BUILD_INFO.json" 2>/dev/null; then
+      return 1
+    fi
   fi
 
-  curl -fsSL \
-    -H "Authorization: Bearer ${token}" \
-    -H "Accept: application/octet-stream" \
-    "${info_url}" -o "${tmp_dir}/BUILD_INFO.json"
-
   local remote_sha local_sha=""
-  remote_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("commitSha",""))' "${tmp_dir}/BUILD_INFO.json")"
+  remote_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("commitSha",""))' "${tmp_dir}/BUILD_INFO.json" 2>/dev/null || true)"
   if [[ -f "${APP_DIR}/BUILD_INFO.json" ]]; then
     local_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("commitSha",""))' "${APP_DIR}/BUILD_INFO.json" 2>/dev/null || true)"
   elif [[ -d "${APP_DIR}/.git" ]]; then
@@ -134,14 +146,19 @@ for name in ("BUILD_INFO.json", "antigravity-chat-bundle.tar.gz", "antigravity-c
 
   echo "[auto-update] Prebuilt Actions bundle update detected: ${local_sha:0:8} -> ${remote_sha:0:8}"
 
-  curl -fsSL \
-    -H "Authorization: Bearer ${token}" \
-    -H "Accept: application/octet-stream" \
-    "${sha_url}" -o "${tmp_dir}/antigravity-chat-bundle.tar.gz.sha256"
-  curl -fsSL \
-    -H "Authorization: Bearer ${token}" \
-    -H "Accept: application/octet-stream" \
-    "${bundle_url}" -o "${tmp_dir}/antigravity-chat-bundle.tar.gz"
+  if [[ -n "${token}" ]]; then
+    curl -fsSL \
+      -H "Authorization: Bearer ${token}" \
+      -H "Accept: application/octet-stream" \
+      "${sha_url}" -o "${tmp_dir}/antigravity-chat-bundle.tar.gz.sha256"
+    curl -fsSL \
+      -H "Authorization: Bearer ${token}" \
+      -H "Accept: application/octet-stream" \
+      "${bundle_url}" -o "${tmp_dir}/antigravity-chat-bundle.tar.gz"
+  else
+    curl -fsSL "${sha_url}" -o "${tmp_dir}/antigravity-chat-bundle.tar.gz.sha256"
+    curl -fsSL "${bundle_url}" -o "${tmp_dir}/antigravity-chat-bundle.tar.gz"
+  fi
 
   local apply_flags=()
   if [[ -d "${APP_DIR}/.git" ]]; then

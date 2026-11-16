@@ -80,9 +80,9 @@ fi
 
 echo "==> [6/6] Final notes for Oracle Always Free Ubuntu + GitHub Actions + Tailscale:"
 echo "Option A (Recommended, zero VM build): Deploy prebuilt bundle via GitHub Actions:"
-echo "  - Enable GitHub Actions Tailscale Push (ENABLE_TAILSCALE_DEPLOY=true) OR set"
-echo "    GITHUB_READ_TOKEN=<fine-grained Contents:Read PAT> in /etc/antigravity-chat/env"
-echo "    so antigravity-chat-updater.timer downloads the prebuilt CI release bundle."
+echo "  - Enable antigravity-chat-updater.timer (public repos download Release 'latest' with zero config;"
+echo "    for private repos add GITHUB_READ_TOKEN=<Contents:Read PAT> to /etc/antigravity-chat/env),"
+echo "    OR enable GitHub Actions Tailscale Push (ENABLE_TAILSCALE_DEPLOY=true)."
 echo "Option B (Local build fallback): Clone & build in ${APP_DIR}: npm ci && npm run build"
 echo ""
 echo "Install systemd units:"

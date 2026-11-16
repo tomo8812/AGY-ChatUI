@@ -20,7 +20,7 @@ Google の公式 CLI（[`agy`](https://antigravity.google)）を **無改変の�
   - **GitHub Actions**（[`.github/workflows/ci-deploy.yml`](.github/workflows/ci-deploy.yml)）が `typecheck`・`npm test`・`npm run build` を実行し、純粋 JS サーバー実行依存のみ（約 41 MB・ネイティブバイナリ無し・ARM64/x64 共通）のバンドル `antigravity-chat-bundle.tar.gz` を作成して GitHub Release `latest` に公開します。Oracle 側 2 コア VM で重い Vite/TypeScript ビルドを走らせる必要がありません。
   - **デプロイ方式（どちらも可）**:
     1. **Tailscale 経由の即時プッシュデプロイ（最速）**: GitHub Secrets / Variables に Tailscale OAuth と SSH 情報を設定すると、`main` への push 完了直後に GitHub Actions から Tailscale 越しに自動デプロイ・再起動します。
-    2. **サーバー側自動更新タイマー（ポーリング）**: `deploy/antigravity-chat-updater.timer` が 3 分ごとに更新を確認します。`/etc/antigravity-chat/env` に `GITHUB_READ_TOKEN` を設定しておけば GitHub Actions ビルド済みバンドルを数秒で展開して再起動します（未設定時は `git pull --ff-only` + ローカルビルドにフォールバック）。
+    2. **サーバー側自動更新タイマー（ポーリング）**: `deploy/antigravity-chat-updater.timer` が 3 分ごとに更新を確認し、GitHub Actions ビルド済みバンドルを数秒で展開して再起動します（公開リポジトリはトークン不要。非公開リポジトリの場合のみ `/etc/antigravity-chat/env` に `GITHUB_READ_TOKEN` を設定、未設定時は `git pull --ff-only` + ローカルビルドにフォールバック）。
   - **クライアント / PWA**: `buildId` 不一致（`/api/health`・`/api/auth/bootstrap`・WebSocket `hello`・`BUILD_INFO.json` ハッシュ連動）および Service Worker 更新を検知すると、入力中・応答生成中・認証入力中でないタイミングで自動リロードします（作業中は通知バナー表示）。
 - **プロジェクト（共有カスタム指示 ＆ 資料）**
   - プロジェクト配下のチャット作成時に資料を `.project-context/` へ Copy-on-Write で複製するため、チャット内の編集で原紙や別チャットが汚染されません。
@@ -78,10 +78,13 @@ sudo tailscale serve --bg http://127.0.0.1:3000
     - Variable (任意): `TS_CI_TAGS` = `tag:ci`（Tailscale ACL で許可したタグ）
     - Secrets: `TS_OAUTH_CLIENT_ID`, `TS_OAUTH_SECRET`（Tailscale OAuth Client）, `DEPLOY_HOST`（VMの Tailscale IP 例 `100.x.y.z`）, `DEPLOY_SSH_KEY`（秘密鍵・Tailscale SSH 使用時は空でも可）
 - **パターン2: サーバー側タイマーで Actions ビルド済み Release を自動取得（Tailscale ACL 設定不要）**
-  - GitHub の Fine-grained PAT（対象リポジトリ `Contents: Read` のみ）を `/etc/antigravity-chat/env` に1行追記し、タイマーを有効化します:
+  - タイマーを有効化します（公開リポジトリならこれだけで事前ビルド済み Release を自動適用します）:
+    ```bash
+    sudo systemctl enable --now antigravity-chat-updater.timer
+    ```
+  - 非公開（Private）リポジトリの場合は、GitHub の Fine-grained PAT（対象リポジトリ `Contents: Read` のみ）も `/etc/antigravity-chat/env` に追記してください:
     ```bash
     echo 'GITHUB_READ_TOKEN=github_pat_xxxx' | sudo tee -a /etc/antigravity-chat/env >/dev/null
-    sudo systemctl enable --now antigravity-chat-updater.timer
     ```
 
 ## 開発サーバー（モックモード / 実機モード）
