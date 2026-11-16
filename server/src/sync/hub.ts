@@ -13,7 +13,10 @@ interface SocketRegistration {
 export class SyncHub {
   private readonly connections = new Map<string, Set<SocketRegistration>>();
 
-  constructor(private readonly db: AppDatabase) {}
+  constructor(
+    private readonly db: AppDatabase,
+    private readonly buildId = 'dev'
+  ) {}
 
   registerConnection(params: {
     userId: string;
@@ -56,6 +59,7 @@ export class SyncHub {
       kind: 'hello',
       userId: reg.userId,
       clientId: reg.clientId,
+      buildId: this.buildId,
       latestSeq,
       resyncRequired: truncated,
       events: truncated ? [] : events,

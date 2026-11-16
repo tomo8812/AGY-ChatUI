@@ -14,3 +14,6 @@ data/
 coverage/
 __pycache__/
 *.pyc
+BUILD_INFO.json
+.bundle-lock-sha256
+antigravity-chat-bundle.tar.gz*

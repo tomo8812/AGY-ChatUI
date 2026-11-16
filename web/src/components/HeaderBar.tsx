@@ -3,7 +3,7 @@ import type { WsConnectionStatus } from '../api/ws';
 import type {
   AgyProfile,
   ChatRecord,
-  ParsedSessionOptions,
+  QuotaBucket,
   QuotaSnapshotRecord,
 } from '../types';
 import { FolderIcon, GaugeIcon, MenuIcon } from './Icons';
@@ -11,7 +11,7 @@ import { QuotaPopover } from './QuotaPopover';
 
 interface HeaderBarProps {
   activeChat: ChatRecord | null;
-  sessionOptions: ParsedSessionOptions | null;
+  selectedModelId: string;
   agyProfile: AgyProfile | null;
   quota: QuotaSnapshotRecord | null;
   quotaRefreshing: boolean;
@@ -20,15 +20,38 @@ interface HeaderBarProps {
   workspaceCount: number;
   workspaceOpen: boolean;
   onOpenSidebar: () => void;
-  onChangeModel: (modelId: string) => void;
-  onChangeEffort: (effortValue: string) => void;
   onRefreshQuota: () => void;
   onToggleWorkspace: () => void;
 }
 
+function pickSummaryBucket(quota: QuotaSnapshotRecord | null, modelId: string): QuotaBucket | null {
+  if (!quota || quota.status !== 'ok' || quota.buckets.length === 0) return null;
+
+  const lowerModel = modelId.toLowerCase();
+  const candidates = quota.buckets.filter((b) => {
+    const label = `${b.group ?? ''} ${b.model}`.toLowerCase();
+    if (lowerModel.includes('argon')) return label.includes('argon');
+    if (lowerModel.includes('claude') || lowerModel.includes('gpt') || lowerModel.includes('openai')) {
+      return label.includes('claude') || label.includes('gpt');
+    }
+    if (lowerModel.includes('gemini')) {
+      return label.includes('gemini') && !label.includes('argon');
+    }
+    return false;
+  });
+
+  const pool = candidates.length > 0 ? candidates : quota.buckets;
+  return pool.reduce<QuotaBucket | null>((best, cur) => {
+    if (!best) return cur;
+    const bestPct = best.remainingPercent ?? 101;
+    const curPct = cur.remainingPercent ?? 101;
+    return curPct < bestPct ? cur : best;
+  }, null);
+}
+
 export const HeaderBar: React.FC<HeaderBarProps> = ({
   activeChat,
-  sessionOptions,
+  selectedModelId,
   agyProfile,
   quota,
   quotaRefreshing,
@@ -37,29 +60,13 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
   workspaceCount,
   workspaceOpen,
   onOpenSidebar,
-  onChangeModel,
-  onChangeEffort,
   onRefreshQuota,
   onToggleWorkspace,
 }) => {
   const [quotaOpen, setQuotaOpen] = useState(false);
 
-  const modelOption = sessionOptions?.configOptions.find(
-    (c) => c.id === sessionOptions.modelOptionId
-  );
-  const effortOption = sessionOptions?.configOptions.find(
-    (c) => c.id === sessionOptions.effortOptionId
-  );
-
-  const currentModelValue =
-    activeChat?.modelId || modelOption?.currentValue || modelOption?.options[0]?.value || '';
-  const currentEffortValue =
-    activeChat?.effortValue || effortOption?.currentValue || effortOption?.options[0]?.value || '';
-
-  const primaryBucket =
-    quota?.status === 'ok' && quota.buckets.length > 0
-      ? quota.buckets.find((b) => currentModelValue && b.model.includes(currentModelValue)) ?? quota.buckets[0]
-      : null;
+  const primaryBucket = pickSummaryBucket(quota, selectedModelId);
+  const primaryPct = primaryBucket?.remainingPercent ?? null;
 
   const quotaPillText =
     quota?.status === 'ok'
@@ -80,41 +87,9 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
           <MenuIcon size={20} />
         </button>
 
-        {activeChat && modelOption && modelOption.options.length > 0 ? (
-          <div className="model-controls">
-            <select
-              aria-label="モデル選択"
-              className="header-select"
-              value={currentModelValue}
-              onChange={(e) => onChangeModel(e.target.value)}
-            >
-              {modelOption.options.map((opt) => (
-                <option key={opt.value} value={opt.value}>
-                  {opt.name}
-                </option>
-              ))}
-            </select>
-
-            {effortOption && effortOption.options.length > 0 && (
-              <select
-                aria-label="推論レベル (Effort)"
-                className="header-select effort-select"
-                value={currentEffortValue}
-                onChange={(e) => onChangeEffort(e.target.value)}
-              >
-                {effortOption.options.map((opt) => (
-                  <option key={opt.value} value={opt.value}>
-                    {opt.name}
-                  </option>
-                ))}
-              </select>
-            )}
-          </div>
-        ) : (
-          <div className="header-title-fallback">
-            {activeChat ? activeChat.title : 'Antigravity Chat'}
-          </div>
-        )}
+        <div className="header-title-fallback truncate">
+          {activeChat ? activeChat.title : 'Antigravity Chat'}
+        </div>
       </div>
 
       <div className="header-right">
@@ -139,6 +114,14 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
           >
             <GaugeIcon size={14} />
             <span>{quotaPillText}</span>
+            {primaryPct !== null && (
+              <span className="pill-mini-bar" aria-hidden="true">
+                <span
+                  className={`pill-mini-fill ${primaryPct <= 15 ? 'low' : primaryPct <= 40 ? 'mid' : 'high'}`}
+                  style={{ width: `${Math.max(0, Math.min(100, primaryPct))}%` }}
+                />
+              </span>
+            )}
           </button>
 
           {quotaOpen && (

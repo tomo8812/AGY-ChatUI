@@ -14,6 +14,7 @@ import type {
   PreviewKind,
   ProjectFileRecord,
   ProjectRecord,
+  PushSubscriptionRecord,
   QuotaBucket,
   QuotaSnapshotRecord,
   RunRecord,
@@ -83,10 +84,29 @@ export class AppDatabase {
         user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
         theme TEXT NOT NULL DEFAULT 'system',
         auto_approve_safe_reads INTEGER NOT NULL DEFAULT 0,
+        notify_on_response INTEGER NOT NULL DEFAULT 0,
         default_model_id TEXT,
         default_effort_value TEXT,
         updated_at INTEGER NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS app_kv (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        endpoint TEXT NOT NULL UNIQUE,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        user_agent TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_push_subs_user ON push_subscriptions(user_id);
 
       CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
@@ -226,6 +246,12 @@ export class AppDatabase {
       );
       CREATE INDEX IF NOT EXISTS idx_sync_events_user_seq ON sync_events(user_id, seq);
     `);
+
+    // Safe additive column migrations for existing databases
+    const prefCols = this.db.prepare('PRAGMA table_info(user_preferences)').all() as Array<{ name: string }>;
+    if (!prefCols.some((col) => col.name === 'notify_on_response')) {
+      this.db.exec('ALTER TABLE user_preferences ADD COLUMN notify_on_response INTEGER NOT NULL DEFAULT 0;');
+    }
   }
 
   recoverInterruptedRuns(): void {
@@ -300,8 +326,8 @@ export class AppDatabase {
 
       this.db
         .prepare(
-          `INSERT INTO user_preferences (user_id, theme, auto_approve_safe_reads, updated_at)
-           VALUES (?, 'system', 0, ?)`
+          `INSERT INTO user_preferences (user_id, theme, auto_approve_safe_reads, notify_on_response, updated_at)
+           VALUES (?, 'system', 0, 0, ?)`
         )
         .run(params.id, now);
       this.db.exec('COMMIT;');
@@ -471,7 +497,7 @@ export class AppDatabase {
   getPreferences(userId: string): UserPreferences {
     const row = this.db
       .prepare(
-        `SELECT user_id, theme, auto_approve_safe_reads, default_model_id, default_effort_value, updated_at
+        `SELECT user_id, theme, auto_approve_safe_reads, notify_on_response, default_model_id, default_effort_value, updated_at
          FROM user_preferences WHERE user_id = ?`
       )
       .get(userId) as Record<string, unknown> | undefined;
@@ -481,6 +507,7 @@ export class AppDatabase {
         userId,
         theme: 'system',
         autoApproveSafeReads: false,
+        notifyOnResponse: false,
         defaultModelId: null,
         defaultEffortValue: null,
         updatedAt: now,
@@ -490,6 +517,7 @@ export class AppDatabase {
       userId: String(row.user_id),
       theme: row.theme as 'system' | 'light' | 'dark',
       autoApproveSafeReads: Number(row.auto_approve_safe_reads) === 1,
+      notifyOnResponse: Number(row.notify_on_response) === 1,
       defaultModelId: row.default_model_id ? String(row.default_model_id) : null,
       defaultEffortValue: row.default_effort_value ? String(row.default_effort_value) : null,
       updatedAt: Number(row.updated_at),
@@ -498,17 +526,18 @@ export class AppDatabase {
 
   updatePreferences(
     userId: string,
-    patch: Partial<Pick<UserPreferences, 'theme' | 'autoApproveSafeReads' | 'defaultModelId' | 'defaultEffortValue'>>
+    patch: Partial<Pick<UserPreferences, 'theme' | 'autoApproveSafeReads' | 'notifyOnResponse' | 'defaultModelId' | 'defaultEffortValue'>>
   ): UserPreferences {
     const cur = this.getPreferences(userId);
     const now = Date.now();
     this.db
       .prepare(
-        `INSERT INTO user_preferences (user_id, theme, auto_approve_safe_reads, default_model_id, default_effort_value, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO user_preferences (user_id, theme, auto_approve_safe_reads, notify_on_response, default_model_id, default_effort_value, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_id) DO UPDATE SET
            theme = excluded.theme,
            auto_approve_safe_reads = excluded.auto_approve_safe_reads,
+           notify_on_response = excluded.notify_on_response,
            default_model_id = excluded.default_model_id,
            default_effort_value = excluded.default_effort_value,
            updated_at = excluded.updated_at`
@@ -517,6 +546,7 @@ export class AppDatabase {
         userId,
         patch.theme ?? cur.theme,
         (patch.autoApproveSafeReads ?? cur.autoApproveSafeReads) ? 1 : 0,
+        (patch.notifyOnResponse ?? cur.notifyOnResponse) ? 1 : 0,
         patch.defaultModelId !== undefined ? patch.defaultModelId : cur.defaultModelId,
         patch.defaultEffortValue !== undefined ? patch.defaultEffortValue : cur.defaultEffortValue,
         now
@@ -1283,6 +1313,112 @@ export class AppDatabase {
         snap.fetchedAt
       );
     return snap;
+  }
+
+  // ---- App Key-Value Metadata (e.g. persisted VAPID keypair) ----
+
+  getAppValue(key: string): string | null {
+    const row = this.db.prepare('SELECT value FROM app_kv WHERE key = ?').get(key) as { value: string } | undefined;
+    return row ? String(row.value) : null;
+  }
+
+  setAppValue(key: string, value: string): void {
+    const now = Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO app_kv (key, value, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET
+           value = excluded.value,
+           updated_at = excluded.updated_at`
+      )
+      .run(key, value, now);
+  }
+
+  // ---- Push Subscriptions ----
+
+  upsertPushSubscription(params: {
+    id: string;
+    userId: string;
+    endpoint: string;
+    p256dh: string;
+    auth: string;
+    userAgent: string;
+  }): PushSubscriptionRecord {
+    const now = Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO push_subscriptions (id, user_id, endpoint, p256dh, auth, user_agent, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(endpoint) DO UPDATE SET
+           user_id = excluded.user_id,
+           p256dh = excluded.p256dh,
+           auth = excluded.auth,
+           user_agent = excluded.user_agent,
+           updated_at = excluded.updated_at`
+      )
+      .run(
+        params.id,
+        params.userId,
+        params.endpoint,
+        params.p256dh,
+        params.auth,
+        params.userAgent,
+        now,
+        now
+      );
+
+    const row = this.db
+      .prepare('SELECT * FROM push_subscriptions WHERE endpoint = ? AND user_id = ?')
+      .get(params.endpoint, params.userId) as Record<string, unknown>;
+    return {
+      id: String(row.id),
+      userId: String(row.user_id),
+      endpoint: String(row.endpoint),
+      p256dh: String(row.p256dh),
+      auth: String(row.auth),
+      userAgent: String(row.user_agent),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    };
+  }
+
+  listPushSubscriptions(userId: string): PushSubscriptionRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM push_subscriptions WHERE user_id = ? ORDER BY updated_at DESC')
+      .all(userId) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      id: String(row.id),
+      userId: String(row.user_id),
+      endpoint: String(row.endpoint),
+      p256dh: String(row.p256dh),
+      auth: String(row.auth),
+      userAgent: String(row.user_agent),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    }));
+  }
+
+  countPushSubscriptions(userId: string): number {
+    const row = this.db
+      .prepare('SELECT COUNT(*) AS cnt FROM push_subscriptions WHERE user_id = ?')
+      .get(userId) as { cnt: number };
+    return Number(row.cnt);
+  }
+
+  deletePushSubscriptionByEndpoint(userId: string, endpoint: string): boolean {
+    const info = this.db
+      .prepare('DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint = ?')
+      .run(userId, endpoint);
+    return Number(info.changes) > 0;
+  }
+
+  deletePushSubscriptionById(id: string): void {
+    this.db.prepare('DELETE FROM push_subscriptions WHERE id = ?').run(id);
+  }
+
+  deleteAllPushSubscriptionsForUser(userId: string): void {
+    this.db.prepare('DELETE FROM push_subscriptions WHERE user_id = ?').run(userId);
   }
 
   // ---- Sync Events ----

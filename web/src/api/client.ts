@@ -109,7 +109,14 @@ export const api = {
 
   logoutAll: () => apiFetch<{ ok: boolean }>('/api/auth/logout-all', { method: 'POST' }),
 
-  updatePreferences: (patch: Partial<Pick<UserPreferences, 'theme' | 'autoApproveSafeReads' | 'defaultModelId' | 'defaultEffortValue'>>) =>
+  updatePreferences: (
+    patch: Partial<
+      Pick<
+        UserPreferences,
+        'theme' | 'autoApproveSafeReads' | 'notifyOnResponse' | 'defaultModelId' | 'defaultEffortValue'
+      >
+    >
+  ) =>
     apiFetch<{ preferences: UserPreferences }>('/api/preferences', { method: 'PATCH', body: patch }),
 
   // Antigravity account binding
@@ -250,8 +257,48 @@ export const api = {
       { method: 'POST', body: { projectId } }
     ),
 
+  // Health & version detection
+  getHealth: () =>
+    apiFetch<{ ok: boolean; agyMode: 'real' | 'mock'; buildId?: string; uptimeSec: number }>('/api/health'),
+
+  // Pre-chat model & effort options
+  getAgyOptions: (modelId?: string | null) => {
+    const qs = modelId ? `?modelId=${encodeURIComponent(modelId)}` : '';
+    return apiFetch<{ sessionOptions: ParsedSessionOptions | null }>(`/api/agy/options${qs}`);
+  },
+
   // Quota
   getQuota: () => apiFetch<{ quota: QuotaSnapshotRecord }>('/api/quota'),
 
-  refreshQuota: () => apiFetch<{ quota: QuotaSnapshotRecord }>('/api/quota/refresh', { method: 'POST' }),
+  refreshQuota: (auto = false) =>
+    apiFetch<{ quota: QuotaSnapshotRecord }>('/api/quota/refresh', {
+      method: 'POST',
+      body: auto ? { auto: true } : {},
+    }),
+
+  // Web Push Notifications
+  getNotificationConfig: () =>
+    apiFetch<{ vapidPublicKey: string; subscriptionCount: number }>('/api/notifications/config'),
+
+  subscribePush: (payload: {
+    endpoint: string;
+    keys: { p256dh: string; auth: string };
+    userAgent?: string;
+  }) =>
+    apiFetch<{ ok: boolean; subscriptionCount: number }>('/api/notifications/subscribe', {
+      method: 'POST',
+      body: payload,
+    }),
+
+  unsubscribePush: (endpoint: string) =>
+    apiFetch<{ ok: boolean; removed: boolean; subscriptionCount: number }>('/api/notifications/unsubscribe', {
+      method: 'POST',
+      body: { endpoint },
+    }),
+
+  sendTestPush: () =>
+    apiFetch<{ sent: number; failed: number; removed: number; total: number; lastError?: string }>(
+      '/api/notifications/test',
+      { method: 'POST', body: {} }
+    ),
 };

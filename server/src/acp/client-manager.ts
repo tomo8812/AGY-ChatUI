@@ -1,6 +1,7 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import path from 'node:path';
 import readline from 'node:readline';
 import { Readable, Writable } from 'node:stream';
 import {
@@ -132,6 +133,8 @@ interface WorkerInstance {
 export class AcpClientManager {
   private readonly workers = new Map<string, WorkerInstance>();
   private readonly connecting = new Map<string, Promise<WorkerInstance>>();
+  private readonly userOptionsCache = new Map<string, { options: ParsedSessionOptions; cachedAt: number }>();
+  private readonly userOptionProbes = new Map<string, Promise<ParsedSessionOptions | null>>();
   private readonly cleanupTimer: NodeJS.Timeout;
 
   constructor(
@@ -148,13 +151,146 @@ export class AcpClientManager {
     await Promise.allSettled([...this.workers.keys()].map((k) => this.stopWorkerByKey(k)));
   }
 
+  invalidateUserOptionsCache(userId: string): void {
+    for (const key of [...this.userOptionsCache.keys()]) {
+      if (key.startsWith(`${userId}:`)) {
+        this.userOptionsCache.delete(key);
+      }
+    }
+  }
+
   async stopAllForUser(userId: string): Promise<void> {
+    this.invalidateUserOptionsCache(userId);
     const keys = [...this.workers.values()].filter((w) => w.userId === userId).map((w) => w.key);
     await Promise.allSettled(keys.map((k) => this.stopWorkerByKey(k)));
   }
 
   async stopChatWorker(userId: string, chatId: string): Promise<void> {
     await this.stopWorkerByKey(`${userId}:${chatId}`);
+  }
+
+  async getOrProbeUserOptions(
+    userId: string,
+    desiredModelId: string | null = null
+  ): Promise<ParsedSessionOptions | null> {
+    const profile = this.db.getAgyProfile(userId);
+    if (!profile || profile.authStatus !== 'authenticated') {
+      return null;
+    }
+
+    // Reuse an already-running worker for this user if model matches (or no preference specified)
+    for (const worker of this.workers.values()) {
+      if (
+        worker.userId === userId &&
+        worker.parsedOptions.configOptions.length > 0 &&
+        (!desiredModelId || worker.parsedOptions.currentModelId === desiredModelId)
+      ) {
+        this.cacheUserOptions(userId, worker.parsedOptions);
+        return worker.parsedOptions;
+      }
+    }
+
+    const cacheKey = `${userId}:${desiredModelId ?? ''}`;
+    const cached = this.userOptionsCache.get(cacheKey);
+    if (cached && Date.now() - cached.cachedAt < 15 * 60 * 1000) {
+      return cached.options;
+    }
+
+    const inFlight = this.userOptionProbes.get(cacheKey);
+    if (inFlight) return inFlight;
+
+    const promise = this.probeUserOptionsOnce(userId, profile.profileDir, desiredModelId).finally(() => {
+      this.userOptionProbes.delete(cacheKey);
+    });
+    this.userOptionProbes.set(cacheKey, promise);
+    return promise;
+  }
+
+  private cacheUserOptions(userId: string, options: ParsedSessionOptions): void {
+    const now = Date.now();
+    this.userOptionsCache.set(`${userId}:`, { options, cachedAt: now });
+    if (options.currentModelId) {
+      this.userOptionsCache.set(`${userId}:${options.currentModelId}`, { options, cachedAt: now });
+    }
+  }
+
+  private async probeUserOptionsOnce(
+    userId: string,
+    profileDir: string,
+    desiredModelId: string | null
+  ): Promise<ParsedSessionOptions | null> {
+    const tempProbeCwd = path.join(profileDir, '.tmp', 'options-probe');
+    fs.mkdirSync(tempProbeCwd, { recursive: true, mode: 0o700 });
+    const apiKey = this.loadApiKeyForUser(userId);
+    const spec = buildAgyCommandSpec({
+      config: this.config,
+      subcommandArgs: ['acp'],
+      profileDir,
+      workspaceDir: tempProbeCwd,
+      geminiApiKey: apiKey,
+      enableSandboxBwrap: false,
+    });
+
+    const child = spawn(spec.command, spec.args, {
+      cwd: tempProbeCwd,
+      env: spec.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    try {
+      const app = client({ name: 'antigravity-chat-options-probe' });
+      const stream = ndJsonStream(
+        Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>,
+        Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>
+      );
+      const conn = app.connect(stream);
+      const init = await Promise.race([
+        conn.agent.request(methods.agent.initialize, {
+          protocolVersion: PROTOCOL_VERSION,
+          clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+          clientInfo: { name: 'antigravity-chat-ui', title: 'Antigravity Chat UI', version: '1.0.0' },
+        }),
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error('ACP options initialize timeout')), 15_000)),
+      ]);
+
+      const created = (await conn.agent.request(methods.agent.session.new, {
+        cwd: tempProbeCwd,
+        mcpServers: [],
+      })) as NewSessionResponse;
+      let parsed = normalizeConfigOptions(created.configOptions);
+
+      if (desiredModelId && parsed.modelOptionId && parsed.currentModelId !== desiredModelId) {
+        const updated = await conn.agent
+          .request(methods.agent.session.setConfigOption, {
+            sessionId: created.sessionId,
+            configId: parsed.modelOptionId,
+            value: desiredModelId,
+          })
+          .catch(() => null);
+        if (updated) {
+          parsed = normalizeConfigOptions(updated.configOptions);
+        }
+      }
+
+      if (init.agentCapabilities?.sessionCapabilities?.close && created.sessionId) {
+        await conn.agent.request(methods.agent.session.close, { sessionId: created.sessionId }).catch(() => {});
+      }
+      conn.close();
+
+      if (parsed.configOptions.length > 0) {
+        this.userOptionsCache.set(`${userId}:${desiredModelId ?? ''}`, { options: parsed, cachedAt: Date.now() });
+        this.cacheUserOptions(userId, parsed);
+      }
+      return parsed;
+    } catch {
+      return null;
+    } finally {
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // ignore
+      }
+    }
   }
 
   /**
@@ -267,6 +403,9 @@ export class AcpClientManager {
 
   async ensureSessionOptions(userId: string, chatId: string): Promise<ParsedSessionOptions> {
     const worker = await this.getOrStartWorker(userId, chatId);
+    if (worker.parsedOptions.configOptions.length > 0) {
+      this.cacheUserOptions(userId, worker.parsedOptions);
+    }
     return worker.parsedOptions;
   }
 
@@ -297,6 +436,10 @@ export class AcpClientManager {
         value: patch.effortValue,
       });
       worker.parsedOptions = normalizeConfigOptions(res.configOptions);
+    }
+
+    if (worker.parsedOptions.configOptions.length > 0) {
+      this.cacheUserOptions(userId, worker.parsedOptions);
     }
 
     const updatedChat = this.db.updateChat(userId, chatId, {
@@ -832,10 +975,40 @@ export class AcpClientManager {
       }
     }
 
+    if (chat.modelId && parsedOptions.modelOptionId && parsedOptions.currentModelId !== chat.modelId) {
+      const res = await conn.agent
+        .request(methods.agent.session.setConfigOption, {
+          sessionId: acpSessionId,
+          configId: parsedOptions.modelOptionId,
+          value: chat.modelId,
+        })
+        .catch(() => null);
+      if (res) {
+        parsedOptions = normalizeConfigOptions(res.configOptions);
+      }
+    }
+
+    if (
+      chat.effortValue &&
+      parsedOptions.effortOptionId &&
+      parsedOptions.currentEffortValue !== chat.effortValue
+    ) {
+      const res = await conn.agent
+        .request(methods.agent.session.setConfigOption, {
+          sessionId: acpSessionId,
+          configId: parsedOptions.effortOptionId,
+          value: chat.effortValue,
+        })
+        .catch(() => null);
+      if (res) {
+        parsedOptions = normalizeConfigOptions(res.configOptions);
+      }
+    }
+
     this.db.updateChat(userId, chatId, {
       acpSessionId,
-      modelId: chat.modelId ?? parsedOptions.currentModelId,
-      effortValue: chat.effortValue ?? parsedOptions.currentEffortValue,
+      modelId: parsedOptions.currentModelId ?? chat.modelId,
+      effortValue: parsedOptions.currentEffortValue ?? chat.effortValue,
     });
 
     workerRef = {
@@ -1048,6 +1221,3 @@ export class AcpClientManager {
     }
   }
 }
-
-// Re-export path helper cleanly inside same module for write target creation
-import path from 'node:path';

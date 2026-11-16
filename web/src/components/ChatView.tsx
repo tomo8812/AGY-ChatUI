@@ -5,11 +5,13 @@ import type {
   AttachmentRef,
   ChatRecord,
   MessageRecord,
+  ParsedSessionOptions,
   PendingPermissionRecord,
   ProjectRecord,
   RunRecord,
   ToolCallItem,
 } from '../types';
+import { EffortBar } from './EffortBar';
 import {
   CheckIcon,
   ChevronIcon,
@@ -32,7 +34,13 @@ interface ChatViewProps {
   artifacts: ArtifactRecord[];
   pendingPermissions: PendingPermissionRecord[];
   activeRun: RunRecord | null;
+  sessionOptions: ParsedSessionOptions | null;
+  selectedModelId: string;
+  selectedEffortValue: string;
   clientId: string;
+  onChangeModel: (modelId: string) => void;
+  onChangeEffort: (effortValue: string) => void;
+  onDraftChange?: (hasDraft: boolean) => void;
   onSendPrompt: (text: string, files: AttachmentRef[]) => Promise<void>;
   onUploadFiles: (files: File[]) => Promise<AttachmentRef[]>;
   onCancelRun: (runId: string) => Promise<void>;
@@ -200,7 +208,13 @@ export const ChatView: React.FC<ChatViewProps> = ({
   artifacts,
   pendingPermissions,
   activeRun,
+  sessionOptions,
+  selectedModelId,
+  selectedEffortValue,
   clientId,
+  onChangeModel,
+  onChangeEffort,
+  onDraftChange,
   onSendPrompt,
   onUploadFiles,
   onCancelRun,
@@ -232,6 +246,10 @@ export const ChatView: React.FC<ChatViewProps> = ({
     setUiNotice(null);
   }, [chat?.id]);
 
+  useEffect(() => {
+    onDraftChange?.(inputText.trim().length > 0 || stagedAttachments.length > 0);
+  }, [inputText, stagedAttachments.length, onDraftChange]);
+
   // Smooth auto-scroll on new messages or active streaming progress
   const lastMsg = messages[messages.length - 1];
   useEffect(() => {
@@ -245,6 +263,29 @@ export const ChatView: React.FC<ChatViewProps> = ({
     el.style.height = 'auto';
     el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
   }, [inputText]);
+
+  const modelOption = sessionOptions?.configOptions.find(
+    (o) => o.id === sessionOptions.modelOptionId || o.category === 'model'
+  );
+  const effortOption = sessionOptions?.configOptions.find(
+    (o) => o.id === sessionOptions.effortOptionId || o.category === 'thought_level'
+  );
+  const currentModelValue =
+    selectedModelId || modelOption?.currentValue || modelOption?.options[0]?.value || '';
+  const currentEffortValue =
+    (effortOption?.options.some((o) => o.value === selectedEffortValue)
+      ? selectedEffortValue
+      : undefined) ||
+    effortOption?.currentValue ||
+    effortOption?.options[0]?.value ||
+    '';
+  const isRunBusy = Boolean(
+    activeRun &&
+      (activeRun.status === 'running' ||
+        activeRun.status === 'queued' ||
+        activeRun.status === 'awaiting_permission')
+  );
+  const configBusy = sending || uploading || isRunBusy;
 
   const handleFilesSelected = async (files: File[]) => {
     if (files.length === 0) return;
@@ -371,32 +412,12 @@ export const ChatView: React.FC<ChatViewProps> = ({
         <div className="messages-rail">
           {messages.length === 0 ? (
             <div className="welcome-empty">
-              <div className="brand-mark lg">A</div>
-              <h2>{project ? project.name : 'どのような作業を進めますか？'}</h2>
-              <p className="muted-sm">
-                {project
-                  ? project.description ||
-                    (project.instructions
-                      ? `指示設定済み: ${project.instructions.slice(0, 90)}${project.instructions.length > 90 ? '...' : ''}`
-                      : `共有資料 (${project.files.length}件) が参照可能です。`)
-                  : 'メッセージの送信、コード作成、資料解析、表・SVG・PDF・HTMLプレビューなどを公式 Antigravity CLI で実行します。'}
-              </p>
-              <div className="starter-chips">
-                {[
-                  'このワークスペースで現在の課題整理の手順を提案して',
-                  '比較表を含むMarkdownとMermaid構成図を作成して',
-                  '添付した資料・コードのレビューをして',
-                ].map((prompt) => (
-                  <button
-                    key={prompt}
-                    type="button"
-                    className="starter-chip"
-                    onClick={() => setInputText(prompt)}
-                  >
-                    {prompt}
-                  </button>
-                ))}
-              </div>
+              <h2>{project ? project.name : 'お手伝いできることはありますか？'}</h2>
+              {project && (project.description || project.files.length > 0) && (
+                <p className="muted-sm">
+                  {project.description || `共有資料 (${project.files.length}件) が参照可能です。`}
+                </p>
+              )}
             </div>
           ) : (
             messages.map((msg) => {
@@ -433,7 +454,6 @@ export const ChatView: React.FC<ChatViewProps> = ({
 
               return (
                 <div key={msg.id} className="msg-row assistant">
-                  <div className="assistant-avatar">A</div>
                   <div className="assistant-body">
                     {msg.status === 'queued' && (
                       <div className="queue-status-pill">
@@ -553,15 +573,6 @@ export const ChatView: React.FC<ChatViewProps> = ({
           )}
 
           <form onSubmit={handleSubmit} className="composer-box">
-            <button
-              type="button"
-              className="composer-icon-btn"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={uploading}
-              title="ファイルを添付（複数・画像ペースト・ドロップ対応）"
-            >
-              <PaperclipIcon size={18} />
-            </button>
             <input
               ref={fileInputRef}
               type="file"
@@ -581,29 +592,71 @@ export const ChatView: React.FC<ChatViewProps> = ({
               onChange={(e) => setInputText(e.target.value)}
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
-              placeholder={uploading ? 'ファイルをアップロード中...' : 'Antigravity にメッセージを送る...'}
+              placeholder={uploading ? 'ファイルをアップロード中...' : 'メッセージを入力...'}
               disabled={uploading}
             />
 
-            {activeRun && (activeRun.status === 'running' || activeRun.status === 'queued' || activeRun.status === 'awaiting_permission') && (
-              <button
-                type="button"
-                className="stop-btn"
-                onClick={() => void onCancelRun(activeRun.id)}
-                title="生成・キューを停止"
-              >
-                <StopIcon size={14} />
-              </button>
-            )}
+            <div className="composer-toolbar">
+              <div className="composer-toolbar-left">
+                <button
+                  type="button"
+                  className="composer-icon-btn"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={uploading}
+                  title="ファイルを添付（複数・画像ペースト・ドロップ対応）"
+                >
+                  <PaperclipIcon size={18} />
+                </button>
 
-            <button
-              type="submit"
-              className="send-btn"
-              disabled={sending || uploading || (!inputText.trim() && stagedAttachments.length === 0)}
-              title="送信"
-            >
-              <SendIcon size={17} />
-            </button>
+                {modelOption && modelOption.options.length > 0 && (
+                  <select
+                    aria-label="モデル選択"
+                    className="composer-model-select"
+                    value={currentModelValue}
+                    disabled={configBusy}
+                    onChange={(e) => onChangeModel(e.target.value)}
+                    title="使用モデルを選択"
+                  >
+                    {modelOption.options.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.name}
+                      </option>
+                    ))}
+                  </select>
+                )}
+
+                {effortOption && effortOption.options.length > 0 && (
+                  <EffortBar
+                    options={effortOption.options}
+                    value={currentEffortValue}
+                    disabled={configBusy}
+                    onChange={onChangeEffort}
+                  />
+                )}
+              </div>
+
+              <div className="composer-toolbar-right">
+                {isRunBusy && activeRun && (
+                  <button
+                    type="button"
+                    className="stop-btn"
+                    onClick={() => void onCancelRun(activeRun.id)}
+                    title="生成・キューを停止"
+                  >
+                    <StopIcon size={14} />
+                  </button>
+                )}
+
+                <button
+                  type="submit"
+                  className="send-btn"
+                  disabled={sending || uploading || (!inputText.trim() && stagedAttachments.length === 0)}
+                  title="送信"
+                >
+                  <SendIcon size={17} />
+                </button>
+              </div>
+            </div>
           </form>
 
           <div className="composer-hint">

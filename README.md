@@ -12,9 +12,16 @@ Google の公式 CLI（[`agy`](https://antigravity.google)）を **無改変の�
   - ログインした Web ユーザーごとに完全に分離された専用プロファイル（`DATA_ROOT/profiles/<userId>/agy-home`）を持ち、初回チャット前に **認証コード貼り付け**（`agy acp --login` の PTY 出力から Google OAuth URL を発行し、ブラウザ認証後にコードを貼り付ける方式）または任意の `GEMINI_API_KEY` で公式認証を完了します。
   - 複数ユーザーが異なる Antigravity / Google アカウントで同時に独立してチャット実行可能です。
 - **ChatGPT ライクな集中 UI ＆ モバイル/PWA 対応**
-  - Vanilla CSS（ライト / ダーク / システム追従テーマ）、レスポンシブ設計（iPhone Safari「ホーム画面に追加」PWA 対応・ノッチ領域対応）。
-  - モデル切替 ＆ ACP `configOptions` に準拠した動的 Effort（推論レベル）連動。
-  - ヘッダー統合の利用枠（Quota）モニター（公式 `agy -p /usage --output-format json` を手動オンデマンドで取得し、取得不可時は偽装せず正直に表示）。
+  - 標準ニュートラル配色ベースの Vanilla CSS（ライト / ダーク / システム追従テーマ）、レスポンシブ設計（iPhone Safari「ホーム画面に追加」PWA 対応・ノッチ領域対応）。
+  - 入力欄ツールバーにモデル選択リストと、ACP `configOptions` に連動した段階式 **Effort（推論レベル）スライダーバー** を配置（新規チャット送信前から切替可能）。
+  - 利用枠（Quota）モニター（公式 `agy -p /usage` の 4列 TSV / JSON 出力をモデル系統別のグループ見出し＋見やすい残量バーとして可視化し、5分クールダウン付きの低頻度自動更新＋手動更新に対応）。
+  - **応答完了通知（Web Push + ブラウザ通知）**: 設定モーダルのスライド式トグルスイッチからオン/オフでき、PC ブラウザのバックグラウンドタブや iPhone ホーム画面追加 PWA のロック画面でも応答完了通知を受け取れます（純粋 Node 24 暗号化実装・VAPID 鍵は SQLite 永続化・テスト通知ボタン付き）。
+- **アップデート検知 ＆ 高速デプロイ（GitHub Actions 事前ビルド）**
+  - **GitHub Actions**（[`.github/workflows/ci-deploy.yml`](.github/workflows/ci-deploy.yml)）が `typecheck`・`npm test`・`npm run build` を実行し、純粋 JS サーバー実行依存のみ（約 41 MB・ネイティブバイナリ無し・ARM64/x64 共通）のバンドル `antigravity-chat-bundle.tar.gz` を作成して GitHub Release `latest` に公開します。Oracle 側 2 コア VM で重い Vite/TypeScript ビルドを走らせる必要がありません。
+  - **デプロイ方式（どちらも可）**:
+    1. **Tailscale 経由の即時プッシュデプロイ（最速）**: GitHub Secrets / Variables に Tailscale OAuth と SSH 情報を設定すると、`main` への push 完了直後に GitHub Actions から Tailscale 越しに自動デプロイ・再起動します。
+    2. **サーバー側自動更新タイマー（ポーリング）**: `deploy/antigravity-chat-updater.timer` が 3 分ごとに更新を確認します。`/etc/antigravity-chat/env` に `GITHUB_READ_TOKEN` を設定しておけば GitHub Actions ビルド済みバンドルを数秒で展開して再起動します（未設定時は `git pull --ff-only` + ローカルビルドにフォールバック）。
+  - **クライアント / PWA**: `buildId` 不一致（`/api/health`・`/api/auth/bootstrap`・WebSocket `hello`・`BUILD_INFO.json` ハッシュ連動）および Service Worker 更新を検知すると、入力中・応答生成中・認証入力中でないタイミングで自動リロードします（作業中は通知バナー表示）。
 - **プロジェクト（共有カスタム指示 ＆ 資料）**
   - プロジェクト配下のチャット作成時に資料を `.project-context/` へ Copy-on-Write で複製するため、チャット内の編集で原紙や別チャットが汚染されません。
   - プロジェクト更新時は既存チャットに「最新化」バナーを表示し、ユーザー操作で明示的に同期できます。
@@ -26,8 +33,8 @@ Google の公式 CLI（[`agy`](https://antigravity.google)）を **無改変の�
 
 ## Oracle Cloud Always Free (Ubuntu) 推奨構成
 
-- **最推奨**: **`VM.Standard.A1.Flex` (Ampere ARM64, 最大 2 OCPU / 12 GB RAM — 月 1,500 OCPU時間・9,000 GB時間)** — 1台の **2 OCPU / 12 GB VM** に集約する構成が最適です。12 GB RAM は Node 24 サーバー・`npm run build`・複数 `agy acp` ワーカー・`pdftoppm` に対して十分余裕がありますが、ローカルツール実行時は **2 コアの CPU がボトルネック** になりやすいため、デフォルトを **`MAX_CONCURRENT_ACP=2`、`MAX_ACP_PER_USER=2`、`IDLE_WORKER_MS=600000`（10分）、`INSTALL_LIBREOFFICE=0`** に最適化しています（主にチャット応答中心なら `MAX_CONCURRENT_ACP=3` も可、`.pptx` PDF変換が必要時のみ `INSTALL_LIBREOFFICE=1`）。
-- **軽量単体向け**: **`VM.Standard.E2.1.Micro` (1/8 OCPU, 1 GB RAM)** — 2GB スワップ追加 + `MAX_CONCURRENT_ACP=1`、`MAX_ACP_PER_USER=1`、`IDLE_WORKER_MS=180000`、`INSTALL_LIBREOFFICE=0` で動作可能。
+- **最推奨**: **`VM.Standard.A1.Flex` (Ampere ARM64, 最大 2 OCPU / 12 GB RAM — 月 1,500 OCPU時間・9,000 GB時間)** — 1台の **2 OCPU / 12 GB VM** に集約する構成が最適です。12 GB RAM は Node 24 サーバー・複数 `agy acp` ワーカー・`pdftoppm` に対して十分余裕がありますが、ローカルツール実行時は **2 コアの CPU がボトルネック** になりやすいため、ビルド作業を GitHub Actions 側に逃がしつつデフォルトを **`MAX_CONCURRENT_ACP=2`、`MAX_ACP_PER_USER=2`、`IDLE_WORKER_MS=600000`（10分）、`INSTALL_LIBREOFFICE=0`** に最適化しています（主にチャット応答中心なら `MAX_CONCURRENT_ACP=3` も可、`.pptx` PDF変換が必要時のみ `INSTALL_LIBREOFFICE=1`）。
+- **軽量単体向け**: **`VM.Standard.E2.1.Micro` (1/8 OCPU, 1 GB RAM)** — Actions 事前ビルドバンドル運用なら VM 上で `npm ci` / `vite build` を行わないため 1GB RAM でも更新負荷を抑えられます（実行時は `MAX_CONCURRENT_ACP=1`、`MAX_ACP_PER_USER=1`、`IDLE_WORKER_MS=180000` 推奨）。
 - 詳しい運用ノート（Tailscale Serve による HTTPS 公開と Ubuntu `iptables` 回避、7日間アイドル回収ルール、コンシューマ版 `oauth-personal` 利用規約上の注意）は [docs/architecture.md](docs/architecture.md) を参照してください。
 
 ## セットアップ ＆ ビルド
@@ -47,17 +54,35 @@ npm run build
 ### Ubuntu サーバー（Oracle Always Free）への導入手順
 
 ```bash
-# 必要 OS パッケージ・Node 24・2GBスワップ(<=2GB環境時)・サービスユーザーを作成
+# 1. OS パッケージ・Node 24・サービスユーザー・/etc/antigravity-chat/env (SESSION_SECRET) を作成
 sudo bash deploy/ubuntu-setup.sh
 
-# リポジトリを /opt/antigravity-chat に配置してビルド後、systemd サービスを有効化
-sudo cp deploy/antigravity-chat.service /etc/systemd/system/antigravity-chat.service
+# 2. systemd ユニット配置・起動
+sudo cp deploy/antigravity-chat.service /etc/systemd/system/
+sudo cp deploy/antigravity-chat-updater.service /etc/systemd/system/
+sudo cp deploy/antigravity-chat-updater.timer /etc/systemd/system/
+sudo chmod +x /opt/antigravity-chat/deploy/*.sh
 sudo systemctl daemon-reload
 sudo systemctl enable --now antigravity-chat
 
-# Tailscale で安全に HTTPS 公開（Oracle iptables やセキュリティリストのポート開放不要）
+# 3. Tailscale で安全に HTTPS 公開（Oracle iptables やセキュリティリストのポート開放不要）
 sudo tailscale serve --bg http://127.0.0.1:3000
 ```
+
+#### GitHub Actions 高速デプロイの設定方法（2パターン）
+
+- **パターン1: Actions から Tailscale 経由で即時プッシュデプロイ（最速・VM側ポーリング不要）**
+  - GitHub リポジトリ Settings → **Secrets and variables → Actions**:
+    - Variable: `ENABLE_TAILSCALE_DEPLOY` = `true`
+    - Variable: `DEPLOY_USER` = `ubuntu`（VMの sudo 可能ユーザー名）
+    - Variable (任意): `TS_CI_TAGS` = `tag:ci`（Tailscale ACL で許可したタグ）
+    - Secrets: `TS_OAUTH_CLIENT_ID`, `TS_OAUTH_SECRET`（Tailscale OAuth Client）, `DEPLOY_HOST`（VMの Tailscale IP 例 `100.x.y.z`）, `DEPLOY_SSH_KEY`（秘密鍵・Tailscale SSH 使用時は空でも可）
+- **パターン2: サーバー側タイマーで Actions ビルド済み Release を自動取得（Tailscale ACL 設定不要）**
+  - GitHub の Fine-grained PAT（対象リポジトリ `Contents: Read` のみ）を `/etc/antigravity-chat/env` に1行追記し、タイマーを有効化します:
+    ```bash
+    echo 'GITHUB_READ_TOKEN=github_pat_xxxx' | sudo tee -a /etc/antigravity-chat/env >/dev/null
+    sudo systemctl enable --now antigravity-chat-updater.timer
+    ```
 
 ## 開発サーバー（モックモード / 実機モード）
 
@@ -72,7 +97,8 @@ npm run dev:web
 
 ## ディレクトリ構成
 
+- `.github/workflows/`: CI テスト・ビルド・Release バンドル生成・Tailscale プッシュデプロイ定義
 - `server/`: Fastify + WebSocket + `node:sqlite` バックエンド、ACP マネージャ、公平スケジューラ、ワークスペース分離、認証・PTY ログインブリッジ
 - `web/`: React + TypeScript + Vanilla CSS フロントエンド（Vite + PWA）
-- `deploy/`: Oracle Always Free Ubuntu 向けセットアップスクリプト ＆ systemd ユニット
+- `deploy/`: Oracle Always Free Ubuntu 向けセットアップスクリプト・バンドル展開スクリプト・自動更新スクリプト ＆ systemd ユニット
 - `docs/`: アーキテクチャ設計 ＆ 運用・コンプライアンス詳細 ([docs/architecture.md](docs/architecture.md))

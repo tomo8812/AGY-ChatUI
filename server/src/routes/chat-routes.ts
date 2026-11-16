@@ -53,6 +53,23 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
     return prof?.authStatus === 'authenticated';
   };
 
+  app.get('/api/agy/options', async (req, reply) => {
+    const session = requireAuth(req, reply, db);
+    if (!session) return;
+    if (!ensureAgyAuthenticated(session.user.id)) {
+      return reply.code(403).send({ error: 'AGY_AUTH_REQUIRED', message: 'Antigravity認証が必要です。' });
+    }
+    const query = (req.query ?? {}) as { modelId?: string };
+    const prefs = db.getPreferences(session.user.id);
+    const desiredModel = query.modelId?.trim() || prefs.defaultModelId || null;
+    try {
+      const sessionOptions = await acp.getOrProbeUserOptions(session.user.id, desiredModel);
+      return { sessionOptions };
+    } catch {
+      return { sessionOptions: null };
+    }
+  });
+
   app.get('/api/chats', async (req, reply) => {
     const session = requireAuth(req, reply, db);
     if (!session) return;

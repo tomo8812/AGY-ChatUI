@@ -13,6 +13,13 @@ import { ProjectModal } from './components/ProjectModal';
 import { SettingsModal } from './components/SettingsModal';
 import { Sidebar } from './components/Sidebar';
 import { WorkspaceDrawer } from './components/WorkspaceDrawer';
+import {
+  ensurePushSubscribed,
+  getActivePushSubscription,
+  isNotificationSupported,
+  showBrowserNotification,
+  unsubscribePushOnDevice,
+} from './utils/notifications';
 import type {
   AgyLoginFlowState,
   AgyProfile,
@@ -38,6 +45,10 @@ function applyThemeToDocument(theme: 'system' | 'light' | 'dark'): void {
     typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches;
   const effective = theme === 'system' ? (prefersDark ? 'dark' : 'light') : theme;
   document.documentElement.dataset.theme = effective;
+  const metaTheme = document.querySelector('meta[name="theme-color"]');
+  if (metaTheme) {
+    metaTheme.setAttribute('content', effective === 'dark' ? '#212121' : '#ffffff');
+  }
 }
 
 function mergeDeltaText(existing: string, offset: number, chunk: string): { next: string; gapDetected: boolean } {
@@ -80,10 +91,14 @@ export const App: React.FC = () => {
   const [pendingPermissions, setPendingPermissions] = useState<PendingPermissionRecord[]>([]);
   const [activeRun, setActiveRun] = useState<RunRecord | null>(null);
   const [sessionOptions, setSessionOptions] = useState<ParsedSessionOptions | null>(null);
+  const [userOptions, setUserOptions] = useState<ParsedSessionOptions | null>(null);
   const [contextUsage, setContextUsage] = useState<{ used: number; size: number } | null>(null);
 
   const [quota, setQuota] = useState<QuotaSnapshotRecord | null>(null);
   const [quotaRefreshing, setQuotaRefreshing] = useState(false);
+
+  const [pendingUpdateBuild, setPendingUpdateBuild] = useState<string | null>(null);
+  const [hasComposerDraft, setHasComposerDraft] = useState(false);
 
   const [wsStatus, setWsStatus] = useState<WsConnectionStatus>('disconnected');
   const [sidebarMobileOpen, setSidebarMobileOpen] = useState(false);
@@ -96,9 +111,56 @@ export const App: React.FC = () => {
 
   const activeChatIdRef = useRef<string | null>(null);
   activeChatIdRef.current = activeChatId;
+  const chatsRef = useRef<ChatRecord[]>([]);
+  chatsRef.current = chats;
+  const localNotifiedRunsRef = useRef<Set<string>>(new Set());
+
+  const initialBuildIdRef = useRef<string | null>(null);
+  const lastHealthCheckRef = useRef<number>(0);
+  const quotaRef = useRef<QuotaSnapshotRecord | null>(null);
+  quotaRef.current = quota;
+  const quotaRefreshingRef = useRef(false);
+  const agyAuthRef = useRef(false);
+  agyAuthRef.current = agyProfile?.authStatus === 'authenticated';
+  const prevAgyAuthRef = useRef(false);
+  const preferencesRef = useRef<UserPreferences | null>(null);
+  preferencesRef.current = preferences;
 
   const wsRef = useRef<SyncSocketClient | null>(null);
   const resyncDebounceRef = useRef<number | null>(null);
+
+  const notifyDetectedBuild = useCallback((nextBuildId?: string | null) => {
+    if (!nextBuildId) return;
+    if (!initialBuildIdRef.current) {
+      initialBuildIdRef.current = nextBuildId;
+      return;
+    }
+    if (nextBuildId !== initialBuildIdRef.current) {
+      setPendingUpdateBuild((prev) => prev || nextBuildId);
+    }
+  }, []);
+
+  const triggerQuotaRefresh = useCallback(async (auto: boolean) => {
+    if (quotaRefreshingRef.current) return;
+    if (auto) {
+      const cur = quotaRef.current;
+      if (cur && cur.fetchedAt > 0 && cur.status === 'ok' && Date.now() - cur.fetchedAt < 5 * 60 * 1000) {
+        return;
+      }
+    }
+    quotaRefreshingRef.current = true;
+    if (!auto) setQuotaRefreshing(true);
+    try {
+      const res = await api.refreshQuota(auto);
+      quotaRef.current = res.quota;
+      setQuota(res.quota);
+    } catch {
+      // Ignore silent auto-refresh failures; manual errors can propagate only if needed
+    } finally {
+      quotaRefreshingRef.current = false;
+      if (!auto) setQuotaRefreshing(false);
+    }
+  }, []);
 
   const loadWorkspaceLists = useCallback(async () => {
     const [chatsRes, projRes, quotaRes] = await Promise.all([
@@ -108,8 +170,15 @@ export const App: React.FC = () => {
     ]);
     setChats(chatsRes.chats);
     setProjects(projRes.projects);
+    quotaRef.current = quotaRes.quota;
     setQuota(quotaRes.quota);
-  }, []);
+    if (
+      agyAuthRef.current &&
+      (!quotaRes.quota.fetchedAt || Date.now() - quotaRes.quota.fetchedAt >= 10 * 60 * 1000)
+    ) {
+      void triggerQuotaRefresh(true);
+    }
+  }, [triggerQuotaRefresh]);
 
   const loadChatDetail = useCallback(async (chatId: string) => {
     const detail = await api.getChat(chatId);
@@ -145,6 +214,9 @@ export const App: React.FC = () => {
       try {
         const res = await api.bootstrap();
         if (!active) return;
+        if (res.buildId) {
+          initialBuildIdRef.current = res.buildId;
+        }
         setBootstrapMeta({
           userCount: res.userCount,
           allowPublicSignup: res.allowPublicSignup,
@@ -166,11 +238,168 @@ export const App: React.FC = () => {
     };
   }, []);
 
+  // Periodic + focus-based backend build check & PWA Service Worker update notification
+  useEffect(() => {
+    const onSwUpdate = () => {
+      setPendingUpdateBuild((prev) => prev || 'sw-update');
+    };
+    window.addEventListener('agy:app-update-detected', onSwUpdate);
+
+    const checkServerBuild = () => {
+      if (document.visibilityState !== 'visible') return;
+      const now = Date.now();
+      if (now - lastHealthCheckRef.current < 60_000) return;
+      lastHealthCheckRef.current = now;
+      void api
+        .getHealth()
+        .then((res) => {
+          notifyDetectedBuild(res.buildId);
+        })
+        .catch(() => {});
+    };
+
+    const onVisibility = () => checkServerBuild();
+    document.addEventListener('visibilitychange', onVisibility);
+    const interval = window.setInterval(checkServerBuild, 5 * 60 * 1000);
+
+    return () => {
+      window.removeEventListener('agy:app-update-detected', onSwUpdate);
+      document.removeEventListener('visibilitychange', onVisibility);
+      clearInterval(interval);
+    };
+  }, [notifyDetectedBuild]);
+
+  // Auto-reload safely when a new build is detected and no work is in progress
+  const isSafeToReload =
+    !hasComposerDraft &&
+    !activeRun &&
+    loginFlow?.status !== 'awaiting_url' &&
+    loginFlow?.status !== 'awaiting_code' &&
+    loginFlow?.status !== 'verifying';
+
+  useEffect(() => {
+    if (!pendingUpdateBuild || !isSafeToReload) return;
+    try {
+      if (pendingUpdateBuild === 'sw-update') {
+        const lastSwReload = Number(sessionStorage.getItem('agy_last_sw_reload_ts') || '0');
+        if (Date.now() - lastSwReload < 30_000) return;
+      } else if (sessionStorage.getItem('agy_reloaded_build') === pendingUpdateBuild) {
+        return;
+      }
+    } catch {
+      // continue if sessionStorage unavailable
+    }
+
+    const timer = window.setTimeout(() => {
+      try {
+        if (pendingUpdateBuild === 'sw-update') {
+          sessionStorage.setItem('agy_last_sw_reload_ts', String(Date.now()));
+        } else {
+          sessionStorage.setItem('agy_reloaded_build', pendingUpdateBuild);
+        }
+      } catch {
+        // ignore
+      }
+      window.location.reload();
+    }, 900);
+
+    return () => clearTimeout(timer);
+  }, [pendingUpdateBuild, isSafeToReload]);
+
   // Load chats & projects when authenticated
   useEffect(() => {
     if (!user) return;
     void loadWorkspaceLists();
   }, [user?.id, loadWorkspaceLists]);
+
+  // Open target chat from ?chatId=... query param or notification click events
+  useEffect(() => {
+    if (!user) return;
+    const params = new URLSearchParams(window.location.search);
+    const targetChatId = params.get('chatId');
+    if (targetChatId) {
+      setActiveChatId(targetChatId);
+      setWorkspaceOpen(false);
+      setSidebarMobileOpen(false);
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+  }, [user?.id]);
+
+  useEffect(() => {
+    const onOpenChat = (e: Event) => {
+      const chatId = (e as CustomEvent<{ chatId?: string }>).detail?.chatId;
+      if (chatId) {
+        setActiveChatId(chatId);
+        setWorkspaceOpen(false);
+        setSidebarMobileOpen(false);
+      }
+    };
+    window.addEventListener('agy:open-chat', onOpenChat);
+
+    const sw = typeof navigator !== 'undefined' ? navigator.serviceWorker : undefined;
+    const onSwMessage = (event: MessageEvent) => {
+      if (event.data && event.data.type === 'OPEN_CHAT' && typeof event.data.chatId === 'string') {
+        setActiveChatId(event.data.chatId);
+        setWorkspaceOpen(false);
+        setSidebarMobileOpen(false);
+      }
+    };
+    sw?.addEventListener('message', onSwMessage);
+
+    return () => {
+      window.removeEventListener('agy:open-chat', onOpenChat);
+      sw?.removeEventListener('message', onSwMessage);
+    };
+  }, []);
+
+  // Automatically sync browser Push subscription if notifyOnResponse is ON and permission is already granted
+  useEffect(() => {
+    if (!user || !preferences?.notifyOnResponse) return;
+    if (!isNotificationSupported() || Notification.permission !== 'granted') return;
+    void ensurePushSubscribed();
+  }, [user?.id, preferences?.notifyOnResponse]);
+
+  // Probe default model/effort options for welcome screen & run low-frequency quota background refresh
+  const isAgyAuthenticated = agyProfile?.authStatus === 'authenticated';
+  useEffect(() => {
+    const justAuthenticated = !prevAgyAuthRef.current && isAgyAuthenticated;
+    prevAgyAuthRef.current = isAgyAuthenticated;
+
+    if (!user || !isAgyAuthenticated) {
+      setUserOptions(null);
+      return;
+    }
+
+    let active = true;
+    void api
+      .getAgyOptions(preferencesRef.current?.defaultModelId ?? null)
+      .then((res) => {
+        if (active && res.sessionOptions) {
+          setUserOptions(res.sessionOptions);
+        }
+      })
+      .catch(() => {});
+
+    if (justAuthenticated && quotaRef.current && quotaRef.current.status !== 'ok') {
+      void triggerQuotaRefresh(true);
+    }
+
+    const maybeRefreshQuota = () => {
+      if (document.visibilityState !== 'visible') return;
+      const cur = quotaRef.current;
+      if (cur && (!cur.fetchedAt || Date.now() - cur.fetchedAt >= 15 * 60 * 1000)) {
+        void triggerQuotaRefresh(true);
+      }
+    };
+
+    const interval = window.setInterval(maybeRefreshQuota, 5 * 60 * 1000);
+    document.addEventListener('visibilitychange', maybeRefreshQuota);
+    return () => {
+      active = false;
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', maybeRefreshQuota);
+    };
+  }, [user?.id, isAgyAuthenticated, triggerQuotaRefresh]);
 
   // Load detail when switching active chat
   useEffect(() => {
@@ -358,6 +587,45 @@ export const App: React.FC = () => {
             );
           }
         }
+        if (
+          run &&
+          run.status !== 'cancelled' &&
+          preferencesRef.current?.notifyOnResponse &&
+          Date.now() - evt.createdAt < 30_000 &&
+          !localNotifiedRunsRef.current.has(run.id) &&
+          isNotificationSupported() &&
+          Notification.permission === 'granted' &&
+          (document.visibilityState !== 'visible' || !document.hasFocus() || evt.chatId !== curChatId)
+        ) {
+          if (localNotifiedRunsRef.current.size > 200) {
+            localNotifiedRunsRef.current.clear();
+          }
+          localNotifiedRunsRef.current.add(run.id);
+
+          const chatTitle =
+            chatsRef.current.find((c) => c.id === run.chatId)?.title || 'Antigravity Chat';
+          const preview = (msg?.contentText || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+          const body =
+            run.status === 'error'
+              ? run.errorMessage || '応答の生成中にエラーが発生しました。'
+              : preview || '応答が完了しました。';
+          const title = run.status === 'error' ? `エラーで終了 — ${chatTitle}` : chatTitle;
+
+          void getActivePushSubscription().then((sub) => {
+            if (!sub) {
+              void showBrowserNotification({
+                title,
+                body,
+                tag: `run-${run.id}`,
+                chatId: run.chatId,
+              });
+            }
+          });
+        }
+        const curQuota = quotaRef.current;
+        if (!curQuota?.fetchedAt || Date.now() - curQuota.fetchedAt >= 5 * 60 * 1000) {
+          void triggerQuotaRefresh(true);
+        }
         break;
       }
       case 'permission.requested': {
@@ -410,7 +678,7 @@ export const App: React.FC = () => {
         break;
       }
     }
-  }, []);
+  }, [triggerQuotaRefresh]);
 
   const handleEphemeralEvent = useCallback(
     (evt: Extract<WsIncomingMessage, { kind: 'ephemeral' }>['event']) => {
@@ -482,6 +750,7 @@ export const App: React.FC = () => {
     const client = new SyncSocketClient({
       onStatusChange: setWsStatus,
       onHello: (msg) => {
+        notifyDetectedBuild(msg.buildId);
         if (msg.resyncRequired) {
           void loadWorkspaceLists();
           if (activeChatIdRef.current) void loadChatDetail(activeChatIdRef.current);
@@ -500,6 +769,9 @@ export const App: React.FC = () => {
       onAuthLost: () => {
         setUser(null);
         setAgyProfile(null);
+        setUserOptions(null);
+        setSessionOptions(null);
+        setQuota(null);
         setActiveChatId(null);
         setChats([]);
         setProjects([]);
@@ -512,14 +784,119 @@ export const App: React.FC = () => {
       client.stop();
       if (wsRef.current === client) wsRef.current = null;
     };
-  }, [user?.id, loadWorkspaceLists, loadChatDetail, handleDurableEvent, handleEphemeralEvent]);
+  }, [user?.id, loadWorkspaceLists, loadChatDetail, handleDurableEvent, handleEphemeralEvent, notifyDetectedBuild]);
+
+  const activeChat = chats.find((c) => c.id === activeChatId) ?? null;
+  const activeProject =
+    activeChat?.projectId ? projects.find((p) => p.id === activeChat.projectId) ?? null : null;
+
+  const effectiveSessionOptions = activeChat ? (sessionOptions ?? userOptions) : userOptions;
+  const activeModelOption = effectiveSessionOptions?.configOptions.find(
+    (o) => o.id === effectiveSessionOptions.modelOptionId || o.category === 'model'
+  );
+  const activeEffortOption = effectiveSessionOptions?.configOptions.find(
+    (o) => o.id === effectiveSessionOptions.effortOptionId || o.category === 'thought_level'
+  );
+  const selectedModelId =
+    (activeChat ? activeChat.modelId : preferences?.defaultModelId) ||
+    activeModelOption?.currentValue ||
+    activeModelOption?.options[0]?.value ||
+    '';
+  const rawEffortValue =
+    (activeChat ? activeChat.effortValue : preferences?.defaultEffortValue) ||
+    activeEffortOption?.currentValue ||
+    activeEffortOption?.options[0]?.value ||
+    '';
+  const selectedEffortValue =
+    activeEffortOption?.options.some((o) => o.value === rawEffortValue)
+      ? rawEffortValue
+      : activeEffortOption?.currentValue || activeEffortOption?.options[0]?.value || rawEffortValue;
 
   const handleCreateChat = async (projectId: string | null = null) => {
-    const res = await api.createChat({ projectId });
+    const res = await api.createChat({
+      projectId,
+      modelId: selectedModelId || null,
+      effortValue: selectedEffortValue || null,
+    });
     setChats((prev) => [res.chat, ...prev.filter((c) => c.id !== res.chat.id)]);
     setActiveChatId(res.chat.id);
     if (res.sessionOptions) setSessionOptions(res.sessionOptions);
     return res.chat;
+  };
+
+  const handleChangeModel = async (modelId: string) => {
+    if (activeChat) {
+      const res = await api.patchChat(activeChat.id, { modelId });
+      setChats((prev) => prev.map((c) => (c.id === activeChat.id ? { ...c, ...res.chat } : c)));
+      if (res.sessionOptions) setSessionOptions(res.sessionOptions);
+      return;
+    }
+
+    setPreferences((prev) => (prev ? { ...prev, defaultModelId: modelId } : prev));
+    const [prefRes, optRes] = await Promise.all([
+      api.updatePreferences({ defaultModelId: modelId }),
+      api.getAgyOptions(modelId),
+    ]);
+    let nextPrefs = prefRes.preferences;
+    if (optRes.sessionOptions) {
+      setUserOptions(optRes.sessionOptions);
+      const nextEffortOpt = optRes.sessionOptions.configOptions.find(
+        (o) => o.id === optRes.sessionOptions?.effortOptionId || o.category === 'thought_level'
+      );
+      if (
+        nextEffortOpt &&
+        nextPrefs.defaultEffortValue &&
+        !nextEffortOpt.options.some((o) => o.value === nextPrefs.defaultEffortValue)
+      ) {
+        const fallbackEffort =
+          nextEffortOpt.currentValue || nextEffortOpt.options[0]?.value || null;
+        if (fallbackEffort) {
+          const synced = await api.updatePreferences({ defaultEffortValue: fallbackEffort });
+          nextPrefs = synced.preferences;
+        }
+      }
+    }
+    setPreferences(nextPrefs);
+  };
+
+  const handleChangeEffort = async (effortValue: string) => {
+    if (activeChat) {
+      const res = await api.patchChat(activeChat.id, { effortValue });
+      setChats((prev) => prev.map((c) => (c.id === activeChat.id ? { ...c, ...res.chat } : c)));
+      if (res.sessionOptions) setSessionOptions(res.sessionOptions);
+      return;
+    }
+
+    setPreferences((prev) => (prev ? { ...prev, defaultEffortValue: effortValue } : prev));
+    setUserOptions((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        currentEffortValue: effortValue,
+        configOptions: prev.configOptions.map((o) =>
+          o.id === prev.effortOptionId || o.category === 'thought_level'
+            ? { ...o, currentValue: effortValue }
+            : o
+        ),
+      };
+    });
+    const res = await api.updatePreferences({ defaultEffortValue: effortValue });
+    setPreferences(res.preferences);
+  };
+
+  const handleManualReloadUpdate = () => {
+    if (pendingUpdateBuild) {
+      try {
+        if (pendingUpdateBuild === 'sw-update') {
+          sessionStorage.setItem('agy_last_sw_reload_ts', String(Date.now()));
+        } else {
+          sessionStorage.setItem('agy_reloaded_build', pendingUpdateBuild);
+        }
+      } catch {
+        // ignore
+      }
+    }
+    window.location.reload();
   };
 
   const ensureActiveChatForAction = async (): Promise<string> => {
@@ -563,6 +940,7 @@ export const App: React.FC = () => {
 
   const handleLogout = async (allDevices = false) => {
     try {
+      await unsubscribePushOnDevice().catch(() => {});
       if (allDevices) await api.logoutAll();
       else await api.logout();
     } catch {
@@ -571,6 +949,10 @@ export const App: React.FC = () => {
     wsRef.current?.stop();
     setUser(null);
     setAgyProfile(null);
+    setUserOptions(null);
+    setSessionOptions(null);
+    setQuota(null);
+    setHasComposerDraft(false);
     setActiveChatId(null);
     setChats([]);
     setProjects([]);
@@ -588,7 +970,6 @@ export const App: React.FC = () => {
   if (bootstrapping) {
     return (
       <div className="splash-shell">
-        <div className="brand-mark lg">A</div>
         <div className="muted-sm">起動中...</div>
       </div>
     );
@@ -627,10 +1008,6 @@ export const App: React.FC = () => {
     );
   }
 
-  const activeChat = chats.find((c) => c.id === activeChatId) ?? null;
-  const activeProject =
-    activeChat?.projectId ? projects.find((p) => p.id === activeChat.projectId) ?? null : null;
-
   return (
     <div className="app-shell">
       <Sidebar
@@ -662,7 +1039,7 @@ export const App: React.FC = () => {
       <main className="main-pane">
         <HeaderBar
           activeChat={activeChat}
-          sessionOptions={sessionOptions}
+          selectedModelId={selectedModelId}
           agyProfile={agyProfile}
           quota={quota}
           quotaRefreshing={quotaRefreshing}
@@ -671,29 +1048,22 @@ export const App: React.FC = () => {
           workspaceCount={artifacts.length}
           workspaceOpen={workspaceOpen}
           onOpenSidebar={() => setSidebarMobileOpen(true)}
-          onChangeModel={async (modelId) => {
-            if (!activeChat) return;
-            const res = await api.patchChat(activeChat.id, { modelId });
-            setChats((prev) => prev.map((c) => (c.id === activeChat.id ? { ...c, ...res.chat } : c)));
-            if (res.sessionOptions) setSessionOptions(res.sessionOptions);
-          }}
-          onChangeEffort={async (effortValue) => {
-            if (!activeChat) return;
-            const res = await api.patchChat(activeChat.id, { effortValue });
-            setChats((prev) => prev.map((c) => (c.id === activeChat.id ? { ...c, ...res.chat } : c)));
-            if (res.sessionOptions) setSessionOptions(res.sessionOptions);
-          }}
-          onRefreshQuota={async () => {
-            setQuotaRefreshing(true);
-            try {
-              const res = await api.refreshQuota();
-              setQuota(res.quota);
-            } finally {
-              setQuotaRefreshing(false);
-            }
-          }}
+          onRefreshQuota={() => void triggerQuotaRefresh(false)}
           onToggleWorkspace={() => setWorkspaceOpen((o) => !o)}
         />
+
+        {pendingUpdateBuild && (
+          <div className="update-banner" role="status">
+            <span>
+              {isSafeToReload
+                ? '新しいバージョンを検知しました。自動的に最新画面へ更新します...'
+                : '新しいバージョンが利用可能です（送信中・入力中の作業完了後に自動更新されます）'}
+            </span>
+            <button type="button" className="btn btn-secondary btn-xs" onClick={handleManualReloadUpdate}>
+              今すぐ更新
+            </button>
+          </div>
+        )}
 
         <div className="content-stage">
           <ChatView
@@ -703,7 +1073,13 @@ export const App: React.FC = () => {
             artifacts={artifacts}
             pendingPermissions={pendingPermissions}
             activeRun={activeRun}
+            sessionOptions={effectiveSessionOptions}
+            selectedModelId={selectedModelId}
+            selectedEffortValue={selectedEffortValue}
             clientId={wsRef.current?.getClientId() ?? 'local'}
+            onChangeModel={(modelId) => void handleChangeModel(modelId)}
+            onChangeEffort={(effortValue) => void handleChangeEffort(effortValue)}
+            onDraftChange={setHasComposerDraft}
             onSendPrompt={handleSendPrompt}
             onUploadFiles={handleUploadFiles}
             onCancelRun={handleCancelRun}

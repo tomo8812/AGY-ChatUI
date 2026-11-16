@@ -89,7 +89,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
       <aside className={`sidebar ${openMobile ? 'open' : ''}`}>
         <div className="sidebar-top">
           <div className="sidebar-brand">
-            <div className="brand-mark sm">A</div>
             <span className="brand-title">Antigravity</span>
           </div>
           <div className="row-actions">

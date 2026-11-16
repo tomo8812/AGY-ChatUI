@@ -16,8 +16,10 @@ import { AppDatabase } from './db/database.js';
 import { registerAuthRoutes } from './routes/auth-routes.js';
 import { registerChatRoutes } from './routes/chat-routes.js';
 import { registerFileRoutes } from './routes/file-routes.js';
+import { registerNotificationRoutes } from './routes/notification-routes.js';
 import { registerProjectRoutes } from './routes/project-routes.js';
 import { registerQuotaRoutes } from './routes/quota-routes.js';
+import { PushNotificationService } from './notifications/web-push.js';
 import { SyncHub } from './sync/hub.js';
 
 export interface AppContext {
@@ -29,7 +31,32 @@ export interface AppContext {
   agyAuth: AgyAuthManager;
   scheduler: ExecutionScheduler;
   quotaService: QuotaService;
+  pushService: PushNotificationService;
   shutdown: () => Promise<void>;
+}
+
+function computeBuildId(webDistDir: string): string {
+  if (process.env.AGY_BUILD_ID && process.env.AGY_BUILD_ID.trim()) {
+    return process.env.AGY_BUILD_ID.trim();
+  }
+  const hash = crypto.createHash('sha256');
+  const candidates = [
+    path.join(webDistDir, 'index.html'),
+    path.join(webDistDir, 'sw.js'),
+    import.meta.filename,
+    path.resolve(import.meta.dirname, '..', '..', 'BUILD_INFO.json'),
+  ];
+  for (const file of candidates) {
+    try {
+      const data = fs.readFileSync(file);
+      hash.update(path.basename(file));
+      hash.update(String(data.length));
+      hash.update(data);
+    } catch {
+      // ignore missing file during dev/test
+    }
+  }
+  return hash.digest('hex').slice(0, 16);
 }
 
 export async function createApp(configOverrides: Partial<AppConfig> = {}): Promise<AppContext> {
@@ -45,13 +72,15 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
 
+  const buildId = computeBuildId(config.webDistDir);
   const db = new AppDatabase(config.dbPath);
   db.recoverInterruptedRuns();
 
-  const hub = new SyncHub(db);
+  const hub = new SyncHub(db, buildId);
+  const pushService = new PushNotificationService(config, db);
   const acp = new AcpClientManager(config, db, hub);
   const agyAuth = new AgyAuthManager(config, db, hub, acp);
-  const scheduler = new ExecutionScheduler(config, db, hub, acp);
+  const scheduler = new ExecutionScheduler(config, db, hub, acp, pushService);
   const quotaService = new QuotaService(config, db, hub);
 
   const app = Fastify({
@@ -73,15 +102,17 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
     return {
       ok: true,
       agyMode: config.agyMode,
+      buildId,
       uptimeSec: Math.floor(process.uptime()),
     };
   });
 
-  await registerAuthRoutes(app, { config, db, hub, agyAuth });
+  await registerAuthRoutes(app, { config, db, hub, agyAuth, buildId });
   await registerProjectRoutes(app, { config, db, hub, agyAuth });
   await registerChatRoutes(app, { config, db, hub, agyAuth, acp, scheduler });
   await registerFileRoutes(app, { config, db, hub, agyAuth });
   await registerQuotaRoutes(app, { config, db, hub, agyAuth, quotaService });
+  await registerNotificationRoutes(app, { config, db, hub, agyAuth, pushService });
 
   app.get('/api/ws', { websocket: true }, (socket, req) => {
     const session = authenticateRequest(req, db);
@@ -137,6 +168,17 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
       root: config.webDistDir,
       prefix: '/',
       wildcard: false,
+      setHeaders: (reply, filePath) => {
+        if (
+          filePath.endsWith('index.html') ||
+          filePath.endsWith('sw.js') ||
+          filePath.endsWith('.webmanifest')
+        ) {
+          reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+        } else if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+          reply.header('Cache-Control', 'public, max-age=31536000, immutable');
+        }
+      },
     });
 
     app.setNotFoundHandler((req, reply) => {
@@ -145,7 +187,10 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
       }
       const indexFile = path.join(config.webDistDir, 'index.html');
       if (fs.existsSync(indexFile)) {
-        return reply.type('text/html; charset=utf-8').send(fs.readFileSync(indexFile, 'utf8'));
+        return reply
+          .header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+          .type('text/html; charset=utf-8')
+          .send(fs.readFileSync(indexFile, 'utf8'));
       }
       return reply.code(404).send({ error: 'NOT_FOUND' });
     });
@@ -171,6 +216,7 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
     agyAuth,
     scheduler,
     quotaService,
+    pushService,
     shutdown,
   };
 }

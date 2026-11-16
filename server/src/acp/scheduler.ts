@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import type { AppConfig } from '../config.js';
 import type { AppDatabase } from '../db/database.js';
+import type { PushNotificationService } from '../notifications/web-push.js';
 import type { SyncHub } from '../sync/hub.js';
 import type { AttachmentRef, MessageRecord, RunRecord } from '../types.js';
 import type { AcpClientManager } from './client-manager.js';
@@ -28,7 +29,8 @@ export class ExecutionScheduler {
     private readonly config: AppConfig,
     private readonly db: AppDatabase,
     private readonly hub: SyncHub,
-    private readonly acp: AcpClientManager
+    private readonly acp: AcpClientManager,
+    private readonly pushService?: PushNotificationService
   ) {}
 
   enqueueTurn(params: {
@@ -298,6 +300,16 @@ export class ExecutionScheduler {
         runId: job.runId,
         payload: { run: finalRun, message: finalMsg },
       });
+
+      if (status !== 'cancelled') {
+        void this.pushService?.notifyRunFinished({
+          userId: job.userId,
+          chatId: job.chatId,
+          runId: job.runId,
+          status,
+          previewText: finalMsg.contentText,
+        });
+      }
     } catch (err) {
       const finishedAt = Date.now();
       const errorMsg = err instanceof Error ? err.message : String(err);
@@ -320,6 +332,16 @@ export class ExecutionScheduler {
         runId: job.runId,
         payload: { run: finalRun, message: finalMsg },
       });
+
+      if (!isCancelled) {
+        void this.pushService?.notifyRunFinished({
+          userId: job.userId,
+          chatId: job.chatId,
+          runId: job.runId,
+          status: 'error',
+          errorMessage: errorMsg,
+        });
+      }
     } finally {
       this.activeJobs.delete(job.runId);
       this.activeChatIds.delete(job.chatId);

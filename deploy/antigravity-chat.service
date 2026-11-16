@@ -19,6 +19,7 @@ Environment=AGY_BIN=agy
 Environment=MAX_CONCURRENT_ACP=2
 Environment=MAX_ACP_PER_USER=2
 Environment=IDLE_WORKER_MS=600000
+EnvironmentFile=-/etc/antigravity-chat/env
 ExecStart=/usr/bin/node /opt/antigravity-chat/server/dist/index.js
 Restart=on-failure
 RestartSec=3

@@ -18,7 +18,10 @@ export async function registerQuotaRoutes(app: FastifyInstance, deps: QuotaRoute
   app.post('/api/quota/refresh', async (req, reply) => {
     const session = requireAuth(req, reply, db);
     if (!session) return;
-    const quota = await quotaService.refreshOnDemand(session.user.id);
+    const query = (req.query ?? {}) as { auto?: string };
+    const body = (req.body ?? {}) as { auto?: boolean };
+    const auto = query.auto === '1' || query.auto === 'true' || body.auto === true;
+    const quota = await quotaService.refreshOnDemand(session.user.id, { auto });
     return { quota };
   });
 }

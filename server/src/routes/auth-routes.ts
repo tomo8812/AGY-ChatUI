@@ -19,6 +19,7 @@ export interface RouteDeps {
   db: AppDatabase;
   hub: SyncHub;
   agyAuth: AgyAuthManager;
+  buildId?: string;
 }
 
 const registerSchema = z.object({
@@ -35,6 +36,7 @@ const loginSchema = z.object({
 const prefsSchema = z.object({
   theme: z.enum(['system', 'light', 'dark']).optional(),
   autoApproveSafeReads: z.boolean().optional(),
+  notifyOnResponse: z.boolean().optional(),
   defaultModelId: z.string().nullable().optional(),
   defaultEffortValue: z.string().nullable().optional(),
 });
@@ -53,7 +55,7 @@ export function requireAuth(req: FastifyRequest, reply: FastifyReply, db: AppDat
 }
 
 export async function registerAuthRoutes(app: FastifyInstance, deps: RouteDeps): Promise<void> {
-  const { config, db, hub, agyAuth } = deps;
+  const { config, db, hub, agyAuth, buildId = 'dev' } = deps;
 
   app.get('/api/auth/bootstrap', async (req) => {
     const userCount = db.countUsers();
@@ -63,6 +65,7 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: RouteDeps):
         userCount,
         allowPublicSignup: config.allowPublicSignup,
         agyMode: config.agyMode,
+        buildId,
         authenticated: false,
         user: null,
         agyProfile: null,
@@ -75,6 +78,7 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: RouteDeps):
       userCount,
       allowPublicSignup: config.allowPublicSignup,
       agyMode: config.agyMode,
+      buildId,
       authenticated: true,
       user: session.user,
       agyProfile: db.getAgyProfile(session.user.id),
@@ -185,6 +189,7 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: RouteDeps):
     const session = requireAuth(req, reply, db);
     if (!session) return;
     db.deleteAllUserSessions(session.user.id);
+    db.deleteAllPushSubscriptionsForUser(session.user.id);
     hub.disconnectAllForUser(session.user.id, 'logout_all');
     clearSessionCookies(req, reply, config);
     return { ok: true };

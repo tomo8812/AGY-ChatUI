@@ -58,7 +58,6 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
     <div className="auth-shell">
       <div className="auth-card">
         <div className="auth-brand">
-          <div className="brand-mark">A</div>
           <div>
             <h1>Antigravity Chat</h1>
             <p className="muted-sm">Self-Hosted AI Workspace</p>

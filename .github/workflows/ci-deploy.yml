@@ -1,0 +1,193 @@
+name: CI Build & Deploy
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Typecheck, Test & Build Bundle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24 LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install workspace dependencies
+        run: npm ci
+
+      - name: Typecheck server & web
+        run: npm run typecheck
+
+      - name: Run automated test suite
+        run: npm test
+
+      - name: Build production bundles (web + server)
+        run: npm run build
+
+      - name: Package self-contained runtime bundle
+        run: |
+          rm -rf .bundle-stage antigravity-chat-bundle.tar.gz antigravity-chat-bundle.tar.gz.sha256 BUILD_INFO.json
+          mkdir -p .bundle-stage/server .bundle-stage/web
+
+          cp package.json package-lock.json .bundle-stage/
+          cp server/package.json .bundle-stage/server/
+          cp web/package.json .bundle-stage/web/
+          cp -r server/dist .bundle-stage/server/
+          cp -r server/scripts .bundle-stage/server/
+          cp -r web/dist .bundle-stage/web/
+          cp -r deploy .bundle-stage/
+
+          # Install ONLY pure-JS production deps for server (~41MB, zero native C++ addons)
+          npm --prefix .bundle-stage ci --omit=dev --workspace=server --no-audit --no-fund
+
+          BUILD_ID="$(node -e '
+            const fs = require("fs"), crypto = require("crypto");
+            const h = crypto.createHash("sha256");
+            h.update(process.env.GITHUB_SHA || "");
+            for (const f of [".bundle-stage/web/dist/index.html", ".bundle-stage/web/dist/sw.js", ".bundle-stage/server/dist/app.js"]) {
+              h.update(fs.readFileSync(f));
+            }
+            console.log(h.digest("hex").slice(0, 16));
+          ')"
+
+          cat > .bundle-stage/BUILD_INFO.json <<EOF
+          {
+            "commitSha": "${GITHUB_SHA}",
+            "shortSha": "${GITHUB_SHA::8}",
+            "buildId": "${BUILD_ID}",
+            "builtAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+          cp .bundle-stage/BUILD_INFO.json BUILD_INFO.json
+          tar -czf antigravity-chat-bundle.tar.gz -C .bundle-stage .
+          sha256sum antigravity-chat-bundle.tar.gz > antigravity-chat-bundle.tar.gz.sha256
+          ls -lh antigravity-chat-bundle.tar.gz
+
+      - name: Upload workflow bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: antigravity-chat-bundle
+          path: |
+            antigravity-chat-bundle.tar.gz
+            antigravity-chat-bundle.tar.gz.sha256
+            BUILD_INFO.json
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Publish prebuilt bundle to rolling GitHub Release "latest"
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f latest "${GITHUB_SHA}"
+          git push -f origin refs/tags/latest
+
+          if gh release view latest >/dev/null 2>&1; then
+            gh release edit latest \
+              --target "${GITHUB_SHA}" \
+              --title "Latest Prebuilt Bundle" \
+              --notes "Prebuilt pure-JS server & Vite bundle from ${GITHUB_SHA}"
+            gh release upload latest \
+              antigravity-chat-bundle.tar.gz \
+              antigravity-chat-bundle.tar.gz.sha256 \
+              BUILD_INFO.json \
+              --clobber
+          else
+            gh release create latest \
+              antigravity-chat-bundle.tar.gz \
+              antigravity-chat-bundle.tar.gz.sha256 \
+              BUILD_INFO.json \
+              --target "${GITHUB_SHA}" \
+              --title "Latest Prebuilt Bundle" \
+              --notes "Prebuilt pure-JS server & Vite bundle from ${GITHUB_SHA}"
+          fi
+
+  deploy-tailscale:
+    name: Push Deploy to Oracle VM via Tailscale
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.ENABLE_TAILSCALE_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout deploy script
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            deploy/apply-bundle.sh
+
+      - name: Download prebuilt bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: antigravity-chat-bundle
+          path: bundle
+
+      - name: Connect ephemeral runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: ${{ vars.TS_CI_TAGS || 'tag:ci' }}
+
+      - name: Deploy bundle over Tailscale SSH & restart service
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}
+        run: |
+          if [ -z "${DEPLOY_HOST}" ]; then
+            echo "ERROR: secrets.DEPLOY_HOST is not configured." >&2
+            exit 1
+          fi
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=20)
+          if [ -n "${DEPLOY_SSH_KNOWN_HOSTS}" ]; then
+            printf '%s\n' "${DEPLOY_SSH_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+            chmod 600 ~/.ssh/known_hosts
+            SSH_OPTS+=(-o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts)
+          else
+            SSH_OPTS+=(-o StrictHostKeyChecking=accept-new)
+          fi
+
+          if [ -n "${DEPLOY_SSH_KEY}" ]; then
+            printf '%s\n' "${DEPLOY_SSH_KEY}" > ~/.ssh/deploy_key
+            chmod 600 ~/.ssh/deploy_key
+            SSH_OPTS+=(-i ~/.ssh/deploy_key)
+          fi
+
+          TARGET="${DEPLOY_USER}@${DEPLOY_HOST}"
+          ssh "${SSH_OPTS[@]}" "${TARGET}" "mkdir -p /tmp/acy-deploy"
+          scp "${SSH_OPTS[@]}" \
+            bundle/antigravity-chat-bundle.tar.gz \
+            bundle/antigravity-chat-bundle.tar.gz.sha256 \
+            deploy/apply-bundle.sh \
+            "${TARGET}:/tmp/acy-deploy/"
+
+          ssh "${SSH_OPTS[@]}" "${TARGET}" \
+            "sudo -n bash /tmp/acy-deploy/apply-bundle.sh /tmp/acy-deploy/antigravity-chat-bundle.tar.gz --sha256 /tmp/acy-deploy/antigravity-chat-bundle.tar.gz.sha256 && rm -rf /tmp/acy-deploy"

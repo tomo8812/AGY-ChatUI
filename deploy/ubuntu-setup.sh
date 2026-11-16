@@ -38,20 +38,34 @@ npm -v
 
 echo "==> [3/6] Checking official Antigravity CLI (agy)..."
 if ! command -v agy >/dev/null 2>&1; then
-  echo "INFO: 'agy' binary not found in PATH."
-  echo "Please install the official unmodified Google Antigravity CLI package for your architecture:"
-  echo "  dpkg --print-architecture -> $(dpkg --print-architecture)"
-  echo "  e.g. npm install -g @google/antigravity-cli   OR   official tar.gz from antigravity-cli releases"
+  echo "INFO: 'agy' binary not found in system PATH (/usr/local/bin:/usr/bin:/bin)."
+  echo "Install the official unmodified Google Antigravity CLI for $(dpkg --print-architecture):"
+  echo "  curl -fsSL https://antigravity.google/cli/install.sh | bash"
+  echo "  (If installed under ~/.local/bin or ~/.antigravity/bin, symlink it to /usr/local/bin/agy"
+  echo "   or set AGY_BIN=/full/path/to/agy inside /etc/antigravity-chat/env for systemd.)"
 fi
 
-echo "==> [4/6] Creating dedicated system user and data directories..."
+echo "==> [4/6] Creating dedicated system user, directories, and persistent SESSION_SECRET..."
 if ! id "${APP_USER}" >/dev/null 2>&1; then
   useradd --system --create-home --home-dir "/home/${APP_USER}" --shell /bin/bash "${APP_USER}"
 fi
 
-mkdir -p "${APP_DIR}" "${DATA_DIR}/profiles" "${DATA_DIR}/workspaces" "${DATA_DIR}/projects" "${DATA_DIR}/uploads" "${DATA_DIR}/artifacts-cache"
+if [[ ! -d "${APP_DIR}" ]]; then
+  mkdir -p "${APP_DIR}"
+  chown "${APP_USER}:${APP_USER}" "${APP_DIR}"
+fi
+mkdir -p "${DATA_DIR}/profiles" "${DATA_DIR}/workspaces" "${DATA_DIR}/projects" "${DATA_DIR}/uploads" "${DATA_DIR}/artifacts-cache"
 chown -R "${APP_USER}:${APP_USER}" "${DATA_DIR}"
 chmod 700 "${DATA_DIR}" "${DATA_DIR}/profiles" "${DATA_DIR}/workspaces" "${DATA_DIR}/projects"
+
+mkdir -p /etc/antigravity-chat
+chmod 700 /etc/antigravity-chat
+if [[ ! -f /etc/antigravity-chat/env ]]; then
+  SESSION_SECRET_VAL="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+  printf 'SESSION_SECRET=%s\n' "${SESSION_SECRET_VAL}" > /etc/antigravity-chat/env
+  chmod 600 /etc/antigravity-chat/env
+  echo "Created /etc/antigravity-chat/env with persistent SESSION_SECRET."
+fi
 
 echo "==> [5/6] Configuring optional 2GB swap (critical on VM.Standard.E2.1.Micro 1GB RAM)..."
 TOTAL_RAM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
@@ -64,13 +78,21 @@ if [[ "${TOTAL_RAM_KB}" -lt 2200000 ]] && [[ ! -f /swapfile ]]; then
   echo '/swapfile none swap sw 0 0' >> /etc/fstab
 fi
 
-echo "==> [6/6] Final notes for Oracle Always Free Ubuntu + Tailscale:"
-echo "1. Copy / build repository into ${APP_DIR}: npm ci && npm run build"
-echo "2. Copy deploy/antigravity-chat.service -> /etc/systemd/system/antigravity-chat.service"
-echo "3. Do NOT open port 3000 in OCI Security Lists or Ubuntu iptables."
-echo "   Instead install Tailscale and expose ONLY over your tailnet HTTPS:"
-echo "     curl -fsSL https://tailscale.com/install.sh | sh"
-echo "     sudo tailscale up"
-echo "     sudo tailscale serve --bg http://127.0.0.1:3000"
-echo "4. Enable and start service:"
-echo "     sudo systemctl daemon-reload && sudo systemctl enable --now antigravity-chat"
+echo "==> [6/6] Final notes for Oracle Always Free Ubuntu + GitHub Actions + Tailscale:"
+echo "Option A (Recommended, zero VM build): Deploy prebuilt bundle via GitHub Actions:"
+echo "  - Enable GitHub Actions Tailscale Push (ENABLE_TAILSCALE_DEPLOY=true) OR set"
+echo "    GITHUB_READ_TOKEN=<fine-grained Contents:Read PAT> in /etc/antigravity-chat/env"
+echo "    so antigravity-chat-updater.timer downloads the prebuilt CI release bundle."
+echo "Option B (Local build fallback): Clone & build in ${APP_DIR}: npm ci && npm run build"
+echo ""
+echo "Install systemd units:"
+echo "  sudo cp ${APP_DIR}/deploy/antigravity-chat.service /etc/systemd/system/"
+echo "  sudo cp ${APP_DIR}/deploy/antigravity-chat-updater.service /etc/systemd/system/"
+echo "  sudo cp ${APP_DIR}/deploy/antigravity-chat-updater.timer /etc/systemd/system/"
+echo "Expose ONLY via Tailscale HTTPS (do NOT open port 3000 in OCI/iptables):"
+echo "  curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up"
+echo "  sudo tailscale serve --bg http://127.0.0.1:3000"
+echo "Enable services:"
+echo "  sudo systemctl daemon-reload"
+echo "  sudo systemctl enable --now antigravity-chat"
+echo "  sudo systemctl enable --now antigravity-chat-updater.timer"

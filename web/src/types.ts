@@ -214,6 +214,8 @@ export interface WorkspaceFileEntry {
 
 export interface QuotaBucket {
   model: string;
+  group?: string;
+  windowLabel?: string;
   remainingPercent: number | null;
   usedPercent: number | null;
   remainingLabel: string;
@@ -234,6 +236,7 @@ export interface UserPreferences {
   userId: string;
   theme: 'system' | 'light' | 'dark';
   autoApproveSafeReads: boolean;
+  notifyOnResponse: boolean;
   defaultModelId: string | null;
   defaultEffortValue: string | null;
   updatedAt: number;
@@ -243,6 +246,7 @@ export interface BootstrapResponse {
   userCount: number;
   allowPublicSignup: boolean;
   agyMode: 'real' | 'mock';
+  buildId?: string;
   authenticated: boolean;
   user: WebUser | null;
   agyProfile: AgyProfile | null;
@@ -277,6 +281,7 @@ export type WsIncomingMessage =
       kind: 'hello';
       userId: string;
       clientId: string;
+      buildId?: string;
       latestSeq: number;
       resyncRequired: boolean;
       events: SyncEventEnvelope[];

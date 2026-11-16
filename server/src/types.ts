@@ -197,6 +197,8 @@ export interface ArtifactRecord {
 
 export interface QuotaBucket {
   model: string;
+  group?: string;
+  windowLabel?: string;
   remainingPercent: number | null;
   usedPercent: number | null;
   remainingLabel: string;
@@ -217,8 +219,20 @@ export interface UserPreferences {
   userId: string;
   theme: 'system' | 'light' | 'dark';
   autoApproveSafeReads: boolean;
+  notifyOnResponse: boolean;
   defaultModelId: string | null;
   defaultEffortValue: string | null;
+  updatedAt: number;
+}
+
+export interface PushSubscriptionRecord {
+  id: string;
+  userId: string;
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+  userAgent: string;
+  createdAt: number;
   updatedAt: number;
 }
 
