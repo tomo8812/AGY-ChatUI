@@ -166,7 +166,9 @@ export function captureBrainSnapshot(
   workspaceDir?: string | null
 ): Map<string, BrainSnapshotEntry> {
   const snap = new Map<string, BrainSnapshotEntry>();
-  const roots = getAllowedBrainRoots(profileDir, workspaceDir);
+  const roots = workspaceDir
+    ? [getChatBrainHostDir(profileDir, workspaceDir)]
+    : getAllowedBrainRoots(profileDir, workspaceDir);
 
   const walk = (rootReal: string, currentDir: string) => {
     let entries: fs.Dirent[];

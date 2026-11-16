@@ -411,6 +411,77 @@ function getTsxImportUrl(): string {
   return pathToFileURL(resolved).href;
 }
 
+function symlinkIfMissing(targetPath: string, linkPath: string): void {
+  if (!fs.existsSync(targetPath)) return;
+  try {
+    const st = fs.lstatSync(linkPath);
+    if (st.isSymbolicLink() || st.isFile() || st.isDirectory()) return;
+  } catch {
+    // does not exist
+  }
+  try {
+    fs.symlinkSync(targetPath, linkPath);
+  } catch {
+    // ignore if created concurrently
+  }
+}
+
+export function ensurePerChatHomeDir(profileDir: string, workspaceDir: string): string {
+  const profileAbs = path.resolve(profileDir);
+  const workspaceAbs = path.resolve(workspaceDir);
+  const wsKey = path.basename(workspaceAbs) || 'default';
+  const chatHomeDir = path.join(profileAbs, '.chat-homes', wsKey);
+  const chatBrainHostDir = getChatBrainHostDir(profileAbs, workspaceAbs);
+  const chatScratchHostDir = path.join(profileAbs, '.chat-scratch', wsKey);
+  const chatPlaygroundHostDir = path.join(profileAbs, '.chat-playground', wsKey);
+
+  fs.mkdirSync(chatHomeDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(chatBrainHostDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(chatScratchHostDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(chatPlaygroundHostDir, { recursive: true, mode: 0o700 });
+
+  // Symlink top-level shared auth/XDG items from profileAbs
+  for (const name of ['.mock-agy-auth.json', '.config', '.local', '.cache']) {
+    symlinkIfMissing(path.join(profileAbs, name), path.join(chatHomeDir, name));
+  }
+
+  // Isolate .gemini per chat while sharing auth/config/skills
+  const profileGemini = path.join(profileAbs, '.gemini');
+  const chatGemini = path.join(chatHomeDir, '.gemini');
+  fs.mkdirSync(chatGemini, { recursive: true, mode: 0o700 });
+
+  const isolatedVendorDirs = new Set(['antigravity', 'antigravity-cli', 'jetski']);
+  const isolatedLeafDirs = new Set(['brain', 'scratch', 'playground']);
+
+  if (fs.existsSync(profileGemini)) {
+    for (const entry of fs.readdirSync(profileGemini, { withFileTypes: true })) {
+      if (isolatedVendorDirs.has(entry.name) || isolatedLeafDirs.has(entry.name)) continue;
+      symlinkIfMissing(path.join(profileGemini, entry.name), path.join(chatGemini, entry.name));
+    }
+  }
+
+  symlinkIfMissing(chatBrainHostDir, path.join(chatGemini, 'brain'));
+  symlinkIfMissing(chatScratchHostDir, path.join(chatGemini, 'scratch'));
+  symlinkIfMissing(chatPlaygroundHostDir, path.join(chatGemini, 'playground'));
+
+  for (const vendor of isolatedVendorDirs) {
+    const chatVendorDir = path.join(chatGemini, vendor);
+    const profileVendorDir = path.join(profileGemini, vendor);
+    fs.mkdirSync(chatVendorDir, { recursive: true, mode: 0o700 });
+    if (fs.existsSync(profileVendorDir)) {
+      for (const entry of fs.readdirSync(profileVendorDir, { withFileTypes: true })) {
+        if (isolatedLeafDirs.has(entry.name)) continue;
+        symlinkIfMissing(path.join(profileVendorDir, entry.name), path.join(chatVendorDir, entry.name));
+      }
+    }
+    symlinkIfMissing(chatBrainHostDir, path.join(chatVendorDir, 'brain'));
+    symlinkIfMissing(chatScratchHostDir, path.join(chatVendorDir, 'scratch'));
+    symlinkIfMissing(chatPlaygroundHostDir, path.join(chatVendorDir, 'playground'));
+  }
+
+  return chatHomeDir;
+}
+
 export function buildAgyCommandSpec(params: {
   config: AppConfig;
   subcommandArgs: string[];
@@ -421,11 +492,23 @@ export function buildAgyCommandSpec(params: {
 }): SpawnCommandSpec {
   const workspaceFallback = path.resolve(params.workspaceDir ?? params.profileDir);
 
+  const isProbeWorkspace =
+    !params.workspaceDir || path.basename(path.resolve(params.workspaceDir)) === '.probe';
+
   if (params.config.agyMode === 'mock') {
+    const effectiveHome = !isProbeWorkspace
+      ? ensurePerChatHomeDir(params.profileDir, params.workspaceDir!)
+      : params.profileDir;
     const env = buildIsolatedAgyEnv({
       profileDir: params.profileDir,
       geminiApiKey: params.geminiApiKey,
       includeMockVars: true,
+      extraEnv: !isProbeWorkspace
+        ? {
+            HOME: effectiveHome,
+            USERPROFILE: effectiveHome,
+          }
+        : undefined,
     });
     const mockArgs = params.config.mockAgentPath.endsWith('.ts')
       ? ['--import', getTsxImportUrl(), params.config.mockAgentPath, ...params.subcommandArgs]
@@ -491,14 +574,30 @@ export function buildAgyCommandSpec(params: {
     }
 
     const chatBrainHostDir = getChatBrainHostDir(profileAbs, workspaceAbs);
+    const wsKey = path.basename(workspaceAbs) || 'default';
+    const chatScratchHostDir = path.join(profileAbs, '.chat-scratch', wsKey);
+    const chatPlaygroundHostDir = path.join(profileAbs, '.chat-playground', wsKey);
     fs.mkdirSync(chatBrainHostDir, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(chatScratchHostDir, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(chatPlaygroundHostDir, { recursive: true, mode: 0o700 });
     const brainSubdirs = [
       ['.gemini', 'antigravity-cli', 'brain'],
       ['.gemini', 'antigravity', 'brain'],
       ['.gemini', 'jetski', 'brain'],
       ['.gemini', 'brain'],
     ] as const;
-    for (const rel of brainSubdirs) {
+    const scratchSubdirs = [
+      ['.gemini', 'antigravity-cli', 'scratch'],
+      ['.gemini', 'antigravity', 'scratch'],
+      ['.gemini', 'jetski', 'scratch'],
+      ['.gemini', 'scratch'],
+    ] as const;
+    const playgroundSubdirs = [
+      ['.gemini', 'antigravity', 'playground'],
+      ['.gemini', 'jetski', 'playground'],
+      ['.gemini', 'playground'],
+    ] as const;
+    for (const rel of [...brainSubdirs, ...scratchSubdirs, ...playgroundSubdirs]) {
       fs.mkdirSync(path.join(profileAbs, ...rel), { recursive: true, mode: 0o700 });
     }
 
@@ -519,6 +618,27 @@ export function buildAgyCommandSpec(params: {
       chatBrainHostDir,
       `${SANDBOX_HOME_MOUNT}/.gemini/brain`,
       '--bind',
+      chatScratchHostDir,
+      `${SANDBOX_HOME_MOUNT}/.gemini/antigravity-cli/scratch`,
+      '--bind',
+      chatScratchHostDir,
+      `${SANDBOX_HOME_MOUNT}/.gemini/antigravity/scratch`,
+      '--bind',
+      chatScratchHostDir,
+      `${SANDBOX_HOME_MOUNT}/.gemini/jetski/scratch`,
+      '--bind',
+      chatScratchHostDir,
+      `${SANDBOX_HOME_MOUNT}/.gemini/scratch`,
+      '--bind',
+      chatPlaygroundHostDir,
+      `${SANDBOX_HOME_MOUNT}/.gemini/antigravity/playground`,
+      '--bind',
+      chatPlaygroundHostDir,
+      `${SANDBOX_HOME_MOUNT}/.gemini/jetski/playground`,
+      '--bind',
+      chatPlaygroundHostDir,
+      `${SANDBOX_HOME_MOUNT}/.gemini/playground`,
+      '--bind',
       workspaceAbs,
       SANDBOX_WORKSPACE_MOUNT,
       '--chdir',
@@ -537,9 +657,18 @@ export function buildAgyCommandSpec(params: {
     };
   }
 
+  const effectiveHome = params.workspaceDir
+    ? ensurePerChatHomeDir(params.profileDir, params.workspaceDir)
+    : params.profileDir;
   const env = buildIsolatedAgyEnv({
     profileDir: params.profileDir,
     geminiApiKey: params.geminiApiKey,
+    extraEnv: params.workspaceDir
+      ? {
+          HOME: effectiveHome,
+          USERPROFILE: effectiveHome,
+        }
+      : undefined,
   });
 
   return {

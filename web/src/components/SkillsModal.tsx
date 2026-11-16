@@ -402,10 +402,10 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
 
   const scopeHint =
     scope === 'global'
-      ? 'すべてのチャットで利用可能 (.gemini/config/skills/ — 従来の .gemini/skills/ 等も自動読込)'
+      ? 'すべてのチャットで利用可能'
       : scope === 'project'
-        ? '選択中のプロジェクト内チャットへ同期 (.agents/skills/)'
-        : '現在開いているチャット専用 (.agents/skills/)';
+        ? '選択中のプロジェクト内で利用可能'
+        : 'このチャットのみで利用可能';
 
   const canUseCurrentScope =
     scope === 'global' ||
@@ -418,10 +418,7 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
         <div className="modal-head">
           <div className="row-actions">
             <SparklesIcon size={17} />
-            <div>
-              <h3>Agent Skills 管理</h3>
-              <div className="muted-xs">SKILL.md 形式で専門手順・スクリプト・参照資料を登録し、`/` から直接起動できます</div>
-            </div>
+            <h3>スキル管理</h3>
           </div>
           <button type="button" className="icon-btn" onClick={onClose} aria-label="閉じる">
             <CloseIcon size={18} />
@@ -597,7 +594,7 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
                 <SparklesIcon size={28} />
                 <div style={{ fontWeight: 600, marginTop: 6 }}>スキルを選択または新規作成</div>
                 <p className="muted-sm" style={{ maxWidth: 420 }}>
-                  有効なスキルはチャット欄で <code>/スキル名</code> と入力するか、<code>/</code> ボタンから素早く呼び出せます。モデルが必要に応じて自律的に参照することもあります。
+                  有効なスキルはチャット欄で <code>/</code> から呼び出せます。
                 </p>
               </div>
             ) : loadingDetail ? (
@@ -643,14 +640,14 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
                         });
                       }}
                     >
-                      {rawMode ? 'フォーム編集へ' : 'SKILL.md 生編集'}
+                      {rawMode ? 'フォーム編集へ' : '直接編集'}
                     </button>
                   </div>
                 </div>
 
                 {editorMode === 'new' && (
                   <label className="field">
-                    <span>スキルID（スラッグ / 半角英小文字・数字・ハイフン）</span>
+                    <span>コマンド名（半角英小文字・数字・ハイフン）</span>
                     <input
                       type="text"
                       value={slug}
@@ -663,7 +660,7 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
 
                 {rawMode ? (
                   <label className="field">
-                    <span>SKILL.md 全文（YAMLフロントマター含む）</span>
+                    <span>スキル定義</span>
                     <textarea
                       rows={13}
                       className="mono-textarea"
@@ -681,35 +678,34 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
                         type="text"
                         value={name}
                         onChange={(e) => setName(e.target.value)}
-                        placeholder="例: コードレビュー（未入力ならスラッグを使用）"
+                        placeholder="例: コードレビュー"
                       />
                     </label>
 
                     <label className="field">
-                      <span>説明（必須 — Antigravityがいつこのスキルを使うかの判断材料）</span>
+                      <span>説明（必須）</span>
                       <input
                         type="text"
                         value={description}
                         onChange={(e) => setDescription(e.target.value)}
-                        placeholder="例: 変更されたコードやPRをバグ・セキュリティ観点でレビューするときに使う"
+                        placeholder="例: コードやPRをレビューするときに使う"
                         required
                       />
                     </label>
 
                     <label className="field">
-                      <span>指示本文 (SKILL.md Instructions)</span>
+                      <span>指示内容</span>
                       <textarea
                         rows={8}
                         value={instructions}
                         onChange={(e) => setInstructions(e.target.value)}
-                        placeholder="AIに従わせたい詳細なルール・チェックリスト・出力フォーマット等を記述してください。"
+                        placeholder="従わせたいルール・手順・出力形式などを記述してください。"
                       />
                     </label>
 
                     <ToggleSwitch
                       checked={disableModelInvocation}
-                      label="モデルによる自動呼び出しを禁止（/コマンド明示時のみ実行）"
-                      description="副作用のある手順や、ユーザーが /slug を指定したときだけ実行したいスキルに推奨です。"
+                      label="/コマンド指定時のみ実行（自動呼び出ししない）"
                       onChange={setDisableModelInvocation}
                     />
                   </>
@@ -743,8 +739,7 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
                   <section className="settings-section" style={{ marginTop: 4 }}>
                     <div className="row-between" style={{ marginBottom: 8 }}>
                       <div>
-                        <h4>同梱スクリプト・参照資料 (scripts/, references/, ...)</h4>
-                        <div className="muted-xs">SKILL.md から参照できる補助ファイルを同梱できます。</div>
+                        <h4>添付ファイル・資料</h4>
                       </div>
                       <div className="row-actions">
                         <select

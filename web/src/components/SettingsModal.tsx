@@ -381,7 +381,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               checked={preferences.notifyOnResponse}
               disabled={notifBusy}
               label="応答が終了したら通知する"
-              description="AIの回答生成が完了（またはエラー終了）したときにお知らせします。iPhoneは「ホーム画面に追加」でロック画面通知にも対応します。"
               onChange={(next) => void handleToggleNotification(next)}
             />
 
@@ -425,11 +424,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <ToggleSwitch
               checked={preferences.hapticFeedback}
               label="操作・応答完了を振動で区別して知らせる"
-              description={
-                isAppleTouchHapticsFallback()
-                  ? '送信・停止タップ時の触覚スイッチフィードバックとバックグラウンドPush通知（通知音・バイブ）に対応します。'
-                  : 'メッセージ送信、生成停止、応答完了、エラー、承認要求を異なる振動パターンで伝えます。'
-              }
               onChange={(next) => void handlePrefChange({ hapticFeedback: next })}
             />
 
@@ -442,7 +436,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         <span>{item.label}</span>
                         <span className="haptic-pattern-badge">{item.patternLabel}</span>
                       </div>
-                      <div className="muted-xs">{item.description}</div>
                     </div>
                     <button
                       type="button"
@@ -455,14 +448,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 ))}
               </div>
             )}
-
-            {preferences.hapticFeedback && isAppleTouchHapticsFallback() && (
-              <div className="notif-meta-row">
-                <span className="muted-xs">
-                  iPhone/iPad の Safari / PWA では Web標準の振動API（navigator.vibrate）が OS により非対応のため、送信・停止ボタン直接タップ時のネイティブスイッチ触覚（iOS 17.4+）＋バックグラウンド完了Push通知でのバイブ/通知音による通知となります。
-                </span>
-              </div>
-            )}
           </section>
 
           <section className="settings-section">
@@ -470,7 +455,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <ToggleSwitch
               checked={preferences.autoApproveSafeReads}
               label="ワークスペース内の読み取り専用ツールを自動許可"
-              description="ファイル書き込み・削除・コマンド実行などの変更系操作は引き続き明示承認を求めます。"
               onChange={(next) => void handlePrefChange({ autoApproveSafeReads: next })}
             />
           </section>
@@ -484,16 +468,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     <span className={`status-dot ${sandbox.active ? 'ok' : 'warn'}`} />
                     <span>
                       {sandbox.active
-                        ? '有効 — 作業フォルダのみ可視 (bubblewrap / /workspace)'
+                        ? '有効 — 作業フォルダのみ可視'
                         : sandbox.backend === 'mock'
-                          ? 'モックモード（AGY_MODE=mock）'
+                          ? 'モックモード'
                           : sandbox.mode === 'off'
-                            ? '無効（SANDBOX_MODE=off）'
-                            : '未有効化（ホスト環境で実行中）'}
+                            ? '無効'
+                            : '未有効化'}
                     </span>
-                  </div>
-                  <div className="muted-xs" style={{ marginTop: 2 }}>
-                    モード: {sandbox.mode} / チャットの作業フォルダ以外はカーネル名前空間で隠蔽されます
                   </div>
                 </div>
               </div>

@@ -68,12 +68,19 @@ const ThoughtsAccordion: React.FC<{ text: string; streaming?: boolean }> = React
   if (!text.trim()) return null;
 
   return (
-    <div className="thoughts-box">
-      <button type="button" className="disclosure-btn" onClick={() => setOpen((v) => !v)}>
-        <ChevronIcon size={14} dir={open ? 'down' : 'right'} />
-        <span>思考プロセス {streaming ? '（生成中...）' : ''}</span>
+    <div className="owui-thoughts">
+      <button
+        type="button"
+        className={`owui-disclosure-btn ${streaming ? 'is-streaming' : ''}`}
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+      >
+        <span className="owui-disclosure-label">
+          {streaming ? '思考中...' : '思考プロセス'}
+        </span>
+        <ChevronIcon size={13} dir={open ? 'down' : 'right'} className="owui-disclosure-chevron" />
       </button>
-      {open && <pre className="thoughts-pre">{text}</pre>}
+      {open && <div className="owui-thoughts-body">{text}</div>}
     </div>
   );
 });
@@ -85,59 +92,57 @@ function isSubagentTool(tc: ToolCallItem): boolean {
   );
 }
 
-function formatToolStatusLabel(tc: ToolCallItem, subagent: boolean): string {
-  if (tc.status === 'completed') {
-    return subagent ? 'サブエージェント完了' : '完了';
-  }
-  if (tc.status === 'failed') {
-    return subagent ? 'サブエージェント失敗' : '失敗';
-  }
-  if (tc.status === 'in_progress' || tc.status === 'pending') {
-    return subagent ? 'サブエージェント応答中...' : '実行中...';
-  }
-  return tc.status;
-}
-
 const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ toolCalls }) => {
   const [openIds, setOpenIds] = useState<Record<string, boolean>>({});
   if (!toolCalls || toolCalls.length === 0) return null;
 
   return (
-    <div className="tools-list">
+    <div className="owui-tools-list">
       {toolCalls.map((tc) => {
         const isOpen = Boolean(openIds[tc.toolCallId]);
         const subagent = isSubagentTool(tc);
         const isRunning = tc.status === 'in_progress' || tc.status === 'pending';
-        const badgeCls =
-          tc.status === 'completed'
-            ? 'ok'
-            : tc.status === 'failed'
-              ? 'danger'
-              : 'pending';
+        const isFailed = tc.status === 'failed';
         const displayTitle = tc.subagentLabel || tc.title;
-        const statusLabel = formatToolStatusLabel(tc, subagent);
+        const hasDetails =
+          Boolean(tc.locations && tc.locations.length > 0) ||
+          Boolean(tc.contentText) ||
+          tc.rawInput !== undefined ||
+          tc.rawOutput !== undefined;
+
         return (
           <div
             key={tc.toolCallId}
-            className={`tool-chip-card ${subagent ? 'subagent-chip-card' : ''} ${
-              isRunning ? 'is-running' : ''
-            }`}
+            className={`owui-tool-item ${isRunning ? 'is-running' : ''} ${isFailed ? 'is-failed' : ''}`}
           >
             <button
               type="button"
-              className="tool-chip-head"
-              onClick={() =>
-                setOpenIds((prev) => ({ ...prev, [tc.toolCallId]: !prev[tc.toolCallId] }))
-              }
+              className="owui-tool-head"
+              onClick={() => {
+                if (hasDetails) {
+                  setOpenIds((prev) => ({ ...prev, [tc.toolCallId]: !prev[tc.toolCallId] }));
+                }
+              }}
+              aria-expanded={hasDetails ? isOpen : undefined}
             >
-              <span className={`status-dot ${badgeCls} ${isRunning ? 'pulse' : ''}`} />
-              {subagent && <span className="subagent-tag">Subagent</span>}
-              <span className="tool-title truncate">{displayTitle}</span>
-              <span className={`tool-status-label muted-xs ${badgeCls}`}>{statusLabel}</span>
-              <ChevronIcon size={13} dir={isOpen ? 'down' : 'right'} />
+              {isRunning ? (
+                <span className="owui-tool-spinner" aria-hidden="true" />
+              ) : isFailed ? (
+                <CloseIcon size={13} className="owui-tool-icon-fail" />
+              ) : (
+                <CheckIcon size={13} className="owui-tool-icon-ok" />
+              )}
+              {subagent && <span className="owui-subagent-tag">Subagent</span>}
+              <span className="owui-tool-title truncate">
+                {isRunning ? `実行中: ${displayTitle}` : displayTitle}
+              </span>
+              {isFailed && <span className="owui-tool-fail-label">失敗</span>}
+              {hasDetails && (
+                <ChevronIcon size={13} dir={isOpen ? 'down' : 'right'} className="owui-disclosure-chevron" />
+              )}
             </button>
-            {isOpen && (
-              <div className="tool-chip-body">
+            {isOpen && hasDetails && (
+              <div className="owui-tool-body">
                 {tc.locations && tc.locations.length > 0 && (
                   <div className="muted-xs">
                     対象: {tc.locations.map((l) => l.path).join(', ')}
@@ -307,7 +312,6 @@ const MessageRow: React.FC<{
       msg.status === 'streaming'
         ? [...msg.toolCalls].reverse().find((t) => t.status === 'in_progress' || t.status === 'pending')
         : undefined;
-    const activeToolIsSubagent = activeToolCall ? isSubagentTool(activeToolCall) : false;
 
     return (
       <div className="msg-row assistant">
@@ -346,24 +350,13 @@ const MessageRow: React.FC<{
               />
               {msg.status === 'streaming' && <span className="stream-cursor" />}
             </div>
-          ) : msg.status === 'streaming' && !activeToolCall ? (
+          ) : msg.status === 'streaming' && !activeToolCall && !msg.thoughtsText.trim() ? (
             <div className="streaming-placeholder">
               <span className="pulse-dot" /> 応答を生成中...
             </div>
           ) : msg.status === 'cancelled' ? (
             <div className="muted-sm">（生成がキャンセルされました）</div>
           ) : null}
-
-          {activeToolCall && (
-            <div className="streaming-placeholder subagent-live-banner">
-              <span className="pulse-dot" />
-              <span>
-                {activeToolIsSubagent
-                  ? `${activeToolCall.subagentLabel || activeToolCall.title} が応答中...`
-                  : `${activeToolCall.title} を実行中...`}
-              </span>
-            </div>
-          )}
 
           {msg.errorMessage && <div className="error-box">{msg.errorMessage}</div>}
 
@@ -886,8 +879,11 @@ const ChatComposer = React.memo(
                     <EffortBar
                       options={effortOptions}
                       value={currentEffortValue}
+                      modelOptions={modelOptions}
+                      selectedModelId={currentModelValue}
                       disabled={configBusy}
                       onChange={onChangeEffort}
+                      onChangeModel={onChangeModel}
                     />
                   )}
 
