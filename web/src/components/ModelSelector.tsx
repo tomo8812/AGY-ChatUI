@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { AcpSelectOption } from '../types';
-import { CheckIcon, ChevronIcon, ModelIcon } from './Icons';
+import { CheckIcon, ChevronIcon } from './Icons';
 
 interface ModelSelectorProps {
   options: AcpSelectOption[];
@@ -194,8 +194,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
         aria-label="モデル選択"
         title={displayLabel ? `モデル: ${displayLabel}` : 'モデル選択'}
       >
-        <ModelIcon size={14} className="model-trigger-icon" />
-        <span className="model-trigger-label truncate">{displayLabel}</span>
+        <span className="model-trigger-label">{displayLabel}</span>
         <ChevronIcon size={13} dir={open ? 'up' : 'down'} className="model-trigger-chevron" />
       </button>
 

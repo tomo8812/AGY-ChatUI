@@ -60,23 +60,6 @@ export const EffortDialIcon: React.FC<IconProps & { ratio?: number; animated?: b
   );
 };
 
-export const ModelIcon: React.FC<IconProps> = ({ size = 15, className }) => (
-  <svg
-    width={size}
-    height={size}
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="1.85"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    className={className}
-  >
-    <path d="M12 3l1.9 5.6L19.5 10.5l-5.6 1.9L12 18l-1.9-5.6L4.5 10.5l5.6-1.9L12 3z" />
-    <path d="M19 3v4M21 5h-4" />
-  </svg>
-);
-
 export const CloseIcon: React.FC<IconProps> = ({ size = 18, className }) => (
   <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
     <path d="M18 6L6 18M6 6l12 12" />
