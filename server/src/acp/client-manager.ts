@@ -2521,8 +2521,31 @@ export class AcpClientManager {
       };
       turn.lastParentActivityAt = now;
       if (Array.isArray(stateObj.background)) {
-        turn.backgroundWorkCount = stateObj.background.length;
-        for (const item of stateObj.background) {
+        const activeBg = stateObj.background;
+        turn.backgroundWorkCount = activeBg.length;
+        const allBridges: ActiveTurnBridge[] = [...worker.turnBridges.values()];
+        if (worker.backgroundBridge && !allBridges.includes(worker.backgroundBridge)) {
+          allBridges.push(worker.backgroundBridge);
+        }
+        for (const b of allBridges) {
+          if (b === turn || !b.initialPromptDone || b.backgroundWorkCount === 0) continue;
+          if (activeBg.length === 0) {
+            b.backgroundWorkCount = 0;
+          } else {
+            const stillHasWorkForB = activeBg.some(
+              (item) =>
+                item &&
+                ((typeof item.sessionId === 'string' && b.subagents.has(item.sessionId)) ||
+                  (typeof item.toolCallId === 'string' &&
+                    (b.asyncSubagentToolIds.has(item.toolCallId) ||
+                      b.toolCalls.some((t) => t.toolCallId === item.toolCallId))))
+            );
+            if (!stillHasWorkForB) {
+              b.backgroundWorkCount = 0;
+            }
+          }
+        }
+        for (const item of activeBg) {
           if (item && item.type === 'subagent' && typeof item.sessionId === 'string') {
             if (!turn.subagents.has(item.sessionId)) {
               this.upsertSubagentToolCall(worker, turn, {
@@ -2535,6 +2558,12 @@ export class AcpClientManager {
         }
       } else if (stateObj.background === null) {
         turn.backgroundWorkCount = 0;
+        for (const b of worker.turnBridges.values()) {
+          if (b.initialPromptDone) b.backgroundWorkCount = 0;
+        }
+        if (worker.backgroundBridge && worker.backgroundBridge.initialPromptDone) {
+          worker.backgroundBridge.backgroundWorkCount = 0;
+        }
       }
       if (stateObj.state) {
         turn.parentState = stateObj.state;
