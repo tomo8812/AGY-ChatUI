@@ -1218,25 +1218,72 @@ export const App: React.FC = () => {
     return res.chat;
   }, []);
 
+  const optionsByModelRef = useRef<Map<string, ParsedSessionOptions>>(new Map());
+
+  useEffect(() => {
+    const activeOpts = activeChat ? sessionOptions : userOptions;
+    if (activeOpts?.currentModelId) {
+      optionsByModelRef.current.set(activeOpts.currentModelId, activeOpts);
+    }
+  }, [activeChat, sessionOptions, userOptions]);
+
   const handleChangeModel = useCallback(async (modelId: string) => {
     const curChat = activeChatRef.current;
+    const cachedOpts = optionsByModelRef.current.get(modelId);
+
     if (curChat) {
+      setChats((prev) => prev.map((c) => (c.id === curChat.id ? { ...c, modelId } : c)));
+      setDraftCreatedChat((prev) =>
+        prev && prev.id === curChat.id ? { ...prev, modelId } : prev
+      );
+      setSessionOptions((prev) => {
+        if (cachedOpts) return cachedOpts;
+        if (!prev) return prev;
+        return {
+          ...prev,
+          currentModelId: modelId,
+          configOptions: prev.configOptions.map((o) =>
+            o.id === prev.modelOptionId || o.category === 'model'
+              ? { ...o, currentValue: modelId }
+              : o
+          ),
+        };
+      });
+
       const res = await api.patchChat(curChat.id, { modelId });
       setChats((prev) => prev.map((c) => (c.id === curChat.id ? { ...c, ...res.chat } : c)));
       setDraftCreatedChat((prev) =>
         prev && prev.id === curChat.id ? { ...prev, ...res.chat } : prev
       );
-      if (res.sessionOptions) setSessionOptions(res.sessionOptions);
+      if (res.sessionOptions) {
+        optionsByModelRef.current.set(modelId, res.sessionOptions);
+        setSessionOptions(res.sessionOptions);
+      }
       return;
     }
 
     setPreferences((prev) => (prev ? { ...prev, defaultModelId: modelId } : prev));
+    setUserOptions((prev) => {
+      if (cachedOpts) return cachedOpts;
+      if (!prev) return prev;
+      return {
+        ...prev,
+        currentModelId: modelId,
+        configOptions: prev.configOptions.map((o) =>
+          o.id === prev.modelOptionId || o.category === 'model'
+            ? { ...o, currentValue: modelId }
+            : o
+        ),
+      };
+    });
+
     const [prefRes, optRes] = await Promise.all([
       api.updatePreferences({ defaultModelId: modelId }),
       api.getAgyOptions(modelId),
     ]);
     let nextPrefs = prefRes.preferences;
     if (optRes.sessionOptions) {
+      optionsByModelRef.current.set(modelId, optRes.sessionOptions);
       setUserOptions(optRes.sessionOptions);
       const nextEffortOpt = optRes.sessionOptions.configOptions.find(
         (o) => o.id === optRes.sessionOptions?.effortOptionId || o.category === 'thought_level'
@@ -1249,8 +1296,12 @@ export const App: React.FC = () => {
         const fallbackEffort =
           nextEffortOpt.currentValue || nextEffortOpt.options[0]?.value || null;
         if (fallbackEffort) {
-          const synced = await api.updatePreferences({ defaultEffortValue: fallbackEffort });
-          nextPrefs = synced.preferences;
+          nextPrefs = { ...nextPrefs, defaultEffortValue: fallbackEffort };
+          setPreferences(nextPrefs);
+          void api.updatePreferences({ defaultEffortValue: fallbackEffort }).then((synced) => {
+            setPreferences(synced.preferences);
+          });
+          return;
         }
       }
     }
@@ -1260,6 +1311,23 @@ export const App: React.FC = () => {
   const handleChangeEffort = useCallback(async (effortValue: string) => {
     const curChat = activeChatRef.current;
     if (curChat) {
+      setChats((prev) => prev.map((c) => (c.id === curChat.id ? { ...c, effortValue } : c)));
+      setDraftCreatedChat((prev) =>
+        prev && prev.id === curChat.id ? { ...prev, effortValue } : prev
+      );
+      setSessionOptions((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          currentEffortValue: effortValue,
+          configOptions: prev.configOptions.map((o) =>
+            o.id === prev.effortOptionId || o.category === 'thought_level'
+              ? { ...o, currentValue: effortValue }
+              : o
+          ),
+        };
+      });
+
       const res = await api.patchChat(curChat.id, { effortValue });
       setChats((prev) => prev.map((c) => (c.id === curChat.id ? { ...c, ...res.chat } : c)));
       setDraftCreatedChat((prev) =>

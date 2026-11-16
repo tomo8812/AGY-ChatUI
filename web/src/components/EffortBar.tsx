@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { AcpSelectOption } from '../types';
-import { CheckIcon, ChevronIcon, EffortDialIcon } from './Icons';
+import { CheckIcon, ChevronIcon } from './Icons';
 
 interface EffortBarProps {
   options: AcpSelectOption[];
@@ -65,6 +65,7 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
   const [view, setView] = useState<'effort' | 'model'>('effort');
   const [dragRatio, setDragRatio] = useState<number | null>(null);
   const [pendingValue, setPendingValue] = useState<string | null>(null);
+  const [pendingModelId, setPendingModelId] = useState<string | null>(null);
   const [pcAnchorStyle, setPcAnchorStyle] = useState<React.CSSProperties>({});
 
   const isDesktop = useIsDesktop();
@@ -79,13 +80,31 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
   const safeOptions = options ?? [];
   const safeModelOptions = modelOptions ?? [];
   const canSwitchModel = safeModelOptions.length > 0 && Boolean(onChangeModel);
+  const hasEffortOptions = safeOptions.length > 0;
 
-  // Clear optimistic pendingValue once prop `value` catches up
   useEffect(() => {
     if (pendingValue !== null && value === pendingValue) {
       setPendingValue(null);
     }
   }, [value, pendingValue]);
+
+  useEffect(() => {
+    if (pendingModelId !== null && selectedModelId === pendingModelId) {
+      setPendingModelId(null);
+    }
+  }, [selectedModelId, pendingModelId]);
+
+  // If options changed after a model switch and pendingValue is no longer valid, clear it
+  useEffect(() => {
+    if (pendingValue !== null && safeOptions.length > 0 && !safeOptions.some((o) => o.value === pendingValue)) {
+      setPendingValue(null);
+    }
+  }, [safeOptions, pendingValue]);
+
+  const effectiveModelId = pendingModelId ?? selectedModelId;
+  const selectedModelOpt =
+    safeModelOptions.find((o) => o.value === effectiveModelId) ?? safeModelOptions[0];
+  const modelDisplayName = selectedModelOpt?.name ?? effectiveModelId;
 
   const effectiveValue = pendingValue ?? value;
   const foundIndex = safeOptions.findIndex((o) => o.value === effectiveValue);
@@ -98,8 +117,15 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
       : committedIndex;
 
   const previewOption = safeOptions[previewIndex] ?? safeOptions[0];
-  const previewLabel = formatEffortLabel(previewOption, previewOption?.value ?? effectiveValue);
-  const committedLabel = formatEffortLabel(safeOptions[committedIndex], effectiveValue);
+  const previewLabel = hasEffortOptions
+    ? formatEffortLabel(previewOption, previewOption?.value ?? effectiveValue)
+    : '';
+  const committedLabel = hasEffortOptions
+    ? formatEffortLabel(safeOptions[committedIndex], effectiveValue)
+    : '';
+
+  const triggerText = [modelDisplayName, committedLabel].filter(Boolean).join(' ');
+  const headerText = [modelDisplayName, previewLabel].filter(Boolean).join(' ');
 
   const ratio =
     dragRatio !== null
@@ -107,19 +133,6 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
       : safeOptions.length <= 1
         ? 1
         : committedIndex / maxIndex;
-
-  const iconRatio = (() => {
-    if (safeOptions.length > 1) return ratio;
-    const singleVal = safeOptions[0]?.value.trim().toLowerCase() ?? '';
-    if (singleVal === 'none' || singleVal === 'off' || singleVal === 'minimal' || singleVal === 'min' || singleVal === 'low') {
-      return 0;
-    }
-    if (singleVal === 'medium' || singleVal === 'med') return 0.5;
-    if (singleVal === 'high' || singleVal === 'max' || singleVal === 'maximum' || singleVal === 'xhigh') {
-      return 1;
-    }
-    return 0.5;
-  })();
 
   const updatePcPosition = useCallback(() => {
     const trigger = triggerRef.current;
@@ -142,7 +155,7 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
   useEffect(() => {
     if (!open) {
       setDragRatio(null);
-      setView('effort');
+      setView(hasEffortOptions ? 'effort' : 'model');
       activePointerIdRef.current = null;
       isThumbDragRef.current = false;
       dragHasMovedRef.current = false;
@@ -151,7 +164,7 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.preventDefault();
-        if (view === 'model') {
+        if (view === 'model' && hasEffortOptions) {
           setView('effort');
         } else {
           setOpen(false);
@@ -170,9 +183,9 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('resize', onResize);
     };
-  }, [open, view, isDesktop, updatePcPosition]);
+  }, [open, view, hasEffortOptions, isDesktop, updatePcPosition]);
 
-  if (safeOptions.length === 0) return null;
+  if (!hasEffortOptions && safeModelOptions.length === 0) return null;
 
   const getThumbPad = (): number => {
     const thumbEl = thumbRef.current;
@@ -197,7 +210,6 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
     const thumbEl = thumbRef.current;
     if (!thumbEl) return false;
     const rect = thumbEl.getBoundingClientRect();
-    // Generous hit margin around the circular thumb (6px)
     const pad = 6;
     return (
       clientX >= rect.left - pad &&
@@ -226,17 +238,13 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
     activePointerIdRef.current = e.pointerId;
     dragStartXRef.current = e.clientX;
     dragHasMovedRef.current = false;
-
-    const hitThumb = isHitOnThumb(e.clientX, e.clientY);
-    isThumbDragRef.current = hitThumb;
+    isThumbDragRef.current = isHitOnThumb(e.clientX, e.clientY);
 
     try {
       e.currentTarget.setPointerCapture(e.pointerId);
     } catch {
       // ignore
     }
-    // IMPORTANT: Do NOT set dragRatio on pointerDown!
-    // Only follow pointer movement if the circular thumb was pressed and dragged.
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -267,12 +275,9 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
     if (wasThumbDrag) {
       const finalRatio = computeRatioFromClientX(e.clientX);
       const nearestIdx = Math.round(finalRatio * maxIndex);
-      // Update pendingValue BEFORE clearing dragRatio so CSS animates smoothly
-      // from finalRatio directly to nearestIdx without snapping back to old value
       commitIndex(nearestIdx);
       setDragRatio(null);
     } else {
-      // Track slot click (or stationary thumb tap): animate smoothly to clicked level
       const clickRatio = computeRatioFromClientX(e.clientX);
       const targetIdx = Math.round(clickRatio * maxIndex);
       setDragRatio(null);
@@ -289,73 +294,76 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
   };
 
   const thumbDiameter = isDesktop ? 36 : 44;
-  const trackEndDiameter = thumbDiameter + 6; // 3px inset on each side
+  const trackEndDiameter = thumbDiameter + 6;
 
-  const renderSlider = () => (
-    <div className={`effort-pill-shell ${isDesktop ? 'is-compact' : ''}`}>
-      <div
-        ref={trackRef}
-        className={`effort-pill-track ${dragRatio !== null ? 'is-dragging' : ''}`}
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
-        onPointerCancel={handlePointerCancel}
-      >
+  const renderSlider = () => {
+    if (!hasEffortOptions) return null;
+    return (
+      <div className={`effort-pill-shell ${isDesktop ? 'is-compact' : ''}`}>
         <div
-          className="effort-pill-fill"
-          style={{
-            width: `calc(${trackEndDiameter}px + ${ratio} * (100% - ${trackEndDiameter}px))`,
-          }}
-        />
+          ref={trackRef}
+          className={`effort-pill-track ${dragRatio !== null ? 'is-dragging' : ''}`}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerCancel}
+        >
+          <div
+            className="effort-pill-fill"
+            style={{
+              width: `calc(${trackEndDiameter}px + ${ratio} * (100% - ${trackEndDiameter}px))`,
+            }}
+          />
 
-        <div className="effort-pill-dots" aria-hidden="true">
-          {safeOptions.map((opt, idx) => {
-            const dotRatio = safeOptions.length <= 1 ? 1 : idx / maxIndex;
-            const isCovered = dotRatio <= ratio + 0.001;
-            return (
-              <span
-                key={opt.value}
-                className={`effort-pill-dot ${isCovered ? 'covered' : ''}`}
-                style={{
-                  left: `calc(${trackEndDiameter / 2}px + ${dotRatio} * (100% - ${trackEndDiameter}px))`,
-                }}
-              />
-            );
-          })}
+          <div className="effort-pill-dots" aria-hidden="true">
+            {safeOptions.map((opt, idx) => {
+              const dotRatio = safeOptions.length <= 1 ? 1 : idx / maxIndex;
+              const isCovered = dotRatio <= ratio + 0.001;
+              return (
+                <span
+                  key={opt.value}
+                  className={`effort-pill-dot ${isCovered ? 'covered' : ''}`}
+                  style={{
+                    left: `calc(${trackEndDiameter / 2}px + ${dotRatio} * (100% - ${trackEndDiameter}px))`,
+                  }}
+                />
+              );
+            })}
+          </div>
+
+          <div
+            ref={thumbRef}
+            className="effort-pill-thumb"
+            aria-hidden="true"
+            style={{
+              left: `calc(3px + ${ratio} * (100% - ${trackEndDiameter}px))`,
+            }}
+          />
+
+          <input
+            type="range"
+            className="effort-pill-sr-range"
+            aria-label="推論レベル (Effort)"
+            aria-valuetext={previewLabel}
+            min={0}
+            max={Math.max(0, safeOptions.length - 1)}
+            step={1}
+            value={previewIndex}
+            disabled={disabled || safeOptions.length <= 1}
+            onChange={(e) => {
+              const nextIdx = Number.parseInt(e.target.value, 10);
+              commitIndex(nextIdx);
+            }}
+          />
         </div>
-
-        <div
-          ref={thumbRef}
-          className="effort-pill-thumb"
-          aria-hidden="true"
-          style={{
-            left: `calc(3px + ${ratio} * (100% - ${trackEndDiameter}px))`,
-          }}
-        />
-
-        <input
-          type="range"
-          className="effort-pill-sr-range"
-          aria-label="推論レベル (Effort)"
-          aria-valuetext={previewLabel}
-          min={0}
-          max={Math.max(0, safeOptions.length - 1)}
-          step={1}
-          value={previewIndex}
-          disabled={disabled || safeOptions.length <= 1}
-          onChange={(e) => {
-            const nextIdx = Number.parseInt(e.target.value, 10);
-            commitIndex(nextIdx);
-          }}
-        />
       </div>
-    </div>
-  );
+    );
+  };
 
   const renderModelList = () => (
     <div className="effort-model-list" role="listbox" aria-label="モデルを選択">
       {safeModelOptions.map((opt) => {
-        const isSelected = opt.value === selectedModelId;
+        const isSelected = opt.value === effectiveModelId;
         return (
           <button
             key={opt.value}
@@ -364,10 +372,11 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
             aria-selected={isSelected}
             className={`effort-model-item ${isSelected ? 'selected' : ''}`}
             onClick={() => {
-              if (opt.value !== selectedModelId) {
+              if (opt.value !== effectiveModelId) {
+                setPendingModelId(opt.value);
                 onChangeModel?.(opt.value);
               }
-              setOpen(false);
+              setView('effort');
             }}
           >
             <span className="effort-model-name truncate">{opt.name}</span>
@@ -379,6 +388,8 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
       })}
     </div>
   );
+
+  const activeView = view === 'model' || !hasEffortOptions ? 'model' : 'effort';
 
   const overlayNode =
     open && typeof document !== 'undefined'
@@ -394,11 +405,11 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
                 style={pcAnchorStyle}
                 role="dialog"
                 aria-modal="true"
-                aria-label={view === 'model' ? 'モデル選択' : '推論レベル (Effort)'}
+                aria-label={activeView === 'model' ? 'モデル選択' : '推論レベル (Effort)'}
                 onClick={(e) => e.stopPropagation()}
               >
-                {view === 'effort' ? (
-                  <div className="effort-pc-content">
+                {activeView === 'effort' ? (
+                  <div key="effort" className="effort-pc-content effort-view-anim">
                     <button
                       type="button"
                       className={`effort-level-switch-btn ${canSwitchModel ? 'clickable' : ''}`}
@@ -408,16 +419,13 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
                       disabled={!canSwitchModel}
                       title={canSwitchModel ? 'クリックしてモデルを切替' : undefined}
                     >
-                      <span className="effort-dial-fixed">
-                        <EffortDialIcon size={17} ratio={iconRatio} animated={dragRatio === null} />
-                      </span>
-                      <span className="effort-level-text">{previewLabel}</span>
+                      <span className="effort-level-text">{headerText}</span>
                       {canSwitchModel && <ChevronIcon size={13} dir="right" className="effort-level-chevron" />}
                     </button>
                     {renderSlider()}
                   </div>
                 ) : (
-                  <div className="effort-pc-model-content">
+                  <div key="model" className="effort-pc-model-content effort-view-anim">
                     {renderModelList()}
                   </div>
                 )}
@@ -435,11 +443,11 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
                 className="effort-overlay-stage"
                 role="dialog"
                 aria-modal="true"
-                aria-label={view === 'model' ? 'モデル選択' : '推論レベル (Effort)'}
+                aria-label={activeView === 'model' ? 'モデル選択' : '推論レベル (Effort)'}
                 onClick={(e) => e.stopPropagation()}
               >
-                {view === 'effort' ? (
-                  <>
+                {activeView === 'effort' ? (
+                  <div key="effort" className="effort-mobile-effort-view effort-view-anim">
                     <button
                       type="button"
                       className={`effort-overlay-label-row effort-level-switch-btn ${canSwitchModel ? 'clickable' : ''}`}
@@ -448,10 +456,7 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
                       }}
                       disabled={!canSwitchModel}
                     >
-                      <span className="effort-dial-fixed">
-                        <EffortDialIcon size={21} ratio={iconRatio} animated={dragRatio === null} />
-                      </span>
-                      <span className="effort-overlay-label">{previewLabel}</span>
+                      <span className="effort-overlay-label">{headerText}</span>
                       {canSwitchModel && <ChevronIcon size={15} dir="right" className="effort-level-chevron" />}
                     </button>
 
@@ -460,19 +465,21 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
                     {previewOption?.description && (
                       <div className="effort-overlay-desc">{previewOption.description}</div>
                     )}
-                  </>
+                  </div>
                 ) : (
-                  <div className="effort-mobile-model-card">
-                    <div className="effort-mobile-model-head">
-                      <button
-                        type="button"
-                        className="effort-mobile-back-btn"
-                        onClick={() => setView('effort')}
-                      >
-                        <ChevronIcon size={14} dir="left" />
-                        <span>思考量 ({previewLabel})</span>
-                      </button>
-                    </div>
+                  <div key="model" className="effort-mobile-model-card effort-view-anim">
+                    {hasEffortOptions && (
+                      <div className="effort-mobile-model-head">
+                        <button
+                          type="button"
+                          className="effort-mobile-back-btn"
+                          onClick={() => setView('effort')}
+                        >
+                          <ChevronIcon size={14} dir="left" />
+                          <span>{headerText}</span>
+                        </button>
+                      </div>
+                    )}
                     {renderModelList()}
                   </div>
                 )}
@@ -490,17 +497,18 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
         type="button"
         className={`effort-trigger-btn ${open ? 'active' : ''}`}
         onClick={() => {
-          if (!disabled) setOpen((v) => !v);
+          if (!disabled) {
+            setView(hasEffortOptions ? 'effort' : 'model');
+            setOpen((v) => !v);
+          }
         }}
         disabled={disabled}
         aria-expanded={open}
         aria-haspopup="dialog"
-        title={`推論レベル: ${committedLabel}`}
+        title={triggerText}
       >
-        <span className="effort-dial-fixed">
-          <EffortDialIcon size={17} ratio={iconRatio} animated={dragRatio === null} />
-        </span>
-        <span className="effort-trigger-label">{committedLabel}</span>
+        <span className="effort-trigger-label">{triggerText}</span>
+        <ChevronIcon size={12} dir={open ? 'up' : 'down'} className="effort-level-chevron" />
       </button>
 
       {overlayNode}

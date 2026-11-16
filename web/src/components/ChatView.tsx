@@ -30,7 +30,6 @@ import {
   StopIcon,
 } from './Icons';
 import { MarkdownContent } from './MarkdownContent';
-import { ModelSelector } from './ModelSelector';
 
 interface ChatViewProps {
   chat: ChatRecord | null;
@@ -863,19 +862,10 @@ const ChatComposer = React.memo(
                   >
                     <SlashIcon size={16} />
                   </button>
-
-                  {modelOptions.length > 0 && (
-                    <ModelSelector
-                      options={modelOptions}
-                      value={currentModelValue}
-                      disabled={configBusy}
-                      onChange={onChangeModel}
-                    />
-                  )}
                 </div>
 
                 <div className="composer-toolbar-right">
-                  {effortOptions.length > 0 && (
+                  {(effortOptions.length > 0 || modelOptions.length > 0) && (
                     <EffortBar
                       options={effortOptions}
                       value={currentEffortValue}
