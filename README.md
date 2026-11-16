@@ -17,12 +17,12 @@ Google の公式 CLI（[`agy`](https://antigravity.google)）を **無改変の�
   - 「新しいチャット」を押しただけでは空チャットを履歴に増やさず、最初のメッセージ送信／応答が確定してからサイドバーへ永続表示します。
   - コンパクト化された利用枠（Quota）モニター（公式 `agy -p /usage` の 4列 TSV / JSON 出力をモデル系統別のグループ見出し＋見やすい残量バーとして可視化し、5分クールダウン付きの低頻度自動更新＋手動更新に対応）。
   - **応答完了通知（Web Push + ブラウザ通知）**: 設定モーダルのスライド式トグルスイッチからオン/オフでき、PC ブラウザのバックグラウンドタブや iPhone ホーム画面追加 PWA のロック画面でも応答完了通知を受け取れます（純粋 Node 24 暗号化実装・VAPID 鍵は SQLite 永続化・テスト通知ボタン付き）。
-- **アップデート検知 ＆ 高速デプロイ（GitHub Actions 事前ビルド）**
-  - **GitHub Actions**（[`.github/workflows/ci-deploy.yml`](.github/workflows/ci-deploy.yml)）が `typecheck`・`npm test`・`npm run build` を実行し、純粋 JS サーバー実行依存のみ（約 41 MB・ネイティブバイナリ無し・ARM64/x64 共通）のバンドル `antigravity-chat-bundle.tar.gz` を作成して GitHub Release `latest` に公開します。Oracle 側 2 コア VM で重い Vite/TypeScript ビルドを走らせる必要がありません。
+- **アップデート検知 ＆ 高速デプロイ（GitHub Actions 事前ビルド ＆ SemVer 自動リリース）**
+  - **GitHub Actions**（[`.github/workflows/ci-deploy.yml`](.github/workflows/ci-deploy.yml) / [`scripts/version.mjs`](scripts/version.mjs)）が Conventional Commits（`feat:` で minor、`BREAKING CHANGE` / `!:` で major、それ以外で patch）に基づき SemVer タグ（`vX.Y.Z`）を自動採番し、`typecheck`・`npm test`・`npm run build` を実行。純粋 JS サーバー実行依存のみ（約 41 MB・ネイティブバイナリ無し・ARM64/x64 共通）のバンドル `antigravity-chat-bundle.tar.gz` を作成し、リリースノート付きのバージョン別 GitHub Release（例: `v1.1.0`）として公開します（既存 VM 互換のため `latest` ミラーも同期更新）。Oracle 側 2 コア VM で重い Vite/TypeScript ビルドを走らせる必要がありません。
   - **デプロイ方式（どちらも可）**:
     1. **Tailscale 経由の即時プッシュデプロイ（最速）**: GitHub Secrets / Variables に Tailscale OAuth と SSH 情報を設定すると、`main` への push 完了直後に GitHub Actions から Tailscale 越しに自動デプロイ・再起動します。
-    2. **サーバー側自動更新タイマー（ポーリング）**: `deploy/antigravity-chat-updater.timer` が 3 分ごとに更新を確認し、GitHub Actions ビルド済みバンドルを数秒で展開して再起動します（公開リポジトリはトークン不要。非公開リポジトリの場合のみ `/etc/antigravity-chat/env` に `GITHUB_READ_TOKEN` を設定、未設定時は `git pull --ff-only` + ローカルビルドにフォールバック）。
-  - **クライアント / PWA**: `buildId` 不一致（`/api/health`・`/api/auth/bootstrap`・WebSocket `hello`・`BUILD_INFO.json` ハッシュ連動）および Service Worker 更新を検知すると、入力中・応答生成中・認証入力中でないタイミングで自動リロードします（作業中は通知バナー表示）。
+    2. **サーバー側自動更新タイマー（ポーリング）**: `deploy/antigravity-chat-updater.timer` が 3 分ごとに最新リリースを確認し、GitHub Actions ビルド済みバンドルを数秒で展開して再起動します（公開リポジトリはトークン不要。`/etc/antigravity-chat/env` に `RELEASE_TAG=vX.Y.Z` を指定すれば特定バージョン固定・ロールバックも可能。非公開リポジトリの場合のみ `GITHUB_READ_TOKEN` を設定、未設定時は `git pull --ff-only` + ローカルビルドにフォールバック）。
+  - **クライアント / PWA**: `buildId`・バージョン不一致（`/api/health`・`/api/auth/bootstrap`・WebSocket `hello`・`BUILD_INFO.json` ハッシュ連動）および Service Worker キャッシュ更新（ビルドごとに `sw.js` へバージョンを刻印）を検知すると、入力中・応答生成中・認証入力中でないタイミングで自動リロードします（作業中は通知バナー表示、設定モーダルで現在のバージョン・SHA を確認可能）。
 - **プロジェクト（共有カスタム指示 ＆ 資料）**
   - プロジェクト配下のチャット作成時に資料を `.project-context/` へ Copy-on-Write で複製するため、チャット内の編集で原紙や別チャットが汚染されません。
   - プロジェクト更新時は既存チャットに「最新化」バナーを表示し、ユーザー操作で明示的に同期できます。

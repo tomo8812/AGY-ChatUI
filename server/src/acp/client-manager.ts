@@ -406,7 +406,7 @@ export class AcpClientManager {
         conn.agent.request(methods.agent.initialize, {
           protocolVersion: PROTOCOL_VERSION,
           clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-          clientInfo: { name: 'antigravity-chat-ui', title: 'Antigravity Chat UI', version: '1.0.0' },
+          clientInfo: { name: 'antigravity-chat-ui', title: 'Antigravity Chat UI', version: this.config.appVersion },
         }),
         new Promise<never>((_, rej) => setTimeout(() => rej(new Error('ACP options initialize timeout')), 15_000)),
       ]);
@@ -492,7 +492,7 @@ export class AcpClientManager {
         conn.agent.request(methods.agent.initialize, {
           protocolVersion: PROTOCOL_VERSION,
           clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-          clientInfo: { name: 'antigravity-chat-ui', title: 'Antigravity Chat UI', version: '1.0.0' },
+          clientInfo: { name: 'antigravity-chat-ui', title: 'Antigravity Chat UI', version: this.config.appVersion },
         }),
         new Promise<never>((_, rej) => setTimeout(() => rej(new Error('ACP initialize timeout')), 15_000)),
       ]);
@@ -542,7 +542,7 @@ export class AcpClientManager {
       );
       const init = await conn.agent.request(methods.agent.initialize, {
         protocolVersion: PROTOCOL_VERSION,
-        clientInfo: { name: 'antigravity-chat-ui', version: '1.0.0' },
+        clientInfo: { name: 'antigravity-chat-ui', version: this.config.appVersion },
       });
       if (init.agentCapabilities?.auth?.logout) {
         await conn.agent.request(methods.agent.logout, {});
@@ -1168,7 +1168,7 @@ export class AcpClientManager {
       clientInfo: {
         name: 'antigravity-chat-ui',
         title: 'Antigravity Chat UI',
-        version: '1.0.0',
+        version: this.config.appVersion,
       },
     });
 

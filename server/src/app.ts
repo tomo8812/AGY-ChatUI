@@ -23,10 +23,12 @@ import { registerSkillRoutes } from './routes/skill-routes.js';
 import { SkillService } from './skills/skill-service.js';
 import { PushNotificationService } from './notifications/web-push.js';
 import { SyncHub } from './sync/hub.js';
+import { loadAppBuildInfo, type AppBuildInfo } from './version.js';
 
 export interface AppContext {
   app: FastifyInstance;
   config: AppConfig;
+  buildInfo: AppBuildInfo;
   db: AppDatabase;
   hub: SyncHub;
   acp: AcpClientManager;
@@ -36,30 +38,6 @@ export interface AppContext {
   pushService: PushNotificationService;
   skillService: SkillService;
   shutdown: () => Promise<void>;
-}
-
-function computeBuildId(webDistDir: string): string {
-  if (process.env.AGY_BUILD_ID && process.env.AGY_BUILD_ID.trim()) {
-    return process.env.AGY_BUILD_ID.trim();
-  }
-  const hash = crypto.createHash('sha256');
-  const candidates = [
-    path.join(webDistDir, 'index.html'),
-    path.join(webDistDir, 'sw.js'),
-    import.meta.filename,
-    path.resolve(import.meta.dirname, '..', '..', 'BUILD_INFO.json'),
-  ];
-  for (const file of candidates) {
-    try {
-      const data = fs.readFileSync(file);
-      hash.update(path.basename(file));
-      hash.update(String(data.length));
-      hash.update(data);
-    } catch {
-      // ignore missing file during dev/test
-    }
-  }
-  return hash.digest('hex').slice(0, 16);
 }
 
 export async function createApp(configOverrides: Partial<AppConfig> = {}): Promise<AppContext> {
@@ -75,11 +53,13 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
 
-  const buildId = computeBuildId(config.webDistDir);
+  const buildInfo = loadAppBuildInfo(config.webDistDir, configOverrides.appVersion);
+  config.appVersion = buildInfo.version;
+  const buildId = buildInfo.buildId;
   const db = new AppDatabase(config.dbPath);
   db.recoverInterruptedRuns();
 
-  const hub = new SyncHub(db, buildId);
+  const hub = new SyncHub(db, buildId, buildInfo.version);
   const pushService = new PushNotificationService(config, db);
   const quotaService = new QuotaService(config, db, hub);
   const skillService = new SkillService(config, db, hub);
@@ -106,12 +86,16 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
     return {
       ok: true,
       agyMode: config.agyMode,
+      version: buildInfo.version,
+      tag: buildInfo.tag,
+      shortSha: buildInfo.shortSha,
+      builtAt: buildInfo.builtAt,
       buildId,
       uptimeSec: Math.floor(process.uptime()),
     };
   });
 
-  await registerAuthRoutes(app, { config, db, hub, agyAuth, buildId });
+  await registerAuthRoutes(app, { config, db, hub, agyAuth, buildId, buildInfo });
   await registerProjectRoutes(app, { config, db, hub, agyAuth });
   await registerChatRoutes(app, { config, db, hub, agyAuth, acp, scheduler, skillService });
   await registerFileRoutes(app, { config, db, hub, agyAuth });
@@ -216,6 +200,7 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
   return {
     app,
     config,
+    buildInfo,
     db,
     hub,
     acp,

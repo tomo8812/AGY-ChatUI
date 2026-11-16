@@ -27,6 +27,13 @@ import { AgyOnboarding } from './AgyOnboarding';
 import { CloseIcon } from './Icons';
 import { ToggleSwitch } from './ToggleSwitch';
 
+interface AppInfoMeta {
+  version: string;
+  shortSha?: string | null;
+  buildId?: string | null;
+  builtAt?: string | null;
+}
+
 interface SettingsModalProps {
   user: WebUser;
   agyProfile: AgyProfile | null;
@@ -34,6 +41,7 @@ interface SettingsModalProps {
   preferences: UserPreferences;
   agyMode: 'real' | 'mock';
   sandbox: SandboxStatus | null;
+  appInfo?: AppInfoMeta;
   onClose: () => void;
   onUpdatePreferences: (prefs: UserPreferences) => void;
   onUpdateAgy: (payload: { profile: AgyProfile; loginFlow?: AgyLoginFlowState | null }) => void;
@@ -47,6 +55,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   preferences,
   agyMode,
   sandbox,
+  appInfo,
   onClose,
   onUpdatePreferences,
   onUpdateAgy,
@@ -538,6 +547,33 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <button type="button" className="btn btn-danger-outline btn-sm" onClick={() => onLogout(true)}>
                 全端末からログアウト
               </button>
+            </div>
+          </section>
+
+          <section className="settings-section">
+            <h4>バージョン情報</h4>
+            <div className="settings-kv">
+              <div>
+                <div className="kv-value">
+                  <span>
+                    v
+                    {appInfo?.version ||
+                      (typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.0.0')}
+                  </span>
+                  {(appInfo?.shortSha ||
+                    (typeof __APP_COMMIT_SHA__ !== 'undefined' && __APP_COMMIT_SHA__)) && (
+                    <span className="muted-xs" style={{ marginLeft: 8 }}>
+                      ({appInfo?.shortSha || __APP_COMMIT_SHA__})
+                    </span>
+                  )}
+                </div>
+                <div className="muted-xs" style={{ marginTop: 2 }}>
+                  {appInfo?.buildId ? `Build ID: ${appInfo.buildId}` : '開発ビルド'}
+                  {appInfo?.builtAt
+                    ? ` • ${new Date(appInfo.builtAt).toLocaleString('ja-JP')}`
+                    : ''}
+                </div>
+              </div>
             </div>
           </section>
 

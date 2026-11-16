@@ -410,7 +410,16 @@ export const api = {
 
   // Health & version detection
   getHealth: () =>
-    apiFetch<{ ok: boolean; agyMode: 'real' | 'mock'; buildId?: string; uptimeSec: number }>('/api/health'),
+    apiFetch<{
+      ok: boolean;
+      agyMode: 'real' | 'mock';
+      version?: string;
+      tag?: string | null;
+      shortSha?: string | null;
+      builtAt?: string | null;
+      buildId?: string;
+      uptimeSec: number;
+    }>('/api/health'),
 
   // Pre-chat model & effort options
   getAgyOptions: (modelId?: string | null) => {

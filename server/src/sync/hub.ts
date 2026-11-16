@@ -15,7 +15,8 @@ export class SyncHub {
 
   constructor(
     private readonly db: AppDatabase,
-    private readonly buildId = 'dev'
+    private readonly buildId = 'dev',
+    private readonly appVersion = '1.0.0'
   ) {}
 
   registerConnection(params: {
@@ -60,6 +61,7 @@ export class SyncHub {
       userId: reg.userId,
       clientId: reg.clientId,
       buildId: this.buildId,
+      version: this.appVersion,
       latestSeq,
       resyncRequired: truncated,
       events: truncated ? [] : events,

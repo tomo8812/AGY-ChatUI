@@ -107,6 +107,19 @@ export const App: React.FC = () => {
   const [quotaRefreshing, setQuotaRefreshing] = useState(false);
 
   const [pendingUpdateBuild, setPendingUpdateBuild] = useState<string | null>(null);
+  const [pendingUpdateVersion, setPendingUpdateVersion] = useState<string | null>(null);
+  const [appBuildInfo, setAppBuildInfo] = useState<{
+    version: string;
+    shortSha: string | null;
+    buildId: string | null;
+    builtAt: string | null;
+  }>({
+    version: typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.0.0',
+    shortSha:
+      typeof __APP_COMMIT_SHA__ !== 'undefined' && __APP_COMMIT_SHA__ ? __APP_COMMIT_SHA__ : null,
+    buildId: null,
+    builtAt: null,
+  });
   const [hasComposerDraft, setHasComposerDraft] = useState(false);
 
   const [wsStatus, setWsStatus] = useState<WsConnectionStatus>('disconnected');
@@ -139,6 +152,7 @@ export const App: React.FC = () => {
   const locallyCancelledRunIdsRef = useRef<Set<string>>(new Set());
 
   const initialBuildIdRef = useRef<string | null>(null);
+  const initialVersionRef = useRef<string>(appBuildInfo.version);
   const lastHealthCheckRef = useRef<number>(0);
   const quotaRef = useRef<QuotaSnapshotRecord | null>(null);
   quotaRef.current = quota;
@@ -166,16 +180,23 @@ export const App: React.FC = () => {
     }
   }, []);
 
-  const notifyDetectedBuild = useCallback((nextBuildId?: string | null) => {
-    if (!nextBuildId) return;
-    if (!initialBuildIdRef.current) {
-      initialBuildIdRef.current = nextBuildId;
-      return;
-    }
-    if (nextBuildId !== initialBuildIdRef.current) {
-      setPendingUpdateBuild((prev) => prev || nextBuildId);
-    }
-  }, []);
+  const notifyDetectedBuild = useCallback(
+    (nextBuildId?: string | null, nextVersion?: string | null) => {
+      if (!nextBuildId) return;
+      if (!initialBuildIdRef.current) {
+        initialBuildIdRef.current = nextBuildId;
+        if (nextVersion) initialVersionRef.current = nextVersion;
+        return;
+      }
+      if (nextBuildId !== initialBuildIdRef.current) {
+        setPendingUpdateBuild((prev) => prev || nextBuildId);
+        if (nextVersion && nextVersion !== initialVersionRef.current) {
+          setPendingUpdateVersion((prev) => prev || nextVersion);
+        }
+      }
+    },
+    []
+  );
 
   const triggerQuotaRefresh = useCallback(async (auto: boolean, minAgeMs = 5 * 60 * 1000) => {
     if (quotaRefreshingRef.current) return;
@@ -324,6 +345,15 @@ export const App: React.FC = () => {
         if (res.buildId) {
           initialBuildIdRef.current = res.buildId;
         }
+        if (res.version) {
+          initialVersionRef.current = res.version;
+        }
+        setAppBuildInfo((prev) => ({
+          version: res.version || prev.version,
+          shortSha: res.shortSha ?? prev.shortSha,
+          buildId: res.buildId ?? prev.buildId,
+          builtAt: res.builtAt ?? prev.builtAt,
+        }));
         setBootstrapMeta({
           userCount: res.userCount,
           allowPublicSignup: res.allowPublicSignup,
@@ -363,7 +393,7 @@ export const App: React.FC = () => {
       void api
         .getHealth()
         .then((res) => {
-          notifyDetectedBuild(res.buildId);
+          notifyDetectedBuild(res.buildId, res.version);
         })
         .catch(() => {});
     };
@@ -925,7 +955,7 @@ export const App: React.FC = () => {
     const client = new SyncSocketClient({
       onStatusChange: setWsStatus,
       onHello: (msg) => {
-        notifyDetectedBuild(msg.buildId);
+        notifyDetectedBuild(msg.buildId, msg.version);
         if (msg.resyncRequired) {
           void loadWorkspaceLists();
           if (activeChatIdRef.current) void loadChatDetail(activeChatIdRef.current);
@@ -1265,6 +1295,7 @@ export const App: React.FC = () => {
         userCount={bootstrapMeta.userCount}
         allowPublicSignup={bootstrapMeta.allowPublicSignup}
         agyMode={bootstrapMeta.agyMode}
+        version={appBuildInfo.version}
         onAuthenticated={(payload) => {
           setUser(payload.user);
           setAgyProfile(payload.agyProfile);
@@ -1349,8 +1380,8 @@ export const App: React.FC = () => {
           <div className="update-banner" role="status">
             <span>
               {isSafeToReload
-                ? '新しいバージョンを検知しました。自動的に最新画面へ更新します...'
-                : '新しいバージョンが利用可能です（送信中・入力中の作業完了後に自動更新されます）'}
+                ? `新しいバージョン${pendingUpdateVersion ? ` (v${pendingUpdateVersion})` : ''}を検知しました。自動的に最新画面へ更新します...`
+                : `新しいバージョン${pendingUpdateVersion ? ` (v${pendingUpdateVersion})` : ''}が利用可能です（送信中・入力中の作業完了後に自動更新されます）`}
             </span>
             <button type="button" className="btn btn-secondary btn-xs" onClick={handleManualReloadUpdate}>
               今すぐ更新
@@ -1415,6 +1446,7 @@ export const App: React.FC = () => {
           preferences={preferences}
           agyMode={bootstrapMeta.agyMode}
           sandbox={sandboxStatus}
+          appInfo={appBuildInfo}
           onClose={() => setSettingsOpen(false)}
           onUpdatePreferences={(next) => setPreferences(next)}
           onUpdateAgy={({ profile, loginFlow: nextFlow }) => {
