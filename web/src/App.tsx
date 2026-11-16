@@ -1,4 +1,4 @@
-import React, { Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from './api/client';
 import { SyncSocketClient, type WsConnectionStatus } from './api/ws';
 import { AgyOnboarding } from './components/AgyOnboarding';
@@ -22,6 +22,14 @@ import {
   showBrowserNotification,
   unsubscribePushOnDevice,
 } from './utils/notifications';
+import {
+  clearAllViewerCaches,
+  invalidateChatViewerCache,
+  markWorkspaceDirty,
+  notifyArtifactUpdated,
+  seedChatArtifacts,
+  setViewerCacheUser,
+} from './utils/viewerCache';
 import type {
   AgyLoginFlowState,
   AgyProfile,
@@ -123,6 +131,8 @@ export const App: React.FC = () => {
   const [hasComposerDraft, setHasComposerDraft] = useState(false);
 
   const [wsStatus, setWsStatus] = useState<WsConnectionStatus>('disconnected');
+  const [wsClientId, setWsClientId] = useState<string>('local');
+  const [workspaceSyncToken, setWorkspaceSyncToken] = useState(0);
   const [sidebarMobileOpen, setSidebarMobileOpen] = useState(false);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -138,6 +148,9 @@ export const App: React.FC = () => {
 
   const activeChatIdRef = useRef<string | null>(null);
   activeChatIdRef.current = activeChatId;
+  const activeChatRef = useRef<ChatRecord | null>(null);
+  const draftProjectIdRef = useRef<string | null>(null);
+  draftProjectIdRef.current = draftProjectId;
   const chatsRef = useRef<ChatRecord[]>([]);
   chatsRef.current = chats;
   const messagesRef = useRef<MessageRecord[]>([]);
@@ -147,6 +160,8 @@ export const App: React.FC = () => {
   const draftCreatedChatRef = useRef<ChatRecord | null>(null);
   draftCreatedChatRef.current = draftCreatedChat;
   const effectiveProjectIdRef = useRef<string | null>(null);
+  const selectedModelIdRef = useRef<string>('');
+  const selectedEffortValueRef = useRef<string>('');
   const skipNextLoadChatIdRef = useRef<string | null>(null);
   const localNotifiedRunsRef = useRef<Set<string>>(new Set());
   const locallyCancelledRunIdsRef = useRef<Set<string>>(new Set());
@@ -176,6 +191,7 @@ export const App: React.FC = () => {
       activeChatIdRef.current !== draftChat.id ||
       (messagesRef.current.length === 0 && !activeRunRef.current)
     ) {
+      invalidateChatViewerCache(draftChat.id);
       void api.deleteChat(draftChat.id).catch(() => {});
     }
   }, []);
@@ -253,8 +269,16 @@ export const App: React.FC = () => {
   const loadChatDetail = useCallback(async (chatId: string) => {
     const detail = await api.getChat(chatId);
     if (activeChatIdRef.current !== chatId) return;
+    seedChatArtifacts(chatId, detail.artifacts);
     setMessages(detail.messages);
     setArtifacts(detail.artifacts);
+    setViewerArtifact((cur) => {
+      if (!cur || cur.chatId !== chatId) return cur;
+      const latest = detail.artifacts.find((a) => a.id === cur.id);
+      if (!latest) return cur;
+      if (latest.sha256 === cur.sha256 && latest.updatedAt === cur.updatedAt) return cur;
+      return latest;
+    });
     setPendingPermissions(detail.pendingPermissions);
     setActiveRun(detail.activeRun);
     setSessionOptions(detail.sessionOptions);
@@ -264,13 +288,22 @@ export const App: React.FC = () => {
     );
   }, []);
 
+  // Isolate viewer caches strictly per authenticated WebUser
+  useEffect(() => {
+    setViewerCacheUser(user?.id ?? null);
+  }, [user?.id]);
+
   // Sync CSS --app-vh & data-keyboard-open with iPhone / mobile visualViewport
   useEffect(() => {
     if (typeof window === 'undefined') return;
     let baseHeight = Math.max(window.innerHeight, window.visualViewport?.height ?? 0);
     let blurTimer: number | undefined;
+    let rafId: number | undefined;
+    let lastAppliedVh: number | null = null;
+    let lastAppliedKeyboardOpen: boolean | null = null;
 
-    const updateViewport = () => {
+    const applyViewport = () => {
+      rafId = undefined;
       const vv = window.visualViewport;
       const vvHeight = vv ? Math.round(vv.height) : window.innerHeight;
       const activeEl = document.activeElement;
@@ -284,38 +317,50 @@ export const App: React.FC = () => {
       if (!isTextFocused) {
         baseHeight = Math.max(window.innerHeight, vvHeight);
       }
-      document.documentElement.style.setProperty('--app-vh', `${vvHeight}px`);
+      if (lastAppliedVh !== vvHeight) {
+        lastAppliedVh = vvHeight;
+        document.documentElement.style.setProperty('--app-vh', `${vvHeight}px`);
+      }
       const heightDrop = Math.max(window.innerHeight - vvHeight, baseHeight - vvHeight);
       const keyboardOpen = window.innerWidth <= 860 && (heightDrop > 120 || isTextFocused);
-      if (keyboardOpen) {
-        document.documentElement.dataset.keyboardOpen = 'true';
-        if (vv && vv.offsetTop > 0) {
-          window.scrollTo(0, 0);
+      if (lastAppliedKeyboardOpen !== keyboardOpen) {
+        lastAppliedKeyboardOpen = keyboardOpen;
+        if (keyboardOpen) {
+          document.documentElement.dataset.keyboardOpen = 'true';
+        } else {
+          delete document.documentElement.dataset.keyboardOpen;
         }
-      } else {
-        delete document.documentElement.dataset.keyboardOpen;
       }
+      if (keyboardOpen && vv && vv.offsetTop > 0) {
+        window.scrollTo(0, 0);
+      }
+    };
+
+    const scheduleViewportUpdate = () => {
+      if (rafId !== undefined) return;
+      rafId = window.requestAnimationFrame(applyViewport);
     };
 
     const onFocusOut = () => {
       if (blurTimer !== undefined) window.clearTimeout(blurTimer);
-      blurTimer = window.setTimeout(updateViewport, 60);
+      blurTimer = window.setTimeout(scheduleViewportUpdate, 60);
     };
 
-    updateViewport();
+    applyViewport();
     const vv = window.visualViewport;
-    vv?.addEventListener('resize', updateViewport);
-    vv?.addEventListener('scroll', updateViewport);
-    window.addEventListener('resize', updateViewport);
-    window.addEventListener('focusin', updateViewport);
+    vv?.addEventListener('resize', scheduleViewportUpdate);
+    vv?.addEventListener('scroll', scheduleViewportUpdate);
+    window.addEventListener('resize', scheduleViewportUpdate);
+    window.addEventListener('focusin', scheduleViewportUpdate);
     window.addEventListener('focusout', onFocusOut);
 
     return () => {
       if (blurTimer !== undefined) window.clearTimeout(blurTimer);
-      vv?.removeEventListener('resize', updateViewport);
-      vv?.removeEventListener('scroll', updateViewport);
-      window.removeEventListener('resize', updateViewport);
-      window.removeEventListener('focusin', updateViewport);
+      if (rafId !== undefined) window.cancelAnimationFrame(rafId);
+      vv?.removeEventListener('resize', scheduleViewportUpdate);
+      vv?.removeEventListener('scroll', scheduleViewportUpdate);
+      window.removeEventListener('resize', scheduleViewportUpdate);
+      window.removeEventListener('focusin', scheduleViewportUpdate);
       window.removeEventListener('focusout', onFocusOut);
       document.documentElement.style.removeProperty('--app-vh');
       delete document.documentElement.dataset.keyboardOpen;
@@ -674,6 +719,8 @@ export const App: React.FC = () => {
       case 'chat.deleted': {
         const chatId = p.chatId as string | undefined;
         if (chatId) {
+          invalidateChatViewerCache(chatId);
+          setViewerArtifact((cur) => (cur?.chatId === chatId ? null : cur));
           setChats((prev) => prev.filter((c) => c.id !== chatId));
           setDraftCreatedChat((prev) => (prev && prev.id === chatId ? null : prev));
           if (curChatId === chatId) setActiveChatId(null);
@@ -747,6 +794,9 @@ export const App: React.FC = () => {
             )
           );
         }
+        if (evt.chatId) {
+          markWorkspaceDirty(evt.chatId);
+        }
         if (evt.chatId === curChatId) {
           if (run) {
             setActiveRun((cur) => (cur?.id === run.id ? null : cur));
@@ -759,6 +809,7 @@ export const App: React.FC = () => {
                 : [...prev, msg]
             );
           }
+          setWorkspaceSyncToken((t) => t + 1);
         }
 
         const hapticOn = Boolean(preferencesRef.current?.hapticFeedback ?? true);
@@ -869,6 +920,12 @@ export const App: React.FC = () => {
       }
       case 'artifact.created': {
         const art = p.artifact as ArtifactRecord | undefined;
+        if (art) {
+          notifyArtifactUpdated(art);
+        }
+        if (evt.chatId) {
+          markWorkspaceDirty(evt.chatId);
+        }
         if (art && evt.chatId === curChatId) {
           setArtifacts((prev) => {
             const idx = prev.findIndex((x) => x.id === art.id);
@@ -879,6 +936,8 @@ export const App: React.FC = () => {
             }
             return [art, ...prev];
           });
+          setViewerArtifact((cur) => (cur?.id === art.id ? art : cur));
+          setWorkspaceSyncToken((t) => t + 1);
         }
         break;
       }
@@ -949,6 +1008,7 @@ export const App: React.FC = () => {
     if (!user) {
       wsRef.current?.stop();
       wsRef.current = null;
+      setWsClientId('local');
       return;
     }
 
@@ -958,7 +1018,11 @@ export const App: React.FC = () => {
         notifyDetectedBuild(msg.buildId, msg.version);
         if (msg.resyncRequired) {
           void loadWorkspaceLists();
-          if (activeChatIdRef.current) void loadChatDetail(activeChatIdRef.current);
+          if (activeChatIdRef.current) {
+            markWorkspaceDirty(activeChatIdRef.current);
+            setWorkspaceSyncToken((t) => t + 1);
+            void loadChatDetail(activeChatIdRef.current);
+          }
         } else {
           isReplayingHelloRef.current = true;
           try {
@@ -977,6 +1041,9 @@ export const App: React.FC = () => {
       onDurableEvent: handleDurableEvent,
       onEphemeralEvent: handleEphemeralEvent,
       onAuthLost: () => {
+        clearAllViewerCaches();
+        setViewerArtifact(null);
+        setWsClientId('local');
         setUser(null);
         setAgyProfile(null);
         setSandboxStatus(null);
@@ -989,11 +1056,17 @@ export const App: React.FC = () => {
         setDraftCreatedChat(null);
         setDraftProjectId(null);
         setActiveChatId(null);
+        setMessages([]);
+        setArtifacts([]);
+        setPendingPermissions([]);
+        setActiveRun(null);
+        setContextUsage(null);
         setChats([]);
         setProjects([]);
       },
     });
     wsRef.current = client;
+    setWsClientId(client.getClientId());
     client.start();
 
     return () => {
@@ -1002,13 +1075,19 @@ export const App: React.FC = () => {
     };
   }, [user?.id, loadWorkspaceLists, loadChatDetail, handleDurableEvent, handleEphemeralEvent, notifyDetectedBuild]);
 
-  const activeChat =
-    chats.find((c) => c.id === activeChatId) ??
-    (draftCreatedChat?.id === activeChatId ? draftCreatedChat : null);
+  const activeChat = useMemo(
+    () =>
+      chats.find((c) => c.id === activeChatId) ??
+      (draftCreatedChat?.id === activeChatId ? draftCreatedChat : null),
+    [chats, activeChatId, draftCreatedChat]
+  );
+  activeChatRef.current = activeChat;
   const effectiveProjectId = activeChat ? activeChat.projectId : draftProjectId;
   effectiveProjectIdRef.current = effectiveProjectId;
-  const activeProject =
-    effectiveProjectId ? projects.find((p) => p.id === effectiveProjectId) ?? null : null;
+  const activeProject = useMemo(
+    () => (effectiveProjectId ? projects.find((p) => p.id === effectiveProjectId) ?? null : null),
+    [effectiveProjectId, projects]
+  );
 
   useEffect(() => {
     if (!user) {
@@ -1049,9 +1128,22 @@ export const App: React.FC = () => {
   }, [effectiveSessionOptions?.availableCommands, skillsState]);
 
   const openAndTrackArtifact = useCallback((art: ArtifactRecord) => {
+    notifyArtifactUpdated(art);
     setViewerArtifact(art);
-    setArtifacts((prev) => (prev.some((x) => x.id === art.id) ? prev : [art, ...prev]));
+    setArtifacts((prev) => {
+      const idx = prev.findIndex((x) => x.id === art.id);
+      if (idx >= 0) {
+        if (prev[idx].sha256 === art.sha256 && prev[idx].updatedAt === art.updatedAt) {
+          return prev;
+        }
+        const copy = [...prev];
+        copy[idx] = art;
+        return copy;
+      }
+      return [art, ...prev];
+    });
   }, []);
+
   const activeModelOption = effectiveSessionOptions?.configOptions.find(
     (o) => o.id === effectiveSessionOptions.modelOptionId || o.category === 'model'
   );
@@ -1072,8 +1164,10 @@ export const App: React.FC = () => {
     activeEffortOption?.options.some((o) => o.value === rawEffortValue)
       ? rawEffortValue
       : activeEffortOption?.currentValue || activeEffortOption?.options[0]?.value || rawEffortValue;
+  selectedModelIdRef.current = selectedModelId;
+  selectedEffortValueRef.current = selectedEffortValue;
 
-  const handleStartDraftChat = (projectId: string | null = null) => {
+  const handleStartDraftChat = useCallback((projectId: string | null = null) => {
     cleanupEmptyDraftChat();
     activeChatIdRef.current = null;
     setActiveChatId(null);
@@ -1087,13 +1181,13 @@ export const App: React.FC = () => {
     setWorkspaceOpen(false);
     setHasComposerDraft(false);
     setDraftResetToken((t) => t + 1);
-  };
+  }, [cleanupEmptyDraftChat]);
 
-  const createDraftBackedChat = async (): Promise<ChatRecord> => {
+  const createDraftBackedChat = useCallback(async (): Promise<ChatRecord> => {
     const res = await api.createChat({
-      projectId: draftProjectId,
-      modelId: selectedModelId || null,
-      effortValue: selectedEffortValue || null,
+      projectId: draftProjectIdRef.current,
+      modelId: selectedModelIdRef.current || null,
+      effortValue: selectedEffortValueRef.current || null,
     });
     draftCreatedChatRef.current = res.chat;
     setDraftCreatedChat(res.chat);
@@ -1103,14 +1197,15 @@ export const App: React.FC = () => {
     activeChatIdRef.current = res.chat.id;
     setActiveChatId(res.chat.id);
     return res.chat;
-  };
+  }, []);
 
-  const handleChangeModel = async (modelId: string) => {
-    if (activeChat) {
-      const res = await api.patchChat(activeChat.id, { modelId });
-      setChats((prev) => prev.map((c) => (c.id === activeChat.id ? { ...c, ...res.chat } : c)));
+  const handleChangeModel = useCallback(async (modelId: string) => {
+    const curChat = activeChatRef.current;
+    if (curChat) {
+      const res = await api.patchChat(curChat.id, { modelId });
+      setChats((prev) => prev.map((c) => (c.id === curChat.id ? { ...c, ...res.chat } : c)));
       setDraftCreatedChat((prev) =>
-        prev && prev.id === activeChat.id ? { ...prev, ...res.chat } : prev
+        prev && prev.id === curChat.id ? { ...prev, ...res.chat } : prev
       );
       if (res.sessionOptions) setSessionOptions(res.sessionOptions);
       return;
@@ -1141,14 +1236,15 @@ export const App: React.FC = () => {
       }
     }
     setPreferences(nextPrefs);
-  };
+  }, []);
 
-  const handleChangeEffort = async (effortValue: string) => {
-    if (activeChat) {
-      const res = await api.patchChat(activeChat.id, { effortValue });
-      setChats((prev) => prev.map((c) => (c.id === activeChat.id ? { ...c, ...res.chat } : c)));
+  const handleChangeEffort = useCallback(async (effortValue: string) => {
+    const curChat = activeChatRef.current;
+    if (curChat) {
+      const res = await api.patchChat(curChat.id, { effortValue });
+      setChats((prev) => prev.map((c) => (c.id === curChat.id ? { ...c, ...res.chat } : c)));
       setDraftCreatedChat((prev) =>
-        prev && prev.id === activeChat.id ? { ...prev, ...res.chat } : prev
+        prev && prev.id === curChat.id ? { ...prev, ...res.chat } : prev
       );
       if (res.sessionOptions) setSessionOptions(res.sessionOptions);
       return;
@@ -1169,7 +1265,21 @@ export const App: React.FC = () => {
     });
     const res = await api.updatePreferences({ defaultEffortValue: effortValue });
     setPreferences(res.preferences);
-  };
+  }, []);
+
+  const handleChangeModelCb = useCallback(
+    (modelId: string) => {
+      void handleChangeModel(modelId);
+    },
+    [handleChangeModel]
+  );
+
+  const handleChangeEffortCb = useCallback(
+    (effortValue: string) => {
+      void handleChangeEffort(effortValue);
+    },
+    [handleChangeEffort]
+  );
 
   const handleManualReloadUpdate = () => {
     if (pendingUpdateBuild) {
@@ -1186,65 +1296,154 @@ export const App: React.FC = () => {
     window.location.reload();
   };
 
-  const ensureActiveChatForAction = async (): Promise<string> => {
+  const ensureActiveChatForAction = useCallback(async (): Promise<string> => {
     if (activeChatIdRef.current) return activeChatIdRef.current;
     const created = await createDraftBackedChat();
     return created.id;
-  };
+  }, [createDraftBackedChat]);
 
-  const handleUploadFiles = async (files: File[]): Promise<AttachmentRef[]> => {
-    const chatId = await ensureActiveChatForAction();
-    const res = await api.uploadChatAttachments(chatId, files);
-    return res.attachments;
-  };
+  const handleUploadFiles = useCallback(
+    async (files: File[]): Promise<AttachmentRef[]> => {
+      const chatId = await ensureActiveChatForAction();
+      const res = await api.uploadChatAttachments(chatId, files);
+      markWorkspaceDirty(chatId);
+      if (activeChatIdRef.current === chatId) {
+        setWorkspaceSyncToken((t) => t + 1);
+      }
+      return res.attachments;
+    },
+    [ensureActiveChatForAction]
+  );
 
-  const handleSendPrompt = async (text: string, files: AttachmentRef[]): Promise<void> => {
-    triggerHaptic('send', Boolean(preferencesRef.current?.hapticFeedback ?? true));
-    const existingId = activeChatIdRef.current;
-    const wasDraft = !existingId || draftCreatedChatRef.current?.id === existingId;
-    const chatId = existingId || (await createDraftBackedChat()).id;
-    const clientMessageId =
-      typeof crypto !== 'undefined' && crypto.randomUUID
-        ? crypto.randomUUID()
-        : `cm-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const handleSendPrompt = useCallback(
+    async (text: string, files: AttachmentRef[]): Promise<void> => {
+      triggerHaptic('send', Boolean(preferencesRef.current?.hapticFeedback ?? true));
+      const existingId = activeChatIdRef.current;
+      const wasDraft = !existingId || draftCreatedChatRef.current?.id === existingId;
+      const chatId = existingId || (await createDraftBackedChat()).id;
+      const clientMessageId =
+        typeof crypto !== 'undefined' && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `cm-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-    const res = await api.sendMessage(chatId, {
-      text,
-      attachmentIds: files.map((f) => f.artifactId),
-      clientMessageId,
-    });
+      const res = await api.sendMessage(chatId, {
+        text,
+        attachmentIds: files.map((f) => f.artifactId),
+        clientMessageId,
+      });
 
-    const draftSnap = draftCreatedChatRef.current;
-    if (draftSnap?.id === chatId) {
-      draftCreatedChatRef.current = null;
-      setDraftCreatedChat(null);
-    }
-    const promotedChat = res.chat ?? (wasDraft && draftSnap?.id === chatId ? draftSnap : undefined);
-    if (promotedChat) {
-      setChats((prev) => [
-        { ...promotedChat, activeRun: res.run },
-        ...prev.filter((c) => c.id !== promotedChat.id),
-      ]);
-    }
+      const draftSnap = draftCreatedChatRef.current;
+      if (draftSnap?.id === chatId) {
+        draftCreatedChatRef.current = null;
+        setDraftCreatedChat(null);
+      }
+      const promotedChat = res.chat ?? (wasDraft && draftSnap?.id === chatId ? draftSnap : undefined);
+      if (promotedChat) {
+        setChats((prev) => [
+          { ...promotedChat, activeRun: res.run },
+          ...prev.filter((c) => c.id !== promotedChat.id),
+        ]);
+      }
 
-    setMessages((prev) => {
-      const copy = [...prev];
-      if (!copy.some((m) => m.id === res.userMessage.id)) copy.push(res.userMessage);
-      if (!copy.some((m) => m.id === res.assistantMessage.id)) copy.push(res.assistantMessage);
-      return copy;
-    });
-    setActiveRun(res.run);
-    void triggerQuotaRefresh(true, 5_000);
-  };
+      setMessages((prev) => {
+        const copy = [...prev];
+        if (!copy.some((m) => m.id === res.userMessage.id)) copy.push(res.userMessage);
+        if (!copy.some((m) => m.id === res.assistantMessage.id)) copy.push(res.assistantMessage);
+        return copy;
+      });
+      setActiveRun(res.run);
+      void triggerQuotaRefresh(true, 5_000);
+    },
+    [createDraftBackedChat, triggerQuotaRefresh]
+  );
 
-  const handleCancelRun = async (runId: string) => {
-    if (!activeChatId) return;
+  const handleCancelRun = useCallback(async (runId: string) => {
+    const chatId = activeChatIdRef.current;
+    if (!chatId) return;
     if (locallyCancelledRunIdsRef.current.size > 200) {
       locallyCancelledRunIdsRef.current.clear();
     }
     locallyCancelledRunIdsRef.current.add(runId);
-    await api.cancelRun(activeChatId, runId);
-  };
+    await api.cancelRun(chatId, runId);
+  }, []);
+
+  const handleSelectChat = useCallback(
+    (id: string) => {
+      if (draftCreatedChatRef.current?.id !== id) {
+        cleanupEmptyDraftChat();
+      }
+      setDraftProjectId(null);
+      setActiveChatId(id);
+      setWorkspaceOpen(false);
+    },
+    [cleanupEmptyDraftChat]
+  );
+
+  const handleRenameChat = useCallback(async (chatId: string, title: string) => {
+    const res = await api.patchChat(chatId, { title });
+    setChats((prev) => prev.map((c) => (c.id === chatId ? { ...c, ...res.chat } : c)));
+    setDraftCreatedChat((prev) => (prev && prev.id === chatId ? { ...prev, ...res.chat } : prev));
+  }, []);
+
+  const handleDeleteChat = useCallback(async (chatId: string) => {
+    await api.deleteChat(chatId);
+    invalidateChatViewerCache(chatId);
+    setViewerArtifact((cur) => (cur?.chatId === chatId ? null : cur));
+    setChats((prev) => prev.filter((c) => c.id !== chatId));
+    setDraftCreatedChat((prev) => (prev && prev.id === chatId ? null : prev));
+    if (activeChatIdRef.current === chatId) {
+      activeChatIdRef.current = null;
+      setActiveChatId(null);
+    }
+  }, []);
+
+  const handleSyncProject = useCallback(async () => {
+    const curChat = activeChatRef.current;
+    if (!curChat) return;
+    const res = await api.syncChatProject(curChat.id);
+    markWorkspaceDirty(curChat.id);
+    setChats((prev) => prev.map((c) => (c.id === curChat.id ? { ...c, ...res.chat } : c)));
+    setDraftCreatedChat((prev) =>
+      prev && prev.id === curChat.id ? { ...prev, ...res.chat } : prev
+    );
+    await loadChatDetail(curChat.id);
+    if (activeChatIdRef.current === curChat.id) {
+      setWorkspaceSyncToken((t) => t + 1);
+    }
+  }, [loadChatDetail]);
+
+  const handlePermissionUpdated = useCallback((perm: PendingPermissionRecord) => {
+    setPendingPermissions((prev) => prev.filter((x) => x.id !== perm.id));
+  }, []);
+
+  const handleNewChatForProject = useCallback(
+    (projId?: string | null) => {
+      handleStartDraftChat(projId ?? null);
+    },
+    [handleStartDraftChat]
+  );
+
+  const handleHeaderNewChat = useCallback(() => {
+    handleStartDraftChat(null);
+  }, [handleStartDraftChat]);
+
+  const handleCloseSidebarMobile = useCallback(() => setSidebarMobileOpen(false), []);
+  const handleOpenSidebar = useCallback(() => setSidebarMobileOpen(true), []);
+  const handleOpenProjectModal = useCallback((proj: ProjectRecord | null) => setProjectModalTarget(proj), []);
+  const handleOpenSkills = useCallback(() => setSkillsOpen(true), []);
+  const handleOpenSettings = useCallback(() => setSettingsOpen(true), []);
+  const handleRefreshQuota = useCallback(() => {
+    void triggerQuotaRefresh(false);
+  }, [triggerQuotaRefresh]);
+  const handleOpenQuotaPopover = useCallback(() => {
+    void triggerQuotaRefresh(true, 10_000);
+  }, [triggerQuotaRefresh]);
+  const handleToggleWorkspace = useCallback(() => setWorkspaceOpen((o) => !o), []);
+  const handleCloseWorkspace = useCallback(() => setWorkspaceOpen(false), []);
+  const handleCloseViewer = useCallback(() => setViewerArtifact(null), []);
+  const handleCopiedToProject = useCallback((updatedProj: ProjectRecord) => {
+    setProjects((prev) => prev.map((p) => (p.id === updatedProj.id ? updatedProj : p)));
+  }, []);
 
   const handleLogout = async (allDevices = false) => {
     try {
@@ -1255,6 +1454,9 @@ export const App: React.FC = () => {
       // clear UI even if already expired
     }
     wsRef.current?.stop();
+    clearAllViewerCaches();
+    setViewerArtifact(null);
+    setWsClientId('local');
     setUser(null);
     setAgyProfile(null);
     setSandboxStatus(null);
@@ -1268,6 +1470,11 @@ export const App: React.FC = () => {
     setDraftCreatedChat(null);
     setDraftProjectId(null);
     setActiveChatId(null);
+    setMessages([]);
+    setArtifacts([]);
+    setPendingPermissions([]);
+    setActiveRun(null);
+    setContextUsage(null);
     setChats([]);
     setProjects([]);
     setSettingsOpen(false);
@@ -1334,28 +1541,14 @@ export const App: React.FC = () => {
         projects={projects}
         activeChatId={activeChatId}
         skillCount={skillsState?.commands.length ?? 0}
-        onCloseMobile={() => setSidebarMobileOpen(false)}
-        onNewChat={(projId) => handleStartDraftChat(projId ?? null)}
-        onSelectChat={(id) => {
-          if (draftCreatedChatRef.current?.id !== id) {
-            cleanupEmptyDraftChat();
-          }
-          setDraftProjectId(null);
-          setActiveChatId(id);
-          setWorkspaceOpen(false);
-        }}
-        onRenameChat={async (chatId, title) => {
-          const res = await api.patchChat(chatId, { title });
-          setChats((prev) => prev.map((c) => (c.id === chatId ? { ...c, ...res.chat } : c)));
-        }}
-        onDeleteChat={async (chatId) => {
-          await api.deleteChat(chatId);
-          setChats((prev) => prev.filter((c) => c.id !== chatId));
-          if (activeChatId === chatId) setActiveChatId(null);
-        }}
-        onOpenProjectModal={(proj) => setProjectModalTarget(proj)}
-        onOpenSkills={() => setSkillsOpen(true)}
-        onOpenSettings={() => setSettingsOpen(true)}
+        onCloseMobile={handleCloseSidebarMobile}
+        onNewChat={handleNewChatForProject}
+        onSelectChat={handleSelectChat}
+        onRenameChat={handleRenameChat}
+        onDeleteChat={handleDeleteChat}
+        onOpenProjectModal={handleOpenProjectModal}
+        onOpenSkills={handleOpenSkills}
+        onOpenSettings={handleOpenSettings}
       />
 
       <main className="main-pane">
@@ -1369,11 +1562,11 @@ export const App: React.FC = () => {
           contextUsage={contextUsage}
           workspaceCount={artifacts.length}
           workspaceOpen={workspaceOpen}
-          onOpenSidebar={() => setSidebarMobileOpen(true)}
-          onNewChat={() => handleStartDraftChat(null)}
-          onRefreshQuota={() => void triggerQuotaRefresh(false)}
-          onOpenQuotaPopover={() => void triggerQuotaRefresh(true, 10_000)}
-          onToggleWorkspace={() => setWorkspaceOpen((o) => !o)}
+          onOpenSidebar={handleOpenSidebar}
+          onNewChat={handleHeaderNewChat}
+          onRefreshQuota={handleRefreshQuota}
+          onOpenQuotaPopover={handleOpenQuotaPopover}
+          onToggleWorkspace={handleToggleWorkspace}
         />
 
         {pendingUpdateBuild && (
@@ -1402,28 +1595,18 @@ export const App: React.FC = () => {
             selectedModelId={selectedModelId}
             selectedEffortValue={selectedEffortValue}
             draftResetToken={draftResetToken}
-            clientId={wsRef.current?.getClientId() ?? 'local'}
+            clientId={wsClientId}
             hapticEnabled={preferences?.hapticFeedback ?? true}
-            onChangeModel={(modelId) => void handleChangeModel(modelId)}
-            onChangeEffort={(effortValue) => void handleChangeEffort(effortValue)}
+            onChangeModel={handleChangeModelCb}
+            onChangeEffort={handleChangeEffortCb}
             onDraftChange={setHasComposerDraft}
             onSendPrompt={handleSendPrompt}
             onUploadFiles={handleUploadFiles}
             onCancelRun={handleCancelRun}
-            onSyncProject={async () => {
-              if (!activeChat) return;
-              const res = await api.syncChatProject(activeChat.id);
-              setChats((prev) => prev.map((c) => (c.id === activeChat.id ? { ...c, ...res.chat } : c)));
-              setDraftCreatedChat((prev) =>
-                prev && prev.id === activeChat.id ? { ...prev, ...res.chat } : prev
-              );
-              await loadChatDetail(activeChat.id);
-            }}
+            onSyncProject={handleSyncProject}
             onOpenArtifact={openAndTrackArtifact}
-            onPermissionUpdated={(perm) => {
-              setPendingPermissions((prev) => prev.filter((x) => x.id !== perm.id));
-            }}
-            onOpenSkills={() => setSkillsOpen(true)}
+            onPermissionUpdated={handlePermissionUpdated}
+            onOpenSkills={handleOpenSkills}
             externalDraftCommand={externalDraftCommand}
           />
 
@@ -1431,7 +1614,8 @@ export const App: React.FC = () => {
             <WorkspaceDrawer
               chatId={activeChat.id}
               artifacts={artifacts}
-              onClose={() => setWorkspaceOpen(false)}
+              workspaceSyncToken={workspaceSyncToken}
+              onClose={handleCloseWorkspace}
               onOpenArtifact={openAndTrackArtifact}
             />
           )}
@@ -1509,10 +1693,9 @@ export const App: React.FC = () => {
           <ArtifactViewerModal
             artifact={viewerArtifact}
             projects={projects}
-            onClose={() => setViewerArtifact(null)}
-            onCopiedToProject={(updatedProj) => {
-              setProjects((prev) => prev.map((p) => (p.id === updatedProj.id ? updatedProj : p)));
-            }}
+            onClose={handleCloseViewer}
+            onCopiedToProject={handleCopiedToProject}
+            onOpenArtifact={openAndTrackArtifact}
           />
         </Suspense>
       )}

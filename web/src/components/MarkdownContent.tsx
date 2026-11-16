@@ -1,13 +1,26 @@
 import hljs from 'highlight.js';
 import DOMPurify from 'dompurify';
-import React, { useEffect, useId, useRef, useState } from 'react';
-import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
+import React, { useCallback, useContext, useEffect, useId, useMemo, useRef, useState } from 'react';
+import ReactMarkdown, { defaultUrlTransform, type Components } from 'react-markdown';
 import rehypeKatex from 'rehype-katex';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
-import { api } from '../api/client';
 import type { ArtifactRecord, MessageRecord } from '../types';
+import {
+  codeHighlightCache,
+  fastTextHash,
+  mermaidSvgCache,
+  normalizeClientLinkReference,
+  peekResolvedLink,
+  resolveLinkCached,
+  subscribeArtifactUpdates,
+} from '../utils/viewerCache';
 import { CheckIcon, CopyIcon, DownloadIcon } from './Icons';
+
+const REMARK_PLUGINS = [remarkGfm, remarkMath];
+const REHYPE_PLUGINS = [rehypeKatex];
+
+let mermaidRenderSeq = 0;
 
 const markdownUrlTransform = (url: string): string => {
   if (/^file:\/\//i.test(url.trim())) {
@@ -17,6 +30,7 @@ const markdownUrlTransform = (url: string): string => {
 };
 
 function getEffectiveTheme(): 'light' | 'dark' {
+  if (typeof document === 'undefined') return 'light';
   return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
 }
 
@@ -56,149 +70,189 @@ function extractReactText(node: React.ReactNode): string {
   return '';
 }
 
-export const MermaidBlock: React.FC<{ code: string }> = ({ code }) => {
-  const uid = useId().replace(/:/g, '_');
-  const [svgHtml, setSvgHtml] = useState<string | null>(null);
-  const [showSource, setShowSource] = useState(false);
-  const [renderError, setRenderError] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
+export const MermaidBlock: React.FC<{ code: string; streaming?: boolean }> = React.memo(
+  ({ code, streaming = false }) => {
+    const uid = useId().replace(/:/g, '_');
+    const trimmed = code.trim();
+    const theme = getEffectiveTheme();
+    const cacheKey = `${theme}:${fastTextHash(trimmed)}`;
 
-  useEffect(() => {
-    let active = true;
-    const render = async () => {
-      try {
-        const mermaid = (await import('mermaid')).default;
-        mermaid.initialize({
-          startOnLoad: false,
-          securityLevel: 'strict',
-          theme: getEffectiveTheme() === 'dark' ? 'dark' : 'default',
-        });
-        const result = await mermaid.render(`mmd_${uid}_${Date.now()}`, code.trim());
-        if (!active) return;
-        const safeSvg = DOMPurify.sanitize(result.svg, {
-          USE_PROFILES: { svg: true, svgFilters: true },
-        });
-        setSvgHtml(safeSvg);
+    const [svgHtml, setSvgHtml] = useState<string | null>(() => mermaidSvgCache.get(cacheKey) ?? null);
+    const [showSource, setShowSource] = useState(false);
+    const [renderError, setRenderError] = useState<string | null>(null);
+    const [copied, setCopied] = useState(false);
+
+    useEffect(() => {
+      const cached = mermaidSvgCache.get(cacheKey);
+      if (cached) {
+        setSvgHtml(cached);
         setRenderError(null);
-      } catch (err) {
-        if (!active) return;
-        setRenderError(err instanceof Error ? err.message : 'Mermaidの描画に失敗しました');
+        return;
       }
-    };
-    void render();
-    return () => {
-      active = false;
-    };
-  }, [code, uid]);
+      if (!trimmed) {
+        setSvgHtml(null);
+        return;
+      }
 
-  const handleCopy = async () => {
-    await navigator.clipboard.writeText(code);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1600);
-  };
+      let active = true;
+      const delayMs = streaming ? 240 : 0;
+      const timer = window.setTimeout(() => {
+        const render = async () => {
+          try {
+            const mermaid = (await import('mermaid')).default;
+            mermaid.initialize({
+              startOnLoad: false,
+              securityLevel: 'strict',
+              theme: theme === 'dark' ? 'dark' : 'default',
+            });
+            mermaidRenderSeq += 1;
+            const result = await mermaid.render(`mmd_${uid}_${mermaidRenderSeq}`, trimmed);
+            if (!active) return;
+            const safeSvg = DOMPurify.sanitize(result.svg, {
+              USE_PROFILES: { svg: true, svgFilters: true },
+            });
+            mermaidSvgCache.set(cacheKey, safeSvg);
+            setSvgHtml(safeSvg);
+            setRenderError(null);
+          } catch (err) {
+            if (!active) return;
+            if (!streaming) {
+              setRenderError(err instanceof Error ? err.message : 'Mermaidの描画に失敗しました');
+            }
+          }
+        };
+        void render();
+      }, delayMs);
 
-  return (
-    <div className="rich-block mermaid-card">
-      <div className="rich-block-head">
-        <span className="lang-pill">Mermaid 図</span>
-        <div className="row-actions">
-          <button type="button" className="chip-btn" onClick={() => setShowSource((v) => !v)}>
-            {showSource ? '図を表示' : 'ソース'}
-          </button>
-          <button type="button" className="chip-btn" onClick={handleCopy}>
-            {copied ? <CheckIcon size={13} /> : <CopyIcon size={13} />}
-            <span>{copied ? 'コピー済' : 'コピー'}</span>
-          </button>
-        </div>
-      </div>
-      {showSource || renderError ? (
-        <div>
-          {renderError && <div className="muted-xs mermaid-warn">図の構文エラー: {renderError}</div>}
-          <pre className="code-pre">
-            <code>{code}</code>
-          </pre>
-        </div>
-      ) : svgHtml ? (
-        <div className="mermaid-svg-wrap" dangerouslySetInnerHTML={{ __html: svgHtml }} />
-      ) : (
-        <div className="mermaid-loading muted-sm">図を描画中...</div>
-      )}
-    </div>
-  );
-};
+      return () => {
+        active = false;
+        window.clearTimeout(timer);
+      };
+    }, [trimmed, cacheKey, theme, streaming, uid]);
 
-export const CodeBlock: React.FC<{ language: string; code: string }> = ({ language, code }) => {
-  const [copied, setCopied] = useState(false);
-  const [wrapped, setWrapped] = useState(false);
-  const [collapsed, setCollapsed] = useState(false);
+    const handleCopy = useCallback(async () => {
+      await navigator.clipboard.writeText(code);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    }, [code]);
 
-  const normalized = code.replace(/\n$/, '');
-  const lineCount = normalized.split('\n').length;
-
-  let highlightedHtml = '';
-  try {
-    if (language && hljs.getLanguage(language)) {
-      highlightedHtml = hljs.highlight(normalized, { language }).value;
-    } else if (normalized.length < 25_000) {
-      highlightedHtml = hljs.highlightAuto(normalized).value;
-    }
-  } catch {
-    highlightedHtml = '';
-  }
-
-  const handleCopy = async () => {
-    await navigator.clipboard.writeText(normalized);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1600);
-  };
-
-  const handleDownload = () => {
-    const ext = extForLang(language);
-    const blob = new Blob([normalized + '\n'], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `snippet.${ext}`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  };
-
-  return (
-    <div className="rich-block code-card">
-      <div className="rich-block-head">
-        <span className="lang-pill">{language || 'text'} ({lineCount}行)</span>
-        <div className="row-actions">
-          <button type="button" className="chip-btn" onClick={() => setWrapped((w) => !w)}>
-            {wrapped ? '折返し解除' : '折返し'}
-          </button>
-          {lineCount > 14 && (
-            <button type="button" className="chip-btn" onClick={() => setCollapsed((c) => !c)}>
-              {collapsed ? '展開' : '畳む'}
+    return (
+      <div className="rich-block mermaid-card">
+        <div className="rich-block-head">
+          <span className="lang-pill">Mermaid 図</span>
+          <div className="row-actions">
+            <button type="button" className="chip-btn" onClick={() => setShowSource((v) => !v)}>
+              {showSource ? '図を表示' : 'ソース'}
             </button>
-          )}
-          <button type="button" className="chip-btn" onClick={handleDownload} title="ファイルとして保存">
-            <DownloadIcon size={13} />
-          </button>
-          <button type="button" className="chip-btn" onClick={handleCopy}>
-            {copied ? <CheckIcon size={13} /> : <CopyIcon size={13} />}
-            <span>{copied ? 'コピー済' : 'コピー'}</span>
-          </button>
+            <button type="button" className="chip-btn" onClick={handleCopy}>
+              {copied ? <CheckIcon size={13} /> : <CopyIcon size={13} />}
+              <span>{copied ? 'コピー済' : 'コピー'}</span>
+            </button>
+          </div>
         </div>
+        {showSource || (renderError && !streaming) ? (
+          <div>
+            {renderError && !streaming && <div className="muted-xs mermaid-warn">図の構文エラー: {renderError}</div>}
+            <pre className="code-pre">
+              <code>{code}</code>
+            </pre>
+          </div>
+        ) : svgHtml ? (
+          <div className="mermaid-svg-wrap" dangerouslySetInnerHTML={{ __html: svgHtml }} />
+        ) : (
+          <div className="mermaid-loading muted-sm">図を描画中...</div>
+        )}
       </div>
-      {!collapsed && (
-        <pre className={`code-pre hljs ${wrapped ? 'wrapped' : ''}`}>
-          {highlightedHtml ? (
-            <code dangerouslySetInnerHTML={{ __html: highlightedHtml }} />
-          ) : (
-            <code>{normalized}</code>
-          )}
-        </pre>
-      )}
-    </div>
-  );
-};
+    );
+  }
+);
 
-const CopyableTable: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+export const CodeBlock: React.FC<{ language: string; code: string; streaming?: boolean }> = React.memo(
+  ({ language, code, streaming = false }) => {
+    const [copied, setCopied] = useState(false);
+    const [wrapped, setWrapped] = useState(false);
+    const [collapsed, setCollapsed] = useState(false);
+
+    const normalized = useMemo(() => code.replace(/\n$/, ''), [code]);
+    const lineCount = useMemo(() => normalized.split('\n').length, [normalized]);
+
+    const highlightedHtml = useMemo(() => {
+      const langKey = (language || 'auto').toLowerCase();
+      const cacheKey = `block:${langKey}:${fastTextHash(normalized)}`;
+      const cached = codeHighlightCache.get(cacheKey);
+      if (cached) return cached.html;
+
+      try {
+        if (language && hljs.getLanguage(language) && normalized.length < 100_000) {
+          const res = hljs.highlight(normalized, { language });
+          if (!streaming) {
+            codeHighlightCache.set(cacheKey, { html: res.value, language });
+          }
+          return res.value;
+        }
+        if (!streaming && normalized.length < 25_000) {
+          const res = hljs.highlightAuto(normalized);
+          codeHighlightCache.set(cacheKey, { html: res.value, language: res.language ?? 'auto' });
+          return res.value;
+        }
+      } catch {
+        // fallback to plain code
+      }
+      return '';
+    }, [language, normalized, streaming]);
+
+    const handleCopy = useCallback(async () => {
+      await navigator.clipboard.writeText(normalized);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    }, [normalized]);
+
+    const handleDownload = useCallback(() => {
+      const ext = extForLang(language);
+      const blob = new Blob([normalized + '\n'], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `snippet.${ext}`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }, [language, normalized]);
+
+    return (
+      <div className="rich-block code-card">
+        <div className="rich-block-head">
+          <span className="lang-pill">
+            {language || 'text'} ({lineCount}行)
+          </span>
+          <div className="row-actions">
+            <button type="button" className="chip-btn" onClick={() => setWrapped((w) => !w)}>
+              {wrapped ? '折返し解除' : '折返し'}
+            </button>
+            {lineCount > 14 && (
+              <button type="button" className="chip-btn" onClick={() => setCollapsed((c) => !c)}>
+                {collapsed ? '展開' : '畳む'}
+              </button>
+            )}
+            <button type="button" className="chip-btn" onClick={handleDownload} title="ファイルとして保存">
+              <DownloadIcon size={13} />
+            </button>
+            <button type="button" className="chip-btn" onClick={handleCopy}>
+              {copied ? <CheckIcon size={13} /> : <CopyIcon size={13} />}
+              <span>{copied ? 'コピー済' : 'コピー'}</span>
+            </button>
+          </div>
+        </div>
+        {!collapsed && (
+          <pre className={`code-pre hljs ${wrapped ? 'wrapped' : ''}`}>
+            {highlightedHtml ? <code dangerouslySetInnerHTML={{ __html: highlightedHtml }} /> : <code>{normalized}</code>}
+          </pre>
+        )}
+      </div>
+    );
+  }
+);
+
+const CopyableTable: React.FC<{ children: React.ReactNode }> = React.memo(({ children }) => {
   const tableRef = useRef<HTMLTableElement>(null);
   const [copiedMode, setCopiedMode] = useState<'md' | 'csv' | null>(null);
 
@@ -232,9 +286,7 @@ const CopyableTable: React.FC<{ children: React.ReactNode }> = ({ children }) =>
     const csv = rows
       .map((r) =>
         r
-          .map((cell) =>
-            /[",\n]/.test(cell) ? `"${cell.replace(/"/g, '""')}"` : cell
-          )
+          .map((cell) => (/[",\n]/.test(cell) ? `"${cell.replace(/"/g, '""')}"` : cell))
           .join(',')
       )
       .join('\n');
@@ -263,9 +315,9 @@ const CopyableTable: React.FC<{ children: React.ReactNode }> = ({ children }) =>
       </div>
     </div>
   );
-};
+});
 
-const CopyableBlockquote: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+const CopyableBlockquote: React.FC<{ children: React.ReactNode }> = React.memo(({ children }) => {
   const quoteRef = useRef<HTMLQuoteElement>(null);
   const [copied, setCopied] = useState(false);
 
@@ -285,7 +337,9 @@ const CopyableBlockquote: React.FC<{ children: React.ReactNode }> = ({ children 
       </button>
     </div>
   );
-};
+});
+
+const DIRECT_URL_RE = /^https?:|^data:|^blob:|^\/api\/files\//i;
 
 const WorkspaceImage: React.FC<{
   chatId?: string;
@@ -293,37 +347,55 @@ const WorkspaceImage: React.FC<{
   alt?: string;
   messageStatus?: MessageRecord['status'];
   onOpenArtifact?: (artifact: ArtifactRecord) => void;
-}> = ({ chatId, src, alt, messageStatus, onOpenArtifact }) => {
-  const [resolved, setResolved] = useState<{ url: string; artifact: ArtifactRecord } | null>(null);
+}> = React.memo(({ chatId, src, alt, messageStatus, onOpenArtifact }) => {
+  const isDirect = DIRECT_URL_RE.test(src);
+
+  const [resolved, setResolved] = useState<{ url: string; artifact: ArtifactRecord } | null>(() => {
+    if (isDirect || !chatId || !src) return null;
+    const hit = peekResolvedLink(chatId, src);
+    return hit ? { url: hit.previewUrl, artifact: hit.artifact } : null;
+  });
   const [failed, setFailed] = useState(false);
   const [retryToken, setRetryToken] = useState(0);
   const prevStatusRef = useRef<MessageRecord['status'] | undefined>(messageStatus);
 
-  const isDirect = /^https?:|^data:|^blob:|^\/api\/files\//i.test(src);
-
   useEffect(() => {
-    setResolved(null);
-    setFailed(false);
-    setRetryToken(0);
+    if (isDirect || !chatId || !src) {
+      setResolved(null);
+      setFailed(false);
+      return;
+    }
+    const hit = peekResolvedLink(chatId, src);
+    if (hit) {
+      setResolved((cur) =>
+        cur && cur.url === hit.previewUrl && cur.artifact.updatedAt === hit.artifact.updatedAt
+          ? cur
+          : { url: hit.previewUrl, artifact: hit.artifact }
+      );
+      setFailed(false);
+    } else {
+      setResolved(null);
+      setFailed(false);
+      setRetryToken(0);
+    }
   }, [chatId, src, isDirect]);
 
   useEffect(() => {
     const prev = prevStatusRef.current;
     prevStatusRef.current = messageStatus;
-    if (prev !== 'completed' && messageStatus === 'completed' && !resolved) {
+    if (prev !== 'completed' && messageStatus === 'completed' && !resolved && !isDirect && chatId && src) {
       setFailed(false);
       setRetryToken((t) => t + 1);
     }
-  }, [messageStatus, resolved]);
+  }, [messageStatus, resolved, isDirect, chatId, src]);
 
   useEffect(() => {
     if (isDirect || !chatId || !src || resolved) return;
     let active = true;
     let retryTimer: number | undefined;
 
-    const attemptResolve = (allowRetry: boolean) => {
-      api
-        .resolveLink(chatId, src)
+    const attemptResolve = (allowRetry: boolean, forceRefresh = false) => {
+      resolveLinkCached(chatId, src, { forceRefresh })
         .then((res) => {
           if (!active) return;
           setFailed(false);
@@ -333,7 +405,7 @@ const WorkspaceImage: React.FC<{
           if (!active) return;
           if (allowRetry) {
             retryTimer = window.setTimeout(() => {
-              if (active) attemptResolve(false);
+              if (active) attemptResolve(false, true);
             }, 500);
           } else {
             setFailed(true);
@@ -341,7 +413,7 @@ const WorkspaceImage: React.FC<{
         });
     };
 
-    attemptResolve(true);
+    attemptResolve(true, retryToken > 0);
 
     return () => {
       active = false;
@@ -349,8 +421,38 @@ const WorkspaceImage: React.FC<{
     };
   }, [chatId, src, isDirect, retryToken, resolved]);
 
+  const resolvedRef = useRef(resolved);
+  resolvedRef.current = resolved;
+
+  // Keep inline image URL up-to-date when artifact bytes change on server
+  useEffect(() => {
+    if (isDirect || !chatId || !src) return;
+    const normalizedSrc = normalizeClientLinkReference(src);
+    return subscribeArtifactUpdates((updated) => {
+      if (updated.chatId !== chatId) return;
+      const curResolved = resolvedRef.current;
+      const matchesCurrent =
+        (curResolved && curResolved.artifact.id === updated.id) ||
+        (normalizedSrc && (updated.relPath === normalizedSrc || updated.id === normalizedSrc));
+      if (matchesCurrent) {
+        const refreshed = peekResolvedLink(chatId, updated.relPath);
+        const nextUrl =
+          refreshed?.previewUrl ??
+          (updated.sha256
+            ? `/api/files/${updated.id}/content?v=${updated.sha256.slice(0, 12)}`
+            : `/api/files/${updated.id}/content`);
+        setFailed(false);
+        setResolved((cur) =>
+          cur && cur.url === nextUrl && cur.artifact.updatedAt === updated.updatedAt
+            ? cur
+            : { url: nextUrl, artifact: updated }
+        );
+      }
+    });
+  }, [chatId, src, isDirect]);
+
   if (isDirect) {
-    return <img src={src} alt={alt ?? ''} className="md-inline-img" loading="lazy" />;
+    return <img src={src} alt={alt ?? ''} className="md-inline-img" loading="lazy" decoding="async" />;
   }
   if (!src) {
     return <span className="muted-xs">[画像リンク解決不可: {alt || '空のパス'}]</span>;
@@ -367,9 +469,92 @@ const WorkspaceImage: React.FC<{
       alt={alt ?? resolved.artifact.filename}
       className="md-inline-img clickable"
       loading="lazy"
+      decoding="async"
       onClick={() => onOpenArtifact?.(resolved.artifact)}
     />
   );
+});
+
+interface MarkdownRenderContextValue {
+  chatId?: string;
+  messageStatus?: MessageRecord['status'];
+  onOpenArtifact?: (artifact: ArtifactRecord) => void;
+  onWorkspaceHref: (href: string) => void;
+}
+
+const MarkdownRenderContext = React.createContext<MarkdownRenderContextValue>({
+  onWorkspaceHref: () => {},
+});
+
+const MarkdownPre: React.FC<{ children?: React.ReactNode }> = React.memo(({ children }) => {
+  const { messageStatus } = useContext(MarkdownRenderContext);
+  const first = Array.isArray(children) ? children[0] : children;
+  if (React.isValidElement<{ className?: string; children?: React.ReactNode }>(first)) {
+    const className = first.props.className ?? '';
+    const langMatch = /language-([^\s]+)/.exec(className);
+    const lang = langMatch ? langMatch[1] : '';
+    const rawCode = extractReactText(first.props.children);
+    const isStreaming = messageStatus === 'streaming';
+    if (lang.toLowerCase() === 'mermaid') {
+      return <MermaidBlock code={rawCode} streaming={isStreaming} />;
+    }
+    return <CodeBlock language={lang} code={rawCode} streaming={isStreaming} />;
+  }
+  return <pre className="code-pre">{children}</pre>;
+});
+
+const MarkdownCode: React.FC<React.HTMLAttributes<HTMLElement>> = React.memo(
+  ({ className, children, ...props }) => (
+    <code className={`inline-code ${className ?? ''}`} {...props}>
+      {children}
+    </code>
+  )
+);
+
+const MarkdownLink: React.FC<{ href?: string; children?: React.ReactNode }> = React.memo(({ href, children }) => {
+  const { onWorkspaceHref } = useContext(MarkdownRenderContext);
+  const rawHref = (href ?? '').trim();
+  const isExternal = /^https?:\/\/|^mailto:/i.test(rawHref);
+  if (isExternal) {
+    return (
+      <a href={rawHref} target="_blank" rel="noopener noreferrer" className="md-link external">
+        {children}
+      </a>
+    );
+  }
+  return (
+    <button
+      type="button"
+      className="md-link workspace-file-link"
+      onClick={() => onWorkspaceHref(rawHref)}
+      title={rawHref ? `ファイルをプレビュー: ${rawHref}` : '空のリンク'}
+    >
+      {children}
+    </button>
+  );
+});
+
+const MarkdownImage: React.FC<{ src?: string; alt?: string }> = React.memo(({ src, alt }) => {
+  const { chatId, messageStatus, onOpenArtifact } = useContext(MarkdownRenderContext);
+  return (
+    <WorkspaceImage
+      chatId={chatId}
+      src={src ?? ''}
+      alt={alt}
+      messageStatus={messageStatus}
+      onOpenArtifact={onOpenArtifact}
+    />
+  );
+});
+
+// Hoisted module-level component map so React never unmounts nested viewers (images, code, mermaid) across parent re-renders
+const MARKDOWN_COMPONENTS: Components = {
+  pre: MarkdownPre,
+  code: MarkdownCode as Components['code'],
+  table: CopyableTable as Components['table'],
+  blockquote: CopyableBlockquote as Components['blockquote'],
+  a: MarkdownLink as Components['a'],
+  img: MarkdownImage as Components['img'],
 };
 
 export interface MarkdownContentProps {
@@ -382,85 +567,57 @@ export interface MarkdownContentProps {
 
 export const MarkdownContent: React.FC<MarkdownContentProps> = React.memo(
   ({ content, chatId, messageStatus, onOpenArtifact, onResolveError }) => {
-    const handleWorkspaceHref = async (href: string) => {
-      if (!href.trim()) {
-        onResolveError?.('参照されたファイルパスが空のため開けませんでした。');
-        return;
-      }
-      if (!chatId || !onOpenArtifact) return;
-      try {
-        const res = await api.resolveLink(chatId, href);
-        onOpenArtifact(res.artifact);
-      } catch {
-        onResolveError?.(`参照されたファイル "${href}" を開けませんでした（存在しないかアクセス権限がありません）。`);
-      }
-    };
+    const onResolveErrorRef = useRef(onResolveError);
+    onResolveErrorRef.current = onResolveError;
+
+    const handleWorkspaceHref = useCallback(
+      async (href: string) => {
+        if (!href.trim()) {
+          onResolveErrorRef.current?.('参照されたファイルパスが空のため開けませんでした。');
+          return;
+        }
+        if (!chatId || !onOpenArtifact) return;
+        const cached = peekResolvedLink(chatId, href);
+        if (cached) {
+          onOpenArtifact(cached.artifact);
+          return;
+        }
+        try {
+          const res = await resolveLinkCached(chatId, href);
+          onOpenArtifact(res.artifact);
+        } catch {
+          onResolveErrorRef.current?.(
+            `参照されたファイル "${href}" を開けませんでした（存在しないかアクセス権限がありません）。`
+          );
+        }
+      },
+      [chatId, onOpenArtifact]
+    );
+
+    const contextValue = useMemo<MarkdownRenderContextValue>(
+      () => ({
+        chatId,
+        messageStatus,
+        onOpenArtifact,
+        onWorkspaceHref: handleWorkspaceHref,
+      }),
+      [chatId, messageStatus, onOpenArtifact, handleWorkspaceHref]
+    );
 
     return (
       <div className="md-body">
-        <ReactMarkdown
-          urlTransform={markdownUrlTransform}
-          remarkPlugins={[remarkGfm, remarkMath]}
-          rehypePlugins={[rehypeKatex]}
-          components={{
-            pre: ({ children }) => {
-              const first = Array.isArray(children) ? children[0] : children;
-              if (React.isValidElement<{ className?: string; children?: React.ReactNode }>(first)) {
-                const className = first.props.className ?? '';
-                const langMatch = /language-([^\s]+)/.exec(className);
-                const lang = langMatch ? langMatch[1] : '';
-                const rawCode = extractReactText(first.props.children);
-                if (lang.toLowerCase() === 'mermaid') {
-                  return <MermaidBlock code={rawCode} />;
-                }
-                return <CodeBlock language={lang} code={rawCode} />;
-              }
-              return <pre className="code-pre">{children}</pre>;
-            },
-            code: ({ className, children, ...props }) => {
-              return (
-                <code className={`inline-code ${className ?? ''}`} {...props}>
-                  {children}
-                </code>
-              );
-            },
-            table: ({ children }) => <CopyableTable>{children}</CopyableTable>,
-            blockquote: ({ children }) => <CopyableBlockquote>{children}</CopyableBlockquote>,
-            a: ({ href, children }) => {
-              const rawHref = (href ?? '').trim();
-              const isExternal = /^https?:\/\/|^mailto:/i.test(rawHref);
-              if (isExternal) {
-                return (
-                  <a href={rawHref} target="_blank" rel="noopener noreferrer" className="md-link external">
-                    {children}
-                  </a>
-                );
-              }
-              return (
-                <button
-                  type="button"
-                  className="md-link workspace-file-link"
-                  onClick={() => void handleWorkspaceHref(rawHref)}
-                  title={rawHref ? `ファイルをプレビュー: ${rawHref}` : '空のリンク'}
-                >
-                  {children}
-                </button>
-              );
-            },
-            img: ({ src, alt }) => (
-              <WorkspaceImage
-                chatId={chatId}
-                src={src ?? ''}
-                alt={alt}
-                messageStatus={messageStatus}
-                onOpenArtifact={onOpenArtifact}
-              />
-            ),
-          }}
-        >
-          {content}
-        </ReactMarkdown>
+        <MarkdownRenderContext.Provider value={contextValue}>
+          <ReactMarkdown
+            urlTransform={markdownUrlTransform}
+            remarkPlugins={REMARK_PLUGINS}
+            rehypePlugins={REHYPE_PLUGINS}
+            components={MARKDOWN_COMPONENTS}
+          >
+            {content}
+          </ReactMarkdown>
+        </MarkdownRenderContext.Provider>
       </div>
     );
   }
 );
+

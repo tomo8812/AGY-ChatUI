@@ -3,12 +3,13 @@ import fs from 'node:fs';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { convertPresentationToPdfCached } from '../files/artifacts.js';
+import { computeStrongEtag, formatHttpDate, isFreshRequest } from '../files/http-cache.js';
 import { resolveAuthorizedChatFileReference } from '../files/link-resolver.js';
 import {
   listWorkspaceFiles,
   resolveContainedExistingPath,
   resolveContainedWriteTarget,
-  sha256File,
+  sha256FileAsync,
 } from '../files/workspace.js';
 import { requireAuth, type RouteDeps } from './auth-routes.js';
 
@@ -21,8 +22,31 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const { chatId } = req.params as { chatId: string };
     const chat = db.getChat(session.user.id, chatId);
     if (!chat) return reply.code(404).send({ error: 'NOT_FOUND', message: 'チャットが見つかりません。' });
+
     const files = listWorkspaceFiles(chat.workspaceDir, true);
     const artifacts = db.listArtifactsForChat(session.user.id, chatId);
+
+    const etagParts: Array<string | number> = ['ws-v1', chatId, files.length, artifacts.length];
+    let latestMtime = chat.updatedAt;
+    for (const f of files) {
+      etagParts.push(f.relPath, f.sizeBytes, f.mtimeMs);
+      if (f.mtimeMs > latestMtime) latestMtime = f.mtimeMs;
+    }
+    for (const a of artifacts) {
+      etagParts.push(a.id, a.sha256, a.updatedAt);
+      if (a.updatedAt > latestMtime) latestMtime = a.updatedAt;
+    }
+
+    const etag = computeStrongEtag(etagParts);
+    reply.header('Vary', 'Cookie');
+    reply.header('Cache-Control', 'private, max-age=0, must-revalidate');
+    reply.header('ETag', etag);
+    reply.header('Last-Modified', formatHttpDate(latestMtime));
+
+    if (isFreshRequest(req.headers, etag, latestMtime)) {
+      return reply.code(304).send();
+    }
+
     return { files, artifacts };
   });
 
@@ -66,7 +90,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const session = requireAuth(req, reply, db);
     if (!session) return;
     const { artifactId } = req.params as { artifactId: string };
-    const query = req.query as { download?: string; converted?: string };
+    const query = req.query as { download?: string; converted?: string; v?: string };
 
     const artifact = db.getArtifact(session.user.id, artifactId);
     if (!artifact) return reply.code(404).send({ error: 'NOT_FOUND', message: 'ファイルが存在しないかアクセス権がありません。' });
@@ -82,8 +106,9 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
 
     let serveMime = artifact.mimeType;
     let serveFilename = artifact.filename;
+    const isConvertedPdf = query.converted === 'pdf' && artifact.previewKind === 'pptx';
 
-    if (query.converted === 'pdf' && artifact.previewKind === 'pptx') {
+    if (isConvertedPdf) {
       const convertedPath = await convertPresentationToPdfCached({
         libreOfficeBin: config.libreOfficeBin,
         cacheRoot: config.artifactsCacheRoot,
@@ -101,12 +126,33 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
       serveFilename = `${artifact.filename}.pdf`;
     }
 
-    const stat = fs.statSync(absPath);
+    const stat = await fs.promises.stat(absPath);
     const totalSize = stat.size;
     const forceDownload = query.download === '1' || query.download === 'true';
+    const expectedV = artifact.sha256 ? artifact.sha256.slice(0, 12) : '';
+    const diskMatchesArtifact =
+      isConvertedPdf || (stat.size === artifact.sizeBytes && Math.floor(stat.mtimeMs) <= artifact.updatedAt);
+    const hasMatchingVersion = Boolean(
+      query.v && expectedV && query.v === expectedV && !forceDownload && diskMatchesArtifact
+    );
+
+    const variant = isConvertedPdf ? 'pdf' : forceDownload ? 'dl' : 'inline';
+    const etag = computeStrongEtag([
+      artifact.id,
+      artifact.sha256,
+      variant,
+      totalSize,
+      Math.round(stat.mtimeMs * 1000),
+    ]);
 
     reply.header('X-Content-Type-Options', 'nosniff');
-    reply.header('Cache-Control', 'private, max-age=0, must-revalidate');
+    reply.header('Vary', 'Cookie');
+    reply.header('ETag', etag);
+    reply.header('Last-Modified', formatHttpDate(stat.mtimeMs));
+    reply.header(
+      'Cache-Control',
+      hasMatchingVersion ? 'private, max-age=300, stale-while-revalidate=3600' : 'private, max-age=0, must-revalidate'
+    );
     reply.header('Accept-Ranges', 'bytes');
 
     // Never allow inline HTML/SVG script execution directly on the same origin `/content` URL
@@ -120,6 +166,10 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     } else {
       reply.header('Content-Type', serveMime);
       reply.header('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(serveFilename)}`);
+    }
+
+    if (isFreshRequest(req.headers, etag, stat.mtimeMs)) {
+      return reply.code(304).send();
     }
 
     const rangeHeader = req.headers.range;
@@ -149,6 +199,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const session = requireAuth(req, reply, db);
     if (!session) return;
     const { artifactId } = req.params as { artifactId: string };
+    const query = req.query as { v?: string };
     const artifact = db.getArtifact(session.user.id, artifactId);
     if (!artifact || artifact.previewKind !== 'html') {
       return reply.code(404).send({ error: 'NOT_FOUND' });
@@ -157,15 +208,41 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     if (!chat) return reply.code(404).send({ error: 'NOT_FOUND' });
 
     const { absPath } = resolveContainedExistingPath(chat.workspaceDir, artifact.relPath);
-    const html = fs.readFileSync(absPath, 'utf8');
+    const stat = await fs.promises.stat(absPath);
+
+    const expectedV = artifact.sha256 ? artifact.sha256.slice(0, 12) : '';
+    const diskMatchesArtifact =
+      stat.size === artifact.sizeBytes && Math.floor(stat.mtimeMs) <= artifact.updatedAt;
+    const hasMatchingVersion = Boolean(query.v && expectedV && query.v === expectedV && diskMatchesArtifact);
+
+    const etag = computeStrongEtag([
+      'sandbox-v1',
+      artifact.id,
+      artifact.sha256,
+      stat.size,
+      Math.round(stat.mtimeMs * 1000),
+    ]);
 
     // Strong sandbox + CSP: runs strictly in an opaque origin iframe (`sandbox="allow-scripts"`) with zero network or storage access
     reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('Vary', 'Cookie');
+    reply.header('ETag', etag);
+    reply.header('Last-Modified', formatHttpDate(stat.mtimeMs));
+    reply.header(
+      'Cache-Control',
+      hasMatchingVersion ? 'private, max-age=300, stale-while-revalidate=3600' : 'private, max-age=0, must-revalidate'
+    );
     reply.header(
       'Content-Security-Policy',
       "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; form-action 'none'; frame-ancestors 'self';"
     );
     reply.header('Content-Type', 'text/html; charset=utf-8');
+
+    if (isFreshRequest(req.headers, etag, stat.mtimeMs)) {
+      return reply.code(304).send();
+    }
+
+    const html = await fs.promises.readFile(absPath, 'utf8');
     return reply.send(html);
   });
 
@@ -184,9 +261,12 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
 
     const { absPath: srcPath } = resolveContainedExistingPath(chat.workspaceDir, artifact.relPath);
     const target = resolveContainedWriteTarget(project.storageDir, artifact.filename);
-    fs.mkdirSync(project.storageDir, { recursive: true, mode: 0o700 });
-    fs.copyFileSync(srcPath, target.absPath);
-    const stat = fs.statSync(target.absPath);
+    await fs.promises.mkdir(project.storageDir, { recursive: true, mode: 0o700 });
+    await fs.promises.copyFile(srcPath, target.absPath);
+    const [stat, sha256] = await Promise.all([
+      fs.promises.stat(target.absPath),
+      sha256FileAsync(target.absPath),
+    ]);
 
     const { file } = db.upsertProjectFile({
       id: crypto.randomUUID(),
@@ -196,7 +276,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
       filename: artifact.filename,
       mimeType: artifact.mimeType,
       sizeBytes: stat.size,
-      sha256: sha256File(target.absPath),
+      sha256,
       createdAt: Date.now(),
     });
 

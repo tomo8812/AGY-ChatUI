@@ -159,6 +159,14 @@ export function extractCandidatePathsFromToolCalls(toolCalls: ToolCallItem[]): s
   return [...candidates];
 }
 
+function buildArtifactUrls(artifact: ArtifactRecord): { previewUrl: string; downloadUrl: string } {
+  const versionSuffix = artifact.sha256 ? `?v=${artifact.sha256.slice(0, 12)}` : '';
+  return {
+    previewUrl: `/api/files/${artifact.id}/content${versionSuffix}`,
+    downloadUrl: `/api/files/${artifact.id}/content?download=1`,
+  };
+}
+
 /**
  * Resolves a model-mentioned file reference (relative path, workspace-scoped absolute path,
  * artifact ID, or generated artifact inside the user's own profile `.gemini/<profile>/brain/` dir)
@@ -188,11 +196,42 @@ export function resolveAuthorizedChatFileReference(params: {
   const byId = params.db.getArtifact(params.userId, candidate);
   if (byId && byId.chatId === params.chatId) {
     try {
-      resolveContainedExistingPath(chat.workspaceDir, byId.relPath);
+      const { absPath } = resolveContainedExistingPath(chat.workspaceDir, byId.relPath);
+      const stat = fs.statSync(absPath);
+      if (!stat.isFile()) return null;
+      let current = byId;
+      const shouldVerify =
+        stat.size !== byId.sizeBytes ||
+        Math.floor(stat.mtimeMs) > byId.updatedAt ||
+        stat.size <= 512 * 1024;
+      if (shouldVerify) {
+        const nextSha = sha256File(absPath);
+        if (
+          nextSha !== byId.sha256 ||
+          stat.size !== byId.sizeBytes ||
+          Math.floor(stat.mtimeMs) > byId.updatedAt
+        ) {
+          current = params.db.upsertArtifact({
+            id: byId.id,
+            userId: byId.userId,
+            chatId: byId.chatId,
+            messageId: byId.messageId,
+            runId: byId.runId,
+            relPath: byId.relPath,
+            filename: byId.filename,
+            mimeType: byId.mimeType,
+            sizeBytes: stat.size,
+            sha256: nextSha,
+            source: byId.source,
+            previewKind: byId.previewKind,
+            diffPatch: null,
+            minUpdatedAt: stat.mtimeMs,
+          });
+        }
+      }
       return {
-        artifact: byId,
-        previewUrl: `/api/files/${byId.id}/content`,
-        downloadUrl: `/api/files/${byId.id}/content?download=1`,
+        artifact: current,
+        ...buildArtifactUrls(current),
       };
     } catch {
       return null;
@@ -206,30 +245,44 @@ export function resolveAuthorizedChatFileReference(params: {
     if (!stat.isFile()) return null;
 
     let artifact = params.db.findArtifactByRelPath(params.userId, params.chatId, relPath);
-    if (!artifact) {
-      const filename = path.basename(relPath);
-      const { mimeType, previewKind } = detectMimeAndPreviewKind(filename);
-      artifact = params.db.upsertArtifact({
-        id: crypto.randomUUID(),
-        userId: params.userId,
-        chatId: params.chatId,
-        messageId: null,
-        runId: null,
-        relPath,
-        filename,
-        mimeType,
-        sizeBytes: stat.size,
-        sha256: sha256File(absPath),
-        source: relPath.startsWith('.project-context/') ? 'project_copy' : 'generated',
-        previewKind,
-        diffPatch: null,
-      });
+    const shouldHash =
+      !artifact ||
+      stat.size !== artifact.sizeBytes ||
+      Math.floor(stat.mtimeMs) > artifact.updatedAt ||
+      stat.size <= 512 * 1024;
+
+    if (shouldHash) {
+      const fileSha = sha256File(absPath);
+      if (
+        !artifact ||
+        artifact.sha256 !== fileSha ||
+        stat.size !== artifact.sizeBytes ||
+        Math.floor(stat.mtimeMs) > artifact.updatedAt
+      ) {
+        const filename = path.basename(relPath);
+        const { mimeType, previewKind } = detectMimeAndPreviewKind(filename);
+        artifact = params.db.upsertArtifact({
+          id: artifact?.id ?? crypto.randomUUID(),
+          userId: params.userId,
+          chatId: params.chatId,
+          messageId: null,
+          runId: null,
+          relPath,
+          filename,
+          mimeType,
+          sizeBytes: stat.size,
+          sha256: fileSha,
+          source: relPath.startsWith('.project-context/') ? 'project_copy' : (artifact?.source ?? 'generated'),
+          previewKind,
+          diffPatch: null,
+          minUpdatedAt: stat.mtimeMs,
+        });
+      }
     }
 
     return {
-      artifact,
-      previewUrl: `/api/files/${artifact.id}/content`,
-      downloadUrl: `/api/files/${artifact.id}/content?download=1`,
+      artifact: artifact!,
+      ...buildArtifactUrls(artifact!),
     };
   } catch {
     // Fall through to check the user's own Antigravity brain directory
@@ -255,9 +308,14 @@ export function resolveAuthorizedChatFileReference(params: {
 
     let artifact = params.db.findArtifactByRelPath(params.userId, params.chatId, imported.relPath);
     const fileSha = sha256File(imported.absPath);
-    if (!artifact || artifact.sha256 !== fileSha) {
+    if (
+      !artifact ||
+      artifact.sha256 !== fileSha ||
+      stat.size !== artifact.sizeBytes ||
+      Math.floor(stat.mtimeMs) > artifact.updatedAt
+    ) {
       artifact = params.db.upsertArtifact({
-        id: crypto.randomUUID(),
+        id: artifact?.id ?? crypto.randomUUID(),
         userId: params.userId,
         chatId: params.chatId,
         messageId: null,
@@ -270,13 +328,13 @@ export function resolveAuthorizedChatFileReference(params: {
         source: 'generated',
         previewKind,
         diffPatch: null,
+        minUpdatedAt: stat.mtimeMs,
       });
     }
 
     return {
       artifact,
-      previewUrl: `/api/files/${artifact.id}/content`,
-      downloadUrl: `/api/files/${artifact.id}/content?download=1`,
+      ...buildArtifactUrls(artifact),
     };
   } catch {
     return null;

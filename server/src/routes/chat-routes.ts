@@ -10,7 +10,6 @@ import {
   detectMimeAndPreviewKind,
   resolveContainedWriteTarget,
   sanitizeFileName,
-  sha256File,
   syncProjectFilesToWorkspace,
 } from '../files/workspace.js';
 import type { AttachmentRef } from '../types.js';
@@ -316,9 +315,9 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
       fs.mkdirSync(path.dirname(target.absPath), { recursive: true, mode: 0o700 });
 
       const buf = await part.toBuffer();
-      fs.writeFileSync(target.absPath, buf);
-      const stat = fs.statSync(target.absPath);
+      await fs.promises.writeFile(target.absPath, buf);
       const { mimeType, previewKind } = detectMimeAndPreviewKind(filename, part.mimetype);
+      const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
 
       const artifact = db.upsertArtifact({
         id: crypto.randomUUID(),
@@ -329,8 +328,8 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
         relPath: target.relPath,
         filename,
         mimeType,
-        sizeBytes: stat.size,
-        sha256: sha256File(target.absPath),
+        sizeBytes: buf.length,
+        sha256,
         source: 'attachment',
         previewKind,
         diffPatch: null,

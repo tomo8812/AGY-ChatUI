@@ -1216,8 +1216,9 @@ export class AppDatabase {
     source: 'attachment' | 'generated' | 'project_copy';
     previewKind: PreviewKind;
     diffPatch: string | null;
+    minUpdatedAt?: number;
   }): ArtifactRecord {
-    const now = Date.now();
+    const now = Math.max(Date.now(), Math.ceil(params.minUpdatedAt ?? 0));
     this.db
       .prepare(
         `INSERT INTO artifacts (

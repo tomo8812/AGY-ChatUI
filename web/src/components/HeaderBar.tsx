@@ -51,7 +51,7 @@ function pickSummaryBucket(quota: QuotaSnapshotRecord | null, modelId: string): 
   }, null);
 }
 
-export const HeaderBar: React.FC<HeaderBarProps> = ({
+export const HeaderBar: React.FC<HeaderBarProps> = React.memo(({
   activeChat,
   selectedModelId,
   agyProfile,
@@ -192,4 +192,4 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
       </div>
     </header>
   );
-};
+});

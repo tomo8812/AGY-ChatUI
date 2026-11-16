@@ -8,6 +8,7 @@ import type {
   SkillSummary,
   SkillTemplate,
 } from '../types';
+import { invalidateSkillFileCache, makeSkillFileCacheKey, skillFileCache } from '../utils/viewerCache';
 import { CloseIcon, FileIcon, PlusIcon, SparklesIcon, TrashIcon } from './Icons';
 import { ToggleSwitch } from './ToggleSwitch';
 
@@ -199,6 +200,12 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
         setStatusNote(`スキル "/${saved.slug}" を保存しました。`);
       }
 
+      invalidateSkillFileCache({
+        scope: saved.scope,
+        slug: saved.slug,
+        projectId: saved.projectId ?? (saved.scope === 'project' ? effectiveProjectId : null),
+        chatId: saved.chatId ?? (saved.scope === 'workspace' ? activeChatId : null),
+      });
       setEditorMode('edit');
       setSelectedDetail(saved);
       setSlug(saved.slug);
@@ -248,6 +255,12 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
         projectId: selectedDetail.projectId ?? effectiveProjectId,
         chatId: selectedDetail.chatId ?? activeChatId,
       });
+      invalidateSkillFileCache({
+        scope: selectedDetail.scope,
+        slug: selectedDetail.slug,
+        projectId: selectedDetail.projectId ?? effectiveProjectId,
+        chatId: selectedDetail.chatId ?? activeChatId,
+      });
       setStatusNote(`スキル "/${selectedDetail.slug}" を削除しました。`);
       setSelectedDetail(null);
       setEditorMode('idle');
@@ -274,6 +287,12 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
         chatId: selectedDetail.chatId ?? activeChatId,
         folder: uploadFolder,
       });
+      invalidateSkillFileCache({
+        scope: selectedDetail.scope,
+        slug: selectedDetail.slug,
+        projectId: selectedDetail.projectId ?? effectiveProjectId,
+        chatId: selectedDetail.chatId ?? activeChatId,
+      });
       setSelectedDetail(res.skill);
       setStatusNote(`${fileList.length}件のリソースを追加しました。`);
       await refreshSkills();
@@ -287,17 +306,33 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
 
   const handleCreateTextResource = async () => {
     if (!selectedDetail || !newFileRelPath.trim()) return;
+    const targetRelPath = newFileRelPath.trim();
     setBusy(true);
     setError(null);
     try {
       const res = await api.saveSkillTextFile(selectedDetail.scope, selectedDetail.slug, {
-        relPath: newFileRelPath.trim(),
+        relPath: targetRelPath,
         content: newFileContent,
         projectId: selectedDetail.projectId ?? effectiveProjectId,
         chatId: selectedDetail.chatId ?? activeChatId,
       });
+      const cacheKey = makeSkillFileCacheKey({
+        scope: selectedDetail.scope,
+        slug: selectedDetail.slug,
+        relPath: targetRelPath,
+        projectId: selectedDetail.projectId ?? effectiveProjectId,
+        chatId: selectedDetail.chatId ?? activeChatId,
+      });
+      invalidateSkillFileCache({
+        scope: selectedDetail.scope,
+        slug: selectedDetail.slug,
+        projectId: selectedDetail.projectId ?? effectiveProjectId,
+        chatId: selectedDetail.chatId ?? activeChatId,
+        relPath: targetRelPath,
+      });
+      skillFileCache.set(cacheKey, { relPath: targetRelPath, content: newFileContent });
       setSelectedDetail(res.skill);
-      setPreviewResource({ relPath: newFileRelPath.trim(), content: newFileContent });
+      setPreviewResource({ relPath: targetRelPath, content: newFileContent });
       setNewFileRelPath('');
       setNewFileContent('');
       setShowNewFileBox(false);
@@ -313,11 +348,24 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
   const handleReadResource = async (relPath: string) => {
     if (!selectedDetail) return;
     setError(null);
+    const cacheKey = makeSkillFileCacheKey({
+      scope: selectedDetail.scope,
+      slug: selectedDetail.slug,
+      relPath,
+      projectId: selectedDetail.projectId ?? effectiveProjectId,
+      chatId: selectedDetail.chatId ?? activeChatId,
+    });
+    const cached = skillFileCache.get(cacheKey);
+    if (cached) {
+      setPreviewResource(cached);
+      return;
+    }
     try {
       const res = await api.readSkillFile(selectedDetail.scope, selectedDetail.slug, relPath, {
         projectId: selectedDetail.projectId ?? effectiveProjectId,
         chatId: selectedDetail.chatId ?? activeChatId,
       });
+      skillFileCache.set(cacheKey, res);
       setPreviewResource(res);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'ファイルの読込に失敗しました。');
@@ -333,6 +381,13 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
       const res = await api.deleteSkillFile(selectedDetail.scope, selectedDetail.slug, relPath, {
         projectId: selectedDetail.projectId ?? effectiveProjectId,
         chatId: selectedDetail.chatId ?? activeChatId,
+      });
+      invalidateSkillFileCache({
+        scope: selectedDetail.scope,
+        slug: selectedDetail.slug,
+        projectId: selectedDetail.projectId ?? effectiveProjectId,
+        chatId: selectedDetail.chatId ?? activeChatId,
+        relPath,
       });
       setSelectedDetail(res.skill);
       if (previewResource?.relPath === relPath) setPreviewResource(null);

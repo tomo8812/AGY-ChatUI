@@ -30,7 +30,7 @@ interface SidebarProps {
   onOpenSettings: () => void;
 }
 
-export const Sidebar: React.FC<SidebarProps> = ({
+export const Sidebar: React.FC<SidebarProps> = React.memo(({
   openMobile,
   user,
   agyProfile,
@@ -349,4 +349,4 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </aside>
     </>
   );
-};
+});

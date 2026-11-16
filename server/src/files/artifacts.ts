@@ -128,6 +128,7 @@ export function syncWorkspaceChangesAsArtifacts(params: {
       source: isInitialProjectCopy && !changed ? 'project_copy' : 'generated',
       previewKind,
       diffPatch,
+      minUpdatedAt: after.mtimeMs,
     });
     registered.push(record);
   }

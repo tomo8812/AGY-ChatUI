@@ -17,7 +17,7 @@ interface PopoverStyleVars extends React.CSSProperties {
   '--model-pop-max-h'?: string;
 }
 
-export const ModelSelector: React.FC<ModelSelectorProps> = ({
+export const ModelSelector: React.FC<ModelSelectorProps> = React.memo(({
   options,
   value,
   disabled = false,
@@ -201,4 +201,4 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
       {popoverNode}
     </>
   );
-};
+});

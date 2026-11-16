@@ -264,7 +264,10 @@ export interface WorkspaceFileEntry {
   name: string;
   sizeBytes: number;
   mtimeMs: number;
+  updatedAt?: number;
   isProjectContext: boolean;
+  previewKind: PreviewKind;
+  mimeType: string;
 }
 
 export interface QuotaBucket {

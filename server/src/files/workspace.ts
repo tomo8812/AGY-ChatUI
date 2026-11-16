@@ -192,15 +192,36 @@ export function detectMimeAndPreviewKind(filename: string, providedMime?: string
 
 export function sha256File(absPath: string): string {
   const hash = crypto.createHash('sha256');
-  hash.update(fs.readFileSync(absPath));
-  return hash.digest('hex');
+  const fd = fs.openSync(absPath, 'r');
+  try {
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    let bytesRead = 0;
+    while ((bytesRead = fs.readSync(fd, chunk, 0, chunk.length, null)) > 0) {
+      hash.update(chunk.subarray(0, bytesRead));
+    }
+    return hash.digest('hex');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+export function sha256FileAsync(absPath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(absPath, { highWaterMark: 64 * 1024 });
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+    stream.on('error', reject);
+  });
 }
 
 export interface WorkspaceTreeEntry {
   relPath: string;
   name: string;
   sizeBytes: number;
+  mtimeMs: number;
   updatedAt: number;
+  isProjectContext: boolean;
   previewKind: PreviewKind;
   mimeType: string;
 }
@@ -211,28 +232,46 @@ export function listWorkspaceFiles(workspaceDir: string, includeProjectContext =
   const rootReal = fs.realpathSync(workspaceDir);
 
   const walk = (dir: string, prefix = '') => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
       if (entry.name === '.git' || entry.name === 'node_modules') continue;
       if (prefix === '' && (entry.name === '.agents' || entry.name === '.agent')) continue;
       if (!includeProjectContext && prefix === '' && entry.name === '.project-context') continue;
       if (entry.isSymbolicLink()) continue; // never traverse symlinks
       const full = path.join(dir, entry.name);
-      const real = fs.realpathSync(full);
+      let real: string;
+      try {
+        real = fs.realpathSync(full);
+      } catch {
+        continue;
+      }
       if (!real.startsWith(rootReal + path.sep)) continue;
       const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
       if (entry.isDirectory()) {
         walk(real, rel);
       } else if (entry.isFile()) {
-        const stat = fs.statSync(real);
-        const { mimeType, previewKind } = detectMimeAndPreviewKind(entry.name);
-        results.push({
-          relPath: rel,
-          name: entry.name,
-          sizeBytes: stat.size,
-          updatedAt: Math.floor(stat.mtimeMs),
-          previewKind,
-          mimeType,
-        });
+        try {
+          const stat = fs.statSync(real);
+          const { mimeType, previewKind } = detectMimeAndPreviewKind(entry.name);
+          const mtimeMs = Math.floor(stat.mtimeMs);
+          results.push({
+            relPath: rel,
+            name: entry.name,
+            sizeBytes: stat.size,
+            mtimeMs,
+            updatedAt: mtimeMs,
+            isProjectContext: rel === '.project-context' || rel.startsWith('.project-context/'),
+            previewKind,
+            mimeType,
+          });
+        } catch {
+          // ignore files deleted mid-walk
+        }
       }
     }
   };

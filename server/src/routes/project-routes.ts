@@ -3,12 +3,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { computeStrongEtag, formatHttpDate, isFreshRequest } from '../files/http-cache.js';
 import {
   detectMimeAndPreviewKind,
   resolveContainedExistingPath,
   resolveContainedWriteTarget,
   sanitizeFileName,
-  sha256File,
 } from '../files/workspace.js';
 import { requireAuth, type RouteDeps } from './auth-routes.js';
 
@@ -141,9 +141,9 @@ export async function registerProjectRoutes(app: FastifyInstance, deps: RouteDep
       const filename = sanitizeFileName(part.filename || 'file.bin');
       const target = resolveContainedWriteTarget(project.storageDir, filename);
       const buf = await part.toBuffer();
-      fs.writeFileSync(target.absPath, buf);
-      const stat = fs.statSync(target.absPath);
+      await fs.promises.writeFile(target.absPath, buf);
       const { mimeType } = detectMimeAndPreviewKind(filename, part.mimetype);
+      const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
 
       const { file } = db.upsertProjectFile({
         id: crypto.randomUUID(),
@@ -152,8 +152,8 @@ export async function registerProjectRoutes(app: FastifyInstance, deps: RouteDep
         relPath: target.relPath,
         filename,
         mimeType,
-        sizeBytes: stat.size,
-        sha256: sha256File(target.absPath),
+        sizeBytes: buf.length,
+        sha256,
         createdAt: Date.now(),
       });
       uploaded.push(file);
@@ -212,10 +212,35 @@ export async function registerProjectRoutes(app: FastifyInstance, deps: RouteDep
     const file = db.listProjectFiles(session.user.id, projectId).find((f) => f.id === fileId);
     if (!file) return reply.code(404).send({ error: 'NOT_FOUND' });
 
-    const { absPath } = resolveContainedExistingPath(project.storageDir, file.relPath);
+    let absPath: string;
+    try {
+      absPath = resolveContainedExistingPath(project.storageDir, file.relPath).absPath;
+    } catch {
+      return reply.code(403).send({ error: 'FORBIDDEN' });
+    }
+
+    const stat = await fs.promises.stat(absPath);
+    const etag = computeStrongEtag([
+      'proj-file',
+      file.id,
+      file.sha256,
+      stat.size,
+      Math.round(stat.mtimeMs * 1000),
+    ]);
+
     reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('Vary', 'Cookie');
+    reply.header('Cache-Control', 'private, max-age=0, must-revalidate');
+    reply.header('ETag', etag);
+    reply.header('Last-Modified', formatHttpDate(stat.mtimeMs));
     reply.header('Content-Type', file.mimeType);
     reply.header('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(file.filename)}`);
+
+    if (isFreshRequest(req.headers, etag, stat.mtimeMs)) {
+      return reply.code(304).send();
+    }
+
+    reply.header('Content-Length', String(stat.size));
     return reply.send(fs.createReadStream(absPath));
   });
 }

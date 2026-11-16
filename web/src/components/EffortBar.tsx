@@ -35,7 +35,7 @@ export function formatEffortLabel(opt: AcpSelectOption | undefined, fallbackValu
   return opt.name;
 }
 
-export const EffortBar: React.FC<EffortBarProps> = ({
+export const EffortBar: React.FC<EffortBarProps> = React.memo(({
   options,
   value,
   disabled = false,
@@ -263,4 +263,4 @@ export const EffortBar: React.FC<EffortBarProps> = ({
       {overlayNode}
     </>
   );
-};
+});

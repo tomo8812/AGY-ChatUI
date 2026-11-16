@@ -57,5 +57,34 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
     sourcemap: false,
+    chunkSizeWarningLimit: 700,
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            {
+              name: 'vendor-react',
+              test: /[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/,
+              priority: 30,
+            },
+            {
+              name: 'vendor-hljs',
+              test: /[\\/]node_modules[\\/]highlight\.js[\\/]/,
+              priority: 25,
+            },
+            {
+              name: 'vendor-katex',
+              test: /[\\/]node_modules[\\/]katex[\\/]/,
+              priority: 22,
+            },
+            {
+              name: 'vendor-markdown',
+              test: /[\\/]node_modules[\\/](react-markdown|remark-.*|rehype-.*|unified|mdast-.*|hast-.*|micromark.*|unist-.*|vfile.*|property-information|comma-separated-tokens|space-separated-tokens|dompurify)[\\/]/,
+              priority: 20,
+            },
+          ],
+        },
+      },
+    },
   },
 });
