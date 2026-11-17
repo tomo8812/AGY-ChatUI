@@ -7,7 +7,6 @@ import {
   captureBrainSnapshot,
   InternalPathStreamRewriter,
   syncNewBrainFilesToWorkspace,
-  rewriteInternalPathsToWorkspace,
 } from '../src/files/link-resolver.js';
 import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
 
@@ -37,16 +36,21 @@ describe('streamed generated file links', () => {
       'file:///home/sandbox/.gemini/antigravity-cli/brain/session-1/%6Diffy.jpg',
     ]) {
       const text = `画像: ![Miffy](${reference}) 保存先: [miffy.jpg](${reference})`;
-      const expected = rewriteInternalPathsToWorkspace(text, profile, workspace);
-      expect(expected).toContain('/workspace/generated/miffy.jpg');
-      expect(expected).not.toContain('.gemini');
+      const target = `${reference.startsWith('file:') ? 'file://' : ''}/workspace/generated/miffy.jpg`;
+      const expected = `画像: ![Miffy](${target}) 保存先: [miffy.jpg](${target})`;
+      const resetGenerated = () => fs.rmSync(path.join(workspace, 'generated'), { recursive: true, force: true });
+      const expectImported = () => expect(fs.readFileSync(path.join(workspace, 'generated/miffy.jpg'), 'utf8')).toBe('image bytes');
       for (let split = 1; split < text.length; split++) {
+        resetGenerated();
         const stream = new InternalPathStreamRewriter(profile, workspace);
         const actual = stream.write(text.slice(0, split)) + stream.write(text.slice(split)) + stream.write('', true);
         expect(actual, `split ${split} in ${reference}`).toBe(expected);
+        expectImported();
       }
+      resetGenerated();
       const stream = new InternalPathStreamRewriter(profile, workspace);
       expect([...text].map(char => stream.write(char)).join('') + stream.write('', true)).toBe(expected);
+      expectImported();
     }
     expect(fs.readFileSync(path.join(workspace, 'generated/miffy.jpg'), 'utf8')).toBe('image bytes');
   });
@@ -135,6 +139,39 @@ describe('streamed generated file links', () => {
     const exact = await resolve(reference);
     expect(exact.status).toBe(200);
     expect(exact.data.artifact.relPath).toBe(`generated/brain/d9343c9e-f0ac-4a7b-9735-3da9e0881e8f/${filename}`);
+  });
+
+  it('preserves uploaded filenames, MIME types and preview kinds when refreshing by ID or path', async () => {
+    const srv = await createTestServer();
+    cleanups.push(srv.cleanup);
+    const { client: alice, userId } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+    const chat = (await alice.request<{ chat: { id: string; workspaceDir: string } }>(
+      'POST', '/api/chats', { title: 'Attachment refresh' }
+    )).data.chat;
+    const form = new FormData();
+    form.append('files', new Blob(['image bytes'], { type: 'image/png' }), 'illustration');
+    const upload = await alice.request<{ attachments: Array<{ artifactId: string; relPath: string }> }>(
+      'POST', `/api/chats/${chat.id}/attachments`, form
+    );
+    expect(upload.status).toBe(201);
+    const attachment = upload.data.attachments[0];
+    const original = srv.ctx.db.getArtifact(userId, attachment.artifactId)!;
+    expect(original.filename).toBe('illustration');
+    expect(original.mimeType).toBe('image/png');
+    expect(original.previewKind).toBe('image');
+    expect(original.relPath).toMatch(/^attachments\/\d+-illustration$/);
+    for (const reference of [original.id, original.relPath]) {
+      fs.appendFileSync(path.join(chat.workspaceDir, original.relPath), 'updated image bytes');
+      const resolved = await alice.request<{ artifact: typeof original }>(
+        'POST', `/api/chats/${chat.id}/resolve-link`, { reference }
+      );
+      expect(resolved.status).toBe(200);
+      expect(resolved.data.artifact).toMatchObject({
+        id: original.id, filename: original.filename, mimeType: original.mimeType,
+        previewKind: original.previewKind, source: original.source,
+      });
+      expect(resolved.data.artifact.sha256).not.toBe(original.sha256);
+    }
   });
 
   it('keeps every streamed Markdown reference resolvable and delta offsets contiguous', async () => {

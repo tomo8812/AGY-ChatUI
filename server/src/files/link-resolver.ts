@@ -496,8 +496,8 @@ export function resolveAuthorizedChatFileReference(params: {
           !artifact || artifact.sha256 !== fileSha || stat.size !== artifact.sizeBytes ||
           Math.floor(stat.mtimeMs) > artifact.updatedAt
         ) {
-          const filename = path.basename(relPath);
-          const { mimeType, previewKind } = detectMimeAndPreviewKind(filename);
+          const filename = artifact?.filename ?? path.basename(relPath);
+          const { mimeType, previewKind } = artifact ?? detectMimeAndPreviewKind(filename);
           artifact = params.db.upsertArtifact({
             id: artifact?.id ?? crypto.randomUUID(),
             userId: params.userId,
