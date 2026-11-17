@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getChatBrainHostDir } from '../src/acp/env-isolation.js';
 import {
   captureBrainSnapshot,
+  extractCandidatePathsFromText,
   InternalPathStreamRewriter,
   normalizeLinkCandidatePath,
   rewriteInternalFileReference,
@@ -73,6 +74,26 @@ describe('streamed generated file links', () => {
         const stream = new InternalPathStreamRewriter(profile, workspace);
         expect(stream.write(text.slice(0, split)) + stream.write(text.slice(split)) + stream.write('', true), `split ${split}`).toBe(expected);
         expect(fs.readFileSync(path.join(workspace, 'generated', filename), 'utf8')).toBe('destination bytes');
+      }
+    }
+  });
+
+  it('preserves balanced filename delimiters in bare references and candidate extraction', () => {
+    const { profile, workspace } = fixture();
+    for (const filename of ['report(v1).pdf', 'report[final].png', 'report([draft]).zip']) {
+      fs.writeFileSync(path.join(getChatBrainHostDir(profile, workspace), 'session-1', filename), 'bare path bytes');
+      const source = `/home/sandbox/.gemini/antigravity-cli/brain/session-1/${filename}`;
+      const encoded = encodeURIComponent(filename).replace(/[()]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+      for (const reference of [source, `file://${source}`]) {
+        const text = `result: (${reference}).`;
+        expect(extractCandidatePathsFromText(text)).toEqual([source]);
+        const expected = `result: (file:///workspace/generated/${encoded}).`;
+        for (let split = 1; split < text.length; split++) {
+          fs.rmSync(path.join(workspace, 'generated'), { recursive: true, force: true });
+          const stream = new InternalPathStreamRewriter(profile, workspace);
+          expect(stream.write(text.slice(0, split)) + stream.write(text.slice(split)) + stream.write('', true), `split ${split}`).toBe(expected);
+          expect(fs.readFileSync(path.join(workspace, 'generated', filename), 'utf8')).toBe('bare path bytes');
+        }
       }
     }
   });

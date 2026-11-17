@@ -322,6 +322,32 @@ export function rewriteInternalFileReference(
     ? workspaceFileUri(relPath) : `${SANDBOX_WORKSPACE_MOUNT}/${relPath}`;
 }
 
+/** Plain path tokens may contain balanced filename parentheses and brackets. */
+function plainFileReferences(text: string): {
+  ranges: Array<{ start: number; end: number }>;
+  pendingStart?: number;
+} {
+  const ranges: Array<{ start: number; end: number }> = [];
+  const starts = /(?:file:\/\/|~\/|\/)/gi;
+  let match: RegExpExecArray | null;
+  while ((match = starts.exec(text)) !== null) {
+    const closing: string[] = [];
+    let end = starts.lastIndex;
+    for (; end < text.length; end++) {
+      const char = text[end];
+      if (/[\s"'`<>」』】》〉、。]/.test(char)) break;
+      if (char === '(' || char === '[') closing.push(char === '(' ? ')' : ']');
+      if (char === ')' || char === ']') {
+        if (closing.pop() !== char) break;
+      }
+    }
+    ranges.push({ start: match.index, end });
+    if (end === text.length) return { ranges, pendingStart: match.index };
+    starts.lastIndex = end;
+  }
+  return { ranges };
+}
+
 /** Locate inline destinations as units, including spaces, angle brackets and balanced parentheses. */
 function inlineFileDestinations(text: string): {
   ranges: Array<{ start: number; end: number }>;
@@ -367,13 +393,18 @@ export function rewriteInternalPathsToWorkspace(
   profileDir: string,
   workspaceDir?: string | null
 ): string {
-  const rewritePlain = (value: string) => value.replace(/(?:file:\/\/)?(\/[^\s"'`<>()\[\]」』】》〉、。]+)/gi,
-    (fullMatch, rawPath: string) => {
-      const trailing = /([.,;:!?]+)$/.exec(rawPath)?.[1] ?? '';
-      const reference = trailing ? fullMatch.slice(0, -trailing.length) : fullMatch;
-      return rewriteInternalFileReference(reference, profileDir, workspaceDir) + trailing;
+  const rewritePlain = (value: string) => {
+    let result = '';
+    let cursor = 0;
+    for (const range of plainFileReferences(value).ranges) {
+      const raw = value.slice(range.start, range.end);
+      const trailing = /([.,;:!?]+)$/.exec(raw)?.[1] ?? '';
+      const reference = trailing ? raw.slice(0, -trailing.length) : raw;
+      result += value.slice(cursor, range.start) + rewriteInternalFileReference(reference, profileDir, workspaceDir) + trailing;
+      cursor = range.end;
     }
-  );
+    return result + value.slice(cursor);
+  };
   let result = '';
   let cursor = 0;
   for (const range of inlineFileDestinations(text).ranges) {
@@ -402,8 +433,9 @@ export class InternalPathStreamRewriter {
     const tail = final ? null : /[^\s"'`<>()\[\]」』】》〉、。]*$/.exec(text);
     const mayBePath = tail && (tail[0].includes('/') || /(?:file:|file|fil|fi|f)$/i.test(tail[0]));
     const destination = final ? undefined : inlineFileDestinations(text).pendingStart;
+    const plain = final ? undefined : plainFileReferences(text).pendingStart;
     const closingLabel = !final && text.endsWith(']') ? text.length - 1 : text.length;
-    const boundary = Math.min(mayBePath ? tail.index : text.length, destination ?? text.length, closingLabel);
+    const boundary = Math.min(mayBePath ? tail.index : text.length, destination ?? text.length, plain ?? text.length, closingLabel);
     this.pending = text.slice(boundary);
     return rewriteInternalPathsToWorkspace(text.slice(0, boundary), this.profileDir, this.workspaceDir);
   }
@@ -487,10 +519,9 @@ export function importAuthorizedBrainFileToWorkspace(params: {
 export function extractCandidatePathsFromText(text: string): string[] {
   const candidates = new Set<string>();
   if (!text) return [];
-  const regex = /(?:file:\/\/\/|\/|~\/)[^\s"'`<>()\[\]」』】》〉、。]+/g;
-  let match: RegExpExecArray | null;
-  while ((match = regex.exec(text)) !== null) {
-    const cleaned = normalizeLinkCandidatePath(match[0].replace(/[.,;:!?]+$/, ''));
+  for (const range of plainFileReferences(text).ranges) {
+    const raw = text.slice(range.start, range.end).replace(/[.,;:!?]+$/, '');
+    const cleaned = normalizeLinkCandidatePath(raw);
     if (cleaned) candidates.add(cleaned);
   }
   return [...candidates];
