@@ -62,13 +62,16 @@ echo "==> [3/6] Checking official Antigravity CLI (agy -> /usr/local/bin/agy)...
 CANONICAL_AGY_BIN="/usr/local/bin/agy"
 if [[ ! -x "${CANONICAL_AGY_BIN}" ]]; then
   FOUND_AGY_CANDIDATE=""
-  for cand in /usr/bin/agy /bin/agy /root/.local/bin/agy /root/.antigravity/bin/agy /home/*/.local/bin/agy /home/*/.antigravity/bin/agy; do
+  for cand in /usr/bin/agy /bin/agy /root/.local/bin/agy /root/.antigravity/bin/agy; do
     if [[ -x "${cand}" ]]; then
-      FOUND_AGY_CANDIDATE="$(readlink -f "${cand}" 2>/dev/null || echo "${cand}")"
-      break
+      cand_real="$(readlink -f "${cand}" 2>/dev/null || echo "${cand}")"
+      if [[ -f "${cand_real}" ]] && [[ "$(stat -c '%u' "${cand_real}" 2>/dev/null || echo 1)" == "0" ]]; then
+        FOUND_AGY_CANDIDATE="${cand_real}"
+        break
+      fi
     fi
   done
-  if [[ -n "${FOUND_AGY_CANDIDATE}" ]] && [[ -f "${FOUND_AGY_CANDIDATE}" ]]; then
+  if [[ -n "${FOUND_AGY_CANDIDATE}" ]]; then
     install -m 755 "${FOUND_AGY_CANDIDATE}" "${CANONICAL_AGY_BIN}"
     echo "Unified Antigravity CLI binary to ${CANONICAL_AGY_BIN} (from ${FOUND_AGY_CANDIDATE})."
   fi

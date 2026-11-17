@@ -405,6 +405,69 @@ promote_to_canonical_agy() {
   return 0
 }
 
+is_trusted_agy_candidate() {
+  local cand="$1"
+  python3 - "$cand" <<'PY' >/dev/null 2>&1
+import os, stat, sys
+
+cand = sys.argv[1]
+if not cand or not os.path.lexists(cand):
+    sys.exit(1)
+
+euid = os.geteuid()
+allowed_uids = {0} if euid == 0 else {0, euid}
+bad_mode_mask = 0o022 if euid == 0 else 0o002
+
+def check_ancestors(target: str) -> bool:
+    cur = os.path.abspath(target)
+    while True:
+        try:
+            lst = os.lstat(cur)
+            st = os.stat(cur)
+        except OSError:
+            return False
+        if lst.st_uid not in allowed_uids or st.st_uid not in allowed_uids:
+            return False
+        if (st.st_mode & bad_mode_mask) != 0 and not (st.st_mode & stat.S_ISVTX):
+            return False
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return True
+
+# Verify candidate's parent directory is not user/world writable
+cand_abs = os.path.abspath(cand)
+cand_parent = os.path.dirname(cand_abs)
+if not check_ancestors(cand_parent):
+    sys.exit(1)
+
+# If candidate itself is a symlink, verify symlink owner too
+try:
+    lst = os.lstat(cand_abs)
+except OSError:
+    sys.exit(1)
+if stat.S_ISLNK(lst.st_mode) and lst.st_uid not in allowed_uids:
+    sys.exit(1)
+
+# Verify resolved real binary and its ancestors are trusted, regular, executable
+real = os.path.realpath(cand_abs)
+if not check_ancestors(real):
+    sys.exit(1)
+try:
+    rst = os.stat(real)
+except OSError:
+    sys.exit(1)
+if not stat.S_ISREG(rst.st_mode):
+    sys.exit(1)
+if rst.st_uid not in allowed_uids or (rst.st_mode & bad_mode_mask) != 0:
+    sys.exit(1)
+if not os.access(real, os.X_OK):
+    sys.exit(1)
+sys.exit(0)
+PY
+}
+
 unify_agy_binaries() {
   local target_bin="$1"
   local -a candidates=()
@@ -418,23 +481,30 @@ unify_agy_binaries() {
       /bin/agy
       /root/.local/bin/agy
       /root/.antigravity/bin/agy
-      /home/*/.local/bin/agy
-      /home/*/.antigravity/bin/agy
     )
   fi
 
-  local target_ver=""
-  if [[ -x "${target_bin}" ]]; then
+  local target_real="" target_ver=""
+  if is_trusted_agy_candidate "${target_bin}"; then
+    target_real="$(readlink -f "${target_bin}" 2>/dev/null || echo "${target_bin}")"
     target_ver="$(read_agy_version "${target_bin}")"
   fi
 
-  # 1. If canonical target is missing/broken or another path holds a newer version, promote it
+  # 1. If canonical target is missing/broken or another trusted path holds a newer version, promote it
   local best_cand="" best_ver=""
-  local cand cand_real cand_ver target_real=""
+  local cand cand_real cand_ver
   for cand in "${candidates[@]}"; do
-    [[ -x "${cand}" ]] || continue
+    [[ "${cand}" != "${target_bin}" ]] || continue
+    if ! is_trusted_agy_candidate "${cand}"; then
+      if [[ -e "${cand}" || -L "${cand}" ]]; then
+        echo "[auto-update] WARNING: Skipping untrusted or writable agy candidate at ${cand}." >&2
+      fi
+      continue
+    fi
     cand_real="$(readlink -f "${cand}" 2>/dev/null || echo "${cand}")"
-    [[ -f "${cand_real}" ]] || continue
+    if [[ -n "${target_real}" ]] && [[ -n "${target_ver}" ]] && [[ "${cand_real}" == "${target_real}" ]]; then
+      continue
+    fi
     cand_ver="$(read_agy_version "${cand}")"
     [[ -n "${cand_ver}" ]] || continue
 
@@ -453,19 +523,19 @@ unify_agy_binaries() {
 
   if [[ -n "${best_cand}" ]]; then
     promote_to_canonical_agy "${best_cand}" "${target_bin}" || true
-    if [[ -x "${target_bin}" ]]; then
+    if is_trusted_agy_candidate "${target_bin}"; then
+      target_real="$(readlink -f "${target_bin}" 2>/dev/null || echo "${target_bin}")"
       target_ver="$(read_agy_version "${target_bin}")"
     fi
   fi
 
-  # 2. If canonical target is healthy, replace duplicate non-package binaries with symlinks to target
-  [[ -x "${target_bin}" && -n "${target_ver}" ]] || return 0
-  target_real="$(readlink -f "${target_bin}" 2>/dev/null || echo "${target_bin}")"
-  [[ -f "${target_real}" ]] || return 0
+  # 2. If canonical target is healthy, replace trusted non-package duplicates with symlinks to target
+  [[ -n "${target_ver}" && -n "${target_real}" && -f "${target_real}" ]] || return 0
 
   for cand in "${candidates[@]}"; do
     [[ -f "${cand}" || -L "${cand}" ]] || continue
     [[ "${cand}" != "${target_bin}" ]] || continue
+    is_trusted_agy_candidate "${cand}" || continue
     cand_real="$(readlink -f "${cand}" 2>/dev/null || true)"
     if [[ -n "${cand_real}" ]] && [[ "${cand_real}" == "${target_real}" ]]; then
       continue
@@ -474,12 +544,7 @@ unify_agy_binaries() {
       echo "[auto-update] WARNING: Package-managed duplicate agy at ${cand} differs from ${target_bin}."
       continue
     fi
-    local parent_owner=""
-    parent_owner="$(stat -c '%U:%G' "$(dirname "${cand}")" 2>/dev/null || true)"
     if ln -sfn "${target_bin}" "${cand}" 2>/dev/null; then
-      if [[ "$(id -u)" -eq 0 ]] && [[ -n "${parent_owner}" ]]; then
-        chown -h "${parent_owner}" "${cand}" 2>/dev/null || true
-      fi
       echo "[auto-update] Linked duplicate agy ${cand} -> ${target_bin}."
     fi
   done
