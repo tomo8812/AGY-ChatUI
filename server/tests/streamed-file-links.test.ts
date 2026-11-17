@@ -60,6 +60,23 @@ describe('streamed generated file links', () => {
     expect(fs.readFileSync(path.join(workspace, 'generated/miffy.jpg'), 'utf8')).toBe('image bytes');
   });
 
+  it('keeps inline Markdown destinations together across whitespace and parenthesis chunk boundaries', () => {
+    const { profile, workspace } = fixture();
+    for (const [filename, angled] of [['report final.png', true], ['report final.png', false], ['report(v1).pdf', false]] as const) {
+      fs.writeFileSync(path.join(getChatBrainHostDir(profile, workspace), 'session-1', filename), 'destination bytes');
+      const source = `/home/sandbox/.gemini/antigravity-cli/brain/session-1/${filename}`;
+      const target = `file:///workspace/generated/${encodeURIComponent(filename).replace(/[()]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)}`;
+      const text = `![result](${angled ? `<${source}>` : source} "Title")`;
+      const expected = `![result](${angled ? `<${target}>` : target} "Title")`;
+      for (let split = 1; split < text.length; split++) {
+        fs.rmSync(path.join(workspace, 'generated'), { recursive: true, force: true });
+        const stream = new InternalPathStreamRewriter(profile, workspace);
+        expect(stream.write(text.slice(0, split)) + stream.write(text.slice(split)) + stream.write('', true), `split ${split}`).toBe(expected);
+        expect(fs.readFileSync(path.join(workspace, 'generated', filename), 'utf8')).toBe('destination bytes');
+      }
+    }
+  });
+
   it('holds incomplete paths, flushes a final bare link once, and keeps independent streams separate', () => {
     const { profile, workspace } = fixture();
     const content = new InternalPathStreamRewriter(profile, workspace);

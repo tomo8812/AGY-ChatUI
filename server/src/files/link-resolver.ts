@@ -322,18 +322,69 @@ export function rewriteInternalFileReference(
     ? workspaceFileUri(relPath) : `${SANDBOX_WORKSPACE_MOUNT}/${relPath}`;
 }
 
+/** Locate inline destinations as units, including spaces, angle brackets and balanced parentheses. */
+function inlineFileDestinations(text: string): {
+  ranges: Array<{ start: number; end: number }>;
+  pendingStart?: number;
+} {
+  const ranges: Array<{ start: number; end: number }> = [];
+  for (let open = text.indexOf(']('); open >= 0; open = text.indexOf('](', open + 2)) {
+    let start = open + 2;
+    while (/\s/.test(text[start] ?? '') && start < text.length) start++;
+    const literal = text[start] === '<';
+    let inLiteral = literal;
+    let literalEnd = -1;
+    let depth = 1;
+    let quote = '';
+    let end = start + (literal ? 1 : 0);
+    for (; end < text.length; end++) {
+      const char = text[end];
+      if (char === '\\') { end++; continue; }
+      if (inLiteral) {
+        if (char === '>') { inLiteral = false; literalEnd = end; }
+        continue;
+      }
+      if (quote) { if (char === quote) quote = ''; continue; }
+      if ((char === '"' || char === "'") && /\s/.test(text[end - 1] ?? '')) { quote = char; continue; }
+      if (char === '(') depth++;
+      if (char === ')' && --depth === 0) break;
+    }
+    if (end >= text.length) return { ranges, pendingStart: open };
+    if (literal) {
+      ranges.push({ start: start + 1, end: literalEnd });
+    } else {
+      const body = text.slice(start, end).trimEnd();
+      const title = /\s+(?:"[^"]*"|'[^']*'|\([^)]*\))\s*$/.exec(body);
+      ranges.push({ start, end: start + body.length - (title?.[0].length ?? 0) });
+    }
+    open = end - 1;
+  }
+  return { ranges };
+}
+
 export function rewriteInternalPathsToWorkspace(
   text: string,
   profileDir: string,
   workspaceDir?: string | null
 ): string {
-  return text.replace(/(?:file:\/\/)?(\/[^\s"'`<>()\[\]」』】》〉、。]+)/gi,
+  const rewritePlain = (value: string) => value.replace(/(?:file:\/\/)?(\/[^\s"'`<>()\[\]」』】》〉、。]+)/gi,
     (fullMatch, rawPath: string) => {
       const trailing = /([.,;:!?]+)$/.exec(rawPath)?.[1] ?? '';
       const reference = trailing ? fullMatch.slice(0, -trailing.length) : fullMatch;
       return rewriteInternalFileReference(reference, profileDir, workspaceDir) + trailing;
     }
   );
+  let result = '';
+  let cursor = 0;
+  for (const range of inlineFileDestinations(text).ranges) {
+    result += rewritePlain(text.slice(cursor, range.start));
+    const raw = text.slice(range.start, range.end);
+    const reference = raw.replace(/\\([\\()[\]<>])/g, '$1');
+    const rewritten = rewriteInternalFileReference(reference, profileDir, workspaceDir);
+    result += rewritten === reference ? raw : rewritten;
+    cursor = range.end;
+  }
+  return result + rewritePlain(text.slice(cursor));
 }
 
 /** Rewrites only complete path tokens; ACP chunks can split anywhere in a URI. */
@@ -350,7 +401,9 @@ export class InternalPathStreamRewriter {
     // Retain unfinished paths, including partial "file:" prefixes, until a boundary arrives.
     const tail = final ? null : /[^\s"'`<>()\[\]」』】》〉、。]*$/.exec(text);
     const mayBePath = tail && (tail[0].includes('/') || /(?:file:|file|fil|fi|f)$/i.test(tail[0]));
-    const boundary = mayBePath ? tail.index : text.length;
+    const destination = final ? undefined : inlineFileDestinations(text).pendingStart;
+    const closingLabel = !final && text.endsWith(']') ? text.length - 1 : text.length;
+    const boundary = Math.min(mayBePath ? tail.index : text.length, destination ?? text.length, closingLabel);
     this.pending = text.slice(boundary);
     return rewriteInternalPathsToWorkspace(text.slice(0, boundary), this.profileDir, this.workspaceDir);
   }

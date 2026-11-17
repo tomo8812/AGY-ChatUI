@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -14,6 +15,17 @@ afterEach(async () => {
 function references(text: string): string[] {
   return [...text.matchAll(/\]\(([^)]+)\)/g)].map(match => match[1]);
 }
+
+function fileReference(relPath: string): string {
+  const encoded = relPath.split('/').map(part => encodeURIComponent(part).replace(/[!'()*]/g,
+    char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)).join('/');
+  return `file:///workspace/${encoded}`;
+}
+
+const previewKinds = {
+  png: 'image', svg: 'svg', pdf: 'pdf', docx: 'docx', xlsx: 'table', pptx: 'pptx',
+  zip: 'binary', md: 'markdown', csv: 'table', html: 'html', wav: 'audio', mp4: 'video',
+} as const;
 
 describe('subagent artifact delivery across file formats and ACP channels', () => {
   it('preserves links, bytes, metadata and isolation after end_turn across every content channel', async () => {
@@ -53,6 +65,24 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
     expect(artifacts).toHaveLength(21);
     expect(subagent.status).toBe('completed');
     expect(subagent.subagentState).toBe('idle');
+    const expectedBytesByName = new Map<string, Buffer>([
+      ...Object.keys(previewKinds).map(ext => [
+        `report (v1) [final] #50%.${ext}`, mockArtifactBytes(ext as keyof typeof previewKinds),
+      ] as [string, Buffer]),
+      ['inline notes.md', Buffer.from('# Inline notes')],
+      ['inline document.bin', mockArtifactBytes('pdf')], ['empty.txt', Buffer.alloc(0)],
+      ['shared.bin', mockArtifactBytes('png')], ['declared image.svg', mockArtifactBytes('png')],
+    ]);
+    for (const format of ['png', 'pngAlternate', 'wav'] as const) {
+      const bytes = mockArtifactBytes(format);
+      const hash = crypto.createHash('sha256').update(bytes).digest('hex').slice(0, 12);
+      expectedBytesByName.set(`generated-${hash}.${format === 'pngAlternate' ? 'png' : format}`, bytes);
+    }
+    const expectedByReference = new Map(artifacts.map(artifact => {
+      const bytes = expectedBytesByName.get(artifact.filename);
+      expect(bytes, artifact.filename).toBeDefined();
+      return [fileReference(artifact.relPath), { artifact, bytes }] as const;
+    }));
     const channels: Record<string, string> = {
       parent: message.contentText,
       parentThoughts: message.thoughtsText,
@@ -64,24 +94,39 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
     for (const [channel, text] of Object.entries(channels)) {
       expect(text, channel).not.toMatch(/\.gemini|generated\/\//);
       expect(references(text).length, channel).toBeGreaterThanOrEqual(channel === 'parentThoughts' ? 8 : 20);
+      if (channel !== 'parentThoughts') {
+        for (const ext of Object.keys(previewKinds)) {
+          const expected = fileReference(`generated/report (v1) [final] #50%.${ext}`);
+          expect(text, `${channel}: ${ext} link`).toContain(`[${ext} file](${expected})`);
+        }
+      }
+      for (const artifact of artifacts.filter(item =>
+        ['inline notes.md', 'inline document.bin', 'empty.txt', 'shared.bin'].includes(item.filename)
+      )) {
+        const image = artifact.mimeType.startsWith('image/');
+        expect(text.split('\n'), `${channel}: ${artifact.filename}`).toContain(
+          `${image ? '!' : ''}[${artifact.filename}](${fileReference(artifact.relPath)})`
+        );
+      }
+      for (const artifact of artifacts.filter(item => item.filename.startsWith('generated-'))) {
+        expect(text, `${channel}: ${artifact.filename}`).toContain(`](${fileReference(artifact.relPath)})`);
+      }
+
       for (const reference of new Set(references(text))) {
+        const expected = expectedByReference.get(reference);
+        expect(expected, `${channel}: ${reference}`).toBeDefined();
         const response = await alice.request<{ artifact: ArtifactRecord; previewUrl: string }>(
           'POST', `/api/chats/${chat.id}/resolve-link`, { reference }
         );
         expect(response.status, `${channel}: ${reference}`).toBe(200);
+        expect(response.data.artifact.id, `${channel}: ${reference}`).toBe(expected!.artifact.id);
         const bytes = await fetch(`${srv.baseUrl}${response.data.previewUrl}`, {
           headers: { Cookie: alice.cookieHeader },
         });
         expect(bytes.status).toBe(200);
-        expect(Buffer.from(await bytes.arrayBuffer())).toEqual(
-          fs.readFileSync(path.join(chat.workspaceDir, response.data.artifact.relPath))
-        );
+        expect(Buffer.from(await bytes.arrayBuffer())).toEqual(expected!.bytes);
       }
     }
-    const previewKinds = {
-      png: 'image', svg: 'svg', pdf: 'pdf', docx: 'docx', xlsx: 'table', pptx: 'pptx',
-      zip: 'binary', md: 'markdown', csv: 'table', html: 'html', wav: 'audio', mp4: 'video',
-    };
     for (const [ext, previewKind] of Object.entries(previewKinds)) {
       const filename = `report (v1) [final] #50%.${ext}`;
       const artifact = artifacts.find(item => item.filename === filename)!;
