@@ -106,7 +106,7 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
       fs.readFileSync(path.join(chat.workspaceDir, item.relPath)).toString('base64')
     );
     expect(inlineImageBytes.sort()).toEqual([mockArtifactBytes('png').toString('base64'), mockArtifactBytes('pngAlternate').toString('base64')].sort());
-    const declared = artifacts.find(item => item.filename === 'declared image.bin')!;
+    const declared = artifacts.find(item => item.filename === 'declared image.svg')!;
     expect(declared.mimeType).toBe('image/png');
     expect(declared.previewKind).toBe('image');
     expect(fs.readFileSync(path.join(chat.workspaceDir, declared.relPath))).toEqual(mockArtifactBytes('png'));
@@ -114,7 +114,7 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
       const event = frame.event as { type: string; payload?: { artifact?: ArtifactRecord } } | undefined;
       const artifact = event?.payload?.artifact;
       return event?.type === 'artifact.created' && artifact?.id === declared.id &&
-        artifact.filename === 'declared image.bin' && artifact.mimeType === 'image/png';
+        artifact.filename === 'declared image.svg' && artifact.mimeType === 'image/png';
     })).toBe(true);
     expect(message.sessionMessages!.every(item => item.done)).toBe(true);
     const otherChat = (await alice.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Other chat' })).data.chat;

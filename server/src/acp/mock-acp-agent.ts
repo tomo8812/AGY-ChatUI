@@ -670,11 +670,12 @@ function runAcpServer(): void {
               sessionUpdate: 'agent_message_chunk', content: { type: 'resource_link', uri: file, name: filename },
             } });
           }
-          const declaredFile = path.join(dir, 'declared-source.bin');
+          // Deliberately conflicting extension: explicit native image/png must win over .svg.
+          const declaredFile = path.join(dir, 'declared-source.svg');
           fs.writeFileSync(declaredFile, mockArtifactBytes('png'));
           const declaredBlock: ContentBlock = {
             type: 'resource_link', uri: pathToFileURL(declaredFile).href,
-            name: 'declared image.bin', mimeType: 'image/png',
+            name: 'declared image.svg', mimeType: 'image/png',
           };
           for (const sessionId of [childId, state.id]) {
             await sendUpdate({ sessionId, update: { sessionUpdate: 'agent_message_chunk', content: declaredBlock } });

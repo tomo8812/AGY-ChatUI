@@ -1696,13 +1696,22 @@ export class AcpClientManager {
     }
   }
 
+  private contentFileType(filename: string, declaredMime?: string | null): ReturnType<typeof detectMimeAndPreviewKind> {
+    if (!declaredMime || declaredMime === 'application/octet-stream') {
+      return detectMimeAndPreviewKind(filename);
+    }
+    const extension = mime.extension(declaredMime) || 'bin';
+    const detected = detectMimeAndPreviewKind(`content.${extension}`, declaredMime);
+    return { ...detected, mimeType: declaredMime };
+  }
+
   /** Present every ACP file block through the same storage/link path in every channel. */
   private renderContentBlock(worker: WorkerInstance, turn: ActiveTurnBridge, block: ContentBlock): string {
     if (block.type === 'text') return block.text;
     if (block.type === 'resource_link') {
       const reference = rewriteInternalFileReference(block.uri, worker.profileDir, worker.workspaceDir);
       const filename = block.name || path.basename(normalizeLinkCandidatePath(reference) ?? reference);
-      const { previewKind } = detectMimeAndPreviewKind(filename, block.mimeType);
+      const { previewKind } = this.contentFileType(filename, block.mimeType);
       try {
         const candidate = toHostWorkspacePath(worker.workspaceDir, SANDBOX_WORKSPACE_MOUNT, reference);
         const resolved = resolveContainedExistingPath(worker.workspaceDir, candidate);
@@ -1735,7 +1744,7 @@ export class AcpClientManager {
     const relPath = this.saveInlineAssetToWorkspace(worker, turn, data, mimeType, filename);
     if (!relPath) return '';
     const label = filename || (block.type === 'image' ? '生成画像' : path.basename(relPath));
-    const { previewKind } = detectMimeAndPreviewKind(filename || relPath, mimeType);
+    const { previewKind } = this.contentFileType(filename || relPath, mimeType);
     return `\n${formatFileLink(label, relPath, previewKind === 'image' || previewKind === 'svg')}\n`;
   }
 
@@ -1754,7 +1763,9 @@ export class AcpClientManager {
         item.workspaceRelPath
       );
       const filename = item.mimeType ? item.filename : (existing?.filename ?? item.filename);
-      const { mimeType, previewKind } = detectMimeAndPreviewKind(filename, item.mimeType ?? existing?.mimeType);
+      const { mimeType, previewKind } = item.mimeType
+        ? this.contentFileType(filename, item.mimeType)
+        : existing ?? detectMimeAndPreviewKind(filename);
       turn.syncedBrainFiles.set(item.workspaceRelPath, { ...item, filename, mimeType });
       const artifact = this.db.upsertArtifact({
         id: existing?.id ?? crypto.randomUUID(),
