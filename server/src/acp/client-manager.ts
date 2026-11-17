@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
+import mime from 'mime-types';
 import { Readable, Writable } from 'node:stream';
 import {
   client,
@@ -36,7 +37,10 @@ import {
   captureBrainSnapshot,
   extractCandidatePathsFromText,
   extractCandidatePathsFromToolCalls,
+  formatFileLink,
+  rewriteInternalFileReference,
   importAuthorizedBrainFileToWorkspace,
+  normalizeLinkCandidatePath,
   InternalPathStreamRewriter,
   resolveAuthorizedBrainFile,
   rewriteInternalPathsToWorkspace,
@@ -1008,10 +1012,9 @@ export class AcpClientManager {
           !bridge.contentText.includes(synced.workspaceRelPath)
         ) {
           const { previewKind } = detectMimeAndPreviewKind(synced.filename);
-          const snippet =
-            previewKind === 'image' || previewKind === 'svg'
-              ? `\n\n![${synced.filename}](${synced.workspaceRelPath})\n\n保存先: [${synced.filename}](file://${SANDBOX_WORKSPACE_MOUNT}/${synced.workspaceRelPath})`
-              : `\n\n成果物を保存しました: [${synced.filename}](file://${SANDBOX_WORKSPACE_MOUNT}/${synced.workspaceRelPath})`;
+          const snippet = previewKind === 'image' || previewKind === 'svg'
+            ? `\n\n${formatFileLink(synced.filename, synced.workspaceRelPath, true)}\n\n保存先: ${formatFileLink(synced.filename, synced.workspaceRelPath)}`
+            : `\n\n成果物を保存しました: ${formatFileLink(synced.filename, synced.workspaceRelPath)}`;
           this.appendTurnContentChunk(worker, bridge, snippet);
         }
       }
@@ -1658,45 +1661,68 @@ export class AcpClientManager {
     this.maybeFlushTurnProgress(turn);
   }
 
-  private saveInlineBase64AssetToWorkspace(
+  private saveInlineAssetToWorkspace(
     worker: WorkerInstance,
     turn: ActiveTurnBridge,
-    params: { data: string; mimeType: string; suggestedName?: string }
+    data: Buffer,
+    mimeType: string,
+    suggestedName?: string
   ): string | null {
     try {
-      const buf = Buffer.from(params.data, 'base64');
-      if (buf.length === 0) return null;
-      const extFromMime =
-        params.mimeType === 'image/png'
-          ? '.png'
-          : params.mimeType === 'image/jpeg'
-            ? '.jpg'
-            : params.mimeType === 'image/webp'
-              ? '.webp'
-              : params.mimeType === 'image/gif'
-                ? '.gif'
-                : params.mimeType === 'image/svg+xml'
-                  ? '.svg'
-                  : '.bin';
-      const baseName = sanitizeFileName(
-        params.suggestedName || `generated-${Date.now()}${extFromMime}`
-      );
-      const finalName = path.extname(baseName) ? baseName : `${baseName}${extFromMime}`;
-      const relPath = `generated/${finalName}`;
-      const target = resolveContainedWriteTarget(worker.workspaceDir, relPath);
+      const ext = mime.extension(mimeType) || 'bin';
+      const filename = sanitizeFileName(suggestedName || `generated.${ext}`);
+      const hash = crypto.createHash('sha256').update(data).digest('hex');
+      const suffix = path.extname(filename) || `.${ext}`;
+      const stem = path.extname(filename) ? filename.slice(0, -suffix.length) : filename;
+      const target = resolveContainedWriteTarget(worker.workspaceDir, `generated/${stem}-${hash}${suffix}`);
       fs.mkdirSync(path.dirname(target.absPath), { recursive: true, mode: 0o700 });
-      fs.writeFileSync(target.absPath, buf);
+      if (!fs.existsSync(target.absPath) || sha256File(target.absPath) !== hash) {
+        fs.writeFileSync(target.absPath, data);
+      }
       this.registerAndEmitSyncedWorkspaceFile(worker, turn, {
         brainAbsPath: target.absPath,
-        relUnderBrain: finalName,
+        relUnderBrain: filename,
         workspaceAbsPath: target.absPath,
         workspaceRelPath: target.relPath,
-        filename: path.basename(target.relPath),
+        filename,
+        mimeType,
       });
       return target.relPath;
     } catch {
       return null;
     }
+  }
+
+  /** Present every ACP file block through the same storage/link path in every channel. */
+  private renderContentBlock(worker: WorkerInstance, turn: ActiveTurnBridge, block: ContentBlock): string {
+    if (block.type === 'text') return block.text;
+    if (block.type === 'resource_link') {
+      const reference = rewriteInternalFileReference(block.uri, worker.profileDir, worker.workspaceDir);
+      const filename = block.name || path.basename(normalizeLinkCandidatePath(reference) ?? reference);
+      const { previewKind } = detectMimeAndPreviewKind(filename, block.mimeType);
+      return `\n${formatFileLink(filename, reference, previewKind === 'image' || previewKind === 'svg')}\n`;
+    }
+    let data: Buffer;
+    let mimeType: string;
+    let filename: string | undefined;
+    if (block.type === 'resource') {
+      const resource = block.resource;
+      if (!resource || (!('text' in resource) && !('blob' in resource))) return '';
+      data = 'text' in resource ? Buffer.from(resource.text, 'utf8') : Buffer.from(resource.blob, 'base64');
+      mimeType = resource.mimeType || ('text' in resource ? 'text/plain' : 'application/octet-stream');
+      try { filename = decodeURIComponent(path.posix.basename(new URL(resource.uri).pathname)); } catch { /* Use a MIME-derived name. */ }
+    } else if (block.type === 'image' || block.type === 'audio') {
+      if (typeof block.data !== 'string') return '';
+      data = Buffer.from(block.data, 'base64');
+      mimeType = block.mimeType;
+    } else {
+      return '';
+    }
+    const relPath = this.saveInlineAssetToWorkspace(worker, turn, data, mimeType, filename);
+    if (!relPath) return '';
+    const label = filename || (block.type === 'image' ? '生成画像' : path.basename(relPath));
+    const { previewKind } = detectMimeAndPreviewKind(filename || relPath, mimeType);
+    return `\n${formatFileLink(label, relPath, previewKind === 'image' || previewKind === 'svg')}\n`;
   }
 
   private registerAndEmitSyncedWorkspaceFile(
@@ -1709,7 +1735,7 @@ export class AcpClientManager {
       const stat = fs.statSync(item.workspaceAbsPath);
       if (!stat.isFile()) return;
       const fileSha = sha256File(item.workspaceAbsPath);
-      const { mimeType, previewKind } = detectMimeAndPreviewKind(item.filename);
+      const { mimeType, previewKind } = detectMimeAndPreviewKind(item.filename, item.mimeType);
       const existing = this.db.findArtifactByRelPath(
         worker.userId,
         worker.chatId,
@@ -1811,33 +1837,9 @@ export class AcpClientManager {
       if (!item || typeof item !== 'object') continue;
       const entry = item as Record<string, unknown>;
       if (entry.type === 'content' && entry.content && typeof entry.content === 'object') {
-        const block = entry.content as Record<string, unknown>;
-        if (block.type === 'text' && typeof block.text === 'string') {
-          textParts.push(
-            rewriteInternalPathsToWorkspace(block.text, worker.profileDir, worker.workspaceDir)
-          );
-        } else if (
-          block.type === 'image' &&
-          typeof block.data === 'string' &&
-          typeof block.mimeType === 'string'
-        ) {
-          const rel = this.saveInlineBase64AssetToWorkspace(worker, turn, {
-            data: block.data,
-            mimeType: block.mimeType,
-          });
-          if (rel) {
-            textParts.push(`![生成画像](${rel})`);
-          }
-        } else if (block.type === 'resource_link' && typeof block.uri === 'string') {
-          const rewritten = rewriteInternalPathsToWorkspace(
-            block.uri,
-            worker.profileDir,
-            worker.workspaceDir
-          );
-          textParts.push(rewritten);
-        }
+        textParts.push(this.renderContentBlock(worker, turn, entry.content as ContentBlock));
       } else if (entry.type === 'diff' && typeof entry.path === 'string') {
-        const cleanPath = rewriteInternalPathsToWorkspace(
+        const cleanPath = rewriteInternalFileReference(
           entry.path,
           worker.profileDir,
           worker.workspaceDir
@@ -1845,7 +1847,9 @@ export class AcpClientManager {
         textParts.push(`Diff: ${cleanPath}`);
       }
     }
-    return textParts.length > 0 ? textParts.join('\n').trim() : undefined;
+    return textParts.length > 0
+      ? rewriteInternalPathsToWorkspace(textParts.join(''), worker.profileDir, worker.workspaceDir).trim()
+      : undefined;
   }
 
   private pruneOldTurnBridges(worker: WorkerInstance): void {
@@ -2180,50 +2184,24 @@ export class AcpClientManager {
       };
       this.upsertSubagentToolCall(worker, turn, {
         subSessionId: childSessionId,
-        childToolCall: childTool,
+        childToolCall: scrubToolCallsInternalPaths([childTool], worker.profileDir, worker.workspaceDir)[0],
       });
       return;
     }
 
     if (update.sessionUpdate === 'agent_thought_chunk') {
-      if (update.content.type === 'text' && update.content.text) {
-        this.upsertSubagentToolCall(worker, turn, {
-          subSessionId: childSessionId,
-          thoughtsDelta: update.content.text,
-        });
-      }
+      this.upsertSubagentToolCall(worker, turn, {
+        subSessionId: childSessionId,
+        thoughtsDelta: this.renderContentBlock(worker, turn, update.content),
+      });
       return;
     }
 
     if (update.sessionUpdate === 'agent_message_chunk') {
-      if (update.content.type === 'image') {
-        const rel = this.saveInlineBase64AssetToWorkspace(worker, turn, {
-          data: update.content.data,
-          mimeType: update.content.mimeType,
-        });
-        if (rel) {
-          this.upsertSubagentToolCall(worker, turn, {
-            subSessionId: childSessionId,
-            contentDelta: `\n\n![生成画像](${rel})\n`,
-          });
-        }
-      } else if (update.content.type === 'resource_link') {
-        this.syncBrainDeliverablesMidTurn(worker, turn);
-        const rewrittenUri = rewriteInternalPathsToWorkspace(
-          update.content.uri,
-          worker.profileDir,
-          worker.workspaceDir
-        );
-        this.upsertSubagentToolCall(worker, turn, {
-          subSessionId: childSessionId,
-          contentDelta: `\n[${update.content.name || path.basename(rewrittenUri)}](${rewrittenUri})\n`,
-        });
-      } else if (update.content.type === 'text' && update.content.text) {
-        this.upsertSubagentToolCall(worker, turn, {
-          subSessionId: childSessionId,
-          contentDelta: update.content.text,
-        });
-      }
+      this.upsertSubagentToolCall(worker, turn, {
+        subSessionId: childSessionId,
+        contentDelta: this.renderContentBlock(worker, turn, update.content),
+      });
       this.syncBrainDeliverablesMidTurn(worker, turn);
     }
   }
@@ -2233,27 +2211,10 @@ export class AcpClientManager {
     turn: ActiveTurnBridge,
     blocks: ContentBlock[]
   ): string {
-    const parts: string[] = [];
-    for (const block of blocks) {
-      if (!block || typeof block !== 'object') continue;
-      if (block.type === 'text' && typeof block.text === 'string') {
-        parts.push(block.text);
-      } else if (block.type === 'image' && typeof block.data === 'string') {
-        const rel = this.saveInlineBase64AssetToWorkspace(worker, turn, {
-          data: block.data,
-          mimeType: block.mimeType,
-        });
-        if (rel) parts.push(`\n\n![生成画像](${rel})\n`);
-      } else if (block.type === 'resource_link' && typeof block.uri === 'string') {
-        const rewritten = rewriteInternalPathsToWorkspace(
-          block.uri,
-          worker.profileDir,
-          worker.workspaceDir
-        );
-        parts.push(`[${block.name || path.basename(rewritten)}](${rewritten})`);
-      }
-    }
-    return rewriteInternalPathsToWorkspace(parts.join(''), worker.profileDir, worker.workspaceDir);
+    return rewriteInternalPathsToWorkspace(
+      blocks.map(block => this.renderContentBlock(worker, turn, block)).join(''),
+      worker.profileDir, worker.workspaceDir
+    );
   }
 
   private handleInterSessionMessageNotification(
@@ -2691,39 +2652,13 @@ export class AcpClientManager {
           );
         }
       }
-      if (update.content.type === 'text') {
-        this.appendTurnContentChunk(worker, turn, update.content.text);
-      } else if (update.content.type === 'image') {
-        const rel = this.saveInlineBase64AssetToWorkspace(worker, turn, {
-          data: update.content.data,
-          mimeType: update.content.mimeType,
-        });
-        if (rel) {
-          this.appendTurnContentChunk(worker, turn, `\n\n![生成画像](${rel})\n`);
-        }
-      } else if (update.content.type === 'resource_link') {
-        this.syncBrainDeliverablesMidTurn(worker, turn);
-        const rewrittenUri = rewriteInternalPathsToWorkspace(
-          update.content.uri,
-          worker.profileDir,
-          worker.workspaceDir
-        );
-        const rel = rewrittenUri.replace(/^file:\/\//, '').replace(/^\/workspace\//, '');
-        const { previewKind } = detectMimeAndPreviewKind(update.content.name || rel);
-        const md =
-          previewKind === 'image' || previewKind === 'svg'
-            ? `\n\n![${update.content.name || path.basename(rel)}](${rel})\n`
-            : `\n\n[${update.content.name || path.basename(rel)}](${rewrittenUri})\n`;
-        this.appendTurnContentChunk(worker, turn, md);
-      }
+      this.appendTurnContentChunk(worker, turn, this.renderContentBlock(worker, turn, update.content));
       finalizeIfBackground(update.content.type !== 'text');
       return;
     }
 
     if (update.sessionUpdate === 'agent_thought_chunk') {
-      if (update.content.type === 'text') {
-        this.appendTurnThoughtChunk(worker, turn, update.content.text);
-      }
+      this.appendTurnThoughtChunk(worker, turn, this.renderContentBlock(worker, turn, update.content));
       finalizeIfBackground();
       return;
     }

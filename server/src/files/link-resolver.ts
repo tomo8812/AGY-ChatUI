@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   getChatBrainHostDir,
   SANDBOX_HOME_MOUNT,
@@ -220,6 +221,7 @@ export interface SyncedBrainFile {
   workspaceAbsPath: string;
   workspaceRelPath: string;
   filename: string;
+  mimeType?: string;
 }
 
 export function syncNewBrainFilesToWorkspace(params: {
@@ -259,62 +261,77 @@ export function syncNewBrainFilesToWorkspace(params: {
   return synced;
 }
 
+function encodeMarkdownUrl(url: string): string {
+  return url.replace(/[()[\]"'<>\s]/g, char =>
+    [...Buffer.from(char)].map(byte => `%${byte.toString(16).toUpperCase().padStart(2, '0')}`).join('')
+  );
+}
+
+export function workspaceFileUri(relPath: string): string {
+  return encodeMarkdownUrl(pathToFileURL(`${SANDBOX_WORKSPACE_MOUNT}/${relPath}`).href);
+}
+
+export function formatFileLink(filename: string, reference: string, image = false): string {
+  const label = filename.replace(/[\\[\]]/g, '\\$&');
+  let destination = reference;
+  if (/^file:\/\//i.test(reference)) {
+    const candidate = normalizeLinkCandidatePath(reference);
+    if (candidate) destination = pathToFileURL(candidate).href;
+  } else if (!/^[a-z][a-z\d+.-]*:/i.test(reference)) {
+    destination = pathToFileURL(path.posix.resolve(SANDBOX_WORKSPACE_MOUNT, reference)).href;
+  }
+  return `${image ? '!' : ''}[${label}](${encodeMarkdownUrl(destination)})`;
+}
+
+/** A structured URI/location is one reference, even when its filename contains spaces. */
+export function rewriteInternalFileReference(
+  reference: string,
+  profileDir: string,
+  workspaceDir?: string | null
+): string {
+  const normalized = normalizeLinkCandidatePath(reference);
+  if (!normalized) return reference;
+  const profileAbs = path.resolve(profileDir);
+  const brainFile = resolveAuthorizedBrainFile({
+    profileDir: profileAbs, workspaceDir, candidatePath: normalized,
+  });
+  if (brainFile && workspaceDir) {
+    try {
+      const imported = importAuthorizedBrainFileToWorkspace({
+        workspaceDir, sourceAbsPath: brainFile.absPath,
+      });
+      return /^file:\/\//i.test(reference) || /[\s%#?()[\]]/.test(imported.relPath)
+        ? workspaceFileUri(imported.relPath)
+        : `${SANDBOX_WORKSPACE_MOUNT}/${imported.relPath}`;
+    } catch {
+      // Redact inaccessible internal paths below.
+    }
+  }
+  const isInternalPath =
+    normalized.startsWith(`${profileAbs}/`) || normalized === profileAbs ||
+    normalized.startsWith(`${SANDBOX_HOME_MOUNT}/`) || normalized === SANDBOX_HOME_MOUNT ||
+    normalized.startsWith('/var/lib/antigravity-chat/');
+  if (!isInternalPath) return reference;
+  const base = path.basename(normalized.replace(/\/+$/, ''));
+  const ext = path.extname(base);
+  const relPath = ext && !INTERNAL_BRAIN_EXCLUDED_EXTENSIONS.has(ext.toLowerCase())
+    ? `generated/${sanitizeFileName(base)}` : 'generated/';
+  return /^file:\/\//i.test(reference) || /[\s%#?()[\]]/.test(relPath)
+    ? workspaceFileUri(relPath) : `${SANDBOX_WORKSPACE_MOUNT}/${relPath}`;
+}
+
 export function rewriteInternalPathsToWorkspace(
   text: string,
   profileDir: string,
   workspaceDir?: string | null
 ): string {
-  if (!text) return text;
-  const profileAbs = path.resolve(profileDir);
-
-  return text.replace(/(file:\/\/)?(\/[^\s"'`<>()\[\]」』】》〉、。]+)/g, (fullMatch, filePrefix: string | undefined, rawPath: string) => {
-    const trailingMatch = /([.,;:!?]+)$/.exec(rawPath);
-    const trailing = trailingMatch ? trailingMatch[1] : '';
-    const cleanRaw = trailing ? rawPath.slice(0, -trailing.length) : rawPath;
-    const normalized = normalizeLinkCandidatePath(`${filePrefix ?? ''}${cleanRaw}`);
-
-    if (normalized) {
-      const brainResolved = resolveAuthorizedBrainFile({
-        profileDir: profileAbs,
-        workspaceDir,
-        candidatePath: normalized,
-      });
-      if (brainResolved && workspaceDir) {
-        try {
-          const imported = importAuthorizedBrainFileToWorkspace({
-            workspaceDir,
-            sourceAbsPath: brainResolved.absPath,
-          });
-          const replacementPath = `${SANDBOX_WORKSPACE_MOUNT}/${imported.relPath}`;
-          return `${filePrefix ?? ''}${replacementPath}${trailing}`;
-        } catch {
-          // fallback below
-        }
-      }
-      if (brainResolved) {
-        const fname = sanitizeFileName(path.basename(brainResolved.absPath));
-        return `${filePrefix ?? ''}${SANDBOX_WORKSPACE_MOUNT}/generated/${fname}${trailing}`;
-      }
+  return text.replace(/(file:\/\/)?(\/[^\s"'`<>()\[\]」』】》〉、。]+)/gi,
+    (fullMatch, filePrefix: string | undefined, rawPath: string) => {
+      const trailing = /([.,;:!?]+)$/.exec(rawPath)?.[1] ?? '';
+      const reference = trailing ? fullMatch.slice(0, -trailing.length) : fullMatch;
+      return rewriteInternalFileReference(reference, profileDir, workspaceDir) + trailing;
     }
-
-    const isInternalPath =
-      cleanRaw.startsWith(`${profileAbs}/`) ||
-      cleanRaw === profileAbs ||
-      cleanRaw.startsWith(`${SANDBOX_HOME_MOUNT}/`) ||
-      cleanRaw === SANDBOX_HOME_MOUNT ||
-      cleanRaw.startsWith('/var/lib/antigravity-chat/');
-
-    if (isInternalPath) {
-      const base = path.basename(cleanRaw.replace(/\/+$/, ''));
-      const ext = path.extname(base);
-      if (ext && !INTERNAL_BRAIN_EXCLUDED_EXTENSIONS.has(ext.toLowerCase())) {
-        return `${filePrefix ?? ''}${SANDBOX_WORKSPACE_MOUNT}/generated/${sanitizeFileName(base)}${trailing}`;
-      }
-      return `${filePrefix ?? ''}${SANDBOX_WORKSPACE_MOUNT}/generated/${trailing}`;
-    }
-
-    return fullMatch;
-  });
+  );
 }
 
 /** Rewrites only complete path tokens; ACP chunks can split anywhere in a URI. */
@@ -345,7 +362,9 @@ export function scrubToolCallsInternalPaths(
   const scrubValue = (val: unknown, depth = 0): unknown => {
     if (depth > 5 || val == null) return val;
     if (typeof val === 'string') {
-      return rewriteInternalPathsToWorkspace(val, profileDir, workspaceDir);
+      return /^(?:file:\/\/|\/|~\/)/i.test(val.trim())
+        ? rewriteInternalFileReference(val, profileDir, workspaceDir)
+        : rewriteInternalPathsToWorkspace(val, profileDir, workspaceDir);
     }
     if (Array.isArray(val)) {
       return val.map((item) => scrubValue(item, depth + 1));
@@ -368,8 +387,14 @@ export function scrubToolCallsInternalPaths(
       : tc.contentText,
     locations: tc.locations?.map((loc) => ({
       ...loc,
-      path: rewriteInternalPathsToWorkspace(loc.path, profileDir, workspaceDir),
+      path: rewriteInternalFileReference(loc.path, profileDir, workspaceDir),
     })),
+    subagentContentText: tc.subagentContentText
+      ? rewriteInternalPathsToWorkspace(tc.subagentContentText, profileDir, workspaceDir) : tc.subagentContentText,
+    subagentThoughtsText: tc.subagentThoughtsText
+      ? rewriteInternalPathsToWorkspace(tc.subagentThoughtsText, profileDir, workspaceDir) : tc.subagentThoughtsText,
+    subagentToolCalls: tc.subagentToolCalls
+      ? scrubToolCallsInternalPaths(tc.subagentToolCalls, profileDir, workspaceDir) : tc.subagentToolCalls,
     rawInput: scrubValue(tc.rawInput),
     rawOutput: scrubValue(tc.rawOutput),
   }));

@@ -11,6 +11,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import readline from 'node:readline';
 import { Readable, Writable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -21,6 +22,7 @@ import {
   PROTOCOL_VERSION,
   RequestError,
   type AgentContext,
+  type ContentBlock,
   type SessionConfigOption,
 } from '@agentclientprotocol/sdk';
 
@@ -609,6 +611,90 @@ function runAcpServer(): void {
           });
         })();
 
+        return { stopReason: 'end_turn' as const };
+      }
+
+      // Exercise all file delivery channels after the native foreground turn has ended.
+      if (promptText.includes('[SUBAGENT_FILES]')) {
+        const childId = `${state.id}-file-worker`;
+        const toolId = `${childId}-launch`;
+        await sendUpdate({ sessionId: state.id, update: {
+          sessionUpdate: 'tool_call', toolCallId: toolId, title: 'invoke_subagent', status: 'completed',
+          rawInput: { Subagents: [{ Role: 'File Worker' }] },
+        } });
+        await sendUpdate({ sessionId: state.id, update: {
+          sessionUpdate: 'subagent_update', sessionId: childId, toolCallId: toolId, state: { state: 'running' },
+        } });
+        void (async () => {
+          await delay(80);
+          if (state.cancelled) return;
+          const dir = path.join(homeDir, '.gemini', 'antigravity-cli', 'brain', childId);
+          fs.mkdirSync(dir, { recursive: true });
+          await sendUpdate({ sessionId: state.id, update: { sessionUpdate: 'state_update', state: 'running' } });
+          for (const ext of ['png', 'svg', 'pdf', 'docx', 'xlsx', 'pptx', 'zip', 'md', 'csv', 'html', 'wav', 'mp4']) {
+            const filename = `report (v1) [final] #50%.${ext}`;
+            const file = path.join(dir, filename);
+            fs.writeFileSync(file, `${ext} artifact bytes`);
+            const uri = pathToFileURL(file).href.replace(/[()[\]]/g, c => `%${c.charCodeAt(0).toString(16)}`);
+            const text = `[${ext} file](${uri})`;
+            const split = text.indexOf('/brain/');
+            for (const chunk of [text.slice(0, split), text.slice(split)]) {
+              await sendUpdate({ sessionId: childId, update: {
+                sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: chunk },
+              } });
+              await sendUpdate({ sessionId: childId, update: {
+                sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: chunk },
+              } });
+              await sendUpdate({ sessionId: state.id, update: {
+                sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: chunk },
+              } });
+              await sendUpdate({ sessionId: state.id, update: {
+                sessionUpdate: 'session_message_chunk', messageId: `file-${ext}`,
+                senderSessionId: childId, content: { type: 'text', text: chunk }, done: false,
+              } as never });
+            }
+            await sendUpdate({ sessionId: state.id, update: {
+              sessionUpdate: 'session_message', messageId: `file-${ext}`, done: true,
+            } as never });
+            await sendUpdate({ sessionId: childId, update: {
+              sessionUpdate: 'tool_call', toolCallId: `file-tool-${ext}`, title: `Export ${ext}`, status: 'completed',
+              locations: [{ path: file }], rawOutput: { path: file },
+              content: [
+                { type: 'content', content: { type: 'text', text: text.slice(0, split) } },
+                { type: 'content', content: { type: 'text', text: text.slice(split) } },
+                { type: 'content', content: { type: 'resource_link', uri: file, name: filename } },
+              ],
+            } });
+            await sendUpdate({ sessionId: childId, update: {
+              sessionUpdate: 'agent_message_chunk', content: { type: 'resource_link', uri: file, name: filename },
+            } });
+          }
+          const inlineBlocks: ContentBlock[] = [
+            { type: 'resource', resource: { uri: 'artifact:///inline%20notes.md', mimeType: 'text/markdown', text: '# Inline notes' } },
+            { type: 'resource', resource: { uri: 'artifact:///inline%20document.bin', mimeType: 'application/pdf', blob: Buffer.from('%PDF-inline bytes').toString('base64') } },
+            { type: 'resource', resource: { uri: 'artifact:///empty.txt', mimeType: 'text/plain', text: '' } },
+            { type: 'audio', mimeType: 'audio/wav', data: Buffer.from('inline audio bytes').toString('base64') },
+            { type: 'image', mimeType: 'image/png', data: Buffer.from('inline image A').toString('base64') },
+            { type: 'image', mimeType: 'image/png', data: Buffer.from('inline image B').toString('base64') },
+          ];
+          for (const [i, block] of inlineBlocks.entries()) {
+            await sendUpdate({ sessionId: childId, update: { sessionUpdate: 'agent_message_chunk', content: block } });
+            await sendUpdate({ sessionId: state.id, update: { sessionUpdate: 'agent_message_chunk', content: block } });
+            await sendUpdate({ sessionId: childId, update: { sessionUpdate: 'agent_thought_chunk', content: block } });
+            await sendUpdate({ sessionId: state.id, update: { sessionUpdate: 'agent_thought_chunk', content: block } });
+            await sendUpdate({ sessionId: childId, update: {
+              sessionUpdate: 'tool_call', toolCallId: `inline-${i}`, title: 'Inline file', status: 'completed',
+              content: [{ type: 'content', content: block }],
+            } });
+            await sendUpdate({ sessionId: state.id, update: {
+              sessionUpdate: 'session_message', messageId: `inline-${i}`, content: [block], done: true,
+            } as never });
+          }
+          await sendUpdate({ sessionId: childId, update: { sessionUpdate: 'state_update', state: 'idle', stopReason: 'end_turn' } });
+          await sendUpdate({ sessionId: state.id, update: {
+            sessionUpdate: 'state_update', state: 'idle', stopReason: 'end_turn', background: [],
+          } });
+        })();
         return { stopReason: 'end_turn' as const };
       }
 
