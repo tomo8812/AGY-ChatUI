@@ -664,6 +664,7 @@ fi
     // 6. Successful agy update still restarts service when run_app_update fails, preserving exit code
     writeMockAgy('1.5.8');
     fs.writeFileSync(systemctlLogPath, '');
+    fs.rmSync(path.join(appDir, 'BUILD_INFO.json'), { force: true });
     execFileSync('git', ['init', '-b', 'main', appDir], { encoding: 'utf8' });
     execFileSync('git', ['-C', appDir, 'remote', 'add', 'origin', path.join(tmpRoot, 'missing-remote.git')], {
       encoding: 'utf8',
