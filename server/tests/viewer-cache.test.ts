@@ -103,6 +103,35 @@ describe('viewerCache client caching & LRU utilities', () => {
     expect(buildArtifactSandboxUrl(html)).toBe('/api/files/a3/sandbox?v=abc123def456');
   });
 
+  it('refreshes aliased links and emits updates when only filename, MIME or preview kind changes', async () => {
+    setViewerCacheUser('user-a');
+    let artifact = makeArtifact({ relPath: 'sub/report.bin', filename: 'report.bin', mimeType: 'application/octet-stream', previewKind: 'binary' });
+    const fetcher = vi.fn(async () => ({
+      artifact, previewUrl: buildArtifactContentUrl(artifact), downloadUrl: buildArtifactContentUrl(artifact, { download: true }),
+    }));
+    const alias = 'file:///workspace/alias/report.bin';
+    await resolveLinkCached('chat-1', alias, { fetcher });
+    const updated = vi.fn();
+    const unsubscribe = subscribeArtifactUpdates(updated);
+    try {
+      for (const patch of [
+        { mimeType: 'application/pdf' },
+        { previewKind: 'pdf' as const },
+        { filename: 'report.pdf' },
+      ]) {
+        artifact = { ...artifact, ...patch };
+        notifyArtifactUpdated(artifact);
+        expect(updated).toHaveBeenLastCalledWith(artifact);
+        expect(peekResolvedLink('chat-1', alias)?.artifact).toEqual(artifact);
+        expect((await resolveLinkCached('chat-1', alias, { fetcher })).artifact).toEqual(artifact);
+      }
+      expect(updated).toHaveBeenCalledTimes(3);
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    } finally {
+      unsubscribe();
+    }
+  });
+
   it('deduplicates concurrent resolveLinkCached calls and keeps aliased cache keys in sync on updates', async () => {
     setViewerCacheUser('user-a');
     const v1 = makeArtifact({ id: 'art-1', relPath: 'sub/chart.png', sha256: '111111111111aaaa' });

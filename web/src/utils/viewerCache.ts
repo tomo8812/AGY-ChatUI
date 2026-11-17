@@ -535,7 +535,11 @@ function upsertKnownArtifactInternal(artifact: ArtifactRecord): { changed: boole
     prev.sha256 !== artifact.sha256 ||
     prev.sizeBytes !== artifact.sizeBytes ||
     prev.updatedAt !== artifact.updatedAt ||
-    prev.diffPatch !== artifact.diffPatch;
+    prev.diffPatch !== artifact.diffPatch ||
+    prev.filename !== artifact.filename ||
+    prev.mimeType !== artifact.mimeType ||
+    prev.previewKind !== artifact.previewKind ||
+    prev.relPath !== artifact.relPath;
 
   chatMap.set(artifact.id, artifact);
   chatMap.set(`rel:${artifact.relPath}`, artifact);
@@ -554,7 +558,7 @@ function upsertKnownArtifactInternal(artifact: ArtifactRecord): { changed: boole
   resolvedLinkCache.updateWhere((key, cached) => {
     if (!key.startsWith(chatPrefix)) return false;
     const matchesSame = cached.artifact.id === artifact.id || cached.artifact.relPath === artifact.relPath;
-    return matchesSame && (cached.artifact.sha256 !== artifact.sha256 || cached.previewUrl !== entry.previewUrl);
+    return matchesSame;
   }, entry);
 
   if (prev && (prev.sha256 !== artifact.sha256 || prev.updatedAt !== artifact.updatedAt)) {
