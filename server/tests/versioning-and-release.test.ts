@@ -660,5 +660,21 @@ fi
     const outFail = run({ AGY_AUTO_UPDATE: 'true', AGY_UPDATE_INTERVAL_SEC: '0' });
     expect(outFail).toContain('WARNING: agy update failed');
     expect(fs.readFileSync(systemctlLogPath, 'utf8')).toBe('');
+
+    // 6. Successful agy update still restarts service when run_app_update fails, preserving exit code
+    writeMockAgy('1.5.8');
+    fs.writeFileSync(systemctlLogPath, '');
+    execFileSync('git', ['init', '-b', 'main', appDir], { encoding: 'utf8' });
+    execFileSync('git', ['-C', appDir, 'remote', 'add', 'origin', path.join(tmpRoot, 'missing-remote.git')], {
+      encoding: 'utf8',
+    });
+    let appFailStatus = 0;
+    try {
+      run({ AGY_AUTO_UPDATE: 'true', AGY_UPDATE_INTERVAL_SEC: '0', RELEASE_TAG: 'auto' });
+    } catch (err: unknown) {
+      appFailStatus = (err as { status?: number }).status ?? 0;
+    }
+    expect(appFailStatus).not.toBe(0);
+    expect(fs.readFileSync(systemctlLogPath, 'utf8')).toContain('restart antigravity-chat.service');
   });
 });

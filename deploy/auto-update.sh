@@ -499,14 +499,24 @@ run_app_update() {
   echo "[auto-update] Updated successfully to v${FALLBACK_VERSION} (${REMOTE_SHA:0:8})."
 }
 
-update_agy_cli
-run_app_update
-
-if [[ "${AGY_CLI_UPDATED}" -eq 1 ]] && [[ "${APP_RESTARTED}" -eq 0 ]]; then
-  if command -v "${SYSTEMCTL_BIN}" >/dev/null 2>&1; then
-    if "${SYSTEMCTL_BIN}" cat "${SERVICE_NAME}" >/dev/null 2>&1; then
-      echo "[auto-update] Restarting ${SERVICE_NAME} to pick up updated Antigravity CLI..."
-      "${SYSTEMCTL_BIN}" restart "${SERVICE_NAME}"
+restart_service_if_cli_updated() {
+  local exit_code=$?
+  if [[ "${AGY_CLI_UPDATED:-0}" -eq 1 ]] && [[ "${APP_RESTARTED:-0}" -eq 0 ]]; then
+    if command -v "${SYSTEMCTL_BIN}" >/dev/null 2>&1; then
+      if "${SYSTEMCTL_BIN}" cat "${SERVICE_NAME}" >/dev/null 2>&1; then
+        echo "[auto-update] Restarting ${SERVICE_NAME} to pick up updated Antigravity CLI..."
+        if "${SYSTEMCTL_BIN}" restart "${SERVICE_NAME}"; then
+          APP_RESTARTED=1
+        elif [[ "${exit_code}" -eq 0 ]]; then
+          exit_code=1
+        fi
+      fi
     fi
   fi
-fi
+  exit "${exit_code}"
+}
+
+trap restart_service_if_cli_updated EXIT
+
+update_agy_cli
+run_app_update
