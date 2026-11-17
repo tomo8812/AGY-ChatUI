@@ -539,4 +539,126 @@ esac
     expect(fs.readFileSync(curlLogPath, 'utf8')).toContain('/releases?per_page=30');
     expect(fs.readFileSync(curlLogPath, 'utf8')).toContain('/v1.10.0/BUILD_INFO.json');
   });
+
+  it('auto-update.sh automatically updates agy CLI, restarts service on change, respects interval/disable, and survives errors', () => {
+    const repoRoot = path.resolve(import.meta.dirname, '..', '..');
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-cli-autoupdate-test-'));
+    cleanups.push(async () => {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    });
+
+    const appDir = path.join(tmpRoot, 'app');
+    const dataRoot = path.join(tmpRoot, 'data');
+    const agyBinPath = path.join(tmpRoot, 'mock-agy');
+    const systemctlPath = path.join(tmpRoot, 'mock-systemctl');
+    const agyLogPath = path.join(tmpRoot, 'agy.log');
+    const systemctlLogPath = path.join(tmpRoot, 'systemctl.log');
+    const stampPath = path.join(tmpRoot, 'agy-stamp');
+
+    fs.mkdirSync(appDir, { recursive: true });
+    fs.mkdirSync(dataRoot, { recursive: true });
+    fs.writeFileSync(
+      path.join(appDir, 'BUILD_INFO.json'),
+      JSON.stringify({ version: '1.0.0', tag: 'v1.0.0', commitSha: 'abcdef1234567890' })
+    );
+
+    const writeMockAgy = (version: string, shouldFailUpdate = false) => {
+      const script = `#!/usr/bin/env bash
+set -euo pipefail
+echo "cmd=$* disable=\${AGY_CLI_DISABLE_AUTO_UPDATE:-unset}" >> "${agyLogPath}"
+if [[ "\${1:-}" == "--version" ]]; then
+  echo "${version}"
+  exit 0
+fi
+if [[ "\${1:-}" == "update" ]]; then
+  if [[ "${shouldFailUpdate ? '1' : '0'}" == "1" ]]; then
+    echo "network error" >&2
+    exit 1
+  fi
+  cat <<'EOF' > "${agyBinPath}"
+#!/usr/bin/env bash
+set -euo pipefail
+echo "cmd=\$* disable=\${AGY_CLI_DISABLE_AUTO_UPDATE:-unset}" >> "${agyLogPath}"
+if [[ "\${1:-}" == "--version" ]]; then
+  echo "1.5.9"
+  exit 0
+fi
+if [[ "\${1:-}" == "update" ]]; then
+  echo "already up to date"
+  exit 0
+fi
+EOF
+  chmod +x "${agyBinPath}"
+  echo "updated to 1.5.9"
+  exit 0
+fi
+`;
+      fs.writeFileSync(agyBinPath, script, { mode: 0o755 });
+    };
+
+    fs.writeFileSync(
+      systemctlPath,
+      `#!/usr/bin/env bash
+set -euo pipefail
+echo "$*" >> "${systemctlLogPath}"
+if [[ "\${1:-}" == "cat" ]]; then
+  exit 0
+fi
+`,
+      { mode: 0o755 }
+    );
+
+    const run = (extraEnv: Record<string, string>) =>
+      execFileSync('bash', [path.join(repoRoot, 'deploy', 'auto-update.sh')], {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          APP_DIR: appDir,
+          DATA_ROOT: dataRoot,
+          ENV_FILE: path.join(tmpRoot, 'nonexistent-env'),
+          LOCK_FILE: path.join(tmpRoot, 'lock'),
+          RELEASE_TAG: 'v9.9.9',
+          GITHUB_REPO: '',
+          AGY_BIN: agyBinPath,
+          SYSTEMCTL_BIN: systemctlPath,
+          AGY_UPDATE_STAMP_FILE: stampPath,
+          AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
+          ...extraEnv,
+        },
+      });
+
+    // 1. AGY_AUTO_UPDATE=false skips agy update
+    writeMockAgy('1.5.8');
+    run({ AGY_AUTO_UPDATE: 'false' });
+    expect(fs.existsSync(agyLogPath)).toBe(false);
+    expect(fs.existsSync(systemctlLogPath)).toBe(false);
+
+    // 2. Updates agy 1.5.8 -> 1.5.9 with AGY_CLI_DISABLE_AUTO_UPDATE unset, and restarts service
+    const outUpdated = run({ AGY_AUTO_UPDATE: 'true', AGY_UPDATE_INTERVAL_SEC: '900' });
+    expect(outUpdated).toContain('Antigravity CLI (agy) updated: 1.5.8 -> 1.5.9');
+    expect(outUpdated).toContain('Restarting antigravity-chat.service to pick up updated Antigravity CLI');
+    const agyLog1 = fs.readFileSync(agyLogPath, 'utf8');
+    expect(agyLog1).toContain('cmd=update disable=unset');
+    const sysLog1 = fs.readFileSync(systemctlLogPath, 'utf8');
+    expect(sysLog1).toContain('restart antigravity-chat.service');
+
+    // 3. Throttled by AGY_UPDATE_INTERVAL_SEC=900 on immediate next run
+    fs.writeFileSync(agyLogPath, '');
+    fs.writeFileSync(systemctlLogPath, '');
+    run({ AGY_AUTO_UPDATE: 'true', AGY_UPDATE_INTERVAL_SEC: '900' });
+    expect(fs.readFileSync(agyLogPath, 'utf8')).toBe('');
+    expect(fs.readFileSync(systemctlLogPath, 'utf8')).toBe('');
+
+    // 4. Interval=0 allows immediate check; no-op when already latest (no service restart)
+    const outNoop = run({ AGY_AUTO_UPDATE: 'true', AGY_UPDATE_INTERVAL_SEC: '0' });
+    expect(outNoop).not.toContain('Antigravity CLI (agy) updated');
+    expect(fs.readFileSync(agyLogPath, 'utf8')).toContain('cmd=update disable=unset');
+    expect(fs.readFileSync(systemctlLogPath, 'utf8')).toBe('');
+
+    // 5. Failed agy update logs warning without aborting auto-update.sh
+    writeMockAgy('1.5.9', true);
+    const outFail = run({ AGY_AUTO_UPDATE: 'true', AGY_UPDATE_INTERVAL_SEC: '0' });
+    expect(outFail).toContain('WARNING: agy update failed');
+    expect(fs.readFileSync(systemctlLogPath, 'utf8')).toBe('');
+  });
 });

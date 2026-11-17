@@ -16,6 +16,13 @@ SERVICE_NAME="${SERVICE_NAME:-antigravity-chat.service}"
 ENV_FILE="${ENV_FILE:-/etc/antigravity-chat/env}"
 LOCK_FILE="${LOCK_FILE:-/run/antigravity-chat-updater.lock}"
 CURL_BIN="${CURL_BIN:-curl}"
+SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
+DATA_ROOT="${DATA_ROOT:-/var/lib/antigravity-chat}"
+AGY_BIN="${AGY_BIN:-agy}"
+AGY_MODE="${AGY_MODE:-}"
+AGY_AUTO_UPDATE="${AGY_AUTO_UPDATE:-true}"
+AGY_UPDATE_INTERVAL_SEC="${AGY_UPDATE_INTERVAL_SEC:-900}"
+AGY_UPDATE_STAMP_FILE="${AGY_UPDATE_STAMP_FILE:-}"
 
 export PATH="/usr/local/bin:/usr/bin:/bin:${PATH}"
 
@@ -25,6 +32,13 @@ if [[ -r "${ENV_FILE}" ]]; then
   source "${ENV_FILE}"
   set +a
 fi
+
+DATA_ROOT="${DATA_ROOT:-/var/lib/antigravity-chat}"
+AGY_BIN="${AGY_BIN:-agy}"
+AGY_MODE="${AGY_MODE:-}"
+AGY_AUTO_UPDATE="${AGY_AUTO_UPDATE:-true}"
+AGY_UPDATE_INTERVAL_SEC="${AGY_UPDATE_INTERVAL_SEC:-900}"
+AGY_UPDATE_STAMP_FILE="${AGY_UPDATE_STAMP_FILE:-}"
 
 RELEASE_TAG="${RELEASE_TAG:-auto}"
 if [[ "${RELEASE_TAG}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -112,7 +126,7 @@ try_prebuilt_release_update() {
   fi
 
   tmp_dir="$(mktemp -d /tmp/acy-release-XXXXXX)"
-  trap 'rm -rf "${tmp_dir}"' RETURN
+  trap 'rm -rf "${tmp_dir:-}"; trap - RETURN' RETURN
 
   local selected_tag="" info_url="" bundle_url="" sha_url=""
   if [[ -n "${token}" ]]; then
@@ -302,92 +316,197 @@ for name in ("BUILD_INFO.json", "antigravity-chat-bundle.tar.gz", "antigravity-c
     --sha256 "${tmp_dir}/antigravity-chat-bundle.tar.gz.sha256" \
     "${apply_flags[@]}" || return 1
 
+  APP_RESTARTED=1
   echo "[auto-update] Applied release bundle ${remote_desc}."
   return 0
 }
 
-# 1. Try fast prebuilt Actions Release bundle first
-if [[ "${DEPLOY_MODE:-auto}" != "git" ]] && try_prebuilt_release_update; then
-  exit 0
-fi
+AGY_CLI_UPDATED=0
+APP_RESTARTED=0
 
-# Do not bypass a pinned RELEASE_TAG by falling back to main branch HEAD
-if [[ "${RELEASE_TAG}" != "auto" ]]; then
-  echo "[auto-update] Skip: pinned release tag ${RELEASE_TAG} bundle is not available."
-  exit 0
-fi
+is_truthy() {
+  case "${1,,}" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
-# 2. Fallback: git pull + local build (when prebuilt SemVer releases are not yet available)
-if [[ ! -d "${APP_DIR}/.git" ]]; then
-  echo "[auto-update] Skip: neither prebuilt SemVer release nor .git checkout is available in ${APP_DIR}."
-  exit 0
-fi
-
-if [[ -n "$(git_repo status --porcelain)" ]]; then
-  echo "[auto-update] Working tree in ${APP_DIR} has uncommitted changes; skipping automatic pull."
-  exit 0
-fi
-
-git_repo fetch --quiet --force --tags "${REMOTE_NAME}" "${BRANCH}"
-
-LOCAL_SHA="$(git_repo rev-parse HEAD)"
-REMOTE_SHA="$(git_repo rev-parse "${REMOTE_NAME}/${BRANCH}")"
-
-if [[ "${LOCAL_SHA}" == "${REMOTE_SHA}" ]]; then
-  exit 0
-fi
-
-if ! git_repo merge-base --is-ancestor "${LOCAL_SHA}" "${REMOTE_SHA}"; then
-  echo "[auto-update] ERROR: ${LOCAL_SHA:0:8} is not an ancestor of ${REMOTE_NAME}/${BRANCH} (${REMOTE_SHA:0:8})."
-  exit 1
-fi
-
-echo "[auto-update] Git fallback update detected: ${LOCAL_SHA:0:8} -> ${REMOTE_SHA:0:8}"
-
-DEPS_CHANGED="$(git_repo diff --name-only "${LOCAL_SHA}" "${REMOTE_SHA}" -- package.json package-lock.json server/package.json web/package.json || true)"
-
-git_repo pull --ff-only "${REMOTE_NAME}" "${BRANCH}"
-
-if [[ -n "${DEPS_CHANGED}" ]] || [[ ! -d "${APP_DIR}/node_modules" ]]; then
-  echo "[auto-update] Installing dependencies via npm ci..."
-  run_as_owner npm --prefix "${APP_DIR}" ci --no-audit --no-fund
-fi
-
-FALLBACK_VERSION=""
-FALLBACK_TAG=""
-if [[ -f "${APP_DIR}/scripts/version.mjs" ]]; then
-  VER_JSON="$(run_as_owner node "${APP_DIR}/scripts/version.mjs" resolve --cwd "${APP_DIR}" --sha "${REMOTE_SHA}" 2>/dev/null || true)"
-  if [[ -n "${VER_JSON}" ]]; then
-    FALLBACK_VERSION="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("version",""))' "${VER_JSON}" 2>/dev/null || true)"
-    FALLBACK_TAG="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("releaseTag",""))' "${VER_JSON}" 2>/dev/null || true)"
+resolve_agy_stamp_file() {
+  if [[ -n "${AGY_UPDATE_STAMP_FILE}" ]]; then
+    echo "${AGY_UPDATE_STAMP_FILE}"
+    return 0
   fi
-fi
-if [[ -z "${FALLBACK_VERSION}" ]]; then
-  FALLBACK_VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version","1.0.0"))' "${APP_DIR}/package.json" 2>/dev/null || echo "1.0.0")"
-  FALLBACK_TAG="v${FALLBACK_VERSION}"
-fi
+  if [[ -d "${DATA_ROOT}" ]] && [[ -w "${DATA_ROOT}" ]]; then
+    echo "${DATA_ROOT}/.agy-update-check"
+    return 0
+  fi
+  echo "/tmp/antigravity-chat-agy-update-check"
+}
 
-echo "[auto-update] Building web and server bundles locally (v${FALLBACK_VERSION})..."
-run_as_owner env VITE_APP_VERSION="${FALLBACK_VERSION}" VITE_APP_COMMIT_SHA="${REMOTE_SHA:0:8}" npm --prefix "${APP_DIR}" run build
+update_agy_cli() {
+  if ! is_truthy "${AGY_AUTO_UPDATE:-true}"; then
+    return 0
+  fi
+  if [[ "${AGY_MODE:-}" == "mock" ]]; then
+    return 0
+  fi
 
-if [[ -f "${APP_DIR}/scripts/version.mjs" ]]; then
-  if [[ -f "${APP_DIR}/web/dist/sw.js" ]]; then
-    run_as_owner node "${APP_DIR}/scripts/version.mjs" stamp-sw \
-      --file "${APP_DIR}/web/dist/sw.js" \
+  local agy_path
+  agy_path="$(command -v "${AGY_BIN}" 2>/dev/null || true)"
+  if [[ -z "${agy_path}" ]] || [[ ! -x "${agy_path}" ]]; then
+    return 0
+  fi
+
+  local stamp_file interval_sec now last_check=0
+  stamp_file="$(resolve_agy_stamp_file)"
+  interval_sec="${AGY_UPDATE_INTERVAL_SEC:-900}"
+  if [[ ! "${interval_sec}" =~ ^[0-9]+$ ]]; then
+    interval_sec=900
+  fi
+  now="$(date +%s)"
+
+  if [[ "${interval_sec}" -gt 0 ]] && [[ -r "${stamp_file}" ]]; then
+    last_check="$(cat "${stamp_file}" 2>/dev/null | tr -dc '0-9' || true)"
+    last_check="${last_check:-0}"
+    if [[ "${last_check}" -gt 0 ]] && (( now - last_check < interval_sec )); then
+      return 0
+    fi
+  fi
+
+  mkdir -p "$(dirname "${stamp_file}")" 2>/dev/null || true
+  printf '%s\n' "${now}" > "${stamp_file}" 2>/dev/null || true
+
+  local agy_real before_sha="" before_ver="" after_sha="" after_ver=""
+  agy_real="$(readlink -f "${agy_path}" 2>/dev/null || echo "${agy_path}")"
+  if [[ -f "${agy_real}" ]]; then
+    before_sha="$(sha256sum "${agy_real}" 2>/dev/null | awk '{print $1}' || true)"
+  fi
+  before_ver="$(timeout 10 env -u AGY_CLI_DISABLE_AUTO_UPDATE "${agy_path}" --version </dev/null 2>/dev/null | tr -d '\r' | head -n 1 || true)"
+
+  local update_out="" update_rc=0
+  update_out="$(timeout 120 env -u AGY_CLI_DISABLE_AUTO_UPDATE "${agy_path}" update </dev/null 2>&1)" || update_rc=$?
+  if [[ "${update_rc}" -ne 0 ]]; then
+    echo "[auto-update] WARNING: agy update failed (exit ${update_rc}): ${update_out}"
+    return 0
+  fi
+
+  local agy_real_after
+  agy_real_after="$(readlink -f "${agy_path}" 2>/dev/null || echo "${agy_path}")"
+  if [[ -f "${agy_real_after}" ]]; then
+    after_sha="$(sha256sum "${agy_real_after}" 2>/dev/null | awk '{print $1}' || true)"
+  fi
+  after_ver="$(timeout 10 env -u AGY_CLI_DISABLE_AUTO_UPDATE "${agy_path}" --version </dev/null 2>/dev/null | tr -d '\r' | head -n 1 || true)"
+
+  if { [[ -n "${after_sha}" ]] && [[ "${after_sha}" != "${before_sha}" ]]; } || { [[ -n "${after_ver}" ]] && [[ "${after_ver}" != "${before_ver}" ]]; }; then
+    if [[ "$(id -u)" -eq 0 ]] && [[ -f "${agy_real_after}" ]]; then
+      chmod 755 "${agy_real_after}" 2>/dev/null || true
+    fi
+    echo "[auto-update] Antigravity CLI (agy) updated: ${before_ver:-unknown} -> ${after_ver:-unknown}"
+    AGY_CLI_UPDATED=1
+  fi
+  return 0
+}
+
+run_app_update() {
+  # 1. Try fast prebuilt Actions Release bundle first
+  if [[ "${DEPLOY_MODE:-auto}" != "git" ]] && try_prebuilt_release_update; then
+    return 0
+  fi
+
+  # Do not bypass a pinned RELEASE_TAG by falling back to main branch HEAD
+  if [[ "${RELEASE_TAG}" != "auto" ]]; then
+    echo "[auto-update] Skip: pinned release tag ${RELEASE_TAG} bundle is not available."
+    return 0
+  fi
+
+  # 2. Fallback: git pull + local build (when prebuilt SemVer releases are not yet available)
+  if [[ ! -d "${APP_DIR}/.git" ]]; then
+    echo "[auto-update] Skip: neither prebuilt SemVer release nor .git checkout is available in ${APP_DIR}."
+    return 0
+  fi
+
+  if [[ -n "$(git_repo status --porcelain)" ]]; then
+    echo "[auto-update] Working tree in ${APP_DIR} has uncommitted changes; skipping automatic pull."
+    return 0
+  fi
+
+  git_repo fetch --quiet --force --tags "${REMOTE_NAME}" "${BRANCH}"
+
+  local LOCAL_SHA REMOTE_SHA
+  LOCAL_SHA="$(git_repo rev-parse HEAD)"
+  REMOTE_SHA="$(git_repo rev-parse "${REMOTE_NAME}/${BRANCH}")"
+
+  if [[ "${LOCAL_SHA}" == "${REMOTE_SHA}" ]]; then
+    return 0
+  fi
+
+  if ! git_repo merge-base --is-ancestor "${LOCAL_SHA}" "${REMOTE_SHA}"; then
+    echo "[auto-update] ERROR: ${LOCAL_SHA:0:8} is not an ancestor of ${REMOTE_NAME}/${BRANCH} (${REMOTE_SHA:0:8})."
+    return 1
+  fi
+
+  echo "[auto-update] Git fallback update detected: ${LOCAL_SHA:0:8} -> ${REMOTE_SHA:0:8}"
+
+  local DEPS_CHANGED
+  DEPS_CHANGED="$(git_repo diff --name-only "${LOCAL_SHA}" "${REMOTE_SHA}" -- package.json package-lock.json server/package.json web/package.json || true)"
+
+  git_repo pull --ff-only "${REMOTE_NAME}" "${BRANCH}"
+
+  if [[ -n "${DEPS_CHANGED}" ]] || [[ ! -d "${APP_DIR}/node_modules" ]]; then
+    echo "[auto-update] Installing dependencies via npm ci..."
+    run_as_owner npm --prefix "${APP_DIR}" ci --no-audit --no-fund
+  fi
+
+  local FALLBACK_VERSION="" FALLBACK_TAG="" VER_JSON=""
+  if [[ -f "${APP_DIR}/scripts/version.mjs" ]]; then
+    VER_JSON="$(run_as_owner node "${APP_DIR}/scripts/version.mjs" resolve --cwd "${APP_DIR}" --sha "${REMOTE_SHA}" 2>/dev/null || true)"
+    if [[ -n "${VER_JSON}" ]]; then
+      FALLBACK_VERSION="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("version",""))' "${VER_JSON}" 2>/dev/null || true)"
+      FALLBACK_TAG="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("releaseTag",""))' "${VER_JSON}" 2>/dev/null || true)"
+    fi
+  fi
+  if [[ -z "${FALLBACK_VERSION}" ]]; then
+    FALLBACK_VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version","1.0.0"))' "${APP_DIR}/package.json" 2>/dev/null || echo "1.0.0")"
+    FALLBACK_TAG="v${FALLBACK_VERSION}"
+  fi
+
+  echo "[auto-update] Building web and server bundles locally (v${FALLBACK_VERSION})..."
+  run_as_owner env VITE_APP_VERSION="${FALLBACK_VERSION}" VITE_APP_COMMIT_SHA="${REMOTE_SHA:0:8}" npm --prefix "${APP_DIR}" run build
+
+  if [[ -f "${APP_DIR}/scripts/version.mjs" ]]; then
+    if [[ -f "${APP_DIR}/web/dist/sw.js" ]]; then
+      run_as_owner node "${APP_DIR}/scripts/version.mjs" stamp-sw \
+        --file "${APP_DIR}/web/dist/sw.js" \
+        --version "${FALLBACK_VERSION}" \
+        --sha "${REMOTE_SHA:0:8}" >/dev/null || true
+    fi
+    run_as_owner node "${APP_DIR}/scripts/version.mjs" write-build-info \
+      --out "${APP_DIR}/BUILD_INFO.json" \
       --version "${FALLBACK_VERSION}" \
-      --sha "${REMOTE_SHA:0:8}" >/dev/null || true
+      --tag "${FALLBACK_TAG}" \
+      --sha "${REMOTE_SHA}" \
+      --files "${APP_DIR}/web/dist/index.html,${APP_DIR}/web/dist/sw.js,${APP_DIR}/server/dist/app.js" >/dev/null || true
   fi
-  run_as_owner node "${APP_DIR}/scripts/version.mjs" write-build-info \
-    --out "${APP_DIR}/BUILD_INFO.json" \
-    --version "${FALLBACK_VERSION}" \
-    --tag "${FALLBACK_TAG}" \
-    --sha "${REMOTE_SHA}" \
-    --files "${APP_DIR}/web/dist/index.html,${APP_DIR}/web/dist/sw.js,${APP_DIR}/server/dist/app.js" >/dev/null || true
-fi
 
-if command -v systemctl >/dev/null 2>&1; then
-  echo "[auto-update] Restarting ${SERVICE_NAME}..."
-  systemctl restart "${SERVICE_NAME}"
-fi
+  if command -v "${SYSTEMCTL_BIN}" >/dev/null 2>&1; then
+    if "${SYSTEMCTL_BIN}" cat "${SERVICE_NAME}" >/dev/null 2>&1; then
+      echo "[auto-update] Restarting ${SERVICE_NAME}..."
+      "${SYSTEMCTL_BIN}" restart "${SERVICE_NAME}"
+      APP_RESTARTED=1
+    fi
+  fi
 
-echo "[auto-update] Updated successfully to v${FALLBACK_VERSION} (${REMOTE_SHA:0:8})."
+  echo "[auto-update] Updated successfully to v${FALLBACK_VERSION} (${REMOTE_SHA:0:8})."
+}
+
+update_agy_cli
+run_app_update
+
+if [[ "${AGY_CLI_UPDATED}" -eq 1 ]] && [[ "${APP_RESTARTED}" -eq 0 ]]; then
+  if command -v "${SYSTEMCTL_BIN}" >/dev/null 2>&1; then
+    if "${SYSTEMCTL_BIN}" cat "${SERVICE_NAME}" >/dev/null 2>&1; then
+      echo "[auto-update] Restarting ${SERVICE_NAME} to pick up updated Antigravity CLI..."
+      "${SYSTEMCTL_BIN}" restart "${SERVICE_NAME}"
+    fi
+  fi
+fi
