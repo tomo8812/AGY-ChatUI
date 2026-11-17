@@ -678,4 +678,173 @@ fi
     expect(appFailStatus).not.toBe(0);
     expect(fs.readFileSync(systemctlLogPath, 'utf8')).toContain('restart antigravity-chat.service');
   });
+
+  it('auto-update.sh unifies duplicate agy binaries onto canonical target and symlinks duplicates', () => {
+    const repoRoot = path.resolve(import.meta.dirname, '..', '..');
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-cli-unify-test-'));
+    cleanups.push(async () => {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    });
+
+    const appDir = path.join(tmpRoot, 'app');
+    const dataRoot = path.join(tmpRoot, 'data');
+    const canonicalBin = path.join(tmpRoot, 'usr-local-bin', 'agy');
+    const userLocalBin = path.join(tmpRoot, 'home-ubuntu-local-bin', 'agy');
+    const systemctlPath = path.join(tmpRoot, 'mock-systemctl');
+    const systemctlLogPath = path.join(tmpRoot, 'systemctl.log');
+    const stampPath = path.join(tmpRoot, 'agy-stamp');
+
+    fs.mkdirSync(appDir, { recursive: true });
+    fs.mkdirSync(dataRoot, { recursive: true });
+    fs.mkdirSync(path.dirname(canonicalBin), { recursive: true });
+    fs.mkdirSync(path.dirname(userLocalBin), { recursive: true });
+    fs.writeFileSync(
+      path.join(appDir, 'BUILD_INFO.json'),
+      JSON.stringify({ version: '1.0.0', tag: 'v1.0.0', commitSha: 'abcdef1234567890' })
+    );
+
+    const makeMockAgy = (ver: string) => `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\${1:-}" == "--version" ]]; then
+  echo "${ver}"
+  exit 0
+fi
+if [[ "\${1:-}" == "update" ]]; then
+  echo "already up to date"
+  exit 0
+fi
+`;
+    fs.writeFileSync(canonicalBin, makeMockAgy('1.3.0'), { mode: 0o755 });
+    fs.writeFileSync(userLocalBin, makeMockAgy('1.4.0'), { mode: 0o755 });
+
+    fs.writeFileSync(
+      systemctlPath,
+      `#!/usr/bin/env bash
+set -euo pipefail
+echo "$*" >> "${systemctlLogPath}"
+if [[ "\${1:-}" == "cat" ]]; then
+  exit 0
+fi
+`,
+      { mode: 0o755 }
+    );
+
+    const out = execFileSync('bash', [path.join(repoRoot, 'deploy', 'auto-update.sh')], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        APP_DIR: appDir,
+        DATA_ROOT: dataRoot,
+        ENV_FILE: path.join(tmpRoot, 'nonexistent-env'),
+        LOCK_FILE: path.join(tmpRoot, 'lock'),
+        RELEASE_TAG: 'v9.9.9',
+        GITHUB_REPO: '',
+        AGY_BIN: 'agy',
+        AGY_CANONICAL_BIN: canonicalBin,
+        AGY_CANDIDATE_PATHS: `${canonicalBin}:${userLocalBin}`,
+        SYSTEMCTL_BIN: systemctlPath,
+        AGY_UPDATE_STAMP_FILE: stampPath,
+        AGY_AUTO_UPDATE: 'true',
+        AGY_UPDATE_INTERVAL_SEC: '0',
+      },
+    });
+
+    expect(out).toContain('Unified Antigravity CLI binary ->');
+    expect(out).toContain('Linked duplicate agy');
+    expect(execFileSync(canonicalBin, ['--version'], { encoding: 'utf8' }).trim()).toBe('1.4.0');
+    expect(fs.lstatSync(userLocalBin).isSymbolicLink()).toBe(true);
+    expect(fs.realpathSync(userLocalBin)).toBe(fs.realpathSync(canonicalBin));
+    expect(fs.readFileSync(systemctlLogPath, 'utf8')).toContain('restart antigravity-chat.service');
+
+    // Untrusted world-writable candidate must NEVER be executed or promoted
+    const untrustedBin = path.join(tmpRoot, 'untrusted-agy');
+    const untrustedMarker = path.join(tmpRoot, 'untrusted-executed');
+    fs.writeFileSync(
+      untrustedBin,
+      `#!/usr/bin/env bash
+touch "${untrustedMarker}"
+echo "9.9.9"
+`,
+      { mode: 0o777 }
+    );
+    fs.chmodSync(untrustedBin, 0o777);
+    execFileSync('bash', [path.join(repoRoot, 'deploy', 'auto-update.sh')], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        APP_DIR: appDir,
+        DATA_ROOT: dataRoot,
+        ENV_FILE: path.join(tmpRoot, 'nonexistent-env'),
+        LOCK_FILE: path.join(tmpRoot, 'lock'),
+        RELEASE_TAG: 'v9.9.9',
+        GITHUB_REPO: '',
+        AGY_BIN: 'agy',
+        AGY_CANONICAL_BIN: canonicalBin,
+        AGY_CANDIDATE_PATHS: `${canonicalBin}:${untrustedBin}`,
+        SYSTEMCTL_BIN: systemctlPath,
+        AGY_UPDATE_STAMP_FILE: stampPath,
+        AGY_AUTO_UPDATE: 'true',
+        AGY_UPDATE_INTERVAL_SEC: '0',
+      },
+    });
+    expect(fs.existsSync(untrustedMarker)).toBe(false);
+    expect(execFileSync(canonicalBin, ['--version'], { encoding: 'utf8' }).trim()).toBe('1.4.0');
+  });
+
+  it('apply-bundle.sh migrates Environment=AGY_BIN=agy only when canonical binary exists', () => {
+    const repoRoot = path.resolve(import.meta.dirname, '..', '..');
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-bundle-agy-test-'));
+    cleanups.push(async () => {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    });
+
+    const appDir = path.join(tmpRoot, 'app');
+    const stageSrc = path.join(tmpRoot, 'stage-src');
+    const bundlePath = path.join(tmpRoot, 'bundle.tar.gz');
+    const unitPath = path.join(tmpRoot, 'antigravity-chat.service');
+    const canonicalBin = path.join(tmpRoot, 'usr-local-bin-agy');
+
+    fs.mkdirSync(appDir, { recursive: true });
+    fs.mkdirSync(path.join(stageSrc, 'server', 'dist'), { recursive: true });
+    fs.mkdirSync(path.join(stageSrc, 'web', 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(stageSrc, 'BUILD_INFO.json'), JSON.stringify({ version: '1.0.0' }));
+    execFileSync('tar', ['-czf', bundlePath, '-C', stageSrc, '.']);
+
+    fs.writeFileSync(unitPath, '[Service]\nEnvironment=AGY_BIN=agy\n');
+
+    // 1. Canonical binary missing -> unit file must NOT be rewritten to nonexistent path
+    const outMissing = execFileSync(
+      'bash',
+      [path.join(repoRoot, 'deploy', 'apply-bundle.sh'), bundlePath, '--no-restart'],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          APP_DIR: appDir,
+          SYSTEMD_UNIT_FILE: unitPath,
+          CANONICAL_AGY_BIN: canonicalBin,
+        },
+      }
+    );
+    expect(outMissing).toContain('keeping existing Environment=AGY_BIN=agy');
+    expect(fs.readFileSync(unitPath, 'utf8')).toContain('Environment=AGY_BIN=agy\n');
+
+    // 2. Canonical binary exists -> unit file migrates cleanly
+    fs.writeFileSync(canonicalBin, '#!/bin/sh\necho 1.4.0\n', { mode: 0o755 });
+    const outPresent = execFileSync(
+      'bash',
+      [path.join(repoRoot, 'deploy', 'apply-bundle.sh'), bundlePath, '--no-restart'],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          APP_DIR: appDir,
+          SYSTEMD_UNIT_FILE: unitPath,
+          CANONICAL_AGY_BIN: canonicalBin,
+        },
+      }
+    );
+    expect(outPresent).toContain(`AGY_BIN=${canonicalBin}`);
+    expect(fs.readFileSync(unitPath, 'utf8')).toContain(`Environment=AGY_BIN=${canonicalBin}\n`);
+  });
 });

@@ -160,6 +160,9 @@ if [[ "$(id -u)" -eq 0 ]] && [[ -n "${REPO_OWNER}" ]] && id "${REPO_OWNER}" >/de
 fi
 
 if [[ "$(id -u)" -eq 0 ]]; then
+  UNIT_FILE="${SYSTEMD_UNIT_FILE:-/etc/systemd/system/${SERVICE_NAME}}"
+  NEED_DAEMON_RELOAD=0
+
   if command -v bwrap >/dev/null 2>&1; then
     if [[ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] \
       && [[ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" == "1" ]] \
@@ -182,16 +185,74 @@ EOF
       fi
     fi
 
-    UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}"
     if [[ -f "${UNIT_FILE}" ]] && grep -qE '^NoNewPrivileges=true$' "${UNIT_FILE}"; then
       echo "[apply-bundle] Updating ${UNIT_FILE} (NoNewPrivileges=false) for bubblewrap userns transition..."
       sed -i 's/^NoNewPrivileges=true$/NoNewPrivileges=false/' "${UNIT_FILE}"
-      if command -v systemctl >/dev/null 2>&1; then
-        systemctl daemon-reload || true
-      fi
+      NEED_DAEMON_RELOAD=1
     fi
   else
     echo "[apply-bundle] INFO: 'bwrap' (bubblewrap) is not installed; SANDBOX_MODE=auto will fall back cleanly until installed."
+  fi
+
+  if [[ "${NEED_DAEMON_RELOAD}" -eq 1 ]] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+  fi
+fi
+
+if [[ "$(id -u)" -eq 0 ]] || [[ -n "${SYSTEMD_UNIT_FILE:-}" ]]; then
+  UNIT_FILE="${SYSTEMD_UNIT_FILE:-/etc/systemd/system/${SERVICE_NAME}}"
+  CANONICAL_AGY_BIN="${CANONICAL_AGY_BIN:-/usr/local/bin/agy}"
+
+  if [[ -f "${UNIT_FILE}" ]] && grep -qE '^Environment=AGY_BIN=agy$' "${UNIT_FILE}"; then
+    if [[ ! -x "${CANONICAL_AGY_BIN}" ]] && [[ "$(id -u)" -eq 0 ]]; then
+      for cand in /usr/bin/agy /bin/agy /root/.local/bin/agy /root/.antigravity/bin/agy; do
+        [[ -x "${cand}" ]] || continue
+        is_trusted="$(python3 - "${cand}" <<'PY' 2>/dev/null || echo 0
+import os, stat, sys
+p = os.path.abspath(sys.argv[1])
+def safe(path):
+    cur = path
+    while True:
+        lst = os.lstat(cur)
+        st = os.stat(cur)
+        if lst.st_uid != 0 or st.st_uid != 0:
+            return False
+        if (st.st_mode & 0o022) != 0 and not (st.st_mode & stat.S_ISVTX):
+            return False
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return True
+        cur = parent
+real = os.path.realpath(p)
+if safe(os.path.dirname(p)) and safe(real) and stat.S_ISREG(os.stat(real).st_mode) and os.access(real, os.X_OK):
+    print(1)
+else:
+    print(0)
+PY
+)"
+        [[ "${is_trusted}" == "1" ]] || continue
+        cand_real="$(readlink -f "${cand}" 2>/dev/null || echo "${cand}")"
+        mkdir -p "$(dirname "${CANONICAL_AGY_BIN}")" 2>/dev/null || true
+        tmp_agy="${CANONICAL_AGY_BIN}.tmp.$$"
+        if install -m 755 "${cand_real}" "${tmp_agy}" 2>/dev/null \
+          && timeout 10 env -u AGY_CLI_DISABLE_AUTO_UPDATE "${tmp_agy}" --version </dev/null >/dev/null 2>&1 \
+          && mv -f "${tmp_agy}" "${CANONICAL_AGY_BIN}" 2>/dev/null; then
+          echo "[apply-bundle] Promoted trusted agy binary to ${CANONICAL_AGY_BIN} (from ${cand})."
+          break
+        fi
+        rm -f "${tmp_agy}" 2>/dev/null || true
+      done
+    fi
+
+    if [[ -x "${CANONICAL_AGY_BIN}" ]]; then
+      echo "[apply-bundle] Updating ${UNIT_FILE} (AGY_BIN=${CANONICAL_AGY_BIN}) for single-binary consistency..."
+      sed -i "s|^Environment=AGY_BIN=agy\$|Environment=AGY_BIN=${CANONICAL_AGY_BIN}|" "${UNIT_FILE}"
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload || true
+      fi
+    else
+      echo "[apply-bundle] WARNING: ${CANONICAL_AGY_BIN} not found; keeping existing Environment=AGY_BIN=agy in ${UNIT_FILE}."
+    fi
   fi
 fi
 

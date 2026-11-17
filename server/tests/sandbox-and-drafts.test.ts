@@ -9,6 +9,7 @@ import {
   clearSandboxProbeCache,
   getChatBrainHostDir,
   probeBwrapSandbox,
+  resolveCanonicalAgyBin,
   SANDBOX_HOME_MOUNT,
   SANDBOX_WORKSPACE_MOUNT,
 } from '../src/acp/env-isolation.js';
@@ -276,6 +277,34 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
       const hostPasswd = spec.args[passwdIdx - 1];
       expect(fs.readFileSync(hostPasswd, 'utf8')).toContain(`:${SANDBOX_WORKSPACE_MOUNT}:/bin/bash`);
     }
+
+    // Canonical single-binary resolution: prefers standard system bin dir over arbitrary user PATH entries,
+    // and resolves symlinks identically for non-sandboxed calls (login/quota/off-mode).
+    const sysBinDir = path.join(tmpRoot, 'sys-bin');
+    const userBinDir = path.join(tmpRoot, 'user-bin');
+    fs.mkdirSync(sysBinDir, { recursive: true });
+    fs.mkdirSync(userBinDir, { recursive: true });
+    const sysAgyReal = path.join(sysBinDir, 'agy-real');
+    const sysAgyLink = path.join(sysBinDir, 'agy');
+    const userAgy = path.join(userBinDir, 'agy');
+    fs.writeFileSync(sysAgyReal, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    fs.symlinkSync(sysAgyReal, sysAgyLink);
+    fs.writeFileSync(userAgy, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+
+    const resolvedFromSystem = resolveCanonicalAgyBin(
+      'agy',
+      `${userBinDir}${path.delimiter}${sysBinDir}`,
+      [sysBinDir]
+    );
+    expect(resolvedFromSystem).toBe(fs.realpathSync(sysAgyReal));
+
+    const offSpec = buildAgyCommandSpec({
+      config: loadConfig({ agyMode: 'real', sandboxMode: 'off', agyBin: sysAgyLink, dataRoot: tmpRoot }),
+      subcommandArgs: ['-p', '/usage'],
+      profileDir,
+      enableSandboxBwrap: false,
+    });
+    expect(offSpec.command).toBe(fs.realpathSync(sysAgyReal));
   });
 
   it('auto-syncs subagent brain images into generated/ and delivers native Reactive Wakeup continuation asynchronously after end_turn', async () => {
