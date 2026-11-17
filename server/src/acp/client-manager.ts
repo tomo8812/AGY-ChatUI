@@ -37,6 +37,7 @@ import {
   extractCandidatePathsFromText,
   extractCandidatePathsFromToolCalls,
   importAuthorizedBrainFileToWorkspace,
+  InternalPathStreamRewriter,
   resolveAuthorizedBrainFile,
   rewriteInternalPathsToWorkspace,
   scrubToolCallsInternalPaths,
@@ -317,15 +318,15 @@ interface ActiveTurnBridge {
   assistantMessageId: string;
   contentText: string;
   thoughtsText: string;
+  pathStreams: Map<string, InternalPathStreamRewriter>;
   toolCalls: ToolCallItem[];
   sessionMessages: SessionMessageItem[];
   lastDbFlushAt: number;
   pendingResolvers: Map<string, (outcome: RequestPermissionResponse) => void>;
   beforeWorkspaceSnap: WorkspaceSnapshot;
-  beforeBrainSnap: Map<string, BrainSnapshotEntry>;
+  brainSnapshot: Map<string, BrainSnapshotEntry>;
   emittedArtifactIds: Set<string>;
   syncedBrainFiles: Map<string, SyncedBrainFile>;
-  textAfterLastToolCall: string;
   lastActivityAt: number;
   subagents: Map<string, TrackedSubagentState>;
   asyncSubagentToolIds: Set<string>;
@@ -897,7 +898,7 @@ export class AcpClientManager {
 
     const beforeSkillsSig = captureWorkspaceSkillsSignature(chat.workspaceDir);
     const beforeSnap = captureWorkspaceSnapshot(chat.workspaceDir);
-    const beforeBrainSnap = captureBrainSnapshot(worker.profileDir, chat.workspaceDir);
+    const brainSnapshot = captureBrainSnapshot(worker.profileDir, chat.workspaceDir);
     const nowInit = Date.now();
     const bridge: ActiveTurnBridge = {
       runId: params.runId,
@@ -906,15 +907,15 @@ export class AcpClientManager {
       assistantMessageId: params.assistantMessageId,
       contentText: '',
       thoughtsText: '',
+      pathStreams: new Map(),
       toolCalls: [],
       sessionMessages: [],
       lastDbFlushAt: nowInit,
       pendingResolvers: new Map(),
       beforeWorkspaceSnap: beforeSnap,
-      beforeBrainSnap,
+      brainSnapshot,
       emittedArtifactIds: new Set(),
       syncedBrainFiles: new Map(),
-      textAfterLastToolCall: '',
       lastActivityAt: nowInit,
       subagents: new Map(),
       asyncSubagentToolIds: new Set(),
@@ -985,6 +986,7 @@ export class AcpClientManager {
       // Yield to macrotask queue so any notifications queued in the same stdio frame are processed
       await new Promise((r) => setImmediate(r));
 
+      this.flushParentPathStreams(worker, bridge);
       this.syncBrainDeliverablesMidTurn(worker, bridge);
 
       // Scrub any internal brain/profile paths in toolCalls and contentText into /workspace/generated/...
@@ -1124,6 +1126,7 @@ export class AcpClientManager {
       bridge.initialPromptDone = true;
       bridge.parentState = 'idle';
       // Flush partial work even on error so nothing streamed so far is lost
+      this.flushParentPathStreams(worker, bridge);
       this.db.updateMessage(params.userId, params.assistantMessageId, {
         contentText: bridge.contentText,
         thoughtsText: bridge.thoughtsText,
@@ -1589,20 +1592,56 @@ export class AcpClientManager {
     return workerRef;
   }
 
+  private rewriteStreamChunk(
+    worker: WorkerInstance,
+    turn: ActiveTurnBridge,
+    key: string,
+    chunk: string,
+    final = false
+  ): string {
+    let stream = turn.pathStreams.get(key);
+    if (!stream) {
+      stream = new InternalPathStreamRewriter(worker.profileDir, worker.workspaceDir);
+      turn.pathStreams.set(key, stream);
+    }
+    return stream.write(chunk, final);
+  }
+
+  private appendTurnThoughtChunk(
+    worker: WorkerInstance,
+    turn: ActiveTurnBridge,
+    rawChunk: string,
+    final = false
+  ): void {
+    const chunk = this.rewriteStreamChunk(worker, turn, 'thoughts', rawChunk, final);
+    if (!chunk) return;
+    const offset = turn.thoughtsText.length;
+    turn.thoughtsText += chunk;
+    this.hub.emitEphemeral({
+      userId: worker.userId,
+      type: 'run.delta',
+      chatId: worker.chatId,
+      runId: turn.runId,
+      payload: { messageId: turn.assistantMessageId, field: 'thoughts', offset, chunk },
+    });
+    this.maybeFlushTurnProgress(turn);
+  }
+
+  private flushParentPathStreams(worker: WorkerInstance, turn: ActiveTurnBridge): void {
+    this.appendTurnContentChunk(worker, turn, '', true);
+    this.appendTurnThoughtChunk(worker, turn, '', true);
+  }
+
   private appendTurnContentChunk(
     worker: WorkerInstance,
     turn: ActiveTurnBridge,
-    rawChunk: string
+    rawChunk: string,
+    final = false
   ): void {
-    if (!rawChunk) return;
-    const chunk = rewriteInternalPathsToWorkspace(
-      rawChunk,
-      worker.profileDir,
-      worker.workspaceDir
-    );
+    const chunk = this.rewriteStreamChunk(worker, turn, 'content', rawChunk, final);
+    if (!chunk) return;
     const offset = turn.contentText.length;
     turn.contentText += chunk;
-    turn.textAfterLastToolCall += chunk;
     turn.lastActivityAt = Date.now();
     this.hub.emitEphemeral({
       userId: worker.userId,
@@ -1714,7 +1753,7 @@ export class AcpClientManager {
     const newlySynced = syncNewBrainFilesToWorkspace({
       profileDir: worker.profileDir,
       workspaceDir: worker.workspaceDir,
-      beforeSnap: turn.beforeBrainSnap,
+      snapshot: turn.brainSnapshot,
     });
 
     for (const item of newlySynced) {
@@ -1975,8 +2014,13 @@ export class AcpClientManager {
         ? params.description ?? undefined
         : existingTrack?.description;
 
-    const nextThoughts = (existingTrack?.thoughtsText ?? '') + (params.thoughtsDelta ?? '');
-    const nextContent = (existingTrack?.contentText ?? '') + (params.contentDelta ?? '');
+    const final = params.state === 'idle' || Boolean(params.stopReason);
+    const nextThoughts = (existingTrack?.thoughtsText ?? '') + this.rewriteStreamChunk(
+      worker, turn, `child:${params.subSessionId}:thoughts`, params.thoughtsDelta ?? '', final
+    );
+    const nextContent = (existingTrack?.contentText ?? '') + this.rewriteStreamChunk(
+      worker, turn, `child:${params.subSessionId}:content`, params.contentDelta ?? '', final
+    );
     const nextChildTools = existingTrack ? [...existingTrack.toolCalls] : [];
     if (params.childToolCall) {
       const cIdx = nextChildTools.findIndex(
@@ -2143,14 +2187,9 @@ export class AcpClientManager {
 
     if (update.sessionUpdate === 'agent_thought_chunk') {
       if (update.content.type === 'text' && update.content.text) {
-        const cleaned = rewriteInternalPathsToWorkspace(
-          update.content.text,
-          worker.profileDir,
-          worker.workspaceDir
-        );
         this.upsertSubagentToolCall(worker, turn, {
           subSessionId: childSessionId,
-          thoughtsDelta: cleaned,
+          thoughtsDelta: update.content.text,
         });
       }
       return;
@@ -2180,14 +2219,9 @@ export class AcpClientManager {
           contentDelta: `\n[${update.content.name || path.basename(rewrittenUri)}](${rewrittenUri})\n`,
         });
       } else if (update.content.type === 'text' && update.content.text) {
-        const cleaned = rewriteInternalPathsToWorkspace(
-          update.content.text,
-          worker.profileDir,
-          worker.workspaceDir
-        );
         this.upsertSubagentToolCall(worker, turn, {
           subSessionId: childSessionId,
-          contentDelta: cleaned,
+          contentDelta: update.content.text,
         });
       }
       this.syncBrainDeliverablesMidTurn(worker, turn);
@@ -2203,7 +2237,7 @@ export class AcpClientManager {
     for (const block of blocks) {
       if (!block || typeof block !== 'object') continue;
       if (block.type === 'text' && typeof block.text === 'string') {
-        parts.push(rewriteInternalPathsToWorkspace(block.text, worker.profileDir, worker.workspaceDir));
+        parts.push(block.text);
       } else if (block.type === 'image' && typeof block.data === 'string') {
         const rel = this.saveInlineBase64AssetToWorkspace(worker, turn, {
           data: block.data,
@@ -2219,7 +2253,7 @@ export class AcpClientManager {
         parts.push(`[${block.name || path.basename(rewritten)}](${rewritten})`);
       }
     }
-    return parts.join('');
+    return rewriteInternalPathsToWorkspace(parts.join(''), worker.profileDir, worker.workspaceDir);
   }
 
   private handleInterSessionMessageNotification(
@@ -2241,6 +2275,7 @@ export class AcpClientManager {
     if (rawUpdateType === 'session_message') {
       let nextContent = existing?.contentText ?? '';
       if ('content' in rawUpdate) {
+        turn.pathStreams.delete(`session:${messageId}`);
         if (rawUpdate.content === null || (Array.isArray(rawUpdate.content) && rawUpdate.content.length === 0)) {
           nextContent = '';
         } else if (Array.isArray(rawUpdate.content)) {
@@ -2250,6 +2285,8 @@ export class AcpClientManager {
             rawUpdate.content as ContentBlock[]
           );
         }
+      } else if (rawUpdate.done === true) {
+        nextContent += this.rewriteStreamChunk(worker, turn, `session:${messageId}`, '', true);
       }
       const item: SessionMessageItem = {
         messageId,
@@ -2278,9 +2315,12 @@ export class AcpClientManager {
     } else {
       // session_message_chunk
       const chunkBlock = rawUpdate.content as ContentBlock | undefined;
-      const chunkText = chunkBlock
-        ? this.extractContentBlocksText(worker, turn, [chunkBlock])
-        : '';
+      const rawChunk = chunkBlock?.type === 'text'
+        ? chunkBlock.text
+        : chunkBlock ? this.extractContentBlocksText(worker, turn, [chunkBlock]) : '';
+      const chunkText = this.rewriteStreamChunk(
+        worker, turn, `session:${messageId}`, rawChunk, rawUpdate.done === true
+      );
       const item: SessionMessageItem = {
         messageId,
         senderSessionId: existing?.senderSessionId ?? (typeof rawUpdate.senderSessionId === 'string' ? rawUpdate.senderSessionId : undefined),
@@ -2318,7 +2358,7 @@ export class AcpClientManager {
     if (!latestAssistant) return null;
 
     const beforeWorkspaceSnap = captureWorkspaceSnapshot(worker.workspaceDir);
-    const beforeBrainSnap = captureBrainSnapshot(worker.profileDir, worker.workspaceDir);
+    const brainSnapshot = captureBrainSnapshot(worker.profileDir, worker.workspaceDir);
     const bridge: ActiveTurnBridge = {
       runId: latestAssistant.runId ?? '',
       userId: worker.userId,
@@ -2326,15 +2366,15 @@ export class AcpClientManager {
       assistantMessageId: latestAssistant.id,
       contentText: latestAssistant.contentText,
       thoughtsText: latestAssistant.thoughtsText,
+      pathStreams: new Map(),
       toolCalls: [...latestAssistant.toolCalls],
       sessionMessages: [...(latestAssistant.sessionMessages ?? [])],
       lastDbFlushAt: 0,
       pendingResolvers: new Map(),
       beforeWorkspaceSnap,
-      beforeBrainSnap,
+      brainSnapshot,
       emittedArtifactIds: new Set(latestAssistant.artifactIds),
       syncedBrainFiles: new Map(),
-      textAfterLastToolCall: '',
       lastActivityAt: Date.now(),
       subagents: new Map(),
       asyncSubagentToolIds: new Set(),
@@ -2584,6 +2624,9 @@ export class AcpClientManager {
           worker.backgroundBridge.backgroundWorkCount = 0;
         }
       }
+      if (stateObj.state === 'idle') {
+        this.flushParentPathStreams(worker, turn);
+      }
       if (stateObj.state) {
         turn.parentState = stateObj.state;
         if (stateObj.state === 'idle') {
@@ -2679,26 +2722,7 @@ export class AcpClientManager {
 
     if (update.sessionUpdate === 'agent_thought_chunk') {
       if (update.content.type === 'text') {
-        const offset = turn.thoughtsText.length;
-        const chunk = rewriteInternalPathsToWorkspace(
-          update.content.text,
-          worker.profileDir,
-          worker.workspaceDir
-        );
-        turn.thoughtsText += chunk;
-        this.hub.emitEphemeral({
-          userId: worker.userId,
-          type: 'run.delta',
-          chatId: worker.chatId,
-          runId: turn.runId,
-          payload: {
-            messageId: turn.assistantMessageId,
-            field: 'thoughts',
-            offset,
-            chunk,
-          },
-        });
-        this.maybeFlushTurnProgress(turn);
+        this.appendTurnThoughtChunk(worker, turn, update.content.text);
       }
       finalizeIfBackground();
       return;
@@ -2761,7 +2785,6 @@ export class AcpClientManager {
       if (idx >= 0) turn.toolCalls[idx] = nextTool;
       else turn.toolCalls.push(nextTool);
 
-      turn.textAfterLastToolCall = '';
       this.syncBrainDeliverablesMidTurn(worker, turn);
 
       this.db.updateMessage(turn.userId, turn.assistantMessageId, { toolCalls: turn.toolCalls });
@@ -2837,7 +2860,6 @@ export class AcpClientManager {
       if (nextIdx >= 0) turn.toolCalls[nextIdx] = merged;
       else turn.toolCalls.push(merged);
 
-      turn.textAfterLastToolCall = '';
       this.syncBrainDeliverablesMidTurn(worker, turn);
 
       this.db.updateMessage(turn.userId, turn.assistantMessageId, { toolCalls: turn.toolCalls });

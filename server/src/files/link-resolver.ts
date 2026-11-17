@@ -225,14 +225,14 @@ export interface SyncedBrainFile {
 export function syncNewBrainFilesToWorkspace(params: {
   profileDir: string;
   workspaceDir: string;
-  beforeSnap: Map<string, BrainSnapshotEntry>;
+  snapshot: Map<string, BrainSnapshotEntry>;
 }): SyncedBrainFile[] {
   const afterSnap = captureBrainSnapshot(params.profileDir, params.workspaceDir);
   const synced: SyncedBrainFile[] = [];
 
   for (const [absPath, entry] of afterSnap.entries()) {
     if (entry.sizeBytes <= 0) continue;
-    const prev = params.beforeSnap.get(absPath);
+    const prev = params.snapshot.get(absPath);
     if (prev && prev.sizeBytes === entry.sizeBytes && prev.mtimeMs === entry.mtimeMs) {
       continue;
     }
@@ -241,6 +241,9 @@ export function syncNewBrainFilesToWorkspace(params: {
         workspaceDir: params.workspaceDir,
         sourceAbsPath: absPath,
       });
+      // Advance only after a successful import so unchanged files are not rehashed
+      // and re-registered on every subsequent ACP notification. Failed imports retry.
+      params.snapshot.set(absPath, entry);
       synced.push({
         brainAbsPath: absPath,
         relUnderBrain: entry.relUnderBrain,
@@ -264,11 +267,11 @@ export function rewriteInternalPathsToWorkspace(
   if (!text) return text;
   const profileAbs = path.resolve(profileDir);
 
-  return text.replace(/(file:\/\/)?(\/[^\s"'`<>)\]」』】》〉、。]+)/g, (fullMatch, filePrefix: string | undefined, rawPath: string) => {
+  return text.replace(/(file:\/\/)?(\/[^\s"'`<>()\[\]」』】》〉、。]+)/g, (fullMatch, filePrefix: string | undefined, rawPath: string) => {
     const trailingMatch = /([.,;:!?]+)$/.exec(rawPath);
     const trailing = trailingMatch ? trailingMatch[1] : '';
     const cleanRaw = trailing ? rawPath.slice(0, -trailing.length) : rawPath;
-    const normalized = normalizeLinkCandidatePath(cleanRaw);
+    const normalized = normalizeLinkCandidatePath(`${filePrefix ?? ''}${cleanRaw}`);
 
     if (normalized) {
       const brainResolved = resolveAuthorizedBrainFile({
@@ -312,6 +315,26 @@ export function rewriteInternalPathsToWorkspace(
 
     return fullMatch;
   });
+}
+
+/** Rewrites only complete path tokens; ACP chunks can split anywhere in a URI. */
+export class InternalPathStreamRewriter {
+  private pending = '';
+
+  constructor(
+    private readonly profileDir: string,
+    private readonly workspaceDir: string
+  ) {}
+
+  write(chunk: string, final = false): string {
+    const text = this.pending + chunk;
+    // Retain unfinished paths, including partial "file:" prefixes, until a boundary arrives.
+    const tail = final ? null : /[^\s"'`<>()\[\]」』】》〉、。]*$/.exec(text);
+    const mayBePath = tail && (tail[0].includes('/') || /f(?:i(?:l(?:e:?)?)?)?$/i.test(tail[0]));
+    const boundary = mayBePath ? tail.index : text.length;
+    this.pending = text.slice(boundary);
+    return rewriteInternalPathsToWorkspace(text.slice(0, boundary), this.profileDir, this.workspaceDir);
+  }
 }
 
 export function scrubToolCallsInternalPaths(
@@ -384,7 +407,7 @@ export function importAuthorizedBrainFileToWorkspace(params: {
 export function extractCandidatePathsFromText(text: string): string[] {
   const candidates = new Set<string>();
   if (!text) return [];
-  const regex = /(?:file:\/\/\/|\/|~\/)[^\s"'`<>)\]」』】》〉、。]+/g;
+  const regex = /(?:file:\/\/\/|\/|~\/)[^\s"'`<>()\[\]」』】》〉、。]+/g;
   let match: RegExpExecArray | null;
   while ((match = regex.exec(text)) !== null) {
     const cleaned = normalizeLinkCandidatePath(match[0].replace(/[.,;:!?]+$/, ''));
@@ -457,103 +480,80 @@ export function resolveAuthorizedChatFileReference(params: {
     candidate = candidate.slice(SANDBOX_WORKSPACE_MOUNT.length + 1);
   }
 
-  // Check by artifact ID first (must match both userId and chatId!)
-  const byId = params.db.getArtifact(params.userId, candidate);
-  if (byId && byId.chatId === params.chatId) {
+  // All routes register/refresh the same workspace artifact, preserving its message/run ownership.
+  const resolveWorkspaceFile = (reference: string): ResolvedWorkspaceLink | null => {
     try {
-      const { absPath } = resolveContainedExistingPath(chat.workspaceDir, byId.relPath);
+      const { absPath, relPath } = resolveContainedExistingPath(chat.workspaceDir, reference);
       const stat = fs.statSync(absPath);
       if (!stat.isFile()) return null;
-      let current = byId;
-      const shouldVerify =
-        stat.size !== byId.sizeBytes ||
-        Math.floor(stat.mtimeMs) > byId.updatedAt ||
-        stat.size <= 512 * 1024;
-      if (shouldVerify) {
-        const nextSha = sha256File(absPath);
+      let artifact = params.db.findArtifactByRelPath(params.userId, params.chatId, relPath);
+      if (
+        !artifact || stat.size !== artifact.sizeBytes ||
+        Math.floor(stat.mtimeMs) > artifact.updatedAt || stat.size <= 512 * 1024
+      ) {
+        const fileSha = sha256File(absPath);
         if (
-          nextSha !== byId.sha256 ||
-          stat.size !== byId.sizeBytes ||
-          Math.floor(stat.mtimeMs) > byId.updatedAt
+          !artifact || artifact.sha256 !== fileSha || stat.size !== artifact.sizeBytes ||
+          Math.floor(stat.mtimeMs) > artifact.updatedAt
         ) {
-          current = params.db.upsertArtifact({
-            id: byId.id,
-            userId: byId.userId,
-            chatId: byId.chatId,
-            messageId: byId.messageId,
-            runId: byId.runId,
-            relPath: byId.relPath,
-            filename: byId.filename,
-            mimeType: byId.mimeType,
+          const filename = path.basename(relPath);
+          const { mimeType, previewKind } = detectMimeAndPreviewKind(filename);
+          artifact = params.db.upsertArtifact({
+            id: artifact?.id ?? crypto.randomUUID(),
+            userId: params.userId,
+            chatId: params.chatId,
+            messageId: artifact?.messageId ?? null,
+            runId: artifact?.runId ?? null,
+            relPath,
+            filename,
+            mimeType,
             sizeBytes: stat.size,
-            sha256: nextSha,
-            source: byId.source,
-            previewKind: byId.previewKind,
+            sha256: fileSha,
+            source: relPath.startsWith('.project-context/') ? 'project_copy' : (artifact?.source ?? 'generated'),
+            previewKind,
             diffPatch: null,
             minUpdatedAt: stat.mtimeMs,
           });
         }
       }
-      return {
-        artifact: current,
-        ...buildArtifactUrls(current),
-      };
+      return { artifact: artifact!, ...buildArtifactUrls(artifact!) };
     } catch {
       return null;
     }
+  };
+
+  const byId = params.db.getArtifact(params.userId, candidate);
+  if (byId && byId.chatId === params.chatId) {
+    return resolveWorkspaceFile(byId.relPath);
   }
 
-  // Try resolving strictly inside chat.workspaceDir
-  try {
-    const { absPath, relPath } = resolveContainedExistingPath(chat.workspaceDir, candidate);
-    const stat = fs.statSync(absPath);
-    if (!stat.isFile()) return null;
+  const workspaceFile = resolveWorkspaceFile(candidate);
+  if (workspaceFile) return workspaceFile;
 
-    let artifact = params.db.findArtifactByRelPath(params.userId, params.chatId, relPath);
-    const shouldHash =
-      !artifact ||
-      stat.size !== artifact.sizeBytes ||
-      Math.floor(stat.mtimeMs) > artifact.updatedAt ||
-      stat.size <= 512 * 1024;
-
-    if (shouldHash) {
-      const fileSha = sha256File(absPath);
-      if (
-        !artifact ||
-        artifact.sha256 !== fileSha ||
-        stat.size !== artifact.sizeBytes ||
-        Math.floor(stat.mtimeMs) > artifact.updatedAt
-      ) {
-        const filename = path.basename(relPath);
-        const { mimeType, previewKind } = detectMimeAndPreviewKind(filename);
-        artifact = params.db.upsertArtifact({
-          id: artifact?.id ?? crypto.randomUUID(),
-          userId: params.userId,
-          chatId: params.chatId,
-          messageId: null,
-          runId: null,
-          relPath,
-          filename,
-          mimeType,
-          sizeBytes: stat.size,
-          sha256: fileSha,
-          source: relPath.startsWith('.project-context/') ? 'project_copy' : (artifact?.source ?? 'generated'),
-          previewKind,
-          diffPatch: null,
-          minUpdatedAt: stat.mtimeMs,
-        });
+  // Older chunk-by-chunk rewriting produced generated//brain/<session>/<filename>.
+  // Recover only that signature, within this chat, and only when no hash-suffixed
+  // collision copy makes the original filename ambiguous. Exact workspace paths win.
+  const legacy = /^generated\/\/brain\/[^/.][^/]*\/([^/]+)$/.exec(candidate);
+  if (legacy && legacy[1] !== '.' && legacy[1] !== '..') {
+    const filename = legacy[1];
+    const ext = path.extname(filename);
+    const stem = filename.slice(0, filename.length - ext.length);
+    try {
+      const generated = resolveContainedExistingPath(chat.workspaceDir, 'generated');
+      const entries = fs.readdirSync(generated.absPath);
+      const hasCollision = entries.some((name) =>
+        name.startsWith(`${stem}-`) && name.endsWith(ext) &&
+        /^[a-f0-9]{8}$/.test(name.slice(stem.length + 1, ext ? -ext.length : undefined))
+      );
+      if (!hasCollision) {
+        const recovered = resolveWorkspaceFile(`generated/${filename}`);
+        if (recovered) return recovered;
       }
+    } catch {
+      // Missing generated directory; continue with authorized brain resolution.
     }
-
-    return {
-      artifact: artifact!,
-      ...buildArtifactUrls(artifact!),
-    };
-  } catch {
-    // Fall through to check the user's own Antigravity brain directory
   }
 
-  // Safely resolve artifacts written by Antigravity CLI into this user's own profile brain dir
   const profile = params.db.getAgyProfile(params.userId);
   if (!profile) return null;
   const brainFile = resolveAuthorizedBrainFile({
@@ -568,40 +568,7 @@ export function resolveAuthorizedChatFileReference(params: {
       workspaceDir: chat.workspaceDir,
       sourceAbsPath: brainFile.absPath,
     });
-    const stat = fs.statSync(imported.absPath);
-    const filename = path.basename(imported.relPath);
-    const { mimeType, previewKind } = detectMimeAndPreviewKind(filename);
-
-    let artifact = params.db.findArtifactByRelPath(params.userId, params.chatId, imported.relPath);
-    const fileSha = sha256File(imported.absPath);
-    if (
-      !artifact ||
-      artifact.sha256 !== fileSha ||
-      stat.size !== artifact.sizeBytes ||
-      Math.floor(stat.mtimeMs) > artifact.updatedAt
-    ) {
-      artifact = params.db.upsertArtifact({
-        id: artifact?.id ?? crypto.randomUUID(),
-        userId: params.userId,
-        chatId: params.chatId,
-        messageId: null,
-        runId: null,
-        relPath: imported.relPath,
-        filename,
-        mimeType,
-        sizeBytes: stat.size,
-        sha256: fileSha,
-        source: 'generated',
-        previewKind,
-        diffPatch: null,
-        minUpdatedAt: stat.mtimeMs,
-      });
-    }
-
-    return {
-      artifact,
-      ...buildArtifactUrls(artifact),
-    };
+    return resolveWorkspaceFile(imported.relPath);
   } catch {
     return null;
   }
