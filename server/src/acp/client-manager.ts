@@ -1703,6 +1703,17 @@ export class AcpClientManager {
       const reference = rewriteInternalFileReference(block.uri, worker.profileDir, worker.workspaceDir);
       const filename = block.name || path.basename(normalizeLinkCandidatePath(reference) ?? reference);
       const { previewKind } = detectMimeAndPreviewKind(filename, block.mimeType);
+      try {
+        const candidate = toHostWorkspacePath(worker.workspaceDir, SANDBOX_WORKSPACE_MOUNT, reference);
+        const resolved = resolveContainedExistingPath(worker.workspaceDir, candidate);
+        this.registerAndEmitSyncedWorkspaceFile(worker, turn, {
+          brainAbsPath: resolved.absPath, relUnderBrain: filename,
+          workspaceAbsPath: resolved.absPath, workspaceRelPath: resolved.relPath,
+          filename, mimeType: block.mimeType ?? undefined,
+        });
+      } catch {
+        // External URLs and unavailable files remain links; no file is imported outside the workspace.
+      }
       return `\n${formatFileLink(filename, reference, previewKind === 'image' || previewKind === 'svg')}\n`;
     }
     let data: Buffer;
@@ -1733,17 +1744,18 @@ export class AcpClientManager {
     turn: ActiveTurnBridge,
     item: SyncedBrainFile
   ): void {
-    turn.syncedBrainFiles.set(item.workspaceRelPath, item);
     try {
       const stat = fs.statSync(item.workspaceAbsPath);
       if (!stat.isFile()) return;
       const fileSha = sha256File(item.workspaceAbsPath);
-      const { mimeType, previewKind } = detectMimeAndPreviewKind(item.filename, item.mimeType);
       const existing = this.db.findArtifactByRelPath(
         worker.userId,
         worker.chatId,
         item.workspaceRelPath
       );
+      const filename = item.mimeType ? item.filename : (existing?.filename ?? item.filename);
+      const { mimeType, previewKind } = detectMimeAndPreviewKind(filename, item.mimeType ?? existing?.mimeType);
+      turn.syncedBrainFiles.set(item.workspaceRelPath, { ...item, filename, mimeType });
       const artifact = this.db.upsertArtifact({
         id: existing?.id ?? crypto.randomUUID(),
         userId: worker.userId,
@@ -1751,7 +1763,7 @@ export class AcpClientManager {
         messageId: turn.assistantMessageId,
         runId: turn.runId,
         relPath: item.workspaceRelPath,
-        filename: item.filename,
+        filename,
         mimeType,
         sizeBytes: stat.size,
         sha256: fileSha,
@@ -1760,7 +1772,11 @@ export class AcpClientManager {
         diffPatch: null,
         minUpdatedAt: stat.mtimeMs,
       });
-      if (!turn.emittedArtifactIds.has(artifact.id)) {
+      if (
+        !turn.emittedArtifactIds.has(artifact.id) ||
+        (existing && (existing.sha256 !== artifact.sha256 || existing.mimeType !== artifact.mimeType ||
+          existing.previewKind !== artifact.previewKind || existing.filename !== artifact.filename))
+      ) {
         turn.emittedArtifactIds.add(artifact.id);
         this.hub.emitDurable({
           userId: worker.userId,

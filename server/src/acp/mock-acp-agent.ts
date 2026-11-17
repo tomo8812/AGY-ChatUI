@@ -12,6 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { mockArtifactBytes } from './mock-artifact-fixtures.js';
 import readline from 'node:readline';
 import { Readable, Writable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -631,10 +632,10 @@ function runAcpServer(): void {
           const dir = path.join(homeDir, '.gemini', 'antigravity-cli', 'brain', childId);
           fs.mkdirSync(dir, { recursive: true });
           await sendUpdate({ sessionId: state.id, update: { sessionUpdate: 'state_update', state: 'running' } });
-          for (const ext of ['png', 'svg', 'pdf', 'docx', 'xlsx', 'pptx', 'zip', 'md', 'csv', 'html', 'wav', 'mp4']) {
+          for (const ext of ['png', 'svg', 'pdf', 'docx', 'xlsx', 'pptx', 'zip', 'md', 'csv', 'html', 'wav', 'mp4'] as const) {
             const filename = `report (v1) [final] #50%.${ext}`;
             const file = path.join(dir, filename);
-            fs.writeFileSync(file, `${ext} artifact bytes`);
+            fs.writeFileSync(file, mockArtifactBytes(ext));
             const uri = pathToFileURL(file).href.replace(/[()[\]]/g, c => `%${c.charCodeAt(0).toString(16)}`);
             const text = `[${ext} file](${uri})`;
             const split = text.indexOf('/brain/');
@@ -669,15 +670,24 @@ function runAcpServer(): void {
               sessionUpdate: 'agent_message_chunk', content: { type: 'resource_link', uri: file, name: filename },
             } });
           }
+          const declaredFile = path.join(dir, 'declared-source.bin');
+          fs.writeFileSync(declaredFile, mockArtifactBytes('png'));
+          const declaredBlock: ContentBlock = {
+            type: 'resource_link', uri: pathToFileURL(declaredFile).href,
+            name: 'declared image.bin', mimeType: 'image/png',
+          };
+          for (const sessionId of [childId, state.id]) {
+            await sendUpdate({ sessionId, update: { sessionUpdate: 'agent_message_chunk', content: declaredBlock } });
+          }
           const inlineBlocks: ContentBlock[] = [
             { type: 'resource', resource: { uri: 'artifact:///inline%20notes.md', mimeType: 'text/markdown', text: '# Inline notes' } },
-            { type: 'resource', resource: { uri: 'artifact:///inline%20document.bin', mimeType: 'application/pdf', blob: Buffer.from('%PDF-inline bytes').toString('base64') } },
+            { type: 'resource', resource: { uri: 'artifact:///inline%20document.bin', mimeType: 'application/pdf', blob: mockArtifactBytes('pdf').toString('base64') } },
             { type: 'resource', resource: { uri: 'artifact:///empty.txt', mimeType: 'text/plain', text: '' } },
-            { type: 'resource', resource: { uri: 'artifact:///shared.bin', mimeType: 'application/pdf', blob: Buffer.from('shared bytes').toString('base64') } },
-            { type: 'resource', resource: { uri: 'artifact:///shared.bin', mimeType: 'image/png', blob: Buffer.from('shared bytes').toString('base64') } },
-            { type: 'audio', mimeType: 'audio/wav', data: Buffer.from('inline audio bytes').toString('base64') },
-            { type: 'image', mimeType: 'image/png', data: Buffer.from('inline image A').toString('base64') },
-            { type: 'image', mimeType: 'image/png', data: Buffer.from('inline image B').toString('base64') },
+            { type: 'resource', resource: { uri: 'artifact:///shared.bin', mimeType: 'application/octet-stream', blob: mockArtifactBytes('png').toString('base64') } },
+            { type: 'resource', resource: { uri: 'artifact:///shared.bin', mimeType: 'image/png', blob: mockArtifactBytes('png').toString('base64') } },
+            { type: 'audio', mimeType: 'audio/wav', data: mockArtifactBytes('wav').toString('base64') },
+            { type: 'image', mimeType: 'image/png', data: mockArtifactBytes('png').toString('base64') },
+            { type: 'image', mimeType: 'image/png', data: mockArtifactBytes('pngAlternate').toString('base64') },
           ];
           for (const [i, block] of inlineBlocks.entries()) {
             await sendUpdate({ sessionId: childId, update: { sessionUpdate: 'agent_message_chunk', content: block } });

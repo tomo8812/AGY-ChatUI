@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { mockArtifactBytes } from '../src/acp/mock-artifact-fixtures.js';
 import type { ArtifactRecord, MessageRecord } from '../src/types.js';
 import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
 
@@ -30,7 +31,7 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
     await alice.waitForFrame(frame => {
       const event = frame.event as { type: string; payload?: { message?: MessageRecord } } | undefined;
       const message = event?.payload?.message;
-      return event?.type === 'message.updated' && message?.artifactIds.length === 20 &&
+      return event?.type === 'message.updated' && message?.artifactIds.length === 21 &&
         message.toolCalls.some(tool => tool.subagentState === 'idle');
     }, 15000);
     const detail = (await alice.request<{ messages: MessageRecord[]; artifacts: ArtifactRecord[] }>(
@@ -39,7 +40,7 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
     const message = detail.messages.find(item => item.role === 'assistant')!;
     const subagent = message.toolCalls.find(tool => tool.subagentContentText)!;
     const artifacts = detail.artifacts;
-    expect(artifacts).toHaveLength(20);
+    expect(artifacts).toHaveLength(21);
     expect(subagent.status).toBe('completed');
     expect(subagent.subagentState).toBe('idle');
     const channels: Record<string, string> = {
@@ -76,7 +77,7 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
       const artifact = artifacts.find(item => item.filename === filename)!;
       expect(artifact, ext).toBeDefined();
       expect(artifact.previewKind).toBe(previewKind);
-      expect(fs.readFileSync(path.join(chat.workspaceDir, artifact.relPath), 'utf8')).toBe(`${ext} artifact bytes`);
+      expect(fs.readFileSync(path.join(chat.workspaceDir, artifact.relPath))).toEqual(mockArtifactBytes(ext as Parameters<typeof mockArtifactBytes>[0]));
       const legacyUri = `file:///workspace/generated//brain/old-session/${encodeURIComponent(filename)}`;
       const legacy = await alice.request<{ artifact: ArtifactRecord }>(
         'POST', `/api/chats/${chat.id}/resolve-link`, { reference: legacyUri }
@@ -93,18 +94,28 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
     const inlinePdf = artifacts.find(item => item.filename === 'inline document.bin')!;
     expect(inlinePdf.mimeType).toBe('application/pdf');
     expect(inlinePdf.previewKind).toBe('pdf');
-    expect(fs.readFileSync(path.join(chat.workspaceDir, inlinePdf.relPath), 'utf8')).toBe('%PDF-inline bytes');
+    expect(fs.readFileSync(path.join(chat.workspaceDir, inlinePdf.relPath))).toEqual(mockArtifactBytes('pdf'));
     const shared = artifacts.filter(item => item.filename === 'shared.bin');
     expect(shared).toHaveLength(2);
-    expect(shared.map(item => item.mimeType).sort()).toEqual(['application/pdf', 'image/png']);
+    expect(shared.map(item => item.mimeType).sort()).toEqual(['application/octet-stream', 'image/png']);
     expect(new Set(shared.map(item => item.relPath)).size).toBe(2);
     const empty = artifacts.find(item => item.filename === 'empty.txt')!;
     expect(empty.sizeBytes).toBe(0);
     expect(artifacts.filter(item => item.mimeType === 'image/png' && item.filename === 'generated.png')).toHaveLength(2);
     const inlineImageBytes = artifacts.filter(item => item.filename === 'generated.png').map(item =>
-      fs.readFileSync(path.join(chat.workspaceDir, item.relPath), 'utf8')
+      fs.readFileSync(path.join(chat.workspaceDir, item.relPath)).toString('base64')
     );
-    expect(inlineImageBytes.sort()).toEqual(['inline image A', 'inline image B']);
+    expect(inlineImageBytes.sort()).toEqual([mockArtifactBytes('png').toString('base64'), mockArtifactBytes('pngAlternate').toString('base64')].sort());
+    const declared = artifacts.find(item => item.filename === 'declared image.bin')!;
+    expect(declared.mimeType).toBe('image/png');
+    expect(declared.previewKind).toBe('image');
+    expect(fs.readFileSync(path.join(chat.workspaceDir, declared.relPath))).toEqual(mockArtifactBytes('png'));
+    expect(alice.wsFrames.some(frame => {
+      const event = frame.event as { type: string; payload?: { artifact?: ArtifactRecord } } | undefined;
+      const artifact = event?.payload?.artifact;
+      return event?.type === 'artifact.created' && artifact?.id === declared.id &&
+        artifact.filename === 'declared image.bin' && artifact.mimeType === 'image/png';
+    })).toBe(true);
     expect(message.sessionMessages!.every(item => item.done)).toBe(true);
     const otherChat = (await alice.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Other chat' })).data.chat;
     for (const artifact of artifacts) {

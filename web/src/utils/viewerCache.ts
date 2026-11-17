@@ -334,6 +334,7 @@ export function normalizeClientLinkReference(rawReference: string): string | nul
   }
 
   let candidate = raw;
+  const isFileUri = /^file:\/\//i.test(candidate);
   if (/^file:\/\//i.test(candidate)) {
     try {
       const parsed = new URL(candidate);
@@ -343,7 +344,9 @@ export function normalizeClientLinkReference(rawReference: string): string | nul
     }
   }
 
-  candidate = candidate.replace(/#L\d+(?:-L?\d+)?$/i, '').replace(/:\d+(?::\d+)?$/, '').trim();
+  if (!isFileUri) {
+    candidate = candidate.replace(/#L\d+(?:-L?\d+)?$/i, '').replace(/:\d+(?::\d+)?$/, '').trim();
+  }
   if (!candidate) return null;
 
   if (candidate === '/workspace') return null;
@@ -353,7 +356,7 @@ export function normalizeClientLinkReference(rawReference: string): string | nul
   while (candidate.startsWith('./')) {
     candidate = candidate.slice(2);
   }
-  return candidate.replace(/\/+/g, '/').trim() || null;
+  return candidate.replace(/\/+/g, '/') || null;
 }
 
 // ---------- User-scoped viewer caches ----------

@@ -1,11 +1,16 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { normalizeClientLinkReference } from '../../web/src/utils/viewerCache';
 import { afterEach, describe, expect, it } from 'vitest';
 import { getChatBrainHostDir } from '../src/acp/env-isolation.js';
 import {
   captureBrainSnapshot,
   InternalPathStreamRewriter,
+  normalizeLinkCandidatePath,
+  rewriteInternalFileReference,
+  scrubToolCallsInternalPaths,
   syncNewBrainFilesToWorkspace,
 } from '../src/files/link-resolver.js';
 import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
@@ -66,6 +71,40 @@ describe('streamed generated file links', () => {
     expect(content.write('', true)).toBe('');
     expect(content.write('次の返答です。')).toBe('次の返答です。');
     expect(content.write('通常の本文')).toBe('通常の本文');
+  });
+
+  it('preserves literal line-like filename suffixes in encoded file URIs on server and client', () => {
+    const { profile, workspace } = fixture();
+    for (const filename of ['report.pdf#L10', 'report.pdf:10']) {
+      const source = path.join(getChatBrainHostDir(profile, workspace), 'session-1', filename);
+      fs.writeFileSync(source, 'suffix filename bytes');
+      const uri = pathToFileURL(source).href;
+      expect(normalizeLinkCandidatePath(uri)).toBe(source);
+      const rewritten = rewriteInternalFileReference(uri, profile, workspace);
+      expect(normalizeLinkCandidatePath(rewritten)).toBe(`/workspace/generated/${filename}`);
+      expect(normalizeClientLinkReference(rewritten)).toBe(`generated/${filename}`);
+      expect(normalizeClientLinkReference(`${rewritten}#L42`)).toBe(`generated/${filename}`);
+      expect(fs.readFileSync(path.join(workspace, 'generated', filename), 'utf8')).toBe('suffix filename bytes');
+    }
+  });
+
+  it('keeps free-form raw tool output while rewriting structured path fields as whole references', () => {
+    const { profile, workspace } = fixture();
+    const dir = path.join(getChatBrainHostDir(profile, workspace), 'session-1');
+    const plain = path.join(dir, 'result.txt');
+    const spaced = path.join(dir, 'result with spaces.txt');
+    fs.writeFileSync(plain, 'result');
+    fs.writeFileSync(spaced, 'spaced result');
+    const tools = scrubToolCallsInternalPaths([
+      { toolCallId: 'plain', title: 'Export', status: 'completed', rawOutput: `${plain}\nDone` },
+      { toolCallId: 'structured', title: 'Export', status: 'completed', rawOutput: {
+        path: spaced, stdout: `${plain}\nDone`,
+      } },
+    ], profile, workspace);
+    expect(tools[0].rawOutput).toBe('/workspace/generated/result.txt\nDone');
+    const output = tools[1].rawOutput as { path: string; stdout: string };
+    expect(normalizeLinkCandidatePath(output.path)).toBe('/workspace/generated/result with spaces.txt');
+    expect(output.stdout).toBe('/workspace/generated/result.txt\nDone');
   });
 
   it('imports changed brain files once and retries when an import fails', () => {

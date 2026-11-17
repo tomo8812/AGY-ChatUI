@@ -60,7 +60,7 @@ export function normalizeLinkCandidatePath(rawReference: string): string | null 
   if (/^file:\/\//i.test(candidate)) {
     try {
       const parsed = new URL(candidate);
-      candidate = decodeURIComponent(parsed.pathname);
+      return decodeURIComponent(parsed.pathname) || null;
     } catch {
       return null;
     }
@@ -359,10 +359,10 @@ export function scrubToolCallsInternalPaths(
   profileDir: string,
   workspaceDir?: string | null
 ): ToolCallItem[] {
-  const scrubValue = (val: unknown, depth = 0): unknown => {
+  const scrubValue = (val: unknown, depth = 0, field?: string): unknown => {
     if (depth > 5 || val == null) return val;
     if (typeof val === 'string') {
-      return /^(?:file:\/\/|\/|~\/)/i.test(val.trim())
+      return field && /^(?:path|uri|url|file_path|filepath|absolute_path|relative_path|sourcepath|destinationpath)$/i.test(field)
         ? rewriteInternalFileReference(val, profileDir, workspaceDir)
         : rewriteInternalPathsToWorkspace(val, profileDir, workspaceDir);
     }
@@ -372,7 +372,7 @@ export function scrubToolCallsInternalPaths(
     if (typeof val === 'object') {
       const out: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
-        out[k] = scrubValue(v, depth + 1);
+        out[k] = scrubValue(v, depth + 1, k);
       }
       return out;
     }
