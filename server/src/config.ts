@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { resolveCanonicalAgyBin } from './acp/env-isolation.js';
 import { resolvePackageVersion } from './version.js';
 
 export type SandboxMode = 'auto' | 'strict' | 'off';
@@ -121,5 +122,6 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   if (!overrides.dbPath && overrides.dataRoot) {
     merged.dbPath = path.join(merged.dataRoot, 'antigravity-chat.db');
   }
+  merged.agyBin = resolveCanonicalAgyBin(merged.agyBin);
   return merged;
 }

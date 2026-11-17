@@ -160,6 +160,9 @@ if [[ "$(id -u)" -eq 0 ]] && [[ -n "${REPO_OWNER}" ]] && id "${REPO_OWNER}" >/de
 fi
 
 if [[ "$(id -u)" -eq 0 ]]; then
+  UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}"
+  NEED_DAEMON_RELOAD=0
+
   if command -v bwrap >/dev/null 2>&1; then
     if [[ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] \
       && [[ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" == "1" ]] \
@@ -182,16 +185,23 @@ EOF
       fi
     fi
 
-    UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}"
     if [[ -f "${UNIT_FILE}" ]] && grep -qE '^NoNewPrivileges=true$' "${UNIT_FILE}"; then
       echo "[apply-bundle] Updating ${UNIT_FILE} (NoNewPrivileges=false) for bubblewrap userns transition..."
       sed -i 's/^NoNewPrivileges=true$/NoNewPrivileges=false/' "${UNIT_FILE}"
-      if command -v systemctl >/dev/null 2>&1; then
-        systemctl daemon-reload || true
-      fi
+      NEED_DAEMON_RELOAD=1
     fi
   else
     echo "[apply-bundle] INFO: 'bwrap' (bubblewrap) is not installed; SANDBOX_MODE=auto will fall back cleanly until installed."
+  fi
+
+  if [[ -f "${UNIT_FILE}" ]] && grep -qE '^Environment=AGY_BIN=agy$' "${UNIT_FILE}"; then
+    echo "[apply-bundle] Updating ${UNIT_FILE} (AGY_BIN=/usr/local/bin/agy) for single-binary consistency..."
+    sed -i 's|^Environment=AGY_BIN=agy$|Environment=AGY_BIN=/usr/local/bin/agy|' "${UNIT_FILE}"
+    NEED_DAEMON_RELOAD=1
+  fi
+
+  if [[ "${NEED_DAEMON_RELOAD}" -eq 1 ]] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
   fi
 fi
 

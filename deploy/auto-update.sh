@@ -18,7 +18,9 @@ LOCK_FILE="${LOCK_FILE:-/run/antigravity-chat-updater.lock}"
 CURL_BIN="${CURL_BIN:-curl}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 DATA_ROOT="${DATA_ROOT:-/var/lib/antigravity-chat}"
-AGY_BIN="${AGY_BIN:-agy}"
+AGY_CANONICAL_BIN="${AGY_CANONICAL_BIN:-/usr/local/bin/agy}"
+AGY_BIN="${AGY_BIN:-${AGY_CANONICAL_BIN}}"
+AGY_CANDIDATE_PATHS="${AGY_CANDIDATE_PATHS:-}"
 AGY_MODE="${AGY_MODE:-}"
 AGY_AUTO_UPDATE="${AGY_AUTO_UPDATE:-true}"
 AGY_UPDATE_INTERVAL_SEC="${AGY_UPDATE_INTERVAL_SEC:-900}"
@@ -34,7 +36,9 @@ if [[ -r "${ENV_FILE}" ]]; then
 fi
 
 DATA_ROOT="${DATA_ROOT:-/var/lib/antigravity-chat}"
-AGY_BIN="${AGY_BIN:-agy}"
+AGY_CANONICAL_BIN="${AGY_CANONICAL_BIN:-/usr/local/bin/agy}"
+AGY_BIN="${AGY_BIN:-${AGY_CANONICAL_BIN}}"
+AGY_CANDIDATE_PATHS="${AGY_CANDIDATE_PATHS:-}"
 AGY_MODE="${AGY_MODE:-}"
 AGY_AUTO_UPDATE="${AGY_AUTO_UPDATE:-true}"
 AGY_UPDATE_INTERVAL_SEC="${AGY_UPDATE_INTERVAL_SEC:-900}"
@@ -343,6 +347,144 @@ resolve_agy_stamp_file() {
   echo "/tmp/antigravity-chat-agy-update-check"
 }
 
+is_default_agy_bin_mode() {
+  [[ "${AGY_BIN}" == "agy" ]] || [[ "${AGY_BIN}" == "${AGY_CANONICAL_BIN}" ]]
+}
+
+read_agy_version() {
+  local bin_path="$1"
+  timeout 10 env -u AGY_CLI_DISABLE_AUTO_UPDATE "${bin_path}" --version </dev/null 2>/dev/null | tr -d '\r' | head -n 1 || true
+}
+
+is_semver_newer() {
+  local cand_ver="$1"
+  local base_ver="$2"
+  python3 - "$cand_ver" "$base_ver" <<'PY' >/dev/null 2>&1
+import re, sys
+def parse(s):
+    m = re.search(r'(\d+)\.(\d+)\.(\d+)', s or '')
+    return tuple(int(x) for x in m.groups()) if m else None
+a = parse(sys.argv[1])
+b = parse(sys.argv[2])
+sys.exit(0 if (a is not None and b is not None and a > b) else 1)
+PY
+}
+
+promote_to_canonical_agy() {
+  local src_bin="$1"
+  local target_bin="$2"
+  local src_real target_real tmp_target ver_check
+
+  src_real="$(readlink -f "${src_bin}" 2>/dev/null || echo "${src_bin}")"
+  target_real="$(readlink -f "${target_bin}" 2>/dev/null || true)"
+  [[ -f "${src_real}" && -x "${src_real}" ]] || return 1
+  if [[ -n "${target_real}" ]] && [[ "${src_real}" == "${target_real}" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$(dirname "${target_bin}")" 2>/dev/null || return 1
+  tmp_target="${target_bin}.tmp.$$"
+  if ! install -m 755 "${src_real}" "${tmp_target}" 2>/dev/null; then
+    rm -f "${tmp_target}" 2>/dev/null || true
+    return 1
+  fi
+
+  ver_check="$(read_agy_version "${tmp_target}")"
+  if [[ -z "${ver_check}" ]]; then
+    rm -f "${tmp_target}" 2>/dev/null || true
+    return 1
+  fi
+
+  if ! mv -f "${tmp_target}" "${target_bin}" 2>/dev/null; then
+    rm -f "${tmp_target}" 2>/dev/null || true
+    return 1
+  fi
+
+  echo "[auto-update] Unified Antigravity CLI binary -> ${target_bin} (${ver_check} from ${src_bin})."
+  AGY_CLI_UPDATED=1
+  return 0
+}
+
+unify_agy_binaries() {
+  local target_bin="$1"
+  local -a candidates=()
+
+  if [[ -n "${AGY_CANDIDATE_PATHS}" ]]; then
+    IFS=':' read -r -a candidates <<< "${AGY_CANDIDATE_PATHS}"
+  else
+    candidates=(
+      "${target_bin}"
+      /usr/bin/agy
+      /bin/agy
+      /root/.local/bin/agy
+      /root/.antigravity/bin/agy
+      /home/*/.local/bin/agy
+      /home/*/.antigravity/bin/agy
+    )
+  fi
+
+  local target_ver=""
+  if [[ -x "${target_bin}" ]]; then
+    target_ver="$(read_agy_version "${target_bin}")"
+  fi
+
+  # 1. If canonical target is missing/broken or another path holds a newer version, promote it
+  local best_cand="" best_ver=""
+  local cand cand_real cand_ver target_real=""
+  for cand in "${candidates[@]}"; do
+    [[ -x "${cand}" ]] || continue
+    cand_real="$(readlink -f "${cand}" 2>/dev/null || echo "${cand}")"
+    [[ -f "${cand_real}" ]] || continue
+    cand_ver="$(read_agy_version "${cand}")"
+    [[ -n "${cand_ver}" ]] || continue
+
+    if [[ -z "${target_ver}" ]]; then
+      if [[ -z "${best_cand}" ]] || is_semver_newer "${cand_ver}" "${best_ver}"; then
+        best_cand="${cand}"
+        best_ver="${cand_ver}"
+      fi
+    elif is_semver_newer "${cand_ver}" "${target_ver}"; then
+      if [[ -z "${best_cand}" ]] || is_semver_newer "${cand_ver}" "${best_ver}"; then
+        best_cand="${cand}"
+        best_ver="${cand_ver}"
+      fi
+    fi
+  done
+
+  if [[ -n "${best_cand}" ]]; then
+    promote_to_canonical_agy "${best_cand}" "${target_bin}" || true
+    if [[ -x "${target_bin}" ]]; then
+      target_ver="$(read_agy_version "${target_bin}")"
+    fi
+  fi
+
+  # 2. If canonical target is healthy, replace duplicate non-package binaries with symlinks to target
+  [[ -x "${target_bin}" && -n "${target_ver}" ]] || return 0
+  target_real="$(readlink -f "${target_bin}" 2>/dev/null || echo "${target_bin}")"
+  [[ -f "${target_real}" ]] || return 0
+
+  for cand in "${candidates[@]}"; do
+    [[ -f "${cand}" || -L "${cand}" ]] || continue
+    [[ "${cand}" != "${target_bin}" ]] || continue
+    cand_real="$(readlink -f "${cand}" 2>/dev/null || true)"
+    if [[ -n "${cand_real}" ]] && [[ "${cand_real}" == "${target_real}" ]]; then
+      continue
+    fi
+    if command -v dpkg >/dev/null 2>&1 && dpkg -S "${cand}" >/dev/null 2>&1; then
+      echo "[auto-update] WARNING: Package-managed duplicate agy at ${cand} differs from ${target_bin}."
+      continue
+    fi
+    local parent_owner=""
+    parent_owner="$(stat -c '%U:%G' "$(dirname "${cand}")" 2>/dev/null || true)"
+    if ln -sfn "${target_bin}" "${cand}" 2>/dev/null; then
+      if [[ "$(id -u)" -eq 0 ]] && [[ -n "${parent_owner}" ]]; then
+        chown -h "${parent_owner}" "${cand}" 2>/dev/null || true
+      fi
+      echo "[auto-update] Linked duplicate agy ${cand} -> ${target_bin}."
+    fi
+  done
+}
+
 update_agy_cli() {
   if ! is_truthy "${AGY_AUTO_UPDATE:-true}"; then
     return 0
@@ -351,8 +493,14 @@ update_agy_cli() {
     return 0
   fi
 
-  local agy_path
-  agy_path="$(command -v "${AGY_BIN}" 2>/dev/null || true)"
+  local agy_path=""
+  if is_default_agy_bin_mode; then
+    unify_agy_binaries "${AGY_CANONICAL_BIN}"
+    agy_path="${AGY_CANONICAL_BIN}"
+  else
+    agy_path="$(command -v "${AGY_BIN}" 2>/dev/null || true)"
+  fi
+
   if [[ -z "${agy_path}" ]] || [[ ! -x "${agy_path}" ]]; then
     return 0
   fi
@@ -381,7 +529,7 @@ update_agy_cli() {
   if [[ -f "${agy_real}" ]]; then
     before_sha="$(sha256sum "${agy_real}" 2>/dev/null | awk '{print $1}' || true)"
   fi
-  before_ver="$(timeout 10 env -u AGY_CLI_DISABLE_AUTO_UPDATE "${agy_path}" --version </dev/null 2>/dev/null | tr -d '\r' | head -n 1 || true)"
+  before_ver="$(read_agy_version "${agy_path}")"
 
   local update_out="" update_rc=0
   update_out="$(timeout 120 env -u AGY_CLI_DISABLE_AUTO_UPDATE "${agy_path}" update </dev/null 2>&1)" || update_rc=$?
@@ -390,12 +538,17 @@ update_agy_cli() {
     return 0
   fi
 
+  # Re-unify after update in case `agy update` wrote a new binary into $HOME/.local/bin or $HOME/.antigravity/bin
+  if is_default_agy_bin_mode; then
+    unify_agy_binaries "${AGY_CANONICAL_BIN}"
+  fi
+
   local agy_real_after
   agy_real_after="$(readlink -f "${agy_path}" 2>/dev/null || echo "${agy_path}")"
   if [[ -f "${agy_real_after}" ]]; then
     after_sha="$(sha256sum "${agy_real_after}" 2>/dev/null | awk '{print $1}' || true)"
   fi
-  after_ver="$(timeout 10 env -u AGY_CLI_DISABLE_AUTO_UPDATE "${agy_path}" --version </dev/null 2>/dev/null | tr -d '\r' | head -n 1 || true)"
+  after_ver="$(read_agy_version "${agy_path}")"
 
   if { [[ -n "${after_sha}" ]] && [[ "${after_sha}" != "${before_sha}" ]]; } || { [[ -n "${after_ver}" ]] && [[ "${after_ver}" != "${before_ver}" ]]; }; then
     if [[ "$(id -u)" -eq 0 ]] && [[ -f "${agy_real_after}" ]]; then

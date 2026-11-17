@@ -165,6 +165,30 @@ export function resolveHostExecutable(bin: string, searchPath = process.env.PATH
   return null;
 }
 
+export const SYSTEM_STANDARD_BIN_DIRS = ['/usr/local/bin', '/usr/bin', '/bin'] as const;
+
+/**
+ * Resolves the single canonical `agy` executable path so that server startup,
+ * sandboxed ACP workers, non-sandboxed login/quota calls, and updaters all use
+ * the exact same binary rather than drifting across user/shell PATH differences.
+ */
+export function resolveCanonicalAgyBin(
+  configuredBin: string,
+  searchPath = process.env.PATH,
+  systemDirs: readonly string[] = SYSTEM_STANDARD_BIN_DIRS
+): string {
+  const trimmed = configuredBin.trim() || 'agy';
+  if (trimmed.includes('/')) {
+    return resolveHostExecutable(trimmed, searchPath) ?? path.resolve(trimmed);
+  }
+  if (trimmed === 'agy') {
+    const systemSearchPath = systemDirs.filter(Boolean).join(path.delimiter);
+    const systemHit = systemSearchPath ? resolveHostExecutable(trimmed, systemSearchPath) : null;
+    if (systemHit) return systemHit;
+  }
+  return resolveHostExecutable(trimmed, searchPath) ?? trimmed;
+}
+
 function isInsideSystemMountTree(targetPath: string, mountedDirs: Set<string>): boolean {
   for (const dir of mountedDirs) {
     if (targetPath === dir || targetPath.startsWith(`${dir}/`)) {
@@ -560,10 +584,10 @@ export function buildAgyCommandSpec(params: {
       '/etc/group',
     ];
 
-    const resolvedAgy = resolveHostExecutable(params.config.agyBin, env.PATH);
-    let sandboxAgyCommand = params.config.agyBin;
+    const resolvedAgy = resolveCanonicalAgyBin(params.config.agyBin, env.PATH);
+    let sandboxAgyCommand = resolvedAgy;
 
-    if (resolvedAgy) {
+    if (resolvedAgy.includes('/')) {
       if (isInsideSystemMountTree(resolvedAgy, mountedSystemDirs)) {
         sandboxAgyCommand = resolvedAgy;
       } else {
@@ -683,7 +707,7 @@ export function buildAgyCommandSpec(params: {
   });
 
   return {
-    command: params.config.agyBin,
+    command: resolveCanonicalAgyBin(params.config.agyBin, env.PATH),
     args: params.subcommandArgs,
     env,
     sandboxed: false,

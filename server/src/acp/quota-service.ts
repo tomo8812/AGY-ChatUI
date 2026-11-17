@@ -392,13 +392,18 @@ export class QuotaService {
       persistSnapshot(snap, true);
       return snap;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const errObj = err as { stderr?: unknown; stdout?: unknown; message?: unknown };
+      const stderrText = typeof errObj?.stderr === 'string' ? stripAnsi(errObj.stderr).trim() : '';
+      const rawMsg = err instanceof Error ? err.message : String(err);
+      const cleanMsg = (stderrText || rawMsg.replace(/^Command failed:[^\n]*\n?/, '').trim() || rawMsg)
+        .replace(/\s+/g, ' ')
+        .trim();
       const snap: QuotaSnapshotRecord = {
         userId,
         status: 'unavailable',
         buckets: [],
         rawSummary: null,
-        errorMessage: `取得不可 (${msg.slice(0, 120)})`,
+        errorMessage: `取得不可 (${cleanMsg.slice(0, 240)})`,
         fetchedAt: now,
       };
       persistSnapshot(snap, true);

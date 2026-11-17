@@ -58,13 +58,28 @@ fi
 node -v
 npm -v
 
-echo "==> [3/6] Checking official Antigravity CLI (agy)..."
-if ! command -v agy >/dev/null 2>&1; then
-  echo "INFO: 'agy' binary not found in system PATH (/usr/local/bin:/usr/bin:/bin)."
+echo "==> [3/6] Checking official Antigravity CLI (agy -> /usr/local/bin/agy)..."
+CANONICAL_AGY_BIN="/usr/local/bin/agy"
+if [[ ! -x "${CANONICAL_AGY_BIN}" ]]; then
+  FOUND_AGY_CANDIDATE=""
+  for cand in /usr/bin/agy /bin/agy /root/.local/bin/agy /root/.antigravity/bin/agy /home/*/.local/bin/agy /home/*/.antigravity/bin/agy; do
+    if [[ -x "${cand}" ]]; then
+      FOUND_AGY_CANDIDATE="$(readlink -f "${cand}" 2>/dev/null || echo "${cand}")"
+      break
+    fi
+  done
+  if [[ -n "${FOUND_AGY_CANDIDATE}" ]] && [[ -f "${FOUND_AGY_CANDIDATE}" ]]; then
+    install -m 755 "${FOUND_AGY_CANDIDATE}" "${CANONICAL_AGY_BIN}"
+    echo "Unified Antigravity CLI binary to ${CANONICAL_AGY_BIN} (from ${FOUND_AGY_CANDIDATE})."
+  fi
+fi
+if [[ ! -x "${CANONICAL_AGY_BIN}" ]]; then
+  echo "INFO: '${CANONICAL_AGY_BIN}' not found."
   echo "Install the official unmodified Google Antigravity CLI for $(dpkg --print-architecture):"
   echo "  curl -fsSL https://antigravity.google/cli/install.sh | bash"
-  echo "  (If installed under ~/.local/bin or ~/.antigravity/bin, symlink it to /usr/local/bin/agy"
-  echo "   or set AGY_BIN=/full/path/to/agy inside /etc/antigravity-chat/env for systemd.)"
+  echo "  Then unify it to a single system binary:"
+  echo "  sudo install -m 755 \"\${HOME}/.local/bin/agy\" /usr/local/bin/agy && ln -sfn /usr/local/bin/agy \"\${HOME}/.local/bin/agy\""
+  echo "  (Or set AGY_BIN=/full/path/to/agy inside /etc/antigravity-chat/env.)"
 fi
 
 echo "==> [4/6] Creating dedicated system user, directories, and persistent SESSION_SECRET..."
