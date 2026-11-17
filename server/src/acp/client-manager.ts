@@ -1878,7 +1878,7 @@ export class AcpClientManager {
       }
     }
     return textParts.length > 0
-      ? rewriteInternalPathsToWorkspace(textParts.join(''), worker.profileDir, worker.workspaceDir).trim()
+      ? rewriteInternalPathsToWorkspace(textParts.join('\n'), worker.profileDir, worker.workspaceDir).trim()
       : undefined;
   }
 

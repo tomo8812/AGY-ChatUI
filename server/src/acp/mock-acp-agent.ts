@@ -661,8 +661,8 @@ function runAcpServer(): void {
               sessionUpdate: 'tool_call', toolCallId: `file-tool-${ext}`, title: `Export ${ext}`, status: 'completed',
               locations: [{ path: file }], rawOutput: { path: file },
               content: [
-                { type: 'content', content: { type: 'text', text: text.slice(0, split) } },
-                { type: 'content', content: { type: 'text', text: text.slice(split) } },
+                { type: 'content', content: { type: 'text', text } },
+                { type: 'content', content: { type: 'text', text: 'Tool result complete' } },
                 { type: 'content', content: { type: 'resource_link', uri: file, name: filename } },
               ],
             } });

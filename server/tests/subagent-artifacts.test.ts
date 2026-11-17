@@ -86,6 +86,7 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
       expect(legacy.data.artifact.id).toBe(artifact.id);
     }
     for (const tool of subagent.subagentToolCalls!.filter(tool => tool.locations?.length)) {
+      expect(tool.contentText).toContain(')\nTool result complete\n');
       const location = tool.locations![0].path;
       expect(location).not.toContain('.gemini');
       expect((tool.rawOutput as { path: string }).path).toBe(location);

@@ -442,11 +442,7 @@ const WorkspaceImage: React.FC<{
             ? `/api/files/${updated.id}/content?v=${updated.sha256.slice(0, 12)}`
             : `/api/files/${updated.id}/content`);
         setFailed(false);
-        setResolved((cur) =>
-          cur && cur.url === nextUrl && cur.artifact.updatedAt === updated.updatedAt
-            ? cur
-            : { url: nextUrl, artifact: updated }
-        );
+        setResolved({ url: nextUrl, artifact: updated });
       }
     });
   }, [chatId, src, isDirect]);

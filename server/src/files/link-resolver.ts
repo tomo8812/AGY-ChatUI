@@ -347,7 +347,7 @@ export class InternalPathStreamRewriter {
     const text = this.pending + chunk;
     // Retain unfinished paths, including partial "file:" prefixes, until a boundary arrives.
     const tail = final ? null : /[^\s"'`<>()\[\]」』】》〉、。]*$/.exec(text);
-    const mayBePath = tail && (tail[0].includes('/') || /f(?:i(?:l(?:e:?)?)?)?$/i.test(tail[0]));
+    const mayBePath = tail && (tail[0].includes('/') || /(?:file:|file|fil|fi|f)$/i.test(tail[0]));
     const boundary = mayBePath ? tail.index : text.length;
     this.pending = text.slice(boundary);
     return rewriteInternalPathsToWorkspace(text.slice(0, boundary), this.profileDir, this.workspaceDir);

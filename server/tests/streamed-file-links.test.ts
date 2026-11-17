@@ -71,6 +71,8 @@ describe('streamed generated file links', () => {
     expect(content.write('', true)).toBe('');
     expect(content.write('次の返答です。')).toBe('次の返答です。');
     expect(content.write('通常の本文')).toBe('通常の本文');
+    expect(content.write('Hello')).toBe('Hello');
+    expect(content.write('ordinary unpunctuated output')).toBe('ordinary unpunctuated output');
   });
 
   it('preserves literal line-like filename suffixes in encoded file URIs on server and client', () => {
