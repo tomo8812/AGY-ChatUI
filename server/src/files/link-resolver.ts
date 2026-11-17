@@ -325,8 +325,8 @@ export function rewriteInternalPathsToWorkspace(
   profileDir: string,
   workspaceDir?: string | null
 ): string {
-  return text.replace(/(file:\/\/)?(\/[^\s"'`<>()\[\]」』】》〉、。]+)/gi,
-    (fullMatch, filePrefix: string | undefined, rawPath: string) => {
+  return text.replace(/(?:file:\/\/)?(\/[^\s"'`<>()\[\]」』】》〉、。]+)/gi,
+    (fullMatch, rawPath: string) => {
       const trailing = /([.,;:!?]+)$/.exec(rawPath)?.[1] ?? '';
       const reference = trailing ? fullMatch.slice(0, -trailing.length) : fullMatch;
       return rewriteInternalFileReference(reference, profileDir, workspaceDir) + trailing;

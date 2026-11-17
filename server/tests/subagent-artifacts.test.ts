@@ -30,7 +30,7 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
     await alice.waitForFrame(frame => {
       const event = frame.event as { type: string; payload?: { message?: MessageRecord } } | undefined;
       const message = event?.payload?.message;
-      return event?.type === 'message.updated' && message?.artifactIds.length === 18 &&
+      return event?.type === 'message.updated' && message?.artifactIds.length === 20 &&
         message.toolCalls.some(tool => tool.subagentState === 'idle');
     }, 15000);
     const detail = (await alice.request<{ messages: MessageRecord[]; artifacts: ArtifactRecord[] }>(
@@ -39,7 +39,7 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
     const message = detail.messages.find(item => item.role === 'assistant')!;
     const subagent = message.toolCalls.find(tool => tool.subagentContentText)!;
     const artifacts = detail.artifacts;
-    expect(artifacts).toHaveLength(18);
+    expect(artifacts).toHaveLength(20);
     expect(subagent.status).toBe('completed');
     expect(subagent.subagentState).toBe('idle');
     const channels: Record<string, string> = {
@@ -52,7 +52,7 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
     };
     for (const [channel, text] of Object.entries(channels)) {
       expect(text, channel).not.toMatch(/\.gemini|generated\/\//);
-      expect(references(text).length, channel).toBeGreaterThanOrEqual(channel === 'parentThoughts' ? 6 : 18);
+      expect(references(text).length, channel).toBeGreaterThanOrEqual(channel === 'parentThoughts' ? 8 : 20);
       for (const reference of new Set(references(text))) {
         const response = await alice.request<{ artifact: ArtifactRecord; previewUrl: string }>(
           'POST', `/api/chats/${chat.id}/resolve-link`, { reference }
@@ -94,6 +94,10 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
     expect(inlinePdf.mimeType).toBe('application/pdf');
     expect(inlinePdf.previewKind).toBe('pdf');
     expect(fs.readFileSync(path.join(chat.workspaceDir, inlinePdf.relPath), 'utf8')).toBe('%PDF-inline bytes');
+    const shared = artifacts.filter(item => item.filename === 'shared.bin');
+    expect(shared).toHaveLength(2);
+    expect(shared.map(item => item.mimeType).sort()).toEqual(['application/pdf', 'image/png']);
+    expect(new Set(shared.map(item => item.relPath)).size).toBe(2);
     const empty = artifacts.find(item => item.filename === 'empty.txt')!;
     expect(empty.sizeBytes).toBe(0);
     expect(artifacts.filter(item => item.mimeType === 'image/png' && item.filename === 'generated.png')).toHaveLength(2);

@@ -1672,9 +1672,12 @@ export class AcpClientManager {
       const ext = mime.extension(mimeType) || 'bin';
       const filename = sanitizeFileName(suggestedName || `generated.${ext}`);
       const hash = crypto.createHash('sha256').update(data).digest('hex');
-      const suffix = path.extname(filename) || `.${ext}`;
-      const stem = path.extname(filename) ? filename.slice(0, -suffix.length) : filename;
-      const target = resolveContainedWriteTarget(worker.workspaceDir, `generated/${stem}-${hash}${suffix}`);
+      const originalExt = path.extname(filename);
+      const suffix = /^\.[a-z\d]{1,16}$/i.test(originalExt) ? originalExt : `.${ext}`;
+      const stem = originalExt ? filename.slice(0, -originalExt.length) : filename;
+      const identity = crypto.createHash('sha256').update(JSON.stringify([filename, mimeType, hash])).digest('hex');
+      const storageStem = [...stem].slice(0, 32).join('');
+      const target = resolveContainedWriteTarget(worker.workspaceDir, `generated/${storageStem}-${identity}${suffix}`);
       fs.mkdirSync(path.dirname(target.absPath), { recursive: true, mode: 0o700 });
       if (!fs.existsSync(target.absPath) || sha256File(target.absPath) !== hash) {
         fs.writeFileSync(target.absPath, data);

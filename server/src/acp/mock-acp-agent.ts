@@ -673,6 +673,8 @@ function runAcpServer(): void {
             { type: 'resource', resource: { uri: 'artifact:///inline%20notes.md', mimeType: 'text/markdown', text: '# Inline notes' } },
             { type: 'resource', resource: { uri: 'artifact:///inline%20document.bin', mimeType: 'application/pdf', blob: Buffer.from('%PDF-inline bytes').toString('base64') } },
             { type: 'resource', resource: { uri: 'artifact:///empty.txt', mimeType: 'text/plain', text: '' } },
+            { type: 'resource', resource: { uri: 'artifact:///shared.bin', mimeType: 'application/pdf', blob: Buffer.from('shared bytes').toString('base64') } },
+            { type: 'resource', resource: { uri: 'artifact:///shared.bin', mimeType: 'image/png', blob: Buffer.from('shared bytes').toString('base64') } },
             { type: 'audio', mimeType: 'audio/wav', data: Buffer.from('inline audio bytes').toString('base64') },
             { type: 'image', mimeType: 'image/png', data: Buffer.from('inline image A').toString('base64') },
             { type: 'image', mimeType: 'image/png', data: Buffer.from('inline image B').toString('base64') },
