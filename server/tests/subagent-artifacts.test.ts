@@ -1,12 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mockArtifactBytes } from '../src/acp/mock-artifact-fixtures.js';
 import type { ArtifactRecord, MessageRecord } from '../src/types.js';
 import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
 
 const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
   while (cleanups.length) await cleanups.pop()!();
 });
 
@@ -25,6 +26,15 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
     const chat = (await alice.request<{ chat: { id: string; workspaceDir: string } }>(
       'POST', '/api/chats', { title: 'All subagent artifacts' }
     )).data.chat;
+    const upsertArtifact = srv.ctx.db.upsertArtifact.bind(srv.ctx.db);
+    let failDeclaredArtifact = true;
+    vi.spyOn(srv.ctx.db, 'upsertArtifact').mockImplementation(params => {
+      if (params.filename === 'declared image.svg' && failDeclaredArtifact) {
+        failDeclaredArtifact = false;
+        throw new Error('Transient artifact registration failure');
+      }
+      return upsertArtifact(params);
+    });
     await alice.request('POST', `/api/chats/${chat.id}/messages`, { text: '[SUBAGENT_FILES]' });
     await alice.waitForFrame(frame => frame.kind === 'event' &&
       (frame.event as { type: string }).type === 'run.finished');
@@ -102,11 +112,22 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
     expect(new Set(shared.map(item => item.relPath)).size).toBe(2);
     const empty = artifacts.find(item => item.filename === 'empty.txt')!;
     expect(empty.sizeBytes).toBe(0);
-    expect(artifacts.filter(item => item.mimeType === 'image/png' && item.filename === 'generated.png')).toHaveLength(2);
-    const inlineImageBytes = artifacts.filter(item => item.filename === 'generated.png').map(item =>
+    const unnamedImages = artifacts.filter(item => /^generated-[a-f0-9]{12}\.png$/.test(item.filename));
+    expect(unnamedImages).toHaveLength(2);
+    expect(new Set(unnamedImages.map(item => item.filename)).size).toBe(2);
+    for (const artifact of unnamedImages) {
+      const downloaded = await fetch(`${srv.baseUrl}/api/files/${artifact.id}/content?download=1`, {
+        headers: { Cookie: alice.cookieHeader },
+      });
+      expect(downloaded.status).toBe(200);
+      expect(downloaded.headers.get('content-disposition')).toContain(artifact.filename);
+      expect(Buffer.from(await downloaded.arrayBuffer())).toEqual(fs.readFileSync(path.join(chat.workspaceDir, artifact.relPath)));
+    }
+    const inlineImageBytes = unnamedImages.map(item =>
       fs.readFileSync(path.join(chat.workspaceDir, item.relPath)).toString('base64')
     );
     expect(inlineImageBytes.sort()).toEqual([mockArtifactBytes('png').toString('base64'), mockArtifactBytes('pngAlternate').toString('base64')].sort());
+    expect(failDeclaredArtifact).toBe(false);
     const declared = artifacts.find(item => item.filename === 'declared image.svg')!;
     expect(declared.mimeType).toBe('image/png');
     expect(declared.previewKind).toBe('image');

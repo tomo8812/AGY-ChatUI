@@ -330,7 +330,7 @@ interface ActiveTurnBridge {
   beforeWorkspaceSnap: WorkspaceSnapshot;
   brainSnapshot: Map<string, BrainSnapshotEntry>;
   emittedArtifactIds: Set<string>;
-  syncedBrainFiles: Map<string, SyncedBrainFile>;
+  syncedBrainFiles: Map<string, SyncedBrainFile & { delivered: boolean }>;
   lastActivityAt: number;
   subagents: Map<string, TrackedSubagentState>;
   asyncSubagentToolIds: Set<string>;
@@ -1670,8 +1670,8 @@ export class AcpClientManager {
   ): string | null {
     try {
       const ext = mime.extension(mimeType) || 'bin';
-      const filename = sanitizeFileName(suggestedName || `generated.${ext}`);
       const hash = crypto.createHash('sha256').update(data).digest('hex');
+      const filename = sanitizeFileName(suggestedName || `generated-${hash.slice(0, 12)}.${ext}`);
       const originalExt = path.extname(filename);
       const suffix = /^\.[a-z\d]{1,16}$/i.test(originalExt) ? originalExt : `.${ext}`;
       const stem = originalExt ? filename.slice(0, -originalExt.length) : filename;
@@ -1752,21 +1752,24 @@ export class AcpClientManager {
     worker: WorkerInstance,
     turn: ActiveTurnBridge,
     item: SyncedBrainFile
-  ): void {
+  ): boolean {
+    let artifactId: string | null = null;
+    const pending = item.mimeType ? item : (turn.syncedBrainFiles.get(item.workspaceRelPath) ?? item);
+    turn.syncedBrainFiles.set(item.workspaceRelPath, { ...pending, delivered: false });
     try {
       const stat = fs.statSync(item.workspaceAbsPath);
-      if (!stat.isFile()) return;
+      if (!stat.isFile()) return false;
       const fileSha = sha256File(item.workspaceAbsPath);
       const existing = this.db.findArtifactByRelPath(
         worker.userId,
         worker.chatId,
         item.workspaceRelPath
       );
-      const filename = item.mimeType ? item.filename : (existing?.filename ?? item.filename);
-      const { mimeType, previewKind } = item.mimeType
-        ? this.contentFileType(filename, item.mimeType)
+      const filename = pending?.filename ?? existing?.filename ?? item.filename;
+      const { mimeType, previewKind } = pending?.mimeType
+        ? this.contentFileType(filename, pending.mimeType)
         : existing ?? detectMimeAndPreviewKind(filename);
-      turn.syncedBrainFiles.set(item.workspaceRelPath, { ...item, filename, mimeType });
+      turn.syncedBrainFiles.set(item.workspaceRelPath, { ...pending, filename, delivered: false });
       const artifact = this.db.upsertArtifact({
         id: existing?.id ?? crypto.randomUUID(),
         userId: worker.userId,
@@ -1783,12 +1786,12 @@ export class AcpClientManager {
         diffPatch: null,
         minUpdatedAt: stat.mtimeMs,
       });
+      artifactId = artifact.id;
       if (
         !turn.emittedArtifactIds.has(artifact.id) ||
         (existing && (existing.sha256 !== artifact.sha256 || existing.mimeType !== artifact.mimeType ||
           existing.previewKind !== artifact.previewKind || existing.filename !== artifact.filename))
       ) {
-        turn.emittedArtifactIds.add(artifact.id);
         this.hub.emitDurable({
           userId: worker.userId,
           type: 'artifact.created',
@@ -1796,9 +1799,19 @@ export class AcpClientManager {
           runId: turn.runId,
           payload: { artifact },
         });
+        turn.emittedArtifactIds.add(artifact.id);
       }
+      turn.syncedBrainFiles.set(item.workspaceRelPath, { ...pending, filename, delivered: true });
+      return true;
     } catch {
-      // ignore transient stat error
+      if (artifactId) turn.emittedArtifactIds.delete(artifactId);
+      return false;
+    }
+  }
+
+  private retryPendingWorkspaceFiles(worker: WorkerInstance, turn: ActiveTurnBridge): void {
+    for (const file of turn.syncedBrainFiles.values()) {
+      if (!file.delivered) this.registerAndEmitSyncedWorkspaceFile(worker, turn, file);
     }
   }
 
@@ -1806,15 +1819,13 @@ export class AcpClientManager {
     worker: WorkerInstance,
     turn: ActiveTurnBridge
   ): SyncedBrainFile[] {
+    this.retryPendingWorkspaceFiles(worker, turn);
     const newlySynced = syncNewBrainFilesToWorkspace({
       profileDir: worker.profileDir,
       workspaceDir: worker.workspaceDir,
       snapshot: turn.brainSnapshot,
+      register: (file) => this.registerAndEmitSyncedWorkspaceFile(worker, turn, file),
     });
-
-    for (const item of newlySynced) {
-      this.registerAndEmitSyncedWorkspaceFile(worker, turn, item);
-    }
 
     // Also inspect any explicit paths mentioned in toolCalls so far
     const candidates = new Set<string>([
@@ -2387,6 +2398,7 @@ export class AcpClientManager {
     worker: WorkerInstance,
     bridge: ActiveTurnBridge
   ): void {
+    this.retryPendingWorkspaceFiles(worker, bridge);
     const hintPaths = [...bridge.syncedBrainFiles.values()].map((s) => s.workspaceRelPath);
     const anotherTurnActive = Boolean(worker.activeTurn && worker.activeTurn !== bridge);
     if (anotherTurnActive && hintPaths.length === 0) {

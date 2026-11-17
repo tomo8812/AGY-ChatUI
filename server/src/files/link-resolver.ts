@@ -228,6 +228,7 @@ export function syncNewBrainFilesToWorkspace(params: {
   profileDir: string;
   workspaceDir: string;
   snapshot: Map<string, BrainSnapshotEntry>;
+  register?: (file: SyncedBrainFile) => boolean;
 }): SyncedBrainFile[] {
   const afterSnap = captureBrainSnapshot(params.profileDir, params.workspaceDir);
   const synced: SyncedBrainFile[] = [];
@@ -243,16 +244,17 @@ export function syncNewBrainFilesToWorkspace(params: {
         workspaceDir: params.workspaceDir,
         sourceAbsPath: absPath,
       });
-      // Advance only after a successful import so unchanged files are not rehashed
-      // and re-registered on every subsequent ACP notification. Failed imports retry.
-      params.snapshot.set(absPath, entry);
-      synced.push({
+      const file: SyncedBrainFile = {
         brainAbsPath: absPath,
         relUnderBrain: entry.relUnderBrain,
         workspaceAbsPath: imported.absPath,
         workspaceRelPath: imported.relPath,
         filename: path.basename(imported.relPath),
-      });
+      };
+      // A copy is not delivered until its registration and notification succeed.
+      if (params.register && !params.register(file)) continue;
+      params.snapshot.set(absPath, entry);
+      synced.push(file);
     } catch {
       // ignore failed import
     }

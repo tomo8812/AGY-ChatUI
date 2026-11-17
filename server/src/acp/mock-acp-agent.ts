@@ -677,9 +677,9 @@ function runAcpServer(): void {
             type: 'resource_link', uri: pathToFileURL(declaredFile).href,
             name: 'declared image.svg', mimeType: 'image/png',
           };
-          for (const sessionId of [childId, state.id]) {
-            await sendUpdate({ sessionId, update: { sessionUpdate: 'agent_message_chunk', content: declaredBlock } });
-          }
+          await sendUpdate({ sessionId: childId, update: {
+            sessionUpdate: 'agent_message_chunk', content: declaredBlock,
+          } });
           const inlineBlocks: ContentBlock[] = [
             { type: 'resource', resource: { uri: 'artifact:///inline%20notes.md', mimeType: 'text/markdown', text: '# Inline notes' } },
             { type: 'resource', resource: { uri: 'artifact:///inline%20document.bin', mimeType: 'application/pdf', blob: mockArtifactBytes('pdf').toString('base64') } },

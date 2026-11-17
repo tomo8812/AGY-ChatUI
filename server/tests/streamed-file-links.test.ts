@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { normalizeClientLinkReference } from '../../web/src/utils/viewerCache';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getChatBrainHostDir } from '../src/acp/env-isolation.js';
 import {
   captureBrainSnapshot,
@@ -126,6 +126,23 @@ describe('streamed generated file links', () => {
     expect(changed).toHaveLength(1);
     expect(changed[0].workspaceRelPath).toMatch(/^generated\/miffy-[a-f0-9]{8}\.jpg$/);
     expect(fs.readFileSync(changed[0].workspaceAbsPath, 'utf8')).toBe('updated image bytes');
+  });
+
+  it('keeps copied brain files pending until registration and notification succeed', () => {
+    const { profile, workspace } = fixture();
+    const snapshot = captureBrainSnapshot(profile, workspace);
+    const source = path.join(getChatBrainHostDir(profile, workspace), 'session-1', 'miffy.jpg');
+    const original = snapshot.get(source);
+    fs.writeFileSync(source, 'new image bytes');
+    const register = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
+    const sync = () => syncNewBrainFilesToWorkspace({ profileDir: profile, workspaceDir: workspace, snapshot, register });
+    expect(sync()).toEqual([]);
+    expect(snapshot.get(source)).toEqual(original);
+    expect(fs.readFileSync(path.join(workspace, 'generated/miffy.jpg'), 'utf8')).toBe('new image bytes');
+    expect(sync().map(file => file.workspaceRelPath)).toEqual(['generated/miffy.jpg']);
+    expect(register).toHaveBeenCalledTimes(2);
+    expect(sync()).toEqual([]);
+    expect(register).toHaveBeenCalledTimes(2);
   });
 
   it('serves a file listed in generated through the screenshot link without requiring the brain source', async () => {
