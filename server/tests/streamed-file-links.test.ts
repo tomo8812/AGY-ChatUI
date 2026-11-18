@@ -48,12 +48,12 @@ describe('native and legacy file links', () => {
 
     for (const kind of ['scratch', 'playground']) {
       const root = path.join(profile, `.chat-${kind}`, path.basename(chat.workspaceDir));
-      const filename = '設計メモ #1.md';
+      const filename = '.exports/設計メモ #1.md';
       const file = path.join(root, filename);
-      fs.mkdirSync(root, { recursive: true });
+      fs.mkdirSync(path.dirname(file), { recursive: true });
       fs.writeFileSync(file, kind);
       const sandboxPath = `/home/sandbox/.gemini/antigravity/${kind}/`;
-      const encoded = encodeURIComponent(filename);
+      const encoded = filename.split('/').map(encodeURIComponent).join('/');
       const first = resolve(chat.id, `file://${sandboxPath}${encoded}`)!.artifact;
       expect(first.relPath).toBe(`/home/sandbox/.gemini/${kind}/${filename}`);
       for (const reference of [file, `${sandboxPath}${encoded}`, `~/.gemini/jetski/${kind}/${filename}`]) {

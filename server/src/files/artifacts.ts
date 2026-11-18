@@ -87,10 +87,6 @@ export function syncWorkspaceChangesAsArtifacts(params: {
     }
   }
 
-  const existingByRelPath = new Map(
-    params.db.listArtifactsForChat(params.userId, params.chatId).map((artifact) => [artifact.relPath, artifact])
-  );
-
   const currentMap = captureWorkspaceSnapshot(rootReal);
   for (const [relPath, after] of currentMap.entries()) {
     const prev = params.before.get(relPath);
@@ -99,19 +95,15 @@ export function syncWorkspaceChangesAsArtifacts(params: {
     if (!changed && !hintSet.has(relPath)) {
       continue;
     }
-    if (params.skipIfAlreadyOwnedByOtherMessage && !hintSet.has(relPath)) {
-      const existing = existingByRelPath.get(relPath);
-      if (
-        existing &&
-        existing.messageId &&
-        existing.messageId !== params.messageId &&
-        existing.sha256 === after.sha256
-      ) {
-        continue;
-      }
+    const existing = params.db.findArtifactByRelPath(params.userId, params.chatId, relPath);
+    if (
+      params.skipIfAlreadyOwnedByOtherMessage && !hintSet.has(relPath) &&
+      existing?.messageId && existing.messageId !== params.messageId &&
+      existing.sha256 === after.sha256
+    ) {
+      continue;
     }
 
-    const existing = existingByRelPath.get(relPath);
     const filename = existing?.filename ?? path.basename(relPath);
     const { mimeType, previewKind } = existing ?? detectMimeAndPreviewKind(filename);
     let diffPatch: string | null = null;
