@@ -263,7 +263,7 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: RouteDeps):
     }
     const profile = db.getAgyProfile(session.user.id);
     if (!profile) return reply.code(404).send({ error: 'AGY_PROFILE_NOT_FOUND', message: 'Antigravity プロファイルがありません。' });
-    setAgyAgentMode(profile.profileDir, parsed.data.agentMode);
+    db.withAgyProfileSettingsWrite(() => setAgyAgentMode(profile.profileDir, parsed.data.agentMode));
     return { agentMode: parsed.data.agentMode };
   });
 

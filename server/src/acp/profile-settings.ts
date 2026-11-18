@@ -59,6 +59,8 @@ function writeSettings(file: string, settings: Record<string, unknown>, original
         if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
       }
     } else {
+      // Native CLI writers do not participate in ChatUI's database lock.
+      // Detect external changes observed before the atomic replacement.
       assertSettingsUnchanged(file, original);
       fs.renameSync(temporary, file);
     }

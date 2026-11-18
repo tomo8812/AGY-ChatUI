@@ -447,6 +447,19 @@ export class AppDatabase {
     return rows.map((row) => row.profile_dir);
   }
 
+  withAgyProfileSettingsWrite(write: () => void): void {
+    // Use the shared database to serialize ChatUI writers across processes.
+    // SQLite releases the lock even if a server process exits mid-save.
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      write();
+      this.db.exec('COMMIT;');
+    } catch (err) {
+      this.db.exec('ROLLBACK;');
+      throw err;
+    }
+  }
+
   getAgyProfile(userId: string): AgyProfile | null {
     const row = this.db
       .prepare(
