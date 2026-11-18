@@ -599,7 +599,7 @@ describe('Notifications & Pure-Node Web Push (RFC 8291 / 8292)', () => {
       userAgent: 'Vitest-Error-Test',
     });
 
-    const cfg = loadConfig({ PORT: '0', DATA_DIR: tmpDir, NODE_ENV: 'test' });
+    const cfg = loadConfig({ port: 0, dataRoot: tmpDir, nodeEnv: 'test' });
     const pushService = new PushNotificationService(cfg, db);
 
     await pushService.notifyRunFinished({

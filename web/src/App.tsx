@@ -670,6 +670,8 @@ export const App: React.FC = () => {
           window.clearTimeout(timer);
           pushFallbackTimersRef.current.delete(event.data.tag);
         }
+      } else if (event.data && event.data.type === 'PUSH_SUBSCRIPTION_CHANGED') {
+        void syncPushSubscription(true);
       }
     };
     sw?.addEventListener('message', onSwMessage);
@@ -678,7 +680,7 @@ export const App: React.FC = () => {
       window.removeEventListener('agy:open-chat', onOpenChat);
       sw?.removeEventListener('message', onSwMessage);
     };
-  }, [cleanupEmptyDraftChat]);
+  }, [cleanupEmptyDraftChat, syncPushSubscription]);
 
   // Automatically sync browser Push subscription if notifyOnResponse is ON and permission is already granted
   useEffect(() => {

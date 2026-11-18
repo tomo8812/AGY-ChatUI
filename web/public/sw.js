@@ -86,6 +86,20 @@ self.addEventListener('push', (event) => {
   event.waitUntil(Promise.all([showPromise, notifyClientsPromise]));
 });
 
+async function getCsrfToken() {
+  try {
+    if (self.cookieStore && typeof self.cookieStore.get === 'function') {
+      const cookie = await self.cookieStore.get('agy_chat_csrf');
+      if (cookie && typeof cookie.value === 'string' && cookie.value) {
+        return decodeURIComponent(cookie.value);
+      }
+    }
+  } catch {
+    // Ignore if CookieStore API is unavailable or restricted
+  }
+  return '';
+}
+
 self.addEventListener('pushsubscriptionchange', (event) => {
   event.waitUntil(
     (async () => {
@@ -110,10 +124,22 @@ self.addEventListener('pushsubscriptionchange', (event) => {
         const json = sub.toJSON();
         if (!json.endpoint || !json.keys || !json.keys.p256dh || !json.keys.auth) return;
 
+        const csrfToken = await getCsrfToken();
+        if (!csrfToken) {
+          const clientList = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+          for (const c of clientList) {
+            c.postMessage({ type: 'PUSH_SUBSCRIPTION_CHANGED' });
+          }
+          return;
+        }
+
         await fetch('/api/notifications/subscribe', {
           method: 'POST',
           credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'x-csrf-token': csrfToken,
+          },
           body: JSON.stringify({
             endpoint: json.endpoint,
             keys: { p256dh: json.keys.p256dh, auth: json.keys.auth },
