@@ -182,7 +182,6 @@ describe('Notifications & Pure-Node Web Push (RFC 8291 / 8292)', () => {
     const migrated = new AppDatabase(dbPath);
     const prefs = migrated.getPreferences('u1');
     expect(prefs.theme).toBe('dark');
-    expect(prefs.autoApproveSafeReads).toBe(true);
     expect(prefs.notifyOnResponse).toBe(false);
 
     const updated = migrated.updatePreferences('u1', { notifyOnResponse: true });

@@ -5,6 +5,8 @@ import path from 'node:path';
 import readline from 'node:readline';
 import mime from 'mime-types';
 import { Readable, Writable } from 'node:stream';
+import { fileURLToPath } from 'node:url';
+import { diffLines } from 'diff';
 import {
   client,
   methods,
@@ -23,6 +25,7 @@ import {
   type SessionConfigOption,
   type SessionNotification,
   type SessionUpdate,
+  type ToolCall,
 } from '@agentclientprotocol/sdk';
 import type { AppConfig } from '../config.js';
 import type { AppDatabase } from '../db/database.js';
@@ -41,10 +44,14 @@ import {
 } from '../files/link-resolver.js';
 import {
   detectMimeAndPreviewKind,
+  normalizeRelPath,
+  PathContainmentError,
   resolveContainedExistingPath,
   resolveContainedWriteTarget,
   sanitizeFileName,
   sha256File,
+  supportsWorkspaceTextWrites,
+  writeWorkspaceTextFile,
 } from '../files/workspace.js';
 import type { SyncHub } from '../sync/hub.js';
 import type {
@@ -53,6 +60,7 @@ import type {
   AttachmentRef,
   AvailableCommandItem,
   ChatRecord,
+  MessageActivity,
   PendingPermissionRecord,
   SessionMessageItem,
   SubagentActivityItem,
@@ -211,7 +219,7 @@ export function toHostWorkspacePath(
   let cleaned = acpPath.trim();
   if (cleaned.startsWith('file://')) {
     try {
-      cleaned = decodeURIComponent(new URL(cleaned).pathname);
+      cleaned = fileURLToPath(cleaned, { windows: sandboxWorkspaceRoot === workerWorkspaceDir ? undefined : false });
     } catch {
       // Keep raw string so path containment check rejects malformed URIs
     }
@@ -226,6 +234,44 @@ export function toHostWorkspacePath(
     }
   }
   return cleaned;
+}
+
+function workspaceFilePath(worker: WorkerInstance, acpPath: string): string {
+  const candidate = acpPath.startsWith('file://') ? fileURLToPath(acpPath) : acpPath;
+  const isWindows = path.sep === '\\';
+  const segments = isWindows ? candidate.split(/[\\/]/) : candidate.split('/');
+  if (segments.includes('..') || (!isWindows && candidate.includes('\\'))) {
+    throw new PathContainmentError('無効な作業ファイルのパスです。');
+  }
+  if (!path.isAbsolute(candidate)) {
+    if (/^[a-z][a-z\d+.-]*:\/\//i.test(candidate) || (isWindows && /^[a-z]:/i.test(candidate))) {
+      throw new PathContainmentError('ローカルファイルのパスを指定してください。');
+    }
+    return normalizeRelPath(candidate);
+  }
+
+  // Resolve absolute paths in the agent's namespace before using the host workspace.
+  const relative = path.relative(worker.sandboxWorkspaceRoot, candidate);
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new PathContainmentError('許可された作業領域外のファイルにはアクセスできません。');
+  }
+  return normalizeRelPath(relative);
+}
+
+function summarizeToolDiff(content: ToolCall['content'] | null): ToolCallItem['diffStats'] {
+  const diffs = content?.filter((item) => item.type === 'diff');
+  if (!diffs?.length) return undefined;
+
+  const stats = { added: 0, removed: 0 };
+  for (const diff of diffs) {
+    const lines = diffLines(diff.oldText ?? '', diff.newText, { timeout: 25 });
+    if (!lines) return undefined;
+    for (const line of lines) {
+      if (line.added) stats.added += line.count;
+      if (line.removed) stats.removed += line.count;
+    }
+  }
+  return stats;
 }
 
 export interface ParsedSessionOptions {
@@ -314,6 +360,7 @@ interface ActiveTurnBridge {
   contentText: string;
   thoughtsText: string;
   toolCalls: ToolCallItem[];
+  activity: MessageActivity[];
   sessionMessages: SessionMessageItem[];
   lastDbFlushAt: number;
   pendingResolvers: Map<string, (outcome: RequestPermissionResponse) => void>;
@@ -899,6 +946,7 @@ export class AcpClientManager {
       contentText: '',
       thoughtsText: '',
       toolCalls: [],
+      activity: [],
       sessionMessages: [],
       lastDbFlushAt: nowInit,
       pendingResolvers: new Map(),
@@ -990,11 +1038,14 @@ export class AcpClientManager {
         hintPaths,
       });
 
+      if (bridge.activity.at(-1)?.kind === 'content') bridge.activity.push({ kind: 'answer_end' });
+
       const finalStatus = response.stopReason === 'cancelled' ? 'cancelled' : 'completed';
       const updatedMsg = this.db.updateMessage(params.userId, params.assistantMessageId, {
         contentText: bridge.contentText,
         thoughtsText: bridge.thoughtsText,
         toolCalls: bridge.toolCalls,
+        activity: bridge.activity,
         sessionMessages: bridge.sessionMessages,
         artifactIds: [...new Set([...bridge.emittedArtifactIds, ...newArtifacts.map(a => a.id)])],
         status: finalStatus,
@@ -1058,6 +1109,7 @@ export class AcpClientManager {
         contentText: bridge.contentText,
         thoughtsText: bridge.thoughtsText,
         toolCalls: bridge.toolCalls,
+        activity: bridge.activity,
         sessionMessages: bridge.sessionMessages,
         status: 'error',
         errorMessage: err instanceof Error ? err.message : String(err),
@@ -1181,14 +1233,7 @@ export class AcpClientManager {
       .onRequest(methods.client.fs.writeTextFile, async ({ params }) => {
         if (!workerRef) throw new RequestError(-32603, 'Worker uninitialized');
         try {
-          const hostCandidate = toHostWorkspacePath(
-            workerRef.workspaceDir,
-            workerRef.sandboxWorkspaceRoot,
-            params.path
-          );
-          const { absPath } = resolveContainedWriteTarget(workerRef.workspaceDir, hostCandidate);
-          fs.mkdirSync(path.dirname(absPath), { recursive: true, mode: 0o700 });
-          fs.writeFileSync(absPath, params.content, 'utf8');
+          writeWorkspaceTextFile(workerRef.workspaceDir, workspaceFilePath(workerRef, params.path), params.content);
           return {};
         } catch (err) {
           throw new RequestError(-32602, err instanceof Error ? err.message : 'File write denied');
@@ -1205,29 +1250,7 @@ export class AcpClientManager {
         workerRef.lastBackgroundActivityAt = Date.now();
 
 
-        const prefs = this.db.getPreferences(turn.userId);
-
-        // Optional user preference: auto-approve strictly read-only workspace reads
-        if (prefs.autoApproveSafeReads && params.toolCall.kind === 'read') {
-          const allContained = (params.toolCall.locations ?? []).every((loc) => {
-            try {
-              const hostCandidate = toHostWorkspacePath(
-                workerRef!.workspaceDir,
-                workerRef!.sandboxWorkspaceRoot,
-                loc.path
-              );
-              resolveContainedExistingPath(workerRef!.workspaceDir, hostCandidate);
-              return true;
-            } catch {
-              return false;
-            }
-          });
-          const allowOpt = params.options.find((o) => o.kind === 'allow_once' || o.kind === 'allow_always');
-          if (allContained && allowOpt) {
-            return { outcome: { outcome: 'selected' as const, optionId: allowOpt.optionId } };
-          }
-        }
-
+        // Antigravity evaluates permissions using its native settings. Relay requests to the user.
         const permId = crypto.randomUUID();
         const subagentMeta = classifySubagentToolCall({
           name: (params.toolCall as { name?: string }).name,
@@ -1330,7 +1353,7 @@ export class AcpClientManager {
       {
         protocolVersion: PROTOCOL_VERSION,
         clientCapabilities: {
-          fs: { readTextFile: true, writeTextFile: true },
+          fs: { readTextFile: true, writeTextFile: supportsWorkspaceTextWrites },
           terminal: false,
           session: { configOptions: { boolean: {} } },
           subagents: {},
@@ -1519,13 +1542,14 @@ export class AcpClientManager {
   ): void {
     if (!chunk) return;
     const offset = turn.thoughtsText.length;
+    const activityIndex = this.recordTextActivity(turn, 'thoughts', offset);
     turn.thoughtsText += chunk;
     this.hub.emitEphemeral({
       userId: worker.userId,
       type: 'run.delta',
       chatId: worker.chatId,
       runId: turn.runId,
-      payload: { messageId: turn.assistantMessageId, field: 'thoughts', offset, chunk },
+      payload: { messageId: turn.assistantMessageId, field: 'thoughts', activityIndex, offset, chunk },
     });
     this.maybeFlushTurnProgress(turn);
   }
@@ -1537,6 +1561,7 @@ export class AcpClientManager {
   ): void {
     if (!chunk) return;
     const offset = turn.contentText.length;
+    const activityIndex = this.recordTextActivity(turn, 'content', offset);
     turn.contentText += chunk;
     turn.lastActivityAt = Date.now();
     this.hub.emitEphemeral({
@@ -1547,6 +1572,7 @@ export class AcpClientManager {
       payload: {
         messageId: turn.assistantMessageId,
         field: 'content',
+        activityIndex,
         offset,
         chunk,
       },
@@ -1909,14 +1935,7 @@ export class AcpClientManager {
       });
     }
 
-    this.db.updateMessage(turn.userId, turn.assistantMessageId, { toolCalls: turn.toolCalls });
-    this.hub.emitEphemeral({
-      userId: worker.userId,
-      type: 'run.tool_update',
-      chatId: worker.chatId,
-      runId: turn.runId,
-      payload: { messageId: turn.assistantMessageId, toolCalls: turn.toolCalls },
-    });
+    this.publishToolActivity(worker, turn, targetToolCallId);
   }
 
   private handleChildSessionNotification(
@@ -2127,6 +2146,11 @@ export class AcpClientManager {
       contentText: latestAssistant.contentText,
       thoughtsText: latestAssistant.thoughtsText,
       toolCalls: [...latestAssistant.toolCalls],
+      activity: latestAssistant.activity?.length ? [...latestAssistant.activity] : [
+        ...(latestAssistant.thoughtsText ? [{ kind: 'thoughts', offset: 0 } as const] : []),
+        ...latestAssistant.toolCalls.map(({ toolCallId }) => ({ kind: 'tool' as const, toolCallId })),
+        ...(latestAssistant.contentText ? [{ kind: 'content', offset: 0 } as const, { kind: 'answer_end' } as const] : []),
+      ],
       sessionMessages: [...(latestAssistant.sessionMessages ?? [])],
       lastDbFlushAt: 0,
       pendingResolvers: new Map(),
@@ -2191,6 +2215,7 @@ export class AcpClientManager {
       contentText: bridge.contentText,
       thoughtsText: bridge.thoughtsText,
       toolCalls: bridge.toolCalls,
+      activity: bridge.activity,
       sessionMessages: bridge.sessionMessages,
       artifactIds: [...bridge.emittedArtifactIds],
     });
@@ -2391,6 +2416,8 @@ export class AcpClientManager {
         turn.initialPromptDone
       ) {
         turn.parentWakeupStarted = true;
+      } else if (stateObj.state === 'idle' && turn.initialPromptDone) {
+        if (turn.activity.at(-1)?.kind === 'content') turn.activity.push({ kind: 'answer_end' });
       }
       finalizeIfBackground(stateObj.state === 'idle');
       return;
@@ -2456,17 +2483,9 @@ export class AcpClientManager {
         rawInput: update.rawInput,
         rawContent,
       });
-      if (subagentMeta.isAsyncSubagentLaunch) {
-        turn.asyncSubagentToolIds.add(update.toolCallId);
-        for (const tracked of turn.subagents.values()) {
-          if (tracked.toolCallId === `subagent:${tracked.sessionId}`) {
-            turn.toolCalls = turn.toolCalls.filter((t) => t.toolCallId !== tracked.toolCallId);
-            tracked.toolCallId = update.toolCallId;
-            break;
-          }
-        }
-      }
+      if (subagentMeta.isAsyncSubagentLaunch) this.bindAsyncSubagentTool(turn, update.toolCallId);
       const contentText = this.extractToolCallContentAndSaveAssets(worker, turn, rawContent);
+      const diffStats = summarizeToolDiff(update.content);
       const boundSubagent = [...turn.subagents.values()].find(
         (s) => s.toolCallId === update.toolCallId
       );
@@ -2493,20 +2512,14 @@ export class AcpClientManager {
         rawOutput: update.rawOutput,
         locations: update.locations?.map((l) => ({ path: l.path, line: l.line })),
         ...(contentText ? { contentText } : {}),
+        ...(diffStats ? { diffStats } : {}),
       };
       const idx = turn.toolCalls.findIndex((t) => t.toolCallId === nextTool.toolCallId);
       if (idx >= 0) turn.toolCalls[idx] = nextTool;
       else turn.toolCalls.push(nextTool);
 
 
-      this.db.updateMessage(turn.userId, turn.assistantMessageId, { toolCalls: turn.toolCalls });
-      this.hub.emitEphemeral({
-        userId: worker.userId,
-        type: 'run.tool_update',
-        chatId: worker.chatId,
-        runId: turn.runId,
-        payload: { messageId: turn.assistantMessageId, toolCalls: turn.toolCalls },
-      });
+      this.publishToolActivity(worker, turn, nextTool.toolCallId);
       finalizeIfBackground();
       return;
     }
@@ -2532,17 +2545,9 @@ export class AcpClientManager {
         rawInput: mergedRawInput,
         rawContent,
       });
-      if (subagentMeta.isAsyncSubagentLaunch) {
-        turn.asyncSubagentToolIds.add(update.toolCallId);
-        for (const tracked of turn.subagents.values()) {
-          if (tracked.toolCallId === `subagent:${tracked.sessionId}`) {
-            turn.toolCalls = turn.toolCalls.filter((t) => t.toolCallId !== tracked.toolCallId);
-            tracked.toolCallId = update.toolCallId;
-            break;
-          }
-        }
-      }
+      if (subagentMeta.isAsyncSubagentLaunch) this.bindAsyncSubagentTool(turn, update.toolCallId);
       const contentText = this.extractToolCallContentAndSaveAssets(worker, turn, rawContent);
+      const diffStats = summarizeToolDiff(update.content);
 
       const effectiveStatus =
         update.status !== undefined && update.status !== null ? update.status : existing.status;
@@ -2562,6 +2567,7 @@ export class AcpClientManager {
           ? { locations: update.locations.map((l) => ({ path: l.path, line: l.line })) }
           : {}),
         ...(contentText ? { contentText } : {}),
+        ...(diffStats ? { diffStats } : {}),
       };
       const merged = mergedRaw;
       const nextIdx = turn.toolCalls.findIndex((t) => t.toolCallId === update.toolCallId);
@@ -2569,14 +2575,7 @@ export class AcpClientManager {
       else turn.toolCalls.push(merged);
 
 
-      this.db.updateMessage(turn.userId, turn.assistantMessageId, { toolCalls: turn.toolCalls });
-      this.hub.emitEphemeral({
-        userId: worker.userId,
-        type: 'run.tool_update',
-        chatId: worker.chatId,
-        runId: turn.runId,
-        payload: { messageId: turn.assistantMessageId, toolCalls: turn.toolCalls },
-      });
+      this.publishToolActivity(worker, turn, merged.toolCallId);
       finalizeIfBackground(isTerminalToolUpdate);
     }
   }
@@ -2588,8 +2587,51 @@ export class AcpClientManager {
       this.db.updateMessage(turn.userId, turn.assistantMessageId, {
         contentText: turn.contentText,
         thoughtsText: turn.thoughtsText,
+        activity: turn.activity,
       });
     }
+  }
+
+  private recordTextActivity(turn: ActiveTurnBridge, kind: 'content' | 'thoughts', offset: number): number {
+    if (turn.activity.at(-1)?.kind !== kind) turn.activity.push({ kind, offset });
+    return turn.activity.length - 1;
+  }
+
+  private bindAsyncSubagentTool(turn: ActiveTurnBridge, toolCallId: string): void {
+    turn.asyncSubagentToolIds.add(toolCallId);
+    const tracked = [...turn.subagents.values()].find((child) => child.toolCallId === `subagent:${child.sessionId}`);
+    if (!tracked) return;
+
+    const fallbackId = tracked.toolCallId;
+    turn.toolCalls = turn.toolCalls.filter((tool) => tool.toolCallId !== fallbackId);
+    const fallbackIndex = turn.activity.findIndex((entry) => entry.kind === 'tool' && entry.toolCallId === fallbackId);
+    if (fallbackIndex >= 0) {
+      if (turn.activity.some((entry) => entry.kind === 'tool' && entry.toolCallId === toolCallId)) {
+        turn.activity.splice(fallbackIndex, 1);
+      } else {
+        turn.activity[fallbackIndex] = { kind: 'tool', toolCallId };
+      }
+    }
+    tracked.toolCallId = toolCallId;
+  }
+
+  private publishToolActivity(worker: WorkerInstance, turn: ActiveTurnBridge, toolCallId: string): void {
+    if (!turn.activity.some((entry) => entry.kind === 'tool' && entry.toolCallId === toolCallId)) {
+      turn.activity.push({ kind: 'tool', toolCallId });
+    }
+    this.db.updateMessage(turn.userId, turn.assistantMessageId, {
+      contentText: turn.contentText,
+      thoughtsText: turn.thoughtsText,
+      toolCalls: turn.toolCalls,
+      activity: turn.activity,
+    });
+    this.hub.emitEphemeral({
+      userId: worker.userId,
+      type: 'run.tool_update',
+      chatId: worker.chatId,
+      runId: turn.runId,
+      payload: { messageId: turn.assistantMessageId, toolCalls: turn.toolCalls, activity: turn.activity },
+    });
   }
 
   private loadApiKeyForUser(userId: string): string | null {

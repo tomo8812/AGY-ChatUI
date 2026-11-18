@@ -9,6 +9,7 @@
  *            tool calls, `session/request_permission`, `session/cancel`, and file creation inside `cwd`.
  */
 
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -713,6 +714,7 @@ function runAcpServer(): void {
 
       // [DELAYED_SUBAGENT]: invoke_subagent completes BEFORE subagent_update(running) arrives (#18, #5, #6, #13)
       if (promptText.includes('[DELAYED_SUBAGENT]')) {
+        const remap = promptText.includes('[REMAP_TOOL]');
         const subToolId = `tc-delayed-sub-${Date.now()}`;
         const childSessionId = `${state.id}-delayed-sub-1`;
         await sendUpdate({
@@ -720,18 +722,30 @@ function runAcpServer(): void {
           update: {
             sessionUpdate: 'tool_call',
             toolCallId: subToolId,
-            title: 'invoke_subagent',
+            title: remap ? 'ツール実行' : 'invoke_subagent',
             kind: 'other',
             status: 'in_progress',
-            rawInput: {
-              Subagents: [{ TypeName: 'research', Role: 'Delayed Worker', Prompt: 'Research' }],
-            },
+            ...(remap ? {} : {
+              rawInput: { Subagents: [{ TypeName: 'research', Role: 'Delayed Worker', Prompt: 'Research' }] },
+            }),
           },
         });
+        if (remap) {
+          await sendUpdate({
+            sessionId: state.id,
+            update: {
+              sessionUpdate: 'subagent_update',
+              sessionId: childSessionId,
+              title: 'Delayed Worker',
+              state: { state: 'running' },
+            },
+          });
+        }
         await sendUpdate({
           sessionId: state.id,
           update: {
             sessionUpdate: 'tool_call_update',
+            ...(remap ? { title: 'invoke_subagent' } : {}),
             toolCallId: subToolId,
             status: 'completed',
             rawOutput: { conversationId: childSessionId },
@@ -930,6 +944,28 @@ function runAcpServer(): void {
         return { stopReason: 'end_turn' as const };
       }
 
+      if (promptText.includes('[ACTIVITY_SEQUENCE]')) {
+        const sequenceId = randomUUID();
+        for (const [index, title] of ['pwd', 'rg --files'].entries()) {
+          const toolCallId = `activity-command-${sequenceId}-${index}`;
+          await sendUpdate({
+            sessionId: state.id,
+            update: { sessionUpdate: 'tool_call', toolCallId, kind: 'execute', title, status: 'in_progress' },
+          });
+          await sendUpdate({
+            sessionId: state.id,
+            update: { sessionUpdate: 'tool_call_update', toolCallId, status: 'completed' },
+          });
+        }
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: '作業フォルダを確認しました。レポートを作成します。' },
+          },
+        });
+      }
+
       // Tool call & interactive permission check
       if (promptText.includes('[PERMISSION]')) {
         const toolCallId = `tc-${Date.now()}`;
@@ -970,14 +1006,22 @@ function runAcpServer(): void {
 
         if (permRes.outcome.outcome === 'selected' && permRes.outcome.optionId.startsWith('allow')) {
           const targetPath = path.join(state.cwd, 'created-by-tool.md');
+          const newText = `# Created with user permission\n\nAccount: ${auth?.label ?? 'anon'}\nModel: ${state.modelId}\n`;
+          const created = !fs.existsSync(targetPath);
           await ctx.client.request(methods.client.fs.writeTextFile, {
             sessionId: state.id,
             path: targetPath,
-            content: `# Created with user permission\n\nAccount: ${auth?.label ?? 'anon'}\nModel: ${state.modelId}\n`,
+            content: newText,
           });
           await sendUpdate({
             sessionId: state.id,
-            update: { sessionUpdate: 'tool_call_update', toolCallId, status: 'completed', rawOutput: { wrote: 'created-by-tool.md' } },
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId,
+              status: 'completed',
+              ...(created ? { content: [{ type: 'diff', path: targetPath, newText }] } : {}),
+              rawOutput: { wrote: 'created-by-tool.md' },
+            },
           });
         } else {
           await sendUpdate({

@@ -89,7 +89,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const handlePrefChange = async (
     patch: Partial<
-      Pick<UserPreferences, 'theme' | 'autoApproveSafeReads' | 'notifyOnResponse' | 'hapticFeedback'>
+      Pick<UserPreferences, 'theme' | 'notifyOnResponse' | 'hapticFeedback'>
     >
   ) => {
     setError(null);
@@ -448,15 +448,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 ))}
               </div>
             )}
-          </section>
-
-          <section className="settings-section">
-            <h4>ツール実行の承認</h4>
-            <ToggleSwitch
-              checked={preferences.autoApproveSafeReads}
-              label="ワークスペース内の読み取り専用ツールを自動許可"
-              onChange={(next) => void handlePrefChange({ autoApproveSafeReads: next })}
-            />
           </section>
 
           {sandbox && (

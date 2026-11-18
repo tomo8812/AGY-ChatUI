@@ -50,10 +50,18 @@ export function captureWorkspaceSnapshot(workspaceDir: string): WorkspaceSnapsho
         walk(real, rel);
       } else if (entry.isFile()) {
         const stat = fs.statSync(real);
+        let sha256: string;
+        try {
+          sha256 = sha256File(real);
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code === 'EACCES' || code === 'EPERM') continue;
+          throw err;
+        }
         snapshot.set(rel, {
           sizeBytes: stat.size,
           mtimeMs: stat.mtimeMs,
-          sha256: sha256File(real),
+          sha256,
           textSample: maybeReadUtf8Sample(real, stat.size),
         });
       }

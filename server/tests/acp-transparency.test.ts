@@ -1,6 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { MessageRecord } from '../src/types.js';
+import { PathContainmentError, resolveContainedWriteTarget, supportsWorkspaceTextWrites, writeWorkspaceTextFile } from '../src/files/workspace.js';
+import { getMessageActivity } from '../../web/src/utils/messageActivity.js';
+import { newerMessage } from '../../web/src/utils/messageSnapshot.js';
 import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -13,7 +17,117 @@ afterEach(async () => {
 });
 
 describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
-  it('handles delayed subagent_update after invoke_subagent completed, preserves native status & full child logs, and syncs background artifacts (#4, #5, #6, #10, #13, #18)', async () => {
+  it.skipIf(!supportsWorkspaceTextWrites)('relays native ACP permission requests and replays activity in ACP order', async () => {
+    const srv = await createTestServer();
+    cleanups.push(srv.cleanup);
+    const { client } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+    await client.connectWs();
+
+    const { data: { chat } } = await client.request<{ chat: { id: string; workspaceDir: string } }>(
+      'POST', '/api/chats', {}
+    );
+    const url = `/api/chats/${chat.id}`;
+    const send = async (text: string) => {
+      const { data: { run } } = await client.request<{ run: { id: string } }>('POST', `${url}/messages`, { text });
+      return run.id;
+    };
+    const waitForPermission = async (runId: string) => {
+      const frame = await client.waitForFrame((frame) => {
+        if (frame.kind !== 'event') return false;
+        const event = frame.event as { type: string; runId: string };
+        return event.type === 'permission.requested' && event.runId === runId;
+      });
+      return (frame.event as { payload: { permission: { id: string } } }).payload.permission;
+    };
+    const firstRun = await send('[ACTIVITY_SEQUENCE] [PERMISSION]');
+    const firstPermission = await waitForPermission(firstRun);
+    const filename = path.join(chat.workspaceDir, 'created-by-tool.md');
+    expect(fs.existsSync(filename)).toBe(false);
+    const approval = await client.request('POST', `${url}/permissions/${firstPermission.id}`, { optionId: 'allow_once' });
+    expect(approval.status).toBe(200);
+    await client.waitForFrame((frame) =>
+      frame.kind === 'event' && (frame.event as { type: string }).type === 'run.finished'
+    );
+    const fileContent = fs.readFileSync(filename, 'utf8');
+    expect(fileContent).toContain('Created with user permission');
+
+    const detail = await client.request<{ messages: MessageRecord[] }>('GET', url);
+    const message = detail.data.messages.find((item) => item.role === 'assistant')!;
+    expect(message.activity?.map(({ kind }) => kind)).toEqual([
+      'thoughts', 'tool', 'tool', 'content', 'tool', 'content', 'answer_end',
+    ]);
+    const staleSnapshot = { ...message, status: 'streaming' } as const;
+    expect(newerMessage(message, staleSnapshot)).toBe(message);
+    expect(newerMessage(staleSnapshot, message)).toBe(message);
+    const laterSnapshot = { ...staleSnapshot, updatedAt: message.updatedAt + 1 };
+    expect(newerMessage(message, laterSnapshot)).toBe(laterSnapshot);
+
+    const activity = getMessageActivity(message);
+    expect(activity.blocks.map(({ kind }) => kind)).toEqual(['thoughts', 'tools', 'commentary', 'tools']);
+    expect(activity.hasCurrentAnswer).toBe(true);
+    expect(message.toolCalls.at(-1)?.diffStats).toEqual({ added: 4, removed: 0 });
+    expect(activity.answer).toContain('created-by-tool.md');
+    expect(activity.answer).not.toContain('作業フォルダを確認しました');
+
+    fs.chmodSync(filename, 0o200);
+    const nextRun = await send('[ACTIVITY_SEQUENCE] [PERMISSION]');
+    const nextPermission = await waitForPermission(nextRun);
+    expect((await client.request('POST', `${url}/permissions/${nextPermission.id}`, { optionId: 'allow_once' })).status).toBe(200);
+    await client.waitForFrame((frame) => {
+      if (frame.kind !== 'event') return false;
+      const event = frame.event as { type: string; runId: string };
+      return event.type === 'run.finished' && event.runId === nextRun;
+    });
+    const nextDetail = await client.request<{ messages: MessageRecord[] }>('GET', url);
+    const updated = nextDetail.data.messages.find((item) => item.role === 'assistant' && item.runId === nextRun)!;
+    expect(updated.toolCalls.at(-1)?.status).toBe('completed');
+    expect(updated.toolCalls.at(-1)?.diffStats).toBeUndefined();
+    const commandIds = [message, updated].flatMap((item) =>
+      item.toolCalls.filter((tool) => tool.kind === 'execute').map((tool) => tool.toolCallId)
+    );
+    expect(new Set(commandIds).size).toBe(4);
+    fs.chmodSync(filename, 0o600);
+
+    // Replacing the same in-workspace path with an external symlink requires a decision.
+    const outside = path.join(path.dirname(chat.workspaceDir), 'external.md');
+    fs.renameSync(filename, outside);
+    fs.symlinkSync(outside, filename);
+    const blockedRun = await send('[PERMISSION]');
+    const permission = await waitForPermission(blockedRun);
+    const rejection = await client.request('POST', `${url}/permissions/${permission.id}`, { optionId: 'reject_once' });
+    expect(rejection.status).toBe(200);
+    expect(() => writeWorkspaceTextFile(chat.workspaceDir, 'created-by-tool.md', 'denied')).toThrow(PathContainmentError);
+    fs.symlinkSync(path.dirname(outside), path.join(chat.workspaceDir, 'outside-dir'));
+    expect(() => writeWorkspaceTextFile(chat.workspaceDir, 'outside-dir/external.md', 'denied')).toThrow();
+    expect(fs.readFileSync(outside, 'utf8')).toBe(fileContent);
+
+    writeWorkspaceTextFile(chat.workspaceDir, 'nested/notes.md', 'nested write');
+    const nested = path.join(chat.workspaceDir, 'nested/notes.md');
+    expect(fs.readFileSync(nested, 'utf8')).toBe('nested write');
+    fs.symlinkSync('nested', path.join(chat.workspaceDir, 'nested-link'));
+    writeWorkspaceTextFile(chat.workspaceDir, 'nested-link/via-directory.md', 'directory link write');
+    expect(fs.readFileSync(path.join(chat.workspaceDir, 'nested/via-directory.md'), 'utf8')).toBe('directory link write');
+    const fileLink = path.join(chat.workspaceDir, 'notes-link.md');
+    fs.symlinkSync('nested/notes.md', fileLink);
+    writeWorkspaceTextFile(chat.workspaceDir, 'notes-link.md', 'file link write');
+    expect(fs.lstatSync(fileLink).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(nested, 'utf8')).toBe('file link write');
+    fs.chmodSync(nested, 0o400);
+    if (process.getuid?.() !== 0) {
+      expect(() => writeWorkspaceTextFile(chat.workspaceDir, 'nested/notes.md', 'denied')).toThrow();
+      expect(fs.readFileSync(nested, 'utf8')).toBe('file link write');
+    }
+    fs.chmodSync(nested, 0o200);
+    writeWorkspaceTextFile(chat.workspaceDir, 'nested/notes.md', 'write-only update');
+    fs.chmodSync(nested, 0o600);
+    expect(fs.readFileSync(nested, 'utf8')).toBe('write-only update');
+    const danglingLink = path.join(chat.workspaceDir, 'dangling.md');
+    fs.symlinkSync(path.join(chat.workspaceDir, 'missing.md'), danglingLink);
+    expect(() => resolveContainedWriteTarget(chat.workspaceDir, 'dangling.md')).toThrow(PathContainmentError);
+    client.closeWs();
+  });
+
+  it.each(['', ' [REMAP_TOOL]'])('reports delayed subagent work once and preserves native status and logs (%s)', async (mode) => {
     const srv = await createTestServer();
     cleanups.push(srv.cleanup);
 
@@ -29,7 +143,7 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     const workspaceDir = chatRes.data.chat.workspaceDir;
 
     await alice.request('POST', `/api/chats/${chatId}/messages`, {
-      text: 'Run [DELAYED_SUBAGENT]',
+      text: `Run [DELAYED_SUBAGENT]${mode}`,
     });
 
     const finishedFrame = await alice.waitForFrame(
@@ -62,18 +176,7 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     );
 
     const detail = await alice.request<{
-      messages: Array<{
-        role: string;
-        toolCalls: Array<{
-          title: string;
-          status: string;
-          isSubagent?: boolean;
-          subagentState?: string;
-          subagentThoughtsText?: string;
-          subagentContentText?: string;
-          subagentToolCalls?: Array<{ title: string; status: string }>;
-        }>;
-      }>;
+      messages: MessageRecord[];
       artifacts: Array<{ relPath: string }>;
     }>('GET', `/api/chats/${chatId}`);
 
@@ -81,6 +184,9 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     expect(assistant).toBeTruthy();
     expect(assistant.toolCalls).toHaveLength(1);
     const subTc = assistant.toolCalls[0];
+    expect(assistant.activity?.filter((entry) => entry.kind === 'tool')).toEqual([
+      { kind: 'tool', toolCallId: subTc.toolCallId },
+    ]);
     // Native tool_call status ('completed') must not be rewritten to 'in_progress'
     expect(subTc.status).toBe('completed');
     expect(subTc.subagentState).toBe('idle');

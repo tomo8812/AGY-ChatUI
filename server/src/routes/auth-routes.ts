@@ -38,7 +38,6 @@ const loginSchema = z.object({
 
 const prefsSchema = z.object({
   theme: z.enum(['system', 'light', 'dark']).optional(),
-  autoApproveSafeReads: z.boolean().optional(),
   notifyOnResponse: z.boolean().optional(),
   hapticFeedback: z.boolean().optional(),
   defaultModelId: z.string().nullable().optional(),
