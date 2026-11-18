@@ -33,6 +33,7 @@ export class SyncSocketClient {
   private heartbeatTimer: number | null = null;
   private lastSeq = 0;
   private readonly clientId = getTabClientId();
+  private pushEndpoint: string | null = null;
 
   constructor(private readonly callbacks: SyncSocketCallbacks) {}
 
@@ -44,20 +45,47 @@ export class SyncSocketClient {
     return this.lastSeq;
   }
 
+  setPushEndpoint(endpoint: string | null): void {
+    const normalized = endpoint ? endpoint.trim() : null;
+    if (this.pushEndpoint === normalized && this.ws?.readyState !== WebSocket.OPEN) {
+      this.pushEndpoint = normalized;
+      return;
+    }
+    this.pushEndpoint = normalized;
+    this.sendPresence();
+  }
+
+  private sendPresence(visible = document.visibilityState === 'visible'): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    try {
+      this.ws.send(
+        JSON.stringify({
+          kind: 'presence',
+          visible,
+          pushEndpoint: this.pushEndpoint,
+        })
+      );
+    } catch {
+      // handled on close
+    }
+  }
+
   start(): void {
     this.closedExplicitly = false;
     this.connect();
 
-    document.addEventListener('visibilitychange', this.handleVisibilityWake);
+    document.addEventListener('visibilitychange', this.handleVisibilityChange);
     window.addEventListener('online', this.handleNetworkOnline);
     window.addEventListener('pageshow', this.handlePageShow);
+    window.addEventListener('pagehide', this.handlePageHide);
   }
 
   stop(): void {
     this.closedExplicitly = true;
-    document.removeEventListener('visibilitychange', this.handleVisibilityWake);
+    document.removeEventListener('visibilitychange', this.handleVisibilityChange);
     window.removeEventListener('online', this.handleNetworkOnline);
     window.removeEventListener('pageshow', this.handlePageShow);
+    window.removeEventListener('pagehide', this.handlePageHide);
     this.clearTimers();
     if (this.ws) {
       try {
@@ -74,7 +102,9 @@ export class SyncSocketClient {
     if (this.closedExplicitly) return;
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       try {
-        this.ws.send(JSON.stringify({ kind: 'ping' }));
+        this.ws.send(
+          JSON.stringify({ kind: 'ping', visible: document.visibilityState === 'visible' })
+        );
         return;
       } catch {
         // fall through to reopen
@@ -92,9 +122,12 @@ export class SyncSocketClient {
     this.connect();
   }
 
-  private handleVisibilityWake = (): void => {
+  private handleVisibilityChange = (): void => {
     if (document.visibilityState === 'visible') {
       this.reconnectNow();
+      this.sendPresence(true);
+    } else {
+      this.sendPresence(false);
     }
   };
 
@@ -104,6 +137,11 @@ export class SyncSocketClient {
 
   private handlePageShow = (): void => {
     this.reconnectNow();
+    this.sendPresence();
+  };
+
+  private handlePageHide = (): void => {
+    this.sendPresence(false);
   };
 
   private connect(): void {
@@ -126,10 +164,13 @@ export class SyncSocketClient {
       if (this.ws !== ws) return;
       this.reconnectAttempts = 0;
       this.callbacks.onStatusChange('connected');
+      this.sendPresence();
       this.heartbeatTimer = window.setInterval(() => {
         if (this.ws?.readyState === WebSocket.OPEN) {
           try {
-            this.ws.send(JSON.stringify({ kind: 'ping' }));
+            this.ws.send(
+              JSON.stringify({ kind: 'ping', visible: document.visibilityState === 'visible' })
+            );
           } catch {
             // handled on close
           }

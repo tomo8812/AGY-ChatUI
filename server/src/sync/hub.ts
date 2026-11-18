@@ -3,11 +3,16 @@ import type { WebSocket } from 'ws';
 import type { AppDatabase } from '../db/database.js';
 import type { SyncEventEnvelope } from '../types.js';
 
+const VISIBLE_PRESENCE_TTL_MS = 45_000;
+
 interface SocketRegistration {
   userId: string;
   sessionIdHash: string;
   clientId: string;
   ws: WebSocket;
+  visible: boolean;
+  pushEndpoint: string | null;
+  lastVisibleHeartbeatAt: number;
 }
 
 export class SyncHub {
@@ -31,6 +36,9 @@ export class SyncHub {
       sessionIdHash: params.sessionIdHash,
       clientId: params.clientId,
       ws: params.ws,
+      visible: false,
+      pushEndpoint: null,
+      lastVisibleHeartbeatAt: 0,
     };
 
     let set = this.connections.get(params.userId);
@@ -52,6 +60,58 @@ export class SyncHub {
         }
       }
     };
+  }
+
+  updatePresence(params: {
+    userId: string;
+    ws: WebSocket;
+    visible: boolean;
+    pushEndpoint?: string | null;
+  }): void {
+    const set = this.connections.get(params.userId);
+    if (!set) return;
+    for (const reg of set) {
+      if (reg.ws === params.ws) {
+        reg.visible = params.visible;
+        if (params.pushEndpoint !== undefined) {
+          reg.pushEndpoint = params.pushEndpoint ? params.pushEndpoint.trim() : null;
+        }
+        reg.lastVisibleHeartbeatAt = params.visible ? Date.now() : 0;
+        break;
+      }
+    }
+  }
+
+  touchVisibleHeartbeat(userId: string, ws: WebSocket, visible?: boolean): void {
+    const set = this.connections.get(userId);
+    if (!set) return;
+    for (const reg of set) {
+      if (reg.ws === ws) {
+        if (typeof visible === 'boolean') {
+          reg.visible = visible;
+        }
+        reg.lastVisibleHeartbeatAt = reg.visible ? Date.now() : 0;
+        break;
+      }
+    }
+  }
+
+  getVisiblePushEndpoints(userId: string): Set<string> {
+    const result = new Set<string>();
+    const set = this.connections.get(userId);
+    if (!set || set.size === 0) return result;
+    const now = Date.now();
+    for (const reg of set) {
+      if (
+        reg.ws.readyState === 1 &&
+        reg.visible &&
+        reg.pushEndpoint &&
+        now - reg.lastVisibleHeartbeatAt < VISIBLE_PRESENCE_TTL_MS
+      ) {
+        result.add(reg.pushEndpoint);
+      }
+    }
+    return result;
   }
 
   private sendReplayHello(reg: SocketRegistration, sinceSeq: number): void {

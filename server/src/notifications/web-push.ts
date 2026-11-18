@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import type { AppConfig } from '../config.js';
 import type { AppDatabase } from '../db/database.js';
+import type { SyncHub } from '../sync/hub.js';
 import type { PushSubscriptionRecord } from '../types.js';
 
 export interface NotificationPayload {
@@ -218,7 +219,8 @@ export class PushNotificationService {
 
   constructor(
     private readonly config: AppConfig,
-    private readonly db: AppDatabase
+    private readonly db: AppDatabase,
+    private readonly hub?: SyncHub
   ) {
     const loaded = loadOrCreateVapidKeys(db);
     this.privateKey = loaded.privateKey;
@@ -293,24 +295,33 @@ export class PushNotificationService {
   async sendToUser(
     userId: string,
     payloadObj: NotificationPayload,
-    options?: { currentEndpoint?: string }
+    options?: { currentEndpoint?: string; skipEndpoints?: ReadonlySet<string> }
   ): Promise<SendToUserResult> {
     const subs = this.db.listPushSubscriptions(userId);
     const currentEndpoint = options?.currentEndpoint?.trim() || undefined;
-    if (subs.length === 0) {
+    const skipEndpoints = options?.skipEndpoints;
+    const targetSubs =
+      skipEndpoints && skipEndpoints.size > 0
+        ? subs.filter((sub) => !skipEndpoints.has(sub.endpoint))
+        : subs;
+
+    if (targetSubs.length === 0) {
+      const currentSubPresent = currentEndpoint
+        ? subs.some((sub) => sub.endpoint === currentEndpoint)
+        : false;
       return {
         sent: 0,
         failed: 0,
         removed: 0,
-        total: 0,
+        total: subs.length,
         ...(currentEndpoint
-          ? { currentDeviceRegistered: false, currentDeviceSent: false }
+          ? { currentDeviceRegistered: currentSubPresent, currentDeviceSent: false }
           : {}),
       };
     }
 
     const results = await Promise.all(
-      subs.map(async (sub) => ({ sub, res: await this.sendToSubscription(sub, payloadObj) }))
+      targetSubs.map(async (sub) => ({ sub, res: await this.sendToSubscription(sub, payloadObj) }))
     );
     let sent = 0;
     let failed = 0;
@@ -404,7 +415,8 @@ export class PushNotificationService {
             ...(vibrateComplete ? { vibrate: vibrateComplete } : {}),
           };
 
-    return this.sendToUser(params.userId, payload);
+    const skipEndpoints = this.hub?.getVisiblePushEndpoints(params.userId);
+    return this.sendToUser(params.userId, payload, { skipEndpoints });
   }
 
   async notifyPermissionRequested(params: {
@@ -423,14 +435,19 @@ export class PushNotificationService {
     const toolLabel = truncatePreview(params.toolTitle || undefined, 90) || 'ツール実行の許可';
     const vibratePermission = prefs.hapticFeedback ? [24, 60, 24] : undefined;
 
-    return this.sendToUser(params.userId, {
-      title: `確認待ち — ${cleanTitle}`,
-      body: `${toolLabel} の承認が必要です。`,
-      tag: `perm-${params.permissionId}`,
-      chatId: params.chatId,
-      runId: params.runId,
-      url: `/?chatId=${encodeURIComponent(params.chatId)}`,
-      ...(vibratePermission ? { vibrate: vibratePermission } : {}),
-    });
+    const skipEndpoints = this.hub?.getVisiblePushEndpoints(params.userId);
+    return this.sendToUser(
+      params.userId,
+      {
+        title: `確認待ち — ${cleanTitle}`,
+        body: `${toolLabel} の承認が必要です。`,
+        tag: `perm-${params.permissionId}`,
+        chatId: params.chatId,
+        runId: params.runId,
+        url: `/?chatId=${encodeURIComponent(params.chatId)}`,
+        ...(vibratePermission ? { vibrate: vibratePermission } : {}),
+      },
+      { skipEndpoints }
+    );
   }
 }

@@ -61,7 +61,7 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
   db.recoverInterruptedRuns();
 
   const hub = new SyncHub(db, buildId, buildInfo.version);
-  const pushService = new PushNotificationService(config, db);
+  const pushService = new PushNotificationService(config, db, hub);
   const quotaService = new QuotaService(config, db, hub);
   const skillService = new SkillService(config, db, hub);
   const acp = new AcpClientManager(config, db, hub, skillService, pushService);
@@ -140,9 +140,35 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
 
     socket.on('message', (raw) => {
       try {
-        const msg = JSON.parse(String(raw)) as { kind?: string; sinceSeq?: number };
+        const msg = JSON.parse(String(raw)) as {
+          kind?: string;
+          sinceSeq?: number;
+          visible?: unknown;
+          pushEndpoint?: unknown;
+        };
         if (msg.kind === 'ping') {
+          hub.touchVisibleHeartbeat(
+            session.user.id,
+            socket,
+            typeof msg.visible === 'boolean' ? msg.visible : undefined
+          );
           socket.send(JSON.stringify({ kind: 'pong', ts: Date.now() }));
+        } else if (msg.kind === 'presence') {
+          const visible = typeof msg.visible === 'boolean' ? msg.visible : false;
+          const pushEndpoint =
+            typeof msg.pushEndpoint === 'string' &&
+            msg.pushEndpoint.trim().length > 0 &&
+            msg.pushEndpoint.length <= 2048
+              ? msg.pushEndpoint.trim()
+              : msg.pushEndpoint === null
+                ? null
+                : undefined;
+          hub.updatePresence({
+            userId: session.user.id,
+            ws: socket,
+            visible,
+            pushEndpoint,
+          });
         }
       } catch {
         // ignore invalid messages
