@@ -219,7 +219,7 @@ export function toHostWorkspacePath(
   let cleaned = acpPath.trim();
   if (cleaned.startsWith('file://')) {
     try {
-      cleaned = decodeURIComponent(new URL(cleaned).pathname);
+      cleaned = fileURLToPath(cleaned, { windows: sandboxWorkspaceRoot === workerWorkspaceDir ? undefined : false });
     } catch {
       // Keep raw string so path containment check rejects malformed URIs
     }
@@ -2483,18 +2483,7 @@ export class AcpClientManager {
         rawInput: update.rawInput,
         rawContent,
       });
-      if (subagentMeta.isAsyncSubagentLaunch) {
-        turn.asyncSubagentToolIds.add(update.toolCallId);
-        for (const tracked of turn.subagents.values()) {
-          if (tracked.toolCallId === `subagent:${tracked.sessionId}`) {
-            turn.toolCalls = turn.toolCalls.filter((t) => t.toolCallId !== tracked.toolCallId);
-            const activity = turn.activity.find((entry) => entry.kind === 'tool' && entry.toolCallId === tracked.toolCallId);
-            if (activity?.kind === 'tool') activity.toolCallId = update.toolCallId;
-            tracked.toolCallId = update.toolCallId;
-            break;
-          }
-        }
-      }
+      if (subagentMeta.isAsyncSubagentLaunch) this.bindAsyncSubagentTool(turn, update.toolCallId);
       const contentText = this.extractToolCallContentAndSaveAssets(worker, turn, rawContent);
       const diffStats = summarizeToolDiff(update.content);
       const boundSubagent = [...turn.subagents.values()].find(
@@ -2556,18 +2545,7 @@ export class AcpClientManager {
         rawInput: mergedRawInput,
         rawContent,
       });
-      if (subagentMeta.isAsyncSubagentLaunch) {
-        turn.asyncSubagentToolIds.add(update.toolCallId);
-        for (const tracked of turn.subagents.values()) {
-          if (tracked.toolCallId === `subagent:${tracked.sessionId}`) {
-            turn.toolCalls = turn.toolCalls.filter((t) => t.toolCallId !== tracked.toolCallId);
-            const activity = turn.activity.find((entry) => entry.kind === 'tool' && entry.toolCallId === tracked.toolCallId);
-            if (activity?.kind === 'tool') activity.toolCallId = update.toolCallId;
-            tracked.toolCallId = update.toolCallId;
-            break;
-          }
-        }
-      }
+      if (subagentMeta.isAsyncSubagentLaunch) this.bindAsyncSubagentTool(turn, update.toolCallId);
       const contentText = this.extractToolCallContentAndSaveAssets(worker, turn, rawContent);
       const diffStats = summarizeToolDiff(update.content);
 
@@ -2617,6 +2595,24 @@ export class AcpClientManager {
   private recordTextActivity(turn: ActiveTurnBridge, kind: 'content' | 'thoughts', offset: number): number {
     if (turn.activity.at(-1)?.kind !== kind) turn.activity.push({ kind, offset });
     return turn.activity.length - 1;
+  }
+
+  private bindAsyncSubagentTool(turn: ActiveTurnBridge, toolCallId: string): void {
+    turn.asyncSubagentToolIds.add(toolCallId);
+    const tracked = [...turn.subagents.values()].find((child) => child.toolCallId === `subagent:${child.sessionId}`);
+    if (!tracked) return;
+
+    const fallbackId = tracked.toolCallId;
+    turn.toolCalls = turn.toolCalls.filter((tool) => tool.toolCallId !== fallbackId);
+    const fallbackIndex = turn.activity.findIndex((entry) => entry.kind === 'tool' && entry.toolCallId === fallbackId);
+    if (fallbackIndex >= 0) {
+      if (turn.activity.some((entry) => entry.kind === 'tool' && entry.toolCallId === toolCallId)) {
+        turn.activity.splice(fallbackIndex, 1);
+      } else {
+        turn.activity[fallbackIndex] = { kind: 'tool', toolCallId };
+      }
+    }
+    tracked.toolCallId = toolCallId;
   }
 
   private publishToolActivity(worker: WorkerInstance, turn: ActiveTurnBridge, toolCallId: string): void {

@@ -100,7 +100,7 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     client.closeWs();
   });
 
-  it('handles delayed subagent_update after invoke_subagent completed, preserves native status & full child logs, and syncs background artifacts (#4, #5, #6, #10, #13, #18)', async () => {
+  it.each(['', ' [REMAP_TOOL]'])('reports delayed subagent work once and preserves native status and logs (%s)', async (mode) => {
     const srv = await createTestServer();
     cleanups.push(srv.cleanup);
 
@@ -116,7 +116,7 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     const workspaceDir = chatRes.data.chat.workspaceDir;
 
     await alice.request('POST', `/api/chats/${chatId}/messages`, {
-      text: 'Run [DELAYED_SUBAGENT]',
+      text: `Run [DELAYED_SUBAGENT]${mode}`,
     });
 
     const finishedFrame = await alice.waitForFrame(
@@ -149,18 +149,7 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     );
 
     const detail = await alice.request<{
-      messages: Array<{
-        role: string;
-        toolCalls: Array<{
-          title: string;
-          status: string;
-          isSubagent?: boolean;
-          subagentState?: string;
-          subagentThoughtsText?: string;
-          subagentContentText?: string;
-          subagentToolCalls?: Array<{ title: string; status: string }>;
-        }>;
-      }>;
+      messages: MessageRecord[];
       artifacts: Array<{ relPath: string }>;
     }>('GET', `/api/chats/${chatId}`);
 
@@ -168,6 +157,9 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     expect(assistant).toBeTruthy();
     expect(assistant.toolCalls).toHaveLength(1);
     const subTc = assistant.toolCalls[0];
+    expect(assistant.activity?.filter((entry) => entry.kind === 'tool')).toEqual([
+      { kind: 'tool', toolCallId: subTc.toolCallId },
+    ]);
     // Native tool_call status ('completed') must not be rewritten to 'in_progress'
     expect(subTc.status).toBe('completed');
     expect(subTc.subagentState).toBe('idle');

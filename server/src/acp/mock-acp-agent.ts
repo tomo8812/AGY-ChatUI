@@ -713,6 +713,7 @@ function runAcpServer(): void {
 
       // [DELAYED_SUBAGENT]: invoke_subagent completes BEFORE subagent_update(running) arrives (#18, #5, #6, #13)
       if (promptText.includes('[DELAYED_SUBAGENT]')) {
+        const remap = promptText.includes('[REMAP_TOOL]');
         const subToolId = `tc-delayed-sub-${Date.now()}`;
         const childSessionId = `${state.id}-delayed-sub-1`;
         await sendUpdate({
@@ -720,18 +721,30 @@ function runAcpServer(): void {
           update: {
             sessionUpdate: 'tool_call',
             toolCallId: subToolId,
-            title: 'invoke_subagent',
+            title: remap ? 'ツール実行' : 'invoke_subagent',
             kind: 'other',
             status: 'in_progress',
-            rawInput: {
-              Subagents: [{ TypeName: 'research', Role: 'Delayed Worker', Prompt: 'Research' }],
-            },
+            ...(remap ? {} : {
+              rawInput: { Subagents: [{ TypeName: 'research', Role: 'Delayed Worker', Prompt: 'Research' }] },
+            }),
           },
         });
+        if (remap) {
+          await sendUpdate({
+            sessionId: state.id,
+            update: {
+              sessionUpdate: 'subagent_update',
+              sessionId: childSessionId,
+              title: 'Delayed Worker',
+              state: { state: 'running' },
+            },
+          });
+        }
         await sendUpdate({
           sessionId: state.id,
           update: {
             sessionUpdate: 'tool_call_update',
+            ...(remap ? { title: 'invoke_subagent' } : {}),
             toolCallId: subToolId,
             status: 'completed',
             rawOutput: { conversationId: childSessionId },
