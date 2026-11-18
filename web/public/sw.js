@@ -1,4 +1,4 @@
-const CACHE_NAME = 'antigravity-chat-shell-v4';
+const CACHE_NAME = 'antigravity-chat-shell-v5';
 const SHELL_ASSETS = ['/manifest.webmanifest', '/icon.svg'];
 
 self.addEventListener('install', (event) => {
@@ -56,8 +56,8 @@ self.addEventListener('push', (event) => {
         ? `/?chatId=${encodeURIComponent(chatId)}`
         : '/';
 
-  event.waitUntil(
-    self.registration.showNotification(title, {
+  const showPromise = self.registration
+    .showNotification(title, {
       body,
       icon: '/icon.svg',
       badge: '/icon.svg',
@@ -66,6 +66,64 @@ self.addEventListener('push', (event) => {
       ...(Array.isArray(data.vibrate) ? { vibrate: data.vibrate } : {}),
       data: { chatId, url },
     })
+    .catch(() =>
+      self.registration.showNotification(title, {
+        body,
+        tag,
+        data: { chatId, url },
+      })
+    );
+
+  const notifyClientsPromise = self.clients
+    .matchAll({ type: 'window', includeUncontrolled: true })
+    .then((clientList) => {
+      for (const c of clientList) {
+        c.postMessage({ type: 'PUSH_RECEIVED', tag, chatId });
+      }
+    })
+    .catch(() => {});
+
+  event.waitUntil(Promise.all([showPromise, notifyClientsPromise]));
+});
+
+self.addEventListener('pushsubscriptionchange', (event) => {
+  event.waitUntil(
+    (async () => {
+      try {
+        const cfgRes = await fetch('/api/notifications/config', { credentials: 'include' });
+        if (!cfgRes.ok) return;
+        const cfg = await cfgRes.json();
+        if (!cfg || typeof cfg.vapidPublicKey !== 'string' || !cfg.vapidPublicKey) return;
+
+        const padding = '='.repeat((4 - (cfg.vapidPublicKey.length % 4)) % 4);
+        const base64 = (cfg.vapidPublicKey + padding).replace(/-/g, '+').replace(/_/g, '/');
+        const raw = atob(base64);
+        const applicationServerKey = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i += 1) {
+          applicationServerKey[i] = raw.charCodeAt(i);
+        }
+
+        const sub = await self.registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey,
+        });
+        const json = sub.toJSON();
+        if (!json.endpoint || !json.keys || !json.keys.p256dh || !json.keys.auth) return;
+
+        await fetch('/api/notifications/subscribe', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            endpoint: json.endpoint,
+            keys: { p256dh: json.keys.p256dh, auth: json.keys.auth },
+            userAgent: self.navigator ? self.navigator.userAgent : '',
+          }),
+        });
+      } catch {
+        // Active tabs also re-sync via ensurePushSubscribed()
+      }
+    })()
   );
 });
 

@@ -25,6 +25,16 @@ const unsubscribeSchema = z.object({
   endpoint: z.string().trim().min(1).max(2048),
 });
 
+const statusSchema = z.object({
+  endpoint: z.string().trim().min(1).max(2048).optional(),
+});
+
+const testPushSchema = z
+  .object({
+    endpoint: z.string().trim().min(1).max(2048).optional(),
+  })
+  .optional();
+
 export async function registerNotificationRoutes(
   app: FastifyInstance,
   deps: NotificationRouteDeps
@@ -36,6 +46,18 @@ export async function registerNotificationRoutes(
     if (!session) return;
     return {
       vapidPublicKey: pushService.getPublicKey(),
+      subscriptionCount: db.countPushSubscriptions(session.user.id),
+    };
+  });
+
+  app.post('/api/notifications/status', async (req, reply) => {
+    const session = requireAuth(req, reply, db);
+    if (!session) return;
+
+    const parsed = statusSchema.safeParse(req.body ?? {});
+    const endpoint = parsed.success ? parsed.data.endpoint : undefined;
+    return {
+      registeredOnServer: endpoint ? db.hasPushSubscription(session.user.id, endpoint) : false,
       subscriptionCount: db.countPushSubscriptions(session.user.id),
     };
   });
@@ -108,12 +130,19 @@ export async function registerNotificationRoutes(
     const session = requireAuth(req, reply, db);
     if (!session) return;
 
-    const result = await pushService.sendToUser(session.user.id, {
-      title: 'Antigravity Chat',
-      body: 'テスト通知：応答が完了するとこのように通知が届きます。',
-      tag: `test-${Date.now()}`,
-      url: '/',
-    });
+    const parsed = testPushSchema.safeParse(req.body ?? {});
+    const currentEndpoint = parsed.success ? parsed.data?.endpoint : undefined;
+
+    const result = await pushService.sendToUser(
+      session.user.id,
+      {
+        title: 'Antigravity Chat',
+        body: 'テスト通知：応答が完了するとこのように通知が届きます。',
+        tag: `test-${Date.now()}`,
+        url: '/',
+      },
+      { currentEndpoint }
+    );
     return result;
   });
 }

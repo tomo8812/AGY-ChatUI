@@ -15,7 +15,9 @@ import {
 } from '../utils/haptics';
 import {
   ensurePushSubscribed,
+  formatPushFailureReason,
   getActivePushSubscription,
+  getDevicePushSyncStatus,
   isAppleMobileBrowser,
   isNotificationSupported,
   isPushSupported,
@@ -106,18 +108,28 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   useEffect(() => {
     let active = true;
-    void Promise.all([
-      getActivePushSubscription().catch(() => null),
-      api.getNotificationConfig().catch(() => null),
-    ]).then(([sub, cfg]) => {
+    void getDevicePushSyncStatus().then(async (status) => {
       if (!active) return;
-      setDeviceSubscribed(Boolean(sub));
-      if (cfg) setSubCount(cfg.subscriptionCount);
+      setSubCount(status.subscriptionCount);
+      if (
+        !status.registeredOnServer &&
+        preferences.notifyOnResponse &&
+        isNotificationSupported() &&
+        Notification.permission === 'granted' &&
+        isPushSupported()
+      ) {
+        const res = await ensurePushSubscribed();
+        if (!active) return;
+        setDeviceSubscribed(res.subscribed);
+        if (typeof res.subscriptionCount === 'number') setSubCount(res.subscriptionCount);
+      } else {
+        setDeviceSubscribed(status.registeredOnServer);
+      }
     });
     return () => {
       active = false;
     };
-  }, []);
+  }, [preferences.notifyOnResponse]);
 
   const handleAgentModeChange = async (value: string) => {
     const option = AGENT_MODE_OPTIONS.find((item) => item.value === value);
@@ -213,8 +225,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       }
       if (pushRes.subscribed) {
         setNotifStatusMsg('通知を有効にしました（バックグラウンドでもWeb Pushを受信できます）。');
+      } else if (isPushSupported()) {
+        setError(
+          `設定は有効にしましたが、この端末のバックグラウンドWeb Push登録に失敗しました: ${formatPushFailureReason(pushRes.reason)}`
+        );
       } else {
-        setNotifStatusMsg('通知を有効にしました（アプリ・ブラウザ開いている間の応答完了を通知します）。');
+        setNotifStatusMsg('通知を有効にしました（アプリ・ブラウザを開いている間の応答完了を通知します）。');
       }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : '通知設定の更新に失敗しました。');
@@ -252,11 +268,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       if (typeof pushRes.subscriptionCount === 'number') {
         setSubCount(pushRes.subscriptionCount);
       }
-      setNotifStatusMsg(
-        pushRes.subscribed
-          ? 'この端末をWeb Push通知に登録しました。'
-          : 'この端末での通知を有効にしました。'
-      );
+      if (pushRes.subscribed) {
+        setNotifStatusMsg('この端末をWeb Push通知に登録しました。');
+      } else if (isPushSupported()) {
+        setError(formatPushFailureReason(pushRes.reason));
+      } else {
+        setNotifStatusMsg('この端末でのブラウザ通知を有効にしました。');
+      }
     } finally {
       setNotifBusy(false);
     }
@@ -270,32 +288,56 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       if (isNotificationSupported() && Notification.permission === 'default') {
         await Notification.requestPermission();
       }
-      if (isNotificationSupported() && Notification.permission === 'granted' && isPushSupported() && !deviceSubscribed) {
-        const pushRes = await ensurePushSubscribed();
-        setDeviceSubscribed(pushRes.subscribed);
-        if (typeof pushRes.subscriptionCount === 'number') setSubCount(pushRes.subscriptionCount);
+      if (!isNotificationSupported() || Notification.permission !== 'granted') {
+        setError('通知権限が許可されていません。先に「この端末で許可」から許可してください。');
+        return;
       }
 
-      const res = await api.sendTestPush();
-      if (res.sent > 0) {
-        setNotifStatusMsg(`テスト通知を送信しました（配信先 ${res.sent}台）。`);
-      } else if (isNotificationSupported() && Notification.permission === 'granted') {
-        const shown = await showBrowserNotification({
-          title: 'Antigravity Chat',
-          body: 'テスト通知：応答が完了するとこのように通知が届きます。',
-          tag: `test-${Date.now()}`,
-        });
-        if (shown) {
-          setNotifStatusMsg('ローカルテスト通知を表示しました。');
-        } else if (res.lastError) {
-          setError(`テスト通知の送信に失敗しました: ${res.lastError}`);
-        } else {
-          setError('通知の配信先が見つかりませんでした。いったんオフにしてオンにし直してください。');
+      if (isPushSupported()) {
+        const pushRes = await ensurePushSubscribed();
+        setDeviceSubscribed(pushRes.subscribed);
+        if (typeof pushRes.subscriptionCount === 'number') {
+          setSubCount(pushRes.subscriptionCount);
         }
-      } else if (res.lastError) {
-        setError(`テスト通知の送信に失敗しました: ${res.lastError}`);
+        if (!pushRes.subscribed) {
+          setError(formatPushFailureReason(pushRes.reason));
+          return;
+        }
+
+        const sub = await getActivePushSubscription();
+        const res = await api.sendTestPush(sub?.endpoint);
+        const statusAfter = await getDevicePushSyncStatus().catch(() => null);
+        if (statusAfter) {
+          setDeviceSubscribed(statusAfter.registeredOnServer);
+          setSubCount(statusAfter.subscriptionCount);
+        }
+
+        if (res.currentDeviceSent) {
+          setNotifStatusMsg(
+            `この端末へWeb Pushテスト通知を送信しました（配信成功: ${res.sent}/${res.total}台）。`
+          );
+        } else {
+          const detail =
+            res.currentDeviceError ||
+            res.lastError ||
+            'この端末のPush配信に失敗しました。いったん通知をオフにしてオンにし直してください。';
+          setError(`この端末へのWeb Pushテスト送信に失敗しました: ${detail}`);
+        }
+        return;
+      }
+
+      // Environment without PushManager (local Notification API only)
+      const shown = await showBrowserNotification({
+        title: 'Antigravity Chat',
+        body: 'テスト通知：応答が完了するとこのように通知が届きます。',
+        tag: `test-${Date.now()}`,
+      });
+      if (shown) {
+        setNotifStatusMsg(
+          'ローカルテスト通知を表示しました（※この環境はWeb Push非対応のため、アプリ/ブラウザを開いている間のみ通知されます）。'
+        );
       } else {
-        setError('通知権限が許可されていません。');
+        setError('通知を表示できませんでした。ブラウザの通知設定を確認してください。');
       }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'テスト通知の送信に失敗しました。');
@@ -466,10 +508,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <div className="notif-meta-row">
                 <span className="muted-xs">
                   {deviceSubscribed
-                    ? `この端末はPush受信有効（登録端末: ${Math.max(1, subCount)}台）`
-                    : isNotificationSupported() && Notification.permission === 'granted'
-                      ? 'この端末のブラウザ通知が有効です'
-                      : 'この端末での通知許可が未完了です'}
+                    ? `この端末はサーバーにPush登録済み（登録端末: ${Math.max(1, subCount)}台）`
+                    : isNotificationSupported() && Notification.permission === 'granted' && isPushSupported()
+                      ? 'この端末のWeb Push登録が未完了です（「この端末で許可」を押してください）'
+                      : isNotificationSupported() && Notification.permission === 'granted'
+                        ? 'この端末のブラウザ通知が有効です（Web Push非対応）'
+                        : 'この端末での通知許可が未完了です'}
                 </span>
                 <div className="row-actions">
                   {needsDeviceActivation && (

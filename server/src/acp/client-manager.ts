@@ -53,6 +53,7 @@ import {
   supportsWorkspaceTextWrites,
   writeWorkspaceTextFile,
 } from '../files/workspace.js';
+import type { PushNotificationService } from '../notifications/web-push.js';
 import type { SyncHub } from '../sync/hub.js';
 import type {
   AcpConfigOption,
@@ -374,6 +375,8 @@ interface ActiveTurnBridge {
   backgroundWorkCount: number;
   parentWakeupStarted: boolean;
   receivedWakeupText: boolean;
+  wakeupCount: number;
+  wakeupContentOffset: number;
   lastParentActivityAt: number;
 }
 
@@ -411,7 +414,8 @@ export class AcpClientManager {
     private readonly config: AppConfig,
     private readonly db: AppDatabase,
     private readonly hub: SyncHub,
-    private readonly skillService?: SkillService
+    private readonly skillService?: SkillService,
+    private readonly pushService?: PushNotificationService
   ) {
     this.cleanupTimer = setInterval(() => this.evictIdleWorkers(), 30_000);
     this.cleanupTimer.unref();
@@ -958,6 +962,8 @@ export class AcpClientManager {
       initialPromptDone: false,
       parentWakeupStarted: false,
       receivedWakeupText: false,
+      wakeupCount: 0,
+      wakeupContentOffset: 0,
       lastParentActivityAt: nowInit,
       parentState: 'running',
       backgroundWorkCount: 0,
@@ -1021,6 +1027,7 @@ export class AcpClientManager {
 
       bridge.initialPromptDone = true;
       bridge.parentState = 'idle';
+      bridge.wakeupContentOffset = bridge.contentText.length;
       // Yield to macrotask queue so any notifications queued in the same stdio frame are processed
       await new Promise((r) => setImmediate(r));
 
@@ -1301,6 +1308,17 @@ export class AcpClientManager {
           runId: turn.runId,
           payload: { permission: record },
         });
+        void this.pushService
+          ?.notifyPermissionRequested({
+            userId: turn.userId,
+            chatId: turn.chatId,
+            runId: turn.runId,
+            permissionId: record.id,
+            toolTitle: toolCall.title,
+          })
+          .catch((err) => {
+            console.warn('[acp] Push permission notification failed:', err);
+          });
 
         return new Promise<RequestPermissionResponse>((resolve) => {
           turn.pendingResolvers.set(permId, resolve);
@@ -2160,8 +2178,10 @@ export class AcpClientManager {
       subagents: new Map(),
       asyncSubagentToolIds: new Set(),
       initialPromptDone: true,
-      parentWakeupStarted: true,
-      receivedWakeupText: true,
+      parentWakeupStarted: false,
+      receivedWakeupText: false,
+      wakeupCount: 0,
+      wakeupContentOffset: latestAssistant.contentText.length,
       lastParentActivityAt: Date.now(),
       parentState: 'idle',
       backgroundWorkCount: 0,
@@ -2411,6 +2431,7 @@ export class AcpClientManager {
           }
         }
       }
+      let completedWakeup: { wakeupSeq: number; previewText: string; isError: boolean } | null = null;
       if (
         (stateObj.state === 'running' || stateObj.state === 'requires_action') &&
         turn.initialPromptDone
@@ -2418,8 +2439,51 @@ export class AcpClientManager {
         turn.parentWakeupStarted = true;
       } else if (stateObj.state === 'idle' && turn.initialPromptDone) {
         if (turn.activity.at(-1)?.kind === 'content') turn.activity.push({ kind: 'answer_end' });
+        if (turn.parentWakeupStarted || turn.receivedWakeupText) {
+          turn.parentWakeupStarted = false;
+          turn.receivedWakeupText = false;
+          turn.wakeupCount += 1;
+          const wakeupSlice = turn.contentText.slice(turn.wakeupContentOffset).trim();
+          turn.wakeupContentOffset = turn.contentText.length;
+          completedWakeup = {
+            wakeupSeq: turn.wakeupCount,
+            previewText: wakeupSlice || turn.contentText,
+            isError: stateObj.stopReason === 'error' || stateObj.stopReason === 'refusal',
+          };
+        }
       }
       finalizeIfBackground(stateObj.state === 'idle');
+      if (completedWakeup) {
+        const tag = `run-${turn.runId}-wakeup-${completedWakeup.wakeupSeq}`;
+        const status = completedWakeup.isError ? 'error' : 'completed';
+        const finalMsg = this.db.getMessage(worker.userId, turn.assistantMessageId);
+        this.hub.emitDurable({
+          userId: worker.userId,
+          type: 'run.wakeup_finished',
+          chatId: worker.chatId,
+          runId: turn.runId,
+          payload: {
+            runId: turn.runId,
+            chatId: worker.chatId,
+            message: finalMsg,
+            status,
+            previewText: completedWakeup.previewText,
+            notificationTag: tag,
+          },
+        });
+        void this.pushService
+          ?.notifyRunFinished({
+            userId: worker.userId,
+            chatId: worker.chatId,
+            runId: turn.runId,
+            status,
+            previewText: completedWakeup.previewText,
+            tagOverride: tag,
+          })
+          .catch((err) => {
+            console.warn('[acp] Push wakeup notification failed:', err);
+          });
+      }
       return;
     }
 

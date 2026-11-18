@@ -201,6 +201,17 @@ function truncatePreview(text: string | undefined, maxChars = 120): string {
   return `${collapsed.slice(0, maxChars - 1)}…`;
 }
 
+export interface SendToUserResult {
+  sent: number;
+  failed: number;
+  removed: number;
+  total: number;
+  lastError?: string;
+  currentDeviceRegistered?: boolean;
+  currentDeviceSent?: boolean;
+  currentDeviceError?: string;
+}
+
 export class PushNotificationService {
   private readonly privateKey: crypto.KeyObject;
   private readonly publicKeyBase64Url: string;
@@ -212,6 +223,12 @@ export class PushNotificationService {
     const loaded = loadOrCreateVapidKeys(db);
     this.privateKey = loaded.privateKey;
     this.publicKeyBase64Url = loaded.publicKeyBase64Url;
+
+    if (/(?:\.local|@localhost)(?:$|[:/])/i.test(this.config.vapidSubject)) {
+      console.warn(
+        `[web-push] Warning: VAPID_SUBJECT "${this.config.vapidSubject}" uses a non-public host and may be rejected (HTTP 403 BadJwtToken) by Apple Web Push.`
+      );
+    }
   }
 
   getPublicKey(): string {
@@ -244,7 +261,7 @@ export class PushNotificationService {
           'Content-Type': 'application/octet-stream',
           'Content-Encoding': 'aes128gcm',
           TTL: '86400',
-          Urgency: 'normal',
+          Urgency: 'high',
         },
         body: new Uint8Array(body),
         signal: AbortSignal.timeout(10_000),
@@ -275,20 +292,35 @@ export class PushNotificationService {
 
   async sendToUser(
     userId: string,
-    payloadObj: NotificationPayload
-  ): Promise<{ sent: number; failed: number; removed: number; total: number; lastError?: string }> {
+    payloadObj: NotificationPayload,
+    options?: { currentEndpoint?: string }
+  ): Promise<SendToUserResult> {
     const subs = this.db.listPushSubscriptions(userId);
+    const currentEndpoint = options?.currentEndpoint?.trim() || undefined;
     if (subs.length === 0) {
-      return { sent: 0, failed: 0, removed: 0, total: 0 };
+      return {
+        sent: 0,
+        failed: 0,
+        removed: 0,
+        total: 0,
+        ...(currentEndpoint
+          ? { currentDeviceRegistered: false, currentDeviceSent: false }
+          : {}),
+      };
     }
 
-    const results = await Promise.all(subs.map((sub) => this.sendToSubscription(sub, payloadObj)));
+    const results = await Promise.all(
+      subs.map(async (sub) => ({ sub, res: await this.sendToSubscription(sub, payloadObj) }))
+    );
     let sent = 0;
     let failed = 0;
     let removed = 0;
     let lastError: string | undefined;
+    let currentDeviceRegistered = false;
+    let currentDeviceSent = false;
+    let currentDeviceError: string | undefined;
 
-    for (const r of results) {
+    for (const { sub, res: r } of results) {
       if (r.ok) {
         sent += 1;
       } else {
@@ -296,9 +328,35 @@ export class PushNotificationService {
         if (r.gone) removed += 1;
         if (r.error) lastError = r.error;
       }
+      if (currentEndpoint && sub.endpoint === currentEndpoint) {
+        currentDeviceRegistered = true;
+        currentDeviceSent = r.ok;
+        if (!r.ok && r.error) {
+          currentDeviceError = r.error;
+        }
+      }
     }
 
-    return { sent, failed, removed, total: subs.length, lastError };
+    if (failed > 0 && this.config.nodeEnv !== 'test') {
+      console.warn(
+        `[web-push] Delivery issue for user=${userId} tag=${payloadObj.tag}: sent=${sent}, failed=${failed}, removed=${removed}, lastError=${lastError ?? 'unknown'}`
+      );
+    }
+
+    return {
+      sent,
+      failed,
+      removed,
+      total: subs.length,
+      lastError,
+      ...(currentEndpoint
+        ? {
+            currentDeviceRegistered,
+            currentDeviceSent,
+            ...(currentDeviceError ? { currentDeviceError } : {}),
+          }
+        : {}),
+    };
   }
 
   async notifyRunFinished(params: {
@@ -308,11 +366,12 @@ export class PushNotificationService {
     status: 'completed' | 'error' | 'cancelled';
     previewText?: string;
     errorMessage?: string | null;
-  }): Promise<void> {
-    if (params.status === 'cancelled') return;
+    tagOverride?: string;
+  }): Promise<SendToUserResult | null> {
+    if (params.status === 'cancelled') return null;
 
     const prefs = this.db.getPreferences(params.userId);
-    if (!prefs.notifyOnResponse) return;
+    if (!prefs.notifyOnResponse) return null;
 
     const chat = this.db.getChat(params.userId, params.chatId);
     const chatTitle = chat?.title || 'Antigravity Chat';
@@ -320,13 +379,14 @@ export class PushNotificationService {
 
     const vibrateComplete = prefs.hapticFeedback ? [14, 55, 16, 55, 42] : undefined;
     const vibrateError = prefs.hapticFeedback ? [65, 65, 65, 65, 65] : undefined;
+    const tag = params.tagOverride || `run-${params.runId}`;
 
     const payload: NotificationPayload =
       params.status === 'error'
         ? {
             title: `エラーで終了 — ${cleanTitle}`,
             body: truncatePreview(params.errorMessage || undefined, 120) || '応答の生成中にエラーが発生しました。',
-            tag: `run-${params.runId}`,
+            tag,
             chatId: params.chatId,
             runId: params.runId,
             url: `/?chatId=${encodeURIComponent(params.chatId)}`,
@@ -335,13 +395,40 @@ export class PushNotificationService {
         : {
             title: cleanTitle,
             body: truncatePreview(params.previewText, 120) || '応答が完了しました。',
-            tag: `run-${params.runId}`,
+            tag,
             chatId: params.chatId,
             runId: params.runId,
             url: `/?chatId=${encodeURIComponent(params.chatId)}`,
             ...(vibrateComplete ? { vibrate: vibrateComplete } : {}),
           };
 
-    await this.sendToUser(params.userId, payload);
+    return this.sendToUser(params.userId, payload);
+  }
+
+  async notifyPermissionRequested(params: {
+    userId: string;
+    chatId: string;
+    runId: string;
+    permissionId: string;
+    toolTitle?: string | null;
+  }): Promise<SendToUserResult | null> {
+    const prefs = this.db.getPreferences(params.userId);
+    if (!prefs.notifyOnResponse) return null;
+
+    const chat = this.db.getChat(params.userId, params.chatId);
+    const chatTitle = chat?.title || 'Antigravity Chat';
+    const cleanTitle = chatTitle.length > 52 ? `${chatTitle.slice(0, 51)}…` : chatTitle;
+    const toolLabel = truncatePreview(params.toolTitle || undefined, 90) || 'ツール実行の許可';
+    const vibratePermission = prefs.hapticFeedback ? [24, 60, 24] : undefined;
+
+    return this.sendToUser(params.userId, {
+      title: `確認待ち — ${cleanTitle}`,
+      body: `${toolLabel} の承認が必要です。`,
+      tag: `perm-${params.permissionId}`,
+      chatId: params.chatId,
+      runId: params.runId,
+      url: `/?chatId=${encodeURIComponent(params.chatId)}`,
+      ...(vibratePermission ? { vibrate: vibratePermission } : {}),
+    });
   }
 }

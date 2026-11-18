@@ -16,8 +16,10 @@ import { SkillsModal } from './components/SkillsModal';
 import { triggerHaptic, VIBRATION_PATTERNS } from './utils/haptics';
 import {
   ensurePushSubscribed,
-  getActivePushSubscription,
+  getDevicePushSyncStatus,
+  hasDisplayedNotificationTag,
   isNotificationSupported,
+  isPushSupported,
   showBrowserNotification,
   unsubscribePushOnDevice,
 } from './utils/notifications';
@@ -171,6 +173,9 @@ export const App: React.FC = () => {
   const skipNextLoadChatIdRef = useRef<string | null>(null);
   const localNotifiedRunsRef = useRef<Set<string>>(new Set());
   const locallyCancelledRunIdsRef = useRef<Set<string>>(new Set());
+  const receivedPushTagsRef = useRef<Set<string>>(new Set());
+  const pushServerSyncedRef = useRef<boolean>(false);
+  const pushFallbackTimersRef = useRef<Map<string, number>>(new Map());
 
   const initialBuildIdRef = useRef<string | null>(null);
   const initialVersionRef = useRef<string>(appBuildInfo.version);
@@ -183,9 +188,102 @@ export const App: React.FC = () => {
   const prevAgyAuthRef = useRef(false);
   const preferencesRef = useRef<UserPreferences | null>(null);
   preferencesRef.current = preferences;
+  const userIdRef = useRef<string | null>(null);
+  userIdRef.current = user?.id ?? null;
 
   const wsRef = useRef<SyncSocketClient | null>(null);
   const isReplayingHelloRef = useRef(false);
+
+  const syncPushSubscription = useCallback(async (forceVerify = false) => {
+    if (!userIdRef.current || !preferencesRef.current?.notifyOnResponse) {
+      pushServerSyncedRef.current = false;
+      return;
+    }
+    if (!isNotificationSupported() || Notification.permission !== 'granted' || !isPushSupported()) {
+      pushServerSyncedRef.current = false;
+      return;
+    }
+    try {
+      if (forceVerify) {
+        const status = await getDevicePushSyncStatus();
+        if (status.registeredOnServer) {
+          pushServerSyncedRef.current = true;
+          return;
+        }
+      }
+      const res = await ensurePushSubscribed();
+      pushServerSyncedRef.current = res.subscribed;
+    } catch {
+      pushServerSyncedRef.current = false;
+    }
+  }, []);
+
+  const notifyDesktopWithPushFallback = useCallback(
+    (params: {
+      dedupKey: string;
+      tag: string;
+      title: string;
+      body: string;
+      chatId: string;
+      createdAt: number;
+      vibrate?: number[];
+    }) => {
+      if (isReplayingHelloRef.current) return;
+      if (!preferencesRef.current?.notifyOnResponse) return;
+      if (Date.now() - params.createdAt >= 30_000) return;
+      if (!isNotificationSupported() || Notification.permission !== 'granted') return;
+      if (localNotifiedRunsRef.current.has(params.dedupKey)) return;
+
+      const isBackgroundOrOtherChat =
+        document.visibilityState !== 'visible' ||
+        !document.hasFocus() ||
+        params.chatId !== activeChatIdRef.current;
+      if (!isBackgroundOrOtherChat) return;
+
+      if (localNotifiedRunsRef.current.size > 200) {
+        localNotifiedRunsRef.current.clear();
+      }
+      localNotifiedRunsRef.current.add(params.dedupKey);
+
+      const triggerLocal = () => {
+        void showBrowserNotification({
+          title: params.title,
+          body: params.body,
+          tag: params.tag,
+          chatId: params.chatId,
+          vibrate: params.vibrate,
+        });
+      };
+
+      if (!isPushSupported() || !pushServerSyncedRef.current) {
+        triggerLocal();
+        return;
+      }
+
+      if (receivedPushTagsRef.current.has(params.tag)) return;
+      const existingTimer = pushFallbackTimersRef.current.get(params.tag);
+      if (existingTimer !== undefined) {
+        window.clearTimeout(existingTimer);
+      }
+
+      const timer = window.setTimeout(() => {
+        pushFallbackTimersRef.current.delete(params.tag);
+        if (receivedPushTagsRef.current.has(params.tag)) return;
+        const alreadyFocusedHere =
+          document.visibilityState === 'visible' &&
+          document.hasFocus() &&
+          activeChatIdRef.current === params.chatId;
+        if (alreadyFocusedHere) return;
+        void hasDisplayedNotificationTag(params.tag).then((shown) => {
+          if (!shown && !receivedPushTagsRef.current.has(params.tag)) {
+            triggerLocal();
+          }
+        });
+      }, 1800);
+      pushFallbackTimersRef.current.set(params.tag, timer);
+    },
+    []
+  );
 
   const cleanupEmptyDraftChat = useCallback(() => {
     const draftChat = draftCreatedChatRef.current;
@@ -562,6 +660,16 @@ export const App: React.FC = () => {
         setDraftProjectId(null);
         setActiveChatId(event.data.chatId);
         setSidebarMobileOpen(false);
+      } else if (event.data && event.data.type === 'PUSH_RECEIVED' && typeof event.data.tag === 'string') {
+        if (receivedPushTagsRef.current.size > 200) {
+          receivedPushTagsRef.current.clear();
+        }
+        receivedPushTagsRef.current.add(event.data.tag);
+        const timer = pushFallbackTimersRef.current.get(event.data.tag);
+        if (timer !== undefined) {
+          window.clearTimeout(timer);
+          pushFallbackTimersRef.current.delete(event.data.tag);
+        }
       }
     };
     sw?.addEventListener('message', onSwMessage);
@@ -574,10 +682,28 @@ export const App: React.FC = () => {
 
   // Automatically sync browser Push subscription if notifyOnResponse is ON and permission is already granted
   useEffect(() => {
-    if (!user || !preferences?.notifyOnResponse) return;
-    if (!isNotificationSupported() || Notification.permission !== 'granted') return;
-    void ensurePushSubscribed();
-  }, [user?.id, preferences?.notifyOnResponse]);
+    void syncPushSubscription(false);
+
+    const sw = typeof navigator !== 'undefined' ? navigator.serviceWorker : undefined;
+    const onControllerChange = () => {
+      void syncPushSubscription(false);
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible' && !pushServerSyncedRef.current) {
+        void syncPushSubscription(false);
+      }
+    };
+    sw?.addEventListener('controllerchange', onControllerChange);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      sw?.removeEventListener('controllerchange', onControllerChange);
+      document.removeEventListener('visibilitychange', onVisibility);
+      for (const timer of pushFallbackTimersRef.current.values()) {
+        window.clearTimeout(timer);
+      }
+      pushFallbackTimersRef.current.clear();
+    };
+  }, [user?.id, preferences?.notifyOnResponse, syncPushSubscription]);
 
   // Probe default model/effort options for welcome screen & run balanced visible quota refresh
   const isAgyAuthenticated = agyProfile?.authStatus === 'authenticated';
@@ -867,21 +993,7 @@ export const App: React.FC = () => {
           locallyCancelledRunIdsRef.current.delete(run.id);
         }
 
-        if (
-          run &&
-          run.status !== 'cancelled' &&
-          preferencesRef.current?.notifyOnResponse &&
-          Date.now() - evt.createdAt < 30_000 &&
-          !localNotifiedRunsRef.current.has(run.id) &&
-          isNotificationSupported() &&
-          Notification.permission === 'granted' &&
-          (document.visibilityState !== 'visible' || !document.hasFocus() || evt.chatId !== curChatId)
-        ) {
-          if (localNotifiedRunsRef.current.size > 200) {
-            localNotifiedRunsRef.current.clear();
-          }
-          localNotifiedRunsRef.current.add(run.id);
-
+        if (run && run.status !== 'cancelled') {
           const chatTitle =
             chatsRef.current.find((c) => c.id === run.chatId)?.title || 'Antigravity Chat';
           const preview = (msg?.contentText || '').replace(/\s+/g, ' ').trim().slice(0, 120);
@@ -894,21 +1006,65 @@ export const App: React.FC = () => {
             ? VIBRATION_PATTERNS[run.status === 'error' ? 'error' : 'complete']
             : undefined;
 
-          void getActivePushSubscription().then((sub) => {
-            if (!sub) {
-              void showBrowserNotification({
-                title,
-                body,
-                tag: `run-${run.id}`,
-                chatId: run.chatId,
-                vibrate,
-              });
-            }
+          notifyDesktopWithPushFallback({
+            dedupKey: `run-${run.id}`,
+            tag: `run-${run.id}`,
+            title,
+            body,
+            chatId: run.chatId,
+            createdAt: evt.createdAt,
+            vibrate,
           });
-        }
-        if (run && run.status !== 'cancelled') {
           void triggerQuotaRefresh(true, 5_000);
         }
+        break;
+      }
+      case 'run.wakeup_finished': {
+        const msg = p.message as MessageRecord | undefined;
+        const wakeupStatus = p.status === 'error' ? 'error' : 'completed';
+        const previewText = typeof p.previewText === 'string' ? p.previewText : '';
+        const notificationTag =
+          typeof p.notificationTag === 'string' && p.notificationTag
+            ? p.notificationTag
+            : `run-${evt.runId ?? evt.eventId}-wakeup`;
+
+        if (msg && evt.chatId === curChatId) {
+          setMessages((prev) => upsertMessage(prev, msg));
+        }
+
+        const hapticOn = Boolean(preferencesRef.current?.hapticFeedback ?? true);
+        if (
+          !isReplayingHelloRef.current &&
+          document.visibilityState === 'visible' &&
+          Math.abs(Date.now() - evt.createdAt) < 60_000
+        ) {
+          triggerHaptic(wakeupStatus === 'error' ? 'error' : 'complete', hapticOn);
+        }
+
+        if (evt.chatId) {
+          const chatTitle =
+            chatsRef.current.find((c) => c.id === evt.chatId)?.title || 'Antigravity Chat';
+          const preview = previewText.replace(/\s+/g, ' ').trim().slice(0, 120);
+          const body =
+            wakeupStatus === 'error'
+              ? preview || 'バックグラウンド処理でエラーが発生しました。'
+              : preview || '応答が完了しました。';
+          const title = wakeupStatus === 'error' ? `エラーで終了 — ${chatTitle}` : chatTitle;
+          const vibrate = hapticOn
+            ? VIBRATION_PATTERNS[wakeupStatus === 'error' ? 'error' : 'complete']
+            : undefined;
+
+          notifyDesktopWithPushFallback({
+            dedupKey: notificationTag,
+            tag: notificationTag,
+            title,
+            body,
+            chatId: evt.chatId,
+            createdAt: evt.createdAt,
+            vibrate,
+          });
+        }
+        void triggerQuotaRefresh(true, 5_000);
         break;
       }
       case 'permission.requested': {
@@ -926,13 +1082,27 @@ export const App: React.FC = () => {
               prev.some((x) => x.id === perm.id) ? prev : [...prev, perm]
             );
           }
+          const hapticOn = Boolean(preferencesRef.current?.hapticFeedback ?? true);
           if (
             !isReplayingHelloRef.current &&
             document.visibilityState === 'visible' &&
             Math.abs(Date.now() - evt.createdAt) < 60_000
           ) {
-            triggerHaptic('permission', Boolean(preferencesRef.current?.hapticFeedback ?? true));
+            triggerHaptic('permission', hapticOn);
           }
+
+          const chatTitle =
+            chatsRef.current.find((c) => c.id === perm.chatId)?.title || 'Antigravity Chat';
+          const toolLabel = (perm.toolCall.title || 'ツール実行の許可').replace(/\s+/g, ' ').trim().slice(0, 90);
+          notifyDesktopWithPushFallback({
+            dedupKey: `perm-${perm.id}`,
+            tag: `perm-${perm.id}`,
+            title: `確認待ち — ${chatTitle}`,
+            body: `${toolLabel} の承認が必要です。`,
+            chatId: perm.chatId,
+            createdAt: evt.createdAt,
+            vibrate: hapticOn ? VIBRATION_PATTERNS.permission : undefined,
+          });
         }
         break;
       }
@@ -972,7 +1142,7 @@ export const App: React.FC = () => {
         break;
       }
     }
-  }, [triggerQuotaRefresh, loadSkillsList]);
+  }, [triggerQuotaRefresh, loadSkillsList, notifyDesktopWithPushFallback]);
 
   const handleEphemeralEvent = useCallback(
     (evt: Extract<WsIncomingMessage, { kind: 'ephemeral' }>['event']) => {
@@ -1047,6 +1217,7 @@ export const App: React.FC = () => {
       onStatusChange: setWsStatus,
       onHello: (msg) => {
         notifyDetectedBuild(msg.buildId, msg.version);
+        void syncPushSubscription(true);
         if (msg.resyncRequired) {
           void loadWorkspaceLists();
           if (activeChatIdRef.current) {
