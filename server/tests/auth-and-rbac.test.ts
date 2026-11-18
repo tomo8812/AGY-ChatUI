@@ -57,9 +57,14 @@ describe('Web Auth, Mandatory Agy Code-Paste Binding, and Strict Multi-User RBAC
     expect(readSettings(bobDir)).toEqual({ agentMode: 'auto' });
     expect(readSettings(aliceDir)).toEqual({ ...existing, agentMode: '' });
 
-    const editedDuringSave = { ...existing, agentMode: '', enableTerminalSandbox: false };
-    const concurrentEdit = vi.spyOn(fs, 'fchmodSync').mockImplementationOnce(() => {
-      fs.writeFileSync(settingsPath(aliceDir), JSON.stringify(editedDuringSave));
+    const editedDuringSave = { ...existing, agentMode: 'accept-edits', enableTerminalSandbox: false };
+    const cliTemporary = `${settingsPath(aliceDir)}.cli.tmp`;
+    fs.writeFileSync(cliTemporary, JSON.stringify(editedDuringSave));
+    const originalWrite = fs.writeSync;
+    const concurrentEdit = vi.spyOn(fs, 'writeSync').mockImplementationOnce((...args) => {
+      // Match the CLI's atomic replacement after the final pre-write check.
+      fs.renameSync(cliTemporary, settingsPath(aliceDir));
+      return Reflect.apply(originalWrite, fs, args);
     });
     try {
       expect((await alice.request('PATCH', route, { agentMode: 'plan' })).status).toBe(409);
@@ -67,6 +72,7 @@ describe('Web Auth, Mandatory Agy Code-Paste Binding, and Strict Multi-User RBAC
     } finally {
       concurrentEdit.mockRestore();
     }
+    expect((await alice.request('GET', route)).data).toEqual({ agentMode: 'accept-edits' });
     expect((await alice.request('PATCH', route, { agentMode: 'plan' })).status).toBe(200);
     expect(readSettings(aliceDir)).toEqual({ ...editedDuringSave, agentMode: 'plan' });
   });
