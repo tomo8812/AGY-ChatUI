@@ -132,12 +132,13 @@ interface SessionState {
   cwd: string;
   modelId: string;
   effortValue: string;
+  mode: string;
   systemPromptText: string | null;
   history: string[];
   cancelled: boolean;
 }
 
-function buildConfigOptions(modelId: string, effortValue: string): SessionConfigOption[] {
+function buildConfigOptions({ modelId, effortValue, mode }: SessionState): SessionConfigOption[] {
   const isFlash = modelId === 'gemini-2.5-flash';
   const effortOptions = isFlash
     ? [
@@ -152,6 +153,19 @@ function buildConfigOptions(modelId: string, effortValue: string): SessionConfig
   const validEffort = effortOptions.some((o) => o.value === effortValue) ? effortValue : effortOptions[0].value;
 
   return [
+    {
+      id: 'mode',
+      name: 'Agent Mode',
+      category: 'mode',
+      type: 'select',
+      currentValue: mode,
+      options: [
+        { value: 'default', name: 'Default' },
+        { value: 'accept-edits', name: 'Accept Edits' },
+        { value: 'auto', name: 'Auto' },
+        { value: 'plan', name: 'Plan' },
+      ],
+    },
     {
       id: 'model',
       name: 'Model',
@@ -325,6 +339,7 @@ function runAcpServer(): void {
         cwd: params.cwd,
         modelId: 'gemini-2.5-pro',
         effortValue: 'medium',
+        mode: 'default',
         systemPromptText: sysText,
         history: [],
         cancelled: false,
@@ -339,7 +354,7 @@ function runAcpServer(): void {
       });
       return {
         sessionId: id,
-        configOptions: buildConfigOptions(state.modelId, state.effortValue),
+        configOptions: buildConfigOptions(state),
       };
     })
     .onRequest(methods.agent.session.load, async ({ params, client }) => {
@@ -355,6 +370,7 @@ function runAcpServer(): void {
           cwd: params.cwd,
           modelId: 'gemini-2.5-pro',
           effortValue: 'medium',
+          mode: 'default',
           systemPromptText: null,
           history: [],
           cancelled: false,
@@ -369,7 +385,7 @@ function runAcpServer(): void {
         },
       });
       return {
-        configOptions: buildConfigOptions(state.modelId, state.effortValue),
+        configOptions: buildConfigOptions(state),
       };
     })
     .onRequest(methods.agent.session.resume, async ({ params, client }) => {
@@ -384,6 +400,7 @@ function runAcpServer(): void {
           cwd: params.cwd,
           modelId: 'gemini-2.5-pro',
           effortValue: 'medium',
+          mode: 'default',
           systemPromptText: null,
           history: [],
           cancelled: false,
@@ -398,7 +415,7 @@ function runAcpServer(): void {
         },
       });
       return {
-        configOptions: buildConfigOptions(state.modelId, state.effortValue),
+        configOptions: buildConfigOptions(state),
       };
     })
     .onRequest(methods.agent.session.setConfigOption, async ({ params, client }) => {
@@ -409,8 +426,10 @@ function runAcpServer(): void {
         state.modelId = params.value;
       } else if (params.configId === 'reasoning_effort' && typeof params.value === 'string') {
         state.effortValue = params.value;
+      } else if (params.configId === 'mode' && typeof params.value === 'string') {
+        state.mode = params.value;
       }
-      const configOptions = buildConfigOptions(state.modelId, state.effortValue);
+      const configOptions = buildConfigOptions(state);
       const effortOpt = configOptions.find((c) => c.id === 'reasoning_effort');
       if (effortOpt && effortOpt.type === 'select') {
         state.effortValue = effortOpt.currentValue;

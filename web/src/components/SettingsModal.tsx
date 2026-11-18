@@ -479,7 +479,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               {agentMode === null && (
                 <div>プロファイルに明示指定がないため、Antigravity が実行モードを決めます。</div>
               )}
-              <div>変更は次回の ACP ワーカー起動時に読み込まれます。</div>
+              <div>Antigravity が対応するモードは、新規チャットから反映されます。</div>
             </div>
             {agentModeError && <div className="error-box" role="alert">{agentModeError}</div>}
           </section>
