@@ -105,6 +105,8 @@ npm run dev:web
 
 新規プロファイルには `"agentMode": "auto"` を設定した `settings.json` を作成します。既存プロファイルにファイルがなければ、サーバー起動時に同じ初期設定を作成します。「設定」の「Antigravity エージェントモード」で選んだ値は、そのプロファイルの `settings.json` の `agentMode` に保存され、次回の ACP ワーカー起動時に読み込まれます。標準構成での保存先は `$DATA_ROOT/profiles/<user-id>/agy-home/.gemini/antigravity-cli/settings.json` です。
 
+`agentMode` がファイルにない場合は「CLI の既定モード」と表示します。この場合、Antigravity が実行モードを決めます。利用枠の取得に使う `agy -p /usage` は設定ファイルの一時コピーを使用します。[CLI の設定仕様](https://antigravity.google/docs/cli-settings)
+
 ChatUI の `SANDBOX_MODE` はサーバー側の bubblewrap 分離を制御します。Antigravity の Auto はネイティブのターミナルサンドボックスと承認判断を制御します。[Antigravity CLI の実行モード](https://antigravity.google/docs/cli/modes/) · [ACP 連携ガイド](https://antigravity.google/docs/cli/acp/)
 
 ## ディレクトリ構成

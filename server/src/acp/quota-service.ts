@@ -1,12 +1,13 @@
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
+import path from 'node:path';
 import { promisify } from 'node:util';
 import type { AppConfig } from '../config.js';
 import type { AppDatabase } from '../db/database.js';
 import { decryptSmallSecret } from '../auth/password.js';
 import type { SyncHub } from '../sync/hub.js';
 import type { QuotaBucket, QuotaSnapshotRecord } from '../types.js';
-import { buildAgyCommandSpec } from './env-isolation.js';
+import { buildAgyCommandSpec, prepareAgyUsageHome } from './env-isolation.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -278,12 +279,18 @@ export class QuotaService {
       geminiApiKey: apiKey,
       enableSandboxBwrap: false,
     });
-    return execFileAsync(spec.command, spec.args, {
-      cwd: profileDir,
-      env: spec.env,
-      timeout: 20_000,
-      maxBuffer: 1024 * 1024,
-    });
+    const usageHome = fs.mkdtempSync(path.join(profileDir, '.usage-home-'));
+    try {
+      prepareAgyUsageHome(profileDir, usageHome);
+      return await execFileAsync(spec.command, spec.args, {
+        cwd: usageHome,
+        env: { ...spec.env, HOME: usageHome, USERPROFILE: usageHome },
+        timeout: 20_000,
+        maxBuffer: 1024 * 1024,
+      });
+    } finally {
+      fs.rmSync(usageHome, { recursive: true, force: true });
+    }
   }
 
   private async doRefresh(userId: string): Promise<QuotaSnapshotRecord> {

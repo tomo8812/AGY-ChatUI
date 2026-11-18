@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { parseDelimitedUsageLines, parseUsageOutput } from '../src/acp/quota-service.js';
 import { createTestServer, registerAndBindAgy, TestApiClient } from './helpers/test-harness.js';
@@ -133,11 +134,15 @@ describe('Quota TSV Parsing, Pre-Chat Model/Effort Options, Cooldown Refresh, an
     expect(created.data.sessionOptions.currentEffortValue).toBe('medium');
   });
 
-  it('enforces cooldown for auto quota refresh while allowing explicit manual refreshes', async () => {
+  it('enforces quota refresh cooldown and preserves chat profile settings during usage checks', async () => {
     const srv = await createTestServer();
     cleanups.push(srv.cleanup);
 
-    const { client } = await registerAndBindAgy(srv.baseUrl, 'quotauser', 'user:quota@gmail.com');
+    const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'quotauser', 'user:quota@gmail.com');
+    const profileDir = srv.ctx.db.getAgyProfile(userId)!.profileDir;
+    const settingsFile = path.join(profileDir, '.gemini', 'antigravity-cli', 'settings.json');
+    const settings = '{ "agentMode": "auto", "toolPermission": "strict" }\n';
+    fs.writeFileSync(settingsFile, settings);
 
     const first = await client.request<{ quota: { status: string; fetchedAt: number } }>(
       'POST',
@@ -146,6 +151,7 @@ describe('Quota TSV Parsing, Pre-Chat Model/Effort Options, Cooldown Refresh, an
     );
     expect(first.status).toBe(200);
     expect(first.data.quota.status).toBe('ok');
+    expect(fs.readFileSync(settingsFile, 'utf8')).toBe(settings);
     const ts1 = first.data.quota.fetchedAt;
     expect(ts1).toBeGreaterThan(0);
 
@@ -170,6 +176,8 @@ describe('Quota TSV Parsing, Pre-Chat Model/Effort Options, Cooldown Refresh, an
     );
     expect(manual.status).toBe(200);
     expect(manual.data.quota.fetchedAt).toBeGreaterThan(ts1);
+    expect(fs.readFileSync(settingsFile, 'utf8')).toBe(settings);
+    expect(fs.readdirSync(profileDir).filter((name) => name.startsWith('.usage-home-'))).toEqual([]);
   });
 
   it('exposes consistent buildId on health, bootstrap, and WS hello for update detection', async () => {

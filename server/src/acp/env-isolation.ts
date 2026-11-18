@@ -450,6 +450,33 @@ function symlinkIfMissing(targetPath: string, linkPath: string): void {
   }
 }
 
+export function prepareAgyUsageHome(profileDir: string, usageHome: string): void {
+  const profile = path.resolve(profileDir);
+  for (const name of ['.mock-agy-auth.json', '.config', '.local', '.cache']) {
+    symlinkIfMissing(path.join(profile, name), path.join(usageHome, name));
+  }
+
+  // Share credentials and other CLI data, while letting the one-shot command
+  // normalize only its own copy of settings.json.
+  const settingsDir = path.join('.gemini', 'antigravity-cli');
+  for (const relativeDir of ['.gemini', settingsDir]) {
+    const source = path.join(profile, relativeDir);
+    const destination = path.join(usageHome, relativeDir);
+    fs.mkdirSync(destination, { recursive: true, mode: 0o700 });
+    const entries = fs.existsSync(source) ? fs.readdirSync(source) : [];
+    for (const name of entries) {
+      const from = path.join(source, name);
+      const to = path.join(destination, name);
+      if (relativeDir === '.gemini' && name === 'antigravity-cli') continue;
+      if (relativeDir === settingsDir && name === 'settings.json') {
+        fs.copyFileSync(from, to, fs.constants.COPYFILE_EXCL);
+      } else {
+        symlinkIfMissing(from, to);
+      }
+    }
+  }
+}
+
 export function ensurePerChatHomeDir(profileDir: string, workspaceDir: string): string {
   const profileAbs = path.resolve(profileDir);
   const workspaceAbs = path.resolve(workspaceDir);
