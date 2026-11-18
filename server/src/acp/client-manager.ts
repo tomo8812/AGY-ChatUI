@@ -1215,10 +1215,12 @@ export class AcpClientManager {
       .onRequest(methods.client.fs.readTextFile, async ({ params }) => {
         if (!workerRef) throw new RequestError(-32603, 'Worker uninitialized');
         try {
-          const { absPath } = resolveContainedExistingPath(
+          const hostCandidate = toHostWorkspacePath(
             workerRef.workspaceDir,
-            workspaceFilePath(workerRef, params.path)
+            workerRef.sandboxWorkspaceRoot,
+            params.path
           );
+          const { absPath } = resolveContainedExistingPath(workerRef.workspaceDir, hostCandidate);
           const raw = fs.readFileSync(absPath, 'utf8');
           const lines = raw.split(/\r?\n/);
           const start = params.line && params.line > 0 ? params.line - 1 : 0;

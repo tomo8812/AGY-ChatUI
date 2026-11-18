@@ -81,10 +81,18 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     writeWorkspaceTextFile(chat.workspaceDir, 'nested/notes.md', 'nested write');
     const nested = path.join(chat.workspaceDir, 'nested/notes.md');
     expect(fs.readFileSync(nested, 'utf8')).toBe('nested write');
+    fs.symlinkSync('nested', path.join(chat.workspaceDir, 'nested-link'));
+    writeWorkspaceTextFile(chat.workspaceDir, 'nested-link/via-directory.md', 'directory link write');
+    expect(fs.readFileSync(path.join(chat.workspaceDir, 'nested/via-directory.md'), 'utf8')).toBe('directory link write');
+    const fileLink = path.join(chat.workspaceDir, 'notes-link.md');
+    fs.symlinkSync('nested/notes.md', fileLink);
+    writeWorkspaceTextFile(chat.workspaceDir, 'notes-link.md', 'file link write');
+    expect(fs.lstatSync(fileLink).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(nested, 'utf8')).toBe('file link write');
     fs.chmodSync(nested, 0o400);
     if (process.getuid?.() !== 0) {
       expect(() => writeWorkspaceTextFile(chat.workspaceDir, 'nested/notes.md', 'denied')).toThrow();
-      expect(fs.readFileSync(nested, 'utf8')).toBe('nested write');
+      expect(fs.readFileSync(nested, 'utf8')).toBe('file link write');
     }
     const danglingLink = path.join(chat.workspaceDir, 'dangling.md');
     fs.symlinkSync(path.join(chat.workspaceDir, 'missing.md'), danglingLink);
