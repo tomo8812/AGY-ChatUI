@@ -12,22 +12,26 @@ import type {
   RunRecord,
   ToolCallItem,
 } from '../types';
+import { getMessageActivity } from '../utils/messageActivity';
 import { isAppleTouchHapticsFallback, triggerHaptic } from '../utils/haptics';
 import { EffortBar } from './EffortBar';
 import {
   CheckIcon,
   ChevronIcon,
   CloseIcon,
+  ComposeIcon,
   CopyIcon,
   FileIcon,
   FolderIcon,
   PlusIcon,
   RefreshIcon,
+  SearchIcon,
   SendIcon,
   ShieldIcon,
   SlashIcon,
   SparklesIcon,
   StopIcon,
+  TerminalIcon,
 } from './Icons';
 import { MarkdownContent } from './MarkdownContent';
 
@@ -62,27 +66,54 @@ const EMPTY_PERMS: PendingPermissionRecord[] = [];
 const EMPTY_ARTIFACTS: ArtifactRecord[] = [];
 const EMPTY_SELECT_OPTIONS: NonNullable<ParsedSessionOptions['configOptions']>[number]['options'] = [];
 
-const ThoughtsAccordion: React.FC<{ text: string; streaming?: boolean }> = React.memo(({ text, streaming }) => {
-  const [open, setOpen] = useState(Boolean(streaming));
-  if (!text.trim()) return null;
+function toolIsActive(tool: ToolCallItem): boolean {
+  return tool.status === 'pending' || tool.status === 'in_progress' ||
+    tool.subagentState === 'running' || tool.subagentState === 'requires_action';
+}
+
+function toolIcon(kind: ToolCallItem['kind']) {
+  switch (kind) {
+    case 'execute': return TerminalIcon;
+    case 'edit': return ComposeIcon;
+    case 'read': return FileIcon;
+    case 'search': return SearchIcon;
+    default: return SparklesIcon;
+  }
+}
+
+function toolSummary(tools: ToolCallItem[]): string {
+  const counts = new Map<string, number>();
+  for (const tool of tools) {
+    let label: string;
+    switch (tool.kind) {
+      case 'edit': label = 'ファイル編集'; break;
+      case 'execute': label = 'コマンド'; break;
+      case 'read': label = '読み取り'; break;
+      case 'search': label = '検索'; break;
+      default: label = 'ツール実行';
+    }
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  return [...counts].map(([label, count]) => `${label} ${count}件`).join(' · ');
+}
+
+const ToolActivity: React.FC<{ tools: ToolCallItem[] }> = ({ tools }) => {
+  const active = tools.findLast(toolIsActive);
+  const Icon = toolIcon(tools[0].kind);
 
   return (
-    <div className="owui-thoughts">
-      <button
-        type="button"
-        className={`owui-disclosure-btn ${streaming ? 'is-streaming' : ''}`}
-        onClick={() => setOpen((v) => !v)}
-        aria-expanded={open}
-      >
-        <span className="owui-disclosure-label">
-          {streaming ? '思考中...' : '思考プロセス'}
+    <details className="activity-tools">
+      <summary className="activity-summary">
+        {active ? <span className="owui-tool-spinner" aria-hidden="true" /> : <Icon size={15} />}
+        <span className="truncate" title={active?.title}>
+          {active ? `実行中 · ${active.subagentLabel || active.title}` : toolSummary(tools)}
         </span>
-        <ChevronIcon size={13} dir={open ? 'down' : 'right'} className="owui-disclosure-chevron" />
-      </button>
-      {open && <div className="owui-thoughts-body">{text}</div>}
-    </div>
+        <ChevronIcon size={13} dir="right" className="activity-chevron" />
+      </summary>
+      <ToolCallsList toolCalls={tools} />
+    </details>
   );
-});
+};
 
 function isSubagentTool(tc: ToolCallItem): boolean {
   if (tc.isSubagent) return true;
@@ -100,10 +131,8 @@ const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ too
       {toolCalls.map((tc) => {
         const isOpen = Boolean(openIds[tc.toolCallId]);
         const subagent = isSubagentTool(tc);
-        const isSubagentActive =
-          tc.subagentState === 'running' || tc.subagentState === 'requires_action';
-        const isRunning =
-          tc.status === 'in_progress' || tc.status === 'pending' || isSubagentActive;
+        const isRunning = toolIsActive(tc);
+        const Icon = toolIcon(tc.kind);
         const isFailed = tc.status === 'failed';
         const displayTitle = tc.subagentLabel || tc.title;
         const hasDetails =
@@ -123,11 +152,8 @@ const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ too
             <button
               type="button"
               className="owui-tool-head"
-              onClick={() => {
-                if (hasDetails) {
-                  setOpenIds((prev) => ({ ...prev, [tc.toolCallId]: !prev[tc.toolCallId] }));
-                }
-              }}
+              disabled={!hasDetails}
+              onClick={() => setOpenIds((prev) => ({ ...prev, [tc.toolCallId]: !prev[tc.toolCallId] }))}
               aria-expanded={hasDetails ? isOpen : undefined}
             >
               {isRunning ? (
@@ -135,15 +161,21 @@ const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ too
               ) : isFailed ? (
                 <CloseIcon size={13} className="owui-tool-icon-fail" />
               ) : (
-                <CheckIcon size={13} className="owui-tool-icon-ok" />
+                <Icon size={14} className="owui-tool-icon-ok" />
               )}
               {subagent && <span className="owui-subagent-tag">Subagent</span>}
-              <span className="owui-tool-title truncate">
+              <span className="owui-tool-title truncate" title={displayTitle}>
                 {isRunning ? `実行中: ${displayTitle}` : displayTitle}
               </span>
               {tc.subagentState && tc.subagentState !== 'idle' && (
                 <span className="muted-xs" style={{ marginLeft: 6 }}>
                   ({tc.subagentState})
+                </span>
+              )}
+              {tc.diffStats && (
+                <span className="activity-diff" aria-label={`${tc.diffStats.added} 行追加、${tc.diffStats.removed} 行削除`}>
+                  <span className="activity-diff-added">+{tc.diffStats.added}</span>
+                  <span className="activity-diff-removed">−{tc.diffStats.removed}</span>
                 </span>
               )}
               {isFailed && <span className="owui-tool-fail-label">失敗</span>}
@@ -309,12 +341,14 @@ const MessageRow: React.FC<{
     onResolveError,
   }) => {
     const [copied, setCopied] = useState(false);
+    const { blocks, answer, hasCurrentAnswer } = useMemo(() => getMessageActivity(msg), [msg]);
+    const isWorking = msg.status === 'streaming' && !hasCurrentAnswer;
 
     const handleCopy = useCallback(async () => {
-      await navigator.clipboard.writeText(msg.contentText);
+      await navigator.clipboard.writeText(answer);
       setCopied(true);
       setTimeout(() => setCopied(false), 1600);
-    }, [msg.contentText]);
+    }, [answer]);
 
     if (msg.role === 'user') {
       return (
@@ -341,11 +375,6 @@ const MessageRow: React.FC<{
       );
     }
 
-    const activeToolCall =
-      msg.status === 'streaming'
-        ? [...msg.toolCalls].reverse().find((t) => t.status === 'in_progress' || t.status === 'pending')
-        : undefined;
-
     return (
       <div className="msg-row assistant">
         <div className="assistant-body">
@@ -356,12 +385,34 @@ const MessageRow: React.FC<{
             </div>
           )}
 
-          <ThoughtsAccordion
-            text={msg.thoughtsText}
-            streaming={msg.status === 'streaming' && !msg.contentText}
-          />
-
-          <ToolCallsList toolCalls={msg.toolCalls} />
+          {blocks.length > 0 && (
+            <details className="message-activity" open={isWorking}>
+              <summary className="activity-summary">
+                {isWorking ? <span className="owui-tool-spinner" aria-hidden="true" /> : <SparklesIcon size={15} />}
+                <span>{isWorking ? '作業中' : '作業の履歴'}</span>
+                <ChevronIcon size={13} dir="right" className="activity-chevron" />
+              </summary>
+              <div className="activity-timeline">
+                {blocks.map((block) => {
+                  if (block.kind === 'tools') return <ToolActivity key={block.key} tools={block.tools} />;
+                  if (block.kind === 'thoughts') {
+                    return <div key={block.key} className="activity-thoughts">{block.text}</div>;
+                  }
+                  return (
+                    <div key={block.key} className="activity-commentary">
+                      <MarkdownContent
+                        content={block.text}
+                        chatId={chatId}
+                        messageStatus={msg.status}
+                        onOpenArtifact={onOpenArtifact}
+                        onResolveError={onResolveError}
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+            </details>
+          )}
 
           {msg.sessionMessages && msg.sessionMessages.length > 0 && (
             <div className="owui-tools-list" aria-label="セッション間メッセージ">
@@ -388,18 +439,18 @@ const MessageRow: React.FC<{
             />
           ))}
 
-          {msg.contentText ? (
+          {answer ? (
             <div className="assistant-markdown">
               <MarkdownContent
-                content={msg.contentText}
+                content={answer}
                 chatId={chatId}
                 messageStatus={msg.status}
                 onOpenArtifact={onOpenArtifact}
                 onResolveError={onResolveError}
               />
-              {msg.status === 'streaming' && <span className="stream-cursor" />}
+              {msg.status === 'streaming' && hasCurrentAnswer && <span className="stream-cursor" />}
             </div>
-          ) : msg.status === 'streaming' && !activeToolCall && !msg.thoughtsText.trim() ? (
+          ) : msg.status === 'streaming' && blocks.length === 0 ? (
             <div className="streaming-placeholder">
               <span className="pulse-dot" /> 応答を生成中...
             </div>
@@ -426,7 +477,7 @@ const MessageRow: React.FC<{
             </div>
           )}
 
-          {msg.status !== 'streaming' && msg.status !== 'queued' && msg.contentText && (
+          {msg.status !== 'streaming' && msg.status !== 'queued' && answer && (
             <div className="msg-actions">
               <button type="button" className="chip-btn" onClick={() => void handleCopy()}>
                 {copied ? <CheckIcon size={13} /> : <CopyIcon size={13} />}

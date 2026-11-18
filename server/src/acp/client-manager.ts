@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 import { Readable, Writable } from 'node:stream';
+import { fileURLToPath } from 'node:url';
+import { diffLines } from 'diff';
 import {
   client,
   methods,
@@ -22,6 +24,7 @@ import {
   type SessionConfigOption,
   type SessionNotification,
   type SessionUpdate,
+  type ToolCall,
 } from '@agentclientprotocol/sdk';
 import type { AppConfig } from '../config.js';
 import type { AppDatabase } from '../db/database.js';
@@ -45,6 +48,8 @@ import {
 } from '../files/link-resolver.js';
 import {
   detectMimeAndPreviewKind,
+  normalizeRelPath,
+  PathContainmentError,
   resolveContainedExistingPath,
   resolveContainedWriteTarget,
   sanitizeFileName,
@@ -57,6 +62,7 @@ import type {
   AttachmentRef,
   AvailableCommandItem,
   ChatRecord,
+  MessageActivity,
   PendingPermissionRecord,
   SessionMessageItem,
   SubagentActivityItem,
@@ -232,6 +238,51 @@ export function toHostWorkspacePath(
   return cleaned;
 }
 
+function workspaceFilePath(worker: WorkerInstance, acpPath: string): string {
+  const candidate = acpPath.startsWith('file:') ? fileURLToPath(acpPath) : acpPath;
+  if (candidate.includes('\\') || candidate.split('/').includes('..')) {
+    throw new PathContainmentError('無効な作業ファイルのパスです。');
+  }
+  if (!path.isAbsolute(candidate)) {
+    if (/^[a-z][a-z\d+.-]*:/i.test(candidate)) {
+      throw new PathContainmentError('ローカルファイルのパスを指定してください。');
+    }
+    return normalizeRelPath(candidate);
+  }
+
+  // Resolve absolute paths in the agent's namespace before using the host workspace.
+  const relative = path.relative(worker.sandboxWorkspaceRoot, candidate);
+  if (!relative || relative === '..' || relative.startsWith('../') || path.isAbsolute(relative)) {
+    throw new PathContainmentError('許可された作業領域外のファイルにはアクセスできません。');
+  }
+  return normalizeRelPath(relative);
+}
+
+function resolveWorkspaceWrite(worker: WorkerInstance, acpPath: string) {
+  const target = resolveContainedWriteTarget(worker.workspaceDir, workspaceFilePath(worker, acpPath));
+  const stat = fs.statSync(target.absPath, { throwIfNoEntry: false });
+  if (stat && (!stat.isFile() || stat.nlink !== 1)) {
+    throw new PathContainmentError('通常のファイルにのみ書き込めます。');
+  }
+  return target;
+}
+
+function summarizeToolDiff(content: ToolCall['content'] | null): ToolCallItem['diffStats'] {
+  const diffs = content?.filter((item) => item.type === 'diff');
+  if (!diffs?.length) return undefined;
+
+  const stats = { added: 0, removed: 0 };
+  for (const diff of diffs) {
+    const lines = diffLines(diff.oldText ?? '', diff.newText, { timeout: 25 });
+    if (!lines) return undefined;
+    for (const line of lines) {
+      if (line.added) stats.added += line.count;
+      if (line.removed) stats.removed += line.count;
+    }
+  }
+  return stats;
+}
+
 export interface ParsedSessionOptions {
   configOptions: AcpConfigOption[];
   modelOptionId: string | null;
@@ -318,6 +369,7 @@ interface ActiveTurnBridge {
   contentText: string;
   thoughtsText: string;
   toolCalls: ToolCallItem[];
+  activity: MessageActivity[];
   sessionMessages: SessionMessageItem[];
   lastDbFlushAt: number;
   pendingResolvers: Map<string, (outcome: RequestPermissionResponse) => void>;
@@ -907,6 +959,7 @@ export class AcpClientManager {
       contentText: '',
       thoughtsText: '',
       toolCalls: [],
+      activity: [],
       sessionMessages: [],
       lastDbFlushAt: nowInit,
       pendingResolvers: new Map(),
@@ -993,11 +1046,16 @@ export class AcpClientManager {
         worker.profileDir,
         chat.workspaceDir
       );
-      bridge.contentText = rewriteInternalPathsToWorkspace(
-        bridge.contentText,
-        worker.profileDir,
-        chat.workspaceDir
-      );
+      // Rewrite whole content spans so paths split across chunks are still resolved.
+      // Recalculate each span's offset in the rewritten message.
+      const contentSpans = bridge.activity.filter((entry) => entry.kind === 'content');
+      const originalContent = bridge.contentText;
+      bridge.contentText = '';
+      for (const [index, span] of contentSpans.entries()) {
+        const text = originalContent.slice(span.offset, contentSpans[index + 1]?.offset);
+        span.offset = bridge.contentText.length;
+        bridge.contentText += rewriteInternalPathsToWorkspace(text, worker.profileDir, chat.workspaceDir);
+      }
 
       // Ensure every newly synced brain deliverable is referenced in the assistant message
       for (const synced of bridge.syncedBrainFiles.values()) {
@@ -1060,11 +1118,14 @@ export class AcpClientManager {
         hintPaths,
       });
 
+      if (bridge.activity.at(-1)?.kind === 'content') bridge.activity.push({ kind: 'answer_end' });
+
       const finalStatus = response.stopReason === 'cancelled' ? 'cancelled' : 'completed';
       const updatedMsg = this.db.updateMessage(params.userId, params.assistantMessageId, {
         contentText: bridge.contentText,
         thoughtsText: bridge.thoughtsText,
         toolCalls: bridge.toolCalls,
+        activity: bridge.activity,
         sessionMessages: bridge.sessionMessages,
         artifactIds: newArtifacts.map((a) => a.id),
         status: finalStatus,
@@ -1128,6 +1189,7 @@ export class AcpClientManager {
         contentText: bridge.contentText,
         thoughtsText: bridge.thoughtsText,
         toolCalls: bridge.toolCalls,
+        activity: bridge.activity,
         sessionMessages: bridge.sessionMessages,
         status: 'error',
         errorMessage: err instanceof Error ? err.message : String(err),
@@ -1233,12 +1295,10 @@ export class AcpClientManager {
       .onRequest(methods.client.fs.readTextFile, async ({ params }) => {
         if (!workerRef) throw new RequestError(-32603, 'Worker uninitialized');
         try {
-          const hostCandidate = toHostWorkspacePath(
+          const { absPath } = resolveContainedExistingPath(
             workerRef.workspaceDir,
-            workerRef.sandboxWorkspaceRoot,
-            params.path
+            workspaceFilePath(workerRef, params.path)
           );
-          const { absPath } = resolveContainedExistingPath(workerRef.workspaceDir, hostCandidate);
           const raw = fs.readFileSync(absPath, 'utf8');
           const lines = raw.split(/\r?\n/);
           const start = params.line && params.line > 0 ? params.line - 1 : 0;
@@ -1251,12 +1311,7 @@ export class AcpClientManager {
       .onRequest(methods.client.fs.writeTextFile, async ({ params }) => {
         if (!workerRef) throw new RequestError(-32603, 'Worker uninitialized');
         try {
-          const hostCandidate = toHostWorkspacePath(
-            workerRef.workspaceDir,
-            workerRef.sandboxWorkspaceRoot,
-            params.path
-          );
-          const { absPath } = resolveContainedWriteTarget(workerRef.workspaceDir, hostCandidate);
+          const { absPath } = resolveWorkspaceWrite(workerRef, params.path);
           fs.mkdirSync(path.dirname(absPath), { recursive: true, mode: 0o700 });
           fs.writeFileSync(absPath, params.content, 'utf8');
           return {};
@@ -1279,24 +1334,28 @@ export class AcpClientManager {
 
         const prefs = this.db.getPreferences(turn.userId);
 
-        // Optional user preference: auto-approve strictly read-only workspace reads
-        if (prefs.autoApproveSafeReads && params.toolCall.kind === 'read') {
-          const allContained = (params.toolCall.locations ?? []).every((loc) => {
+        const { kind, locations } = params.toolCall;
+        const allowOnce = params.options.find((option) => option.kind === 'allow_once');
+        const autoApprove =
+          (kind === 'read' && prefs.autoApproveSafeReads) ||
+          (kind === 'edit' && prefs.autoApproveSafeWrites);
+
+        if (autoApprove && allowOnce && locations?.length) {
+          const worker = workerRef;
+          const allContained = locations.every(({ path: acpPath }) => {
             try {
-              const hostCandidate = toHostWorkspacePath(
-                workerRef!.workspaceDir,
-                workerRef!.sandboxWorkspaceRoot,
-                loc.path
-              );
-              resolveContainedExistingPath(workerRef!.workspaceDir, hostCandidate);
+              if (kind === 'read') {
+                const { absPath } = resolveContainedExistingPath(worker.workspaceDir, workspaceFilePath(worker, acpPath));
+                return fs.statSync(absPath).isFile();
+              }
+              resolveWorkspaceWrite(worker, acpPath);
               return true;
             } catch {
               return false;
             }
           });
-          const allowOpt = params.options.find((o) => o.kind === 'allow_once' || o.kind === 'allow_always');
-          if (allContained && allowOpt) {
-            return { outcome: { outcome: 'selected' as const, optionId: allowOpt.optionId } };
+          if (allContained) {
+            return { outcome: { outcome: 'selected' as const, optionId: allowOnce.optionId } };
           }
         }
 
@@ -1601,6 +1660,7 @@ export class AcpClientManager {
       worker.workspaceDir
     );
     const offset = turn.contentText.length;
+    const activityIndex = this.recordTextActivity(turn, 'content', offset);
     turn.contentText += chunk;
     turn.textAfterLastToolCall += chunk;
     turn.lastActivityAt = Date.now();
@@ -1612,6 +1672,7 @@ export class AcpClientManager {
       payload: {
         messageId: turn.assistantMessageId,
         field: 'content',
+        activityIndex,
         offset,
         chunk,
       },
@@ -2049,14 +2110,7 @@ export class AcpClientManager {
       });
     }
 
-    this.db.updateMessage(turn.userId, turn.assistantMessageId, { toolCalls: turn.toolCalls });
-    this.hub.emitEphemeral({
-      userId: worker.userId,
-      type: 'run.tool_update',
-      chatId: worker.chatId,
-      runId: turn.runId,
-      payload: { messageId: turn.assistantMessageId, toolCalls: turn.toolCalls },
-    });
+    this.publishToolActivity(worker, turn, targetToolCallId);
   }
 
   private handleChildSessionNotification(
@@ -2327,6 +2381,11 @@ export class AcpClientManager {
       contentText: latestAssistant.contentText,
       thoughtsText: latestAssistant.thoughtsText,
       toolCalls: [...latestAssistant.toolCalls],
+      activity: latestAssistant.activity?.length ? [...latestAssistant.activity] : [
+        ...(latestAssistant.thoughtsText ? [{ kind: 'thoughts', offset: 0 } as const] : []),
+        ...latestAssistant.toolCalls.map(({ toolCallId }) => ({ kind: 'tool' as const, toolCallId })),
+        ...(latestAssistant.contentText ? [{ kind: 'content', offset: 0 } as const, { kind: 'answer_end' } as const] : []),
+      ],
       sessionMessages: [...(latestAssistant.sessionMessages ?? [])],
       lastDbFlushAt: 0,
       pendingResolvers: new Map(),
@@ -2399,6 +2458,7 @@ export class AcpClientManager {
       contentText: bridge.contentText,
       thoughtsText: bridge.thoughtsText,
       toolCalls: bridge.toolCalls,
+      activity: bridge.activity,
       sessionMessages: bridge.sessionMessages,
       artifactIds: [...bridge.emittedArtifactIds],
     });
@@ -2601,6 +2661,7 @@ export class AcpClientManager {
       ) {
         turn.parentWakeupStarted = true;
       } else if (stateObj.state === 'idle' && turn.initialPromptDone) {
+        if (turn.activity.at(-1)?.kind === 'content') turn.activity.push({ kind: 'answer_end' });
         this.syncBrainDeliverablesMidTurn(worker, turn);
       }
       finalizeIfBackground(stateObj.state === 'idle');
@@ -2678,13 +2739,14 @@ export class AcpClientManager {
     }
 
     if (update.sessionUpdate === 'agent_thought_chunk') {
-      if (update.content.type === 'text') {
+      if (update.content.type === 'text' && update.content.text) {
         const offset = turn.thoughtsText.length;
         const chunk = rewriteInternalPathsToWorkspace(
           update.content.text,
           worker.profileDir,
           worker.workspaceDir
         );
+        const activityIndex = this.recordTextActivity(turn, 'thoughts', offset);
         turn.thoughtsText += chunk;
         this.hub.emitEphemeral({
           userId: worker.userId,
@@ -2694,6 +2756,7 @@ export class AcpClientManager {
           payload: {
             messageId: turn.assistantMessageId,
             field: 'thoughts',
+            activityIndex,
             offset,
             chunk,
           },
@@ -2719,12 +2782,15 @@ export class AcpClientManager {
         for (const tracked of turn.subagents.values()) {
           if (tracked.toolCallId === `subagent:${tracked.sessionId}`) {
             turn.toolCalls = turn.toolCalls.filter((t) => t.toolCallId !== tracked.toolCallId);
+            const activity = turn.activity.find((entry) => entry.kind === 'tool' && entry.toolCallId === tracked.toolCallId);
+            if (activity?.kind === 'tool') activity.toolCallId = update.toolCallId;
             tracked.toolCallId = update.toolCallId;
             break;
           }
         }
       }
       const contentText = this.extractToolCallContentAndSaveAssets(worker, turn, rawContent);
+      const diffStats = summarizeToolDiff(update.content);
       const boundSubagent = [...turn.subagents.values()].find(
         (s) => s.toolCallId === update.toolCallId
       );
@@ -2751,6 +2817,7 @@ export class AcpClientManager {
         rawOutput: update.rawOutput,
         locations: update.locations?.map((l) => ({ path: l.path, line: l.line })),
         ...(contentText ? { contentText } : {}),
+        ...(diffStats ? { diffStats } : {}),
       };
       const [nextTool] = scrubToolCallsInternalPaths(
         [nextToolRaw],
@@ -2764,14 +2831,7 @@ export class AcpClientManager {
       turn.textAfterLastToolCall = '';
       this.syncBrainDeliverablesMidTurn(worker, turn);
 
-      this.db.updateMessage(turn.userId, turn.assistantMessageId, { toolCalls: turn.toolCalls });
-      this.hub.emitEphemeral({
-        userId: worker.userId,
-        type: 'run.tool_update',
-        chatId: worker.chatId,
-        runId: turn.runId,
-        payload: { messageId: turn.assistantMessageId, toolCalls: turn.toolCalls },
-      });
+      this.publishToolActivity(worker, turn, nextTool.toolCallId);
       finalizeIfBackground();
       return;
     }
@@ -2802,12 +2862,15 @@ export class AcpClientManager {
         for (const tracked of turn.subagents.values()) {
           if (tracked.toolCallId === `subagent:${tracked.sessionId}`) {
             turn.toolCalls = turn.toolCalls.filter((t) => t.toolCallId !== tracked.toolCallId);
+            const activity = turn.activity.find((entry) => entry.kind === 'tool' && entry.toolCallId === tracked.toolCallId);
+            if (activity?.kind === 'tool') activity.toolCallId = update.toolCallId;
             tracked.toolCallId = update.toolCallId;
             break;
           }
         }
       }
       const contentText = this.extractToolCallContentAndSaveAssets(worker, turn, rawContent);
+      const diffStats = summarizeToolDiff(update.content);
 
       const effectiveStatus =
         update.status !== undefined && update.status !== null ? update.status : existing.status;
@@ -2827,6 +2890,7 @@ export class AcpClientManager {
           ? { locations: update.locations.map((l) => ({ path: l.path, line: l.line })) }
           : {}),
         ...(contentText ? { contentText } : {}),
+        ...(diffStats ? { diffStats } : {}),
       };
       const [merged] = scrubToolCallsInternalPaths(
         [mergedRaw],
@@ -2840,14 +2904,7 @@ export class AcpClientManager {
       turn.textAfterLastToolCall = '';
       this.syncBrainDeliverablesMidTurn(worker, turn);
 
-      this.db.updateMessage(turn.userId, turn.assistantMessageId, { toolCalls: turn.toolCalls });
-      this.hub.emitEphemeral({
-        userId: worker.userId,
-        type: 'run.tool_update',
-        chatId: worker.chatId,
-        runId: turn.runId,
-        payload: { messageId: turn.assistantMessageId, toolCalls: turn.toolCalls },
-      });
+      this.publishToolActivity(worker, turn, merged.toolCallId);
       finalizeIfBackground(isTerminalToolUpdate);
     }
   }
@@ -2859,8 +2916,33 @@ export class AcpClientManager {
       this.db.updateMessage(turn.userId, turn.assistantMessageId, {
         contentText: turn.contentText,
         thoughtsText: turn.thoughtsText,
+        activity: turn.activity,
       });
     }
+  }
+
+  private recordTextActivity(turn: ActiveTurnBridge, kind: 'content' | 'thoughts', offset: number): number {
+    if (turn.activity.at(-1)?.kind !== kind) turn.activity.push({ kind, offset });
+    return turn.activity.length - 1;
+  }
+
+  private publishToolActivity(worker: WorkerInstance, turn: ActiveTurnBridge, toolCallId: string): void {
+    if (!turn.activity.some((entry) => entry.kind === 'tool' && entry.toolCallId === toolCallId)) {
+      turn.activity.push({ kind: 'tool', toolCallId });
+    }
+    this.db.updateMessage(turn.userId, turn.assistantMessageId, {
+      contentText: turn.contentText,
+      thoughtsText: turn.thoughtsText,
+      toolCalls: turn.toolCalls,
+      activity: turn.activity,
+    });
+    this.hub.emitEphemeral({
+      userId: worker.userId,
+      type: 'run.tool_update',
+      chatId: worker.chatId,
+      runId: turn.runId,
+      payload: { messageId: turn.assistantMessageId, toolCalls: turn.toolCalls, activity: turn.activity },
+    });
   }
 
   private loadApiKeyForUser(userId: string): string | null {

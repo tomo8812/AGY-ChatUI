@@ -38,6 +38,7 @@ import type {
   AvailableCommandItem,
   BootstrapResponse,
   ChatRecord,
+  MessageActivity,
   MessageRecord,
   ParsedSessionOptions,
   PendingPermissionRecord,
@@ -77,6 +78,31 @@ function mergeDeltaText(existing: string, offset: number, chunk: string): { next
   }
   // If an intermediate delta was missed between snapshot HTTP & WS attach
   return { next: existing + chunk, gapDetected: true };
+}
+
+function newerMessage(current: MessageRecord, incoming: MessageRecord): MessageRecord {
+  if (current.updatedAt !== incoming.updatedAt) {
+    return current.updatedAt > incoming.updatedAt ? current : incoming;
+  }
+  if (incoming.status !== 'queued' && incoming.status !== 'streaming' && current.status === 'streaming') {
+    return incoming;
+  }
+  const currentTextLength = current.contentText.length + current.thoughtsText.length;
+  const incomingTextLength = incoming.contentText.length + incoming.thoughtsText.length;
+  if (
+    currentTextLength > incomingTextLength ||
+    (current.activity?.length ?? 0) > (incoming.activity?.length ?? 0) ||
+    (current.status === 'streaming' && incoming.status === 'queued')
+  ) {
+    return current;
+  }
+  return incoming;
+}
+
+function upsertMessage(messages: MessageRecord[], incoming: MessageRecord): MessageRecord[] {
+  return messages.some((message) => message.id === incoming.id)
+    ? messages.map((message) => message.id === incoming.id ? newerMessage(message, incoming) : message)
+    : [...messages, incoming];
 }
 
 export const App: React.FC = () => {
@@ -277,18 +303,7 @@ export const App: React.FC = () => {
       const merged = detail.messages.map((incoming) => {
         const existing = prevById.get(incoming.id);
         if (!existing) return incoming;
-        if (existing.updatedAt > incoming.updatedAt) {
-          return existing;
-        }
-        if (
-          existing.updatedAt === incoming.updatedAt &&
-          (existing.contentText.length + existing.thoughtsText.length >
-            incoming.contentText.length + incoming.thoughtsText.length ||
-            (existing.status === 'streaming' && incoming.status === 'queued'))
-        ) {
-          return existing;
-        }
-        return incoming;
+        return newerMessage(existing, incoming);
       });
       const mergedIds = new Set(merged.map((m) => m.id));
       for (const existing of prev) {
@@ -815,11 +830,7 @@ export const App: React.FC = () => {
       case 'message.updated': {
         const msg = p.message as MessageRecord | undefined;
         if (msg && evt.chatId === curChatId) {
-          setMessages((prev) =>
-            prev.some((m) => m.id === msg.id)
-              ? prev.map((m) => (m.id === msg.id ? msg : m))
-              : [...prev, msg]
-          );
+          setMessages((prev) => upsertMessage(prev, msg));
         }
         break;
       }
@@ -834,11 +845,7 @@ export const App: React.FC = () => {
         if (evt.chatId === curChatId) {
           if (run) setActiveRun(run);
           if (msg) {
-            setMessages((prev) =>
-              prev.some((m) => m.id === msg.id)
-                ? prev.map((m) => (m.id === msg.id ? msg : m))
-                : [...prev, msg]
-            );
+            setMessages((prev) => upsertMessage(prev, msg));
           }
         }
         break;
@@ -865,11 +872,7 @@ export const App: React.FC = () => {
             setPendingPermissions((prev) => prev.filter((perm) => perm.runId !== run.id));
           }
           if (msg) {
-            setMessages((prev) =>
-              prev.some((m) => m.id === msg.id)
-                ? prev.map((m) => (m.id === msg.id ? msg : m))
-                : [...prev, msg]
-            );
+            setMessages((prev) => upsertMessage(prev, msg));
           }
           setWorkspaceSyncToken((t) => t + 1);
         }
@@ -1030,22 +1033,25 @@ export const App: React.FC = () => {
       if (evt.type === 'run.delta') {
         const messageId = p.messageId as string;
         const field = p.field as 'content' | 'thoughts';
+        const textKey = field === 'content' ? 'contentText' : 'thoughtsText';
         const offset = Number(p.offset ?? 0);
         const chunk = String(p.chunk ?? '');
+        const activityIndex = typeof p.activityIndex === 'number' ? p.activityIndex : undefined;
         let gapDetected = false;
 
         setMessages((prev) =>
           prev.map((m) => {
             if (m.id !== messageId) return m;
-            if (field === 'content') {
-              const merged = mergeDeltaText(m.contentText, offset, chunk);
-              if (merged.gapDetected) gapDetected = true;
-              return { ...m, contentText: merged.next, status: 'streaming' };
-            } else {
-              const merged = mergeDeltaText(m.thoughtsText, offset, chunk);
-              if (merged.gapDetected) gapDetected = true;
-              return { ...m, thoughtsText: merged.next, status: 'streaming' };
+            const merged = mergeDeltaText(m[textKey], offset, chunk);
+            const entries = m.activity ?? [];
+            let activity = m.activity;
+            if (activityIndex === entries.length) {
+              activity = [...entries, { kind: field, offset }];
             }
+            if (merged.gapDetected || (activityIndex !== undefined && activityIndex > entries.length)) {
+              gapDetected = true;
+            }
+            return { ...m, [textKey]: merged.next, activity, status: 'streaming' };
           })
         );
         if (gapDetected && evt.chatId) {
@@ -1057,8 +1063,9 @@ export const App: React.FC = () => {
       if (evt.type === 'run.tool_update') {
         const messageId = p.messageId as string;
         const toolCalls = (p.toolCalls as ToolCallItem[] | undefined) ?? [];
+        const activity = p.activity as MessageActivity[] | undefined;
         setMessages((prev) =>
-          prev.map((m) => (m.id === messageId ? { ...m, toolCalls } : m))
+          prev.map((m) => (m.id === messageId ? { ...m, toolCalls, activity: activity ?? m.activity } : m))
         );
       }
     },

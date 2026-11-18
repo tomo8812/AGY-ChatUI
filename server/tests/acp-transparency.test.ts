@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { MessageRecord } from '../src/types.js';
+import { getMessageActivity } from '../../web/src/utils/messageActivity.js';
 import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -13,6 +15,59 @@ afterEach(async () => {
 });
 
 describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
+  it('auto-approves contained edits and replays the activity in ACP order', async () => {
+    const srv = await createTestServer();
+    cleanups.push(srv.cleanup);
+    const { client } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+    const prefs = await client.request<{ preferences: { autoApproveSafeWrites: boolean } }>(
+      'PATCH', '/api/preferences', { autoApproveSafeReads: true, autoApproveSafeWrites: true }
+    );
+    expect(prefs.data.preferences.autoApproveSafeWrites).toBe(true);
+    await client.connectWs();
+
+    const { data: { chat } } = await client.request<{ chat: { id: string; workspaceDir: string } }>(
+      'POST', '/api/chats', {}
+    );
+    const url = `/api/chats/${chat.id}`;
+    await client.request('POST', `${url}/messages`, { text: '[ACTIVITY_SEQUENCE] [PERMISSION]' });
+    await client.waitForFrame((frame) =>
+      frame.kind === 'event' && (frame.event as { type: string }).type === 'run.finished'
+    );
+    expect(client.wsFrames.some((frame) =>
+      frame.kind === 'event' && (frame.event as { type: string }).type === 'permission.requested'
+    )).toBe(false);
+
+    const filename = path.join(chat.workspaceDir, 'created-by-tool.md');
+    const fileContent = fs.readFileSync(filename, 'utf8');
+    expect(fileContent).toContain('Created with user permission');
+
+    const detail = await client.request<{ messages: MessageRecord[] }>('GET', url);
+    const message = detail.data.messages.find((item) => item.role === 'assistant')!;
+    expect(message.activity?.map(({ kind }) => kind)).toEqual([
+      'thoughts', 'tool', 'tool', 'content', 'tool', 'content', 'answer_end',
+    ]);
+    const activity = getMessageActivity(message);
+    expect(activity.blocks.map(({ kind }) => kind)).toEqual(['thoughts', 'tools', 'commentary', 'tools']);
+    expect(activity.hasCurrentAnswer).toBe(true);
+    expect(message.toolCalls.at(-1)?.diffStats).toEqual({ added: 4, removed: 0 });
+    expect(activity.answer).toContain('created-by-tool.md');
+    expect(activity.answer).not.toContain('作業フォルダを確認しました');
+
+    // Replacing the same in-workspace path with an external symlink requires a decision.
+    const outside = path.join(path.dirname(chat.workspaceDir), 'external.md');
+    fs.renameSync(filename, outside);
+    fs.symlinkSync(outside, filename);
+    await client.request('POST', `${url}/messages`, { text: '[PERMISSION]' });
+    const permissionFrame = await client.waitForFrame((frame) =>
+      frame.kind === 'event' && (frame.event as { type: string }).type === 'permission.requested'
+    );
+    const { permission } = (permissionFrame.event as { payload: { permission: { id: string } } }).payload;
+    const rejection = await client.request('POST', `${url}/permissions/${permission.id}`, { optionId: 'reject_once' });
+    expect(rejection.status).toBe(200);
+    expect(fs.readFileSync(outside, 'utf8')).toBe(fileContent);
+    client.closeWs();
+  });
+
   it('handles delayed subagent_update after invoke_subagent completed, preserves native status & full child logs, and syncs background artifacts (#4, #5, #6, #10, #13, #18)', async () => {
     const srv = await createTestServer();
     cleanups.push(srv.cleanup);

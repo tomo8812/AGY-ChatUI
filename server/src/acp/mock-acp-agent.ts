@@ -831,6 +831,27 @@ function runAcpServer(): void {
         return { stopReason: 'end_turn' as const };
       }
 
+      if (promptText.includes('[ACTIVITY_SEQUENCE]')) {
+        for (const [index, title] of ['pwd', 'rg --files'].entries()) {
+          const toolCallId = `activity-command-${index}`;
+          await sendUpdate({
+            sessionId: state.id,
+            update: { sessionUpdate: 'tool_call', toolCallId, kind: 'execute', title, status: 'in_progress' },
+          });
+          await sendUpdate({
+            sessionId: state.id,
+            update: { sessionUpdate: 'tool_call_update', toolCallId, status: 'completed' },
+          });
+        }
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: '作業フォルダを確認しました。レポートを作成します。' },
+          },
+        });
+      }
+
       // Tool call & interactive permission check
       if (promptText.includes('[PERMISSION]')) {
         const toolCallId = `tc-${Date.now()}`;
@@ -871,14 +892,22 @@ function runAcpServer(): void {
 
         if (permRes.outcome.outcome === 'selected' && permRes.outcome.optionId.startsWith('allow')) {
           const targetPath = path.join(state.cwd, 'created-by-tool.md');
+          const newText = `# Created with user permission\n\nAccount: ${auth?.label ?? 'anon'}\nModel: ${state.modelId}\n`;
+          const oldText = fs.existsSync(targetPath) ? fs.readFileSync(targetPath, 'utf8') : null;
           await ctx.client.request(methods.client.fs.writeTextFile, {
             sessionId: state.id,
             path: targetPath,
-            content: `# Created with user permission\n\nAccount: ${auth?.label ?? 'anon'}\nModel: ${state.modelId}\n`,
+            content: newText,
           });
           await sendUpdate({
             sessionId: state.id,
-            update: { sessionUpdate: 'tool_call_update', toolCallId, status: 'completed', rawOutput: { wrote: 'created-by-tool.md' } },
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId,
+              status: 'completed',
+              content: [{ type: 'diff', path: targetPath, oldText, newText }],
+              rawOutput: { wrote: 'created-by-tool.md' },
+            },
           });
         } else {
           await sendUpdate({

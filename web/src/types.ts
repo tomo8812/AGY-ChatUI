@@ -233,7 +233,14 @@ export interface ToolCallItem {
   rawOutput?: unknown;
   locations?: Array<{ path: string; line?: number | null }>;
   contentText?: string;
+  diffStats?: { added: number; removed: number };
 }
+
+export type MessageActivity =
+  | { kind: 'content'; offset: number }
+  | { kind: 'thoughts'; offset: number }
+  | { kind: 'tool'; toolCallId: string }
+  | { kind: 'answer_end' };
 
 export interface MessageRecord {
   id: string;
@@ -244,6 +251,7 @@ export interface MessageRecord {
   contentText: string;
   thoughtsText: string;
   toolCalls: ToolCallItem[];
+  activity?: MessageActivity[];
   sessionMessages?: SessionMessageItem[];
   attachments: AttachmentRef[];
   artifactIds: string[];
@@ -327,6 +335,7 @@ export interface UserPreferences {
   userId: string;
   theme: 'system' | 'light' | 'dark';
   autoApproveSafeReads: boolean;
+  autoApproveSafeWrites: boolean;
   notifyOnResponse: boolean;
   hapticFeedback: boolean;
   defaultModelId: string | null;

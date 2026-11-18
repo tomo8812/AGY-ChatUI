@@ -121,6 +121,7 @@ export const api = {
         UserPreferences,
         | 'theme'
         | 'autoApproveSafeReads'
+        | 'autoApproveSafeWrites'
         | 'notifyOnResponse'
         | 'hapticFeedback'
         | 'defaultModelId'
