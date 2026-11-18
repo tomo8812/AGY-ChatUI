@@ -12,6 +12,7 @@ import {
   decodeBase64Url,
   encryptWebPushPayload,
   loadOrCreateVapidKeys,
+  PushNotificationService,
 } from '../src/notifications/web-push.js';
 import { createTestServer, registerAndBindAgy, TestApiClient } from './helpers/test-harness.js';
 
@@ -535,5 +536,114 @@ describe('Notifications & Pure-Node Web Push (RFC 8291 / 8292)', () => {
         (f.event as { type: string; runId?: string }).type === 'run.finished' &&
         (f.event as { runId?: string }).runId === permRun.data.run.id
     );
+  });
+
+  it('uses previewText on error notifications when errorMessage is omitted and neutral text when empty', async () => {
+    const receivedBodies: Array<{ title: string; body: string; tag: string }> = [];
+    const uaEcdh = crypto.createECDH('prime256v1');
+    const uaPub = uaEcdh.generateKeys();
+    const authSecret = crypto.randomBytes(16);
+
+    const mockPushServer = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: Buffer) => chunks.push(chunk));
+      req.on('end', () => {
+        const jsonText = decryptAes128GcmPayload({
+          encryptedBody: Buffer.concat(chunks),
+          uaEcdh,
+          authSecret,
+        });
+        const parsed = JSON.parse(jsonText) as { title: string; body: string; tag: string };
+        receivedBodies.push(parsed);
+        res.statusCode = 201;
+        res.end('Created');
+      });
+    });
+
+    await new Promise<void>((resolve) => mockPushServer.listen(0, '127.0.0.1', () => resolve()));
+    const addr = mockPushServer.address() as { port: number };
+    cleanups.push(
+      () => new Promise<void>((resolve) => mockPushServer.close(() => resolve()))
+    );
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-push-err-'));
+    cleanups.push(async () => fs.rmSync(tmpDir, { recursive: true, force: true }));
+    const db = new AppDatabase(path.join(tmpDir, 'test.db'));
+    cleanups.push(async () => db.close());
+
+    const user = db.createUser({
+      id: 'err-user-1',
+      username: 'erruser',
+      displayName: 'Err User',
+      passwordHash: 'hash',
+      role: 'user',
+      profileDir: path.join(tmpDir, 'profile'),
+    });
+    db.updatePreferences(user.id, { notifyOnResponse: true });
+    const chat = db.createChat({
+      id: 'err-chat-1',
+      userId: user.id,
+      projectId: null,
+      title: 'エラー検証',
+      workspaceDir: tmpDir,
+      modelId: null,
+      effortValue: null,
+      projectContextVersion: 0,
+    });
+    db.upsertPushSubscription({
+      id: 'sub-err-1',
+      userId: user.id,
+      endpoint: `http://127.0.0.1:${addr.port}/push/err`,
+      p256dh: uaPub.toString('base64url'),
+      auth: authSecret.toString('base64url'),
+      userAgent: 'Vitest-Error-Test',
+    });
+
+    const cfg = loadConfig({ PORT: '0', DATA_DIR: tmpDir, NODE_ENV: 'test' });
+    const pushService = new PushNotificationService(cfg, db);
+
+    await pushService.notifyRunFinished({
+      userId: user.id,
+      chatId: chat.id,
+      runId: 'run-err-1',
+      status: 'error',
+      previewText: 'ツール実行でエラーが発生しました',
+      tagOverride: 'run-err-1-wakeup-1',
+    });
+
+    await pushService.notifyRunFinished({
+      userId: user.id,
+      chatId: chat.id,
+      runId: 'run-err-2',
+      status: 'error',
+      previewText: '',
+      tagOverride: 'run-err-2-wakeup-1',
+    });
+
+    await pushService.notifyRunFinished({
+      userId: user.id,
+      chatId: chat.id,
+      runId: 'run-ok-empty',
+      status: 'completed',
+      previewText: '',
+      tagOverride: 'run-ok-empty-wakeup-1',
+    });
+
+    expect(receivedBodies).toHaveLength(3);
+    expect(receivedBodies[0]).toMatchObject({
+      tag: 'run-err-1-wakeup-1',
+      title: 'エラーで終了 — エラー検証',
+      body: 'ツール実行でエラーが発生しました',
+    });
+    expect(receivedBodies[1]).toMatchObject({
+      tag: 'run-err-2-wakeup-1',
+      title: 'エラーで終了 — エラー検証',
+      body: '応答の生成中にエラーが発生しました。',
+    });
+    expect(receivedBodies[2]).toMatchObject({
+      tag: 'run-ok-empty-wakeup-1',
+      title: 'エラー検証',
+      body: '応答が完了しました。',
+    });
   });
 });

@@ -385,7 +385,9 @@ export class PushNotificationService {
       params.status === 'error'
         ? {
             title: `エラーで終了 — ${cleanTitle}`,
-            body: truncatePreview(params.errorMessage || undefined, 120) || '応答の生成中にエラーが発生しました。',
+            body:
+              truncatePreview(params.errorMessage || params.previewText || undefined, 120) ||
+              '応答の生成中にエラーが発生しました。',
             tag,
             chatId: params.chatId,
             runId: params.runId,

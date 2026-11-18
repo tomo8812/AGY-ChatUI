@@ -2447,7 +2447,7 @@ export class AcpClientManager {
           turn.wakeupContentOffset = turn.contentText.length;
           completedWakeup = {
             wakeupSeq: turn.wakeupCount,
-            previewText: wakeupSlice || turn.contentText,
+            previewText: wakeupSlice,
             isError: stateObj.stopReason === 'error' || stateObj.stopReason === 'refusal',
           };
         }
@@ -2478,6 +2478,7 @@ export class AcpClientManager {
             runId: turn.runId,
             status,
             previewText: completedWakeup.previewText,
+            errorMessage: status === 'error' ? completedWakeup.previewText || undefined : undefined,
             tagOverride: tag,
           })
           .catch((err) => {
