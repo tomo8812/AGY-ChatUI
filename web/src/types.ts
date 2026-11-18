@@ -300,17 +300,6 @@ export interface ArtifactRecord {
   updatedAt: number;
 }
 
-export interface WorkspaceFileEntry {
-  relPath: string;
-  name: string;
-  sizeBytes: number;
-  mtimeMs: number;
-  updatedAt?: number;
-  isProjectContext: boolean;
-  previewKind: PreviewKind;
-  mimeType: string;
-}
-
 export interface QuotaBucket {
   model: string;
   group?: string;

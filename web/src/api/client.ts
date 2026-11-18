@@ -19,7 +19,6 @@ import type {
   SkillsListResponse,
   UserPreferences,
   WebUser,
-  WorkspaceFileEntry,
 } from '../types';
 
 export class ApiError extends Error {
@@ -251,10 +250,7 @@ export const api = {
       { method: 'POST', body: payload }
     ),
 
-  // Workspace & Artifacts
-  getWorkspace: (chatId: string) =>
-    apiFetch<{ files: WorkspaceFileEntry[]; artifacts: ArtifactRecord[] }>(`/api/chats/${chatId}/workspace`),
-
+  // Artifacts
   resolveLink: (chatId: string, reference: string) =>
     apiFetch<{ artifact: ArtifactRecord; previewUrl: string; downloadUrl: string }>(
       `/api/chats/${chatId}/resolve-link`,

@@ -4,6 +4,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { AppDatabase } from '../src/db/database.js';
 import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
@@ -50,7 +51,7 @@ describe('Brain Image Resolution, Haptics & Push Vibrate, Quota minAgeMs, and Ag
     }
   });
 
-  it('imports and serves authorized profile brain images into workspace while blocking dotdirs, oauth files, and other users', async () => {
+  it('serves files in the conversation brain while keeping profile files and other users outside that boundary', async () => {
     const srv = await createTestServer();
     cleanups.push(srv.cleanup);
 
@@ -64,8 +65,6 @@ describe('Brain Image Resolution, Haptics & Push Vibrate, Quota minAgeMs, and Ag
       'bob',
       'user:bob@gmail.com'
     );
-    await alice.connectWs({ clientId: 'alice-brain' });
-    cleanups.push(() => alice.closeWs());
 
     const aliceProfile = srv.ctx.db.getAgyProfile(aliceId)!;
     const bobProfile = srv.ctx.db.getAgyProfile(bobId)!;
@@ -80,7 +79,8 @@ describe('Brain Image Resolution, Haptics & Push Vibrate, Quota minAgeMs, and Ag
     // Seed authorized brain artifacts for Alice's chat inside its isolated brain root
     const cliBrainDir = path.join(chatBrainDir, 'sess-1');
     const jetskiBrainDir = path.join(chatBrainDir, 'sess-2');
-    const dotBrainDir = path.join(chatBrainDir, '.system_generated');
+    const segment = '資料'.repeat(40);
+    const dotBrainDir = path.join(chatBrainDir, '.exports', segment, segment, segment);
     fs.mkdirSync(cliBrainDir, { recursive: true });
     fs.mkdirSync(jetskiBrainDir, { recursive: true });
     fs.mkdirSync(dotBrainDir, { recursive: true });
@@ -89,12 +89,12 @@ describe('Brain Image Resolution, Haptics & Push Vibrate, Quota minAgeMs, and Ag
     const samplePng = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x00]);
     const aliceBrainJpg = path.join(aliceProfile.profileDir, '.gemini', 'antigravity-cli', 'brain', 'sess-1', 'miffy_custom.jpg');
     const aliceBrainPng = path.join(jetskiBrainDir, 'diagram.png');
-    const dotSecret = path.join(dotBrainDir, 'internal.txt');
+    const dotFile = path.join(dotBrainDir, 'report.txt');
     const oauthSecret = path.join(aliceProfile.profileDir, '.gemini', 'oauth_creds.json');
 
     fs.writeFileSync(path.join(cliBrainDir, 'miffy_custom.jpg'), sampleJpg);
     fs.writeFileSync(aliceBrainPng, samplePng);
-    fs.writeFileSync(dotSecret, 'internal metadata');
+    fs.writeFileSync(dotFile, 'report');
     fs.writeFileSync(oauthSecret, '{"token":"secret"}');
 
     // Bob's brain image must NOT be resolvable by Alice
@@ -111,7 +111,7 @@ describe('Brain Image Resolution, Haptics & Push Vibrate, Quota minAgeMs, and Ag
       reference: aliceBrainJpg,
     });
     expect(resRaw.status).toBe(200);
-    expect(resRaw.data.artifact.relPath).toBe('generated/miffy_custom.jpg');
+    expect(resRaw.data.artifact.relPath).toBe('/home/sandbox/.gemini/brain/sess-1/miffy_custom.jpg');
     expect(resRaw.data.artifact.previewKind).toBe('image');
 
     const imgFetch = await fetch(`${srv.baseUrl}${resRaw.data.previewUrl}`, {
@@ -127,12 +127,17 @@ describe('Brain Image Resolution, Haptics & Push Vibrate, Quota minAgeMs, and Ag
       reference: `file://${aliceBrainPng}#L1`,
     });
     expect(resUri.status).toBe(200);
-    expect(resUri.data.artifact.relPath).toBe('generated/diagram.png');
+    expect(resUri.data.artifact.relPath).toBe('/home/sandbox/.gemini/brain/sess-2/diagram.png');
 
-    // 3) Dot-directories (.system_generated), credential files, and other users' brain files are strictly blocked
-    expect(
-      (await alice.request('POST', `/api/chats/${chatId}/resolve-link`, { reference: dotSecret })).status
-    ).toBe(404);
+    // The encoded URI exceeds 2048 characters while the path fits in the filesystem.
+    const dotReference = pathToFileURL(dotFile).href;
+    expect(dotReference.length).toBeGreaterThan(2048);
+    const dotLink = await alice.request<{ previewUrl: string }>(
+      'POST', `/api/chats/${chatId}/resolve-link`, { reference: dotReference }
+    );
+    expect(dotLink.status).toBe(200);
+    expect((await alice.request<string>('GET', dotLink.data.previewUrl)).data).toBe('report');
+
     expect(
       (await alice.request('POST', `/api/chats/${chatId}/resolve-link`, { reference: oauthSecret })).status
     ).toBe(404);
@@ -140,54 +145,8 @@ describe('Brain Image Resolution, Haptics & Push Vibrate, Quota minAgeMs, and Ag
       (await alice.request('POST', `/api/chats/${chatId}/resolve-link`, { reference: `file://${bobBrainJpg}` })).status
     ).toBe(404);
 
-    // 4) Real ACP turn with [BRAIN_IMAGE] auto-imports generated brain image as artifact.created
-    const turnRes = await alice.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
-      text: 'イラスト描いて [BRAIN_IMAGE]',
-    });
-    expect(turnRes.status).toBe(202);
-
-    const artEvent = await alice.waitForFrame(
-      (f) =>
-        f.kind === 'event' &&
-        (f.event as { type: string; payload?: { artifact?: { filename?: string } } }).type === 'artifact.created' &&
-        (f.event as { payload?: { artifact?: { filename?: string } } }).payload?.artifact?.filename ===
-          'mock-brain-art.jpg'
-    );
-    const createdArt = (
-      artEvent.event as { payload: { artifact: { id: string; relPath: string; previewKind: string } } }
-    ).payload.artifact;
-    expect(createdArt.relPath).toBe('generated/mock-brain-art.jpg');
-    expect(createdArt.previewKind).toBe('image');
-
-    await alice.waitForFrame(
-      (f) =>
-        f.kind === 'event' &&
-        (f.event as { type: string; runId?: string }).type === 'run.finished' &&
-        (f.event as { runId?: string }).runId === turnRes.data.run.id
-    );
-
-    const chatDetail = await alice.request<{
-      artifacts: Array<{ id: string; relPath: string }>;
-      messages: Array<{ role: string; contentText: string; artifactIds: string[] }>;
-    }>('GET', `/api/chats/${chatId}`);
-    expect(chatDetail.data.artifacts.some((a) => a.id === createdArt.id)).toBe(true);
-    const assistantMsg = chatDetail.data.messages.find((m) => m.role === 'assistant');
-    expect(assistantMsg?.artifactIds).toContain(createdArt.id);
-
-    // Resolving the same file:// brain path mentioned in the message reuses the imported artifact ID cleanly
-    const match = /file:\/\/([^\s)]+\.jpg)/.exec(assistantMsg?.contentText ?? '');
-    expect(match).not.toBeNull();
-    const resolvedSame = await alice.request<{ artifact: { id: string; relPath: string } }>(
-      'POST',
-      `/api/chats/${chatId}/resolve-link`,
-      { reference: `file://${match![1]}` }
-    );
-    expect(resolvedSame.status).toBe(200);
-    expect(resolvedSame.data.artifact.id).toBe(createdArt.id);
-
-    // Confirm Bob gets 404 trying to access Alice's artifact content
-    const bobReadAliceFile = await bob.request('GET', `/api/files/${createdArt.id}/content`);
-    expect(bobReadAliceFile.status).toBe(404);
+    expect(fs.existsSync(path.join(chatRes.data.chat.workspaceDir, 'generated'))).toBe(false);
+    expect((await bob.request('GET', `/api/files/${resRaw.data.artifact.id}/content`)).status).toBe(404);
   });
 
   it('migrates haptic_feedback column safely, persists preferences, and includes vibrate patterns in Web Push payloads when enabled', async () => {

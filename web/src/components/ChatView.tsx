@@ -33,7 +33,7 @@ import {
   StopIcon,
   TerminalIcon,
 } from './Icons';
-import { MarkdownContent } from './MarkdownContent';
+import { FileReferenceLink, MarkdownContent, type FileLinkProps } from './MarkdownContent';
 
 interface ChatViewProps {
   chat: ChatRecord | null;
@@ -97,7 +97,7 @@ function toolSummary(tools: ToolCallItem[]): string {
   return [...counts].map(([label, count]) => `${label} ${count}件`).join(' · ');
 }
 
-const ToolActivity: React.FC<{ tools: ToolCallItem[] }> = ({ tools }) => {
+const ToolActivity: React.FC<FileLinkProps & { tools: ToolCallItem[] }> = ({ tools, ...fileLinks }) => {
   const active = tools.findLast(toolIsActive);
   const Icon = toolIcon(tools[0].kind);
 
@@ -110,7 +110,7 @@ const ToolActivity: React.FC<{ tools: ToolCallItem[] }> = ({ tools }) => {
         </span>
         <ChevronIcon size={13} dir="right" className="activity-chevron" />
       </summary>
-      <ToolCallsList toolCalls={tools} />
+      <ToolCallsList toolCalls={tools} {...fileLinks} />
     </details>
   );
 };
@@ -122,7 +122,25 @@ function isSubagentTool(tc: ToolCallItem): boolean {
   );
 }
 
-const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ toolCalls }) => {
+function toolOutputStatus(tool: ToolCallItem): MessageRecord['status'] {
+  return toolIsActive(tool) ? 'streaming' : 'completed';
+}
+
+const ToolLocations: React.FC<FileLinkProps & { locations: ToolCallItem['locations'] }> = ({ locations, ...fileLinks }) => {
+  if (!locations?.length) return null;
+  return (
+    <div className="muted-xs">
+      対象: {locations.map((location, index) => (
+        <React.Fragment key={index}>
+          {index > 0 && ', '}
+          <FileReferenceLink reference={location.path} {...fileLinks} />
+        </React.Fragment>
+      ))}
+    </div>
+  );
+};
+
+const ToolCallsList: React.FC<FileLinkProps & { toolCalls: ToolCallItem[] }> = React.memo(({ toolCalls, ...fileLinks }) => {
   const [openIds, setOpenIds] = useState<Record<string, boolean>>({});
   if (!toolCalls || toolCalls.length === 0) return null;
 
@@ -131,7 +149,8 @@ const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ too
       {toolCalls.map((tc) => {
         const isOpen = Boolean(openIds[tc.toolCallId]);
         const subagent = isSubagentTool(tc);
-        const isRunning = toolIsActive(tc);
+        const messageStatus = toolOutputStatus(tc);
+        const isRunning = messageStatus === 'streaming';
         const Icon = toolIcon(tc.kind);
         const isFailed = tc.status === 'failed';
         const displayTitle = tc.subagentLabel || tc.title;
@@ -185,16 +204,14 @@ const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ too
             </button>
             {isOpen && hasDetails && (
               <div className="owui-tool-body">
-                {tc.locations && tc.locations.length > 0 && (
-                  <div className="muted-xs">
-                    対象: {tc.locations.map((l) => l.path).join(', ')}
-                  </div>
+                <ToolLocations locations={tc.locations} {...fileLinks} />
+                {tc.contentText && (
+                  <MarkdownContent content={tc.contentText} messageStatus={messageStatus} {...fileLinks} />
                 )}
-                {tc.contentText && <pre className="tool-json">{tc.contentText}</pre>}
                 {tc.subagentThoughtsText && (
                   <div style={{ marginTop: 6 }}>
                     <div className="muted-xs">Subagent Thoughts</div>
-                    <pre className="tool-json">{tc.subagentThoughtsText}</pre>
+                    <MarkdownContent content={tc.subagentThoughtsText} messageStatus={messageStatus} {...fileLinks} />
                   </div>
                 )}
                 {tc.subagentToolCalls && tc.subagentToolCalls.length > 0 && (
@@ -203,7 +220,10 @@ const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ too
                     {tc.subagentToolCalls.map((stc) => (
                       <div key={stc.toolCallId} className="muted-xs" style={{ marginTop: 2 }}>
                         [{stc.status}] {stc.title}
-                        {stc.contentText ? `: ${stc.contentText}` : ''}
+                        <ToolLocations locations={stc.locations} {...fileLinks} />
+                        {stc.contentText && (
+                          <MarkdownContent content={stc.contentText} messageStatus={toolOutputStatus(stc)} {...fileLinks} />
+                        )}
                       </div>
                     ))}
                   </div>
@@ -211,7 +231,7 @@ const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ too
                 {tc.subagentContentText && (
                   <div style={{ marginTop: 6 }}>
                     <div className="muted-xs">Subagent Output</div>
-                    <pre className="tool-json">{tc.subagentContentText}</pre>
+                    <MarkdownContent content={tc.subagentContentText} messageStatus={messageStatus} {...fileLinks} />
                   </div>
                 )}
                 {tc.rawInput !== undefined && (
@@ -394,12 +414,19 @@ const MessageRow: React.FC<{
               </summary>
               <div className="activity-timeline">
                 {blocks.map((block) => {
-                  if (block.kind === 'tools') return <ToolActivity key={block.key} tools={block.tools} />;
-                  if (block.kind === 'thoughts') {
-                    return <div key={block.key} className="activity-thoughts">{block.text}</div>;
+                  if (block.kind === 'tools') {
+                    return (
+                      <ToolActivity
+                        key={block.key}
+                        tools={block.tools}
+                        chatId={chatId}
+                        onOpenArtifact={onOpenArtifact}
+                        onResolveError={onResolveError}
+                      />
+                    );
                   }
                   return (
-                    <div key={block.key} className="activity-commentary">
+                    <div key={block.key} className={block.kind === 'thoughts' ? 'activity-thoughts' : 'activity-commentary'}>
                       <MarkdownContent
                         content={block.text}
                         chatId={chatId}
@@ -423,7 +450,15 @@ const MessageRow: React.FC<{
                       セッション間メッセージ{sm.senderSessionId ? ` (${sm.senderSessionId})` : ''}
                       {!sm.done ? ' [受信中]' : ''}
                     </div>
-                    {sm.contentText && <pre className="tool-json">{sm.contentText}</pre>}
+                    {sm.contentText && (
+                      <MarkdownContent
+                        content={sm.contentText}
+                        chatId={chatId}
+                        messageStatus={sm.done ? 'completed' : 'streaming'}
+                        onOpenArtifact={onOpenArtifact}
+                        onResolveError={onResolveError}
+                      />
+                    )}
                   </div>
                 </div>
               ))}
