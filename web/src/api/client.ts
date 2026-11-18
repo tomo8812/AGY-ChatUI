@@ -446,6 +446,12 @@ export const api = {
   getNotificationConfig: () =>
     apiFetch<{ vapidPublicKey: string; subscriptionCount: number }>('/api/notifications/config'),
 
+  getNotificationStatus: (endpoint?: string | null) =>
+    apiFetch<{ registeredOnServer: boolean; subscriptionCount: number }>('/api/notifications/status', {
+      method: 'POST',
+      body: endpoint ? { endpoint } : {},
+    }),
+
   subscribePush: (payload: {
     endpoint: string;
     keys: { p256dh: string; auth: string };
@@ -462,9 +468,15 @@ export const api = {
       body: { endpoint },
     }),
 
-  sendTestPush: () =>
-    apiFetch<{ sent: number; failed: number; removed: number; total: number; lastError?: string }>(
-      '/api/notifications/test',
-      { method: 'POST', body: {} }
-    ),
+  sendTestPush: (endpoint?: string | null) =>
+    apiFetch<{
+      sent: number;
+      failed: number;
+      removed: number;
+      total: number;
+      lastError?: string;
+      currentDeviceRegistered?: boolean;
+      currentDeviceSent?: boolean;
+      currentDeviceError?: string;
+    }>('/api/notifications/test', { method: 'POST', body: endpoint ? { endpoint } : {} }),
 };

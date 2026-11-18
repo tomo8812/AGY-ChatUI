@@ -1473,6 +1473,13 @@ export class AppDatabase {
     return Number(row.cnt);
   }
 
+  hasPushSubscription(userId: string, endpoint: string): boolean {
+    const row = this.db
+      .prepare('SELECT 1 AS ok FROM push_subscriptions WHERE user_id = ? AND endpoint = ? LIMIT 1')
+      .get(userId, endpoint) as { ok?: number } | undefined;
+    return Boolean(row?.ok);
+  }
+
   deletePushSubscriptionByEndpoint(userId: string, endpoint: string): boolean {
     const info = this.db
       .prepare('DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint = ?')

@@ -310,13 +310,17 @@ export class ExecutionScheduler {
       });
 
       if (status !== 'cancelled') {
-        void this.pushService?.notifyRunFinished({
-          userId: job.userId,
-          chatId: job.chatId,
-          runId: job.runId,
-          status,
-          previewText: finalMsg.contentText,
-        });
+        void this.pushService
+          ?.notifyRunFinished({
+            userId: job.userId,
+            chatId: job.chatId,
+            runId: job.runId,
+            status,
+            previewText: finalMsg.contentText,
+          })
+          .catch((err) => {
+            console.warn('[scheduler] Push notification failed:', err);
+          });
         void this.quotaService?.refreshOnDemand(job.userId, { auto: true, minAgeMs: 5_000 }).catch(() => {});
       }
     } catch (err) {
@@ -344,13 +348,17 @@ export class ExecutionScheduler {
       });
 
       if (!isCancelled) {
-        void this.pushService?.notifyRunFinished({
-          userId: job.userId,
-          chatId: job.chatId,
-          runId: job.runId,
-          status: 'error',
-          errorMessage: errorMsg,
-        });
+        void this.pushService
+          ?.notifyRunFinished({
+            userId: job.userId,
+            chatId: job.chatId,
+            runId: job.runId,
+            status: 'error',
+            errorMessage: errorMsg,
+          })
+          .catch((pushErr) => {
+            console.warn('[scheduler] Error push notification failed:', pushErr);
+          });
         void this.quotaService?.refreshOnDemand(job.userId, { auto: true, minAgeMs: 5_000 }).catch(() => {});
       }
     } finally {

@@ -108,7 +108,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     maxUploadBytes: parsePositiveInt(process.env.MAX_UPLOAD_MB, 50) * 1024 * 1024,
     allowPublicSignup: parseBool(process.env.ALLOW_PUBLIC_SIGNUP, true),
     secureCookies,
-    vapidSubject: process.env.VAPID_SUBJECT ?? 'mailto:notifications@antigravity.local',
+    vapidSubject: process.env.VAPID_SUBJECT ?? 'https://github.com/tomo8812/AGY-ChatUI',
   };
 
   const merged = { ...base, ...overrides };

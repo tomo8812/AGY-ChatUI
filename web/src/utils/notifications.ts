@@ -55,12 +55,11 @@ async function getSwRegistration(): Promise<ServiceWorkerRegistration | null> {
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return null;
   try {
     const existing = await navigator.serviceWorker.getRegistration();
-    if (existing) {
-      if (existing.active) return existing;
-    }
+    if (existing?.active) return existing;
+
     const ready = await Promise.race<ServiceWorkerRegistration | null>([
       navigator.serviceWorker.ready,
-      new Promise<null>((resolve) => window.setTimeout(() => resolve(null), 2000)),
+      new Promise<null>((resolve) => window.setTimeout(() => resolve(null), 8000)),
     ]);
     return ready ?? existing ?? null;
   } catch {
@@ -76,6 +75,62 @@ export async function getActivePushSubscription(): Promise<PushSubscription | nu
     return await reg.pushManager.getSubscription();
   } catch {
     return null;
+  }
+}
+
+export function formatPushFailureReason(reason?: string): string {
+  switch (reason) {
+    case 'notification_unsupported':
+      return isAppleMobileBrowser() && !isStandalonePwa()
+        ? 'iPhone/iPadではSafari共有メニューから「ホーム画面に追加」したアプリとして開く必要があります。'
+        : 'このブラウザは通知APIに未対応です（HTTPSまたはlocalhostでアクセスしてください）。';
+    case 'permission_not_granted':
+      return 'ブラウザの通知権限が許可されていません。';
+    case 'push_unsupported':
+      return 'この環境はバックグラウンドWeb Push（PushManager / Service Worker）に対応していません。';
+    case 'sw_unavailable':
+      return 'Service Workerがまだ有効化されていません。ページを再読み込みしてからお試しください。';
+    case 'missing_keys':
+      return 'ブラウザからPush暗号鍵を取得できませんでした。';
+    default:
+      return reason ? `Web Push登録エラー: ${reason}` : 'この端末をWeb Pushに登録できませんでした。';
+  }
+}
+
+export async function getDevicePushSyncStatus(): Promise<{
+  hasLocalSubscription: boolean;
+  endpoint: string | null;
+  registeredOnServer: boolean;
+  subscriptionCount: number;
+}> {
+  const sub = await getActivePushSubscription().catch(() => null);
+  const endpoint = sub?.endpoint ?? null;
+  try {
+    const status = await api.getNotificationStatus(endpoint);
+    return {
+      hasLocalSubscription: Boolean(sub),
+      endpoint,
+      registeredOnServer: status.registeredOnServer,
+      subscriptionCount: status.subscriptionCount,
+    };
+  } catch {
+    return {
+      hasLocalSubscription: Boolean(sub),
+      endpoint,
+      registeredOnServer: false,
+      subscriptionCount: 0,
+    };
+  }
+}
+
+export async function hasDisplayedNotificationTag(tag: string): Promise<boolean> {
+  const reg = await getSwRegistration();
+  if (!reg || typeof reg.getNotifications !== 'function') return false;
+  try {
+    const list = await reg.getNotifications({ tag });
+    return list.length > 0;
+  } catch {
+    return false;
   }
 }
 
