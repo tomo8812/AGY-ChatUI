@@ -98,9 +98,13 @@ export function ensureAgyProfileSettings(profileDir: string): void {
   withSettingsPath(profileDir, ensureSettings);
 }
 
-export function getAgyAgentMode(profileDir: string): string | null {
+export function getAgyAgentMode(profileDir: string, { createIfMissing = true } = {}): string | null {
   return withSettingsPath(profileDir, (file) => {
-    ensureSettings(file);
+    if (createIfMissing) {
+      ensureSettings(file);
+    } else if (!fs.lstatSync(file, { throwIfNoEntry: false })) {
+      return null;
+    }
     return withSettingsFile(file, fs.constants.O_RDONLY, (fd) => {
       const { agentMode } = parseSettings(fs.readFileSync(fd));
       return typeof agentMode === 'string' ? agentMode : null;

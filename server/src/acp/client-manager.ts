@@ -74,6 +74,7 @@ import {
   SANDBOX_HOME_MOUNT,
   SANDBOX_WORKSPACE_MOUNT,
 } from './env-isolation.js';
+import { AGY_AGENT_MODES, getAgyAgentMode } from './profile-settings.js';
 
 export function classifySubagentToolCall(params: {
   name?: string;
@@ -1507,6 +1508,36 @@ export class AcpClientManager {
         .catch(() => null);
       if (res) {
         parsedOptions = normalizeConfigOptions(res.configOptions, earlyAvailableCommands);
+      }
+    }
+
+    // Agy ACP can report Default on session/new even when the profile specifies another mode.
+    if (!restoredExistingSession) {
+      let savedMode: string | null = null;
+      try {
+        savedMode = getAgyAgentMode(profile.profileDir, { createIfMissing: false });
+      } catch {
+        // Keep the mode selected by Antigravity if the profile settings cannot be read.
+      }
+      const supportedMode = AGY_AGENT_MODES.find((value) => value === savedMode);
+      const requestedMode = supportedMode === '' ? 'default' : supportedMode;
+      const modeOption = parsedOptions.configOptions.find((item) => item.category === 'mode' || item.id === 'mode');
+      if (
+        requestedMode &&
+        modeOption &&
+        modeOption.currentValue !== requestedMode &&
+        modeOption.options.some((item) => item.value === requestedMode)
+      ) {
+        const res = await conn.agent
+          .request(methods.agent.session.setConfigOption, {
+            sessionId: acpSessionId,
+            configId: modeOption.id,
+            value: requestedMode,
+          })
+          .catch(() => null);
+        if (res) {
+          parsedOptions = normalizeConfigOptions(res.configOptions, earlyAvailableCommands);
+        }
       }
     }
 

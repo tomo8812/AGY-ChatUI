@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { MessageRecord } from '../src/types.js';
+import type { AcpConfigOption, MessageRecord } from '../src/types.js';
 import { PathContainmentError, resolveContainedWriteTarget, supportsWorkspaceTextWrites, writeWorkspaceTextFile } from '../src/files/workspace.js';
 import { getMessageActivity } from '../../web/src/utils/messageActivity.js';
 import { newerMessage } from '../../web/src/utils/messageSnapshot.js';
@@ -17,6 +17,52 @@ afterEach(async () => {
 });
 
 describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
+  it('passes the saved agent mode to new sessions and leaves restored sessions to ACP', async () => {
+    const srv = await createTestServer();
+    cleanups.push(srv.cleanup);
+    const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+    type ChatResponse = {
+      chat: { id: string };
+      sessionOptions: { configOptions: AcpConfigOption[] } | null;
+    };
+    const getMode = (data: ChatResponse) =>
+      data.sessionOptions?.configOptions.find((option) => option.category === 'mode')?.currentValue;
+
+    const autoChat = await client.request<ChatResponse>('POST', '/api/chats', { title: 'Auto' });
+    expect(autoChat.status).toBe(201);
+    expect(getMode(autoChat.data)).toBe('auto');
+
+    expect((await client.request('PATCH', '/api/agy/agent-mode', { agentMode: 'plan' })).status).toBe(200);
+    const planChat = await client.request<ChatResponse>('POST', '/api/chats', { title: 'Plan' });
+    expect(planChat.status).toBe(201);
+    expect(getMode(planChat.data)).toBe('plan');
+
+    const chatUrl = `/api/chats/${planChat.data.chat.id}`;
+    expect((await client.request('PATCH', '/api/agy/agent-mode', { agentMode: 'auto' })).status).toBe(200);
+    expect(getMode((await client.request<ChatResponse>('GET', chatUrl)).data)).toBe('plan');
+    expect(await srv.ctx.acp.stopChatWorkerIfIdle(userId, planChat.data.chat.id)).toBe(true);
+    // The mock's session/load returns its native default in a fresh worker.
+    expect(getMode((await client.request<ChatResponse>('GET', chatUrl)).data)).toBe('default');
+
+    expect(await srv.ctx.acp.stopChatWorkerIfIdle(userId, planChat.data.chat.id)).toBe(true);
+    srv.ctx.db.updateChat(userId, planChat.data.chat.id, { acpSessionId: 'missing-session' });
+    expect(getMode((await client.request<ChatResponse>('GET', chatUrl)).data)).toBe('auto');
+
+    const profile = srv.ctx.db.getAgyProfile(userId)!;
+    const settingsFile = path.join(profile.profileDir, '.gemini', 'antigravity-cli', 'settings.json');
+    fs.writeFileSync(settingsFile, '{}');
+    const defaultChat = await client.request<ChatResponse>('POST', '/api/chats', { title: 'Native default' });
+    expect(defaultChat.status).toBe(201);
+    expect(getMode(defaultChat.data)).toBe('default');
+    expect(fs.readFileSync(settingsFile, 'utf8')).toBe('{}');
+
+    fs.unlinkSync(settingsFile);
+    const missingSettingsChat = await client.request<ChatResponse>('POST', '/api/chats', { title: 'Missing settings' });
+    expect(missingSettingsChat.status).toBe(201);
+    expect(getMode(missingSettingsChat.data)).toBe('default');
+    expect(fs.existsSync(settingsFile)).toBe(false);
+  });
+
   it.skipIf(!supportsWorkspaceTextWrites)('relays native ACP permission requests and replays activity in ACP order', async () => {
     const srv = await createTestServer();
     cleanups.push(srv.cleanup);
