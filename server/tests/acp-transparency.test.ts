@@ -44,6 +44,10 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     // The mock's session/load returns its native default in a fresh worker.
     expect(getMode((await client.request<ChatResponse>('GET', chatUrl)).data)).toBe('default');
 
+    expect(await srv.ctx.acp.stopChatWorkerIfIdle(userId, planChat.data.chat.id)).toBe(true);
+    srv.ctx.db.updateChat(userId, planChat.data.chat.id, { acpSessionId: 'missing-session' });
+    expect(getMode((await client.request<ChatResponse>('GET', chatUrl)).data)).toBe('auto');
+
     const profile = srv.ctx.db.getAgyProfile(userId)!;
     const settingsFile = path.join(profile.profileDir, '.gemini', 'antigravity-cli', 'settings.json');
     fs.writeFileSync(settingsFile, '{}');

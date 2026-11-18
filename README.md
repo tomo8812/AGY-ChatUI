@@ -103,7 +103,7 @@ npm run dev:web
 
 ツールの承認は Antigravity のネイティブ設定に従います。Antigravity が ACP で承認を求めたときは、ChatUI の承認カードで許可または拒否を選べます。
 
-新規プロファイルには `"agentMode": "auto"` を設定した `settings.json` を作成します。既存プロファイルにファイルがなければ、サーバー起動時に同じ初期設定を作成します。「設定」の「Antigravity エージェントモード」で選んだ値は、そのプロファイルの `settings.json` の `agentMode` に保存されます。新規チャットの作成時に、Antigravity がそのモードを選択肢として返した場合、ChatUI は保存値を公式 ACP API に渡します。標準構成での保存先は `$DATA_ROOT/profiles/<user-id>/agy-home/.gemini/antigravity-cli/settings.json` です。
+新規プロファイルには `"agentMode": "auto"` を設定した `settings.json` を作成します。既存プロファイルにファイルがなければ、サーバー起動時に同じ初期設定を作成します。「設定」の「Antigravity エージェントモード」で選んだ値は、そのプロファイルの `settings.json` の `agentMode` に保存されます。新しい ACP セッションの作成時に、Antigravity がそのモードを選択肢として返した場合、ChatUI は保存値を公式 ACP API に渡します。標準構成での保存先は `$DATA_ROOT/profiles/<user-id>/agy-home/.gemini/antigravity-cli/settings.json` です。
 
 `agentMode` がファイルにない場合は「CLI の既定モード」と表示します。この場合、Antigravity が実行モードを決めます。利用枠の取得に使う `agy -p /usage` は設定ファイルの一時コピーを使用します。[CLI の設定仕様](https://antigravity.google/docs/cli-settings)
 

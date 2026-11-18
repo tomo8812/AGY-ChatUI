@@ -1512,7 +1512,7 @@ export class AcpClientManager {
     }
 
     // Agy ACP can report Default on session/new even when the profile specifies another mode.
-    if (!chat.acpSessionId) {
+    if (!restoredExistingSession) {
       let savedMode: string | null = null;
       try {
         savedMode = getAgyAgentMode(profile.profileDir, { createIfMissing: false });
