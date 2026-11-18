@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { MessageRecord } from '../src/types.js';
 import { PathContainmentError, resolveContainedWriteTarget } from '../src/files/workspace.js';
 import { getMessageActivity } from '../../web/src/utils/messageActivity.js';
+import { newerMessage } from '../../web/src/utils/messageSnapshot.js';
 import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -47,6 +48,12 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     expect(message.activity?.map(({ kind }) => kind)).toEqual([
       'thoughts', 'tool', 'tool', 'content', 'tool', 'content', 'answer_end',
     ]);
+    const staleSnapshot = { ...message, status: 'streaming' } as const;
+    expect(newerMessage(message, staleSnapshot)).toBe(message);
+    expect(newerMessage(staleSnapshot, message)).toBe(message);
+    const laterSnapshot = { ...staleSnapshot, updatedAt: message.updatedAt + 1 };
+    expect(newerMessage(message, laterSnapshot)).toBe(laterSnapshot);
+
     const activity = getMessageActivity(message);
     expect(activity.blocks.map(({ kind }) => kind)).toEqual(['thoughts', 'tools', 'commentary', 'tools']);
     expect(activity.hasCurrentAnswer).toBe(true);

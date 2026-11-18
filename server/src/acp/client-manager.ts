@@ -236,11 +236,13 @@ export function toHostWorkspacePath(
 
 function workspaceFilePath(worker: WorkerInstance, acpPath: string): string {
   const candidate = acpPath.startsWith('file://') ? fileURLToPath(acpPath) : acpPath;
-  if (candidate.includes('\\') || candidate.split('/').includes('..')) {
+  const isWindows = path.sep === '\\';
+  const segments = isWindows ? candidate.split(/[\\/]/) : candidate.split('/');
+  if (segments.includes('..') || (!isWindows && candidate.includes('\\'))) {
     throw new PathContainmentError('無効な作業ファイルのパスです。');
   }
   if (!path.isAbsolute(candidate)) {
-    if (/^[a-z][a-z\d+.-]*:\/\//i.test(candidate)) {
+    if (/^[a-z][a-z\d+.-]*:\/\//i.test(candidate) || (isWindows && /^[a-z]:/i.test(candidate))) {
       throw new PathContainmentError('ローカルファイルのパスを指定してください。');
     }
     return normalizeRelPath(candidate);
@@ -248,7 +250,7 @@ function workspaceFilePath(worker: WorkerInstance, acpPath: string): string {
 
   // Resolve absolute paths in the agent's namespace before using the host workspace.
   const relative = path.relative(worker.sandboxWorkspaceRoot, candidate);
-  if (!relative || relative === '..' || relative.startsWith('../') || path.isAbsolute(relative)) {
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     throw new PathContainmentError('許可された作業領域外のファイルにはアクセスできません。');
   }
   return normalizeRelPath(relative);

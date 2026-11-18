@@ -28,6 +28,7 @@ import {
   seedChatArtifacts,
   setViewerCacheUser,
 } from './utils/viewerCache';
+import { newerMessage } from './utils/messageSnapshot';
 import type {
   AgyLoginFlowState,
   AgyProfile,
@@ -76,25 +77,6 @@ function mergeDeltaText(existing: string, offset: number, chunk: string): { next
   }
   // If an intermediate delta was missed between snapshot HTTP & WS attach
   return { next: existing + chunk, gapDetected: true };
-}
-
-function newerMessage(current: MessageRecord, incoming: MessageRecord): MessageRecord {
-  if (current.updatedAt !== incoming.updatedAt) {
-    return current.updatedAt > incoming.updatedAt ? current : incoming;
-  }
-  const currentIsTerminal = current.status !== 'queued' && current.status !== 'streaming';
-  const incomingIsTerminal = incoming.status !== 'queued' && incoming.status !== 'streaming';
-  if (currentIsTerminal !== incomingIsTerminal) return currentIsTerminal ? current : incoming;
-  const currentTextLength = current.contentText.length + current.thoughtsText.length;
-  const incomingTextLength = incoming.contentText.length + incoming.thoughtsText.length;
-  if (
-    currentTextLength > incomingTextLength ||
-    (current.activity?.length ?? 0) > (incoming.activity?.length ?? 0) ||
-    (current.status === 'streaming' && incoming.status === 'queued')
-  ) {
-    return current;
-  }
-  return incoming;
 }
 
 function upsertMessage(messages: MessageRecord[], incoming: MessageRecord): MessageRecord[] {
