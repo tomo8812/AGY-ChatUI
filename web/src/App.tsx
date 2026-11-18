@@ -28,7 +28,7 @@ import {
   seedChatArtifacts,
   setViewerCacheUser,
 } from './utils/viewerCache';
-import { newerMessage } from './utils/messageSnapshot';
+import { newerMessage, upsertMessage } from './utils/messageSnapshot';
 import type {
   AgyLoginFlowState,
   AgyProfile,
@@ -80,12 +80,6 @@ function mergeDeltaText(existing: string, offset: number, chunk: string): { next
 }
 
 type LiveMessage = MessageRecord & { deltaGap?: true };
-
-function upsertMessage(messages: MessageRecord[], incoming: MessageRecord): MessageRecord[] {
-  return messages.some((message) => message.id === incoming.id)
-    ? messages.map((message) => message.id === incoming.id ? newerMessage(message, incoming) : message)
-    : [...messages, incoming];
-}
 
 export const App: React.FC = () => {
   const [bootstrapping, setBootstrapping] = useState(true);

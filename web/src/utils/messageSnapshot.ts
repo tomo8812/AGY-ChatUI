@@ -1,9 +1,7 @@
 import type { MessageRecord } from '../types';
 
 export function newerMessage(current: MessageRecord, incoming: MessageRecord): MessageRecord {
-  if (current.updatedAt !== incoming.updatedAt) {
-    return current.updatedAt > incoming.updatedAt ? current : incoming;
-  }
+  if (incoming.updatedAt > current.updatedAt) return incoming;
   const currentIsTerminal = current.status !== 'queued' && current.status !== 'streaming';
   const incomingIsTerminal = incoming.status !== 'queued' && incoming.status !== 'streaming';
   if (currentIsTerminal && !incomingIsTerminal) return current;
@@ -18,4 +16,12 @@ export function newerMessage(current: MessageRecord, incoming: MessageRecord): M
     return current;
   }
   return incoming;
+}
+
+export function upsertMessage(messages: MessageRecord[], incoming: MessageRecord): MessageRecord[] {
+  const existingIndex = messages.findIndex((message) => message.id === incoming.id);
+  if (existingIndex === -1) return [...messages, incoming];
+  const next = messages.slice();
+  next[existingIndex] = newerMessage(messages[existingIndex], incoming);
+  return next;
 }
