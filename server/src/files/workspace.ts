@@ -55,7 +55,11 @@ export function resolveContainedExistingPath(rootDir: string, candidatePath: str
   return { absPath: candidateReal, relPath };
 }
 
-export function resolveContainedWriteTarget(rootDir: string, relPathRaw: string): {
+export function resolveContainedWriteTarget(
+  rootDir: string,
+  relPathRaw: string,
+  { allowSymlinks = true }: { allowSymlinks?: boolean } = {}
+): {
   absPath: string;
   relPath: string;
 } {
@@ -74,6 +78,7 @@ export function resolveContainedWriteTarget(rootDir: string, relPathRaw: string)
     walk = path.join(walk, segment);
     const stat = fs.lstatSync(walk, { throwIfNoEntry: false });
     if (stat?.isSymbolicLink()) {
+      if (!allowSymlinks) throw new PathContainmentError('シンボリックリンクへの書き込みは許可されていません。');
       try {
         resolveContainedExistingPath(rootReal, walk);
       } catch {
@@ -82,6 +87,57 @@ export function resolveContainedWriteTarget(rootDir: string, relPathRaw: string)
     }
   }
   return { absPath: targetAbs, relPath: rel };
+}
+
+export const supportsWorkspaceTextWrites = process.platform === 'linux' && fs.existsSync('/proc/self/fd');
+
+export function writeWorkspaceTextFile(rootDir: string, relativePath: string, content: string): void {
+  if (!supportsWorkspaceTextWrites) {
+    throw new PathContainmentError('この実行環境では ACP の作業ファイル書き込みを利用できません。');
+  }
+
+  const segments = normalizeRelPath(relativePath).split('/');
+  const filename = segments.pop()!;
+  const { O_DIRECTORY, O_NOFOLLOW, O_RDONLY, O_WRONLY, O_CREAT, O_EXCL } = fs.constants;
+  const directoryFlags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
+  let directory = fs.openSync(rootDir, directoryFlags);
+  try {
+    // Resolve each component relative to an open directory, with symlink following disabled.
+    for (const segment of segments) {
+      const child = `/proc/self/fd/${directory}/${segment}`;
+      try {
+        fs.mkdirSync(child, { mode: 0o700 });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      }
+      const next = fs.openSync(child, directoryFlags);
+      fs.closeSync(directory);
+      directory = next;
+    }
+
+    const parent = `/proc/self/fd/${directory}`;
+    const target = `${parent}/${filename}`;
+    const stat = fs.lstatSync(target, { throwIfNoEntry: false });
+    if (stat && (!stat.isFile() || stat.nlink !== 1)) {
+      throw new PathContainmentError('通常のファイルにのみ書き込めます。');
+    }
+
+    const temporary = `${parent}/.agy-write-${crypto.randomUUID()}`;
+    const fd = fs.openSync(temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, stat ? stat.mode & 0o777 : 0o666);
+    let replaced = false;
+    try {
+      fs.writeFileSync(fd, content, 'utf8');
+      if (stat) fs.fchmodSync(fd, stat.mode & 0o777);
+      // Rename replaces the directory entry without following a concurrently introduced link.
+      fs.renameSync(temporary, target);
+      replaced = true;
+    } finally {
+      fs.closeSync(fd);
+      if (!replaced) fs.rmSync(temporary, { force: true });
+    }
+  } finally {
+    fs.closeSync(directory);
+  }
 }
 
 export function ensureUserDirs(baseRoots: {

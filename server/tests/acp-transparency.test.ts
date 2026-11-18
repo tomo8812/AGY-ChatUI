@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { MessageRecord } from '../src/types.js';
-import { PathContainmentError, resolveContainedWriteTarget } from '../src/files/workspace.js';
+import { PathContainmentError, resolveContainedWriteTarget, writeWorkspaceTextFile } from '../src/files/workspace.js';
 import { getMessageActivity } from '../../web/src/utils/messageActivity.js';
 import { newerMessage } from '../../web/src/utils/messageSnapshot.js';
 import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
@@ -72,8 +72,13 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     const { permission } = (permissionFrame.event as { payload: { permission: { id: string } } }).payload;
     const rejection = await client.request('POST', `${url}/permissions/${permission.id}`, { optionId: 'reject_once' });
     expect(rejection.status).toBe(200);
+    expect(() => writeWorkspaceTextFile(chat.workspaceDir, 'created-by-tool.md', 'denied')).toThrow(PathContainmentError);
+    fs.symlinkSync(path.dirname(outside), path.join(chat.workspaceDir, 'outside-dir'));
+    expect(() => writeWorkspaceTextFile(chat.workspaceDir, 'outside-dir/external.md', 'denied')).toThrow();
     expect(fs.readFileSync(outside, 'utf8')).toBe(fileContent);
 
+    writeWorkspaceTextFile(chat.workspaceDir, 'nested/notes.md', 'nested write');
+    expect(fs.readFileSync(path.join(chat.workspaceDir, 'nested/notes.md'), 'utf8')).toBe('nested write');
     const danglingLink = path.join(chat.workspaceDir, 'dangling.md');
     fs.symlinkSync(path.join(chat.workspaceDir, 'missing.md'), danglingLink);
     expect(() => resolveContainedWriteTarget(chat.workspaceDir, 'dangling.md')).toThrow(PathContainmentError);

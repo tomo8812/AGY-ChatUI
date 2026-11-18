@@ -50,6 +50,8 @@ import {
   resolveContainedWriteTarget,
   sanitizeFileName,
   sha256File,
+  supportsWorkspaceTextWrites,
+  writeWorkspaceTextFile,
 } from '../files/workspace.js';
 import type { SyncHub } from '../sync/hub.js';
 import type {
@@ -257,7 +259,7 @@ function workspaceFilePath(worker: WorkerInstance, acpPath: string): string {
 }
 
 function resolveWorkspaceWrite(worker: WorkerInstance, acpPath: string) {
-  const target = resolveContainedWriteTarget(worker.workspaceDir, workspaceFilePath(worker, acpPath));
+  const target = resolveContainedWriteTarget(worker.workspaceDir, workspaceFilePath(worker, acpPath), { allowSymlinks: false });
   const stat = fs.statSync(target.absPath, { throwIfNoEntry: false });
   if (stat && (!stat.isFile() || stat.nlink !== 1)) {
     throw new PathContainmentError('通常のファイルにのみ書き込めます。');
@@ -1238,9 +1240,7 @@ export class AcpClientManager {
       .onRequest(methods.client.fs.writeTextFile, async ({ params }) => {
         if (!workerRef) throw new RequestError(-32603, 'Worker uninitialized');
         try {
-          const { absPath } = resolveWorkspaceWrite(workerRef, params.path);
-          fs.mkdirSync(path.dirname(absPath), { recursive: true, mode: 0o700 });
-          fs.writeFileSync(absPath, params.content, 'utf8');
+          writeWorkspaceTextFile(workerRef.workspaceDir, workspaceFilePath(workerRef, params.path), params.content);
           return {};
         } catch (err) {
           throw new RequestError(-32602, err instanceof Error ? err.message : 'File write denied');
@@ -1260,10 +1260,11 @@ export class AcpClientManager {
         const prefs = this.db.getPreferences(turn.userId);
 
         const { kind, locations } = params.toolCall;
+        // Always-allow can authorize future ACP calls whose paths have not been checked.
         const allowOnce = params.options.find((option) => option.kind === 'allow_once');
         const autoApprove =
           (kind === 'read' && prefs.autoApproveSafeReads) ||
-          (kind === 'edit' && prefs.autoApproveSafeWrites);
+          (kind === 'edit' && prefs.autoApproveSafeWrites && supportsWorkspaceTextWrites);
 
         if (autoApprove && allowOnce && locations?.length) {
           const worker = workerRef;
@@ -1386,7 +1387,7 @@ export class AcpClientManager {
       {
         protocolVersion: PROTOCOL_VERSION,
         clientCapabilities: {
-          fs: { readTextFile: true, writeTextFile: true },
+          fs: { readTextFile: true, writeTextFile: supportsWorkspaceTextWrites },
           terminal: false,
           session: { configOptions: { boolean: {} } },
           subagents: {},

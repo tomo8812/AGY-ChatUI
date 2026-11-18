@@ -76,8 +76,10 @@ function mergeDeltaText(existing: string, offset: number, chunk: string): { next
     return { next: existing + chunk.slice(existing.length - offset), gapDetected: false };
   }
   // If an intermediate delta was missed between snapshot HTTP & WS attach
-  return { next: existing + chunk, gapDetected: true };
+  return { next: existing, gapDetected: true };
 }
+
+type LiveMessage = MessageRecord & { deltaGap?: true };
 
 function upsertMessage(messages: MessageRecord[], incoming: MessageRecord): MessageRecord[] {
   return messages.some((message) => message.id === incoming.id)
@@ -109,7 +111,7 @@ export const App: React.FC = () => {
   const [draftCreatedChat, setDraftCreatedChat] = useState<ChatRecord | null>(null);
   const [draftResetToken, setDraftResetToken] = useState(0);
 
-  const [messages, setMessages] = useState<MessageRecord[]>([]);
+  const [messages, setMessages] = useState<LiveMessage[]>([]);
   const [artifacts, setArtifacts] = useState<ArtifactRecord[]>([]);
   const [pendingPermissions, setPendingPermissions] = useState<PendingPermissionRecord[]>([]);
   const [activeRun, setActiveRun] = useState<RunRecord | null>(null);
@@ -183,7 +185,6 @@ export const App: React.FC = () => {
   preferencesRef.current = preferences;
 
   const wsRef = useRef<SyncSocketClient | null>(null);
-  const resyncDebounceRef = useRef<number | null>(null);
   const isReplayingHelloRef = useRef(false);
 
   const cleanupEmptyDraftChat = useCallback(() => {
@@ -646,17 +647,14 @@ export const App: React.FC = () => {
     void loadChatDetail(activeChatId);
   }, [user?.id, activeChatId, loadChatDetail]);
 
-  const scheduleActiveChatResync = useCallback(
-    (chatId: string) => {
-      if (resyncDebounceRef.current) clearTimeout(resyncDebounceRef.current);
-      resyncDebounceRef.current = window.setTimeout(() => {
-        if (activeChatIdRef.current === chatId) {
-          void loadChatDetail(chatId);
-        }
-      }, 150);
-    },
-    [loadChatDetail]
-  );
+  const hasDeltaGap = messages.some((message) => message.deltaGap);
+  useEffect(() => {
+    if (!hasDeltaGap || !activeChatId) return;
+    const timeout = window.setTimeout(() => {
+      void loadChatDetail(activeChatId);
+    }, 150);
+    return () => window.clearTimeout(timeout);
+  }, [hasDeltaGap, activeChatId, loadChatDetail]);
 
   const handleDurableEvent = useCallback((evt: SyncEventEnvelope) => {
     const p = evt.payload;
@@ -1004,7 +1002,6 @@ export const App: React.FC = () => {
         const offset = Number(p.offset ?? 0);
         const chunk = String(p.chunk ?? '');
         const activityIndex = typeof p.activityIndex === 'number' ? p.activityIndex : undefined;
-        let gapDetected = false;
 
         setMessages((prev) =>
           prev.map((m) => {
@@ -1015,15 +1012,13 @@ export const App: React.FC = () => {
             if (activityIndex === entries.length) {
               activity = [...entries, { kind: field, offset }];
             }
-            if (merged.gapDetected || (activityIndex !== undefined && activityIndex > entries.length)) {
-              gapDetected = true;
+            if (m.deltaGap || merged.gapDetected || (activityIndex !== undefined && activityIndex > entries.length)) {
+              return m.deltaGap ? m : { ...m, deltaGap: true };
             }
+            if (merged.next === m[textKey] && activity === m.activity) return m;
             return { ...m, [textKey]: merged.next, activity, status: 'streaming' };
           })
         );
-        if (gapDetected && evt.chatId) {
-          scheduleActiveChatResync(evt.chatId);
-        }
         return;
       }
 
@@ -1036,7 +1031,7 @@ export const App: React.FC = () => {
         );
       }
     },
-    [scheduleActiveChatResync]
+    []
   );
 
   // Manage live WebSocket lifecycle cleanly per authenticated user
