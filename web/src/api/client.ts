@@ -33,6 +33,8 @@ export class ApiError extends Error {
   }
 }
 
+export type AgyAgentMode = 'auto' | '' | 'accept-edits' | 'plan';
+
 export function getCsrfToken(): string {
   const cookies = document.cookie.split(';');
   for (const part of cookies) {
@@ -131,6 +133,12 @@ export const api = {
   // Antigravity account binding
   getAgyStatus: () =>
     apiFetch<{ profile: AgyProfile; loginFlow: AgyLoginFlowState }>('/api/agy/status'),
+
+  getAgyAgentMode: () =>
+    apiFetch<{ agentMode: string | null }>('/api/agy/agent-mode'),
+
+  updateAgyAgentMode: (agentMode: AgyAgentMode) =>
+    apiFetch<{ agentMode: AgyAgentMode }>('/api/agy/agent-mode', { method: 'PATCH', body: { agentMode } }),
 
   startAgyLogin: (accountLabel?: string | null) =>
     apiFetch<{ profile: AgyProfile; loginFlow: AgyLoginFlowState }>('/api/agy/login/start', {

@@ -442,6 +442,11 @@ export class AppDatabase {
 
   // ---- Agy Profiles (1:1 per user) ----
 
+  listAgyProfileDirs(): string[] {
+    const rows = this.db.prepare('SELECT profile_dir FROM agy_profiles').all() as { profile_dir: string }[];
+    return rows.map((row) => row.profile_dir);
+  }
+
   getAgyProfile(userId: string): AgyProfile | null {
     const row = this.db
       .prepare(

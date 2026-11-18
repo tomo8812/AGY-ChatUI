@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { ApiError, api } from '../api/client';
+import { ApiError, api, type AgyAgentMode } from '../api/client';
 import type {
   AgyLoginFlowState,
   AgyProfile,
@@ -26,6 +26,13 @@ import {
 import { AgyOnboarding } from './AgyOnboarding';
 import { CloseIcon } from './Icons';
 import { ToggleSwitch } from './ToggleSwitch';
+
+const AGENT_MODE_OPTIONS: { value: AgyAgentMode; label: string }[] = [
+  { value: 'auto', label: 'Auto' },
+  { value: '', label: 'Default' },
+  { value: 'accept-edits', label: 'Accept Edits' },
+  { value: 'plan', label: 'Plan' },
+];
 
 interface AppInfoMeta {
   version: string;
@@ -71,6 +78,24 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [newPassword, setNewPassword] = useState('');
   const [adminMsg, setAdminMsg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [agentMode, setAgentMode] = useState<string | null | undefined>(undefined);
+  const [agentModeSaving, setAgentModeSaving] = useState(false);
+  const [agentModeError, setAgentModeError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    void api.getAgyAgentMode().then(
+      (res) => {
+        if (active) setAgentMode(res.agentMode);
+      },
+      (err) => {
+        if (active) setAgentModeError(err instanceof ApiError ? err.message : 'エージェントモードの読み込みに失敗しました。');
+      }
+    );
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -86,6 +111,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       active = false;
     };
   }, []);
+
+  const handleAgentModeChange = async (value: string) => {
+    const option = AGENT_MODE_OPTIONS.find((item) => item.value === value);
+    if (!option) return;
+    setAgentModeSaving(true);
+    setAgentModeError(null);
+    try {
+      const res = await api.updateAgyAgentMode(option.value);
+      setAgentMode(res.agentMode);
+    } catch (err) {
+      setAgentModeError(err instanceof ApiError ? err.message : 'エージェントモードの保存に失敗しました。');
+    } finally {
+      setAgentModeSaving(false);
+    }
+  };
 
   const handlePrefChange = async (
     patch: Partial<
@@ -309,6 +349,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     preferences.notifyOnResponse &&
     (!isNotificationSupported() || Notification.permission !== 'granted' || (isPushSupported() && !deviceSubscribed));
 
+  const selectedAgentMode = AGENT_MODE_OPTIONS.find((option) => option.value === agentMode)?.value;
+
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal-card modal-md" onClick={(e) => e.stopPropagation()}>
@@ -357,6 +399,31 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </button>
               </div>
             </div>
+          </section>
+
+          <section className="settings-section">
+            <h4><label htmlFor="agy-agent-mode">Antigravity エージェントモード</label></h4>
+            <select
+              id="agy-agent-mode"
+              className="compact-select"
+              value={selectedAgentMode ?? 'current'}
+              disabled={agentMode === undefined || agentModeSaving}
+              aria-describedby="agy-agent-mode-hint"
+              onChange={(e) => void handleAgentModeChange(e.target.value)}
+            >
+              {selectedAgentMode === undefined && (
+                <option value="current" disabled>
+                  {agentMode === undefined
+                    ? (agentModeError ? '読み込み失敗' : '読み込み中…')
+                    : (agentMode === null ? '未設定（CLI の既定値）' : agentMode)}
+                </option>
+              )}
+              {AGENT_MODE_OPTIONS.map(({ value, label }) => (
+                <option key={value} value={value}>{label}</option>
+              ))}
+            </select>
+            <div id="agy-agent-mode-hint" className="muted-xs">次回の ACP ワーカー起動時に読み込まれます。</div>
+            {agentModeError && <div className="error-box" role="alert">{agentModeError}</div>}
           </section>
 
           <section className="settings-section">
