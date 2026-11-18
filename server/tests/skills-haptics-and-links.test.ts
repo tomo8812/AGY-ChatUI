@@ -4,6 +4,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { AppDatabase } from '../src/db/database.js';
 import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
@@ -50,7 +51,7 @@ describe('Brain Image Resolution, Haptics & Push Vibrate, Quota minAgeMs, and Ag
     }
   });
 
-  it('serves the original conversation brain images while blocking dotdirs, oauth files, and other users', async () => {
+  it('serves files in the conversation brain while keeping profile files and other users outside that boundary', async () => {
     const srv = await createTestServer();
     cleanups.push(srv.cleanup);
 
@@ -78,7 +79,8 @@ describe('Brain Image Resolution, Haptics & Push Vibrate, Quota minAgeMs, and Ag
     // Seed authorized brain artifacts for Alice's chat inside its isolated brain root
     const cliBrainDir = path.join(chatBrainDir, 'sess-1');
     const jetskiBrainDir = path.join(chatBrainDir, 'sess-2');
-    const dotBrainDir = path.join(chatBrainDir, '.system_generated');
+    const segment = '資料'.repeat(40);
+    const dotBrainDir = path.join(chatBrainDir, '.exports', segment, segment, segment);
     fs.mkdirSync(cliBrainDir, { recursive: true });
     fs.mkdirSync(jetskiBrainDir, { recursive: true });
     fs.mkdirSync(dotBrainDir, { recursive: true });
@@ -87,12 +89,12 @@ describe('Brain Image Resolution, Haptics & Push Vibrate, Quota minAgeMs, and Ag
     const samplePng = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x00]);
     const aliceBrainJpg = path.join(aliceProfile.profileDir, '.gemini', 'antigravity-cli', 'brain', 'sess-1', 'miffy_custom.jpg');
     const aliceBrainPng = path.join(jetskiBrainDir, 'diagram.png');
-    const dotSecret = path.join(dotBrainDir, 'internal.txt');
+    const dotFile = path.join(dotBrainDir, 'report.txt');
     const oauthSecret = path.join(aliceProfile.profileDir, '.gemini', 'oauth_creds.json');
 
     fs.writeFileSync(path.join(cliBrainDir, 'miffy_custom.jpg'), sampleJpg);
     fs.writeFileSync(aliceBrainPng, samplePng);
-    fs.writeFileSync(dotSecret, 'internal metadata');
+    fs.writeFileSync(dotFile, 'report');
     fs.writeFileSync(oauthSecret, '{"token":"secret"}');
 
     // Bob's brain image must NOT be resolvable by Alice
@@ -127,10 +129,15 @@ describe('Brain Image Resolution, Haptics & Push Vibrate, Quota minAgeMs, and Ag
     expect(resUri.status).toBe(200);
     expect(resUri.data.artifact.relPath).toBe('/home/sandbox/.gemini/brain/sess-2/diagram.png');
 
-    // 3) Dot-directories (.system_generated), credential files, and other users' brain files are strictly blocked
-    expect(
-      (await alice.request('POST', `/api/chats/${chatId}/resolve-link`, { reference: dotSecret })).status
-    ).toBe(404);
+    // The encoded URI exceeds 2048 characters while the path fits in the filesystem.
+    const dotReference = pathToFileURL(dotFile).href;
+    expect(dotReference.length).toBeGreaterThan(2048);
+    const dotLink = await alice.request<{ previewUrl: string }>(
+      'POST', `/api/chats/${chatId}/resolve-link`, { reference: dotReference }
+    );
+    expect(dotLink.status).toBe(200);
+    expect((await alice.request<string>('GET', dotLink.data.previewUrl)).data).toBe('report');
+
     expect(
       (await alice.request('POST', `/api/chats/${chatId}/resolve-link`, { reference: oauthSecret })).status
     ).toBe(404);

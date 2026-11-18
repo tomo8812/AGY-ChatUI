@@ -53,7 +53,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const session = requireAuth(req, reply, db);
     if (!session) return;
     const { chatId } = req.params as { chatId: string };
-    const body = z.object({ reference: z.string().min(1).max(2048) }).safeParse(req.body);
+    const body = z.object({ reference: z.string().min(1) }).safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: 'INVALID_INPUT' });
 
     const resolved = resolveAuthorizedChatFileReference({

@@ -92,8 +92,6 @@ function resolveChatFile(db: AppDatabase, chat: ChatRecord, candidate: string): 
     if (fs.realpathSync(root) !== path.join(fs.realpathSync(home), path.relative(home, root))) return null;
     const resolved = resolveContainedExistingPath(root, alias ? alias[2] : candidate);
     if (!fs.statSync(resolved.absPath).isFile()) return null;
-    // Retain the existing exclusion for internal brain metadata.
-    if (kind === 'brain' && resolved.relPath.split('/').some(segment => segment.startsWith('.'))) return null;
     return { absPath: resolved.absPath, relPath: `${SANDBOX_HOME_MOUNT}/.gemini/${kind}/${resolved.relPath}` };
   } catch {
     return null;
