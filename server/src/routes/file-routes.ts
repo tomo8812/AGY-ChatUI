@@ -4,10 +4,9 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { convertPresentationToPdfCached } from '../files/artifacts.js';
 import { computeStrongEtag, formatHttpDate, isFreshRequest } from '../files/http-cache.js';
-import { resolveAuthorizedChatFileReference } from '../files/link-resolver.js';
+import { resolveArtifactFile, resolveAuthorizedChatFileReference } from '../files/link-resolver.js';
 import {
   listWorkspaceFiles,
-  resolveContainedExistingPath,
   resolveContainedWriteTarget,
   sha256FileAsync,
 } from '../files/workspace.js';
@@ -54,7 +53,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const session = requireAuth(req, reply, db);
     if (!session) return;
     const { chatId } = req.params as { chatId: string };
-    const body = z.object({ reference: z.string().min(1).max(2048) }).safeParse(req.body);
+    const body = z.object({ reference: z.string().min(1) }).safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: 'INVALID_INPUT' });
 
     const resolved = resolveAuthorizedChatFileReference({
@@ -78,10 +77,8 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const chat = db.getChat(session.user.id, artifact.chatId);
     if (!chat) return reply.code(404).send({ error: 'NOT_FOUND' });
 
-    try {
-      resolveContainedExistingPath(chat.workspaceDir, artifact.relPath);
-    } catch {
-      return reply.code(404).send({ error: 'FILE_MISSING', message: '作業領域上のファイルが見つかりません。' });
+    if (!resolveArtifactFile(db, chat, artifact)) {
+      return reply.code(404).send({ error: 'FILE_MISSING', message: '参照先のファイルが見つかりません。' });
     }
     return { artifact };
   });
@@ -97,12 +94,9 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const chat = db.getChat(session.user.id, artifact.chatId);
     if (!chat) return reply.code(404).send({ error: 'NOT_FOUND' });
 
-    let absPath: string;
-    try {
-      absPath = resolveContainedExistingPath(chat.workspaceDir, artifact.relPath).absPath;
-    } catch {
-      return reply.code(403).send({ error: 'FORBIDDEN' });
-    }
+    const file = resolveArtifactFile(db, chat, artifact);
+    if (!file) return reply.code(403).send({ error: 'FORBIDDEN' });
+    let absPath = file.absPath;
 
     let serveMime = artifact.mimeType;
     let serveFilename = artifact.filename;
@@ -207,7 +201,9 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const chat = db.getChat(session.user.id, artifact.chatId);
     if (!chat) return reply.code(404).send({ error: 'NOT_FOUND' });
 
-    const { absPath } = resolveContainedExistingPath(chat.workspaceDir, artifact.relPath);
+    const file = resolveArtifactFile(db, chat, artifact);
+    if (!file) return reply.code(404).send({ error: 'FILE_MISSING' });
+    const { absPath } = file;
     const stat = await fs.promises.stat(absPath);
 
     const expectedV = artifact.sha256 ? artifact.sha256.slice(0, 12) : '';
@@ -259,7 +255,9 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const project = db.getProject(session.user.id, parsed.data.projectId);
     if (!chat || !project) return reply.code(404).send({ error: 'PROJECT_NOT_FOUND' });
 
-    const { absPath: srcPath } = resolveContainedExistingPath(chat.workspaceDir, artifact.relPath);
+    const fileSource = resolveArtifactFile(db, chat, artifact);
+    if (!fileSource) return reply.code(404).send({ error: 'FILE_MISSING' });
+    const { absPath: srcPath } = fileSource;
     const target = resolveContainedWriteTarget(project.storageDir, artifact.filename);
     await fs.promises.mkdir(project.storageDir, { recursive: true, mode: 0o700 });
     await fs.promises.copyFile(srcPath, target.absPath);

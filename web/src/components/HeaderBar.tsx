@@ -6,7 +6,7 @@ import type {
   QuotaBucket,
   QuotaSnapshotRecord,
 } from '../types';
-import { ComposeIcon, FolderIcon, GaugeIcon, MenuIcon } from './Icons';
+import { ComposeIcon, GaugeIcon, MenuIcon } from './Icons';
 import { QuotaPopover } from './QuotaPopover';
 
 interface HeaderBarProps {
@@ -17,13 +17,10 @@ interface HeaderBarProps {
   quotaRefreshing: boolean;
   wsStatus: WsConnectionStatus;
   contextUsage: { used: number; size: number } | null;
-  workspaceCount: number;
-  workspaceOpen: boolean;
   onOpenSidebar: () => void;
   onNewChat: () => void;
   onRefreshQuota: () => void;
   onOpenQuotaPopover?: () => void;
-  onToggleWorkspace: () => void;
 }
 
 function pickSummaryBucket(quota: QuotaSnapshotRecord | null, modelId: string): QuotaBucket | null {
@@ -59,13 +56,10 @@ export const HeaderBar: React.FC<HeaderBarProps> = React.memo(({
   quotaRefreshing,
   wsStatus,
   contextUsage,
-  workspaceCount,
-  workspaceOpen,
   onOpenSidebar,
   onNewChat,
   onRefreshQuota,
   onOpenQuotaPopover,
-  onToggleWorkspace,
 }) => {
   const [quotaOpen, setQuotaOpen] = useState(false);
   const quotaAnchorRef = useRef<HTMLDivElement>(null);
@@ -165,19 +159,6 @@ export const HeaderBar: React.FC<HeaderBarProps> = React.memo(({
           <span className="context-pill hide-xs" title="現在の会話コンテキスト使用量">
             {Math.round((contextUsage.used / contextUsage.size) * 100)}% ctx
           </span>
-        )}
-
-        {activeChat && (
-          <button
-            type="button"
-            className={`pill-btn ${workspaceOpen ? 'active' : ''}`}
-            onClick={onToggleWorkspace}
-            title="作業ディレクトリ・生成ファイルを表示"
-          >
-            <FolderIcon size={14} />
-            <span className="hide-xs">ファイル</span>
-            {workspaceCount > 0 && <span className="count-tag">{workspaceCount}</span>}
-          </button>
         )}
 
         <button

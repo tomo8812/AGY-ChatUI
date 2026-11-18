@@ -442,11 +442,7 @@ const WorkspaceImage: React.FC<{
             ? `/api/files/${updated.id}/content?v=${updated.sha256.slice(0, 12)}`
             : `/api/files/${updated.id}/content`);
         setFailed(false);
-        setResolved((cur) =>
-          cur && cur.url === nextUrl && cur.artifact.updatedAt === updated.updatedAt
-            ? cur
-            : { url: nextUrl, artifact: updated }
-        );
+        setResolved({ url: nextUrl, artifact: updated });
       }
     });
   }, [chatId, src, isDirect]);
@@ -511,6 +507,21 @@ const MarkdownCode: React.FC<React.HTMLAttributes<HTMLElement>> = React.memo(
   )
 );
 
+const FileLinkButton: React.FC<{
+  reference: string;
+  onOpen: (reference: string) => void;
+  children: React.ReactNode;
+}> = ({ reference, onOpen, children }) => (
+  <button
+    type="button"
+    className="md-link workspace-file-link"
+    onClick={() => onOpen(reference)}
+    title={reference ? `ファイルをプレビュー: ${reference}` : '空のリンク'}
+  >
+    {children}
+  </button>
+);
+
 const MarkdownLink: React.FC<{ href?: string; children?: React.ReactNode }> = React.memo(({ href, children }) => {
   const { onWorkspaceHref } = useContext(MarkdownRenderContext);
   const rawHref = (href ?? '').trim();
@@ -523,14 +534,9 @@ const MarkdownLink: React.FC<{ href?: string; children?: React.ReactNode }> = Re
     );
   }
   return (
-    <button
-      type="button"
-      className="md-link workspace-file-link"
-      onClick={() => onWorkspaceHref(rawHref)}
-      title={rawHref ? `ファイルをプレビュー: ${rawHref}` : '空のリンク'}
-    >
+    <FileLinkButton reference={rawHref} onOpen={onWorkspaceHref}>
       {children}
-    </button>
+    </FileLinkButton>
   );
 });
 
@@ -565,34 +571,40 @@ export interface MarkdownContentProps {
   onResolveError?: (message: string) => void;
 }
 
+export type FileLinkProps = Pick<MarkdownContentProps, 'chatId' | 'onOpenArtifact' | 'onResolveError'>;
+
+function useOpenFileReference({ chatId, onOpenArtifact, onResolveError }: FileLinkProps) {
+  const onResolveErrorRef = useRef(onResolveError);
+  onResolveErrorRef.current = onResolveError;
+
+  return useCallback(async (reference: string) => {
+    if (!reference.trim()) {
+      onResolveErrorRef.current?.('参照されたファイルパスが空のため開けませんでした。');
+      return;
+    }
+    if (!chatId || !onOpenArtifact) return;
+    try {
+      const cached = peekResolvedLink(chatId, reference);
+      const resolved = cached && !cached.artifact.relPath.startsWith('/')
+        ? cached
+        : await resolveLinkCached(chatId, reference, { forceRefresh: Boolean(cached) });
+      onOpenArtifact(resolved.artifact);
+    } catch {
+      onResolveErrorRef.current?.(
+        `参照されたファイル "${reference}" を開けませんでした（存在しないかアクセス権限がありません）。`
+      );
+    }
+  }, [chatId, onOpenArtifact]);
+}
+
+export const FileReferenceLink: React.FC<FileLinkProps & { reference: string }> = ({ reference, ...props }) => {
+  const onOpen = useOpenFileReference(props);
+  return <FileLinkButton reference={reference} onOpen={onOpen}>{reference}</FileLinkButton>;
+};
+
 export const MarkdownContent: React.FC<MarkdownContentProps> = React.memo(
   ({ content, chatId, messageStatus, onOpenArtifact, onResolveError }) => {
-    const onResolveErrorRef = useRef(onResolveError);
-    onResolveErrorRef.current = onResolveError;
-
-    const handleWorkspaceHref = useCallback(
-      async (href: string) => {
-        if (!href.trim()) {
-          onResolveErrorRef.current?.('参照されたファイルパスが空のため開けませんでした。');
-          return;
-        }
-        if (!chatId || !onOpenArtifact) return;
-        const cached = peekResolvedLink(chatId, href);
-        if (cached) {
-          onOpenArtifact(cached.artifact);
-          return;
-        }
-        try {
-          const res = await resolveLinkCached(chatId, href);
-          onOpenArtifact(res.artifact);
-        } catch {
-          onResolveErrorRef.current?.(
-            `参照されたファイル "${href}" を開けませんでした（存在しないかアクセス権限がありません）。`
-          );
-        }
-      },
-      [chatId, onOpenArtifact]
-    );
+    const handleWorkspaceHref = useOpenFileReference({ chatId, onOpenArtifact, onResolveError });
 
     const contextValue = useMemo<MarkdownRenderContextValue>(
       () => ({

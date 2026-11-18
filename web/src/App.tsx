@@ -13,7 +13,6 @@ import { ProjectModal } from './components/ProjectModal';
 import { SettingsModal } from './components/SettingsModal';
 import { Sidebar } from './components/Sidebar';
 import { SkillsModal } from './components/SkillsModal';
-import { WorkspaceDrawer } from './components/WorkspaceDrawer';
 import { triggerHaptic, VIBRATION_PATTERNS } from './utils/haptics';
 import {
   ensurePushSubscribed,
@@ -25,7 +24,6 @@ import {
 import {
   clearAllViewerCaches,
   invalidateChatViewerCache,
-  markWorkspaceDirty,
   notifyArtifactUpdated,
   seedChatArtifacts,
   setViewerCacheUser,
@@ -132,9 +130,7 @@ export const App: React.FC = () => {
 
   const [wsStatus, setWsStatus] = useState<WsConnectionStatus>('disconnected');
   const [wsClientId, setWsClientId] = useState<string>('local');
-  const [workspaceSyncToken, setWorkspaceSyncToken] = useState(0);
   const [sidebarMobileOpen, setSidebarMobileOpen] = useState(false);
-  const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [skillsOpen, setSkillsOpen] = useState(false);
   const [skillsState, setSkillsState] = useState<SkillsListResponse | null>(null);
@@ -544,7 +540,6 @@ export const App: React.FC = () => {
       cleanupEmptyDraftChat();
       setDraftProjectId(null);
       setActiveChatId(targetChatId);
-      setWorkspaceOpen(false);
       setSidebarMobileOpen(false);
       window.history.replaceState({}, '', window.location.pathname);
     }
@@ -557,7 +552,6 @@ export const App: React.FC = () => {
         cleanupEmptyDraftChat();
         setDraftProjectId(null);
         setActiveChatId(chatId);
-        setWorkspaceOpen(false);
         setSidebarMobileOpen(false);
       }
     };
@@ -569,7 +563,6 @@ export const App: React.FC = () => {
         cleanupEmptyDraftChat();
         setDraftProjectId(null);
         setActiveChatId(event.data.chatId);
-        setWorkspaceOpen(false);
         setSidebarMobileOpen(false);
       }
     };
@@ -856,9 +849,6 @@ export const App: React.FC = () => {
             )
           );
         }
-        if (evt.chatId) {
-          markWorkspaceDirty(evt.chatId);
-        }
         if (evt.chatId === curChatId) {
           if (run) {
             setActiveRun((cur) => (cur?.id === run.id ? nextActiveRun : cur));
@@ -871,7 +861,6 @@ export const App: React.FC = () => {
                 : [...prev, msg]
             );
           }
-          setWorkspaceSyncToken((t) => t + 1);
         }
 
         const hapticOn = Boolean(preferencesRef.current?.hapticFeedback ?? true);
@@ -985,9 +974,6 @@ export const App: React.FC = () => {
         if (art) {
           notifyArtifactUpdated(art);
         }
-        if (evt.chatId) {
-          markWorkspaceDirty(evt.chatId);
-        }
         if (art && evt.chatId === curChatId) {
           setArtifacts((prev) => {
             const idx = prev.findIndex((x) => x.id === art.id);
@@ -999,7 +985,6 @@ export const App: React.FC = () => {
             return [art, ...prev];
           });
           setViewerArtifact((cur) => (cur?.id === art.id ? art : cur));
-          setWorkspaceSyncToken((t) => t + 1);
         }
         break;
       }
@@ -1081,8 +1066,6 @@ export const App: React.FC = () => {
         if (msg.resyncRequired) {
           void loadWorkspaceLists();
           if (activeChatIdRef.current) {
-            markWorkspaceDirty(activeChatIdRef.current);
-            setWorkspaceSyncToken((t) => t + 1);
             void loadChatDetail(activeChatIdRef.current);
           }
         } else {
@@ -1231,7 +1214,6 @@ export const App: React.FC = () => {
     setActiveRun(null);
     setSessionOptions(null);
     setContextUsage(null);
-    setWorkspaceOpen(false);
     setHasComposerDraft(false);
     setDraftResetToken((t) => t + 1);
   }, [cleanupEmptyDraftChat]);
@@ -1427,10 +1409,6 @@ export const App: React.FC = () => {
     async (files: File[]): Promise<AttachmentRef[]> => {
       const chatId = await ensureActiveChatForAction();
       const res = await api.uploadChatAttachments(chatId, files);
-      markWorkspaceDirty(chatId);
-      if (activeChatIdRef.current === chatId) {
-        setWorkspaceSyncToken((t) => t + 1);
-      }
       return res.attachments;
     },
     [ensureActiveChatForAction]
@@ -1511,7 +1489,6 @@ export const App: React.FC = () => {
       }
       setDraftProjectId(null);
       setActiveChatId(id);
-      setWorkspaceOpen(false);
     },
     [cleanupEmptyDraftChat]
   );
@@ -1538,15 +1515,11 @@ export const App: React.FC = () => {
     const curChat = activeChatRef.current;
     if (!curChat) return;
     const res = await api.syncChatProject(curChat.id);
-    markWorkspaceDirty(curChat.id);
     setChats((prev) => prev.map((c) => (c.id === curChat.id ? { ...c, ...res.chat } : c)));
     setDraftCreatedChat((prev) =>
       prev && prev.id === curChat.id ? { ...prev, ...res.chat } : prev
     );
     await loadChatDetail(curChat.id);
-    if (activeChatIdRef.current === curChat.id) {
-      setWorkspaceSyncToken((t) => t + 1);
-    }
   }, [loadChatDetail]);
 
   const handlePermissionUpdated = useCallback((perm: PendingPermissionRecord) => {
@@ -1575,8 +1548,6 @@ export const App: React.FC = () => {
   const handleOpenQuotaPopover = useCallback(() => {
     void triggerQuotaRefresh(true, 10_000);
   }, [triggerQuotaRefresh]);
-  const handleToggleWorkspace = useCallback(() => setWorkspaceOpen((o) => !o), []);
-  const handleCloseWorkspace = useCallback(() => setWorkspaceOpen(false), []);
   const handleCloseViewer = useCallback(() => setViewerArtifact(null), []);
   const handleCopiedToProject = useCallback((updatedProj: ProjectRecord) => {
     setProjects((prev) => prev.map((p) => (p.id === updatedProj.id ? updatedProj : p)));
@@ -1697,13 +1668,10 @@ export const App: React.FC = () => {
           quotaRefreshing={quotaRefreshing}
           wsStatus={wsStatus}
           contextUsage={contextUsage}
-          workspaceCount={artifacts.length}
-          workspaceOpen={workspaceOpen}
           onOpenSidebar={handleOpenSidebar}
           onNewChat={handleHeaderNewChat}
           onRefreshQuota={handleRefreshQuota}
           onOpenQuotaPopover={handleOpenQuotaPopover}
-          onToggleWorkspace={handleToggleWorkspace}
         />
 
         {pendingUpdateBuild && (
@@ -1747,16 +1715,6 @@ export const App: React.FC = () => {
             externalDraftCommand={externalDraftCommand}
           />
 
-          {workspaceOpen && activeChat && (
-            <WorkspaceDrawer
-              key={activeChat.id}
-              chatId={activeChat.id}
-              artifacts={artifacts}
-              workspaceSyncToken={workspaceSyncToken}
-              onClose={handleCloseWorkspace}
-              onOpenArtifact={openAndTrackArtifact}
-            />
-          )}
         </div>
       </main>
 
