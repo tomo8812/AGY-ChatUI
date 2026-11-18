@@ -208,6 +208,21 @@ describe('native and legacy file links', () => {
     expect(Buffer.from(await content.arrayBuffer())).toEqual(after);
     const refreshed = await resolve(original.id);
     expect(refreshed.data.artifact.sha256).not.toBe(original.sha256);
+
+    const large = Buffer.concat([before, Buffer.alloc(512 * 1024)]);
+    const mtime = new Date('2025-01-01T00:00:00Z');
+    fs.writeFileSync(nativePath, large);
+    fs.utimesSync(nativePath, mtime, mtime);
+    const beforeOverwrite = await resolve(original.id);
+    large[large.length - 1] = 1;
+    fs.writeFileSync(nativePath, large);
+    fs.utimesSync(nativePath, mtime, mtime);
+    const afterOverwrite = await resolve(original.id);
+    expect(afterOverwrite.data.previewUrl).not.toBe(beforeOverwrite.data.previewUrl);
+    const latest = await fetch(`${srv.baseUrl}${afterOverwrite.data.previewUrl}`, {
+      headers: { Cookie: alice.cookieHeader },
+    });
+    expect(Buffer.from(await latest.arrayBuffer())).toEqual(large);
     expect(fs.existsSync(path.join(workspaceDir, 'generated'))).toBe(false);
   });
 });

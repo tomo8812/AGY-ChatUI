@@ -139,7 +139,7 @@ export function resolveAuthorizedChatFileReference(params: {
         ? detectContentFileType(filename, params.mimeType)
         : existing ?? detectMimeAndPreviewKind(path.basename(relPath));
       const mtimeChanged = !existing || Math.floor(stat.mtimeMs) > existing.updatedAt;
-      const sha256 = mtimeChanged || stat.size !== existing?.sizeBytes || stat.size <= 512 * 1024
+      const sha256 = path.isAbsolute(relPath) || mtimeChanged || stat.size !== existing?.sizeBytes || stat.size <= 512 * 1024
         ? sha256File(absPath) : existing.sha256;
       const artifact = existing && !mtimeChanged && existing.sha256 === sha256 &&
         existing.sizeBytes === stat.size && existing.filename === filename &&
