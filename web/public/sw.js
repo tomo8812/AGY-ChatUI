@@ -70,17 +70,21 @@ self.addEventListener('push', (event) => {
     // Apple Web Push requires showNotification() whenever a push arrives; foreground Apple
     // suppression is handled server-side before dispatching.
     if (!isTestPush && clientList.some((c) => c.focused || c.visibilityState === 'visible')) {
-      let isApplePush = false;
+      let canSafelySuppress = false;
       try {
         const sub = await self.registration.pushManager.getSubscription();
         if (sub && sub.endpoint) {
           const host = new URL(sub.endpoint).hostname.toLowerCase();
-          isApplePush = host === 'push.apple.com' || host.endsWith('.push.apple.com');
+          const isApplePush = host === 'push.apple.com' || host.endsWith('.push.apple.com');
+          if (!isApplePush) {
+            canSafelySuppress = true;
+          }
         }
       } catch {
-        // Fall through to showNotification safely
+        // Subscription detection failed: fall through to showNotification to protect Apple userVisibleOnly
+        canSafelySuppress = false;
       }
-      if (!isApplePush) {
+      if (canSafelySuppress) {
         return;
       }
     }
