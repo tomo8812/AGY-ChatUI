@@ -92,6 +92,17 @@ function runCliUsage(): number {
     process.stderr.write('Authentication required.\n');
     return 1;
   }
+  // agy normalizes the user's settings on headless startup.
+  const settingsFile = path.join(homeDir, '.gemini', 'antigravity-cli', 'settings.json');
+  if (fs.existsSync(settingsFile)) {
+    const settings = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+    if (settings.agentMode === 'auto') {
+      delete settings.agentMode;
+      const temporary = `${settingsFile}.${randomUUID()}.tmp`;
+      fs.writeFileSync(temporary, JSON.stringify(settings));
+      fs.renameSync(temporary, settingsFile);
+    }
+  }
   const suffix = auth.label.includes('b') ? 42 : 84;
   const payload = {
     account: auth.label,

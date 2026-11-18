@@ -426,14 +426,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <option value="current" disabled>
                   {agentMode === undefined
                     ? (agentModeLoading ? '読み込み中…' : '現在の値を取得できませんでした')
-                    : (agentMode === null ? '未設定（CLI の既定値）' : agentMode)}
+                    : (agentMode === null ? 'CLI の既定モード' : agentMode)}
                 </option>
               )}
               {AGENT_MODE_OPTIONS.map(({ value, label }) => (
                 <option key={value} value={value}>{label}</option>
               ))}
             </select>
-            <div id="agy-agent-mode-hint" className="muted-xs">次回の ACP ワーカー起動時に読み込まれます。</div>
+            <div id="agy-agent-mode-hint" className="muted-xs">
+              {agentMode === null && (
+                <div>プロファイルに明示指定がないため、Antigravity が実行モードを決めます。</div>
+              )}
+              <div>変更は次回の ACP ワーカー起動時に読み込まれます。</div>
+            </div>
             {agentModeError && <div className="error-box" role="alert">{agentModeError}</div>}
           </section>
 
