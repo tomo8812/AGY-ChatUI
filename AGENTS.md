@@ -8,6 +8,7 @@ This file applies **only** to the `tomo8812/AGY-ChatUI` repository.
 
 - **Pass through native `agy` / ACP behavior faithfully**: Preserve Antigravity's native agent-turn semantics, Reactive Wakeup, background notifications, tool states, subagent lifecycles, and authentication without ChatUI-side state overrides, synthetic timers, or custom control logic; ChatUI may still queue outer user requests (`ExecutionScheduler`), manage external ACP process lifecycles (`IDLE_WORKER_MS`) for isolation and resource limits, and apply user-configured ACP permission preferences (such as `autoApproveSafeReads`).
 - **Keep ChatUI strictly as a thin, transparent presentation and isolation layer**: Only handle multi-user workspace/process isolation, resource-bounded request queuing, user-configured ACP permission responses, UI rendering, persistence/replay, and transport — never alter, intercept, or re-interpret how Antigravity itself thinks, schedules internally, or executes.
+- **Forward the saved agent mode at session creation**: When Antigravity advertises the saved profile `agentMode` as a supported choice, ChatUI may forward it once through native ACP `session/set_config_option` for a newly created session. Antigravity owns mode behavior and approval decisions. Restored sessions retain the mode Antigravity returns.
 
 ## Pull Request Review Workflow
 
