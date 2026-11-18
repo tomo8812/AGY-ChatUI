@@ -2,6 +2,7 @@ import type { MessageRecord } from '../types';
 
 export function newerMessage(current: MessageRecord, incoming: MessageRecord): MessageRecord {
   if (incoming.updatedAt > current.updatedAt) return incoming;
+  if (current.updatedAt > incoming.updatedAt) return current;
   const currentIsTerminal = current.status !== 'queued' && current.status !== 'streaming';
   const incomingIsTerminal = incoming.status !== 'queued' && incoming.status !== 'streaming';
   if (currentIsTerminal && !incomingIsTerminal) return current;

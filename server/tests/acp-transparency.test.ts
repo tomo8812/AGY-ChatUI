@@ -61,6 +61,7 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     expect(newerMessage(staleSnapshot, message)).toBe(message);
     const laterSnapshot = { ...staleSnapshot, updatedAt: message.updatedAt + 1 };
     expect(newerMessage(message, laterSnapshot)).toBe(laterSnapshot);
+    expect(newerMessage(laterSnapshot, message)).toBe(laterSnapshot);
 
     const activity = getMessageActivity(message);
     expect(activity.blocks.map(({ kind }) => kind)).toEqual(['thoughts', 'tools', 'commentary', 'tools']);
