@@ -323,8 +323,6 @@ export interface QuotaSnapshotRecord {
 export interface UserPreferences {
   userId: string;
   theme: 'system' | 'light' | 'dark';
-  autoApproveSafeReads: boolean;
-  autoApproveSafeWrites: boolean;
   notifyOnResponse: boolean;
   hapticFeedback: boolean;
   defaultModelId: string | null;

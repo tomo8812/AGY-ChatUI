@@ -119,8 +119,6 @@ export const api = {
       Pick<
         UserPreferences,
         | 'theme'
-        | 'autoApproveSafeReads'
-        | 'autoApproveSafeWrites'
         | 'notifyOnResponse'
         | 'hapticFeedback'
         | 'defaultModelId'

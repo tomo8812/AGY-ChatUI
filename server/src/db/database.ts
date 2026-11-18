@@ -85,8 +85,6 @@ export class AppDatabase {
       CREATE TABLE IF NOT EXISTS user_preferences (
         user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
         theme TEXT NOT NULL DEFAULT 'system',
-        auto_approve_safe_reads INTEGER NOT NULL DEFAULT 0,
-        auto_approve_safe_writes INTEGER NOT NULL DEFAULT 0,
         notify_on_response INTEGER NOT NULL DEFAULT 0,
         haptic_feedback INTEGER NOT NULL DEFAULT 1,
         default_model_id TEXT,
@@ -258,9 +256,6 @@ export class AppDatabase {
     if (!prefCols.some((col) => col.name === 'notify_on_response')) {
       this.db.exec('ALTER TABLE user_preferences ADD COLUMN notify_on_response INTEGER NOT NULL DEFAULT 0;');
     }
-    if (!prefCols.some((col) => col.name === 'auto_approve_safe_writes')) {
-      this.db.exec('ALTER TABLE user_preferences ADD COLUMN auto_approve_safe_writes INTEGER NOT NULL DEFAULT 0;');
-    }
     if (!prefCols.some((col) => col.name === 'haptic_feedback')) {
       this.db.exec('ALTER TABLE user_preferences ADD COLUMN haptic_feedback INTEGER NOT NULL DEFAULT 1;');
     }
@@ -345,8 +340,8 @@ export class AppDatabase {
 
       this.db
         .prepare(
-          `INSERT INTO user_preferences (user_id, theme, auto_approve_safe_reads, notify_on_response, updated_at)
-           VALUES (?, 'system', 0, 0, ?)`
+          `INSERT INTO user_preferences (user_id, theme, notify_on_response, updated_at)
+           VALUES (?, 'system', 0, ?)`
         )
         .run(params.id, now);
       this.db.exec('COMMIT;');
@@ -516,7 +511,7 @@ export class AppDatabase {
   getPreferences(userId: string): UserPreferences {
     const row = this.db
       .prepare(
-        `SELECT user_id, theme, auto_approve_safe_reads, auto_approve_safe_writes, notify_on_response, haptic_feedback, default_model_id, default_effort_value, updated_at
+        `SELECT user_id, theme, notify_on_response, haptic_feedback, default_model_id, default_effort_value, updated_at
          FROM user_preferences WHERE user_id = ?`
       )
       .get(userId) as Record<string, unknown> | undefined;
@@ -525,8 +520,6 @@ export class AppDatabase {
       return {
         userId,
         theme: 'system',
-        autoApproveSafeReads: false,
-        autoApproveSafeWrites: false,
         notifyOnResponse: false,
         hapticFeedback: true,
         defaultModelId: null,
@@ -537,8 +530,6 @@ export class AppDatabase {
     return {
       userId: String(row.user_id),
       theme: row.theme as 'system' | 'light' | 'dark',
-      autoApproveSafeReads: Number(row.auto_approve_safe_reads) === 1,
-      autoApproveSafeWrites: Number(row.auto_approve_safe_writes) === 1,
       notifyOnResponse: Number(row.notify_on_response) === 1,
       hapticFeedback: row.haptic_feedback === undefined || row.haptic_feedback === null ? true : Number(row.haptic_feedback) === 1,
       defaultModelId: row.default_model_id ? String(row.default_model_id) : null,
@@ -552,7 +543,7 @@ export class AppDatabase {
     patch: Partial<
       Pick<
         UserPreferences,
-        'theme' | 'autoApproveSafeReads' | 'autoApproveSafeWrites' | 'notifyOnResponse' | 'hapticFeedback' | 'defaultModelId' | 'defaultEffortValue'
+        'theme' | 'notifyOnResponse' | 'hapticFeedback' | 'defaultModelId' | 'defaultEffortValue'
       >
     >
   ): UserPreferences {
@@ -560,12 +551,10 @@ export class AppDatabase {
     const now = Date.now();
     this.db
       .prepare(
-        `INSERT INTO user_preferences (user_id, theme, auto_approve_safe_reads, auto_approve_safe_writes, notify_on_response, haptic_feedback, default_model_id, default_effort_value, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO user_preferences (user_id, theme, notify_on_response, haptic_feedback, default_model_id, default_effort_value, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_id) DO UPDATE SET
            theme = excluded.theme,
-           auto_approve_safe_reads = excluded.auto_approve_safe_reads,
-           auto_approve_safe_writes = excluded.auto_approve_safe_writes,
            notify_on_response = excluded.notify_on_response,
            haptic_feedback = excluded.haptic_feedback,
            default_model_id = excluded.default_model_id,
@@ -575,8 +564,6 @@ export class AppDatabase {
       .run(
         userId,
         patch.theme ?? cur.theme,
-        (patch.autoApproveSafeReads ?? cur.autoApproveSafeReads) ? 1 : 0,
-        (patch.autoApproveSafeWrites ?? cur.autoApproveSafeWrites) ? 1 : 0,
         (patch.notifyOnResponse ?? cur.notifyOnResponse) ? 1 : 0,
         (patch.hapticFeedback ?? cur.hapticFeedback) ? 1 : 0,
         patch.defaultModelId !== undefined ? patch.defaultModelId : cur.defaultModelId,

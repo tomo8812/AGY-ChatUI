@@ -89,7 +89,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const handlePrefChange = async (
     patch: Partial<
-      Pick<UserPreferences, 'theme' | 'autoApproveSafeReads' | 'autoApproveSafeWrites' | 'notifyOnResponse' | 'hapticFeedback'>
+      Pick<UserPreferences, 'theme' | 'notifyOnResponse' | 'hapticFeedback'>
     >
   ) => {
     setError(null);
@@ -448,23 +448,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 ))}
               </div>
             )}
-          </section>
-
-          <section className="settings-section">
-            <h4>ツール実行の承認</h4>
-            <ToggleSwitch
-              checked={preferences.autoApproveSafeReads}
-              label="作業フォルダ内のファイル読み取りを自動承認"
-              onChange={(next) => void handlePrefChange({ autoApproveSafeReads: next })}
-            />
-            <ToggleSwitch
-              checked={preferences.autoApproveSafeWrites}
-              label="作業フォルダ内のファイル作成・編集を自動承認"
-              onChange={(next) => void handlePrefChange({ autoApproveSafeWrites: next })}
-            />
-            <p className="muted-xs">
-              作業フォルダの外へのアクセスやコマンド実行、削除などには確認が必要です。
-            </p>
           </section>
 
           {sandbox && (

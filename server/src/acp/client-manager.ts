@@ -258,15 +258,6 @@ function workspaceFilePath(worker: WorkerInstance, acpPath: string): string {
   return normalizeRelPath(relative);
 }
 
-function resolveWorkspaceWrite(worker: WorkerInstance, acpPath: string) {
-  const target = resolveContainedWriteTarget(worker.workspaceDir, workspaceFilePath(worker, acpPath), { allowSymlinks: false });
-  const stat = fs.statSync(target.absPath, { throwIfNoEntry: false });
-  if (stat && (!stat.isFile() || stat.nlink !== 1)) {
-    throw new PathContainmentError('通常のファイルにのみ書き込めます。');
-  }
-  return target;
-}
-
 function summarizeToolDiff(content: ToolCall['content'] | null): ToolCallItem['diffStats'] {
   const diffs = content?.filter((item) => item.type === 'diff');
   if (!diffs?.length) return undefined;
@@ -1257,34 +1248,7 @@ export class AcpClientManager {
         workerRef.lastBackgroundActivityAt = Date.now();
 
 
-        const prefs = this.db.getPreferences(turn.userId);
-
-        const { kind, locations } = params.toolCall;
-        // Always-allow can authorize future ACP calls whose paths have not been checked.
-        const allowOnce = params.options.find((option) => option.kind === 'allow_once');
-        const autoApprove =
-          (kind === 'read' && prefs.autoApproveSafeReads) ||
-          (kind === 'edit' && prefs.autoApproveSafeWrites && supportsWorkspaceTextWrites);
-
-        if (autoApprove && allowOnce && locations?.length) {
-          const worker = workerRef;
-          const allContained = locations.every(({ path: acpPath }) => {
-            try {
-              if (kind === 'read') {
-                const { absPath } = resolveContainedExistingPath(worker.workspaceDir, workspaceFilePath(worker, acpPath));
-                return fs.statSync(absPath).isFile();
-              }
-              resolveWorkspaceWrite(worker, acpPath);
-              return true;
-            } catch {
-              return false;
-            }
-          });
-          if (allContained) {
-            return { outcome: { outcome: 'selected' as const, optionId: allowOnce.optionId } };
-          }
-        }
-
+        // Antigravity evaluates permissions using its native settings. Relay requests to the user.
         const permId = crypto.randomUUID();
         const subagentMeta = classifySubagentToolCall({
           name: (params.toolCall as { name?: string }).name,

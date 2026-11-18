@@ -55,11 +55,7 @@ export function resolveContainedExistingPath(rootDir: string, candidatePath: str
   return { absPath: candidateReal, relPath };
 }
 
-export function resolveContainedWriteTarget(
-  rootDir: string,
-  relPathRaw: string,
-  { allowSymlinks = true }: { allowSymlinks?: boolean } = {}
-): {
+export function resolveContainedWriteTarget(rootDir: string, relPathRaw: string): {
   absPath: string;
   relPath: string;
 } {
@@ -78,7 +74,6 @@ export function resolveContainedWriteTarget(
     walk = path.join(walk, segment);
     const stat = fs.lstatSync(walk, { throwIfNoEntry: false });
     if (stat?.isSymbolicLink()) {
-      if (!allowSymlinks) throw new PathContainmentError('シンボリックリンクへの書き込みは許可されていません。');
       try {
         resolveContainedExistingPath(rootReal, walk);
       } catch {

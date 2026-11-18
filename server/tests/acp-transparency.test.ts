@@ -17,14 +17,10 @@ afterEach(async () => {
 });
 
 describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
-  it.skipIf(!supportsWorkspaceTextWrites)('auto-approves contained edits and replays the activity in ACP order', async () => {
+  it.skipIf(!supportsWorkspaceTextWrites)('relays native ACP permission requests and replays activity in ACP order', async () => {
     const srv = await createTestServer();
     cleanups.push(srv.cleanup);
     const { client } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
-    const prefs = await client.request<{ preferences: { autoApproveSafeWrites: boolean } }>(
-      'PATCH', '/api/preferences', { autoApproveSafeReads: true, autoApproveSafeWrites: true }
-    );
-    expect(prefs.data.preferences.autoApproveSafeWrites).toBe(true);
     await client.connectWs();
 
     const { data: { chat } } = await client.request<{ chat: { id: string; workspaceDir: string } }>(
@@ -32,14 +28,22 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     );
     const url = `/api/chats/${chat.id}`;
     await client.request('POST', `${url}/messages`, { text: '[ACTIVITY_SEQUENCE] [PERMISSION]' });
+    const waitForPermission = async (previousId?: string) => {
+      const frame = await client.waitForFrame((frame) => {
+        if (frame.kind !== 'event') return false;
+        const event = frame.event as { type: string; payload: { permission?: { id: string } } };
+        return event.type === 'permission.requested' && event.payload.permission?.id !== previousId;
+      });
+      return (frame.event as { payload: { permission: { id: string } } }).payload.permission;
+    };
+    const firstPermission = await waitForPermission();
+    const filename = path.join(chat.workspaceDir, 'created-by-tool.md');
+    expect(fs.existsSync(filename)).toBe(false);
+    const approval = await client.request('POST', `${url}/permissions/${firstPermission.id}`, { optionId: 'allow_once' });
+    expect(approval.status).toBe(200);
     await client.waitForFrame((frame) =>
       frame.kind === 'event' && (frame.event as { type: string }).type === 'run.finished'
     );
-    expect(client.wsFrames.some((frame) =>
-      frame.kind === 'event' && (frame.event as { type: string }).type === 'permission.requested'
-    )).toBe(false);
-
-    const filename = path.join(chat.workspaceDir, 'created-by-tool.md');
     const fileContent = fs.readFileSync(filename, 'utf8');
     expect(fileContent).toContain('Created with user permission');
 
@@ -66,10 +70,7 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     fs.renameSync(filename, outside);
     fs.symlinkSync(outside, filename);
     await client.request('POST', `${url}/messages`, { text: '[PERMISSION]' });
-    const permissionFrame = await client.waitForFrame((frame) =>
-      frame.kind === 'event' && (frame.event as { type: string }).type === 'permission.requested'
-    );
-    const { permission } = (permissionFrame.event as { payload: { permission: { id: string } } }).payload;
+    const permission = await waitForPermission(firstPermission.id);
     const rejection = await client.request('POST', `${url}/permissions/${permission.id}`, { optionId: 'reject_once' });
     expect(rejection.status).toBe(200);
     expect(() => writeWorkspaceTextFile(chat.workspaceDir, 'created-by-tool.md', 'denied')).toThrow(PathContainmentError);
