@@ -9,6 +9,7 @@
  *            tool calls, `session/request_permission`, `session/cancel`, and file creation inside `cwd`.
  */
 
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -944,8 +945,9 @@ function runAcpServer(): void {
       }
 
       if (promptText.includes('[ACTIVITY_SEQUENCE]')) {
+        const sequenceId = randomUUID();
         for (const [index, title] of ['pwd', 'rg --files'].entries()) {
-          const toolCallId = `activity-command-${index}`;
+          const toolCallId = `activity-command-${sequenceId}-${index}`;
           await sendUpdate({
             sessionId: state.id,
             update: { sessionUpdate: 'tool_call', toolCallId, kind: 'execute', title, status: 'in_progress' },

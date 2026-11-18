@@ -27,16 +27,20 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
       'POST', '/api/chats', {}
     );
     const url = `/api/chats/${chat.id}`;
-    await client.request('POST', `${url}/messages`, { text: '[ACTIVITY_SEQUENCE] [PERMISSION]' });
-    const waitForPermission = async (previousId?: string) => {
+    const send = async (text: string) => {
+      const { data: { run } } = await client.request<{ run: { id: string } }>('POST', `${url}/messages`, { text });
+      return run.id;
+    };
+    const waitForPermission = async (runId: string) => {
       const frame = await client.waitForFrame((frame) => {
         if (frame.kind !== 'event') return false;
-        const event = frame.event as { type: string; payload: { permission?: { id: string } } };
-        return event.type === 'permission.requested' && event.payload.permission?.id !== previousId;
+        const event = frame.event as { type: string; runId: string };
+        return event.type === 'permission.requested' && event.runId === runId;
       });
       return (frame.event as { payload: { permission: { id: string } } }).payload.permission;
     };
-    const firstPermission = await waitForPermission();
+    const firstRun = await send('[ACTIVITY_SEQUENCE] [PERMISSION]');
+    const firstPermission = await waitForPermission(firstRun);
     const filename = path.join(chat.workspaceDir, 'created-by-tool.md');
     expect(fs.existsSync(filename)).toBe(false);
     const approval = await client.request('POST', `${url}/permissions/${firstPermission.id}`, { optionId: 'allow_once' });
@@ -65,12 +69,31 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     expect(activity.answer).toContain('created-by-tool.md');
     expect(activity.answer).not.toContain('作業フォルダを確認しました');
 
+    fs.chmodSync(filename, 0o200);
+    const nextRun = await send('[ACTIVITY_SEQUENCE] [PERMISSION]');
+    const nextPermission = await waitForPermission(nextRun);
+    expect((await client.request('POST', `${url}/permissions/${nextPermission.id}`, { optionId: 'allow_once' })).status).toBe(200);
+    await client.waitForFrame((frame) => {
+      if (frame.kind !== 'event') return false;
+      const event = frame.event as { type: string; runId: string };
+      return event.type === 'run.finished' && event.runId === nextRun;
+    });
+    const nextDetail = await client.request<{ messages: MessageRecord[] }>('GET', url);
+    const updated = nextDetail.data.messages.find((item) => item.role === 'assistant' && item.runId === nextRun)!;
+    expect(updated.toolCalls.at(-1)?.status).toBe('completed');
+    expect(updated.toolCalls.at(-1)?.diffStats).toBeUndefined();
+    const commandIds = [message, updated].flatMap((item) =>
+      item.toolCalls.filter((tool) => tool.kind === 'execute').map((tool) => tool.toolCallId)
+    );
+    expect(new Set(commandIds).size).toBe(4);
+    fs.chmodSync(filename, 0o600);
+
     // Replacing the same in-workspace path with an external symlink requires a decision.
     const outside = path.join(path.dirname(chat.workspaceDir), 'external.md');
     fs.renameSync(filename, outside);
     fs.symlinkSync(outside, filename);
-    await client.request('POST', `${url}/messages`, { text: '[PERMISSION]' });
-    const permission = await waitForPermission(firstPermission.id);
+    const blockedRun = await send('[PERMISSION]');
+    const permission = await waitForPermission(blockedRun);
     const rejection = await client.request('POST', `${url}/permissions/${permission.id}`, { optionId: 'reject_once' });
     expect(rejection.status).toBe(200);
     expect(() => writeWorkspaceTextFile(chat.workspaceDir, 'created-by-tool.md', 'denied')).toThrow(PathContainmentError);
@@ -94,6 +117,10 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
       expect(() => writeWorkspaceTextFile(chat.workspaceDir, 'nested/notes.md', 'denied')).toThrow();
       expect(fs.readFileSync(nested, 'utf8')).toBe('file link write');
     }
+    fs.chmodSync(nested, 0o200);
+    writeWorkspaceTextFile(chat.workspaceDir, 'nested/notes.md', 'write-only update');
+    fs.chmodSync(nested, 0o600);
+    expect(fs.readFileSync(nested, 'utf8')).toBe('write-only update');
     const danglingLink = path.join(chat.workspaceDir, 'dangling.md');
     fs.symlinkSync(path.join(chat.workspaceDir, 'missing.md'), danglingLink);
     expect(() => resolveContainedWriteTarget(chat.workspaceDir, 'dangling.md')).toThrow(PathContainmentError);
