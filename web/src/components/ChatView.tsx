@@ -29,7 +29,7 @@ import {
   SparklesIcon,
   StopIcon,
 } from './Icons';
-import { MarkdownContent } from './MarkdownContent';
+import { FileReferenceLink, MarkdownContent, type FileLinkProps } from './MarkdownContent';
 
 interface ChatViewProps {
   chat: ChatRecord | null;
@@ -62,7 +62,11 @@ const EMPTY_PERMS: PendingPermissionRecord[] = [];
 const EMPTY_ARTIFACTS: ArtifactRecord[] = [];
 const EMPTY_SELECT_OPTIONS: NonNullable<ParsedSessionOptions['configOptions']>[number]['options'] = [];
 
-const ThoughtsAccordion: React.FC<{ text: string; streaming?: boolean }> = React.memo(({ text, streaming }) => {
+const ThoughtsAccordion: React.FC<FileLinkProps & {
+  text: string;
+  streaming: boolean;
+  messageStatus: MessageRecord['status'];
+}> = React.memo(({ text, streaming, messageStatus, ...fileLinks }) => {
   const [open, setOpen] = useState(Boolean(streaming));
   if (!text.trim()) return null;
 
@@ -79,7 +83,11 @@ const ThoughtsAccordion: React.FC<{ text: string; streaming?: boolean }> = React
         </span>
         <ChevronIcon size={13} dir={open ? 'down' : 'right'} className="owui-disclosure-chevron" />
       </button>
-      {open && <div className="owui-thoughts-body">{text}</div>}
+      {open && (
+        <div className="owui-thoughts-body">
+          <MarkdownContent content={text} messageStatus={messageStatus} {...fileLinks} />
+        </div>
+      )}
     </div>
   );
 });
@@ -91,7 +99,25 @@ function isSubagentTool(tc: ToolCallItem): boolean {
   );
 }
 
-type FileLinkProps = Pick<React.ComponentProps<typeof MarkdownContent>, 'chatId' | 'onOpenArtifact' | 'onResolveError'>;
+function toolOutputStatus(tool: ToolCallItem): MessageRecord['status'] {
+  return tool.status === 'pending' || tool.status === 'in_progress' ||
+    tool.subagentState === 'running' || tool.subagentState === 'requires_action'
+    ? 'streaming' : 'completed';
+}
+
+const ToolLocations: React.FC<FileLinkProps & { locations: ToolCallItem['locations'] }> = ({ locations, ...fileLinks }) => {
+  if (!locations?.length) return null;
+  return (
+    <div className="muted-xs">
+      対象: {locations.map((location, index) => (
+        <React.Fragment key={index}>
+          {index > 0 && ', '}
+          <FileReferenceLink reference={location.path} {...fileLinks} />
+        </React.Fragment>
+      ))}
+    </div>
+  );
+};
 
 const ToolCallsList: React.FC<FileLinkProps & { toolCalls: ToolCallItem[] }> = React.memo(({ toolCalls, ...fileLinks }) => {
   const [openIds, setOpenIds] = useState<Record<string, boolean>>({});
@@ -102,10 +128,8 @@ const ToolCallsList: React.FC<FileLinkProps & { toolCalls: ToolCallItem[] }> = R
       {toolCalls.map((tc) => {
         const isOpen = Boolean(openIds[tc.toolCallId]);
         const subagent = isSubagentTool(tc);
-        const isSubagentActive =
-          tc.subagentState === 'running' || tc.subagentState === 'requires_action';
-        const isRunning =
-          tc.status === 'in_progress' || tc.status === 'pending' || isSubagentActive;
+        const messageStatus = toolOutputStatus(tc);
+        const isRunning = messageStatus === 'streaming';
         const isFailed = tc.status === 'failed';
         const displayTitle = tc.subagentLabel || tc.title;
         const hasDetails =
@@ -155,16 +179,14 @@ const ToolCallsList: React.FC<FileLinkProps & { toolCalls: ToolCallItem[] }> = R
             </button>
             {isOpen && hasDetails && (
               <div className="owui-tool-body">
-                {tc.locations && tc.locations.length > 0 && (
-                  <div className="muted-xs">
-                    対象: {tc.locations.map((l) => l.path).join(', ')}
-                  </div>
+                <ToolLocations locations={tc.locations} {...fileLinks} />
+                {tc.contentText && (
+                  <MarkdownContent content={tc.contentText} messageStatus={messageStatus} {...fileLinks} />
                 )}
-                {tc.contentText && <MarkdownContent content={tc.contentText} {...fileLinks} />}
                 {tc.subagentThoughtsText && (
                   <div style={{ marginTop: 6 }}>
                     <div className="muted-xs">Subagent Thoughts</div>
-                    <pre className="tool-json">{tc.subagentThoughtsText}</pre>
+                    <MarkdownContent content={tc.subagentThoughtsText} messageStatus={messageStatus} {...fileLinks} />
                   </div>
                 )}
                 {tc.subagentToolCalls && tc.subagentToolCalls.length > 0 && (
@@ -173,7 +195,10 @@ const ToolCallsList: React.FC<FileLinkProps & { toolCalls: ToolCallItem[] }> = R
                     {tc.subagentToolCalls.map((stc) => (
                       <div key={stc.toolCallId} className="muted-xs" style={{ marginTop: 2 }}>
                         [{stc.status}] {stc.title}
-                        {stc.contentText && <MarkdownContent content={stc.contentText} {...fileLinks} />}
+                        <ToolLocations locations={stc.locations} {...fileLinks} />
+                        {stc.contentText && (
+                          <MarkdownContent content={stc.contentText} messageStatus={toolOutputStatus(stc)} {...fileLinks} />
+                        )}
                       </div>
                     ))}
                   </div>
@@ -181,7 +206,7 @@ const ToolCallsList: React.FC<FileLinkProps & { toolCalls: ToolCallItem[] }> = R
                 {tc.subagentContentText && (
                   <div style={{ marginTop: 6 }}>
                     <div className="muted-xs">Subagent Output</div>
-                    <MarkdownContent content={tc.subagentContentText} {...fileLinks} />
+                    <MarkdownContent content={tc.subagentContentText} messageStatus={messageStatus} {...fileLinks} />
                   </div>
                 )}
                 {tc.rawInput !== undefined && (
@@ -361,6 +386,10 @@ const MessageRow: React.FC<{
           <ThoughtsAccordion
             text={msg.thoughtsText}
             streaming={msg.status === 'streaming' && !msg.contentText}
+            messageStatus={msg.status}
+            chatId={chatId}
+            onOpenArtifact={onOpenArtifact}
+            onResolveError={onResolveError}
           />
 
           <ToolCallsList
@@ -383,7 +412,7 @@ const MessageRow: React.FC<{
                       <MarkdownContent
                         content={sm.contentText}
                         chatId={chatId}
-                        messageStatus={sm.done ? undefined : 'streaming'}
+                        messageStatus={sm.done ? 'completed' : 'streaming'}
                         onOpenArtifact={onOpenArtifact}
                         onResolveError={onResolveError}
                       />

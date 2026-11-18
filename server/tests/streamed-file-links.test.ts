@@ -1,10 +1,12 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { normalizeClientLinkReference } from '../../web/src/utils/viewerCache';
 import { afterEach, describe, expect, it } from 'vitest';
 import { getChatBrainHostDir } from '../src/acp/env-isolation.js';
-import { normalizeLinkCandidatePath } from '../src/files/link-resolver.js';
+import { AppDatabase } from '../src/db/database.js';
+import { normalizeLinkCandidatePath, resolveArtifactFile, resolveAuthorizedChatFileReference } from '../src/files/link-resolver.js';
 import type { ArtifactRecord } from '../src/types.js';
 import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
 
@@ -23,19 +25,26 @@ describe('native and legacy file links', () => {
     }
   });
 
-  it('resolves the current chat scratch and playground aliases and keeps their files isolated', async () => {
-    const srv = await createTestServer();
-    cleanups.push(srv.cleanup);
-    const { client: alice, userId } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
-    const createChat = async () => (await alice.request<{ chat: { id: string; workspaceDir: string } }>(
-      'POST', '/api/chats', { title: 'Native file paths' }
-    )).data.chat;
-    const chat = await createChat();
-    const other = await createChat();
-    const profile = srv.ctx.db.getAgyProfile(userId)!.profileDir;
-    const resolve = (chatId: string, reference: string) => alice.request<{ artifact: ArtifactRecord; previewUrl: string }>(
-      'POST', `/api/chats/${chatId}/resolve-link`, { reference }
-    );
+  it('resolves the current chat scratch and playground aliases and keeps their files isolated', () => {
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-native-links-'));
+    const db = new AppDatabase(':memory:');
+    cleanups.push(() => {
+      db.close();
+      fs.rmSync(temp, { recursive: true, force: true });
+    });
+    const profile = path.join(temp, 'profile');
+    const userId = 'alice';
+    db.createUser({ id: userId, username: 'alice', displayName: 'Alice', passwordHash: '', role: 'user', profileDir: profile });
+    const createChat = (id: string) => {
+      const workspaceDir = path.join(temp, 'workspaces', id);
+      fs.mkdirSync(workspaceDir, { recursive: true });
+      return db.createChat({
+        id, userId, workspaceDir, title: id, projectId: null, projectContextVersion: 0, modelId: null, effortValue: null,
+      });
+    };
+    const chat = createChat('chat');
+    const other = createChat('other');
+    const resolve = (chatId: string, reference: string) => resolveAuthorizedChatFileReference({ db, userId, chatId, reference });
 
     for (const kind of ['scratch', 'playground']) {
       const root = path.join(profile, `.chat-${kind}`, path.basename(chat.workspaceDir));
@@ -45,22 +54,19 @@ describe('native and legacy file links', () => {
       fs.writeFileSync(file, kind);
       const sandboxPath = `/home/sandbox/.gemini/antigravity/${kind}/`;
       const encoded = encodeURIComponent(filename);
-      const first = await resolve(chat.id, `file://${sandboxPath}${encoded}`);
-      expect(first.status).toBe(200);
-      expect(first.data.artifact.relPath).toBe(`/home/sandbox/.gemini/${kind}/${filename}`);
+      const first = resolve(chat.id, `file://${sandboxPath}${encoded}`)!.artifact;
+      expect(first.relPath).toBe(`/home/sandbox/.gemini/${kind}/${filename}`);
       for (const reference of [file, `${sandboxPath}${encoded}`, `~/.gemini/jetski/${kind}/${filename}`]) {
-        expect((await resolve(chat.id, reference)).data.artifact.id).toBe(first.data.artifact.id);
-        expect((await resolve(other.id, reference)).status).toBe(404);
+        expect(resolve(chat.id, reference)?.artifact.id).toBe(first.id);
+        expect(resolve(other.id, reference)).toBeNull();
       }
       const otherRoot = path.join(profile, `.chat-${kind}`, path.basename(other.workspaceDir));
-      fs.rmdirSync(otherRoot);
       fs.symlinkSync(root, otherRoot);
-      expect((await resolve(other.id, `${sandboxPath}${encoded}`)).status).toBe(404);
+      expect(resolve(other.id, `${sandboxPath}${encoded}`)).toBeNull();
       fs.symlinkSync(file, path.join(chat.workspaceDir, 'outside.md'));
-      expect((await resolve(chat.id, '/workspace/outside.md')).status).toBe(404);
+      expect(resolve(chat.id, '/workspace/outside.md')).toBeNull();
       fs.unlinkSync(path.join(chat.workspaceDir, 'outside.md'));
-      const bytes = await fetch(`${srv.baseUrl}${first.data.previewUrl}`, { headers: { Cookie: alice.cookieHeader } });
-      expect(await bytes.text()).toBe(kind);
+      expect(resolveArtifactFile(db, chat, first)?.absPath).toBe(file);
     }
   });
 
