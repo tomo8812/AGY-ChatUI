@@ -307,7 +307,7 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
     expect(offSpec.command).toBe(fs.realpathSync(sysAgyReal));
   });
 
-  it('auto-syncs subagent brain images into generated/ and delivers native Reactive Wakeup continuation asynchronously after end_turn', async () => {
+  it('resolves the subagent image from the native Reactive Wakeup continuation after end_turn', async () => {
     const srv = await createTestServer();
     cleanups.push(srv.cleanup);
 
@@ -322,8 +322,6 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
     const chatId = chatRes.data.chat.id;
     const workspaceDir = chatRes.data.chat.workspaceDir;
 
-    // Native subagent brain image generation must finish foreground turn on end_turn and
-    // sync background Reactive Wakeup continuation + generated/ artifact asynchronously
     await alice.request('POST', `/api/chats/${chatId}/messages`, {
       text: 'Generate cyber cat [SUBAGENT_IMAGE]',
     });
@@ -361,14 +359,17 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
     expect(latestAssistant.toolCalls).toHaveLength(1);
     expect(latestAssistant.toolCalls[0].isSubagent).toBe(true);
     expect(latestAssistant.toolCalls[0].status).toBe('completed');
-    // Automatic continuation response and generated/ link should be present
     expect(latestAssistant.contentText).toContain('サブエージェントによる画像生成が完了しました');
     expect(latestAssistant.contentText).toContain('subagent-art.png');
-    // File exists in workspace/generated/subagent-art.png and is registered as an artifact
-    expect(fs.existsSync(path.join(workspaceDir, 'generated', 'subagent-art.png'))).toBe(true);
-    expect(
-      detailAfterSubagent.data.artifacts.some((a) => a.relPath === 'generated/subagent-art.png')
-    ).toBe(true);
+    const reference = /\]\(([^)]+subagent-art\.png)\)/.exec(latestAssistant.contentText)?.[1];
+    expect(reference).toContain('/.gemini/antigravity-cli/brain/');
+    const resolved = await alice.request<{ artifact: { relPath: string; previewKind: string }; previewUrl: string }>(
+      'POST', `/api/chats/${chatId}/resolve-link`, { reference }
+    );
+    expect(resolved.status).toBe(200);
+    expect(resolved.data.artifact.previewKind).toBe('image');
+    expect(resolved.data.artifact.relPath).toMatch(/^\/home\/sandbox\/\.gemini\/brain\/.+\/subagent-art\.png$/);
+    expect(fs.existsSync(path.join(workspaceDir, 'generated'))).toBe(false);
 
     alice.closeWs();
   });
@@ -418,47 +419,13 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
     expect(meRes.data.sandbox?.backend).toBe('mock');
   });
 
-  it('strictly isolates per-chat brain roots, bwrap hidden dirs, and empty chat workspace API', async () => {
-    const { getAllowedBrainRoots, resolveAuthorizedBrainFile } = await import(
-      '../src/files/link-resolver.js'
-    );
-
+  it('isolates bwrap hidden dirs and the per-chat workspace API', async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-isolation-'));
     cleanups.push(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
 
     const profileDir = path.join(tmpDir, 'profile');
-    const ws1 = path.join(tmpDir, 'workspaces', 'chat-1');
-    const ws2 = path.join(tmpDir, 'workspaces', 'chat-2');
-    fs.mkdirSync(ws1, { recursive: true });
-    fs.mkdirSync(ws2, { recursive: true });
-
-    // Shared legacy brain file and chat-1 brain file
-    const sharedBrainFile = path.join(profileDir, '.gemini', 'antigravity', 'brain', 'sess-x', 'old.png');
-    fs.mkdirSync(path.dirname(sharedBrainFile), { recursive: true });
-    fs.writeFileSync(sharedBrainFile, 'shared-old');
-
-    const chat1BrainFile = path.join(getChatBrainHostDir(profileDir, ws1), 'sess-1', 'miffy.jpg');
-    fs.mkdirSync(path.dirname(chat1BrainFile), { recursive: true });
-    fs.writeFileSync(chat1BrainFile, 'chat1-img');
-
-    // getAllowedBrainRoots with workspaceDir must only include that chat's brain dir
-    expect(getAllowedBrainRoots(profileDir, ws2)).toEqual([getChatBrainHostDir(profileDir, ws2)]);
-
-    // chat-2 must NOT resolve shared legacy brain or chat-1 brain files
-    expect(
-      resolveAuthorizedBrainFile({
-        profileDir,
-        workspaceDir: ws2,
-        candidatePath: sharedBrainFile,
-      })
-    ).toBeNull();
-    expect(
-      resolveAuthorizedBrainFile({
-        profileDir,
-        workspaceDir: ws2,
-        candidatePath: chat1BrainFile,
-      })
-    ).toBeNull();
+    const workspaceDir = path.join(tmpDir, 'workspaces', 'chat');
+    fs.mkdirSync(workspaceDir, { recursive: true });
 
     // Real bwrap command spec masks .chat-brains / .chat-homes / .chat-scratch / .chat-playground
     const realCfg = loadConfig({ agyMode: 'real', sandboxMode: 'auto', agyBin: 'echo' });
@@ -466,7 +433,7 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
       config: realCfg,
       subcommandArgs: ['acp'],
       profileDir,
-      workspaceDir: ws2,
+      workspaceDir,
       enableSandboxBwrap: true,
     });
     if (spec.sandboxed) {

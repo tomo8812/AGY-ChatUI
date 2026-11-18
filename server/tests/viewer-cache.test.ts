@@ -1,25 +1,19 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { ArtifactRecord, WorkspaceFileEntry } from '../../web/src/types';
+import type { ArtifactRecord } from '../../web/src/types';
 import {
   artifactTextCache,
   buildArtifactContentUrl,
   buildArtifactSandboxUrl,
-  buildWorkspaceTree,
   ByteLruCache,
   clearAllViewerCaches,
   codeHighlightCache,
   invalidateChatViewerCache,
-  loadWorkspaceCached,
-  markWorkspaceDirty,
   notifyArtifactUpdated,
   pdfBytesCache,
   peekResolvedLink,
   resolveLinkCached,
   seedChatArtifacts,
   setViewerCacheUser,
-  setWorkspaceFolderExpanded,
-  getCachedWorkspace,
-  getWorkspaceFolderExpandedMap,
   normalizeClientLinkReference,
   skillFileCache,
   subscribeArtifactUpdates,
@@ -84,6 +78,7 @@ describe('viewerCache client caching & LRU utilities', () => {
     expect(normalizeClientLinkReference('./sub//report.md#L10-L25')).toBe('sub/report.md');
     expect(normalizeClientLinkReference('/workspace/src/main.ts:42:9')).toBe('src/main.ts');
     expect(normalizeClientLinkReference('file:///workspace/assets/diagram.svg')).toBe('assets/diagram.svg');
+    expect(normalizeClientLinkReference('file://example.com/workspace/private.png')).toBeNull();
     expect(normalizeClientLinkReference('https://example.com/a.png')).toBeNull();
     expect(normalizeClientLinkReference('/api/files/123/content')).toBeNull();
     expect(normalizeClientLinkReference('blob:http://localhost/123')).toBeNull();
@@ -184,12 +179,10 @@ describe('viewerCache client caching & LRU utilities', () => {
     seedChatArtifacts('chat-2', [a2]);
     artifactTextCache.set('art-c1:hash', 'secret-user-1');
     skillFileCache.set('global:my-skill:SKILL.md', { relPath: 'SKILL.md', content: 'skill-body' });
-    setWorkspaceFolderExpanded('chat-1', 'src', false);
 
     // Deleting chat-1 clears chat-1 entries while preserving chat-2
     invalidateChatViewerCache('chat-1');
     expect(peekResolvedLink('chat-1', 'img.png')).toBeNull();
-    expect(getWorkspaceFolderExpandedMap('chat-1')).toEqual({});
     expect(peekResolvedLink('chat-2', 'img.png')?.artifact.id).toBe('art-c2');
 
     // Switching user wipes EVERYTHING
@@ -214,62 +207,5 @@ describe('viewerCache client caching & LRU utilities', () => {
     });
     await inflight;
     expect(peekResolvedLink('chat-9', 'leak.png')).toBeNull();
-  });
-
-  it('deduplicates workspace loads, preserves dirty state on mid-flight mutations, and builds sorted trees', async () => {
-    setViewerCacheUser('user-1');
-    const sampleFiles: WorkspaceFileEntry[] = [
-      { relPath: 'zeta.txt', name: 'zeta.txt', sizeBytes: 10, mtimeMs: 100, isProjectContext: false, previewKind: 'code', mimeType: 'text/plain' },
-      { relPath: 'src/b.ts', name: 'b.ts', sizeBytes: 20, mtimeMs: 100, isProjectContext: false, previewKind: 'code', mimeType: 'text/typescript' },
-      { relPath: 'src/nested/a.png', name: 'a.png', sizeBytes: 30, mtimeMs: 100, isProjectContext: false, previewKind: 'image', mimeType: 'image/png' },
-    ];
-
-    let resolveFetch!: (val: { files: WorkspaceFileEntry[]; artifacts: ArtifactRecord[] }) => void;
-    const fetcher = vi.fn(
-      () =>
-        new Promise<{ files: WorkspaceFileEntry[]; artifacts: ArtifactRecord[] }>((resolve) => {
-          resolveFetch = resolve;
-        })
-    );
-
-    const p1 = loadWorkspaceCached('chat-w1', { fetcher });
-    const p2 = loadWorkspaceCached('chat-w1', { fetcher });
-    expect(fetcher).toHaveBeenCalledTimes(1);
-
-    // Simulate artifact creation occurring WHILE the initial workspace fetch is in flight
-    markWorkspaceDirty('chat-w1');
-    resolveFetch({ files: sampleFiles, artifacts: [] });
-
-    const [res1, res2] = await Promise.all([p1, p2]);
-    expect(res1.dirty).toBe(true);
-    expect(res2.dirty).toBe(true);
-    expect(getCachedWorkspace('chat-w1')?.dirty).toBe(true);
-
-    // Next load sees dirty=true and refreshes cleanly when un-interrupted
-    const clean = await loadWorkspaceCached('chat-w1', {
-      fetcher: async () => ({ files: sampleFiles, artifacts: [] }),
-    });
-    expect(clean.dirty).toBe(false);
-    expect(clean.files).toHaveLength(3);
-
-    // Verify hierarchical tree structure & sorting (folders first, alphabetical, recursive file counts)
-    const tree = buildWorkspaceTree(sampleFiles);
-    expect(tree).toHaveLength(2);
-    expect(tree[0].kind).toBe('folder');
-    if (tree[0].kind === 'folder') {
-      expect(tree[0].name).toBe('src');
-      expect(tree[0].fileCount).toBe(2);
-      expect(tree[0].children).toHaveLength(2);
-      expect(tree[0].children[0].kind).toBe('folder');
-      expect(tree[0].children[0].name).toBe('nested');
-      if (tree[0].children[0].kind === 'folder') {
-        expect(tree[0].children[0].fileCount).toBe(1);
-        expect(tree[0].children[0].children[0].name).toBe('a.png');
-      }
-      expect(tree[0].children[1].kind).toBe('file');
-      expect(tree[0].children[1].name).toBe('b.ts');
-    }
-    expect(tree[1].kind).toBe('file');
-    expect(tree[1].name).toBe('zeta.txt');
   });
 });

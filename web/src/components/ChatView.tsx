@@ -91,7 +91,9 @@ function isSubagentTool(tc: ToolCallItem): boolean {
   );
 }
 
-const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ toolCalls }) => {
+type FileLinkProps = Pick<React.ComponentProps<typeof MarkdownContent>, 'chatId' | 'onOpenArtifact' | 'onResolveError'>;
+
+const ToolCallsList: React.FC<FileLinkProps & { toolCalls: ToolCallItem[] }> = React.memo(({ toolCalls, ...fileLinks }) => {
   const [openIds, setOpenIds] = useState<Record<string, boolean>>({});
   if (!toolCalls || toolCalls.length === 0) return null;
 
@@ -158,7 +160,7 @@ const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ too
                     対象: {tc.locations.map((l) => l.path).join(', ')}
                   </div>
                 )}
-                {tc.contentText && <pre className="tool-json">{tc.contentText}</pre>}
+                {tc.contentText && <MarkdownContent content={tc.contentText} {...fileLinks} />}
                 {tc.subagentThoughtsText && (
                   <div style={{ marginTop: 6 }}>
                     <div className="muted-xs">Subagent Thoughts</div>
@@ -171,7 +173,7 @@ const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ too
                     {tc.subagentToolCalls.map((stc) => (
                       <div key={stc.toolCallId} className="muted-xs" style={{ marginTop: 2 }}>
                         [{stc.status}] {stc.title}
-                        {stc.contentText ? `: ${stc.contentText}` : ''}
+                        {stc.contentText && <MarkdownContent content={stc.contentText} {...fileLinks} />}
                       </div>
                     ))}
                   </div>
@@ -179,7 +181,7 @@ const ToolCallsList: React.FC<{ toolCalls: ToolCallItem[] }> = React.memo(({ too
                 {tc.subagentContentText && (
                   <div style={{ marginTop: 6 }}>
                     <div className="muted-xs">Subagent Output</div>
-                    <pre className="tool-json">{tc.subagentContentText}</pre>
+                    <MarkdownContent content={tc.subagentContentText} {...fileLinks} />
                   </div>
                 )}
                 {tc.rawInput !== undefined && (
@@ -361,7 +363,12 @@ const MessageRow: React.FC<{
             streaming={msg.status === 'streaming' && !msg.contentText}
           />
 
-          <ToolCallsList toolCalls={msg.toolCalls} />
+          <ToolCallsList
+            toolCalls={msg.toolCalls}
+            chatId={chatId}
+            onOpenArtifact={onOpenArtifact}
+            onResolveError={onResolveError}
+          />
 
           {msg.sessionMessages && msg.sessionMessages.length > 0 && (
             <div className="owui-tools-list" aria-label="セッション間メッセージ">
@@ -372,7 +379,15 @@ const MessageRow: React.FC<{
                       セッション間メッセージ{sm.senderSessionId ? ` (${sm.senderSessionId})` : ''}
                       {!sm.done ? ' [受信中]' : ''}
                     </div>
-                    {sm.contentText && <pre className="tool-json">{sm.contentText}</pre>}
+                    {sm.contentText && (
+                      <MarkdownContent
+                        content={sm.contentText}
+                        chatId={chatId}
+                        messageStatus={sm.done ? undefined : 'streaming'}
+                        onOpenArtifact={onOpenArtifact}
+                        onResolveError={onResolveError}
+                      />
+                    )}
                   </div>
                 </div>
               ))}

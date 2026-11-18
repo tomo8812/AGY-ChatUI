@@ -1,14 +1,15 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import { getChatBrainHostDir } from '../src/acp/env-isolation.js';
+import { normalizeLinkCandidatePath } from '../src/files/link-resolver.js';
 import { mockArtifactBytes } from '../src/acp/mock-artifact-fixtures.js';
 import type { ArtifactRecord, MessageRecord } from '../src/types.js';
 import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
 
 const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => {
-  vi.restoreAllMocks();
   while (cleanups.length) await cleanups.pop()!();
 });
 
@@ -31,22 +32,13 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
   it('preserves links, bytes, metadata and isolation after end_turn across every content channel', async () => {
     const srv = await createTestServer();
     cleanups.push(srv.cleanup);
-    const { client: alice } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+    const { client: alice, userId } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
     const { client: bob } = await registerAndBindAgy(srv.baseUrl, 'bob', 'user:bob@gmail.com');
     await alice.connectWs();
     cleanups.push(() => alice.closeWs());
     const chat = (await alice.request<{ chat: { id: string; workspaceDir: string } }>(
       'POST', '/api/chats', { title: 'All subagent artifacts' }
     )).data.chat;
-    const upsertArtifact = srv.ctx.db.upsertArtifact.bind(srv.ctx.db);
-    let failDeclaredArtifact = true;
-    vi.spyOn(srv.ctx.db, 'upsertArtifact').mockImplementation(params => {
-      if (params.filename === 'declared image.svg' && failDeclaredArtifact) {
-        failDeclaredArtifact = false;
-        throw new Error('Transient artifact registration failure');
-      }
-      return upsertArtifact(params);
-    });
     await alice.request('POST', `/api/chats/${chat.id}/messages`, { text: '[SUBAGENT_FILES]' });
     await alice.waitForFrame(frame => frame.kind === 'event' &&
       (frame.event as { type: string }).type === 'run.finished');
@@ -78,11 +70,10 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
       const hash = crypto.createHash('sha256').update(bytes).digest('hex').slice(0, 12);
       expectedBytesByName.set(`generated-${hash}.${format === 'pngAlternate' ? 'png' : format}`, bytes);
     }
-    const expectedByReference = new Map(artifacts.map(artifact => {
-      const bytes = expectedBytesByName.get(artifact.filename);
-      expect(bytes, artifact.filename).toBeDefined();
-      return [fileReference(artifact.relPath), { artifact, bytes }] as const;
-    }));
+    const brainDir = getChatBrainHostDir(srv.ctx.db.getAgyProfile(userId)!.profileDir, chat.workspaceDir);
+    const originalFile = (artifact: ArtifactRecord) => artifact.relPath.startsWith('/home/sandbox/.gemini/brain/')
+      ? path.join(brainDir, artifact.relPath.split('/brain/')[1])
+      : path.join(chat.workspaceDir, artifact.relPath);
     const channels: Record<string, string> = {
       parent: message.contentText,
       parentThoughts: message.thoughtsText,
@@ -92,12 +83,11 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
       sessions: message.sessionMessages!.map(item => item.contentText).join('\n'),
     };
     for (const [channel, text] of Object.entries(channels)) {
-      expect(text, channel).not.toMatch(/\.gemini|generated\/\//);
+      expect(text, channel).not.toContain('generated//');
       expect(references(text).length, channel).toBeGreaterThanOrEqual(channel === 'parentThoughts' ? 8 : 20);
       if (channel !== 'parentThoughts') {
         for (const ext of Object.keys(previewKinds)) {
-          const expected = fileReference(`generated/report (v1) [final] #50%.${ext}`);
-          expect(text, `${channel}: ${ext} link`).toContain(`[${ext} file](${expected})`);
+          expect(text, `${channel}: ${ext} link`).toContain(`[${ext} file](file://`);
         }
       }
       for (const artifact of artifacts.filter(item =>
@@ -113,18 +103,21 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
       }
 
       for (const reference of new Set(references(text))) {
-        const expected = expectedByReference.get(reference);
-        expect(expected, `${channel}: ${reference}`).toBeDefined();
         const response = await alice.request<{ artifact: ArtifactRecord; previewUrl: string }>(
           'POST', `/api/chats/${chat.id}/resolve-link`, { reference }
         );
         expect(response.status, `${channel}: ${reference}`).toBe(200);
-        expect(response.data.artifact.id, `${channel}: ${reference}`).toBe(expected!.artifact.id);
+        const candidate = normalizeLinkCandidatePath(reference)!;
+        const relPath = candidate.includes('/.gemini/antigravity-cli/brain/')
+          ? `/home/sandbox/.gemini/brain/${candidate.split('/brain/')[1]}`
+          : candidate.slice('/workspace/'.length);
+        const expected = artifacts.find(artifact => artifact.relPath === relPath);
+        expect(response.data.artifact.id, `${channel}: ${reference}`).toBe(expected?.id);
         const bytes = await fetch(`${srv.baseUrl}${response.data.previewUrl}`, {
           headers: { Cookie: alice.cookieHeader },
         });
         expect(bytes.status).toBe(200);
-        expect(Buffer.from(await bytes.arrayBuffer())).toEqual(expected!.bytes);
+        expect(Buffer.from(await bytes.arrayBuffer())).toEqual(expectedBytesByName.get(expected!.filename));
       }
     }
     for (const [ext, previewKind] of Object.entries(previewKinds)) {
@@ -132,8 +125,9 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
       const artifact = artifacts.find(item => item.filename === filename)!;
       expect(artifact, ext).toBeDefined();
       expect(artifact.previewKind).toBe(previewKind);
-      expect(fs.readFileSync(path.join(chat.workspaceDir, artifact.relPath))).toEqual(mockArtifactBytes(ext as Parameters<typeof mockArtifactBytes>[0]));
-      const legacyUri = `file:///workspace/generated//brain/old-session/${encodeURIComponent(filename)}`;
+      expect(fs.readFileSync(originalFile(artifact))).toEqual(mockArtifactBytes(ext as Parameters<typeof mockArtifactBytes>[0]));
+      const session = artifact.relPath.split('/brain/')[1].split('/')[0];
+      const legacyUri = `file:///workspace/generated//brain/${session}/${encodeURIComponent(filename)}`;
       const legacy = await alice.request<{ artifact: ArtifactRecord }>(
         'POST', `/api/chats/${chat.id}/resolve-link`, { reference: legacyUri }
       );
@@ -143,7 +137,7 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
     for (const tool of subagent.subagentToolCalls!.filter(tool => tool.locations?.length)) {
       expect(tool.contentText).toContain(')\nTool result complete\n');
       const location = tool.locations![0].path;
-      expect(location).not.toContain('.gemini');
+      expect(location).toContain('/.gemini/antigravity-cli/brain/');
       expect((tool.rawOutput as { path: string }).path).toBe(location);
       expect((await alice.request('POST', `/api/chats/${chat.id}/resolve-link`, { reference: location })).status).toBe(200);
     }
@@ -172,17 +166,19 @@ describe('subagent artifact delivery across file formats and ACP channels', () =
       fs.readFileSync(path.join(chat.workspaceDir, item.relPath)).toString('base64')
     );
     expect(inlineImageBytes.sort()).toEqual([mockArtifactBytes('png').toString('base64'), mockArtifactBytes('pngAlternate').toString('base64')].sort());
-    expect(failDeclaredArtifact).toBe(false);
     const declared = artifacts.find(item => item.filename === 'declared image.svg')!;
     expect(declared.mimeType).toBe('image/png');
     expect(declared.previewKind).toBe('image');
-    expect(fs.readFileSync(path.join(chat.workspaceDir, declared.relPath))).toEqual(mockArtifactBytes('png'));
+    expect(fs.readFileSync(originalFile(declared))).toEqual(mockArtifactBytes('png'));
     expect(alice.wsFrames.some(frame => {
       const event = frame.event as { type: string; payload?: { artifact?: ArtifactRecord } } | undefined;
       const artifact = event?.payload?.artifact;
       return event?.type === 'artifact.created' && artifact?.id === declared.id &&
         artifact.filename === 'declared image.svg' && artifact.mimeType === 'image/png';
     })).toBe(true);
+    const workspaceFiles = fs.readdirSync(path.join(chat.workspaceDir, 'generated'));
+    expect(workspaceFiles).toHaveLength(8);
+    expect(workspaceFiles.some(name => name.startsWith('report') || name.startsWith('declared'))).toBe(false);
     expect(message.sessionMessages!.every(item => item.done)).toBe(true);
     const otherChat = (await alice.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Other chat' })).data.chat;
     for (const artifact of artifacts) {

@@ -33,20 +33,11 @@ import {
   type WorkspaceSnapshot,
 } from '../files/artifacts.js';
 import {
-  type BrainSnapshotEntry,
-  captureBrainSnapshot,
-  extractCandidatePathsFromText,
-  extractCandidatePathsFromToolCalls,
+  detectContentFileType,
   formatFileLink,
-  rewriteInternalFileReference,
-  importAuthorizedBrainFileToWorkspace,
   normalizeLinkCandidatePath,
-  InternalPathStreamRewriter,
-  resolveAuthorizedBrainFile,
-  rewriteInternalPathsToWorkspace,
-  scrubToolCallsInternalPaths,
-  type SyncedBrainFile,
-  syncNewBrainFilesToWorkspace,
+  resolveArtifactFile,
+  resolveAuthorizedChatFileReference,
 } from '../files/link-resolver.js';
 import {
   detectMimeAndPreviewKind,
@@ -322,15 +313,12 @@ interface ActiveTurnBridge {
   assistantMessageId: string;
   contentText: string;
   thoughtsText: string;
-  pathStreams: Map<string, InternalPathStreamRewriter>;
   toolCalls: ToolCallItem[];
   sessionMessages: SessionMessageItem[];
   lastDbFlushAt: number;
   pendingResolvers: Map<string, (outcome: RequestPermissionResponse) => void>;
   beforeWorkspaceSnap: WorkspaceSnapshot;
-  brainSnapshot: Map<string, BrainSnapshotEntry>;
   emittedArtifactIds: Set<string>;
-  syncedBrainFiles: Map<string, SyncedBrainFile & { delivered: boolean }>;
   lastActivityAt: number;
   subagents: Map<string, TrackedSubagentState>;
   asyncSubagentToolIds: Set<string>;
@@ -902,7 +890,6 @@ export class AcpClientManager {
 
     const beforeSkillsSig = captureWorkspaceSkillsSignature(chat.workspaceDir);
     const beforeSnap = captureWorkspaceSnapshot(chat.workspaceDir);
-    const brainSnapshot = captureBrainSnapshot(worker.profileDir, chat.workspaceDir);
     const nowInit = Date.now();
     const bridge: ActiveTurnBridge = {
       runId: params.runId,
@@ -911,15 +898,12 @@ export class AcpClientManager {
       assistantMessageId: params.assistantMessageId,
       contentText: '',
       thoughtsText: '',
-      pathStreams: new Map(),
       toolCalls: [],
       sessionMessages: [],
       lastDbFlushAt: nowInit,
       pendingResolvers: new Map(),
       beforeWorkspaceSnap: beforeSnap,
-      brainSnapshot,
       emittedArtifactIds: new Set(),
-      syncedBrainFiles: new Map(),
       lastActivityAt: nowInit,
       subagents: new Map(),
       asyncSubagentToolIds: new Set(),
@@ -950,9 +934,11 @@ export class AcpClientManager {
 
       for (const att of params.attachments) {
         try {
-          const { absPath, relPath } = resolveContainedExistingPath(chat.workspaceDir, att.relPath);
+          const file = resolveArtifactFile(this.db, chat, att);
+          if (!file) continue;
+          const { absPath, relPath } = file;
           const acpFilePath = worker.sandboxed
-            ? path.posix.join(worker.sandboxWorkspaceRoot, relPath)
+            ? path.posix.resolve(worker.sandboxWorkspaceRoot, relPath)
             : absPath;
           if (att.previewKind === 'image' && worker.init.agentCapabilities?.promptCapabilities?.image) {
             const b64 = fs.readFileSync(absPath).toString('base64');
@@ -990,69 +976,8 @@ export class AcpClientManager {
       // Yield to macrotask queue so any notifications queued in the same stdio frame are processed
       await new Promise((r) => setImmediate(r));
 
-      this.flushParentPathStreams(worker, bridge);
-      this.syncBrainDeliverablesMidTurn(worker, bridge);
-
-      // Scrub any internal brain/profile paths in toolCalls and contentText into /workspace/generated/...
-      bridge.toolCalls = scrubToolCallsInternalPaths(
-        bridge.toolCalls,
-        worker.profileDir,
-        chat.workspaceDir
-      );
-      bridge.contentText = rewriteInternalPathsToWorkspace(
-        bridge.contentText,
-        worker.profileDir,
-        chat.workspaceDir
-      );
-
-      // Ensure every newly synced brain deliverable is referenced in the assistant message
-      for (const synced of bridge.syncedBrainFiles.values()) {
-        if (
-          !bridge.contentText.includes(synced.filename) &&
-          !bridge.contentText.includes(synced.workspaceRelPath)
-        ) {
-          const { previewKind } = detectMimeAndPreviewKind(synced.filename);
-          const snippet = previewKind === 'image' || previewKind === 'svg'
-            ? `\n\n${formatFileLink(synced.filename, synced.workspaceRelPath, true)}\n\n保存先: ${formatFileLink(synced.filename, synced.workspaceRelPath)}`
-            : `\n\n成果物を保存しました: ${formatFileLink(synced.filename, synced.workspaceRelPath)}`;
-          this.appendTurnContentChunk(worker, bridge, snippet);
-        }
-      }
-
-      // Collect tool-referenced locations and any authorized profile brain assets mentioned by the agent
-      const hintPaths: string[] = [...bridge.syncedBrainFiles.values()].map((s) => s.workspaceRelPath);
-      const candidatePaths = new Set<string>();
-      for (const tc of bridge.toolCalls) {
-        for (const loc of tc.locations ?? []) {
-          candidatePaths.add(loc.path);
-          const hostHint = toHostWorkspacePath(worker.workspaceDir, worker.sandboxWorkspaceRoot, loc.path);
-          if (hostHint) hintPaths.push(hostHint);
-        }
-      }
-      for (const extracted of extractCandidatePathsFromToolCalls(bridge.toolCalls)) {
-        candidatePaths.add(extracted);
-      }
-      for (const extracted of extractCandidatePathsFromText(bridge.contentText)) {
-        candidatePaths.add(extracted);
-      }
-
-      for (const candidatePath of candidatePaths) {
-        const brainFile = resolveAuthorizedBrainFile({
-          profileDir: worker.profileDir,
-          workspaceDir: chat.workspaceDir,
-          candidatePath,
-        });
-        if (!brainFile) continue;
-        try {
-          const imported = importAuthorizedBrainFileToWorkspace({
-            workspaceDir: chat.workspaceDir,
-            sourceAbsPath: brainFile.absPath,
-          });
-          hintPaths.push(imported.relPath);
-        } catch {
-          // ignore unreadable brain asset
-        }
-      }
+      const hintPaths = bridge.toolCalls.flatMap(tool => (tool.locations ?? [])
+        .map(location => toHostWorkspacePath(worker.workspaceDir, worker.sandboxWorkspaceRoot, location.path)));
 
       const newArtifacts = syncWorkspaceChangesAsArtifacts({
         db: this.db,
@@ -1071,7 +996,7 @@ export class AcpClientManager {
         thoughtsText: bridge.thoughtsText,
         toolCalls: bridge.toolCalls,
         sessionMessages: bridge.sessionMessages,
-        artifactIds: newArtifacts.map((a) => a.id),
+        artifactIds: [...new Set([...bridge.emittedArtifactIds, ...newArtifacts.map(a => a.id)])],
         status: finalStatus,
       })!;
 
@@ -1129,7 +1054,6 @@ export class AcpClientManager {
       bridge.initialPromptDone = true;
       bridge.parentState = 'idle';
       // Flush partial work even on error so nothing streamed so far is lost
-      this.flushParentPathStreams(worker, bridge);
       this.db.updateMessage(params.userId, params.assistantMessageId, {
         contentText: bridge.contentText,
         thoughtsText: bridge.thoughtsText,
@@ -1280,8 +1204,6 @@ export class AcpClientManager {
         workerRef.lastUsedAt = Date.now();
         workerRef.lastBackgroundActivityAt = Date.now();
 
-        // First sync any newly generated brain files into /workspace/generated/
-        this.syncBrainDeliverablesMidTurn(workerRef, turn);
 
         const prefs = this.db.getPreferences(turn.userId);
 
@@ -1313,7 +1235,7 @@ export class AcpClientManager {
           kind: params.toolCall.kind ?? undefined,
           rawInput: params.toolCall.rawInput,
         });
-        const rawToolCall: ToolCallItem = {
+        const toolCall: ToolCallItem = {
           toolCallId: params.toolCall.toolCallId,
           title: params.toolCall.title ?? 'ツール実行の許可',
           ...((params.toolCall as { name?: string }).name
@@ -1327,11 +1249,6 @@ export class AcpClientManager {
           rawInput: params.toolCall.rawInput,
           locations: (params.toolCall.locations ?? []).map((l) => ({ path: l.path, line: l.line })),
         };
-        const [toolCall] = scrubToolCallsInternalPaths(
-          [rawToolCall],
-          workerRef.profileDir,
-          workerRef.workspaceDir
-        );
         const options = params.options.map((o) => ({
           optionId: o.optionId,
           name: o.name,
@@ -1595,28 +1512,11 @@ export class AcpClientManager {
     return workerRef;
   }
 
-  private rewriteStreamChunk(
-    worker: WorkerInstance,
-    turn: ActiveTurnBridge,
-    key: string,
-    chunk: string,
-    final = false
-  ): string {
-    let stream = turn.pathStreams.get(key);
-    if (!stream) {
-      stream = new InternalPathStreamRewriter(worker.profileDir, worker.workspaceDir);
-      turn.pathStreams.set(key, stream);
-    }
-    return stream.write(chunk, final);
-  }
-
   private appendTurnThoughtChunk(
     worker: WorkerInstance,
     turn: ActiveTurnBridge,
-    rawChunk: string,
-    final = false
+    chunk: string
   ): void {
-    const chunk = this.rewriteStreamChunk(worker, turn, 'thoughts', rawChunk, final);
     if (!chunk) return;
     const offset = turn.thoughtsText.length;
     turn.thoughtsText += chunk;
@@ -1630,18 +1530,11 @@ export class AcpClientManager {
     this.maybeFlushTurnProgress(turn);
   }
 
-  private flushParentPathStreams(worker: WorkerInstance, turn: ActiveTurnBridge): void {
-    this.appendTurnContentChunk(worker, turn, '', true);
-    this.appendTurnThoughtChunk(worker, turn, '', true);
-  }
-
   private appendTurnContentChunk(
     worker: WorkerInstance,
     turn: ActiveTurnBridge,
-    rawChunk: string,
-    final = false
+    chunk: string
   ): void {
-    const chunk = this.rewriteStreamChunk(worker, turn, 'content', rawChunk, final);
     if (!chunk) return;
     const offset = turn.contentText.length;
     turn.contentText += chunk;
@@ -1682,47 +1575,21 @@ export class AcpClientManager {
       if (!fs.existsSync(target.absPath) || sha256File(target.absPath) !== hash) {
         fs.writeFileSync(target.absPath, data);
       }
-      this.registerAndEmitSyncedWorkspaceFile(worker, turn, {
-        brainAbsPath: target.absPath,
-        relUnderBrain: filename,
-        workspaceAbsPath: target.absPath,
-        workspaceRelPath: target.relPath,
-        filename,
-        mimeType,
-      });
+      this.publishArtifactReference(turn, target.relPath, filename, mimeType);
       return target.relPath;
     } catch {
       return null;
     }
   }
 
-  private contentFileType(filename: string, declaredMime?: string | null): ReturnType<typeof detectMimeAndPreviewKind> {
-    if (!declaredMime || declaredMime === 'application/octet-stream') {
-      return detectMimeAndPreviewKind(filename);
-    }
-    const extension = mime.extension(declaredMime) || 'bin';
-    const detected = detectMimeAndPreviewKind(`content.${extension}`, declaredMime);
-    return { ...detected, mimeType: declaredMime };
-  }
-
-  /** Present every ACP file block through the same storage/link path in every channel. */
+  /** Use the supplied file reference when present and persist inline-only bytes. */
   private renderContentBlock(worker: WorkerInstance, turn: ActiveTurnBridge, block: ContentBlock): string {
     if (block.type === 'text') return block.text;
     if (block.type === 'resource_link') {
-      const reference = rewriteInternalFileReference(block.uri, worker.profileDir, worker.workspaceDir);
+      const reference = block.uri;
       const filename = block.name || path.basename(normalizeLinkCandidatePath(reference) ?? reference);
-      const { previewKind } = this.contentFileType(filename, block.mimeType);
-      try {
-        const candidate = toHostWorkspacePath(worker.workspaceDir, SANDBOX_WORKSPACE_MOUNT, reference);
-        const resolved = resolveContainedExistingPath(worker.workspaceDir, candidate);
-        this.registerAndEmitSyncedWorkspaceFile(worker, turn, {
-          brainAbsPath: resolved.absPath, relUnderBrain: filename,
-          workspaceAbsPath: resolved.absPath, workspaceRelPath: resolved.relPath,
-          filename, mimeType: block.mimeType ?? undefined,
-        });
-      } catch {
-        // External URLs and unavailable files remain links; no file is imported outside the workspace.
-      }
+      const { previewKind } = detectContentFileType(filename, block.mimeType);
+      this.publishArtifactReference(turn, reference, filename, block.mimeType);
       return `\n${formatFileLink(filename, reference, previewKind === 'image' || previewKind === 'svg')}\n`;
     }
     let data: Buffer;
@@ -1731,10 +1598,17 @@ export class AcpClientManager {
     if (block.type === 'resource') {
       const resource = block.resource;
       if (!resource || (!('text' in resource) && !('blob' in resource))) return '';
-      data = 'text' in resource ? Buffer.from(resource.text, 'utf8') : Buffer.from(resource.blob, 'base64');
       mimeType = resource.mimeType || ('text' in resource ? 'text/plain' : 'application/octet-stream');
       try { filename = decodeURIComponent(path.posix.basename(new URL(resource.uri).pathname)); } catch { /* Use a MIME-derived name. */ }
+      if (this.publishArtifactReference(turn, resource.uri, filename, mimeType)) {
+        const { previewKind } = detectContentFileType(filename || resource.uri, mimeType);
+        return `\n${formatFileLink(filename || resource.uri, resource.uri, previewKind === 'image' || previewKind === 'svg')}\n`;
+      }
+      data = 'text' in resource ? Buffer.from(resource.text, 'utf8') : Buffer.from(resource.blob, 'base64');
     } else if (block.type === 'image' || block.type === 'audio') {
+      if (block.type === 'image' && block.uri && this.publishArtifactReference(turn, block.uri, undefined, block.mimeType)) {
+        return `\n${formatFileLink('生成画像', block.uri, true)}\n`;
+      }
       if (typeof block.data !== 'string') return '';
       data = Buffer.from(block.data, 'base64');
       mimeType = block.mimeType;
@@ -1744,127 +1618,34 @@ export class AcpClientManager {
     const relPath = this.saveInlineAssetToWorkspace(worker, turn, data, mimeType, filename);
     if (!relPath) return '';
     const label = filename || (block.type === 'image' ? '生成画像' : path.basename(relPath));
-    const { previewKind } = this.contentFileType(filename || relPath, mimeType);
+    const { previewKind } = detectContentFileType(filename || relPath, mimeType);
     return `\n${formatFileLink(label, relPath, previewKind === 'image' || previewKind === 'svg')}\n`;
   }
 
-  private registerAndEmitSyncedWorkspaceFile(
-    worker: WorkerInstance,
-    turn: ActiveTurnBridge,
-    item: SyncedBrainFile
-  ): boolean {
-    let artifactId: string | null = null;
-    const pending = item.mimeType ? item : (turn.syncedBrainFiles.get(item.workspaceRelPath) ?? item);
-    turn.syncedBrainFiles.set(item.workspaceRelPath, { ...pending, delivered: false });
-    try {
-      const stat = fs.statSync(item.workspaceAbsPath);
-      if (!stat.isFile()) return false;
-      const fileSha = sha256File(item.workspaceAbsPath);
-      const existing = this.db.findArtifactByRelPath(
-        worker.userId,
-        worker.chatId,
-        item.workspaceRelPath
-      );
-      const filename = pending?.filename ?? existing?.filename ?? item.filename;
-      const { mimeType, previewKind } = pending?.mimeType
-        ? this.contentFileType(filename, pending.mimeType)
-        : existing ?? detectMimeAndPreviewKind(filename);
-      turn.syncedBrainFiles.set(item.workspaceRelPath, { ...pending, filename, delivered: false });
-      const artifact = this.db.upsertArtifact({
-        id: existing?.id ?? crypto.randomUUID(),
-        userId: worker.userId,
-        chatId: worker.chatId,
-        messageId: turn.assistantMessageId,
-        runId: turn.runId,
-        relPath: item.workspaceRelPath,
-        filename,
-        mimeType,
-        sizeBytes: stat.size,
-        sha256: fileSha,
-        source: 'generated',
-        previewKind,
-        diffPatch: null,
-        minUpdatedAt: stat.mtimeMs,
-      });
-      artifactId = artifact.id;
-      if (
-        !turn.emittedArtifactIds.has(artifact.id) ||
-        (existing && (existing.sha256 !== artifact.sha256 || existing.mimeType !== artifact.mimeType ||
-          existing.previewKind !== artifact.previewKind || existing.filename !== artifact.filename))
-      ) {
-        this.hub.emitDurable({
-          userId: worker.userId,
-          type: 'artifact.created',
-          chatId: worker.chatId,
-          runId: turn.runId,
-          payload: { artifact },
-        });
-        turn.emittedArtifactIds.add(artifact.id);
-      }
-      turn.syncedBrainFiles.set(item.workspaceRelPath, { ...pending, filename, delivered: true });
-      return true;
-    } catch {
-      if (artifactId) turn.emittedArtifactIds.delete(artifactId);
-      return false;
-    }
-  }
-
-  private retryPendingWorkspaceFiles(worker: WorkerInstance, turn: ActiveTurnBridge): void {
-    for (const file of turn.syncedBrainFiles.values()) {
-      if (!file.delivered) this.registerAndEmitSyncedWorkspaceFile(worker, turn, file);
-    }
-  }
-
-  private syncBrainDeliverablesMidTurn(
-    worker: WorkerInstance,
-    turn: ActiveTurnBridge
-  ): SyncedBrainFile[] {
-    this.retryPendingWorkspaceFiles(worker, turn);
-    const newlySynced = syncNewBrainFilesToWorkspace({
-      profileDir: worker.profileDir,
-      workspaceDir: worker.workspaceDir,
-      snapshot: turn.brainSnapshot,
-      register: (file) => this.registerAndEmitSyncedWorkspaceFile(worker, turn, file),
+  private publishArtifactReference(turn: ActiveTurnBridge, reference: string, label?: string, mimeType?: string | null): boolean {
+    const resolved = resolveAuthorizedChatFileReference({
+      db: this.db,
+      userId: turn.userId,
+      chatId: turn.chatId,
+      messageId: turn.assistantMessageId,
+      runId: turn.runId,
+      reference,
+      label,
+      mimeType,
     });
-
-    // Also inspect any explicit paths mentioned in toolCalls so far
-    const candidates = new Set<string>([
-      ...extractCandidatePathsFromToolCalls(turn.toolCalls),
-      ...extractCandidatePathsFromText(turn.contentText),
-    ]);
-    for (const tc of turn.toolCalls) {
-      for (const loc of tc.locations ?? []) {
-        if (loc.path) candidates.add(loc.path);
-      }
-    }
-
-    for (const candidatePath of candidates) {
-      const brainFile = resolveAuthorizedBrainFile({
-        profileDir: worker.profileDir,
-        workspaceDir: worker.workspaceDir,
-        candidatePath,
+    if (!resolved) return false;
+    const { artifact } = resolved;
+    if (!turn.emittedArtifactIds.has(artifact.id)) {
+      turn.emittedArtifactIds.add(artifact.id);
+      this.hub.emitDurable({
+        userId: turn.userId,
+        chatId: turn.chatId,
+        runId: turn.runId,
+        type: 'artifact.created',
+        payload: { artifact },
       });
-      if (!brainFile) continue;
-      try {
-        const imported = importAuthorizedBrainFileToWorkspace({
-          workspaceDir: worker.workspaceDir,
-          sourceAbsPath: brainFile.absPath,
-        });
-        const item: SyncedBrainFile = {
-          brainAbsPath: brainFile.absPath,
-          relUnderBrain: brainFile.relUnderBrain,
-          workspaceAbsPath: imported.absPath,
-          workspaceRelPath: imported.relPath,
-          filename: path.basename(imported.relPath),
-        };
-        this.registerAndEmitSyncedWorkspaceFile(worker, turn, item);
-        newlySynced.push(item);
-      } catch {
-        // ignore
-      }
     }
-
-    return newlySynced;
+    return true;
   }
 
   private extractToolCallContentAndSaveAssets(
@@ -1880,16 +1661,11 @@ export class AcpClientManager {
       if (entry.type === 'content' && entry.content && typeof entry.content === 'object') {
         textParts.push(this.renderContentBlock(worker, turn, entry.content as ContentBlock));
       } else if (entry.type === 'diff' && typeof entry.path === 'string') {
-        const cleanPath = rewriteInternalFileReference(
-          entry.path,
-          worker.profileDir,
-          worker.workspaceDir
-        );
-        textParts.push(`Diff: ${cleanPath}`);
+        textParts.push(`Diff: ${entry.path}`);
       }
     }
     return textParts.length > 0
-      ? rewriteInternalPathsToWorkspace(textParts.join('\n'), worker.profileDir, worker.workspaceDir).trim()
+      ? textParts.join('\n').trim()
       : undefined;
   }
 
@@ -2059,13 +1835,8 @@ export class AcpClientManager {
         ? params.description ?? undefined
         : existingTrack?.description;
 
-    const final = params.state === 'idle' || Boolean(params.stopReason);
-    const nextThoughts = (existingTrack?.thoughtsText ?? '') + this.rewriteStreamChunk(
-      worker, turn, `child:${params.subSessionId}:thoughts`, params.thoughtsDelta ?? '', final
-    );
-    const nextContent = (existingTrack?.contentText ?? '') + this.rewriteStreamChunk(
-      worker, turn, `child:${params.subSessionId}:content`, params.contentDelta ?? '', final
-    );
+    const nextThoughts = (existingTrack?.thoughtsText ?? '') + (params.thoughtsDelta ?? '');
+    const nextContent = (existingTrack?.contentText ?? '') + (params.contentDelta ?? '');
     const nextChildTools = existingTrack ? [...existingTrack.toolCalls] : [];
     if (params.childToolCall) {
       const cIdx = nextChildTools.findIndex(
@@ -2170,7 +1941,6 @@ export class AcpClientManager {
         state: resolvedState,
         stopReason: stateObj.stopReason,
       });
-      this.syncBrainDeliverablesMidTurn(worker, turn);
       return;
     }
 
@@ -2180,7 +1950,6 @@ export class AcpClientManager {
         turn,
         (update as { content?: unknown }).content
       );
-      this.syncBrainDeliverablesMidTurn(worker, turn);
       const existingTrack = turn.subagents.get(childSessionId);
       const prevChildTool = existingTrack?.toolCalls.find(
         (c) => c.toolCallId === update.toolCallId
@@ -2225,7 +1994,7 @@ export class AcpClientManager {
       };
       this.upsertSubagentToolCall(worker, turn, {
         subSessionId: childSessionId,
-        childToolCall: scrubToolCallsInternalPaths([childTool], worker.profileDir, worker.workspaceDir)[0],
+        childToolCall: childTool,
       });
       return;
     }
@@ -2243,7 +2012,6 @@ export class AcpClientManager {
         subSessionId: childSessionId,
         contentDelta: this.renderContentBlock(worker, turn, update.content),
       });
-      this.syncBrainDeliverablesMidTurn(worker, turn);
     }
   }
 
@@ -2252,10 +2020,7 @@ export class AcpClientManager {
     turn: ActiveTurnBridge,
     blocks: ContentBlock[]
   ): string {
-    return rewriteInternalPathsToWorkspace(
-      blocks.map(block => this.renderContentBlock(worker, turn, block)).join(''),
-      worker.profileDir, worker.workspaceDir
-    );
+    return blocks.map(block => this.renderContentBlock(worker, turn, block)).join('');
   }
 
   private handleInterSessionMessageNotification(
@@ -2277,7 +2042,6 @@ export class AcpClientManager {
     if (rawUpdateType === 'session_message') {
       let nextContent = existing?.contentText ?? '';
       if ('content' in rawUpdate) {
-        turn.pathStreams.delete(`session:${messageId}`);
         if (rawUpdate.content === null || (Array.isArray(rawUpdate.content) && rawUpdate.content.length === 0)) {
           nextContent = '';
         } else if (Array.isArray(rawUpdate.content)) {
@@ -2287,8 +2051,6 @@ export class AcpClientManager {
             rawUpdate.content as ContentBlock[]
           );
         }
-      } else if (rawUpdate.done === true) {
-        nextContent += this.rewriteStreamChunk(worker, turn, `session:${messageId}`, '', true);
       }
       const item: SessionMessageItem = {
         messageId,
@@ -2320,16 +2082,13 @@ export class AcpClientManager {
       const rawChunk = chunkBlock?.type === 'text'
         ? chunkBlock.text
         : chunkBlock ? this.extractContentBlocksText(worker, turn, [chunkBlock]) : '';
-      const chunkText = this.rewriteStreamChunk(
-        worker, turn, `session:${messageId}`, rawChunk, rawUpdate.done === true
-      );
       const item: SessionMessageItem = {
         messageId,
         senderSessionId: existing?.senderSessionId ?? (typeof rawUpdate.senderSessionId === 'string' ? rawUpdate.senderSessionId : undefined),
         recipientSessionId: existing?.recipientSessionId,
         senderMessageId: existing?.senderMessageId,
         recipientMessageId: existing?.recipientMessageId,
-        contentText: (existing?.contentText ?? '') + chunkText,
+        contentText: (existing?.contentText ?? '') + rawChunk,
         done: rawUpdate.done === true ? true : existing?.done ?? false,
         updatedAt: now,
       };
@@ -2360,7 +2119,6 @@ export class AcpClientManager {
     if (!latestAssistant) return null;
 
     const beforeWorkspaceSnap = captureWorkspaceSnapshot(worker.workspaceDir);
-    const brainSnapshot = captureBrainSnapshot(worker.profileDir, worker.workspaceDir);
     const bridge: ActiveTurnBridge = {
       runId: latestAssistant.runId ?? '',
       userId: worker.userId,
@@ -2368,15 +2126,12 @@ export class AcpClientManager {
       assistantMessageId: latestAssistant.id,
       contentText: latestAssistant.contentText,
       thoughtsText: latestAssistant.thoughtsText,
-      pathStreams: new Map(),
       toolCalls: [...latestAssistant.toolCalls],
       sessionMessages: [...(latestAssistant.sessionMessages ?? [])],
       lastDbFlushAt: 0,
       pendingResolvers: new Map(),
       beforeWorkspaceSnap,
-      brainSnapshot,
       emittedArtifactIds: new Set(latestAssistant.artifactIds),
-      syncedBrainFiles: new Map(),
       lastActivityAt: Date.now(),
       subagents: new Map(),
       asyncSubagentToolIds: new Set(),
@@ -2398,10 +2153,7 @@ export class AcpClientManager {
     worker: WorkerInstance,
     bridge: ActiveTurnBridge
   ): void {
-    this.retryPendingWorkspaceFiles(worker, bridge);
-    const hintPaths = [...bridge.syncedBrainFiles.values()].map((s) => s.workspaceRelPath);
-    const anotherTurnActive = Boolean(worker.activeTurn && worker.activeTurn !== bridge);
-    if (anotherTurnActive && hintPaths.length === 0) {
+    if (worker.activeTurn && worker.activeTurn !== bridge) {
       return;
     }
     const newArtifacts = syncWorkspaceChangesAsArtifacts({
@@ -2411,10 +2163,7 @@ export class AcpClientManager {
       workspaceDir: worker.workspaceDir,
       messageId: bridge.assistantMessageId,
       runId: bridge.runId || null,
-      before: anotherTurnActive
-        ? captureWorkspaceSnapshot(worker.workspaceDir)
-        : bridge.beforeWorkspaceSnap,
-      hintPaths,
+      before: bridge.beforeWorkspaceSnap,
       skipIfAlreadyOwnedByOtherMessage: true,
     });
     for (const art of newArtifacts) {
@@ -2569,7 +2318,6 @@ export class AcpClientManager {
         state: resolvedSubState,
         stopReason: subStateObj?.stopReason,
       });
-      this.syncBrainDeliverablesMidTurn(worker, turn);
       finalizeIfBackground(resolvedSubState === 'idle');
       return;
     }
@@ -2627,9 +2375,6 @@ export class AcpClientManager {
           worker.backgroundBridge.backgroundWorkCount = 0;
         }
       }
-      if (stateObj.state === 'idle') {
-        this.flushParentPathStreams(worker, turn);
-      }
       if (stateObj.state) {
         turn.parentState = stateObj.state;
         if (stateObj.state === 'idle') {
@@ -2646,15 +2391,12 @@ export class AcpClientManager {
         turn.initialPromptDone
       ) {
         turn.parentWakeupStarted = true;
-      } else if (stateObj.state === 'idle' && turn.initialPromptDone) {
-        this.syncBrainDeliverablesMidTurn(worker, turn);
       }
       finalizeIfBackground(stateObj.state === 'idle');
       return;
     }
 
     if (rawUpdateType === 'session_message' || rawUpdateType === 'session_message_chunk') {
-      this.syncBrainDeliverablesMidTurn(worker, turn);
       this.handleInterSessionMessageNotification(worker, turn, rawUpdateType, rawUpdate);
       finalizeIfBackground(rawUpdateType === 'session_message' || Boolean(rawUpdate.done));
       return;
@@ -2679,7 +2421,6 @@ export class AcpClientManager {
       turn.parentState = 'running';
       if (!turn.parentWakeupStarted) {
         turn.parentWakeupStarted = true;
-        this.syncBrainDeliverablesMidTurn(worker, turn);
       }
     }
 
@@ -2730,7 +2471,7 @@ export class AcpClientManager {
         (s) => s.toolCallId === update.toolCallId
       );
 
-      const nextToolRaw: ToolCallItem = {
+      const nextTool: ToolCallItem = {
         toolCallId: update.toolCallId,
         title: update.title,
         ...(rawName ? { name: rawName } : {}),
@@ -2753,16 +2494,10 @@ export class AcpClientManager {
         locations: update.locations?.map((l) => ({ path: l.path, line: l.line })),
         ...(contentText ? { contentText } : {}),
       };
-      const [nextTool] = scrubToolCallsInternalPaths(
-        [nextToolRaw],
-        worker.profileDir,
-        worker.workspaceDir
-      );
       const idx = turn.toolCalls.findIndex((t) => t.toolCallId === nextTool.toolCallId);
       if (idx >= 0) turn.toolCalls[idx] = nextTool;
       else turn.toolCalls.push(nextTool);
 
-      this.syncBrainDeliverablesMidTurn(worker, turn);
 
       this.db.updateMessage(turn.userId, turn.assistantMessageId, { toolCalls: turn.toolCalls });
       this.hub.emitEphemeral({
@@ -2828,16 +2563,11 @@ export class AcpClientManager {
           : {}),
         ...(contentText ? { contentText } : {}),
       };
-      const [merged] = scrubToolCallsInternalPaths(
-        [mergedRaw],
-        worker.profileDir,
-        worker.workspaceDir
-      );
+      const merged = mergedRaw;
       const nextIdx = turn.toolCalls.findIndex((t) => t.toolCallId === update.toolCallId);
       if (nextIdx >= 0) turn.toolCalls[nextIdx] = merged;
       else turn.toolCalls.push(merged);
 
-      this.syncBrainDeliverablesMidTurn(worker, turn);
 
       this.db.updateMessage(turn.userId, turn.assistantMessageId, { toolCalls: turn.toolCalls });
       this.hub.emitEphemeral({

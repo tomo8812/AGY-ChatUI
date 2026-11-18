@@ -56,7 +56,7 @@ To safely isolate Web users **without touching `agy` internals**:
 
 ## 5. Multi-Format Previews & Path Security
 
-- **Workspaces & Artifacts**: Every `(userId, chatId)` receives an isolated folder `DATA_ROOT/workspaces/<userId>/<chatId>`.
+- **Workspaces & Artifacts**: Every `(userId, chatId)` receives an isolated workspace at `DATA_ROOT/workspaces/<userId>/<chatId>`. ChatUI renders links to files in that workspace and the chat's Antigravity `brain`, `scratch`, and `playground` directories. The file endpoints read from those directories directly. ACP payloads delivered only as inline bytes are saved for preview and download.
 - **Project Shared Files**: Uploaded read-only to `DATA_ROOT/projects/<userId>/<projectId>/files`. When a chat joins/starts in a project or the user explicitly clicks 「共有資料を最新化」, files are copied using CoW (`fs.copyFileSync` / `--reflink=auto` style) into `<workspace>/.project-context/` (or explicit sync folder) and tracked by `project_context_version` so edits inside a chat never alter the project originals or peer chats.
 - **Path Containment**: All reads, downloads, and markdown file-link resolutions resolve via `fs.realpathSync` and reject any target outside the authorized `(userId, chatId)` workspace root (`403 Forbidden`).
 - **Active Content Sandboxing**: HTML/JS artifacts render inside `<iframe sandbox="allow-scripts">` (specifically **omitting `allow-same-origin`** so the artifact origin is opaque and cannot read Web cookies or call APIs) accompanied by strict CSP headers when served from `/api/files/:id/sandbox`. SVGs are sanitized with DOMPurify and rendered inside `<img>` / sanitized viewer rather than inline DOM injection.

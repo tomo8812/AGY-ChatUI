@@ -1,20 +1,11 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { normalizeClientLinkReference } from '../../web/src/utils/viewerCache';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { getChatBrainHostDir } from '../src/acp/env-isolation.js';
-import {
-  captureBrainSnapshot,
-  extractCandidatePathsFromText,
-  InternalPathStreamRewriter,
-  normalizeLinkCandidatePath,
-  rewriteInternalFileReference,
-  rewriteInternalPathsToWorkspace,
-  scrubToolCallsInternalPaths,
-  syncNewBrainFilesToWorkspace,
-} from '../src/files/link-resolver.js';
+import { normalizeLinkCandidatePath } from '../src/files/link-resolver.js';
+import type { ArtifactRecord } from '../src/types.js';
 import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
 
 const cleanups: Array<() => void | Promise<void>> = [];
@@ -22,184 +13,55 @@ afterEach(async () => {
   while (cleanups.length) await cleanups.pop()!();
 });
 
-function fixture() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-stream-links-'));
-  cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }));
-  const profile = path.join(root, 'profile');
-  const workspace = path.join(root, 'workspace');
-  const brain = path.join(getChatBrainHostDir(profile, workspace), 'session-1');
-  fs.mkdirSync(brain, { recursive: true });
-  fs.mkdirSync(workspace, { recursive: true });
-  fs.writeFileSync(path.join(brain, 'miffy.jpg'), 'image bytes');
-  return { profile, workspace };
-}
-
-describe('streamed generated file links', () => {
-  it('reuses one import for plain and URI references to the same file within a rewrite', () => {
-    const { profile, workspace } = fixture();
-    const source = path.join(getChatBrainHostDir(profile, workspace), 'session-1', 'miffy.jpg');
-    const destination = path.join(workspace, 'generated/miffy.jpg');
-    const text = `${source} [image](${pathToFileURL(source).href})`;
-    const expected = '/workspace/generated/miffy.jpg [image](file:///workspace/generated/miffy.jpg)';
-    const opened = vi.spyOn(fs, 'openSync');
-    try {
-      expect(rewriteInternalPathsToWorkspace(text, profile, workspace)).toBe(expected);
-      expect(opened.mock.calls.filter(([file]) => file === source || file === destination)).toHaveLength(0);
-      expect(rewriteInternalPathsToWorkspace(text, profile, workspace)).toBe(expected);
-      expect(opened.mock.calls.filter(([file]) => file === source)).toHaveLength(1);
-      expect(opened.mock.calls.filter(([file]) => file === destination)).toHaveLength(1);
-    } finally {
-      opened.mockRestore();
-    }
-  });
-
-  it('rewrites paths at every split position, including file URI prefixes and brain directories', () => {
-    const { profile, workspace } = fixture();
-    for (const reference of [
-      '/home/sandbox/.gemini/antigravity-cli/brain/session-1/miffy.jpg',
-      'file:///home/sandbox/.gemini/antigravity-cli/brain/session-1/miffy.jpg',
-      'file:///home/sandbox/.gemini/antigravity-cli/brain/session-1/%6Diffy.jpg',
-    ]) {
-      const text = `画像: ![Miffy](${reference}) 保存先: [miffy.jpg](${reference})`;
-      const target = `${reference.startsWith('file:') ? 'file://' : ''}/workspace/generated/miffy.jpg`;
-      const expected = `画像: ![Miffy](${target}) 保存先: [miffy.jpg](${target})`;
-      const resetGenerated = () => fs.rmSync(path.join(workspace, 'generated'), { recursive: true, force: true });
-      const expectImported = () => expect(fs.readFileSync(path.join(workspace, 'generated/miffy.jpg'), 'utf8')).toBe('image bytes');
-      for (let split = 1; split < text.length; split++) {
-        resetGenerated();
-        const stream = new InternalPathStreamRewriter(profile, workspace);
-        const actual = stream.write(text.slice(0, split)) + stream.write(text.slice(split)) + stream.write('', true);
-        expect(actual, `split ${split} in ${reference}`).toBe(expected);
-        expectImported();
-      }
-      resetGenerated();
-      const stream = new InternalPathStreamRewriter(profile, workspace);
-      expect([...text].map(char => stream.write(char)).join('') + stream.write('', true)).toBe(expected);
-      expectImported();
-    }
-    expect(fs.readFileSync(path.join(workspace, 'generated/miffy.jpg'), 'utf8')).toBe('image bytes');
-  });
-
-  it('keeps inline Markdown destinations together across whitespace and parenthesis chunk boundaries', () => {
-    const { profile, workspace } = fixture();
-    for (const [filename, angled] of [['report final.png', true], ['report final.png', false], ['report(v1).pdf', false]] as const) {
-      fs.writeFileSync(path.join(getChatBrainHostDir(profile, workspace), 'session-1', filename), 'destination bytes');
-      const source = `/home/sandbox/.gemini/antigravity-cli/brain/session-1/${filename}`;
-      const target = `file:///workspace/generated/${encodeURIComponent(filename).replace(/[()]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)}`;
-      const text = `![result](${angled ? `<${source}>` : source} "Title")`;
-      const expected = `![result](${angled ? `<${target}>` : target} "Title")`;
-      for (let split = 1; split < text.length; split++) {
-        fs.rmSync(path.join(workspace, 'generated'), { recursive: true, force: true });
-        const stream = new InternalPathStreamRewriter(profile, workspace);
-        expect(stream.write(text.slice(0, split)) + stream.write(text.slice(split)) + stream.write('', true), `split ${split}`).toBe(expected);
-        expect(fs.readFileSync(path.join(workspace, 'generated', filename), 'utf8')).toBe('destination bytes');
-      }
-    }
-  });
-
-  it('preserves balanced filename delimiters in bare references and candidate extraction', () => {
-    const { profile, workspace } = fixture();
-    for (const filename of ['report(v1).pdf', 'report[final].png', 'report([draft]).zip']) {
-      fs.writeFileSync(path.join(getChatBrainHostDir(profile, workspace), 'session-1', filename), 'bare path bytes');
-      const source = `/home/sandbox/.gemini/antigravity-cli/brain/session-1/${filename}`;
-      const encoded = encodeURIComponent(filename).replace(/[()]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
-      for (const reference of [source, `file://${source}`]) {
-        const text = `result: (${reference}).`;
-        expect(extractCandidatePathsFromText(text)).toEqual([source]);
-        const expected = `result: (file:///workspace/generated/${encoded}).`;
-        for (let split = 1; split < text.length; split++) {
-          fs.rmSync(path.join(workspace, 'generated'), { recursive: true, force: true });
-          const stream = new InternalPathStreamRewriter(profile, workspace);
-          expect(stream.write(text.slice(0, split)) + stream.write(text.slice(split)) + stream.write('', true), `split ${split}`).toBe(expected);
-          expect(fs.readFileSync(path.join(workspace, 'generated', filename), 'utf8')).toBe('bare path bytes');
-        }
-      }
-    }
-  });
-
-  it('holds incomplete paths, flushes a final bare link once, and keeps independent streams separate', () => {
-    const { profile, workspace } = fixture();
-    const content = new InternalPathStreamRewriter(profile, workspace);
-    const thoughts = new InternalPathStreamRewriter(profile, workspace);
-    expect(content.write('生成しました。file:///home/sandbox/.gemini/antigravity-cli')).toBe('生成しました。');
-    expect(thoughts.write('確認しました。')).toBe('確認しました。');
-    expect(content.write('/brain/session-1/miffy.jpg')).toBe('');
-    expect(content.write('', true)).toBe('file:///workspace/generated/miffy.jpg');
-    expect(content.write('', true)).toBe('');
-    expect(content.write('次の返答です。')).toBe('次の返答です。');
-    expect(content.write('通常の本文')).toBe('通常の本文');
-    expect(content.write('Hello')).toBe('Hello');
-    expect(content.write('ordinary unpunctuated output')).toBe('ordinary unpunctuated output');
-  });
-
-  it('preserves literal line-like filename suffixes in encoded file URIs on server and client', () => {
-    const { profile, workspace } = fixture();
+describe('native and legacy file links', () => {
+  it('preserves literal line-like filename suffixes in encoded file URIs', () => {
     for (const filename of ['report.pdf#L10', 'report.pdf:10']) {
-      const source = path.join(getChatBrainHostDir(profile, workspace), 'session-1', filename);
-      fs.writeFileSync(source, 'suffix filename bytes');
+      const source = `/home/sandbox/.gemini/brain/session/${filename}`;
       const uri = pathToFileURL(source).href;
       expect(normalizeLinkCandidatePath(uri)).toBe(source);
-      const rewritten = rewriteInternalFileReference(uri, profile, workspace);
-      expect(normalizeLinkCandidatePath(rewritten)).toBe(`/workspace/generated/${filename}`);
-      expect(normalizeClientLinkReference(rewritten)).toBe(`generated/${filename}`);
-      expect(normalizeClientLinkReference(`${rewritten}#L42`)).toBe(`generated/${filename}`);
-      expect(fs.readFileSync(path.join(workspace, 'generated', filename), 'utf8')).toBe('suffix filename bytes');
+      expect(normalizeClientLinkReference(`${uri}#L42`)).toBe(source);
     }
   });
 
-  it('keeps free-form raw tool output while rewriting structured path fields as whole references', () => {
-    const { profile, workspace } = fixture();
-    const dir = path.join(getChatBrainHostDir(profile, workspace), 'session-1');
-    const plain = path.join(dir, 'result.txt');
-    const spaced = path.join(dir, 'result with spaces.txt');
-    fs.writeFileSync(plain, 'result');
-    fs.writeFileSync(spaced, 'spaced result');
-    const tools = scrubToolCallsInternalPaths([
-      { toolCallId: 'plain', title: 'Export', status: 'completed', rawOutput: `${plain}\nDone` },
-      { toolCallId: 'structured', title: 'Export', status: 'completed', rawOutput: {
-        path: spaced, stdout: `${plain}\nDone`,
-      } },
-    ], profile, workspace);
-    expect(tools[0].rawOutput).toBe('/workspace/generated/result.txt\nDone');
-    const output = tools[1].rawOutput as { path: string; stdout: string };
-    expect(normalizeLinkCandidatePath(output.path)).toBe('/workspace/generated/result with spaces.txt');
-    expect(output.stdout).toBe('/workspace/generated/result.txt\nDone');
-  });
+  it('resolves the current chat scratch and playground aliases and keeps their files isolated', async () => {
+    const srv = await createTestServer();
+    cleanups.push(srv.cleanup);
+    const { client: alice, userId } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+    const createChat = async () => (await alice.request<{ chat: { id: string; workspaceDir: string } }>(
+      'POST', '/api/chats', { title: 'Native file paths' }
+    )).data.chat;
+    const chat = await createChat();
+    const other = await createChat();
+    const profile = srv.ctx.db.getAgyProfile(userId)!.profileDir;
+    const resolve = (chatId: string, reference: string) => alice.request<{ artifact: ArtifactRecord; previewUrl: string }>(
+      'POST', `/api/chats/${chatId}/resolve-link`, { reference }
+    );
 
-  it('imports changed brain files once and retries when an import fails', () => {
-    const { profile, workspace } = fixture();
-    const source = path.join(getChatBrainHostDir(profile, workspace), 'session-1', 'miffy.jpg');
-    const snapshot = captureBrainSnapshot(profile, workspace);
-    fs.writeFileSync(source, 'new image bytes');
-    // A non-directory generated path makes the initial import fail.
-    fs.writeFileSync(path.join(workspace, 'generated'), 'blocked');
-    expect(syncNewBrainFilesToWorkspace({ profileDir: profile, workspaceDir: workspace, snapshot })).toEqual([]);
-    fs.unlinkSync(path.join(workspace, 'generated'));
-    const imported = syncNewBrainFilesToWorkspace({ profileDir: profile, workspaceDir: workspace, snapshot });
-    expect(imported.map(file => file.workspaceRelPath)).toEqual(['generated/miffy.jpg']);
-    expect(syncNewBrainFilesToWorkspace({ profileDir: profile, workspaceDir: workspace, snapshot })).toEqual([]);
-    fs.writeFileSync(source, 'updated image bytes');
-    const changed = syncNewBrainFilesToWorkspace({ profileDir: profile, workspaceDir: workspace, snapshot });
-    expect(changed).toHaveLength(1);
-    expect(changed[0].workspaceRelPath).toMatch(/^generated\/miffy-[a-f0-9]{8}\.jpg$/);
-    expect(fs.readFileSync(changed[0].workspaceAbsPath, 'utf8')).toBe('updated image bytes');
-  });
-
-  it('keeps copied brain files pending until registration and notification succeed', () => {
-    const { profile, workspace } = fixture();
-    const snapshot = captureBrainSnapshot(profile, workspace);
-    const source = path.join(getChatBrainHostDir(profile, workspace), 'session-1', 'miffy.jpg');
-    const original = snapshot.get(source);
-    fs.writeFileSync(source, 'new image bytes');
-    const register = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
-    const sync = () => syncNewBrainFilesToWorkspace({ profileDir: profile, workspaceDir: workspace, snapshot, register });
-    expect(sync()).toEqual([]);
-    expect(snapshot.get(source)).toEqual(original);
-    expect(fs.readFileSync(path.join(workspace, 'generated/miffy.jpg'), 'utf8')).toBe('new image bytes');
-    expect(sync().map(file => file.workspaceRelPath)).toEqual(['generated/miffy.jpg']);
-    expect(register).toHaveBeenCalledTimes(2);
-    expect(sync()).toEqual([]);
-    expect(register).toHaveBeenCalledTimes(2);
+    for (const kind of ['scratch', 'playground']) {
+      const root = path.join(profile, `.chat-${kind}`, path.basename(chat.workspaceDir));
+      const filename = '設計メモ #1.md';
+      const file = path.join(root, filename);
+      fs.mkdirSync(root, { recursive: true });
+      fs.writeFileSync(file, kind);
+      const sandboxPath = `/home/sandbox/.gemini/antigravity/${kind}/`;
+      const encoded = encodeURIComponent(filename);
+      const first = await resolve(chat.id, `file://${sandboxPath}${encoded}`);
+      expect(first.status).toBe(200);
+      expect(first.data.artifact.relPath).toBe(`/home/sandbox/.gemini/${kind}/${filename}`);
+      for (const reference of [file, `${sandboxPath}${encoded}`, `~/.gemini/jetski/${kind}/${filename}`]) {
+        expect((await resolve(chat.id, reference)).data.artifact.id).toBe(first.data.artifact.id);
+        expect((await resolve(other.id, reference)).status).toBe(404);
+      }
+      const otherRoot = path.join(profile, `.chat-${kind}`, path.basename(other.workspaceDir));
+      fs.rmdirSync(otherRoot);
+      fs.symlinkSync(root, otherRoot);
+      expect((await resolve(other.id, `${sandboxPath}${encoded}`)).status).toBe(404);
+      fs.symlinkSync(file, path.join(chat.workspaceDir, 'outside.md'));
+      expect((await resolve(chat.id, '/workspace/outside.md')).status).toBe(404);
+      fs.unlinkSync(path.join(chat.workspaceDir, 'outside.md'));
+      const bytes = await fetch(`${srv.baseUrl}${first.data.previewUrl}`, { headers: { Cookie: alice.cookieHeader } });
+      expect(await bytes.text()).toBe(kind);
+    }
   });
 
   it('serves a file listed in generated through the screenshot link without requiring the brain source', async () => {
@@ -316,20 +178,30 @@ describe('streamed generated file links', () => {
       streamed += event.payload.chunk;
     }
     expect(streamed).toBe(text);
-    expect(text).not.toMatch(/\.gemini|generated\/\//);
     const references = [...text.matchAll(/\]\(([^)]+)\)/g)].map(m => m[1]);
-    expect(references.length).toBeGreaterThanOrEqual(2);
-    const original = srv.ctx.db.listArtifactsForChat(userId, chat.id).find(a => a.filename === 'mock-brain-art.jpg')!;
-    expect(original.messageId).toBeTruthy();
+    expect(references).toHaveLength(2);
+    expect(references[0]).toContain('/.gemini/antigravity-cli/brain/');
+    expect(references[1]).toBe(`file://${references[0]}`);
+    const resolve = (reference: string) => alice.request<{ artifact: ArtifactRecord; previewUrl: string }>(
+      'POST', `/api/chats/${chat.id}/resolve-link`, { reference }
+    );
+    const first = await resolve(references[0]);
+    expect(first.status).toBe(200);
+    const original = first.data.artifact;
+    expect((await resolve(references[1])).data.artifact.id).toBe(original.id);
     const workspaceDir = srv.ctx.db.getChat(userId, chat.id)!.workspaceDir;
-    fs.appendFileSync(path.join(workspaceDir, original.relPath), 'updated bytes');
-    for (const reference of [...references, original.id]) {
-      const resolved = await alice.request('POST', `/api/chats/${chat.id}/resolve-link`, { reference });
-      expect(resolved.status, reference).toBe(200);
-    }
-    const refreshed = srv.ctx.db.getArtifact(userId, original.id)!;
-    expect(refreshed.sha256).not.toBe(original.sha256);
-    expect(refreshed.messageId).toBe(original.messageId);
-    expect(refreshed.runId).toBe(original.runId);
+    const profileDir = srv.ctx.db.getAgyProfile(userId)!.profileDir;
+    const brainDir = getChatBrainHostDir(profileDir, workspaceDir);
+    const nativePath = path.join(brainDir, original.relPath.split('/brain/')[1]);
+    const before = fs.readFileSync(nativePath);
+    const after = Buffer.concat([before, Buffer.from('updated bytes')]);
+    fs.writeFileSync(nativePath, after);
+    const content = await fetch(`${srv.baseUrl}${first.data.previewUrl}`, {
+      headers: { Cookie: alice.cookieHeader },
+    });
+    expect(Buffer.from(await content.arrayBuffer())).toEqual(after);
+    const refreshed = await resolve(original.id);
+    expect(refreshed.data.artifact.sha256).not.toBe(original.sha256);
+    expect(fs.existsSync(path.join(workspaceDir, 'generated'))).toBe(false);
   });
 });

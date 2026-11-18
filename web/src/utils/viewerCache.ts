@@ -3,7 +3,6 @@ import type {
   ArtifactRecord,
   PreviewKind,
   SkillScope,
-  WorkspaceFileEntry,
 } from '../types';
 
 export interface ByteLruOptions<K, V> {
@@ -156,30 +155,6 @@ export interface PdfCachedPage {
   cssWidth: number;
   cssHeight: number;
 }
-
-export interface CachedWorkspaceEntry {
-  files: WorkspaceFileEntry[];
-  artifacts: ArtifactRecord[];
-  fetchedAt: number;
-  dirty: boolean;
-}
-
-export interface WorkspaceFolderNode {
-  kind: 'folder';
-  name: string;
-  path: string;
-  fileCount: number;
-  children: WorkspaceTreeNode[];
-}
-
-export interface WorkspaceFileNode {
-  kind: 'file';
-  name: string;
-  path: string;
-  entry: WorkspaceFileEntry;
-}
-
-export type WorkspaceTreeNode = WorkspaceFolderNode | WorkspaceFileNode;
 
 export function fastTextHash(text: string): string {
   let h1 = 0x811c9dc5;
@@ -338,6 +313,7 @@ export function normalizeClientLinkReference(rawReference: string): string | nul
   if (/^file:\/\//i.test(candidate)) {
     try {
       const parsed = new URL(candidate);
+      if (parsed.hostname) return null;
       candidate = decodeURIComponent(parsed.pathname);
     } catch {
       return null;
@@ -372,16 +348,6 @@ const resolvedLinkCache = new ByteLruCache<string, ResolvedLinkEntry>({
 });
 const inFlightLinkResolves = new Map<string, Promise<ResolvedLinkEntry>>();
 const artifactListeners = new Set<(artifact: ArtifactRecord) => void>();
-
-// Workspace tree cache & persisted folder expansion state per chat
-const workspaceTreeCache = new ByteLruCache<string, CachedWorkspaceEntry>({
-  maxEntries: 24,
-  maxBytes: 4 * 1024 * 1024,
-  sizeOf: (v) => v.files.length * 192 + v.artifacts.length * 256,
-});
-const inFlightWorkspaceLoads = new Map<string, Promise<CachedWorkspaceEntry>>();
-const workspaceGenByChat = new Map<string, number>();
-const folderExpandedByChat = new Map<string, Record<string, boolean>>();
 
 // Artifact viewer payload & parsed result caches
 export const artifactTextCache = new ByteLruCache<string, string>({
@@ -473,10 +439,6 @@ export function clearAllViewerCaches(): void {
   knownArtifactsByChat.clear();
   resolvedLinkCache.clear();
   inFlightLinkResolves.clear();
-  workspaceTreeCache.clear();
-  inFlightWorkspaceLoads.clear();
-  workspaceGenByChat.clear();
-  folderExpandedByChat.clear();
   artifactTextCache.clear();
   codeHighlightCache.clear();
   diffPatchCache.clear();
@@ -500,10 +462,6 @@ export function invalidateChatViewerCache(chatId: string): void {
   knownArtifactsByChat.delete(chatId);
   const prefix = `${chatId}\0`;
   resolvedLinkCache.deleteWhere((k) => k.startsWith(prefix));
-  workspaceTreeCache.delete(chatId);
-  inFlightWorkspaceLoads.delete(chatId);
-  workspaceGenByChat.set(chatId, (workspaceGenByChat.get(chatId) ?? 0) + 1);
-  folderExpandedByChat.delete(chatId);
 }
 
 function purgeOldArtifactPayloads(artifact: Pick<ArtifactRecord, 'id' | 'sha256' | 'updatedAt'>): void {
@@ -692,149 +650,6 @@ export async function resolveLinkCached(
 
   inFlightLinkResolves.set(cacheKey, promise);
   return promise;
-}
-
-// ---------- Workspace Drawer Tree Caching ----------
-
-export function getCachedWorkspace(chatId: string): CachedWorkspaceEntry | undefined {
-  return workspaceTreeCache.get(chatId);
-}
-
-export function markWorkspaceDirty(chatId: string): void {
-  workspaceGenByChat.set(chatId, (workspaceGenByChat.get(chatId) ?? 0) + 1);
-  const cur = workspaceTreeCache.peek(chatId);
-  if (cur) {
-    cur.dirty = true;
-  }
-}
-
-export async function loadWorkspaceCached(
-  chatId: string,
-  opts?: {
-    force?: boolean;
-    fetcher?: (chatId: string) => Promise<{ files: WorkspaceFileEntry[]; artifacts: ArtifactRecord[] }>;
-  }
-): Promise<CachedWorkspaceEntry> {
-  const cached = workspaceTreeCache.get(chatId);
-  if (cached && !cached.dirty && !opts?.force) {
-    return cached;
-  }
-
-  const pending = inFlightWorkspaceLoads.get(chatId);
-  if (pending && !opts?.force) {
-    return pending;
-  }
-
-  const capturedUser = activeCacheUserId;
-  const startGen = workspaceGenByChat.get(chatId) ?? 0;
-  const fetchFn = opts?.fetcher ?? ((cid: string) => api.getWorkspace(cid));
-  const promise = fetchFn(chatId)
-    .then((res) => {
-      const entry: CachedWorkspaceEntry = {
-        files: res.files,
-        artifacts: res.artifacts,
-        fetchedAt: Date.now(),
-        dirty: (workspaceGenByChat.get(chatId) ?? 0) !== startGen,
-      };
-      if (activeCacheUserId !== capturedUser) {
-        return entry;
-      }
-      workspaceTreeCache.set(chatId, entry);
-      seedChatArtifacts(chatId, res.artifacts);
-      return entry;
-    })
-    .finally(() => {
-      if (inFlightWorkspaceLoads.get(chatId) === promise) {
-        inFlightWorkspaceLoads.delete(chatId);
-      }
-    });
-
-  inFlightWorkspaceLoads.set(chatId, promise);
-  return promise;
-}
-
-export function getWorkspaceFolderExpandedMap(chatId: string): Record<string, boolean> {
-  return folderExpandedByChat.get(chatId) ?? {};
-}
-
-export function setWorkspaceFolderExpanded(chatId: string, folderPath: string, expanded: boolean): void {
-  const cur = folderExpandedByChat.get(chatId) ?? {};
-  folderExpandedByChat.set(chatId, { ...cur, [folderPath]: expanded });
-}
-
-export function buildWorkspaceTree(files: WorkspaceFileEntry[]): WorkspaceTreeNode[] {
-  const rootChildren: WorkspaceTreeNode[] = [];
-  const folderMap = new Map<string, WorkspaceFolderNode>();
-
-  const ensureFolder = (folderPath: string, name: string, parentPath: string | null): WorkspaceFolderNode => {
-    const existing = folderMap.get(folderPath);
-    if (existing) return existing;
-
-    const node: WorkspaceFolderNode = {
-      kind: 'folder',
-      name,
-      path: folderPath,
-      fileCount: 0,
-      children: [],
-    };
-    folderMap.set(folderPath, node);
-    if (parentPath) {
-      const parent = folderMap.get(parentPath);
-      parent?.children.push(node);
-    } else {
-      rootChildren.push(node);
-    }
-    return node;
-  };
-
-  for (const entry of files) {
-    const parts = entry.relPath.split('/').filter(Boolean);
-    if (parts.length <= 1) {
-      rootChildren.push({
-        kind: 'file',
-        name: entry.name,
-        path: entry.relPath,
-        entry,
-      });
-      continue;
-    }
-
-    let parentPath: string | null = null;
-    for (let i = 0; i < parts.length - 1; i += 1) {
-      const folderName = parts[i];
-      const currentPath: string = parentPath ? `${parentPath}/${folderName}` : folderName;
-      const folderNode = ensureFolder(currentPath, folderName, parentPath);
-      folderNode.fileCount += 1;
-      parentPath = currentPath;
-    }
-
-    const leafParent = parentPath ? folderMap.get(parentPath) : undefined;
-    const fileNode: WorkspaceFileNode = {
-      kind: 'file',
-      name: entry.name,
-      path: entry.relPath,
-      entry,
-    };
-    if (leafParent) {
-      leafParent.children.push(fileNode);
-    } else {
-      rootChildren.push(fileNode);
-    }
-  }
-
-  const sortNodes = (nodes: WorkspaceTreeNode[]) => {
-    nodes.sort((a, b) => {
-      if (a.kind !== b.kind) return a.kind === 'folder' ? -1 : 1;
-      return a.name.localeCompare(b.name);
-    });
-    for (const n of nodes) {
-      if (n.kind === 'folder') {
-        sortNodes(n.children);
-      }
-    }
-  };
-  sortNodes(rootChildren);
-  return rootChildren;
 }
 
 // ---------- Skill resource cache helpers ----------
