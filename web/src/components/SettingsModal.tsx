@@ -129,7 +129,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       setAgentMode(res.agentMode);
     } catch (err) {
       setAgentModeError(err instanceof ApiError ? err.message : 'エージェントモードの保存に失敗しました。');
-      if (err instanceof ApiError && err.code === 'AGY_SETTINGS_CHANGED') {
+      if (err instanceof ApiError && err.status === 409) {
         const current = await api.getAgyAgentMode().catch(() => null);
         if (current) setAgentMode(current.agentMode);
       }
