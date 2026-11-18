@@ -52,8 +52,15 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     const settingsFile = path.join(profile.profileDir, '.gemini', 'antigravity-cli', 'settings.json');
     fs.writeFileSync(settingsFile, '{}');
     const defaultChat = await client.request<ChatResponse>('POST', '/api/chats', { title: 'Native default' });
+    expect(defaultChat.status).toBe(201);
     expect(getMode(defaultChat.data)).toBe('default');
     expect(fs.readFileSync(settingsFile, 'utf8')).toBe('{}');
+
+    fs.unlinkSync(settingsFile);
+    const missingSettingsChat = await client.request<ChatResponse>('POST', '/api/chats', { title: 'Missing settings' });
+    expect(missingSettingsChat.status).toBe(201);
+    expect(getMode(missingSettingsChat.data)).toBe('default');
+    expect(fs.existsSync(settingsFile)).toBe(false);
   });
 
   it.skipIf(!supportsWorkspaceTextWrites)('relays native ACP permission requests and replays activity in ACP order', async () => {
