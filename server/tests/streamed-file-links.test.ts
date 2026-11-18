@@ -11,6 +11,7 @@ import {
   InternalPathStreamRewriter,
   normalizeLinkCandidatePath,
   rewriteInternalFileReference,
+  rewriteInternalPathsToWorkspace,
   scrubToolCallsInternalPaths,
   syncNewBrainFilesToWorkspace,
 } from '../src/files/link-resolver.js';
@@ -34,6 +35,24 @@ function fixture() {
 }
 
 describe('streamed generated file links', () => {
+  it('reuses one import for plain and URI references to the same file within a rewrite', () => {
+    const { profile, workspace } = fixture();
+    const source = path.join(getChatBrainHostDir(profile, workspace), 'session-1', 'miffy.jpg');
+    const destination = path.join(workspace, 'generated/miffy.jpg');
+    const text = `${source} [image](${pathToFileURL(source).href})`;
+    const expected = '/workspace/generated/miffy.jpg [image](file:///workspace/generated/miffy.jpg)';
+    const opened = vi.spyOn(fs, 'openSync');
+    try {
+      expect(rewriteInternalPathsToWorkspace(text, profile, workspace)).toBe(expected);
+      expect(opened.mock.calls.filter(([file]) => file === source || file === destination)).toHaveLength(0);
+      expect(rewriteInternalPathsToWorkspace(text, profile, workspace)).toBe(expected);
+      expect(opened.mock.calls.filter(([file]) => file === source)).toHaveLength(1);
+      expect(opened.mock.calls.filter(([file]) => file === destination)).toHaveLength(1);
+    } finally {
+      opened.mockRestore();
+    }
+  });
+
   it('rewrites paths at every split position, including file URI prefixes and brain directories', () => {
     const { profile, workspace } = fixture();
     for (const reference of [
@@ -224,8 +243,14 @@ describe('streamed generated file links', () => {
       'file:///workspace/generated//brain/session/../../secret.jpg',
     ]) expect((await resolve(invalid)).status).toBe(404);
 
-    // Never guess between the original name and a collision copy imported from another source.
-    fs.writeFileSync(path.join(generated, 'miffy_bunny_1794929588212-1234abcd.jpg'), 'other image');
+    const backup = path.join(generated, 'miffy_bunny_1794929588212-1234abcd.jpg');
+    fs.copyFileSync(path.join(generated, filename), backup);
+    const withIdenticalCopy = await resolve(reference);
+    expect(withIdenticalCopy.status).toBe(200);
+    expect(withIdenticalCopy.data.artifact.id).toBe(recovered.data.artifact.id);
+
+    // A same-size copy with different bytes still makes the legacy name ambiguous.
+    fs.writeFileSync(backup, 'different img bytes!');
     expect((await resolve(reference)).status).toBe(404);
     expect((await resolve(`generated/${filename}`)).status).toBe(200);
     // If the referenced nested file really exists, its exact path wins over recovery.

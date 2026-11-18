@@ -289,35 +289,39 @@ export function formatFileLink(filename: string, reference: string, image = fals
 export function rewriteInternalFileReference(
   reference: string,
   profileDir: string,
-  workspaceDir?: string | null
+  workspaceDir?: string | null,
+  importedPaths?: Map<string, string>
 ): string {
   const normalized = normalizeLinkCandidatePath(reference);
   if (!normalized) return reference;
   const profileAbs = path.resolve(profileDir);
-  const brainFile = resolveAuthorizedBrainFile({
-    profileDir: profileAbs, workspaceDir, candidatePath: normalized,
-  });
-  if (brainFile && workspaceDir) {
-    try {
-      const imported = importAuthorizedBrainFileToWorkspace({
-        workspaceDir, sourceAbsPath: brainFile.absPath,
-      });
-      return /^file:\/\//i.test(reference) || /[\s%#?()[\]]/.test(imported.relPath)
-        ? workspaceFileUri(imported.relPath)
-        : `${SANDBOX_WORKSPACE_MOUNT}/${imported.relPath}`;
-    } catch {
-      // Redact inaccessible internal paths below.
+  let relPath = importedPaths?.get(normalized);
+  if (!relPath && workspaceDir) {
+    const brainFile = resolveAuthorizedBrainFile({
+      profileDir: profileAbs, workspaceDir, candidatePath: normalized,
+    });
+    if (brainFile) {
+      try {
+        relPath = importAuthorizedBrainFileToWorkspace({
+          workspaceDir, sourceAbsPath: brainFile.absPath,
+        }).relPath;
+        importedPaths?.set(normalized, relPath);
+      } catch {
+        // Redact inaccessible internal paths below.
+      }
     }
   }
-  const isInternalPath =
-    normalized.startsWith(`${profileAbs}/`) || normalized === profileAbs ||
-    normalized.startsWith(`${SANDBOX_HOME_MOUNT}/`) || normalized === SANDBOX_HOME_MOUNT ||
-    normalized.startsWith('/var/lib/antigravity-chat/');
-  if (!isInternalPath) return reference;
-  const base = path.basename(normalized.replace(/\/+$/, ''));
-  const ext = path.extname(base);
-  const relPath = ext && !INTERNAL_BRAIN_EXCLUDED_EXTENSIONS.has(ext.toLowerCase())
-    ? `generated/${sanitizeFileName(base)}` : 'generated/';
+  if (!relPath) {
+    const isInternalPath =
+      normalized.startsWith(`${profileAbs}/`) || normalized === profileAbs ||
+      normalized.startsWith(`${SANDBOX_HOME_MOUNT}/`) || normalized === SANDBOX_HOME_MOUNT ||
+      normalized.startsWith('/var/lib/antigravity-chat/');
+    if (!isInternalPath) return reference;
+    const base = path.basename(normalized.replace(/\/+$/, ''));
+    const ext = path.extname(base);
+    relPath = ext && !INTERNAL_BRAIN_EXCLUDED_EXTENSIONS.has(ext.toLowerCase())
+      ? `generated/${sanitizeFileName(base)}` : 'generated/';
+  }
   return /^file:\/\//i.test(reference) || /[\s%#?()[\]]/.test(relPath)
     ? workspaceFileUri(relPath) : `${SANDBOX_WORKSPACE_MOUNT}/${relPath}`;
 }
@@ -393,6 +397,9 @@ export function rewriteInternalPathsToWorkspace(
   profileDir: string,
   workspaceDir?: string | null
 ): string {
+  const importedPaths = new Map<string, string>();
+  const rewriteReference = (reference: string) =>
+    rewriteInternalFileReference(reference, profileDir, workspaceDir, importedPaths);
   const rewritePlain = (value: string) => {
     let result = '';
     let cursor = 0;
@@ -400,7 +407,7 @@ export function rewriteInternalPathsToWorkspace(
       const raw = value.slice(range.start, range.end);
       const trailing = /([.,;:!?]+)$/.exec(raw)?.[1] ?? '';
       const reference = trailing ? raw.slice(0, -trailing.length) : raw;
-      result += value.slice(cursor, range.start) + rewriteInternalFileReference(reference, profileDir, workspaceDir) + trailing;
+      result += value.slice(cursor, range.start) + rewriteReference(reference) + trailing;
       cursor = range.end;
     }
     return result + value.slice(cursor);
@@ -411,7 +418,7 @@ export function rewriteInternalPathsToWorkspace(
     result += rewritePlain(text.slice(cursor, range.start));
     const raw = text.slice(range.start, range.end);
     const reference = raw.replace(/\\([\\()[\]<>])/g, '$1');
-    const rewritten = rewriteInternalFileReference(reference, profileDir, workspaceDir);
+    const rewritten = rewriteReference(reference);
     result += rewritten === reference ? raw : rewritten;
     cursor = range.end;
   }
@@ -492,7 +499,6 @@ export function importAuthorizedBrainFileToWorkspace(params: {
   sourceAbsPath: string;
 }): { absPath: string; relPath: string } {
   fs.mkdirSync(params.workspaceDir, { recursive: true, mode: 0o700 });
-  const srcSha = sha256File(params.sourceAbsPath);
   const rawName = sanitizeFileName(path.basename(params.sourceAbsPath));
   const ext = path.extname(rawName);
   const stem = ext ? rawName.slice(0, -ext.length) : rawName;
@@ -500,6 +506,7 @@ export function importAuthorizedBrainFileToWorkspace(params: {
   const primaryRel = `generated/${rawName}`;
   const primaryTarget = resolveContainedWriteTarget(params.workspaceDir, primaryRel);
   if (fs.existsSync(primaryTarget.absPath) && fs.statSync(primaryTarget.absPath).isFile()) {
+    const srcSha = sha256File(params.sourceAbsPath);
     const existingSha = sha256File(primaryTarget.absPath);
     if (existingSha === srcSha) {
       return primaryTarget;
@@ -642,23 +649,31 @@ export function resolveAuthorizedChatFileReference(params: {
   if (workspaceFile) return workspaceFile;
 
   // Older chunk-by-chunk rewriting produced generated//brain/<session>/<filename>.
-  // Recover only that signature, within this chat, and only when no hash-suffixed
-  // collision copy makes the original filename ambiguous. Exact workspace paths win.
+  // Exact workspace paths win. A collision copy only makes recovery ambiguous
+  // when it contains different bytes from the original filename.
   const legacy = /^generated\/\/brain\/[^/.][^/]*\/([^/]+)$/.exec(candidate);
   if (legacy && legacy[1] !== '.' && legacy[1] !== '..') {
     const filename = legacy[1];
     const ext = path.extname(filename);
     const stem = filename.slice(0, filename.length - ext.length);
     try {
+      const relPath = `generated/${filename}`;
+      const original = resolveContainedExistingPath(chat.workspaceDir, relPath);
+      const originalStat = fs.statSync(original.absPath);
       const generated = resolveContainedExistingPath(chat.workspaceDir, 'generated');
-      const entries = fs.readdirSync(generated.absPath);
-      const hasCollision = entries.some((name) =>
-        name.startsWith(`${stem}-`) && name.endsWith(ext) &&
-        /^[a-f0-9]{8}$/.test(name.slice(stem.length + 1, ext ? -ext.length : undefined))
-      );
-      if (!hasCollision) {
-        const recovered = resolveWorkspaceFile(`generated/${filename}`);
-        if (recovered) return recovered;
+      if (originalStat.isFile()) {
+        let originalHash: string | undefined;
+        const hasCollision = fs.readdirSync(generated.absPath, { withFileTypes: true }).some((entry) => {
+          const name = entry.name;
+          if (!entry.isFile() || !name.startsWith(`${stem}-`) || !name.endsWith(ext) ||
+            !/^[a-f0-9]{8}$/.test(name.slice(stem.length + 1, ext ? -ext.length : undefined))) return false;
+
+          const copy = resolveContainedExistingPath(generated.absPath, name);
+          if (fs.statSync(copy.absPath).size !== originalStat.size) return true;
+          originalHash ??= sha256File(original.absPath);
+          return sha256File(copy.absPath) !== originalHash;
+        });
+        if (!hasCollision) return resolveWorkspaceFile(relPath);
       }
     } catch {
       // Missing generated directory; continue with authorized brain resolution.
