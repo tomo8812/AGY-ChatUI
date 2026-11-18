@@ -114,3 +114,5 @@ ChatUI の `SANDBOX_MODE` はサーバー側の bubblewrap 分離を制御しま
 - `web/`: React + TypeScript + Vanilla CSS フロントエンド（Vite + PWA）
 - `deploy/`: Oracle Always Free Ubuntu 向けセットアップスクリプト・バンドル展開スクリプト・自動更新スクリプト ＆ systemd ユニット
 - `docs/`: アーキテクチャ設計 ＆ 運用・コンプライアンス詳細 ([docs/architecture.md](docs/architecture.md))
+
+<!-- PR #10: temporary README change for CodeRabbit review testing; do not merge. -->
