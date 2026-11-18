@@ -1,0 +1,5 @@
+schemaVersion: 0.1.1
+github:
+  draw: on-demand
+  comment:
+    notice: false
