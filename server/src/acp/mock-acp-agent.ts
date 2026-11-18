@@ -1005,7 +1005,7 @@ function runAcpServer(): void {
         if (permRes.outcome.outcome === 'selected' && permRes.outcome.optionId.startsWith('allow')) {
           const targetPath = path.join(state.cwd, 'created-by-tool.md');
           const newText = `# Created with user permission\n\nAccount: ${auth?.label ?? 'anon'}\nModel: ${state.modelId}\n`;
-          const oldText = fs.existsSync(targetPath) ? fs.readFileSync(targetPath, 'utf8') : null;
+          const created = !fs.existsSync(targetPath);
           await ctx.client.request(methods.client.fs.writeTextFile, {
             sessionId: state.id,
             path: targetPath,
@@ -1017,7 +1017,7 @@ function runAcpServer(): void {
               sessionUpdate: 'tool_call_update',
               toolCallId,
               status: 'completed',
-              content: [{ type: 'diff', path: targetPath, oldText, newText }],
+              ...(created ? { content: [{ type: 'diff', path: targetPath, newText }] } : {}),
               rawOutput: { wrote: 'created-by-tool.md' },
             },
           });
