@@ -79,6 +79,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [adminMsg, setAdminMsg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [agentMode, setAgentMode] = useState<string | null | undefined>(undefined);
+  const [agentModeLoading, setAgentModeLoading] = useState(true);
   const [agentModeSaving, setAgentModeSaving] = useState(false);
   const [agentModeError, setAgentModeError] = useState<string | null>(null);
 
@@ -86,10 +87,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     let active = true;
     void api.getAgyAgentMode().then(
       (res) => {
-        if (active) setAgentMode(res.agentMode);
+        if (active) {
+          setAgentMode(res.agentMode);
+          setAgentModeLoading(false);
+        }
       },
       (err) => {
-        if (active) setAgentModeError(err instanceof ApiError ? err.message : 'エージェントモードの読み込みに失敗しました。');
+        if (active) {
+          setAgentModeError(err instanceof ApiError ? err.message : 'エージェントモードの読み込みに失敗しました。');
+          setAgentModeLoading(false);
+        }
       }
     );
     return () => {
@@ -407,14 +414,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               id="agy-agent-mode"
               className="compact-select"
               value={selectedAgentMode ?? 'current'}
-              disabled={agentMode === undefined || agentModeSaving}
+              disabled={agentModeLoading || agentModeSaving}
               aria-describedby="agy-agent-mode-hint"
               onChange={(e) => void handleAgentModeChange(e.target.value)}
             >
               {selectedAgentMode === undefined && (
                 <option value="current" disabled>
                   {agentMode === undefined
-                    ? (agentModeError ? '読み込み失敗' : '読み込み中…')
+                    ? (agentModeLoading ? '読み込み中…' : '現在の値を取得できませんでした')
                     : (agentMode === null ? '未設定（CLI の既定値）' : agentMode)}
                 </option>
               )}

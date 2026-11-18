@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ensurePerChatHomeDir } from '../src/acp/env-isolation.js';
 import { createApp } from '../src/app.js';
 import { createTestServer, registerAndBindAgy, TestApiClient } from './helpers/test-harness.js';
@@ -56,6 +56,19 @@ describe('Web Auth, Mandatory Agy Code-Paste Binding, and Strict Multi-User RBAC
     cleanups.push(restarted.shutdown);
     expect(readSettings(bobDir)).toEqual({ agentMode: 'auto' });
     expect(readSettings(aliceDir)).toEqual({ ...existing, agentMode: '' });
+
+    const editedDuringSave = { ...existing, agentMode: '', enableTerminalSandbox: false };
+    const concurrentEdit = vi.spyOn(fs, 'fchmodSync').mockImplementationOnce(() => {
+      fs.writeFileSync(settingsPath(aliceDir), JSON.stringify(editedDuringSave));
+    });
+    try {
+      expect((await alice.request('PATCH', route, { agentMode: 'plan' })).status).toBe(409);
+      expect(readSettings(aliceDir)).toEqual(editedDuringSave);
+    } finally {
+      concurrentEdit.mockRestore();
+    }
+    expect((await alice.request('PATCH', route, { agentMode: 'plan' })).status).toBe(200);
+    expect(readSettings(aliceDir)).toEqual({ ...editedDuringSave, agentMode: 'plan' });
   });
 
   it('enforces Web auth, CSRF, mandatory initial Antigravity code-paste login, and API key disconnect/rebind', async () => {
