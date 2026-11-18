@@ -235,12 +235,12 @@ export function toHostWorkspacePath(
 }
 
 function workspaceFilePath(worker: WorkerInstance, acpPath: string): string {
-  const candidate = acpPath.startsWith('file:') ? fileURLToPath(acpPath) : acpPath;
+  const candidate = acpPath.startsWith('file://') ? fileURLToPath(acpPath) : acpPath;
   if (candidate.includes('\\') || candidate.split('/').includes('..')) {
     throw new PathContainmentError('無効な作業ファイルのパスです。');
   }
   if (!path.isAbsolute(candidate)) {
-    if (/^[a-z][a-z\d+.-]*:/i.test(candidate)) {
+    if (/^[a-z][a-z\d+.-]*:\/\//i.test(candidate)) {
       throw new PathContainmentError('ローカルファイルのパスを指定してください。');
     }
     return normalizeRelPath(candidate);

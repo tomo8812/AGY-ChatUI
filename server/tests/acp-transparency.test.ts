@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { MessageRecord } from '../src/types.js';
+import { PathContainmentError, resolveContainedWriteTarget } from '../src/files/workspace.js';
 import { getMessageActivity } from '../../web/src/utils/messageActivity.js';
 import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
 
@@ -65,6 +66,10 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     const rejection = await client.request('POST', `${url}/permissions/${permission.id}`, { optionId: 'reject_once' });
     expect(rejection.status).toBe(200);
     expect(fs.readFileSync(outside, 'utf8')).toBe(fileContent);
+
+    const danglingLink = path.join(chat.workspaceDir, 'dangling.md');
+    fs.symlinkSync(path.join(chat.workspaceDir, 'missing.md'), danglingLink);
+    expect(() => resolveContainedWriteTarget(chat.workspaceDir, 'dangling.md')).toThrow(PathContainmentError);
     client.closeWs();
   });
 

@@ -62,17 +62,22 @@ export function resolveContainedWriteTarget(rootDir: string, relPathRaw: string)
   const rel = normalizeRelPath(relPathRaw);
   const rootReal = fs.realpathSync(rootDir);
   const targetAbs = path.resolve(rootReal, rel);
+  const relative = path.relative(rootReal, targetAbs);
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new PathContainmentError('不正な書き込み先パスです。');
+  }
 
   // Reject links that point outside the workspace or cannot be resolved.
-  const segments = rel.split('/');
+  const segments = relative.split(path.sep);
   let walk = rootReal;
   for (const segment of segments) {
     walk = path.join(walk, segment);
     const stat = fs.lstatSync(walk, { throwIfNoEntry: false });
     if (stat?.isSymbolicLink()) {
-      const realTarget = fs.realpathSync(walk);
-      if (realTarget !== rootReal && !realTarget.startsWith(rootReal + path.sep)) {
-        throw new PathContainmentError('作業領域外のシンボリックリンクへの書き込みは拒否されました。');
+      try {
+        resolveContainedExistingPath(rootReal, walk);
+      } catch {
+        throw new PathContainmentError('作業領域内で解決できないシンボリックリンクへの書き込みは拒否されました。');
       }
     }
   }

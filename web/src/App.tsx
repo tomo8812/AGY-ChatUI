@@ -82,9 +82,9 @@ function newerMessage(current: MessageRecord, incoming: MessageRecord): MessageR
   if (current.updatedAt !== incoming.updatedAt) {
     return current.updatedAt > incoming.updatedAt ? current : incoming;
   }
-  if (incoming.status !== 'queued' && incoming.status !== 'streaming' && current.status === 'streaming') {
-    return incoming;
-  }
+  const currentIsTerminal = current.status !== 'queued' && current.status !== 'streaming';
+  const incomingIsTerminal = incoming.status !== 'queued' && incoming.status !== 'streaming';
+  if (currentIsTerminal !== incomingIsTerminal) return currentIsTerminal ? current : incoming;
   const currentTextLength = current.contentText.length + current.thoughtsText.length;
   const incomingTextLength = incoming.contentText.length + incoming.thoughtsText.length;
   if (
