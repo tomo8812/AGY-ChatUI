@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { MessageRecord } from '../src/types.js';
-import { PathContainmentError, resolveContainedWriteTarget, writeWorkspaceTextFile } from '../src/files/workspace.js';
+import { PathContainmentError, resolveContainedWriteTarget, supportsWorkspaceTextWrites, writeWorkspaceTextFile } from '../src/files/workspace.js';
 import { getMessageActivity } from '../../web/src/utils/messageActivity.js';
 import { newerMessage } from '../../web/src/utils/messageSnapshot.js';
 import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
@@ -17,7 +17,7 @@ afterEach(async () => {
 });
 
 describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
-  it('auto-approves contained edits and replays the activity in ACP order', async () => {
+  it.skipIf(!supportsWorkspaceTextWrites)('auto-approves contained edits and replays the activity in ACP order', async () => {
     const srv = await createTestServer();
     cleanups.push(srv.cleanup);
     const { client } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
@@ -78,7 +78,13 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     expect(fs.readFileSync(outside, 'utf8')).toBe(fileContent);
 
     writeWorkspaceTextFile(chat.workspaceDir, 'nested/notes.md', 'nested write');
-    expect(fs.readFileSync(path.join(chat.workspaceDir, 'nested/notes.md'), 'utf8')).toBe('nested write');
+    const nested = path.join(chat.workspaceDir, 'nested/notes.md');
+    expect(fs.readFileSync(nested, 'utf8')).toBe('nested write');
+    fs.chmodSync(nested, 0o400);
+    if (process.getuid?.() !== 0) {
+      expect(() => writeWorkspaceTextFile(chat.workspaceDir, 'nested/notes.md', 'denied')).toThrow();
+      expect(fs.readFileSync(nested, 'utf8')).toBe('nested write');
+    }
     const danglingLink = path.join(chat.workspaceDir, 'dangling.md');
     fs.symlinkSync(path.join(chat.workspaceDir, 'missing.md'), danglingLink);
     expect(() => resolveContainedWriteTarget(chat.workspaceDir, 'dangling.md')).toThrow(PathContainmentError);

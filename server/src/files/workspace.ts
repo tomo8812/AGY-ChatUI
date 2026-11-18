@@ -98,7 +98,7 @@ export function writeWorkspaceTextFile(rootDir: string, relativePath: string, co
 
   const segments = normalizeRelPath(relativePath).split('/');
   const filename = segments.pop()!;
-  const { O_DIRECTORY, O_NOFOLLOW, O_RDONLY, O_WRONLY, O_CREAT, O_EXCL } = fs.constants;
+  const { O_DIRECTORY, O_NOFOLLOW, O_RDONLY, O_WRONLY, O_CREAT, O_EXCL, O_NONBLOCK } = fs.constants;
   const directoryFlags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
   let directory = fs.openSync(rootDir, directoryFlags);
   try {
@@ -120,6 +120,12 @@ export function writeWorkspaceTextFile(rootDir: string, relativePath: string, co
     const stat = fs.lstatSync(target, { throwIfNoEntry: false });
     if (stat && (!stat.isFile() || stat.nlink !== 1)) {
       throw new PathContainmentError('通常のファイルにのみ書き込めます。');
+    }
+
+    if (stat) {
+      // Rename checks the directory's permissions. Also require write access to the file itself.
+      const existing = fs.openSync(target, O_WRONLY | O_NOFOLLOW | O_NONBLOCK);
+      fs.closeSync(existing);
     }
 
     const temporary = `${parent}/.agy-write-${crypto.randomUUID()}`;
