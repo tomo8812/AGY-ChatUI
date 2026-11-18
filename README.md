@@ -103,7 +103,7 @@ npm run dev:web
 
 ツールの承認は Antigravity のネイティブ設定に従います。Antigravity が ACP で承認を求めたときは、ChatUI の承認カードで許可または拒否を選べます。
 
-Antigravity CLI 1.5.7 以降では、対応するアカウントと環境で Auto が既定です。明示する場合は、ACP が使う Antigravity プロファイルの `~/.gemini/antigravity-cli/settings.json` に `"agentMode": "auto"` を設定します。標準構成でのホスト側のパスは `$DATA_ROOT/profiles/<user-id>/agy-home/.gemini/antigravity-cli/settings.json` です。既存プロファイルの設定は次回の ACP ワーカー起動時に読み込まれます。
+新規プロファイルには `"agentMode": "auto"` を設定した `settings.json` を作成します。既存プロファイルにファイルがなければ、サーバー起動時に同じ初期設定を作成します。「設定」の「Antigravity エージェントモード」で選んだ値は、そのプロファイルの `settings.json` の `agentMode` に保存され、次回の ACP ワーカー起動時に読み込まれます。標準構成での保存先は `$DATA_ROOT/profiles/<user-id>/agy-home/.gemini/antigravity-cli/settings.json` です。
 
 ChatUI の `SANDBOX_MODE` はサーバー側の bubblewrap 分離を制御します。Antigravity の Auto はネイティブのターミナルサンドボックスと承認判断を制御します。[Antigravity CLI の実行モード](https://antigravity.google/docs/cli/modes/) · [ACP 連携ガイド](https://antigravity.google/docs/cli/acp/)
 

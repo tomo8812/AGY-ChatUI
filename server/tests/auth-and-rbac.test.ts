@@ -1,4 +1,8 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ensurePerChatHomeDir } from '../src/acp/env-isolation.js';
+import { createApp } from '../src/app.js';
 import { createTestServer, registerAndBindAgy, TestApiClient } from './helpers/test-harness.js';
 
 describe('Web Auth, Mandatory Agy Code-Paste Binding, and Strict Multi-User RBAC', () => {
@@ -9,6 +13,68 @@ describe('Web Auth, Mandatory Agy Code-Paste Binding, and Strict Multi-User RBAC
       const fn = cleanups.pop()!;
       await fn();
     }
+  });
+
+  it('initializes missing CLI settings and edits only the signed-in profile agent mode', async () => {
+    const srv = await createTestServer();
+    cleanups.push(srv.cleanup);
+    const alice = new TestApiClient(srv.baseUrl);
+    const bob = new TestApiClient(srv.baseUrl);
+    const register = (client: TestApiClient, username: string) =>
+      client.request<{ agyProfile: { profileDir: string } }>('POST', '/api/auth/register', {
+        username,
+        password: 'password123',
+      });
+    const aliceRegistration = await register(alice, 'alice');
+    const bobRegistration = await register(bob, 'bob');
+    const aliceDir = aliceRegistration.data.agyProfile.profileDir;
+    const bobDir = bobRegistration.data.agyProfile.profileDir;
+    const settingsPath = (dir: string) => path.join(dir, '.gemini', 'antigravity-cli', 'settings.json');
+    const readSettings = (dir: string) => JSON.parse(fs.readFileSync(settingsPath(dir), 'utf8'));
+    expect(readSettings(aliceDir)).toEqual({ agentMode: 'auto' });
+    expect(readSettings(bobDir)).toEqual({ agentMode: 'auto' });
+
+    const route = '/api/agy/agent-mode';
+    const anonymous = new TestApiClient(srv.baseUrl);
+    expect((await anonymous.request('GET', route)).status).toBe(401);
+    expect((await alice.request('PATCH', route, { agentMode: 'plan' }, { omitCsrf: true })).status).toBe(403);
+    expect((await alice.request('PATCH', route, { agentMode: 'default' })).status).toBe(400);
+
+    const existing = { enableTerminalSandbox: true, toolPermission: { deny: ['example'] } };
+    fs.writeFileSync(settingsPath(aliceDir), JSON.stringify(existing));
+    expect((await alice.request('GET', route)).data).toEqual({ agentMode: null });
+    expect(readSettings(aliceDir)).toEqual(existing);
+    const chatHome = ensurePerChatHomeDir(aliceDir, path.join(srv.ctx.config.workspacesRoot, 'test-chat'));
+
+    expect((await alice.request('PATCH', route, { agentMode: '' })).data).toEqual({ agentMode: '' });
+    expect(readSettings(aliceDir)).toEqual({ ...existing, agentMode: '' });
+    expect(readSettings(chatHome)).toEqual({ ...existing, agentMode: '' });
+    expect((await bob.request('GET', route)).data).toEqual({ agentMode: 'auto' });
+
+    fs.rmSync(settingsPath(bobDir));
+    const restarted = await createApp(srv.ctx.config);
+    cleanups.push(restarted.shutdown);
+    expect(readSettings(bobDir)).toEqual({ agentMode: 'auto' });
+    expect(readSettings(aliceDir)).toEqual({ ...existing, agentMode: '' });
+
+    const editedDuringSave = { ...existing, agentMode: 'accept-edits', enableTerminalSandbox: false };
+    const cliTemporary = `${settingsPath(aliceDir)}.cli.tmp`;
+    fs.writeFileSync(cliTemporary, JSON.stringify(editedDuringSave));
+    const originalWrite = fs.writeSync;
+    const concurrentEdit = vi.spyOn(fs, 'writeSync').mockImplementationOnce((...args) => {
+      // Match the CLI's atomic replacement after the final pre-write check.
+      fs.renameSync(cliTemporary, settingsPath(aliceDir));
+      return Reflect.apply(originalWrite, fs, args);
+    });
+    try {
+      expect((await alice.request('PATCH', route, { agentMode: 'plan' })).status).toBe(409);
+      expect(readSettings(aliceDir)).toEqual(editedDuringSave);
+    } finally {
+      concurrentEdit.mockRestore();
+    }
+    expect((await alice.request('GET', route)).data).toEqual({ agentMode: 'accept-edits' });
+    expect((await alice.request('PATCH', route, { agentMode: 'plan' })).status).toBe(200);
+    expect(readSettings(aliceDir)).toEqual({ ...editedDuringSave, agentMode: 'plan' });
   });
 
   it('enforces Web auth, CSRF, mandatory initial Antigravity code-paste login, and API key disconnect/rebind', async () => {

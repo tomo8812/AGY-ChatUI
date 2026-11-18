@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { probeBwrapSandbox } from '../acp/env-isolation.js';
+import { AGY_AGENT_MODES, ensureAgyProfileSettings, getAgyAgentMode, setAgyAgentMode } from '../acp/profile-settings.js';
 import type { AppConfig } from '../config.js';
 import type { AppDatabase } from '../db/database.js';
 import type { AgyAuthManager } from '../auth/agy-auth.js';
@@ -43,6 +44,8 @@ const prefsSchema = z.object({
   defaultModelId: z.string().nullable().optional(),
   defaultEffortValue: z.string().nullable().optional(),
 });
+
+const agentModeSchema = z.object({ agentMode: z.enum(AGY_AGENT_MODES) }).strict();
 
 export function requireAuth(req: FastifyRequest, reply: FastifyReply, db: AppDatabase) {
   const session = authenticateRequest(req, db);
@@ -127,6 +130,7 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: RouteDeps):
     });
 
     const passwordHash = await hashPassword(parsed.data.password);
+    ensureAgyProfileSettings(profileDir);
     const user = db.createUser({
       id: userId,
       username: normalizedUsername,
@@ -241,6 +245,27 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: RouteDeps):
   });
 
   // ---- Antigravity Profile & Authorization-Code Paste Endpoints ----
+
+  app.get('/api/agy/agent-mode', async (req, reply) => {
+    const session = requireAuth(req, reply, db);
+    if (!session) return;
+    const profile = db.getAgyProfile(session.user.id);
+    if (!profile) return reply.code(404).send({ error: 'AGY_PROFILE_NOT_FOUND', message: 'Antigravity プロファイルがありません。' });
+    return reply.header('Cache-Control', 'no-store').send({ agentMode: getAgyAgentMode(profile.profileDir) });
+  });
+
+  app.patch('/api/agy/agent-mode', async (req, reply) => {
+    const session = requireAuth(req, reply, db);
+    if (!session) return;
+    const parsed = agentModeSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'INVALID_INPUT', message: 'エージェントモードの設定値が不正です。' });
+    }
+    const profile = db.getAgyProfile(session.user.id);
+    if (!profile) return reply.code(404).send({ error: 'AGY_PROFILE_NOT_FOUND', message: 'Antigravity プロファイルがありません。' });
+    db.withAgyProfileSettingsWrite(() => setAgyAgentMode(profile.profileDir, parsed.data.agentMode));
+    return { agentMode: parsed.data.agentMode };
+  });
 
   app.get('/api/agy/status', async (req, reply) => {
     const session = requireAuth(req, reply, db);

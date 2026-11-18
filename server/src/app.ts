@@ -7,6 +7,7 @@ import fastifyStatic from '@fastify/static';
 import websocket from '@fastify/websocket';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { AcpClientManager } from './acp/client-manager.js';
+import { ensureAgyProfileSettings } from './acp/profile-settings.js';
 import { QuotaService } from './acp/quota-service.js';
 import { ExecutionScheduler } from './acp/scheduler.js';
 import { AgyAuthManager } from './auth/agy-auth.js';
@@ -72,6 +73,14 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
     bodyLimit: 10 * 1024 * 1024,
     logger: config.nodeEnv === 'test' ? false : { level: 'info' },
   });
+
+  for (const profileDir of db.listAgyProfileDirs()) {
+    try {
+      ensureAgyProfileSettings(profileDir);
+    } catch (err) {
+      app.log.error({ err, profileDir }, 'Failed to initialize Antigravity profile settings');
+    }
+  }
 
   await app.register(cookie);
   await app.register(multipart, {
