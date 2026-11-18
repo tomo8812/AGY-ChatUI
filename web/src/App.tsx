@@ -16,6 +16,7 @@ import { SkillsModal } from './components/SkillsModal';
 import { triggerHaptic, VIBRATION_PATTERNS } from './utils/haptics';
 import {
   ensurePushSubscribed,
+  getActivePushSubscription,
   getDevicePushSyncStatus,
   hasDisplayedNotificationTag,
   isNotificationSupported,
@@ -197,10 +198,12 @@ export const App: React.FC = () => {
   const syncPushSubscription = useCallback(async (forceVerify = false) => {
     if (!userIdRef.current || !preferencesRef.current?.notifyOnResponse) {
       pushServerSyncedRef.current = false;
+      wsRef.current?.setPushEndpoint(null);
       return;
     }
     if (!isNotificationSupported() || Notification.permission !== 'granted' || !isPushSupported()) {
       pushServerSyncedRef.current = false;
+      wsRef.current?.setPushEndpoint(null);
       return;
     }
     try {
@@ -208,11 +211,13 @@ export const App: React.FC = () => {
         const status = await getDevicePushSyncStatus();
         if (status.registeredOnServer) {
           pushServerSyncedRef.current = true;
+          wsRef.current?.setPushEndpoint(status.endpoint);
           return;
         }
       }
       const res = await ensurePushSubscribed();
       pushServerSyncedRef.current = res.subscribed;
+      wsRef.current?.setPushEndpoint(res.subscribed ? (res.endpoint ?? null) : null);
     } catch {
       pushServerSyncedRef.current = false;
     }
@@ -234,11 +239,8 @@ export const App: React.FC = () => {
       if (!isNotificationSupported() || Notification.permission !== 'granted') return;
       if (localNotifiedRunsRef.current.has(params.dedupKey)) return;
 
-      const isBackgroundOrOtherChat =
-        document.visibilityState !== 'visible' ||
-        !document.hasFocus() ||
-        params.chatId !== activeChatIdRef.current;
-      if (!isBackgroundOrOtherChat) return;
+      // Never show OS/browser notifications while the app itself is open and visible
+      if (document.visibilityState === 'visible') return;
 
       if (localNotifiedRunsRef.current.size > 200) {
         localNotifiedRunsRef.current.clear();
@@ -246,6 +248,7 @@ export const App: React.FC = () => {
       localNotifiedRunsRef.current.add(params.dedupKey);
 
       const triggerLocal = () => {
+        if (document.visibilityState === 'visible') return;
         void showBrowserNotification({
           title: params.title,
           body: params.body,
@@ -269,13 +272,9 @@ export const App: React.FC = () => {
       const timer = window.setTimeout(() => {
         pushFallbackTimersRef.current.delete(params.tag);
         if (receivedPushTagsRef.current.has(params.tag)) return;
-        const alreadyFocusedHere =
-          document.visibilityState === 'visible' &&
-          document.hasFocus() &&
-          activeChatIdRef.current === params.chatId;
-        if (alreadyFocusedHere) return;
+        if (document.visibilityState === 'visible') return;
         void hasDisplayedNotificationTag(params.tag).then((shown) => {
-          if (!shown && !receivedPushTagsRef.current.has(params.tag)) {
+          if (!shown && !receivedPushTagsRef.current.has(params.tag) && document.visibilityState !== 'visible') {
             triggerLocal();
           }
         });
@@ -685,6 +684,11 @@ export const App: React.FC = () => {
   // Automatically sync browser Push subscription if notifyOnResponse is ON and permission is already granted
   useEffect(() => {
     void syncPushSubscription(false);
+    void getActivePushSubscription()
+      .then((sub) => {
+        wsRef.current?.setPushEndpoint(sub?.endpoint ?? null);
+      })
+      .catch(() => {});
 
     const sw = typeof navigator !== 'undefined' ? navigator.serviceWorker : undefined;
     const onControllerChange = () => {
@@ -695,11 +699,17 @@ export const App: React.FC = () => {
         void syncPushSubscription(false);
       }
     };
+    const onEndpointChanged = (e: Event) => {
+      const endpoint = (e as CustomEvent<string | null>).detail ?? null;
+      wsRef.current?.setPushEndpoint(endpoint);
+    };
     sw?.addEventListener('controllerchange', onControllerChange);
     document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('agy:push-endpoint-changed', onEndpointChanged);
     return () => {
       sw?.removeEventListener('controllerchange', onControllerChange);
       document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('agy:push-endpoint-changed', onEndpointChanged);
       for (const timer of pushFallbackTimersRef.current.values()) {
         window.clearTimeout(timer);
       }
@@ -1270,6 +1280,13 @@ export const App: React.FC = () => {
     wsRef.current = client;
     setWsClientId(client.getClientId());
     client.start();
+    void getActivePushSubscription()
+      .then((sub) => {
+        if (wsRef.current === client) {
+          client.setPushEndpoint(sub?.endpoint ?? null);
+        }
+      })
+      .catch(() => {});
 
     return () => {
       client.stop();

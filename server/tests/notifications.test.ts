@@ -646,4 +646,120 @@ describe('Notifications & Pure-Node Web Push (RFC 8291 / 8292)', () => {
       body: '応答が完了しました。',
     });
   });
+
+  it('suppresses run Web Push for devices with an open/visible app while delivering to background devices and explicit test pushes', async () => {
+    const fgReceived: Array<Record<string, unknown>> = [];
+    const bgReceived: Array<Record<string, unknown>> = [];
+
+    const uaEcdh = crypto.createECDH('prime256v1');
+    const uaPub = uaEcdh.generateKeys();
+    const authSecret = crypto.randomBytes(16);
+
+    const mockPushServer = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: Buffer) => chunks.push(chunk));
+      req.on('end', () => {
+        const jsonText = decryptAes128GcmPayload({
+          encryptedBody: Buffer.concat(chunks),
+          uaEcdh,
+          authSecret,
+        });
+        const parsed = JSON.parse(jsonText) as Record<string, unknown>;
+        if (req.url === '/push/fg') fgReceived.push(parsed);
+        else if (req.url === '/push/bg') bgReceived.push(parsed);
+        res.statusCode = 201;
+        res.end('Created');
+      });
+    });
+
+    await new Promise<void>((resolve) => mockPushServer.listen(0, '127.0.0.1', () => resolve()));
+    const addr = mockPushServer.address() as { port: number };
+    const fgEndpoint = `http://127.0.0.1:${addr.port}/push/fg`;
+    const bgEndpoint = `http://127.0.0.1:${addr.port}/push/bg`;
+    cleanups.push(
+      () => new Promise<void>((resolve) => mockPushServer.close(() => resolve()))
+    );
+
+    const srv = await createTestServer();
+    cleanups.push(srv.cleanup);
+
+    const { client: alice } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+    await alice.connectWs({ clientId: 'alice-fg' });
+    cleanups.push(async () => alice.closeWs());
+
+    await alice.request('POST', '/api/notifications/subscribe', {
+      endpoint: fgEndpoint,
+      keys: { p256dh: uaPub.toString('base64url'), auth: authSecret.toString('base64url') },
+      userAgent: 'Vitest-FG',
+    });
+    await alice.request('POST', '/api/notifications/subscribe', {
+      endpoint: bgEndpoint,
+      keys: { p256dh: uaPub.toString('base64url'), auth: authSecret.toString('base64url') },
+      userAgent: 'Vitest-BG',
+    });
+    await alice.request('PATCH', '/api/preferences', { notifyOnResponse: true });
+
+    const chatRes = await alice.request<{ chat: { id: string } }>('POST', '/api/chats', {
+      title: 'フォアグラウンド抑制テスト',
+    });
+    const chatId = chatRes.data.chat.id;
+
+    // Report foreground visibility for fgEndpoint and synchronize via ping/pong
+    alice.ws!.send(JSON.stringify({ kind: 'presence', visible: true, pushEndpoint: fgEndpoint }));
+    alice.ws!.send(JSON.stringify({ kind: 'ping', visible: true }));
+    await alice.waitForFrame((f) => f.kind === 'pong', 3000, false);
+
+    // 1) Run finishes while fgEndpoint is open -> only bgEndpoint receives Push
+    const run1 = await alice.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
+      text: '開いたまま実行',
+    });
+    await alice.waitForFrame(
+      (f) => f.kind === 'event' && (f.event as { type: string; runId?: string }).type === 'run.finished' && (f.event as { runId?: string }).runId === run1.data.run.id
+    );
+    await new Promise<void>((resolve, reject) => {
+      const start = Date.now();
+      const poll = () => {
+        if (bgReceived.some((p) => p.tag === `run-${run1.data.run.id}`)) return resolve();
+        if (Date.now() - start > 3000) return reject(new Error('Timed out waiting for background device push'));
+        setTimeout(poll, 25);
+      };
+      poll();
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    expect(fgReceived).toHaveLength(0);
+    expect(bgReceived.some((p) => p.tag === `run-${run1.data.run.id}`)).toBe(true);
+
+    // 2) Explicit test notification STILL delivers to fgEndpoint even when open
+    const testRes = await alice.request<{ sent: number; currentDeviceSent?: boolean }>(
+      'POST',
+      '/api/notifications/test',
+      { endpoint: fgEndpoint }
+    );
+    expect(testRes.status).toBe(200);
+    expect(testRes.data.sent).toBe(2);
+    expect(testRes.data.currentDeviceSent).toBe(true);
+    expect(fgReceived).toHaveLength(1);
+
+    // 3) Switching fgEndpoint to hidden resumes Push notifications on run.finished
+    alice.ws!.send(JSON.stringify({ kind: 'presence', visible: false, pushEndpoint: fgEndpoint }));
+    alice.ws!.send(JSON.stringify({ kind: 'ping', visible: false }));
+    await alice.waitForFrame((f) => f.kind === 'pong', 3000, false);
+
+    const run2 = await alice.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
+      text: '閉じた状態で実行',
+    });
+    await alice.waitForFrame(
+      (f) => f.kind === 'event' && (f.event as { type: string; runId?: string }).type === 'run.finished' && (f.event as { runId?: string }).runId === run2.data.run.id
+    );
+    await new Promise<void>((resolve, reject) => {
+      const start = Date.now();
+      const poll = () => {
+        if (fgReceived.some((p) => p.tag === `run-${run2.data.run.id}`)) return resolve();
+        if (Date.now() - start > 3000) return reject(new Error('Timed out waiting for resumed fg push'));
+        setTimeout(poll, 25);
+      };
+      poll();
+    });
+    expect(fgReceived.some((p) => p.tag === `run-${run2.data.run.id}`)).toBe(true);
+  });
 });

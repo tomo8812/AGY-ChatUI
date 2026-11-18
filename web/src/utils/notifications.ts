@@ -189,6 +189,10 @@ export async function ensurePushSubscribed(): Promise<{
       userAgent: navigator.userAgent,
     });
 
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent<string | null>('agy:push-endpoint-changed', { detail: endpoint }));
+    }
+
     return {
       subscribed: true,
       endpoint,
@@ -211,6 +215,9 @@ export async function unsubscribePushOnDevice(): Promise<void> {
     // ignore backend error if session already gone
   }
   await sub.unsubscribe().catch(() => false);
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent<string | null>('agy:push-endpoint-changed', { detail: null }));
+  }
 }
 
 export async function showBrowserNotification(params: {

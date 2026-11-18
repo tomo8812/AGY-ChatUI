@@ -1,4 +1,4 @@
-const CACHE_NAME = 'antigravity-chat-shell-v5';
+const CACHE_NAME = 'antigravity-chat-shell-v6';
 const SHELL_ASSETS = ['/manifest.webmanifest', '/icon.svg'];
 
 self.addEventListener('install', (event) => {
@@ -55,35 +55,60 @@ self.addEventListener('push', (event) => {
       : chatId
         ? `/?chatId=${encodeURIComponent(chatId)}`
         : '/';
+  const isTestPush = tag.startsWith('test-');
 
-  const showPromise = self.registration
-    .showNotification(title, {
-      body,
-      icon: '/icon.svg',
-      badge: '/icon.svg',
-      tag,
-      renotify: true,
-      ...(Array.isArray(data.vibrate) ? { vibrate: data.vibrate } : {}),
-      data: { chatId, url },
-    })
-    .catch(() =>
-      self.registration.showNotification(title, {
+  const handlePush = async () => {
+    const clientList = await self.clients
+      .matchAll({ type: 'window', includeUncontrolled: true })
+      .catch(() => []);
+
+    for (const c of clientList) {
+      c.postMessage({ type: 'PUSH_RECEIVED', tag, chatId });
+    }
+
+    // For non-Apple browsers, also guard against in-flight pushes when a window is open/visible.
+    // Apple Web Push requires showNotification() whenever a push arrives; foreground Apple
+    // suppression is handled server-side before dispatching.
+    if (!isTestPush && clientList.some((c) => c.focused || c.visibilityState === 'visible')) {
+      let canSafelySuppress = false;
+      try {
+        const sub = await self.registration.pushManager.getSubscription();
+        if (sub && sub.endpoint) {
+          const host = new URL(sub.endpoint).hostname.toLowerCase();
+          const isApplePush = host === 'push.apple.com' || host.endsWith('.push.apple.com');
+          if (!isApplePush) {
+            canSafelySuppress = true;
+          }
+        }
+      } catch {
+        // Subscription detection failed: fall through to showNotification to protect Apple userVisibleOnly
+        canSafelySuppress = false;
+      }
+      if (canSafelySuppress) {
+        return;
+      }
+    }
+
+    await self.registration
+      .showNotification(title, {
         body,
+        icon: '/icon.svg',
+        badge: '/icon.svg',
         tag,
+        renotify: true,
+        ...(Array.isArray(data.vibrate) ? { vibrate: data.vibrate } : {}),
         data: { chatId, url },
       })
-    );
+      .catch(() =>
+        self.registration.showNotification(title, {
+          body,
+          tag,
+          data: { chatId, url },
+        })
+      );
+  };
 
-  const notifyClientsPromise = self.clients
-    .matchAll({ type: 'window', includeUncontrolled: true })
-    .then((clientList) => {
-      for (const c of clientList) {
-        c.postMessage({ type: 'PUSH_RECEIVED', tag, chatId });
-      }
-    })
-    .catch(() => {});
-
-  event.waitUntil(Promise.all([showPromise, notifyClientsPromise]));
+  event.waitUntil(handlePush());
 });
 
 async function getCsrfToken() {
