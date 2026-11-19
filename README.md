@@ -70,7 +70,7 @@ sudo systemctl enable --now antigravity-chat
 sudo tailscale serve --bg http://127.0.0.1:3000
 ```
 
-標準の systemd ユニットは `agy acp` に `--disable-telemetry` を渡します。既存のユニットで有効にするには `/etc/antigravity-chat/env` に `AGY_ACP_DISABLE_TELEMETRY=true` を設定してサービスを再起動してください。フラグの適用範囲は ACP プロセスです。[Antigravity ACP のフラグ](https://antigravity.google/docs/ide/extensions/acp#flags)
+ChatUI が起動するすべての `agy acp` プロセスに `--disable-telemetry` を渡します。既存サーバーにも通常のアプリ更新で反映され、systemd ユニットや環境ファイルの変更は不要です。[Antigravity ACP のフラグ](https://antigravity.google/docs/ide/extensions/acp#flags)
 
 #### GitHub Actions 高速デプロイの設定方法（2パターン）
 

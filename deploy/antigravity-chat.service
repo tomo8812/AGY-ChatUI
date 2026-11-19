@@ -14,7 +14,6 @@ Environment=PORT=3000
 Environment=TRUST_PROXY=true
 Environment=DATA_ROOT=/var/lib/antigravity-chat
 Environment=AGY_BIN=/usr/local/bin/agy
-Environment=AGY_ACP_DISABLE_TELEMETRY=true
 Environment=SANDBOX_MODE=auto
 # Recommended on VM.Standard.A1.Flex (2 OCPU / 12GB RAM): MAX_CONCURRENT_ACP=2 (or 3 if I/O-only), MAX_ACP_PER_USER=2, IDLE_WORKER_MS=600000
 # Recommended on VM.Standard.E2.1.Micro (1/8 OCPU / 1GB RAM): MAX_CONCURRENT_ACP=1, MAX_ACP_PER_USER=1, IDLE_WORKER_MS=180000

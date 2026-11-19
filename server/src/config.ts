@@ -20,7 +20,6 @@ export interface AppConfig {
   webDistDir: string;
   agyBin: string;
   agyMode: 'real' | 'mock';
-  agyAcpDisableTelemetry: boolean;
   mockAgentPath: string;
   pythonBin: string;
   ptyHelperPath: string;
@@ -92,7 +91,6 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     webDistDir: path.resolve(process.env.WEB_DIST_DIR ?? path.join(repoRoot, 'web', 'dist')),
     agyBin: process.env.AGY_BIN ?? 'agy',
     agyMode,
-    agyAcpDisableTelemetry: parseBool(process.env.AGY_ACP_DISABLE_TELEMETRY, false),
     mockAgentPath: path.resolve(
       process.env.MOCK_AGENT_PATH ?? path.join(import.meta.dirname, 'acp', 'mock-acp-agent.ts')
     ),
