@@ -359,5 +359,44 @@ describe('native and legacy file links', () => {
     const symlinkToBob = path.join(aliceProfile, 'notes', 'bob-alias.md');
     fs.symlinkSync(bobSkill, symlinkToBob);
     expect((await resolveAlice('file:///home/sandbox/notes/bob-alias.md')).status).toBe(404);
+
+    // 6. Per-chat home prefix resolves files from this chat's chatHome (and its symlinks into shared profile)
+    const aliceChatHome = path.join(aliceProfile, '.chat-homes', path.basename(aliceChat.workspaceDir));
+    const chatOnlyFile = path.join(aliceChatHome, 'notes', 'chat-only.md');
+    const shadowedMemo = path.join(aliceChatHome, 'notes', 'memo.md');
+    fs.mkdirSync(path.dirname(chatOnlyFile), { recursive: true });
+    fs.writeFileSync(chatOnlyFile, '# Chat Home Only');
+    fs.writeFileSync(shadowedMemo, '# Chat Home Shadowed Memo');
+    const chatHomeGeminiConfig = path.join(aliceChatHome, '.gemini', 'config');
+    if (!fs.existsSync(chatHomeGeminiConfig)) {
+      fs.mkdirSync(path.dirname(chatHomeGeminiConfig), { recursive: true });
+      fs.symlinkSync(path.join(aliceProfile, '.gemini', 'config'), chatHomeGeminiConfig);
+    }
+
+    const chatOnlyRes = await resolveAlice(`file://${chatOnlyFile}`);
+    expect(chatOnlyRes.status).toBe(200);
+    const chatOnlyBody = await fetch(`${srv.baseUrl}${chatOnlyRes.data.previewUrl}`, {
+      headers: { Cookie: alice.cookieHeader },
+    });
+    expect(chatOnlyBody.status).toBe(200);
+    expect(await chatOnlyBody.text()).toBe('# Chat Home Only');
+    expect((await resolveAlice('file:///home/sandbox/notes/chat-only.md', aliceOtherChat.id)).status).toBe(404);
+
+    const shadowedRes = await resolveAlice(`file://${shadowedMemo}`);
+    expect(shadowedRes.status).toBe(200);
+    const shadowedBody = await fetch(`${srv.baseUrl}${shadowedRes.data.previewUrl}`, {
+      headers: { Cookie: alice.cookieHeader },
+    });
+    expect(await shadowedBody.text()).toBe('# Chat Home Shadowed Memo');
+
+    const homeOnlyFile = path.join(aliceProfile, 'notes', 'home-only.md');
+    fs.writeFileSync(homeOnlyFile, '# Home Only');
+    expect((await resolveAlice(`file://${path.join(aliceChatHome, 'notes', 'home-only.md')}`)).status).toBe(404);
+
+    const viaChatHomeSkill = await resolveAlice(
+      `file://${path.join(aliceChatHome, '.gemini', 'config', 'skills', 'algorithmic-art', 'SKILL.md')}`
+    );
+    expect(viaChatHomeSkill.status).toBe(200);
+    expect(viaChatHomeSkill.data.artifact.id).toBe(fromFileUri.data.artifact.id);
   });
 });
