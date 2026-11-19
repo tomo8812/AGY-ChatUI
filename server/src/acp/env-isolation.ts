@@ -573,6 +573,10 @@ export function buildAgyCommandSpec(params: {
     };
   }
 
+  const agyArgs = params.subcommandArgs[0] === 'acp'
+    ? [...params.subcommandArgs, '--disable-telemetry']
+    : params.subcommandArgs;
+
   const wantsSandbox =
     Boolean(params.enableSandboxBwrap) &&
     params.config.sandboxMode !== 'off' &&
@@ -707,7 +711,7 @@ export function buildAgyCommandSpec(params: {
       SANDBOX_WORKSPACE_MOUNT,
       '--',
       sandboxAgyCommand,
-      ...params.subcommandArgs
+      ...agyArgs
     );
 
     return {
@@ -735,7 +739,7 @@ export function buildAgyCommandSpec(params: {
 
   return {
     command: resolveCanonicalAgyBin(params.config.agyBin, env.PATH),
-    args: params.subcommandArgs,
+    args: agyArgs,
     env,
     sandboxed: false,
     sandboxWorkspaceRoot: workspaceFallback,
