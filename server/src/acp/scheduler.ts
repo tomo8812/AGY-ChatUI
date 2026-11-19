@@ -22,6 +22,8 @@ interface QueuedTurnJob {
 export class ExecutionScheduler {
   private readonly queue: QueuedTurnJob[] = [];
   private readonly activeJobs = new Map<string, QueuedTurnJob>(); // runId -> job
+  private readonly activePromises = new Map<string, Promise<void>>(); // runId -> settled promise
+  private readonly suppressedRunIds = new Set<string>();
   private readonly activeChatIds = new Set<string>();
   private readonly activeByUser = new Map<string, number>();
   private lastScheduledUserIndex = 0;
@@ -163,6 +165,153 @@ export class ExecutionScheduler {
     };
   }
 
+  enqueueTurnForExistingUserMessage(params: {
+    userId: string;
+    chatId: string;
+    userMessageId: string;
+  }): {
+    userMessage: MessageRecord;
+    assistantMessage: MessageRecord;
+    run: RunRecord;
+    chat: ChatRecord;
+  } {
+    const chat = this.db.getChat(params.userId, params.chatId);
+    if (!chat) throw new Error('Chat not found');
+
+    const profile = this.db.getAgyProfile(params.userId);
+    if (!profile || profile.authStatus !== 'authenticated') {
+      throw new Error('Antigravity認証が完了していないため送信できません。');
+    }
+
+    const existingUserMsg = this.db.getMessage(params.userId, params.userMessageId);
+    if (!existingUserMsg || existingUserMsg.chatId !== params.chatId || existingUserMsg.role !== 'user') {
+      throw new Error('User message not found');
+    }
+
+    const now = Math.max(Date.now(), existingUserMsg.createdAt + 1);
+    const runId = crypto.randomUUID();
+    const assistantMessageId = crypto.randomUUID();
+    const queuePosition = this.queue.length + 1;
+
+    const userMessage = this.db.updateMessage(params.userId, existingUserMsg.id, {
+      runId,
+      status: 'completed',
+      errorMessage: null,
+    })!;
+
+    const assistantMessage = this.db.createMessage({
+      id: assistantMessageId,
+      chatId: params.chatId,
+      userId: params.userId,
+      role: 'assistant',
+      contentText: '',
+      status: 'queued',
+      runId,
+      createdAt: now,
+    });
+
+    const run = this.db.createRun({
+      id: runId,
+      chatId: params.chatId,
+      userId: params.userId,
+      userMessageId: userMessage.id,
+      assistantMessageId,
+      status: 'queued',
+      queuePosition,
+      modelId: chat.modelId,
+      effortValue: chat.effortValue,
+    });
+
+    const updatedChat = this.db.updateChat(params.userId, params.chatId, {
+      lastMessageAt: now,
+    })!;
+
+    this.hub.emitDurable({
+      userId: params.userId,
+      type: 'message.created',
+      chatId: params.chatId,
+      runId,
+      payload: {
+        messages: [userMessage, assistantMessage],
+        run,
+        chat: updatedChat,
+      },
+    });
+
+    const job: QueuedTurnJob = {
+      runId,
+      userId: params.userId,
+      chatId: params.chatId,
+      userMessageId: userMessage.id,
+      assistantMessageId,
+      userText: userMessage.contentText,
+      attachments: userMessage.attachments,
+      abortController: new AbortController(),
+      enqueuedAt: now,
+    };
+
+    this.queue.push(job);
+    this.pump();
+
+    return {
+      userMessage,
+      assistantMessage: this.db.getMessage(params.userId, assistantMessageId)!,
+      run: this.db.getRun(params.userId, runId)!,
+      chat: updatedChat,
+    };
+  }
+
+  async cancelAllForChatAndWait(userId: string, chatId: string): Promise<void> {
+    // 1. Drain any queued jobs for this chat before cancelling active work
+    for (let i = this.queue.length - 1; i >= 0; i -= 1) {
+      const job = this.queue[i];
+      if (job.userId === userId && job.chatId === chatId) {
+        this.queue.splice(i, 1);
+        job.abortController.abort();
+        this.db.updateRun(userId, job.runId, {
+          status: 'cancelled',
+          queuePosition: 0,
+          stopReason: 'rewound',
+          finishedAt: Date.now(),
+        });
+        this.db.updateMessage(userId, job.assistantMessageId, { status: 'cancelled' });
+      }
+    }
+
+    // 2. Abort any active job on this chat and wait for it to finish cleanly
+    const activeForChat = [...this.activeJobs.values()].filter(
+      (j) => j.userId === userId && j.chatId === chatId
+    );
+    for (const active of activeForChat) {
+      this.suppressedRunIds.add(active.runId);
+      active.abortController.abort();
+      await this.acp.cancelTurn(userId, chatId, active.runId).catch(() => {});
+    }
+
+    const promises = activeForChat
+      .map((j) => this.activePromises.get(j.runId))
+      .filter((p): p is Promise<void> => Boolean(p));
+
+    if (promises.length > 0) {
+      await Promise.race([
+        Promise.allSettled(promises),
+        new Promise<void>((resolve) => setTimeout(resolve, 600)),
+      ]);
+    }
+
+    // 3. Stop chat ACP worker so any remaining turn / background subagent exits cleanly
+    await this.acp.stopChatWorker(userId, chatId);
+
+    if (promises.length > 0) {
+      await Promise.allSettled(promises);
+    }
+
+    for (const active of activeForChat) {
+      this.suppressedRunIds.delete(active.runId);
+    }
+    this.notifyQueuePositions();
+  }
+
   async cancelRun(userId: string, chatId: string, runId: string): Promise<RunRecord | null> {
     const run = this.db.getRun(userId, runId);
     if (!run || run.chatId !== chatId || run.userId !== userId) {
@@ -276,7 +425,10 @@ export class ExecutionScheduler {
       payload: { run, message: msg },
     });
 
-    void this.runAsync(job);
+    const promise = this.runAsync(job).finally(() => {
+      this.activePromises.delete(job.runId);
+    });
+    this.activePromises.set(job.runId, promise);
   }
 
   private async runAsync(job: QueuedTurnJob): Promise<void> {
@@ -290,6 +442,10 @@ export class ExecutionScheduler {
         assistantMessageId: job.assistantMessageId,
         abortSignal: job.abortController.signal,
       });
+
+      if (this.suppressedRunIds.has(job.runId)) {
+        return;
+      }
 
       const finishedAt = Date.now();
       const status = stopReason === 'cancelled' ? 'cancelled' : 'completed';
@@ -324,6 +480,9 @@ export class ExecutionScheduler {
         void this.quotaService?.refreshOnDemand(job.userId, { auto: true, minAgeMs: 5_000 }).catch(() => {});
       }
     } catch (err) {
+      if (this.suppressedRunIds.has(job.runId)) {
+        return;
+      }
       const finishedAt = Date.now();
       const errorMsg = err instanceof Error ? err.message : String(err);
       const isCancelled = job.abortController.signal.aborted;

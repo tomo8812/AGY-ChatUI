@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { ApiError, api } from '../api/client';
 import type {
   ArtifactRecord,
@@ -21,6 +22,7 @@ import {
   CloseIcon,
   ComposeIcon,
   CopyIcon,
+  EditIcon,
   FileIcon,
   FolderIcon,
   PlusIcon,
@@ -35,10 +37,12 @@ import {
 } from './Icons';
 import { FileReferenceLink, MarkdownContent, type FileLinkProps } from './MarkdownContent';
 
+type ChatViewMessage = MessageRecord & { optimisticPop?: true };
+
 interface ChatViewProps {
   chat: ChatRecord | null;
   project: ProjectRecord | null;
-  messages: MessageRecord[];
+  messages: ChatViewMessage[];
   artifacts: ArtifactRecord[];
   pendingPermissions: PendingPermissionRecord[];
   activeRun: RunRecord | null;
@@ -46,6 +50,7 @@ interface ChatViewProps {
   availableCommands?: AvailableCommandItem[];
   selectedModelId: string;
   selectedEffortValue: string;
+  contextUsage?: { used: number; size: number } | null;
   draftResetToken?: number;
   clientId: string;
   hapticEnabled?: boolean;
@@ -53,6 +58,8 @@ interface ChatViewProps {
   onChangeEffort: (effortValue: string) => void;
   onDraftChange?: (hasDraft: boolean) => void;
   onSendPrompt: (text: string, files: AttachmentRef[]) => Promise<void>;
+  onEditMessage?: (messageId: string, newText: string) => Promise<void>;
+  onRegenerateMessage?: (assistantMessageId: string) => Promise<void>;
   onUploadFiles: (files: File[]) => Promise<AttachmentRef[]>;
   onCancelRun: (runId: string) => Promise<void>;
   onSyncProject: () => Promise<void>;
@@ -61,6 +68,220 @@ interface ChatViewProps {
   onOpenSkills?: () => void;
   externalDraftCommand?: { slug: string; token: number } | null;
 }
+
+interface LongPressMenuState {
+  messageId: string;
+  role: 'user' | 'assistant';
+  textToCopy: string;
+  canEdit: boolean;
+  canRegenerate: boolean;
+  x: number;
+  y: number;
+}
+
+async function copyTextToClipboard(text: string): Promise<void> {
+  if (!text) return;
+  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // Fallback below
+    }
+  }
+  if (typeof document !== 'undefined') {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+  }
+}
+
+function formatContextPercent(used: number, size: number): string {
+  if (size <= 0 || used <= 0) return '0%';
+  const raw = Math.min(100, (used / size) * 100);
+  if (raw < 10) {
+    return `${raw.toFixed(1)}%`;
+  }
+  return `${Math.round(raw)}%`;
+}
+
+function formatTokenCount(count: number): string {
+  return new Intl.NumberFormat('en-US').format(Math.max(0, Math.round(count)));
+}
+
+const ContextUsageControl: React.FC<{
+  contextUsage?: { used: number; size: number } | null;
+}> = React.memo(({ contextUsage }) => {
+  const [open, setOpen] = useState(false);
+  const [popoverStyle, setPopoverStyle] = useState<React.CSSProperties>({});
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  const hasData = Boolean(contextUsage && contextUsage.size > 0);
+  const used = hasData ? Math.max(0, contextUsage!.used) : 0;
+  const size = hasData ? contextUsage!.size : 0;
+  const pct = hasData ? Math.min(100, Math.max(0, (used / size) * 100)) : 0;
+  const pctLabel = hasData ? formatContextPercent(used, size) : '0%';
+  const remaining = hasData ? Math.max(0, size - used) : 0;
+  const toneClass = !hasData
+    ? 'is-empty'
+    : pct >= 90
+      ? 'is-danger'
+      : pct >= 70
+        ? 'is-warn'
+        : 'is-normal';
+
+  const radius = 8;
+  const circumference = 2 * Math.PI * radius;
+  const dashOffset = circumference * (1 - pct / 100);
+
+  const updatePosition = useCallback(() => {
+    const el = triggerRef.current;
+    if (!el || typeof window === 'undefined') return;
+    const rect = el.getBoundingClientRect();
+    const popWidth = Math.min(256, window.innerWidth - 24);
+    const centerLeft = rect.left + rect.width / 2 - popWidth / 2;
+    const clampedLeft = Math.max(12, Math.min(window.innerWidth - popWidth - 12, centerLeft));
+    const bottom = Math.max(12, window.innerHeight - rect.top + 10);
+    setPopoverStyle({
+      left: `${Math.round(clampedLeft)}px`,
+      bottom: `${Math.round(bottom)}px`,
+      width: `${Math.round(popWidth)}px`,
+    });
+  }, []);
+
+  useLayoutEffect(() => {
+    if (open) {
+      updatePosition();
+    }
+  }, [open, updatePosition]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setOpen(false);
+      }
+    };
+    const onResize = () => updatePosition();
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('resize', onResize);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('resize', onResize);
+    };
+  }, [open, updatePosition]);
+
+  return (
+    <>
+      <button
+        ref={triggerRef}
+        type="button"
+        className={`context-ring-btn ${toneClass} ${open ? 'active' : ''}`}
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        aria-label={
+          hasData
+            ? `コンテキスト利用量 ${pctLabel} (${formatTokenCount(used)} / ${formatTokenCount(size)})`
+            : 'コンテキスト利用量（未計測）'
+        }
+        title={
+          hasData
+            ? `コンテキスト: ${pctLabel} (${formatTokenCount(used)} / ${formatTokenCount(size)})`
+            : 'コンテキスト利用量を表示'
+        }
+      >
+        <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true">
+          <circle
+            className="context-ring-track"
+            cx="12"
+            cy="12"
+            r={radius}
+            fill="none"
+            strokeWidth="2.6"
+          />
+          <circle
+            className="context-ring-fill"
+            cx="12"
+            cy="12"
+            r={radius}
+            fill="none"
+            strokeWidth="2.6"
+            strokeLinecap="round"
+            strokeDasharray={circumference}
+            strokeDashoffset={hasData ? dashOffset : circumference}
+            transform="rotate(-90 12 12)"
+          />
+        </svg>
+      </button>
+
+      {open && typeof document !== 'undefined' &&
+        createPortal(
+          <div
+            className="context-popover-backdrop"
+            role="presentation"
+            onClick={() => setOpen(false)}
+          >
+            <div
+              className="context-popover"
+              style={popoverStyle}
+              role="dialog"
+              aria-modal="true"
+              aria-label="コンテキスト利用量"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="context-popover-head">
+                <span className="context-popover-title">コンテキスト利用量</span>
+                <span className={`context-popover-pct ${toneClass}`}>
+                  {hasData ? pctLabel : '—%'}
+                </span>
+              </div>
+
+              <div className="context-popover-bar-track" aria-hidden="true">
+                <div
+                  className={`context-popover-bar-fill ${toneClass}`}
+                  style={{ width: `${hasData ? Math.max(pct > 0 ? 2 : 0, pct) : 0}%` }}
+                />
+              </div>
+
+              {hasData ? (
+                <dl className="context-popover-stats">
+                  <div className="context-popover-row">
+                    <dt>使用率</dt>
+                    <dd>{pctLabel}</dd>
+                  </div>
+                  <div className="context-popover-row">
+                    <dt>利用コンテキスト</dt>
+                    <dd>{formatTokenCount(used)} tokens</dd>
+                  </div>
+                  <div className="context-popover-row">
+                    <dt>最大コンテキスト</dt>
+                    <dd>{formatTokenCount(size)} tokens</dd>
+                  </div>
+                  <div className="context-popover-row">
+                    <dt>残り</dt>
+                    <dd>{formatTokenCount(remaining)} tokens</dd>
+                  </div>
+                </dl>
+              ) : (
+                <div className="context-popover-empty">
+                  まだコンテキスト利用量が取得されていません。応答を受信するとここに表示されます。
+                </div>
+              )}
+            </div>
+          </div>,
+          document.body
+        )}
+    </>
+  );
+});
 
 const EMPTY_PERMS: PendingPermissionRecord[] = [];
 const EMPTY_ARTIFACTS: ArtifactRecord[] = [];
@@ -337,16 +558,23 @@ const PermissionCard: React.FC<{
 });
 
 const MessageRow: React.FC<{
-  msg: MessageRecord;
+  msg: ChatViewMessage;
   chatId?: string;
   clientId: string;
   queuePosition: number | null;
   msgPerms: PendingPermissionRecord[];
   msgArtifacts: ArtifactRecord[];
+  isEditing: boolean;
+  hasFollowingMessages: boolean;
+  hapticEnabled: boolean;
   onOpenArtifact: (artifact: ArtifactRecord) => void;
   onOpenAttachment: (att: AttachmentRef) => void;
   onPermissionUpdated: (perm: PendingPermissionRecord) => void;
   onResolveError: (msg: string) => void;
+  onOpenLongPressMenu: (menu: LongPressMenuState) => void;
+  onSaveEdit: (messageId: string, newText: string) => Promise<void>;
+  onCancelEdit: () => void;
+  onRegenerate: (assistantMessageId: string) => Promise<void>;
 }> = React.memo(
   ({
     msg,
@@ -355,25 +583,162 @@ const MessageRow: React.FC<{
     queuePosition,
     msgPerms,
     msgArtifacts,
+    isEditing,
+    hasFollowingMessages,
+    hapticEnabled,
     onOpenArtifact,
     onOpenAttachment,
     onPermissionUpdated,
     onResolveError,
+    onOpenLongPressMenu,
+    onSaveEdit,
+    onCancelEdit,
+    onRegenerate,
   }) => {
     const [copied, setCopied] = useState(false);
+    const [regenerating, setRegenerating] = useState(false);
+    const [editDraft, setEditDraft] = useState(msg.contentText);
+    const [editSaving, setEditSaving] = useState(false);
+    const [editError, setEditError] = useState<string | null>(null);
+    const editTextareaRef = useRef<HTMLTextAreaElement>(null);
+
+    const longPressTimerRef = useRef<number | null>(null);
+    const longPressStartRef = useRef<{ x: number; y: number; pointerId: number } | null>(null);
+    const suppressContextUntilRef = useRef<number>(0);
+
     const { blocks, answer, hasCurrentAnswer } = useMemo(() => getMessageActivity(msg), [msg]);
     const isWorking = msg.status === 'streaming' && !hasCurrentAnswer;
+    const isOptimistic = msg.id.startsWith('optimistic-');
+
+    const clearLongPress = useCallback(() => {
+      if (longPressTimerRef.current !== null) {
+        window.clearTimeout(longPressTimerRef.current);
+        longPressTimerRef.current = null;
+      }
+      longPressStartRef.current = null;
+    }, []);
+
+    useEffect(() => clearLongPress, [clearLongPress]);
+
+    useEffect(() => {
+      if (isEditing) {
+        setEditDraft(msg.contentText);
+        setEditError(null);
+        setEditSaving(false);
+        window.setTimeout(() => {
+          const el = editTextareaRef.current;
+          if (!el) return;
+          el.focus();
+          const len = el.value.length;
+          el.setSelectionRange(len, len);
+        }, 20);
+      }
+    }, [isEditing, msg.contentText]);
+
+    useEffect(() => {
+      if (!isEditing) return;
+      const el = editTextareaRef.current;
+      if (!el) return;
+      el.style.height = 'auto';
+      el.style.height = `${Math.min(el.scrollHeight, 240)}px`;
+    }, [isEditing, editDraft]);
 
     const handleCopy = useCallback(async () => {
-      await navigator.clipboard.writeText(answer);
+      await copyTextToClipboard(answer);
       setCopied(true);
       setTimeout(() => setCopied(false), 1600);
     }, [answer]);
 
+    const handleRegenerateClick = useCallback(async () => {
+      if (regenerating || isOptimistic) return;
+      setRegenerating(true);
+      try {
+        await onRegenerate(msg.id);
+      } catch (err) {
+        onResolveError(err instanceof ApiError ? err.message : '再生成に失敗しました。');
+      } finally {
+        setRegenerating(false);
+      }
+    }, [regenerating, isOptimistic, onRegenerate, msg.id, onResolveError]);
+
+    const handleEditSubmit = useCallback(
+      async (e?: React.FormEvent) => {
+        e?.preventDefault();
+        if (editSaving) return;
+        if (!editDraft.trim() && msg.attachments.length === 0) {
+          setEditError('メッセージまたはファイルを指定してください。');
+          return;
+        }
+        setEditSaving(true);
+        setEditError(null);
+        try {
+          await onSaveEdit(msg.id, editDraft);
+        } catch (err) {
+          setEditError(err instanceof ApiError ? err.message : '編集の保存に失敗しました。');
+        } finally {
+          setEditSaving(false);
+        }
+      },
+      [editSaving, editDraft, msg.attachments.length, msg.id, onSaveEdit]
+    );
+
+    const createLongPressHandlers = useCallback(
+      (role: 'user' | 'assistant', textToCopy: string, canEdit: boolean, canRegenerate: boolean) => ({
+        onPointerDown: (e: React.PointerEvent<HTMLElement>) => {
+          if (isEditing) return;
+          if (e.pointerType === 'mouse' && e.button !== 0) return;
+          const target = e.target as HTMLElement | null;
+          if (target?.closest('button, a, input, textarea, select, summary, pre, code')) {
+            return;
+          }
+          clearLongPress();
+          const startX = e.clientX;
+          const startY = e.clientY;
+          longPressStartRef.current = { x: startX, y: startY, pointerId: e.pointerId };
+          longPressTimerRef.current = window.setTimeout(() => {
+            longPressTimerRef.current = null;
+            longPressStartRef.current = null;
+            const selected = window.getSelection()?.toString().trim() ?? '';
+            if (selected.length > 0) return;
+            suppressContextUntilRef.current = Date.now() + 500;
+            triggerHaptic('send', hapticEnabled);
+            onOpenLongPressMenu({
+              messageId: msg.id,
+              role,
+              textToCopy,
+              canEdit,
+              canRegenerate,
+              x: startX,
+              y: startY,
+            });
+          }, 420);
+        },
+        onPointerMove: (e: React.PointerEvent<HTMLElement>) => {
+          const start = longPressStartRef.current;
+          if (!start || start.pointerId !== e.pointerId) return;
+          if (Math.hypot(e.clientX - start.x, e.clientY - start.y) > 8) {
+            clearLongPress();
+          }
+        },
+        onPointerUp: () => clearLongPress(),
+        onPointerCancel: () => clearLongPress(),
+        onContextMenu: (e: React.MouseEvent<HTMLElement>) => {
+          if (Date.now() < suppressContextUntilRef.current) {
+            e.preventDefault();
+          }
+        },
+      }),
+      [isEditing, clearLongPress, hapticEnabled, onOpenLongPressMenu, msg.id]
+    );
+
     if (msg.role === 'user') {
+      const userLongPress = createLongPressHandlers('user', msg.contentText, !isOptimistic, false);
       return (
         <div className="msg-row user">
-          <div className="user-bubble">
+          <div
+            className={`user-bubble${msg.optimisticPop ? ' pop-in' : ''}${isEditing ? ' is-editing' : ''}`}
+            {...userLongPress}
+          >
             {msg.attachments.length > 0 && (
               <div className="att-chip-row">
                 {msg.attachments.map((att) => (
@@ -389,15 +754,73 @@ const MessageRow: React.FC<{
                 ))}
               </div>
             )}
-            {msg.contentText && <div className="user-text">{msg.contentText}</div>}
+
+            {isEditing ? (
+              <form className="user-edit-form" onSubmit={handleEditSubmit}>
+                <textarea
+                  ref={editTextareaRef}
+                  className="user-edit-textarea"
+                  rows={2}
+                  value={editDraft}
+                  onChange={(e) => setEditDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Escape') {
+                      e.preventDefault();
+                      onCancelEdit();
+                      return;
+                    }
+                    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229) {
+                      const isMobileTouch = 'ontouchstart' in window && window.innerWidth <= 860;
+                      if (!isMobileTouch) {
+                        e.preventDefault();
+                        void handleEditSubmit();
+                      }
+                    }
+                  }}
+                  disabled={editSaving}
+                />
+                {hasFollowingMessages && (
+                  <div className="user-edit-hint">
+                    このメッセージ以降の履歴を巻き戻して再送信します
+                  </div>
+                )}
+                {editError && <div className="user-edit-error">{editError}</div>}
+                <div className="user-edit-actions">
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-xs"
+                    onClick={onCancelEdit}
+                    disabled={editSaving}
+                  >
+                    キャンセル
+                  </button>
+                  <button
+                    type="submit"
+                    className="btn btn-primary btn-xs"
+                    disabled={editSaving || (!editDraft.trim() && msg.attachments.length === 0)}
+                  >
+                    {editSaving ? '送信中...' : '保存して再送信'}
+                  </button>
+                </div>
+              </form>
+            ) : (
+              msg.contentText && <div className="user-text">{msg.contentText}</div>
+            )}
           </div>
         </div>
       );
     }
 
+    const assistantLongPress = createLongPressHandlers(
+      'assistant',
+      answer || msg.contentText,
+      false,
+      msg.status !== 'streaming' && msg.status !== 'queued' && !isOptimistic
+    );
+
     return (
       <div className="msg-row assistant">
-        <div className="assistant-body">
+        <div className="assistant-body" {...assistantLongPress}>
           {msg.status === 'queued' && (
             <div className="queue-status-pill">
               待機中
@@ -512,12 +935,31 @@ const MessageRow: React.FC<{
             </div>
           )}
 
-          {msg.status !== 'streaming' && msg.status !== 'queued' && answer && (
+          {msg.status !== 'streaming' && msg.status !== 'queued' && (answer || !isOptimistic) && (
             <div className="msg-actions">
-              <button type="button" className="chip-btn" onClick={() => void handleCopy()}>
-                {copied ? <CheckIcon size={13} /> : <CopyIcon size={13} />}
-                <span>{copied ? 'コピー済' : '回答をコピー'}</span>
-              </button>
+              {answer && (
+                <button
+                  type="button"
+                  className={`msg-action-icon-btn ${copied ? 'copied' : ''}`}
+                  onClick={() => void handleCopy()}
+                  aria-label="回答をコピー"
+                  title={copied ? 'コピー済' : '回答をコピー'}
+                >
+                  {copied ? <CheckIcon size={15} /> : <CopyIcon size={15} />}
+                </button>
+              )}
+              {!isOptimistic && (
+                <button
+                  type="button"
+                  className="msg-action-icon-btn"
+                  onClick={() => void handleRegenerateClick()}
+                  disabled={regenerating}
+                  aria-label="再生成"
+                  title="再生成"
+                >
+                  <RefreshIcon size={15} className={regenerating ? 'spin' : ''} />
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -539,6 +981,7 @@ interface ChatComposerProps {
   currentModelValue: string;
   effortOptions: NonNullable<ParsedSessionOptions['configOptions']>[number]['options'];
   currentEffortValue: string;
+  contextUsage?: { used: number; size: number } | null;
   isRunBusy: boolean;
   activeRunId: string | null;
   draftResetToken: number;
@@ -564,6 +1007,7 @@ const ChatComposer = React.memo(
         currentModelValue,
         effortOptions,
         currentEffortValue,
+        contextUsage,
         isRunBusy,
         activeRunId,
         draftResetToken,
@@ -1001,6 +1445,8 @@ const ChatComposer = React.memo(
                 </div>
 
                 <div className="composer-toolbar-right">
+                  <ContextUsageControl contextUsage={contextUsage} />
+
                   {(effortOptions.length > 0 || modelOptions.length > 0) && (
                     <EffortBar
                       options={effortOptions}
@@ -1095,6 +1541,7 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
   availableCommands = [],
   selectedModelId,
   selectedEffortValue,
+  contextUsage,
   draftResetToken = 0,
   clientId,
   hapticEnabled = true,
@@ -1102,6 +1549,8 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
   onChangeEffort,
   onDraftChange,
   onSendPrompt,
+  onEditMessage,
+  onRegenerateMessage,
   onUploadFiles,
   onCancelRun,
   onSyncProject,
@@ -1111,6 +1560,9 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
   externalDraftCommand,
 }) => {
   const [syncingProj, setSyncingProj] = useState(false);
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [longPressMenu, setLongPressMenu] = useState<LongPressMenuState | null>(null);
+  const menuOpenedAtRef = useRef<number>(0);
 
   const chatViewRef = useRef<HTMLDivElement>(null);
   const messagesScrollRef = useRef<HTMLDivElement>(null);
@@ -1307,6 +1759,55 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
     composerRef.current?.showNotice(message);
   }, []);
 
+  useEffect(() => {
+    setEditingMessageId(null);
+    setLongPressMenu(null);
+  }, [chat?.id]);
+
+  useEffect(() => {
+    if (editingMessageId && !messages.some((m) => m.id === editingMessageId)) {
+      setEditingMessageId(null);
+    }
+  }, [editingMessageId, messages]);
+
+  useEffect(() => {
+    if (!longPressMenu) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setLongPressMenu(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [longPressMenu]);
+
+  const handleOpenLongPressMenu = useCallback((menu: LongPressMenuState) => {
+    menuOpenedAtRef.current = Date.now();
+    setLongPressMenu(menu);
+  }, []);
+
+  const handleSaveEdit = useCallback(
+    async (messageId: string, newText: string) => {
+      if (!onEditMessage) return;
+      await onEditMessage(messageId, newText);
+      setEditingMessageId(null);
+    },
+    [onEditMessage]
+  );
+
+  const handleCancelEdit = useCallback(() => {
+    setEditingMessageId(null);
+  }, []);
+
+  const handleRegenerate = useCallback(
+    async (assistantMessageId: string) => {
+      if (!onRegenerateMessage) return;
+      await onRegenerateMessage(assistantMessageId);
+    },
+    [onRegenerateMessage]
+  );
+
   const modelOption = useMemo(
     () =>
       sessionOptions?.configOptions.find(
@@ -1405,9 +1906,9 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
               ) : null}
             </div>
           ) : (
-            messages.map((msg) => (
+            messages.map((msg, idx) => (
               <MessageRow
-                key={msg.id}
+                key={msg.clientMessageId ? `cm:${msg.clientMessageId}` : msg.id}
                 msg={msg}
                 chatId={chat?.id}
                 clientId={clientId}
@@ -1420,10 +1921,17 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
                 }
                 msgPerms={msg.runId ? (pendingPermsByRunId.get(msg.runId) ?? EMPTY_PERMS) : EMPTY_PERMS}
                 msgArtifacts={resolvedArtifactsByMsgId.get(msg.id) ?? EMPTY_ARTIFACTS}
+                isEditing={editingMessageId === msg.id}
+                hasFollowingMessages={idx < messages.length - 1}
+                hapticEnabled={hapticEnabled}
                 onOpenArtifact={onOpenArtifact}
                 onOpenAttachment={openAttachmentRef}
                 onPermissionUpdated={onPermissionUpdated}
                 onResolveError={handleResolveError}
+                onOpenLongPressMenu={handleOpenLongPressMenu}
+                onSaveEdit={handleSaveEdit}
+                onCancelEdit={handleCancelEdit}
+                onRegenerate={handleRegenerate}
               />
             ))
           )}
@@ -1438,6 +1946,7 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
         currentModelValue={currentModelValue}
         effortOptions={effortOptions}
         currentEffortValue={currentEffortValue}
+        contextUsage={contextUsage}
         isRunBusy={isRunBusy}
         activeRunId={activeRun?.id ?? null}
         draftResetToken={draftResetToken}
@@ -1452,6 +1961,92 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
         onOpenSkills={onOpenSkills}
         onPromptSubmitting={handlePromptSubmitting}
       />
+
+      {longPressMenu && typeof document !== 'undefined' &&
+        createPortal(
+          <div
+            className="msg-context-backdrop"
+            role="presentation"
+            onPointerDown={(e) => {
+              if (e.target === e.currentTarget) {
+                setLongPressMenu(null);
+              }
+            }}
+            onClick={(e) => {
+              if (e.target === e.currentTarget && Date.now() - menuOpenedAtRef.current > 250) {
+                setLongPressMenu(null);
+              }
+            }}
+            onContextMenu={(e) => e.preventDefault()}
+          >
+            <div
+              className="msg-context-menu"
+              role="menu"
+              aria-label="メッセージ操作"
+              style={{
+                left: `${Math.round(
+                  Math.max(12, Math.min(window.innerWidth - 196, longPressMenu.x - 88))
+                )}px`,
+                top: `${Math.round(
+                  Math.max(12, Math.min(window.innerHeight - 168, longPressMenu.y - 68))
+                )}px`,
+              }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <button
+                type="button"
+                role="menuitem"
+                className="msg-context-item"
+                disabled={!longPressMenu.textToCopy}
+                onClick={() => {
+                  const text = longPressMenu.textToCopy;
+                  setLongPressMenu(null);
+                  void copyTextToClipboard(text);
+                }}
+              >
+                <CopyIcon size={15} />
+                <span>コピー</span>
+              </button>
+
+              {longPressMenu.canEdit && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="msg-context-item"
+                  onClick={() => {
+                    const targetId = longPressMenu.messageId;
+                    setLongPressMenu(null);
+                    setEditingMessageId(targetId);
+                  }}
+                >
+                  <EditIcon size={15} />
+                  <span>編集</span>
+                </button>
+              )}
+
+              {longPressMenu.canRegenerate && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="msg-context-item"
+                  onClick={() => {
+                    const targetId = longPressMenu.messageId;
+                    setLongPressMenu(null);
+                    void handleRegenerate(targetId).catch((err) => {
+                      handleResolveError(
+                        err instanceof ApiError ? err.message : '再生成に失敗しました。'
+                      );
+                    });
+                  }}
+                >
+                  <RefreshIcon size={15} />
+                  <span>再生成</span>
+                </button>
+              )}
+            </div>
+          </div>,
+          document.body
+        )}
     </div>
   );
 });

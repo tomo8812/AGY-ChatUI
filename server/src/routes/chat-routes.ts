@@ -40,6 +40,10 @@ const sendMessageSchema = z.object({
   clientMessageId: z.string().max(128).optional().nullable(),
 });
 
+const editMessageSchema = z.object({
+  text: z.string().max(100_000),
+});
+
 const permissionActionSchema = z.object({
   optionId: z.string().nullable().optional(),
   cancel: z.boolean().optional(),
@@ -406,6 +410,170 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
     });
 
     return reply.code(result.deduplicated ? 200 : 202).send(result);
+  });
+
+  app.post('/api/chats/:chatId/messages/:messageId/edit', async (req, reply) => {
+    const session = requireAuth(req, reply, db);
+    if (!session) return;
+
+    if (!ensureAgyAuthenticated(session.user.id)) {
+      return reply.code(403).send({
+        error: 'AGY_AUTH_REQUIRED',
+        message: 'メッセージ編集の前にAntigravity公式認証を完了してください。',
+      });
+    }
+
+    const { chatId, messageId } = req.params as { chatId: string; messageId: string };
+    const chat = db.getChat(session.user.id, chatId);
+    if (!chat) return reply.code(404).send({ error: 'NOT_FOUND', message: 'チャットが見つかりません。' });
+
+    const initialMsg = db.getMessage(session.user.id, messageId);
+    if (!initialMsg || initialMsg.chatId !== chatId) {
+      return reply.code(404).send({ error: 'NOT_FOUND', message: 'メッセージが見つかりません。' });
+    }
+    if (initialMsg.role !== 'user') {
+      return reply.code(400).send({ error: 'INVALID_ROLE', message: 'ユーザーのメッセージのみ編集できます。' });
+    }
+
+    const parsed = editMessageSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'INVALID_INPUT', message: 'メッセージ内容を確認してください。' });
+    }
+
+    if (!parsed.data.text.trim() && initialMsg.attachments.length === 0) {
+      return reply.code(400).send({ error: 'EMPTY_MESSAGE', message: 'メッセージまたはファイルを指定してください。' });
+    }
+
+    await scheduler.cancelAllForChatAndWait(session.user.id, chatId);
+
+    const latestChat = db.getChat(session.user.id, chatId);
+    if (!latestChat) return reply.code(404).send({ error: 'NOT_FOUND', message: 'チャットが見つかりません。' });
+    const orderedMessages = db.listMessages(session.user.id, chatId);
+    const idx = orderedMessages.findIndex((m) => m.id === messageId);
+    if (idx < 0) {
+      return reply.code(404).send({ error: 'NOT_FOUND', message: 'メッセージが見つかりません。' });
+    }
+    const targetMsg = orderedMessages[idx];
+    const updateChatTitle =
+      idx === 0 &&
+      latestChat.title === targetMsg.contentText.trim().slice(0, 48) &&
+      parsed.data.text.trim()
+        ? parsed.data.text.trim().slice(0, 48)
+        : undefined;
+
+    const rewound = db.rewindTurnMessages({
+      userId: session.user.id,
+      chatId,
+      keepUserMessageId: messageId,
+      newUserText: parsed.data.text,
+      deleteFromIndexInclusive: idx + 1,
+      orderedMessages,
+      updateChatTitle,
+    });
+
+    hub.emitDurable({
+      userId: session.user.id,
+      type: 'chat.rewound',
+      chatId,
+      payload: {
+        chat: rewound.chat,
+        messages: rewound.messages,
+        artifacts: rewound.artifacts,
+      },
+    });
+
+    const result = scheduler.enqueueTurnForExistingUserMessage({
+      userId: session.user.id,
+      chatId,
+      userMessageId: messageId,
+    });
+
+    return reply.code(200).send({
+      ...result,
+      messages: db.listMessages(session.user.id, chatId),
+      artifacts: rewound.artifacts,
+    });
+  });
+
+  app.post('/api/chats/:chatId/messages/:messageId/regenerate', async (req, reply) => {
+    const session = requireAuth(req, reply, db);
+    if (!session) return;
+
+    if (!ensureAgyAuthenticated(session.user.id)) {
+      return reply.code(403).send({
+        error: 'AGY_AUTH_REQUIRED',
+        message: '再生成の前にAntigravity公式認証を完了してください。',
+      });
+    }
+
+    const { chatId, messageId } = req.params as { chatId: string; messageId: string };
+    const chat = db.getChat(session.user.id, chatId);
+    if (!chat) return reply.code(404).send({ error: 'NOT_FOUND', message: 'チャットが見つかりません。' });
+
+    const initialMsg = db.getMessage(session.user.id, messageId);
+    if (!initialMsg || initialMsg.chatId !== chatId) {
+      return reply.code(404).send({ error: 'NOT_FOUND', message: 'メッセージが見つかりません。' });
+    }
+    if (initialMsg.role !== 'assistant') {
+      return reply.code(400).send({ error: 'INVALID_ROLE', message: 'アシスタントの応答のみ再生成できます。' });
+    }
+
+    await scheduler.cancelAllForChatAndWait(session.user.id, chatId);
+
+    const orderedMessages = db.listMessages(session.user.id, chatId);
+    const idx = orderedMessages.findIndex((m) => m.id === messageId);
+    if (idx < 0) {
+      return reply.code(404).send({ error: 'NOT_FOUND', message: 'メッセージが見つかりません。' });
+    }
+
+    const targetMsg = orderedMessages[idx];
+    const linkedRun = targetMsg.runId ? db.getRun(session.user.id, targetMsg.runId) : null;
+    let pairedIdx = linkedRun
+      ? orderedMessages.findIndex((m, mIdx) => mIdx < idx && m.id === linkedRun.userMessageId && m.role === 'user')
+      : -1;
+    if (pairedIdx < 0) {
+      for (let i = idx - 1; i >= 0; i -= 1) {
+        if (orderedMessages[i].role === 'user') {
+          pairedIdx = i;
+          break;
+        }
+      }
+    }
+    if (pairedIdx < 0) {
+      return reply.code(400).send({ error: 'NO_USER_MESSAGE', message: '対応するユーザーメッセージが見つかりません。' });
+    }
+
+    const pairedUserMsg = orderedMessages[pairedIdx];
+    const rewound = db.rewindTurnMessages({
+      userId: session.user.id,
+      chatId,
+      keepUserMessageId: pairedUserMsg.id,
+      deleteFromIndexInclusive: Math.min(idx, pairedIdx + 1),
+      orderedMessages,
+    });
+
+    hub.emitDurable({
+      userId: session.user.id,
+      type: 'chat.rewound',
+      chatId,
+      payload: {
+        chat: rewound.chat,
+        messages: rewound.messages,
+        artifacts: rewound.artifacts,
+      },
+    });
+
+    const result = scheduler.enqueueTurnForExistingUserMessage({
+      userId: session.user.id,
+      chatId,
+      userMessageId: pairedUserMsg.id,
+    });
+
+    return reply.code(200).send({
+      ...result,
+      messages: db.listMessages(session.user.id, chatId),
+      artifacts: rewound.artifacts,
+    });
   });
 
   app.post('/api/chats/:chatId/runs/:runId/cancel', async (req, reply) => {

@@ -243,6 +243,26 @@ export const api = {
       deduplicated: boolean;
     }>(`/api/chats/${chatId}/messages`, { method: 'POST', body: payload }),
 
+  editMessage: (chatId: string, messageId: string, payload: { text: string }) =>
+    apiFetch<{
+      userMessage: MessageRecord;
+      assistantMessage: MessageRecord;
+      run: RunRecord;
+      chat: ChatRecord;
+      messages: MessageRecord[];
+      artifacts: ArtifactRecord[];
+    }>(`/api/chats/${chatId}/messages/${messageId}/edit`, { method: 'POST', body: payload }),
+
+  regenerateMessage: (chatId: string, messageId: string) =>
+    apiFetch<{
+      userMessage: MessageRecord;
+      assistantMessage: MessageRecord;
+      run: RunRecord;
+      chat: ChatRecord;
+      messages: MessageRecord[];
+      artifacts: ArtifactRecord[];
+    }>(`/api/chats/${chatId}/messages/${messageId}/regenerate`, { method: 'POST' }),
+
   cancelRun: (chatId: string, runId: string) =>
     apiFetch<{ run: RunRecord }>(`/api/chats/${chatId}/runs/${runId}/cancel`, { method: 'POST' }),
 

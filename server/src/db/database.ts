@@ -147,6 +147,8 @@ export class AppDatabase {
         model_id TEXT,
         effort_value TEXT,
         project_context_version INTEGER NOT NULL DEFAULT 0,
+        context_used INTEGER,
+        context_size INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         last_message_at INTEGER NOT NULL
@@ -258,6 +260,13 @@ export class AppDatabase {
     }
     if (!prefCols.some((col) => col.name === 'haptic_feedback')) {
       this.db.exec('ALTER TABLE user_preferences ADD COLUMN haptic_feedback INTEGER NOT NULL DEFAULT 1;');
+    }
+    const chatCols = this.db.prepare('PRAGMA table_info(chats)').all() as Array<{ name: string }>;
+    if (!chatCols.some((col) => col.name === 'context_used')) {
+      this.db.exec('ALTER TABLE chats ADD COLUMN context_used INTEGER;');
+    }
+    if (!chatCols.some((col) => col.name === 'context_size')) {
+      this.db.exec('ALTER TABLE chats ADD COLUMN context_size INTEGER;');
     }
     const msgCols = this.db.prepare('PRAGMA table_info(messages)').all() as Array<{ name: string }>;
     if (!msgCols.some((col) => col.name === 'activity_json')) {
@@ -864,6 +873,8 @@ export class AppDatabase {
       modelId?: string | null;
       effortValue?: string | null;
       projectContextVersion?: number;
+      contextUsed?: number | null;
+      contextSize?: number | null;
       lastMessageAt?: number;
     }
   ): ChatRecord | null {
@@ -874,7 +885,7 @@ export class AppDatabase {
       .prepare(
         `UPDATE chats
          SET title = ?, project_id = ?, acp_session_id = ?, model_id = ?, effort_value = ?,
-             project_context_version = ?, updated_at = ?, last_message_at = ?
+             project_context_version = ?, context_used = ?, context_size = ?, updated_at = ?, last_message_at = ?
          WHERE id = ? AND user_id = ?`
       )
       .run(
@@ -884,6 +895,8 @@ export class AppDatabase {
         patch.modelId !== undefined ? patch.modelId : existing.modelId,
         patch.effortValue !== undefined ? patch.effortValue : existing.effortValue,
         patch.projectContextVersion ?? existing.projectContextVersion,
+        patch.contextUsed !== undefined ? patch.contextUsed : (existing.contextUsed ?? null),
+        patch.contextSize !== undefined ? patch.contextSize : (existing.contextSize ?? null),
         now,
         patch.lastMessageAt ?? existing.lastMessageAt,
         chatId,
@@ -908,6 +921,8 @@ export class AppDatabase {
       modelId: r.model_id ? String(r.model_id) : null,
       effortValue: r.effort_value ? String(r.effort_value) : null,
       projectContextVersion: Number(r.project_context_version),
+      contextUsed: r.context_used !== null && r.context_used !== undefined ? Number(r.context_used) : null,
+      contextSize: r.context_size !== null && r.context_size !== undefined ? Number(r.context_size) : null,
       createdAt: Number(r.created_at),
       updatedAt: Number(r.updated_at),
       lastMessageAt: Number(r.last_message_at),
@@ -918,7 +933,7 @@ export class AppDatabase {
 
   listMessages(userId: string, chatId: string): MessageRecord[] {
     const rows = this.db
-      .prepare('SELECT * FROM messages WHERE chat_id = ? AND user_id = ? ORDER BY created_at ASC')
+      .prepare('SELECT * FROM messages WHERE chat_id = ? AND user_id = ? ORDER BY created_at ASC, rowid ASC')
       .all(chatId, userId) as Array<Record<string, unknown>>;
     return rows.map((r) => this.mapMessage(r));
   }
@@ -1027,6 +1042,123 @@ export class AppDatabase {
     this.db
       .prepare('DELETE FROM messages WHERE chat_id = ? AND user_id = ? AND created_at >= ?')
       .run(chatId, userId, fromCreatedAt);
+  }
+
+  rewindTurnMessages(params: {
+    userId: string;
+    chatId: string;
+    keepUserMessageId: string;
+    newUserText?: string;
+    deleteFromIndexInclusive: number;
+    orderedMessages: MessageRecord[];
+    updateChatTitle?: string;
+  }): {
+    chat: ChatRecord;
+    messages: MessageRecord[];
+    artifacts: ArtifactRecord[];
+  } {
+    const now = Date.now();
+    const toDelete = params.orderedMessages.slice(params.deleteFromIndexInclusive);
+    const deleteMsgIds = toDelete.map((m) => m.id);
+    const affectedMsgIds = Array.from(new Set([...deleteMsgIds, params.keepUserMessageId]));
+    const deleteRunIds = Array.from(
+      new Set(
+        [
+          ...toDelete.map((m) => m.runId),
+          params.orderedMessages.find((m) => m.id === params.keepUserMessageId)?.runId,
+        ].filter((id): id is string => Boolean(id))
+      )
+    );
+
+    this.db.exec('BEGIN;');
+    try {
+      if (deleteMsgIds.length > 0) {
+        const msgPlaceholders = deleteMsgIds.map(() => '?').join(',');
+        this.db
+          .prepare(`DELETE FROM messages WHERE chat_id = ? AND user_id = ? AND id IN (${msgPlaceholders})`)
+          .run(params.chatId, params.userId, ...deleteMsgIds);
+      }
+
+      if (affectedMsgIds.length > 0) {
+        const msgPlaceholders = affectedMsgIds.map(() => '?').join(',');
+        const runConditions: string[] = [
+          `user_message_id IN (${msgPlaceholders})`,
+          `assistant_message_id IN (${msgPlaceholders})`,
+        ];
+        const runArgs: string[] = [params.chatId, params.userId, ...affectedMsgIds, ...affectedMsgIds];
+        if (deleteRunIds.length > 0) {
+          const runPlaceholders = deleteRunIds.map(() => '?').join(',');
+          runConditions.push(`id IN (${runPlaceholders})`);
+          runArgs.push(...deleteRunIds);
+        }
+        this.db
+          .prepare(`DELETE FROM runs WHERE chat_id = ? AND user_id = ? AND (${runConditions.join(' OR ')})`)
+          .run(...runArgs);
+      }
+
+      if (deleteMsgIds.length > 0 || deleteRunIds.length > 0) {
+        const artConditions: string[] = [];
+        const artArgs: string[] = [params.chatId, params.userId];
+        if (deleteMsgIds.length > 0) {
+          const msgPlaceholders = deleteMsgIds.map(() => '?').join(',');
+          artConditions.push(`message_id IN (${msgPlaceholders})`);
+          artArgs.push(...deleteMsgIds);
+        }
+        if (deleteRunIds.length > 0) {
+          const runPlaceholders = deleteRunIds.map(() => '?').join(',');
+          artConditions.push(`run_id IN (${runPlaceholders})`);
+          artArgs.push(...deleteRunIds);
+        }
+        this.db
+          .prepare(
+            `DELETE FROM artifacts
+             WHERE chat_id = ? AND user_id = ? AND source = 'generated' AND (${artConditions.join(' OR ')})`
+          )
+          .run(...artArgs);
+      }
+
+      if (params.newUserText !== undefined) {
+        this.db
+          .prepare(
+            `UPDATE messages
+             SET content_text = ?, run_id = NULL, error_message = NULL, updated_at = ?
+             WHERE id = ? AND chat_id = ? AND user_id = ?`
+          )
+          .run(params.newUserText, now, params.keepUserMessageId, params.chatId, params.userId);
+      } else {
+        this.db
+          .prepare(
+            `UPDATE messages
+             SET run_id = NULL, error_message = NULL, updated_at = ?
+             WHERE id = ? AND chat_id = ? AND user_id = ?`
+          )
+          .run(now, params.keepUserMessageId, params.chatId, params.userId);
+      }
+
+      this.db
+        .prepare(
+          `UPDATE chats
+           SET acp_session_id = NULL,
+               context_used = NULL,
+               context_size = NULL,
+               title = COALESCE(?, title),
+               updated_at = ?,
+               last_message_at = ?
+           WHERE id = ? AND user_id = ?`
+        )
+        .run(params.updateChatTitle ?? null, now, now, params.chatId, params.userId);
+
+      this.db.exec('COMMIT;');
+    } catch (err) {
+      this.db.exec('ROLLBACK;');
+      throw err;
+    }
+
+    return {
+      chat: this.getChat(params.userId, params.chatId)!,
+      messages: this.listMessages(params.userId, params.chatId),
+      artifacts: this.listArtifactsForChat(params.userId, params.chatId),
+    };
   }
 
   private mapMessage(r: Record<string, unknown>): MessageRecord {
