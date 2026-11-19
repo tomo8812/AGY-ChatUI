@@ -573,9 +573,10 @@ export function buildAgyCommandSpec(params: {
     };
   }
 
-  const agyArgs = params.subcommandArgs[0] === 'acp'
-    ? [...params.subcommandArgs, '--disable-telemetry']
-    : params.subcommandArgs;
+  const agyArgs =
+    params.config.agyAcpDisableTelemetry && params.subcommandArgs[0] === 'acp'
+      ? [...params.subcommandArgs, '--disable-telemetry']
+      : params.subcommandArgs;
 
   const wantsSandbox =
     Boolean(params.enableSandboxBwrap) &&

@@ -190,12 +190,14 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
       SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK,
       RANDOM_SECRET_TOKEN: process.env.RANDOM_SECRET_TOKEN,
       LANG: process.env.LANG,
+      AGY_ACP_DISABLE_TELEMETRY: process.env.AGY_ACP_DISABLE_TELEMETRY,
     };
     process.env.SESSION_SECRET = 'super-secret-session';
     process.env.GITHUB_READ_TOKEN = 'ghp_secret123';
     process.env.SSH_AUTH_SOCK = '/tmp/ssh-agent.sock';
     process.env.RANDOM_SECRET_TOKEN = 'should-not-leak';
     process.env.LANG = 'C.UTF-8';
+    process.env.AGY_ACP_DISABLE_TELEMETRY = 'true';
     cleanups.push(() => {
       for (const [k, v] of Object.entries(prevEnv)) {
         if (v === undefined) delete process.env[k];
@@ -298,7 +300,12 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
     );
     expect(resolvedFromSystem).toBe(fs.realpathSync(sysAgyReal));
 
-    const offConfig = loadConfig({ agyMode: 'real', sandboxMode: 'off', agyBin: sysAgyLink, dataRoot: tmpRoot });
+    const offConfig = loadConfig({
+      agyMode: 'real',
+      sandboxMode: 'off',
+      agyBin: sysAgyLink,
+      dataRoot: tmpRoot,
+    });
     const offSpec = buildAgyCommandSpec({
       config: offConfig,
       subcommandArgs: ['-p', '/usage'],
@@ -314,6 +321,14 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
       profileDir,
     });
     expect(loginSpec.args).toEqual(['acp', '--login', '--disable-telemetry']);
+
+    delete process.env.AGY_ACP_DISABLE_TELEMETRY;
+    const defaultAcpSpec = buildAgyCommandSpec({
+      config: loadConfig({ agyMode: 'real', sandboxMode: 'off', agyBin: sysAgyLink, dataRoot: tmpRoot }),
+      subcommandArgs: ['acp'],
+      profileDir,
+    });
+    expect(defaultAcpSpec.args).toEqual(['acp']);
   });
 
   it('resolves the subagent image from the native Reactive Wakeup continuation after end_turn', async () => {
