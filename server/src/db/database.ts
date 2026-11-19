@@ -147,6 +147,8 @@ export class AppDatabase {
         model_id TEXT,
         effort_value TEXT,
         project_context_version INTEGER NOT NULL DEFAULT 0,
+        context_used INTEGER,
+        context_size INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         last_message_at INTEGER NOT NULL
@@ -258,6 +260,13 @@ export class AppDatabase {
     }
     if (!prefCols.some((col) => col.name === 'haptic_feedback')) {
       this.db.exec('ALTER TABLE user_preferences ADD COLUMN haptic_feedback INTEGER NOT NULL DEFAULT 1;');
+    }
+    const chatCols = this.db.prepare('PRAGMA table_info(chats)').all() as Array<{ name: string }>;
+    if (!chatCols.some((col) => col.name === 'context_used')) {
+      this.db.exec('ALTER TABLE chats ADD COLUMN context_used INTEGER;');
+    }
+    if (!chatCols.some((col) => col.name === 'context_size')) {
+      this.db.exec('ALTER TABLE chats ADD COLUMN context_size INTEGER;');
     }
     const msgCols = this.db.prepare('PRAGMA table_info(messages)').all() as Array<{ name: string }>;
     if (!msgCols.some((col) => col.name === 'activity_json')) {
@@ -864,6 +873,8 @@ export class AppDatabase {
       modelId?: string | null;
       effortValue?: string | null;
       projectContextVersion?: number;
+      contextUsed?: number | null;
+      contextSize?: number | null;
       lastMessageAt?: number;
     }
   ): ChatRecord | null {
@@ -874,7 +885,7 @@ export class AppDatabase {
       .prepare(
         `UPDATE chats
          SET title = ?, project_id = ?, acp_session_id = ?, model_id = ?, effort_value = ?,
-             project_context_version = ?, updated_at = ?, last_message_at = ?
+             project_context_version = ?, context_used = ?, context_size = ?, updated_at = ?, last_message_at = ?
          WHERE id = ? AND user_id = ?`
       )
       .run(
@@ -884,6 +895,8 @@ export class AppDatabase {
         patch.modelId !== undefined ? patch.modelId : existing.modelId,
         patch.effortValue !== undefined ? patch.effortValue : existing.effortValue,
         patch.projectContextVersion ?? existing.projectContextVersion,
+        patch.contextUsed !== undefined ? patch.contextUsed : (existing.contextUsed ?? null),
+        patch.contextSize !== undefined ? patch.contextSize : (existing.contextSize ?? null),
         now,
         patch.lastMessageAt ?? existing.lastMessageAt,
         chatId,
@@ -908,6 +921,8 @@ export class AppDatabase {
       modelId: r.model_id ? String(r.model_id) : null,
       effortValue: r.effort_value ? String(r.effort_value) : null,
       projectContextVersion: Number(r.project_context_version),
+      contextUsed: r.context_used !== null && r.context_used !== undefined ? Number(r.context_used) : null,
+      contextSize: r.context_size !== null && r.context_size !== undefined ? Number(r.context_size) : null,
       createdAt: Number(r.created_at),
       updatedAt: Number(r.updated_at),
       lastMessageAt: Number(r.last_message_at),

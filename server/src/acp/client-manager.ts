@@ -2333,6 +2333,25 @@ export class AcpClientManager {
         turn.lastActivityAt = Date.now();
         turn.lastParentActivityAt = Date.now();
       }
+      const used = Number(update.used);
+      const size = Number(update.size);
+      if (Number.isFinite(used) && Number.isFinite(size) && used >= 0 && size >= 0) {
+        const curChat = this.db.getChat(worker.userId, worker.chatId);
+        if (curChat && (curChat.contextUsed !== used || curChat.contextSize !== size)) {
+          const updatedChat = this.db.updateChat(worker.userId, worker.chatId, {
+            contextUsed: used,
+            contextSize: size,
+          });
+          if (updatedChat) {
+            this.hub.emitDurable({
+              userId: worker.userId,
+              type: 'chat.updated',
+              chatId: worker.chatId,
+              payload: { chat: updatedChat },
+            });
+          }
+        }
+      }
       this.hub.emitEphemeral({
         userId: worker.userId,
         type: 'chat.context_usage',

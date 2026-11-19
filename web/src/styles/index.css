@@ -1252,12 +1252,31 @@ pre {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  transform-origin: bottom right;
+  -webkit-touch-callout: none;
+}
+.user-bubble.pop-in {
+  animation: userBubblePopIn 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes userBubblePopIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .user-bubble.pop-in {
+    animation: none;
+  }
 }
 .user-text {
   white-space: pre-wrap;
   word-break: break-word;
 }
-
 .msg-row.assistant {
   display: flex;
   align-items: flex-start;
@@ -1588,7 +1607,80 @@ details[open] > .activity-summary > .activity-chevron {
 
 .msg-actions {
   display: flex;
-  gap: 8px;
+  align-items: center;
+  gap: 4px;
+  margin-top: 2px;
+}
+.msg-action-icon-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.msg-action-icon-btn:hover {
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+}
+[data-theme='dark'] .msg-action-icon-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+.msg-action-icon-btn.copied {
+  color: var(--ok);
+}
+
+.msg-context-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 95;
+  background: transparent;
+}
+.msg-context-menu {
+  position: fixed;
+  min-width: 176px;
+  padding: 6px;
+  border-radius: 14px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-lg);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  animation: modelPopIn 130ms cubic-bezier(0.2, 0.85, 0.3, 1);
+}
+[data-theme='dark'] .msg-context-menu {
+  border-color: rgba(255, 255, 255, 0.14);
+}
+.msg-context-item {
+  width: 100%;
+  min-height: 38px;
+  padding: 7px 11px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 13.5px;
+  font-weight: 500;
+  text-align: left;
+  transition: background-color 110ms ease;
+}
+.msg-context-item:hover,
+.msg-context-item:focus-visible {
+  background: var(--bg-subtle);
+  outline: none;
+}
+[data-theme='dark'] .msg-context-item:hover,
+[data-theme='dark'] .msg-context-item:focus-visible {
+  background: rgba(255, 255, 255, 0.09);
 }
 
 /* Composer */
@@ -2374,6 +2466,154 @@ details[open] > .activity-summary > .activity-chevron {
 [data-theme='dark'] .composer-icon-btn:hover:not(:disabled),
 [data-theme='dark'] .composer-icon-btn.active {
   background: rgba(255, 255, 255, 0.1);
+}
+
+/* Circular Context Usage Control */
+.context-ring-btn {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background-color 120ms ease;
+}
+.context-ring-btn:hover,
+.context-ring-btn.active {
+  background: var(--bg-subtle);
+}
+[data-theme='dark'] .context-ring-btn:hover,
+[data-theme='dark'] .context-ring-btn.active {
+  background: rgba(255, 255, 255, 0.1);
+}
+.context-ring-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.context-ring-track {
+  stroke: var(--border-strong);
+}
+[data-theme='dark'] .context-ring-track {
+  stroke: rgba(255, 255, 255, 0.18);
+}
+.context-ring-fill {
+  transition: stroke-dashoffset 260ms ease, stroke 200ms ease;
+}
+.context-ring-btn.is-empty .context-ring-fill {
+  stroke: transparent;
+}
+.context-ring-btn.is-normal .context-ring-fill {
+  stroke: var(--accent);
+}
+.context-ring-btn.is-warn .context-ring-fill {
+  stroke: var(--warn);
+}
+.context-ring-btn.is-danger .context-ring-fill {
+  stroke: var(--danger);
+}
+
+.context-popover-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 88;
+  background: transparent;
+}
+.context-popover {
+  position: fixed;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-lg);
+  animation: modelPopIn 140ms cubic-bezier(0.2, 0.85, 0.3, 1);
+}
+[data-theme='dark'] .context-popover {
+  border-color: rgba(255, 255, 255, 0.14);
+}
+.context-popover-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.context-popover-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.context-popover-pct {
+  font-size: 14px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+}
+.context-popover-pct.is-empty {
+  color: var(--text-muted);
+}
+.context-popover-pct.is-warn {
+  color: var(--warn);
+}
+.context-popover-pct.is-danger {
+  color: var(--danger);
+}
+.context-popover-bar-track {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg-subtle);
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+[data-theme='dark'] .context-popover-bar-track {
+  background: rgba(255, 255, 255, 0.1);
+}
+.context-popover-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 260ms ease, background-color 200ms ease;
+}
+.context-popover-bar-fill.is-empty {
+  background: transparent;
+}
+.context-popover-bar-fill.is-normal {
+  background: var(--accent);
+}
+.context-popover-bar-fill.is-warn {
+  background: var(--warn);
+}
+.context-popover-bar-fill.is-danger {
+  background: var(--danger);
+}
+.context-popover-stats {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.context-popover-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+}
+.context-popover-row dt {
+  color: var(--text-muted);
+}
+.context-popover-row dd {
+  margin: 0;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+}
+.context-popover-empty {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
 }
 .haptic-btn-shell {
   position: relative;
@@ -3371,12 +3611,17 @@ details[open] > .activity-summary > .activity-chevron {
     min-height: 38px;
   }
   .composer-icon-btn,
+  .context-ring-btn,
   .send-btn,
   .stop-btn {
     width: 36px;
     height: 36px;
     min-width: 36px;
     min-height: 36px;
+  }
+  .msg-action-icon-btn {
+    width: 32px;
+    height: 32px;
   }
   .effort-trigger-btn {
     height: 36px;

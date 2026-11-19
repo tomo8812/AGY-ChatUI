@@ -81,6 +81,8 @@ export interface ChatRecord {
   modelId: string | null;
   effortValue: string | null;
   projectContextVersion: number;
+  contextUsed?: number | null;
+  contextSize?: number | null;
   createdAt: number;
   updatedAt: number;
   lastMessageAt: number;

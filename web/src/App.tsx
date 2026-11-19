@@ -82,12 +82,28 @@ function mergeDeltaText(existing: string, offset: number, chunk: string): { next
   return { next: existing, gapDetected: true };
 }
 
-type LiveMessage = MessageRecord & { deltaGap?: true };
+type LiveMessage = MessageRecord & { deltaGap?: true; optimisticPop?: true };
 
-function upsertMessage(messages: MessageRecord[], incoming: MessageRecord): MessageRecord[] {
-  return messages.some((message) => message.id === incoming.id)
-    ? messages.map((message) => message.id === incoming.id ? newerMessage(message, incoming) : message)
-    : [...messages, incoming];
+function upsertMessage(messages: LiveMessage[], incoming: MessageRecord): LiveMessage[] {
+  const idx = messages.findIndex(
+    (message) =>
+      message.id === incoming.id ||
+      (incoming.clientMessageId !== null && message.clientMessageId === incoming.clientMessageId)
+  );
+  if (idx < 0) {
+    return [...messages, incoming];
+  }
+  const existing = messages[idx];
+  const merged: LiveMessage =
+    existing.id === incoming.id
+      ? newerMessage(existing, incoming)
+      : incoming;
+  if (existing.optimisticPop) {
+    merged.optimisticPop = true;
+  }
+  const copy = [...messages];
+  copy[idx] = merged;
+  return copy;
 }
 
 export const App: React.FC = () => {
@@ -162,7 +178,7 @@ export const App: React.FC = () => {
   draftProjectIdRef.current = draftProjectId;
   const chatsRef = useRef<ChatRecord[]>([]);
   chatsRef.current = chats;
-  const messagesRef = useRef<MessageRecord[]>([]);
+  const messagesRef = useRef<LiveMessage[]>([]);
   messagesRef.current = messages;
   const activeRunRef = useRef<RunRecord | null>(null);
   activeRunRef.current = activeRun;
@@ -411,7 +427,17 @@ export const App: React.FC = () => {
       return detail.activeRun;
     });
     setSessionOptions(detail.sessionOptions);
-    setContextUsage(null);
+    if (
+      detail.chat.contextSize !== null &&
+      detail.chat.contextSize !== undefined &&
+      detail.chat.contextSize > 0 &&
+      detail.chat.contextUsed !== null &&
+      detail.chat.contextUsed !== undefined
+    ) {
+      setContextUsage({ used: detail.chat.contextUsed, size: detail.chat.contextSize });
+    } else {
+      setContextUsage(null);
+    }
     setChats((prev) =>
       prev.map((c) => (c.id === chatId ? { ...detail.chat, activeRun: detail.activeRun } : c))
     );
@@ -856,6 +882,19 @@ export const App: React.FC = () => {
         if (chat) {
           setChats((prev) => prev.map((c) => (c.id === chat.id ? { ...c, ...chat } : c)));
           setDraftCreatedChat((prev) => (prev && prev.id === chat.id ? { ...prev, ...chat } : prev));
+          if (evt.chatId === curChatId) {
+            if (
+              chat.contextSize !== null &&
+              chat.contextSize !== undefined &&
+              chat.contextSize > 0 &&
+              chat.contextUsed !== null &&
+              chat.contextUsed !== undefined
+            ) {
+              setContextUsage({ used: chat.contextUsed, size: chat.contextSize });
+            } else if (chat.contextUsed === null && chat.contextSize === null) {
+              setContextUsage(null);
+            }
+          }
         }
         if (opts && evt.chatId === curChatId) {
           setSessionOptions(opts);
@@ -920,11 +959,11 @@ export const App: React.FC = () => {
         }
         if (evt.chatId === curChatId) {
           setMessages((prev) => {
-            const copy = [...prev];
+            let next = prev;
             for (const m of msgs) {
-              if (!copy.some((x) => x.id === m.id)) copy.push(m);
+              next = upsertMessage(next, m);
             }
-            return copy;
+            return next;
           });
           if (run) {
             setActiveRun((cur) =>
@@ -1593,17 +1632,45 @@ export const App: React.FC = () => {
       triggerHaptic('send', Boolean(preferencesRef.current?.hapticFeedback ?? true));
       const existingId = activeChatIdRef.current;
       const wasDraft = !existingId || draftCreatedChatRef.current?.id === existingId;
-      const chatId = existingId || (await createDraftBackedChat()).id;
       const clientMessageId =
         typeof crypto !== 'undefined' && crypto.randomUUID
           ? crypto.randomUUID()
           : `cm-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-
-      const res = await api.sendMessage(chatId, {
-        text,
-        attachmentIds: files.map((f) => f.artifactId),
+      const now = Date.now();
+      const optimisticUserMsg: LiveMessage = {
+        id: `optimistic-${clientMessageId}`,
+        chatId: existingId ?? 'draft',
+        userId: user?.id ?? '',
         clientMessageId,
-      });
+        role: 'user',
+        contentText: text,
+        thoughtsText: '',
+        toolCalls: [],
+        attachments: files,
+        artifactIds: [],
+        status: 'completed',
+        runId: null,
+        errorMessage: null,
+        createdAt: now,
+        updatedAt: now,
+        optimisticPop: true,
+      };
+
+      setMessages((prev) => [...prev, optimisticUserMsg]);
+
+      let chatId: string;
+      let res: Awaited<ReturnType<typeof api.sendMessage>>;
+      try {
+        chatId = existingId || (await createDraftBackedChat()).id;
+        res = await api.sendMessage(chatId, {
+          text,
+          attachmentIds: files.map((f) => f.artifactId),
+          clientMessageId,
+        });
+      } catch (err) {
+        setMessages((prev) => prev.filter((m) => m.clientMessageId !== clientMessageId));
+        throw err;
+      }
 
       const draftSnap = draftCreatedChatRef.current;
       if (draftSnap?.id === chatId) {
@@ -1629,10 +1696,9 @@ export const App: React.FC = () => {
       }
 
       setMessages((prev) => {
-        const copy = [...prev];
-        if (!copy.some((m) => m.id === res.userMessage.id)) copy.push(res.userMessage);
-        if (!copy.some((m) => m.id === res.assistantMessage.id)) copy.push(res.assistantMessage);
-        return copy;
+        let next = upsertMessage(prev, res.userMessage);
+        next = upsertMessage(next, res.assistantMessage);
+        return next;
       });
       setActiveRun((cur) =>
         cur &&
@@ -1643,7 +1709,7 @@ export const App: React.FC = () => {
       );
       void triggerQuotaRefresh(true, 5_000);
     },
-    [createDraftBackedChat, triggerQuotaRefresh]
+    [user?.id, createDraftBackedChat, triggerQuotaRefresh]
   );
 
   const handleCancelRun = useCallback(async (runId: string) => {
@@ -1841,7 +1907,6 @@ export const App: React.FC = () => {
           quota={quota}
           quotaRefreshing={quotaRefreshing}
           wsStatus={wsStatus}
-          contextUsage={contextUsage}
           onOpenSidebar={handleOpenSidebar}
           onNewChat={handleHeaderNewChat}
           onRefreshQuota={handleRefreshQuota}
@@ -1873,6 +1938,7 @@ export const App: React.FC = () => {
             availableCommands={mergedAvailableCommands}
             selectedModelId={selectedModelId}
             selectedEffortValue={selectedEffortValue}
+            contextUsage={contextUsage}
             draftResetToken={draftResetToken}
             clientId={wsClientId}
             hapticEnabled={preferences?.hapticFeedback ?? true}

@@ -16,7 +16,6 @@ interface HeaderBarProps {
   quota: QuotaSnapshotRecord | null;
   quotaRefreshing: boolean;
   wsStatus: WsConnectionStatus;
-  contextUsage: { used: number; size: number } | null;
   onOpenSidebar: () => void;
   onNewChat: () => void;
   onRefreshQuota: () => void;
@@ -55,7 +54,6 @@ export const HeaderBar: React.FC<HeaderBarProps> = React.memo(({
   quota,
   quotaRefreshing,
   wsStatus,
-  contextUsage,
   onOpenSidebar,
   onNewChat,
   onRefreshQuota,
@@ -155,12 +153,6 @@ export const HeaderBar: React.FC<HeaderBarProps> = React.memo(({
       </div>
 
       <div className="header-right">
-        {contextUsage && contextUsage.size > 0 && (
-          <span className="context-pill hide-xs" title="現在の会話コンテキスト使用量">
-            {Math.round((contextUsage.used / contextUsage.size) * 100)}% ctx
-          </span>
-        )}
-
         <button
           type="button"
           className="circle-icon-btn"
