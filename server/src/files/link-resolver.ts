@@ -141,6 +141,7 @@ const SECRET_FILENAME_RE =
   /(?:^|[._-])(?:oauth|cred|creds|credential|credentials|secret|secrets|token|tokens|auth|apikey|api[_-]key|private[_-]?key|key|passwd|password)(?:$|\.(?:json|ya?ml|toml|ini|conf|cfg|properties|xml|plist|txt|env|bak|old))$/;
 
 const BLOCKED_SECRET_EXTENSIONS = new Set([
+  '.env',
   '.pem',
   '.key',
   '.p12',

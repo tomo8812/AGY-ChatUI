@@ -349,6 +349,7 @@ describe('native and legacy file links', () => {
       'notes/key.json',
       'notes/tokens.yaml',
       'notes/config.toml',
+      'notes/production.env',
     ];
     for (const rel of secretPaths) {
       const full = path.join(aliceProfile, rel);
