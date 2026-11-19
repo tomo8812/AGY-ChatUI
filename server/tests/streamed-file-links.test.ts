@@ -397,6 +397,9 @@ describe('native and legacy file links', () => {
       headers: { Cookie: alice.cookieHeader },
     });
     expect(await shadowedBody.text()).toBe('# Chat Home Shadowed Memo');
+    const tildeShadowedRes = await resolveAlice('~/notes/memo.md');
+    expect(tildeShadowedRes.status).toBe(200);
+    expect(tildeShadowedRes.data.artifact.id).toBe(shadowedRes.data.artifact.id);
 
     const homeOnlyFile = path.join(aliceProfile, 'notes', 'home-only.md');
     fs.writeFileSync(homeOnlyFile, '# Home Only');

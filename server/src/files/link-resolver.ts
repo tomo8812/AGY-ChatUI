@@ -308,10 +308,14 @@ function resolveChatFile(db: AppDatabase, chat: ChatRecord, candidate: string): 
     }
   }
 
+  if (candidate.startsWith('~/')) {
+    return resolveFromChatHome() ?? resolveFromHome();
+  }
+
   const inHome = resolveFromHome();
   if (inHome) return inHome;
 
-  if (homePrefix === SANDBOX_HOME_MOUNT || candidate.startsWith('~/')) {
+  if (homePrefix === SANDBOX_HOME_MOUNT) {
     return resolveFromChatHome();
   }
 
