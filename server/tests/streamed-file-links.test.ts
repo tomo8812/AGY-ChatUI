@@ -382,8 +382,15 @@ describe('native and legacy file links', () => {
     expect(await chatOnlyBody.text()).toBe('# Chat Home Only');
     expect((await resolveAlice('file:///home/sandbox/notes/chat-only.md', aliceOtherChat.id)).status).toBe(404);
 
+    const homeMemoRes = await resolveAlice(`file://${userNote}`);
+    expect(homeMemoRes.status).toBe(200);
     const shadowedRes = await resolveAlice(`file://${shadowedMemo}`);
     expect(shadowedRes.status).toBe(200);
+    expect(shadowedRes.data.artifact.id).not.toBe(homeMemoRes.data.artifact.id);
+    const homeMemoBody = await fetch(`${srv.baseUrl}${homeMemoRes.data.previewUrl}`, {
+      headers: { Cookie: alice.cookieHeader },
+    });
+    expect(await homeMemoBody.text()).toBe('# Personal Note');
     const shadowedBody = await fetch(`${srv.baseUrl}${shadowedRes.data.previewUrl}`, {
       headers: { Cookie: alice.cookieHeader },
     });

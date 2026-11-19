@@ -230,17 +230,52 @@ function resolveChatFile(db: AppDatabase, chat: ChatRecord, candidate: string): 
     }
   }
 
+  const chatHomeMatch = /^\.chat-homes\/([^/]+)\/(.+)$/.exec(relative);
+  if (chatHomeMatch) {
+    if (chatHomeMatch[1] !== workspaceKey) return null;
+    const subRelative = chatHomeMatch[2];
+    if (isBlockedProfileRelPath(subRelative)) return null;
+    try {
+      const homeReal = fs.realpathSync(home);
+      const chatHomeReal = fs.realpathSync(chatHome);
+      if (chatHomeReal !== path.join(homeReal, '.chat-homes', workspaceKey)) return null;
+      const resolved = resolveContainedExistingPath(chatHomeReal, subRelative);
+      if (isBlockedProfileRelPath(resolved.relPath)) return null;
+      if (!fs.statSync(resolved.absPath).isFile()) return null;
+      return {
+        absPath: resolved.absPath,
+        relPath: `${SANDBOX_HOME_MOUNT}/.chat-homes/${workspaceKey}/${resolved.relPath}`,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   if (isBlockedProfileRelPath(relative)) return null;
 
-  const resolveFromRoot = (root: string, expectedHomeRelative?: string): ResolvedChatFile | null => {
+  const resolveFromHome = (): ResolvedChatFile | null => {
     try {
-      if (expectedHomeRelative) {
-        if (fs.realpathSync(root) !== path.join(fs.realpathSync(home), expectedHomeRelative)) return null;
-      }
-      const resolved = resolveContainedExistingPath(root, relative);
+      const resolved = resolveContainedExistingPath(home, relative);
       if (isBlockedProfileRelPath(resolved.relPath)) return null;
       if (!fs.statSync(resolved.absPath).isFile()) return null;
       return { absPath: resolved.absPath, relPath: `${SANDBOX_HOME_MOUNT}/${resolved.relPath}` };
+    } catch {
+      return null;
+    }
+  };
+
+  const resolveFromChatHome = (): ResolvedChatFile | null => {
+    try {
+      const homeReal = fs.realpathSync(home);
+      const chatHomeReal = fs.realpathSync(chatHome);
+      if (chatHomeReal !== path.join(homeReal, '.chat-homes', workspaceKey)) return null;
+      const resolved = resolveContainedExistingPath(chatHomeReal, relative);
+      if (isBlockedProfileRelPath(resolved.relPath)) return null;
+      if (!fs.statSync(resolved.absPath).isFile()) return null;
+      return {
+        absPath: resolved.absPath,
+        relPath: `${SANDBOX_HOME_MOUNT}/.chat-homes/${workspaceKey}/${resolved.relPath}`,
+      };
     } catch {
       return null;
     }
@@ -254,25 +289,33 @@ function resolveChatFile(db: AppDatabase, chat: ChatRecord, candidate: string): 
       const targetReal = fs.realpathSync(path.resolve(chatHomeReal, relative));
       if (!fs.statSync(targetReal).isFile()) return null;
 
-      let resolvedRelPath: string | null = null;
       if (targetReal.startsWith(chatHomeReal + path.sep)) {
-        resolvedRelPath = path.relative(chatHomeReal, targetReal).split(path.sep).join('/');
-      } else if (targetReal.startsWith(homeReal + path.sep)) {
-        resolvedRelPath = path.relative(homeReal, targetReal).split(path.sep).join('/');
+        const resolvedRelPath = path.relative(chatHomeReal, targetReal).split(path.sep).join('/');
+        if (!resolvedRelPath || isBlockedProfileRelPath(resolvedRelPath)) return null;
+        return {
+          absPath: targetReal,
+          relPath: `${SANDBOX_HOME_MOUNT}/.chat-homes/${workspaceKey}/${resolvedRelPath}`,
+        };
       }
-      if (!resolvedRelPath || isBlockedProfileRelPath(resolvedRelPath)) return null;
-      return { absPath: targetReal, relPath: `${SANDBOX_HOME_MOUNT}/${resolvedRelPath}` };
+      if (targetReal.startsWith(homeReal + path.sep)) {
+        const resolvedRelPath = path.relative(homeReal, targetReal).split(path.sep).join('/');
+        if (!resolvedRelPath || isBlockedProfileRelPath(resolvedRelPath)) return null;
+        return { absPath: targetReal, relPath: `${SANDBOX_HOME_MOUNT}/${resolvedRelPath}` };
+      }
+      return null;
     } catch {
       return null;
     }
   }
 
+  const inHome = resolveFromHome();
+  if (inHome) return inHome;
+
   if (homePrefix === SANDBOX_HOME_MOUNT || candidate.startsWith('~/')) {
-    const inChatHome = resolveFromRoot(chatHome, path.join('.chat-homes', workspaceKey));
-    if (inChatHome) return inChatHome;
+    return resolveFromChatHome();
   }
 
-  return resolveFromRoot(home);
+  return null;
 }
 
 /** Resolve a stored artifact for every file endpoint, using the same chat boundary as link resolution. */
