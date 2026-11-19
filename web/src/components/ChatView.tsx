@@ -118,6 +118,7 @@ const ContextUsageControl: React.FC<{
 }> = React.memo(({ contextUsage }) => {
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
 
   const hasData = Boolean(contextUsage && contextUsage.size > 0);
   const used = hasData ? Math.max(0, contextUsage!.used) : 0;
@@ -138,9 +139,15 @@ const ContextUsageControl: React.FC<{
 
   useEffect(() => {
     if (!open) return;
-    const composer = triggerRef.current?.closest('.composer-box');
     const onPointerDown = (event: PointerEvent) => {
-      if (event.target instanceof Node && !composer?.contains(event.target)) setOpen(false);
+      const { target } = event;
+      if (
+        target instanceof Node &&
+        !triggerRef.current?.contains(target) &&
+        !popoverRef.current?.contains(target)
+      ) {
+        setOpen(false);
+      }
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
@@ -148,10 +155,10 @@ const ContextUsageControl: React.FC<{
         setOpen(false);
       }
     };
-    document.addEventListener('pointerdown', onPointerDown);
+    document.addEventListener('pointerdown', onPointerDown, true);
     document.addEventListener('keydown', onKeyDown);
     return () => {
-      document.removeEventListener('pointerdown', onPointerDown);
+      document.removeEventListener('pointerdown', onPointerDown, true);
       document.removeEventListener('keydown', onKeyDown);
     };
   }, [open]);
@@ -201,7 +208,7 @@ const ContextUsageControl: React.FC<{
       </button>
 
       {open && (
-        <div className="context-popover" role="dialog" aria-label="コンテキスト利用量">
+        <div ref={popoverRef} className="context-popover" role="dialog" aria-label="コンテキスト利用量">
           <div className="context-popover-head">
             <span className="context-popover-title">コンテキスト利用量</span>
             <span className={`context-popover-pct ${toneClass}`}>
