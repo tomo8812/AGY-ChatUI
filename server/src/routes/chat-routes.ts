@@ -408,36 +408,6 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
     return reply.code(result.deduplicated ? 200 : 202).send(result);
   });
 
-  for (const action of ['edit', 'regenerate'] as const) {
-    app.post(`/api/chats/:chatId/messages/:messageId/${action}`, async (req, reply) => {
-      const session = requireAuth(req, reply, db);
-      if (!session) return;
-
-      const { chatId, messageId } = req.params as { chatId: string; messageId: string };
-      const message = db.getMessage(session.user.id, messageId);
-      if (!message || message.chatId !== chatId) {
-        return reply.code(404).send({ error: 'NOT_FOUND', message: 'メッセージが見つかりません。' });
-      }
-
-      const expectedRole = action === 'edit' ? 'user' : 'assistant';
-      if (message.role !== expectedRole) {
-        return reply.code(400).send({
-          error: 'INVALID_ROLE',
-          message: action === 'edit'
-            ? 'ユーザーのメッセージのみ編集できます。'
-            : 'アシスタントの応答のみ再生成できます。',
-        });
-      }
-
-      // These operations require a native checkpoint. Creating another ACP session loses
-      // earlier turns and cannot restore the workspace or Antigravity's execution state.
-      return reply.code(501).send({
-        error: 'ACP_REWIND_UNAVAILABLE',
-        message: '会話の巻き戻しは現在の Antigravity ACP 連携では利用できません。',
-      });
-    });
-  }
-
   app.post('/api/chats/:chatId/runs/:runId/cancel', async (req, reply) => {
     const session = requireAuth(req, reply, db);
     if (!session) return;

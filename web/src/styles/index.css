@@ -1624,19 +1624,15 @@ details[open] > .activity-summary > .activity-chevron {
   justify-content: center;
   transition: background-color 120ms ease, color 120ms ease;
 }
-.msg-action-icon-btn:hover:not([aria-disabled="true"]) {
+.msg-action-icon-btn:hover {
   background: var(--bg-subtle);
   color: var(--text-primary);
 }
-[data-theme='dark'] .msg-action-icon-btn:hover:not([aria-disabled="true"]) {
+[data-theme='dark'] .msg-action-icon-btn:hover {
   background: rgba(255, 255, 255, 0.1);
 }
 .msg-action-icon-btn.copied {
   color: var(--ok);
-}
-.msg-action-icon-btn[aria-disabled="true"] {
-  opacity: 0.45;
-  cursor: not-allowed;
 }
 
 .msg-context-backdrop {
@@ -1677,19 +1673,14 @@ details[open] > .activity-summary > .activity-chevron {
   text-align: left;
   transition: background-color 110ms ease;
 }
-.msg-context-item:hover:not(:disabled):not([aria-disabled="true"]),
-.msg-context-item:focus-visible:not(:disabled) {
+.msg-context-item:hover,
+.msg-context-item:focus-visible {
   background: var(--bg-subtle);
   outline: none;
 }
-[data-theme='dark'] .msg-context-item:hover:not(:disabled):not([aria-disabled="true"]),
-[data-theme='dark'] .msg-context-item:focus-visible:not(:disabled) {
+[data-theme='dark'] .msg-context-item:hover,
+[data-theme='dark'] .msg-context-item:focus-visible {
   background: rgba(255, 255, 255, 0.09);
-}
-.msg-context-item:disabled,
-.msg-context-item[aria-disabled="true"] {
-  opacity: 0.45;
-  cursor: not-allowed;
 }
 
 /* Composer */

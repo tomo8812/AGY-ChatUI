@@ -933,7 +933,7 @@ export class AppDatabase {
 
   listMessages(userId: string, chatId: string): MessageRecord[] {
     const rows = this.db
-      .prepare('SELECT * FROM messages WHERE chat_id = ? AND user_id = ? ORDER BY created_at ASC, rowid ASC')
+      .prepare('SELECT * FROM messages WHERE chat_id = ? AND user_id = ? ORDER BY created_at ASC')
       .all(chatId, userId) as Array<Record<string, unknown>>;
     return rows.map((r) => this.mapMessage(r));
   }

@@ -22,7 +22,6 @@ import {
   CloseIcon,
   ComposeIcon,
   CopyIcon,
-  EditIcon,
   FileIcon,
   FolderIcon,
   PlusIcon,
@@ -69,12 +68,9 @@ interface ChatViewProps {
 
 interface LongPressMenuState {
   textToCopy: string;
-  unavailableAction: 'edit' | 'regenerate' | null;
   x: number;
   y: number;
 }
-
-const REWIND_UNAVAILABLE = '会話の巻き戻しは現在の Antigravity ACP 連携では利用できません。';
 
 async function copyTextToClipboard(text: string): Promise<void> {
   if (!text) return;
@@ -589,8 +585,6 @@ const MessageRow: React.FC<{
 
     const { blocks, answer, hasCurrentAnswer } = useMemo(() => getMessageActivity(msg), [msg]);
     const isWorking = msg.status === 'streaming' && !hasCurrentAnswer;
-    const isOptimistic = msg.id.startsWith('optimistic-');
-    const canShowAnswerActions = msg.status !== 'streaming' && msg.status !== 'queued' && !isOptimistic;
 
     const clearLongPress = useCallback(() => {
       if (longPressTimerRef.current !== null) {
@@ -609,9 +603,9 @@ const MessageRow: React.FC<{
     }, [answer]);
 
     const createLongPressHandlers = useCallback(
-      (textToCopy: string, unavailableAction: LongPressMenuState['unavailableAction']) => ({
+      (textToCopy: string) => ({
         onPointerDown: (e: React.PointerEvent<HTMLElement>) => {
-          if (e.pointerType === 'mouse' && e.button !== 0) return;
+          if (!textToCopy || (e.pointerType === 'mouse' && e.button !== 0)) return;
           const target = e.target as HTMLElement | null;
           if (target?.closest('button, a, input, textarea, select, summary, pre, code')) {
             return;
@@ -629,7 +623,6 @@ const MessageRow: React.FC<{
             triggerHaptic('send', hapticEnabled);
             onOpenLongPressMenu({
               textToCopy,
-              unavailableAction,
               x: startX,
               y: startY,
             });
@@ -655,7 +648,7 @@ const MessageRow: React.FC<{
     );
 
     if (msg.role === 'user') {
-      const userLongPress = createLongPressHandlers(msg.contentText, isOptimistic ? null : 'edit');
+      const userLongPress = createLongPressHandlers(msg.contentText);
       return (
         <div className="msg-row user">
           <div
@@ -684,10 +677,7 @@ const MessageRow: React.FC<{
       );
     }
 
-    const assistantLongPress = createLongPressHandlers(
-      answer || msg.contentText,
-      canShowAnswerActions ? 'regenerate' : null
-    );
+    const assistantLongPress = createLongPressHandlers(answer || msg.contentText);
 
     return (
       <div className="msg-row assistant">
@@ -806,28 +796,16 @@ const MessageRow: React.FC<{
             </div>
           )}
 
-          {canShowAnswerActions && (
+          {answer && msg.status !== 'streaming' && msg.status !== 'queued' && (
             <div className="msg-actions">
-              {answer && (
-                <button
-                  type="button"
-                  className={`msg-action-icon-btn ${copied ? 'copied' : ''}`}
-                  onClick={() => void handleCopy()}
-                  aria-label="回答をコピー"
-                  title={copied ? 'コピー済' : '回答をコピー'}
-                >
-                  {copied ? <CheckIcon size={15} /> : <CopyIcon size={15} />}
-                </button>
-              )}
               <button
                 type="button"
-                className="msg-action-icon-btn"
-                aria-disabled="true"
-                aria-label="再生成"
-                title={REWIND_UNAVAILABLE}
-                onClick={() => onResolveError(REWIND_UNAVAILABLE)}
+                className={`msg-action-icon-btn${copied ? ' copied' : ''}`}
+                onClick={() => void handleCopy()}
+                aria-label="回答をコピー"
+                title={copied ? 'コピー済' : '回答をコピー'}
               >
-                <RefreshIcon size={15} />
+                {copied ? <CheckIcon size={15} /> : <CopyIcon size={15} />}
               </button>
             </div>
           )}
@@ -1824,7 +1802,7 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
                   Math.max(12, Math.min(window.innerWidth - 196, longPressMenu.x - 88))
                 )}px`,
                 top: `${Math.round(
-                  Math.max(12, Math.min(window.innerHeight - 168, longPressMenu.y - 68))
+                  Math.max(12, Math.min(window.innerHeight - 68, longPressMenu.y - 24))
                 )}px`,
               }}
               onClick={(e) => e.stopPropagation()}
@@ -1833,7 +1811,6 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
                 type="button"
                 role="menuitem"
                 className="msg-context-item"
-                disabled={!longPressMenu.textToCopy}
                 onClick={() => {
                   const text = longPressMenu.textToCopy;
                   setLongPressMenu(null);
@@ -1843,23 +1820,6 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
                 <CopyIcon size={15} />
                 <span>コピー</span>
               </button>
-
-              {longPressMenu.unavailableAction && (
-                <button
-                  type="button"
-                  role="menuitem"
-                  className="msg-context-item"
-                  aria-disabled="true"
-                  title={REWIND_UNAVAILABLE}
-                  onClick={() => {
-                    setLongPressMenu(null);
-                    handleResolveError(REWIND_UNAVAILABLE);
-                  }}
-                >
-                  {longPressMenu.unavailableAction === 'edit' ? <EditIcon size={15} /> : <RefreshIcon size={15} />}
-                  <span>{longPressMenu.unavailableAction === 'edit' ? '編集' : '再生成'}</span>
-                </button>
-              )}
             </div>
           </div>,
           document.body
