@@ -145,18 +145,18 @@ function isBlockedProfileRelPath(relPath: string): boolean {
   const segments = relPath.split('/').filter(Boolean);
   if (segments.length === 0) return true;
 
-  const top = segments[0];
+  const top = segments[0].toLowerCase();
   if (BLOCKED_PROFILE_TOP_DIRS.has(top) || top.startsWith('.usage-home-')) {
     return true;
   }
 
   if (top === '.gemini') {
-    const sub = segments[1];
+    const sub = segments[1]?.toLowerCase();
     const vendorSub =
       sub === 'antigravity-cli' || sub === 'antigravity' || sub === 'jetski'
-        ? segments[2]
+        ? segments[2]?.toLowerCase()
         : sub;
-    if (vendorSub && BLOCKED_GEMINI_SUBDIRS.has(vendorSub.toLowerCase())) {
+    if (vendorSub && BLOCKED_GEMINI_SUBDIRS.has(vendorSub)) {
       return true;
     }
   }
@@ -169,7 +169,7 @@ function isBlockedProfileRelPath(relPath: string): boolean {
   const basename = segments[segments.length - 1].toLowerCase();
   if (
     BLOCKED_SECRET_FILENAMES.has(basename) ||
-    basename.startsWith('.env.') ||
+    basename.startsWith('.env') ||
     /(?:^|[._-])(?:oauth|cred|creds|credential|credentials|secret|secrets|token|tokens|auth)\.json$/.test(basename)
   ) {
     return true;

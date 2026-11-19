@@ -331,6 +331,8 @@ describe('native and legacy file links', () => {
       '.mock-agy-auth.json',
       '.env',
       '.env.local',
+      '.envrc',
+      '.AWS/credentials',
       '.ssh/id_rsa',
       '.config/gcloud/credentials.db',
       '.local/share/keyrings/default.keyring',
