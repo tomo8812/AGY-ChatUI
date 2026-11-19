@@ -345,6 +345,10 @@ describe('native and legacy file links', () => {
       '.gemini/antigravity/code_tracker/trace.txt',
       'notes/private.pem',
       'notes/custom-token.json',
+      'notes/credentials',
+      'notes/key.json',
+      'notes/tokens.yaml',
+      'notes/config.toml',
     ];
     for (const rel of secretPaths) {
       const full = path.join(aliceProfile, rel);

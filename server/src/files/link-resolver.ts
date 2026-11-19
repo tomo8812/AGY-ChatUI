@@ -103,11 +103,14 @@ const BLOCKED_SECRET_FILENAMES = new Set([
   '.gitcookies',
   '.npmrc',
   '.pypirc',
+  '.yarnrc',
+  '.yarnrc.yml',
   '.bash_history',
   '.zsh_history',
   '.sh_history',
   'oauth_creds.json',
   'google_accounts.json',
+  'credentials',
   'credentials.json',
   'client_secret.json',
   'client_secrets.json',
@@ -116,7 +119,15 @@ const BLOCKED_SECRET_FILENAMES = new Set([
   'application_default_credentials.json',
   'installation_id',
   'mcp_config.json',
+  'config.json',
+  'config.yaml',
+  'config.yml',
+  'config.toml',
   'settings.json',
+  'settings.yaml',
+  'settings.yml',
+  'settings.toml',
+  'settings.ini',
   'auth.json',
   'token.json',
   'tokens.json',
@@ -125,6 +136,9 @@ const BLOCKED_SECRET_FILENAMES = new Set([
   'id_ecdsa',
   'id_dsa',
 ]);
+
+const SECRET_FILENAME_RE =
+  /(?:^|[._-])(?:oauth|cred|creds|credential|credentials|secret|secrets|token|tokens|auth|apikey|api[_-]key|private[_-]?key|key|passwd|password)(?:$|\.(?:json|ya?ml|toml|ini|conf|cfg|properties|xml|plist|txt|env|bak|old))$/;
 
 const BLOCKED_SECRET_EXTENSIONS = new Set([
   '.pem',
@@ -168,7 +182,7 @@ function isBlockedProfileRelPath(relPath: string): boolean {
   if (
     BLOCKED_SECRET_FILENAMES.has(basename) ||
     basename.startsWith('.env') ||
-    /(?:^|[._-])(?:oauth|cred|creds|credential|credentials|secret|secrets|token|tokens|auth)\.json$/.test(basename)
+    SECRET_FILENAME_RE.test(basename)
   ) {
     return true;
   }
