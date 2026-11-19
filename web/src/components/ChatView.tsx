@@ -523,6 +523,8 @@ const PermissionCard: React.FC<{
   );
 });
 
+const NATIVE_MESSAGE_GESTURE_SELECTOR = 'button, a, input, textarea, select, summary, pre, code, [contenteditable]';
+
 const MessageRow: React.FC<{
   msg: ChatViewMessage;
   chatId?: string;
@@ -555,7 +557,12 @@ const MessageRow: React.FC<{
   }) => {
     const [copied, setCopied] = useState(false);
     const longPressTimerRef = useRef<number | null>(null);
-    const longPressStartRef = useRef<{ x: number; y: number; pointerId: number } | null>(null);
+    const longPressStartRef = useRef<{
+      x: number;
+      y: number;
+      pointerId: number;
+      isTouch: boolean;
+    } | null>(null);
     const suppressContextUntilRef = useRef<number>(0);
 
     const { blocks, answer, hasCurrentAnswer } = useMemo(() => getMessageActivity(msg), [msg]);
@@ -583,20 +590,25 @@ const MessageRow: React.FC<{
       (textToCopy: string) => ({
         onPointerDown: (e: React.PointerEvent<HTMLElement>) => {
           if (!textToCopy || (e.pointerType === 'mouse' && e.button !== 0)) return;
-          const target = e.target as HTMLElement | null;
-          if (target?.closest('button, a, input, textarea, select, summary, pre, code')) {
+          const target = e.target instanceof Element ? e.target : null;
+          if (target?.closest(NATIVE_MESSAGE_GESTURE_SELECTOR)) {
             return;
           }
           clearLongPress();
           const source = e.currentTarget;
           const startX = e.clientX;
           const startY = e.clientY;
-          longPressStartRef.current = { x: startX, y: startY, pointerId: e.pointerId };
+          const isTouch = e.pointerType === 'touch';
+          longPressStartRef.current = { x: startX, y: startY, pointerId: e.pointerId, isTouch };
           longPressTimerRef.current = window.setTimeout(() => {
             longPressTimerRef.current = null;
             longPressStartRef.current = null;
-            const selected = window.getSelection()?.toString().trim() ?? '';
-            if (selected.length > 0) return;
+            const selection = window.getSelection();
+            if (isTouch) {
+              selection?.removeAllRanges();
+            } else if (selection?.toString().trim()) {
+              return;
+            }
             suppressContextUntilRef.current = Date.now() + 500;
             triggerHaptic('send', hapticEnabled);
             onOpenLongPressMenu({
@@ -618,9 +630,12 @@ const MessageRow: React.FC<{
         onPointerCancel: () => clearLongPress(),
         onPointerLeave: () => clearLongPress(),
         onContextMenu: (e: React.MouseEvent<HTMLElement>) => {
-          if (Date.now() < suppressContextUntilRef.current) {
-            e.preventDefault();
-          }
+          const target = e.target instanceof Element ? e.target : null;
+          if (!textToCopy || target?.closest(NATIVE_MESSAGE_GESTURE_SELECTOR)) return;
+          const isTouchMenu =
+            longPressStartRef.current?.isTouch ||
+            ('pointerType' in e.nativeEvent && e.nativeEvent.pointerType === 'touch');
+          if (isTouchMenu || Date.now() < suppressContextUntilRef.current) e.preventDefault();
         },
       }),
       [clearLongPress, hapticEnabled, isUserMessage, messageKey, onOpenLongPressMenu]
@@ -631,7 +646,7 @@ const MessageRow: React.FC<{
       return (
         <div className="msg-row user">
           <div
-            className={`user-bubble${msg.optimisticPop ? ' pop-in' : ''}${isCopyTarget ? ' is-copy-target' : ''}`}
+            className={`user-bubble${msg.contentText ? ' message-copy-source' : ''}${msg.optimisticPop ? ' pop-in' : ''}${isCopyTarget ? ' is-copy-target' : ''}`}
             {...userLongPress}
           >
             {msg.attachments.length > 0 && (
@@ -656,11 +671,15 @@ const MessageRow: React.FC<{
       );
     }
 
-    const assistantLongPress = createLongPressHandlers(answer || msg.contentText);
+    const assistantText = answer || msg.contentText;
+    const assistantLongPress = createLongPressHandlers(assistantText);
 
     return (
       <div className="msg-row assistant">
-        <div className={`assistant-body${isCopyTarget ? ' is-copy-target' : ''}`} {...assistantLongPress}>
+        <div
+          className={`assistant-body${assistantText ? ' message-copy-source' : ''}${isCopyTarget ? ' is-copy-target' : ''}`}
+          {...assistantLongPress}
+        >
           {msg.status === 'queued' && (
             <div className="queue-status-pill">
               待機中

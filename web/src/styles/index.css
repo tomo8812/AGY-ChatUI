@@ -1253,7 +1253,6 @@ pre {
   flex-direction: column;
   gap: 8px;
   transform-origin: bottom right;
-  -webkit-touch-callout: none;
 }
 .user-bubble.pop-in {
   animation: userBubblePopIn 320ms cubic-bezier(0.2, 0.72, 0.3, 1) both;
@@ -1638,6 +1637,19 @@ details[open] > .activity-summary > .activity-chevron {
 .user-bubble,
 .assistant-body {
   transition: scale 170ms cubic-bezier(0.2, 0.72, 0.3, 1);
+}
+@media (pointer: coarse) {
+  .message-copy-source,
+  .msg-context-menu {
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  .message-copy-source :is(a, input, textarea, pre, code, [contenteditable]) {
+    -webkit-touch-callout: default;
+    -webkit-user-select: text;
+    user-select: text;
+  }
 }
 .is-copy-target {
   position: relative;
