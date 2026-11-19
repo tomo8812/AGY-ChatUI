@@ -269,7 +269,7 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
         true
       );
       expect(spec.env.PATH?.startsWith('/opt/agy:')).toBe(true);
-      expect(spec.args.slice(-3)).toEqual(['--', '/opt/agy/agy', 'acp']);
+      expect(spec.args.slice(-4)).toEqual(['--', '/opt/agy/agy', 'acp', '--disable-telemetry']);
 
       // Synthetic /etc/passwd & /etc/group created cleanly
       const passwdIdx = spec.args.indexOf('/etc/passwd');
@@ -298,13 +298,34 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
     );
     expect(resolvedFromSystem).toBe(fs.realpathSync(sysAgyReal));
 
+    const offConfig = loadConfig({
+      agyMode: 'real',
+      sandboxMode: 'off',
+      agyBin: sysAgyLink,
+      dataRoot: tmpRoot,
+    });
     const offSpec = buildAgyCommandSpec({
-      config: loadConfig({ agyMode: 'real', sandboxMode: 'off', agyBin: sysAgyLink, dataRoot: tmpRoot }),
+      config: offConfig,
       subcommandArgs: ['-p', '/usage'],
       profileDir,
       enableSandboxBwrap: false,
     });
     expect(offSpec.command).toBe(fs.realpathSync(sysAgyReal));
+    expect(offSpec.args).toEqual(['-p', '/usage']);
+
+    const loginSpec = buildAgyCommandSpec({
+      config: offConfig,
+      subcommandArgs: ['acp', '--login'],
+      profileDir,
+    });
+    expect(loginSpec.args).toEqual(['acp', '--login', '--disable-telemetry']);
+
+    const acpSpec = buildAgyCommandSpec({
+      config: offConfig,
+      subcommandArgs: ['acp'],
+      profileDir,
+    });
+    expect(acpSpec.args).toEqual(['acp', '--disable-telemetry']);
   });
 
   it('resolves the subagent image from the native Reactive Wakeup continuation after end_turn', async () => {
