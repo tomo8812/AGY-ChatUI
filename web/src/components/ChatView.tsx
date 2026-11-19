@@ -75,6 +75,7 @@ interface LongPressMenuState {
   messageKey: string;
   source: HTMLElement;
   alignEnd: boolean;
+  isTouch: boolean;
 }
 
 async function copyTextToClipboard(text: string): Promise<void> {
@@ -624,6 +625,7 @@ const MessageRow: React.FC<{
               messageKey,
               source,
               alignEnd: isUserMessage,
+              isTouch,
             });
           }, 420);
         },
@@ -1413,6 +1415,7 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
   const [syncingProj, setSyncingProj] = useState(false);
   const [longPressMenu, setLongPressMenu] = useState<LongPressMenuState | null>(null);
   const menuPointerDownRef = useRef(false);
+  const releaseTouchCopyGuardRef = useRef<(() => void) | null>(null);
   const copyMenuRef = useRef<HTMLDivElement>(null);
 
   const chatViewRef = useRef<HTMLDivElement>(null);
@@ -1613,6 +1616,43 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
   useEffect(() => {
     setLongPressMenu(null);
   }, [chat?.id]);
+
+  const isTouchCopyMenuOpen = longPressMenu?.isTouch === true;
+
+  useLayoutEffect(() => {
+    if (!isTouchCopyMenuOpen) return;
+
+    const root = document.documentElement;
+    const preventNativeSelection = (event: Event) => event.preventDefault();
+    const clearSelection = () => {
+      const selection = document.getSelection();
+      if (selection && !selection.isCollapsed) selection.removeAllRanges();
+    };
+    const suppressOriginalRelease = (event: TouchEvent) => {
+      if (!menuPointerDownRef.current) event.preventDefault();
+    };
+
+    // The browser can start selecting outside the message after the popup appears.
+    root.classList.add('is-touch-copy-menu-open');
+    clearSelection();
+    document.addEventListener('selectstart', preventNativeSelection, true);
+    document.addEventListener('contextmenu', preventNativeSelection, true);
+    document.addEventListener('selectionchange', clearSelection);
+    document.addEventListener('touchend', suppressOriginalRelease, { capture: true, passive: false });
+
+    const release = () => {
+      if (releaseTouchCopyGuardRef.current !== release) return;
+      releaseTouchCopyGuardRef.current = null;
+      root.classList.remove('is-touch-copy-menu-open');
+      document.removeEventListener('selectstart', preventNativeSelection, true);
+      document.removeEventListener('contextmenu', preventNativeSelection, true);
+      document.removeEventListener('selectionchange', clearSelection);
+      document.removeEventListener('touchend', suppressOriginalRelease, true);
+    };
+
+    releaseTouchCopyGuardRef.current = release;
+    return release;
+  }, [isTouchCopyMenuOpen]);
 
   useLayoutEffect(() => {
     const menu = copyMenuRef.current;
@@ -1847,6 +1887,8 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
                 className="msg-context-item"
                 onClick={() => {
                   const text = longPressMenu.textToCopy;
+                  // The clipboard fallback selects its own textarea synchronously.
+                  releaseTouchCopyGuardRef.current?.();
                   setLongPressMenu(null);
                   void copyTextToClipboard(text);
                 }}
