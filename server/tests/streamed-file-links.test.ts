@@ -245,14 +245,14 @@ describe('native and legacy file links', () => {
     const aliceProfile = srv.ctx.db.getAgyProfile(aliceId)!.profileDir;
     const bobProfile = srv.ctx.db.getAgyProfile(bobId)!.profileDir;
 
-    // 1. Non-sensitive user profile files (skills, docs with "tokens" in markdown filename, user notes)
+    // 1. Non-sensitive user profile files (skills, skill references, global instructions, user notes)
     const skillFile = path.join(aliceProfile, '.gemini', 'config', 'skills', 'algorithmic-art', 'SKILL.md');
-    const designTokensDoc = path.join(aliceProfile, '.gemini', 'config', 'skills', 'theme-factory', 'references', 'design-tokens.md');
+    const skillRefDoc = path.join(aliceProfile, '.gemini', 'config', 'skills', 'theme-factory', 'references', 'palette-guide.md');
     const globalInstructions = path.join(aliceProfile, '.gemini', 'GEMINI.md');
     const userNote = path.join(aliceProfile, 'notes', 'memo.md');
     for (const [filePath, body] of [
       [skillFile, '# Algorithmic Art Skill'],
-      [designTokensDoc, '# Design Tokens'],
+      [skillRefDoc, '# Palette Guide'],
       [globalInstructions, '# Global Instructions'],
       [userNote, '# Personal Note'],
     ]) {
@@ -286,7 +286,7 @@ describe('native and legacy file links', () => {
 
     // Other non-sensitive profile files also resolve
     for (const ref of [
-      'file:///home/sandbox/.gemini/config/skills/theme-factory/references/design-tokens.md',
+      'file:///home/sandbox/.gemini/config/skills/theme-factory/references/palette-guide.md',
       'file:///home/sandbox/.gemini/GEMINI.md',
       'file:///home/sandbox/notes/memo.md',
     ]) {
@@ -353,6 +353,7 @@ describe('native and legacy file links', () => {
       'notes/accessToken.json',
       'notes/client_secret_12345.json',
       'notes/credentials.csv',
+      '.gemini/config/skills/theme-factory/oauth_creds.md',
     ];
     for (const rel of secretPaths) {
       const full = path.join(aliceProfile, rel);

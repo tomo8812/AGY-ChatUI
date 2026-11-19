@@ -156,18 +156,6 @@ const BLOCKED_SECRET_EXTENSIONS = new Set([
   '.ldb',
 ]);
 
-function isSkillMarkdownPath(segments: string[], ext: string): boolean {
-  if (ext !== '.md' && ext !== '.markdown') return false;
-  if (segments[0]?.toLowerCase() !== '.gemini') return false;
-  const second = segments[1]?.toLowerCase();
-  const third = segments[2]?.toLowerCase();
-  return (
-    second === 'skills' ||
-    ((second === 'config' || second === 'antigravity' || second === 'antigravity-cli') &&
-      (third === 'skills' || third === 'skills-disabled'))
-  );
-}
-
 function isBlockedProfileRelPath(relPath: string): boolean {
   const segments = relPath.split('/').filter(Boolean);
   if (segments.length === 0) return true;
@@ -196,12 +184,9 @@ function isBlockedProfileRelPath(relPath: string): boolean {
   if (
     BLOCKED_SECRET_FILENAMES.has(basename) ||
     basename.startsWith('.env') ||
-    BLOCKED_SECRET_EXTENSIONS.has(ext)
+    BLOCKED_SECRET_EXTENSIONS.has(ext) ||
+    SECRET_KEYWORD_RE.test(basename)
   ) {
-    return true;
-  }
-
-  if (SECRET_KEYWORD_RE.test(basename) && !isSkillMarkdownPath(segments, ext)) {
     return true;
   }
 
