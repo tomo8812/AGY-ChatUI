@@ -38,6 +38,10 @@ import { FileReferenceLink, MarkdownContent, type FileLinkProps } from './Markdo
 
 type ChatViewMessage = MessageRecord & { optimisticPop?: true };
 
+function getMessageKey(message: MessageRecord): string {
+  return message.clientMessageId ? `cm:${message.clientMessageId}` : message.id;
+}
+
 interface ChatViewProps {
   chat: ChatRecord | null;
   project: ProjectRecord | null;
@@ -68,8 +72,9 @@ interface ChatViewProps {
 
 interface LongPressMenuState {
   textToCopy: string;
-  x: number;
-  y: number;
+  messageKey: string;
+  source: HTMLElement;
+  alignEnd: boolean;
 }
 
 async function copyTextToClipboard(text: string): Promise<void> {
@@ -112,15 +117,14 @@ const ContextUsageControl: React.FC<{
   contextUsage?: { used: number; size: number } | null;
 }> = React.memo(({ contextUsage }) => {
   const [open, setOpen] = useState(false);
-  const [popoverStyle, setPopoverStyle] = useState<React.CSSProperties>({});
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
 
   const hasData = Boolean(contextUsage && contextUsage.size > 0);
   const used = hasData ? Math.max(0, contextUsage!.used) : 0;
   const size = hasData ? contextUsage!.size : 0;
   const pct = hasData ? Math.min(100, Math.max(0, (used / size) * 100)) : 0;
   const pctLabel = hasData ? formatContextPercent(used, size) : '0%';
-  const remaining = hasData ? Math.max(0, size - used) : 0;
   const toneClass = !hasData
     ? 'is-empty'
     : pct >= 90
@@ -133,43 +137,31 @@ const ContextUsageControl: React.FC<{
   const circumference = 2 * Math.PI * radius;
   const dashOffset = circumference * (1 - pct / 100);
 
-  const updatePosition = useCallback(() => {
-    const el = triggerRef.current;
-    if (!el || typeof window === 'undefined') return;
-    const rect = el.getBoundingClientRect();
-    const popWidth = Math.min(256, window.innerWidth - 24);
-    const centerLeft = rect.left + rect.width / 2 - popWidth / 2;
-    const clampedLeft = Math.max(12, Math.min(window.innerWidth - popWidth - 12, centerLeft));
-    const bottom = Math.max(12, window.innerHeight - rect.top + 10);
-    setPopoverStyle({
-      left: `${Math.round(clampedLeft)}px`,
-      bottom: `${Math.round(bottom)}px`,
-      width: `${Math.round(popWidth)}px`,
-    });
-  }, []);
-
-  useLayoutEffect(() => {
-    if (open) {
-      updatePosition();
-    }
-  }, [open, updatePosition]);
-
   useEffect(() => {
     if (!open) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
+    const onPointerDown = (event: PointerEvent) => {
+      const { target } = event;
+      if (
+        target instanceof Node &&
+        !triggerRef.current?.contains(target) &&
+        !popoverRef.current?.contains(target)
+      ) {
         setOpen(false);
       }
     };
-    const onResize = () => updatePosition();
-    window.addEventListener('keydown', onKeyDown);
-    window.addEventListener('resize', onResize);
-    return () => {
-      window.removeEventListener('keydown', onKeyDown);
-      window.removeEventListener('resize', onResize);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setOpen(false);
+      }
     };
-  }, [open, updatePosition]);
+    document.addEventListener('pointerdown', onPointerDown, true);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown, true);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [open]);
 
   return (
     <>
@@ -215,63 +207,44 @@ const ContextUsageControl: React.FC<{
         </svg>
       </button>
 
-      {open && typeof document !== 'undefined' &&
-        createPortal(
-          <div
-            className="context-popover-backdrop"
-            role="presentation"
-            onClick={() => setOpen(false)}
-          >
+      {open && (
+        <div ref={popoverRef} className="context-popover" role="dialog" aria-label="コンテキスト利用量">
+          <div className="context-popover-head">
+            <span className="context-popover-title">コンテキスト利用量</span>
+            <span className={`context-popover-pct ${toneClass}`}>
+              {hasData ? pctLabel : '—%'}
+            </span>
+          </div>
+
+          <div className="context-popover-bar-track" aria-hidden="true">
             <div
-              className="context-popover"
-              style={popoverStyle}
-              role="dialog"
-              aria-modal="true"
-              aria-label="コンテキスト利用量"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div className="context-popover-head">
-                <span className="context-popover-title">コンテキスト利用量</span>
-                <span className={`context-popover-pct ${toneClass}`}>
-                  {hasData ? pctLabel : '—%'}
-                </span>
-              </div>
+              className={`context-popover-bar-fill ${toneClass}`}
+              style={{ width: `${hasData ? Math.max(pct > 0 ? 2 : 0, pct) : 0}%` }}
+            />
+          </div>
 
-              <div className="context-popover-bar-track" aria-hidden="true">
-                <div
-                  className={`context-popover-bar-fill ${toneClass}`}
-                  style={{ width: `${hasData ? Math.max(pct > 0 ? 2 : 0, pct) : 0}%` }}
-                />
+          {hasData ? (
+            <dl className="context-popover-stats">
+              <div className="context-popover-row">
+                <dt>使用率</dt>
+                <dd>{pctLabel}</dd>
               </div>
-
-              {hasData ? (
-                <dl className="context-popover-stats">
-                  <div className="context-popover-row">
-                    <dt>使用率</dt>
-                    <dd>{pctLabel}</dd>
-                  </div>
-                  <div className="context-popover-row">
-                    <dt>利用コンテキスト</dt>
-                    <dd>{formatTokenCount(used)} tokens</dd>
-                  </div>
-                  <div className="context-popover-row">
-                    <dt>最大コンテキスト</dt>
-                    <dd>{formatTokenCount(size)} tokens</dd>
-                  </div>
-                  <div className="context-popover-row">
-                    <dt>残り</dt>
-                    <dd>{formatTokenCount(remaining)} tokens</dd>
-                  </div>
-                </dl>
-              ) : (
-                <div className="context-popover-empty">
-                  まだコンテキスト利用量が取得されていません。応答を受信するとここに表示されます。
-                </div>
-              )}
+              <div className="context-popover-row">
+                <dt>利用コンテキスト</dt>
+                <dd>{formatTokenCount(used)} tokens</dd>
+              </div>
+              <div className="context-popover-row">
+                <dt>最大コンテキスト</dt>
+                <dd>{formatTokenCount(size)} tokens</dd>
+              </div>
+            </dl>
+          ) : (
+            <div className="context-popover-empty">
+              まだコンテキスト利用量が取得されていません。応答を受信するとここに表示されます。
             </div>
-          </div>,
-          document.body
-        )}
+          )}
+        </div>
+      )}
     </>
   );
 });
@@ -557,6 +530,7 @@ const MessageRow: React.FC<{
   queuePosition: number | null;
   msgPerms: PendingPermissionRecord[];
   msgArtifacts: ArtifactRecord[];
+  isCopyTarget: boolean;
   hapticEnabled: boolean;
   onOpenArtifact: (artifact: ArtifactRecord) => void;
   onOpenAttachment: (att: AttachmentRef) => void;
@@ -571,6 +545,7 @@ const MessageRow: React.FC<{
     queuePosition,
     msgPerms,
     msgArtifacts,
+    isCopyTarget,
     hapticEnabled,
     onOpenArtifact,
     onOpenAttachment,
@@ -585,6 +560,8 @@ const MessageRow: React.FC<{
 
     const { blocks, answer, hasCurrentAnswer } = useMemo(() => getMessageActivity(msg), [msg]);
     const isWorking = msg.status === 'streaming' && !hasCurrentAnswer;
+    const messageKey = getMessageKey(msg);
+    const isUserMessage = msg.role === 'user';
 
     const clearLongPress = useCallback(() => {
       if (longPressTimerRef.current !== null) {
@@ -611,6 +588,7 @@ const MessageRow: React.FC<{
             return;
           }
           clearLongPress();
+          const source = e.currentTarget;
           const startX = e.clientX;
           const startY = e.clientY;
           longPressStartRef.current = { x: startX, y: startY, pointerId: e.pointerId };
@@ -623,8 +601,9 @@ const MessageRow: React.FC<{
             triggerHaptic('send', hapticEnabled);
             onOpenLongPressMenu({
               textToCopy,
-              x: startX,
-              y: startY,
+              messageKey,
+              source,
+              alignEnd: isUserMessage,
             });
           }, 420);
         },
@@ -644,15 +623,15 @@ const MessageRow: React.FC<{
           }
         },
       }),
-      [clearLongPress, hapticEnabled, onOpenLongPressMenu]
+      [clearLongPress, hapticEnabled, isUserMessage, messageKey, onOpenLongPressMenu]
     );
 
-    if (msg.role === 'user') {
+    if (isUserMessage) {
       const userLongPress = createLongPressHandlers(msg.contentText);
       return (
         <div className="msg-row user">
           <div
-            className={`user-bubble${msg.optimisticPop ? ' pop-in' : ''}`}
+            className={`user-bubble${msg.optimisticPop ? ' pop-in' : ''}${isCopyTarget ? ' is-copy-target' : ''}`}
             {...userLongPress}
           >
             {msg.attachments.length > 0 && (
@@ -681,7 +660,7 @@ const MessageRow: React.FC<{
 
     return (
       <div className="msg-row assistant">
-        <div className="assistant-body" {...assistantLongPress}>
+        <div className={`assistant-body${isCopyTarget ? ' is-copy-target' : ''}`} {...assistantLongPress}>
           {msg.status === 'queued' && (
             <div className="queue-status-pill">
               待機中
@@ -1407,6 +1386,7 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
   const [syncingProj, setSyncingProj] = useState(false);
   const [longPressMenu, setLongPressMenu] = useState<LongPressMenuState | null>(null);
   const menuPointerDownRef = useRef(false);
+  const copyMenuRef = useRef<HTMLDivElement>(null);
 
   const chatViewRef = useRef<HTMLDivElement>(null);
   const messagesScrollRef = useRef<HTMLDivElement>(null);
@@ -1607,16 +1587,58 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
     setLongPressMenu(null);
   }, [chat?.id]);
 
-  useEffect(() => {
-    if (!longPressMenu) return;
+  useLayoutEffect(() => {
+    const menu = copyMenuRef.current;
+    const scroller = messagesScrollRef.current;
+    if (!longPressMenu || !menu || !scroller) return;
+
+    const { source, alignEnd } = longPressMenu;
+    const viewport = window.visualViewport;
+    const updatePosition = () => {
+      const rect = source.getBoundingClientRect();
+      const frame = scroller.getBoundingClientRect();
+      const margin = 12;
+      const viewportLeft = viewport?.offsetLeft ?? 0;
+      const viewportTop = viewport?.offsetTop ?? 0;
+      const viewportRight = viewportLeft + (viewport?.width ?? window.innerWidth);
+      const viewportBottom = viewportTop + (viewport?.height ?? window.innerHeight);
+      const left = alignEnd ? rect.right - menu.offsetWidth : rect.left;
+      const gap = 8;
+      const below = rect.bottom + gap;
+      const above = rect.top - menu.offsetHeight - gap;
+      const minTop = Math.max(viewportTop, frame.top) + margin;
+      const maxTop = Math.min(viewportBottom, frame.bottom) - menu.offsetHeight - margin;
+      const top = below > maxTop && above >= minTop ? above : below;
+
+      const maxLeft = viewportRight - menu.offsetWidth - margin;
+      menu.style.left = `${Math.max(viewportLeft + margin, Math.min(left, maxLeft))}px`;
+      menu.style.top = `${Math.max(minTop, Math.min(top, maxTop))}px`;
+    };
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.preventDefault();
         setLongPressMenu(null);
       }
     };
+
+    updatePosition();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(updatePosition);
+    observer?.observe(source);
+    observer?.observe(scroller);
+    observer?.observe(menu);
+    scroller.addEventListener('scroll', updatePosition);
+    window.addEventListener('resize', updatePosition);
     window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
+    viewport?.addEventListener('resize', updatePosition);
+    viewport?.addEventListener('scroll', updatePosition);
+    return () => {
+      observer?.disconnect();
+      scroller.removeEventListener('scroll', updatePosition);
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('keydown', onKeyDown);
+      viewport?.removeEventListener('resize', updatePosition);
+      viewport?.removeEventListener('scroll', updatePosition);
+    };
   }, [longPressMenu]);
 
   const handleOpenLongPressMenu = useCallback((menu: LongPressMenuState) => {
@@ -1724,7 +1746,7 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
           ) : (
             messages.map((msg) => (
               <MessageRow
-                key={msg.clientMessageId ? `cm:${msg.clientMessageId}` : msg.id}
+                key={getMessageKey(msg)}
                 msg={msg}
                 chatId={chat?.id}
                 clientId={clientId}
@@ -1737,6 +1759,7 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
                 }
                 msgPerms={msg.runId ? (pendingPermsByRunId.get(msg.runId) ?? EMPTY_PERMS) : EMPTY_PERMS}
                 msgArtifacts={resolvedArtifactsByMsgId.get(msg.id) ?? EMPTY_ARTIFACTS}
+                isCopyTarget={longPressMenu?.messageKey === getMessageKey(msg)}
                 hapticEnabled={hapticEnabled}
                 onOpenArtifact={onOpenArtifact}
                 onOpenAttachment={openAttachmentRef}
@@ -1776,7 +1799,6 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
       {longPressMenu && typeof document !== 'undefined' &&
         createPortal(
           <div
-            className="msg-context-backdrop"
             role="presentation"
             onPointerDown={() => {
               menuPointerDownRef.current = true;
@@ -1788,25 +1810,10 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
                 e.stopPropagation();
               }
             }}
-            onClick={(e) => {
-              if (e.target === e.currentTarget) setLongPressMenu(null);
-            }}
             onContextMenu={(e) => e.preventDefault()}
           >
-            <div
-              className="msg-context-menu"
-              role="menu"
-              aria-label="メッセージ操作"
-              style={{
-                left: `${Math.round(
-                  Math.max(12, Math.min(window.innerWidth - 196, longPressMenu.x - 88))
-                )}px`,
-                top: `${Math.round(
-                  Math.max(12, Math.min(window.innerHeight - 68, longPressMenu.y - 24))
-                )}px`,
-              }}
-              onClick={(e) => e.stopPropagation()}
-            >
+            <div className="msg-context-backdrop" onClick={() => setLongPressMenu(null)} />
+            <div ref={copyMenuRef} className="msg-context-menu" role="menu" aria-label="メッセージ操作">
               <button
                 type="button"
                 role="menuitem"
@@ -1818,7 +1825,7 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
                 }}
               >
                 <CopyIcon size={15} />
-                <span>コピー</span>
+                <span>コピーする</span>
               </button>
             </div>
           </div>,
