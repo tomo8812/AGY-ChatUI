@@ -137,8 +137,8 @@ const BLOCKED_SECRET_FILENAMES = new Set([
   'id_dsa',
 ]);
 
-const SECRET_FILENAME_RE =
-  /(?:^|[._-])(?:oauth|cred|creds|credential|credentials|secret|secrets|token|tokens|auth|apikey|api[_-]key|private[_-]?key|key|passwd|password)(?:$|\.(?:json|ya?ml|toml|ini|conf|cfg|properties|xml|plist|txt|env|bak|old))$/;
+const SECRET_KEYWORD_RE =
+  /(?:oauth|cred|secret|token|apikey|api[_-]?key|private[_-]?key|passwd|password|(?:^|[._-])(?:auth|key|keys)(?:$|[._-]))/;
 
 const BLOCKED_SECRET_EXTENSIONS = new Set([
   '.env',
@@ -155,6 +155,18 @@ const BLOCKED_SECRET_EXTENSIONS = new Set([
   '.db',
   '.ldb',
 ]);
+
+function isSkillMarkdownPath(segments: string[], ext: string): boolean {
+  if (ext !== '.md' && ext !== '.markdown') return false;
+  if (segments[0]?.toLowerCase() !== '.gemini') return false;
+  const second = segments[1]?.toLowerCase();
+  const third = segments[2]?.toLowerCase();
+  return (
+    second === 'skills' ||
+    ((second === 'config' || second === 'antigravity' || second === 'antigravity-cli') &&
+      (third === 'skills' || third === 'skills-disabled'))
+  );
+}
 
 function isBlockedProfileRelPath(relPath: string): boolean {
   const segments = relPath.split('/').filter(Boolean);
@@ -180,16 +192,16 @@ function isBlockedProfileRelPath(relPath: string): boolean {
   }
 
   const basename = segments[segments.length - 1].toLowerCase();
+  const ext = path.extname(basename);
   if (
     BLOCKED_SECRET_FILENAMES.has(basename) ||
     basename.startsWith('.env') ||
-    SECRET_FILENAME_RE.test(basename)
+    BLOCKED_SECRET_EXTENSIONS.has(ext)
   ) {
     return true;
   }
 
-  const ext = path.extname(basename);
-  if (BLOCKED_SECRET_EXTENSIONS.has(ext)) {
+  if (SECRET_KEYWORD_RE.test(basename) && !isSkillMarkdownPath(segments, ext)) {
     return true;
   }
 
