@@ -333,6 +333,7 @@ describe('native and legacy file links', () => {
       '.env.local',
       '.envrc',
       '.AWS/credentials',
+      'notes/.aws/credentials',
       '.ssh/id_rsa',
       '.config/gcloud/credentials.db',
       '.local/share/keyrings/default.keyring',

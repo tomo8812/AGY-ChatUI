@@ -60,7 +60,7 @@ export function detectContentFileType(filename: string, declaredMime?: string | 
 
 type ResolvedChatFile = { absPath: string; relPath: string };
 
-const BLOCKED_PROFILE_TOP_DIRS = new Set([
+const BLOCKED_PROFILE_DIRS = new Set([
   '.chat-brains',
   '.chat-homes',
   '.chat-scratch',
@@ -145,11 +145,14 @@ function isBlockedProfileRelPath(relPath: string): boolean {
   const segments = relPath.split('/').filter(Boolean);
   if (segments.length === 0) return true;
 
-  const top = segments[0].toLowerCase();
-  if (BLOCKED_PROFILE_TOP_DIRS.has(top) || top.startsWith('.usage-home-')) {
-    return true;
+  for (const segment of segments) {
+    const lower = segment.toLowerCase();
+    if (BLOCKED_PROFILE_DIRS.has(lower) || lower.startsWith('.usage-home-')) {
+      return true;
+    }
   }
 
+  const top = segments[0].toLowerCase();
   if (top === '.gemini') {
     const sub = segments[1]?.toLowerCase();
     const vendorSub =
@@ -159,11 +162,6 @@ function isBlockedProfileRelPath(relPath: string): boolean {
     if (vendorSub && BLOCKED_GEMINI_SUBDIRS.has(vendorSub)) {
       return true;
     }
-  }
-
-  for (const segment of segments) {
-    const lower = segment.toLowerCase();
-    if (lower === '.ssh' || lower === '.gnupg') return true;
   }
 
   const basename = segments[segments.length - 1].toLowerCase();
