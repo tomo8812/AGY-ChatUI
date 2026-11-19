@@ -58,8 +58,6 @@ interface ChatViewProps {
   onChangeEffort: (effortValue: string) => void;
   onDraftChange?: (hasDraft: boolean) => void;
   onSendPrompt: (text: string, files: AttachmentRef[]) => Promise<void>;
-  onEditMessage?: (messageId: string, newText: string) => Promise<void>;
-  onRegenerateMessage?: (assistantMessageId: string) => Promise<void>;
   onUploadFiles: (files: File[]) => Promise<AttachmentRef[]>;
   onCancelRun: (runId: string) => Promise<void>;
   onSyncProject: () => Promise<void>;
@@ -70,14 +68,13 @@ interface ChatViewProps {
 }
 
 interface LongPressMenuState {
-  messageId: string;
-  role: 'user' | 'assistant';
   textToCopy: string;
-  canEdit: boolean;
-  canRegenerate: boolean;
+  unavailableAction: 'edit' | 'regenerate' | null;
   x: number;
   y: number;
 }
+
+const REWIND_UNAVAILABLE = '会話の巻き戻しは現在の Antigravity ACP 連携では利用できません。';
 
 async function copyTextToClipboard(text: string): Promise<void> {
   if (!text) return;
@@ -564,17 +561,12 @@ const MessageRow: React.FC<{
   queuePosition: number | null;
   msgPerms: PendingPermissionRecord[];
   msgArtifacts: ArtifactRecord[];
-  isEditing: boolean;
-  hasFollowingMessages: boolean;
   hapticEnabled: boolean;
   onOpenArtifact: (artifact: ArtifactRecord) => void;
   onOpenAttachment: (att: AttachmentRef) => void;
   onPermissionUpdated: (perm: PendingPermissionRecord) => void;
   onResolveError: (msg: string) => void;
   onOpenLongPressMenu: (menu: LongPressMenuState) => void;
-  onSaveEdit: (messageId: string, newText: string) => Promise<void>;
-  onCancelEdit: () => void;
-  onRegenerate: (assistantMessageId: string) => Promise<void>;
 }> = React.memo(
   ({
     msg,
@@ -583,25 +575,14 @@ const MessageRow: React.FC<{
     queuePosition,
     msgPerms,
     msgArtifacts,
-    isEditing,
-    hasFollowingMessages,
     hapticEnabled,
     onOpenArtifact,
     onOpenAttachment,
     onPermissionUpdated,
     onResolveError,
     onOpenLongPressMenu,
-    onSaveEdit,
-    onCancelEdit,
-    onRegenerate,
   }) => {
     const [copied, setCopied] = useState(false);
-    const [regenerating, setRegenerating] = useState(false);
-    const [editDraft, setEditDraft] = useState(msg.contentText);
-    const [editSaving, setEditSaving] = useState(false);
-    const [editError, setEditError] = useState<string | null>(null);
-    const editTextareaRef = useRef<HTMLTextAreaElement>(null);
-
     const longPressTimerRef = useRef<number | null>(null);
     const longPressStartRef = useRef<{ x: number; y: number; pointerId: number } | null>(null);
     const suppressContextUntilRef = useRef<number>(0);
@@ -609,6 +590,7 @@ const MessageRow: React.FC<{
     const { blocks, answer, hasCurrentAnswer } = useMemo(() => getMessageActivity(msg), [msg]);
     const isWorking = msg.status === 'streaming' && !hasCurrentAnswer;
     const isOptimistic = msg.id.startsWith('optimistic-');
+    const canShowAnswerActions = msg.status !== 'streaming' && msg.status !== 'queued' && !isOptimistic;
 
     const clearLongPress = useCallback(() => {
       if (longPressTimerRef.current !== null) {
@@ -620,72 +602,15 @@ const MessageRow: React.FC<{
 
     useEffect(() => clearLongPress, [clearLongPress]);
 
-    useEffect(() => {
-      if (isEditing) {
-        setEditDraft(msg.contentText);
-        setEditError(null);
-        setEditSaving(false);
-        window.setTimeout(() => {
-          const el = editTextareaRef.current;
-          if (!el) return;
-          el.focus();
-          const len = el.value.length;
-          el.setSelectionRange(len, len);
-        }, 20);
-      }
-    }, [isEditing, msg.contentText]);
-
-    useEffect(() => {
-      if (!isEditing) return;
-      const el = editTextareaRef.current;
-      if (!el) return;
-      el.style.height = 'auto';
-      el.style.height = `${Math.min(el.scrollHeight, 240)}px`;
-    }, [isEditing, editDraft]);
-
     const handleCopy = useCallback(async () => {
       await copyTextToClipboard(answer);
       setCopied(true);
       setTimeout(() => setCopied(false), 1600);
     }, [answer]);
 
-    const handleRegenerateClick = useCallback(async () => {
-      if (regenerating || isOptimistic) return;
-      setRegenerating(true);
-      try {
-        await onRegenerate(msg.id);
-      } catch (err) {
-        onResolveError(err instanceof ApiError ? err.message : '再生成に失敗しました。');
-      } finally {
-        setRegenerating(false);
-      }
-    }, [regenerating, isOptimistic, onRegenerate, msg.id, onResolveError]);
-
-    const handleEditSubmit = useCallback(
-      async (e?: React.FormEvent) => {
-        e?.preventDefault();
-        if (editSaving) return;
-        if (!editDraft.trim() && msg.attachments.length === 0) {
-          setEditError('メッセージまたはファイルを指定してください。');
-          return;
-        }
-        setEditSaving(true);
-        setEditError(null);
-        try {
-          await onSaveEdit(msg.id, editDraft);
-        } catch (err) {
-          setEditError(err instanceof ApiError ? err.message : '編集の保存に失敗しました。');
-        } finally {
-          setEditSaving(false);
-        }
-      },
-      [editSaving, editDraft, msg.attachments.length, msg.id, onSaveEdit]
-    );
-
     const createLongPressHandlers = useCallback(
-      (role: 'user' | 'assistant', textToCopy: string, canEdit: boolean, canRegenerate: boolean) => ({
+      (textToCopy: string, unavailableAction: LongPressMenuState['unavailableAction']) => ({
         onPointerDown: (e: React.PointerEvent<HTMLElement>) => {
-          if (isEditing) return;
           if (e.pointerType === 'mouse' && e.button !== 0) return;
           const target = e.target as HTMLElement | null;
           if (target?.closest('button, a, input, textarea, select, summary, pre, code')) {
@@ -703,11 +628,8 @@ const MessageRow: React.FC<{
             suppressContextUntilRef.current = Date.now() + 500;
             triggerHaptic('send', hapticEnabled);
             onOpenLongPressMenu({
-              messageId: msg.id,
-              role,
               textToCopy,
-              canEdit,
-              canRegenerate,
+              unavailableAction,
               x: startX,
               y: startY,
             });
@@ -722,21 +644,22 @@ const MessageRow: React.FC<{
         },
         onPointerUp: () => clearLongPress(),
         onPointerCancel: () => clearLongPress(),
+        onPointerLeave: () => clearLongPress(),
         onContextMenu: (e: React.MouseEvent<HTMLElement>) => {
           if (Date.now() < suppressContextUntilRef.current) {
             e.preventDefault();
           }
         },
       }),
-      [isEditing, clearLongPress, hapticEnabled, onOpenLongPressMenu, msg.id]
+      [clearLongPress, hapticEnabled, onOpenLongPressMenu]
     );
 
     if (msg.role === 'user') {
-      const userLongPress = createLongPressHandlers('user', msg.contentText, !isOptimistic, false);
+      const userLongPress = createLongPressHandlers(msg.contentText, isOptimistic ? null : 'edit');
       return (
         <div className="msg-row user">
           <div
-            className={`user-bubble${msg.optimisticPop ? ' pop-in' : ''}${isEditing ? ' is-editing' : ''}`}
+            className={`user-bubble${msg.optimisticPop ? ' pop-in' : ''}`}
             {...userLongPress}
           >
             {msg.attachments.length > 0 && (
@@ -755,67 +678,15 @@ const MessageRow: React.FC<{
               </div>
             )}
 
-            {isEditing ? (
-              <form className="user-edit-form" onSubmit={handleEditSubmit}>
-                <textarea
-                  ref={editTextareaRef}
-                  className="user-edit-textarea"
-                  rows={2}
-                  value={editDraft}
-                  onChange={(e) => setEditDraft(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Escape') {
-                      e.preventDefault();
-                      onCancelEdit();
-                      return;
-                    }
-                    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229) {
-                      const isMobileTouch = 'ontouchstart' in window && window.innerWidth <= 860;
-                      if (!isMobileTouch) {
-                        e.preventDefault();
-                        void handleEditSubmit();
-                      }
-                    }
-                  }}
-                  disabled={editSaving}
-                />
-                {hasFollowingMessages && (
-                  <div className="user-edit-hint">
-                    このメッセージ以降の履歴を巻き戻して再送信します
-                  </div>
-                )}
-                {editError && <div className="user-edit-error">{editError}</div>}
-                <div className="user-edit-actions">
-                  <button
-                    type="button"
-                    className="btn btn-ghost btn-xs"
-                    onClick={onCancelEdit}
-                    disabled={editSaving}
-                  >
-                    キャンセル
-                  </button>
-                  <button
-                    type="submit"
-                    className="btn btn-primary btn-xs"
-                    disabled={editSaving || (!editDraft.trim() && msg.attachments.length === 0)}
-                  >
-                    {editSaving ? '送信中...' : '保存して再送信'}
-                  </button>
-                </div>
-              </form>
-            ) : (
-              msg.contentText && <div className="user-text">{msg.contentText}</div>
-            )}
+            {msg.contentText && <div className="user-text">{msg.contentText}</div>}
           </div>
         </div>
       );
     }
 
     const assistantLongPress = createLongPressHandlers(
-      'assistant',
       answer || msg.contentText,
-      false,
-      msg.status !== 'streaming' && msg.status !== 'queued' && !isOptimistic
+      canShowAnswerActions ? 'regenerate' : null
     );
 
     return (
@@ -935,7 +806,7 @@ const MessageRow: React.FC<{
             </div>
           )}
 
-          {msg.status !== 'streaming' && msg.status !== 'queued' && (answer || !isOptimistic) && (
+          {canShowAnswerActions && (
             <div className="msg-actions">
               {answer && (
                 <button
@@ -948,18 +819,16 @@ const MessageRow: React.FC<{
                   {copied ? <CheckIcon size={15} /> : <CopyIcon size={15} />}
                 </button>
               )}
-              {!isOptimistic && (
-                <button
-                  type="button"
-                  className="msg-action-icon-btn"
-                  onClick={() => void handleRegenerateClick()}
-                  disabled={regenerating}
-                  aria-label="再生成"
-                  title="再生成"
-                >
-                  <RefreshIcon size={15} className={regenerating ? 'spin' : ''} />
-                </button>
-              )}
+              <button
+                type="button"
+                className="msg-action-icon-btn"
+                aria-disabled="true"
+                aria-label="再生成"
+                title={REWIND_UNAVAILABLE}
+                onClick={() => onResolveError(REWIND_UNAVAILABLE)}
+              >
+                <RefreshIcon size={15} />
+              </button>
             </div>
           )}
         </div>
@@ -1549,8 +1418,6 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
   onChangeEffort,
   onDraftChange,
   onSendPrompt,
-  onEditMessage,
-  onRegenerateMessage,
   onUploadFiles,
   onCancelRun,
   onSyncProject,
@@ -1560,9 +1427,8 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
   externalDraftCommand,
 }) => {
   const [syncingProj, setSyncingProj] = useState(false);
-  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [longPressMenu, setLongPressMenu] = useState<LongPressMenuState | null>(null);
-  const menuOpenedAtRef = useRef<number>(0);
+  const menuPointerDownRef = useRef(false);
 
   const chatViewRef = useRef<HTMLDivElement>(null);
   const messagesScrollRef = useRef<HTMLDivElement>(null);
@@ -1760,15 +1626,8 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
   }, []);
 
   useEffect(() => {
-    setEditingMessageId(null);
     setLongPressMenu(null);
   }, [chat?.id]);
-
-  useEffect(() => {
-    if (editingMessageId && !messages.some((m) => m.id === editingMessageId)) {
-      setEditingMessageId(null);
-    }
-  }, [editingMessageId, messages]);
 
   useEffect(() => {
     if (!longPressMenu) return;
@@ -1783,30 +1642,9 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
   }, [longPressMenu]);
 
   const handleOpenLongPressMenu = useCallback((menu: LongPressMenuState) => {
-    menuOpenedAtRef.current = Date.now();
+    menuPointerDownRef.current = false;
     setLongPressMenu(menu);
   }, []);
-
-  const handleSaveEdit = useCallback(
-    async (messageId: string, newText: string) => {
-      if (!onEditMessage) return;
-      await onEditMessage(messageId, newText);
-      setEditingMessageId(null);
-    },
-    [onEditMessage]
-  );
-
-  const handleCancelEdit = useCallback(() => {
-    setEditingMessageId(null);
-  }, []);
-
-  const handleRegenerate = useCallback(
-    async (assistantMessageId: string) => {
-      if (!onRegenerateMessage) return;
-      await onRegenerateMessage(assistantMessageId);
-    },
-    [onRegenerateMessage]
-  );
 
   const modelOption = useMemo(
     () =>
@@ -1906,7 +1744,7 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
               ) : null}
             </div>
           ) : (
-            messages.map((msg, idx) => (
+            messages.map((msg) => (
               <MessageRow
                 key={msg.clientMessageId ? `cm:${msg.clientMessageId}` : msg.id}
                 msg={msg}
@@ -1921,17 +1759,12 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
                 }
                 msgPerms={msg.runId ? (pendingPermsByRunId.get(msg.runId) ?? EMPTY_PERMS) : EMPTY_PERMS}
                 msgArtifacts={resolvedArtifactsByMsgId.get(msg.id) ?? EMPTY_ARTIFACTS}
-                isEditing={editingMessageId === msg.id}
-                hasFollowingMessages={idx < messages.length - 1}
                 hapticEnabled={hapticEnabled}
                 onOpenArtifact={onOpenArtifact}
                 onOpenAttachment={openAttachmentRef}
                 onPermissionUpdated={onPermissionUpdated}
                 onResolveError={handleResolveError}
                 onOpenLongPressMenu={handleOpenLongPressMenu}
-                onSaveEdit={handleSaveEdit}
-                onCancelEdit={handleCancelEdit}
-                onRegenerate={handleRegenerate}
               />
             ))
           )}
@@ -1967,15 +1800,18 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
           <div
             className="msg-context-backdrop"
             role="presentation"
-            onPointerDown={(e) => {
-              if (e.target === e.currentTarget) {
-                setLongPressMenu(null);
+            onPointerDown={() => {
+              menuPointerDownRef.current = true;
+            }}
+            onClickCapture={(e) => {
+              // Releasing the original touch can click the menu now under the finger.
+              if (e.detail > 0 && !menuPointerDownRef.current) {
+                e.preventDefault();
+                e.stopPropagation();
               }
             }}
             onClick={(e) => {
-              if (e.target === e.currentTarget && Date.now() - menuOpenedAtRef.current > 250) {
-                setLongPressMenu(null);
-              }
+              if (e.target === e.currentTarget) setLongPressMenu(null);
             }}
             onContextMenu={(e) => e.preventDefault()}
           >
@@ -2008,39 +1844,20 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
                 <span>コピー</span>
               </button>
 
-              {longPressMenu.canEdit && (
+              {longPressMenu.unavailableAction && (
                 <button
                   type="button"
                   role="menuitem"
                   className="msg-context-item"
+                  aria-disabled="true"
+                  title={REWIND_UNAVAILABLE}
                   onClick={() => {
-                    const targetId = longPressMenu.messageId;
                     setLongPressMenu(null);
-                    setEditingMessageId(targetId);
+                    handleResolveError(REWIND_UNAVAILABLE);
                   }}
                 >
-                  <EditIcon size={15} />
-                  <span>編集</span>
-                </button>
-              )}
-
-              {longPressMenu.canRegenerate && (
-                <button
-                  type="button"
-                  role="menuitem"
-                  className="msg-context-item"
-                  onClick={() => {
-                    const targetId = longPressMenu.messageId;
-                    setLongPressMenu(null);
-                    void handleRegenerate(targetId).catch((err) => {
-                      handleResolveError(
-                        err instanceof ApiError ? err.message : '再生成に失敗しました。'
-                      );
-                    });
-                  }}
-                >
-                  <RefreshIcon size={15} />
-                  <span>再生成</span>
+                  {longPressMenu.unavailableAction === 'edit' ? <EditIcon size={15} /> : <RefreshIcon size={15} />}
+                  <span>{longPressMenu.unavailableAction === 'edit' ? '編集' : '再生成'}</span>
                 </button>
               )}
             </div>

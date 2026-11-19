@@ -180,14 +180,8 @@ export const App: React.FC = () => {
   chatsRef.current = chats;
   const messagesRef = useRef<LiveMessage[]>([]);
   messagesRef.current = messages;
-  const artifactsRef = useRef<ArtifactRecord[]>([]);
-  artifactsRef.current = artifacts;
-  const pendingPermissionsRef = useRef<PendingPermissionRecord[]>([]);
-  pendingPermissionsRef.current = pendingPermissions;
   const activeRunRef = useRef<RunRecord | null>(null);
   activeRunRef.current = activeRun;
-  const contextUsageRef = useRef<{ used: number; size: number } | null>(null);
-  contextUsageRef.current = contextUsage;
   const draftCreatedChatRef = useRef<ChatRecord | null>(null);
   draftCreatedChatRef.current = draftCreatedChat;
   const effectiveProjectIdRef = useRef<string | null>(null);
@@ -904,27 +898,6 @@ export const App: React.FC = () => {
         }
         if (opts && evt.chatId === curChatId) {
           setSessionOptions(opts);
-        }
-        break;
-      }
-      case 'chat.rewound': {
-        const chat = p.chat as ChatRecord | undefined;
-        const rewoundMsgs = (p.messages as MessageRecord[] | undefined) ?? [];
-        const rewoundArts = (p.artifacts as ArtifactRecord[] | undefined) ?? [];
-        if (chat) {
-          setChats((prev) =>
-            prev.map((c) => (c.id === chat.id ? { ...c, ...chat, activeRun: null } : c))
-          );
-          setDraftCreatedChat((prev) =>
-            prev && prev.id === chat.id ? { ...prev, ...chat, activeRun: null } : prev
-          );
-        }
-        if (evt.chatId === curChatId) {
-          setMessages(rewoundMsgs);
-          setArtifacts(rewoundArts);
-          setPendingPermissions([]);
-          setActiveRun(null);
-          setContextUsage(null);
         }
         break;
       }
@@ -1739,134 +1712,6 @@ export const App: React.FC = () => {
     [user?.id, createDraftBackedChat, triggerQuotaRefresh]
   );
 
-  const handleEditMessage = useCallback(
-    async (messageId: string, newText: string): Promise<void> => {
-      const chatId = activeChatIdRef.current;
-      if (!chatId) return;
-      triggerHaptic('send', Boolean(preferencesRef.current?.hapticFeedback ?? true));
-
-      const prevMessagesSnap = messagesRef.current;
-      const prevArtifactsSnap = artifactsRef.current;
-      const prevRunSnap = activeRunRef.current;
-      const prevPermsSnap = pendingPermissionsRef.current;
-      const prevCtxSnap = contextUsageRef.current;
-
-      setMessages((prev) => {
-        const idx = prev.findIndex((m) => m.id === messageId);
-        if (idx < 0) return prev;
-        return prev
-          .slice(0, idx + 1)
-          .map((m, i) => (i === idx ? { ...m, contentText: newText, updatedAt: Date.now() } : m));
-      });
-      setActiveRun(null);
-      setPendingPermissions([]);
-      setContextUsage(null);
-
-      try {
-        const res = await api.editMessage(chatId, messageId, { text: newText });
-        if (activeChatIdRef.current !== chatId) return;
-        setChats((prev) =>
-          prev.map((c) => (c.id === chatId ? { ...c, ...res.chat, activeRun: res.run } : c))
-        );
-        setDraftCreatedChat((prev) =>
-          prev && prev.id === chatId ? { ...prev, ...res.chat, activeRun: res.run } : prev
-        );
-        setArtifacts(res.artifacts);
-        setMessages((prev) => {
-          const prevById = new Map(prev.map((m) => [m.id, m]));
-          return res.messages.map((m) => {
-            const existing = prevById.get(m.id);
-            return existing && existing.id === m.id && existing.runId === m.runId
-              ? newerMessage(existing, m)
-              : m;
-          });
-        });
-        setActiveRun((cur) =>
-          cur &&
-          cur.id === res.run.id &&
-          (cur.status === 'running' || cur.status === 'awaiting_permission') &&
-          res.run.status === 'queued'
-            ? cur
-            : res.run
-        );
-        void triggerQuotaRefresh(true, 5_000);
-      } catch (err) {
-        if (activeChatIdRef.current === chatId) {
-          setMessages(prevMessagesSnap);
-          setArtifacts(prevArtifactsSnap);
-          setActiveRun(prevRunSnap);
-          setPendingPermissions(prevPermsSnap);
-          setContextUsage(prevCtxSnap);
-        }
-        throw err;
-      }
-    },
-    [triggerQuotaRefresh]
-  );
-
-  const handleRegenerateMessage = useCallback(
-    async (assistantMessageId: string): Promise<void> => {
-      const chatId = activeChatIdRef.current;
-      if (!chatId) return;
-      triggerHaptic('send', Boolean(preferencesRef.current?.hapticFeedback ?? true));
-
-      const prevMessagesSnap = messagesRef.current;
-      const prevArtifactsSnap = artifactsRef.current;
-      const prevRunSnap = activeRunRef.current;
-      const prevPermsSnap = pendingPermissionsRef.current;
-      const prevCtxSnap = contextUsageRef.current;
-
-      setMessages((prev) => {
-        const idx = prev.findIndex((m) => m.id === assistantMessageId);
-        if (idx < 0) return prev;
-        return prev.slice(0, idx);
-      });
-      setActiveRun(null);
-      setPendingPermissions([]);
-      setContextUsage(null);
-
-      try {
-        const res = await api.regenerateMessage(chatId, assistantMessageId);
-        if (activeChatIdRef.current !== chatId) return;
-        setChats((prev) =>
-          prev.map((c) => (c.id === chatId ? { ...c, ...res.chat, activeRun: res.run } : c))
-        );
-        setDraftCreatedChat((prev) =>
-          prev && prev.id === chatId ? { ...prev, ...res.chat, activeRun: res.run } : prev
-        );
-        setArtifacts(res.artifacts);
-        setMessages((prev) => {
-          const prevById = new Map(prev.map((m) => [m.id, m]));
-          return res.messages.map((m) => {
-            const existing = prevById.get(m.id);
-            return existing && existing.id === m.id && existing.runId === m.runId
-              ? newerMessage(existing, m)
-              : m;
-          });
-        });
-        setActiveRun((cur) =>
-          cur &&
-          cur.id === res.run.id &&
-          (cur.status === 'running' || cur.status === 'awaiting_permission') &&
-          res.run.status === 'queued'
-            ? cur
-            : res.run
-        );
-        void triggerQuotaRefresh(true, 5_000);
-      } catch (err) {
-        if (activeChatIdRef.current === chatId) {
-          setMessages(prevMessagesSnap);
-          setArtifacts(prevArtifactsSnap);
-          setActiveRun(prevRunSnap);
-          setPendingPermissions(prevPermsSnap);
-          setContextUsage(prevCtxSnap);
-        }
-        throw err;
-      }
-    },
-    [triggerQuotaRefresh]
-  );
-
   const handleCancelRun = useCallback(async (runId: string) => {
     const chatId = activeChatIdRef.current;
     if (!chatId) return;
@@ -2101,8 +1946,6 @@ export const App: React.FC = () => {
             onChangeEffort={handleChangeEffortCb}
             onDraftChange={setHasComposerDraft}
             onSendPrompt={handleSendPrompt}
-            onEditMessage={handleEditMessage}
-            onRegenerateMessage={handleRegenerateMessage}
             onUploadFiles={handleUploadFiles}
             onCancelRun={handleCancelRun}
             onSyncProject={handleSyncProject}
