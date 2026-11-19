@@ -1596,12 +1596,16 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
       const viewportRight = viewportLeft + (viewport?.width ?? window.innerWidth);
       const viewportBottom = viewportTop + (viewport?.height ?? window.innerHeight);
       const left = alignEnd ? rect.right - menu.offsetWidth : rect.left;
-      const top = Math.min(rect.bottom, frame.bottom) + 8;
+      const gap = 8;
+      const below = rect.bottom + gap;
+      const above = rect.top - menu.offsetHeight - gap;
+      const minTop = Math.max(viewportTop, frame.top) + margin;
+      const maxTop = Math.min(viewportBottom, frame.bottom) - menu.offsetHeight - margin;
+      const top = below > maxTop && above >= minTop ? above : below;
 
       const maxLeft = viewportRight - menu.offsetWidth - margin;
-      const maxTop = viewportBottom - menu.offsetHeight - margin;
       menu.style.left = `${Math.max(viewportLeft + margin, Math.min(left, maxLeft))}px`;
-      menu.style.top = `${Math.max(viewportTop + margin, Math.min(top, maxTop))}px`;
+      menu.style.top = `${Math.max(minTop, Math.min(top, maxTop))}px`;
     };
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -1611,17 +1615,17 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
     };
 
     updatePosition();
-    const observer = new ResizeObserver(updatePosition);
-    observer.observe(source);
-    observer.observe(scroller);
-    observer.observe(menu);
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(updatePosition);
+    observer?.observe(source);
+    observer?.observe(scroller);
+    observer?.observe(menu);
     scroller.addEventListener('scroll', updatePosition);
     window.addEventListener('resize', updatePosition);
     window.addEventListener('keydown', onKeyDown);
     viewport?.addEventListener('resize', updatePosition);
     viewport?.addEventListener('scroll', updatePosition);
     return () => {
-      observer.disconnect();
+      observer?.disconnect();
       scroller.removeEventListener('scroll', updatePosition);
       window.removeEventListener('resize', updatePosition);
       window.removeEventListener('keydown', onKeyDown);
