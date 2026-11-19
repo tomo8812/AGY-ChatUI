@@ -6,7 +6,7 @@ import mime from 'mime-types';
 import { getChatBrainHostDir, SANDBOX_HOME_MOUNT, SANDBOX_WORKSPACE_MOUNT } from '../acp/env-isolation.js';
 import type { AppDatabase } from '../db/database.js';
 import type { ArtifactRecord, ChatRecord } from '../types.js';
-import { detectMimeAndPreviewKind, resolveContainedExistingPath, sha256File } from './workspace.js';
+import { detectMimeAndPreviewKind, normalizeRelPath, resolveContainedExistingPath, sha256File } from './workspace.js';
 
 export interface ResolvedWorkspaceLink {
   artifact: ArtifactRecord;
@@ -60,12 +60,135 @@ export function detectContentFileType(filename: string, declaredMime?: string | 
 
 type ResolvedChatFile = { absPath: string; relPath: string };
 
+const BLOCKED_PROFILE_TOP_DIRS = new Set([
+  '.chat-brains',
+  '.chat-homes',
+  '.chat-scratch',
+  '.chat-playground',
+  '.probe',
+  '.tmp',
+  '.config',
+  '.local',
+  '.cache',
+  '.ssh',
+  '.gnupg',
+  '.aws',
+  '.kube',
+  '.docker',
+  '.azure',
+  '.gcp',
+]);
+
+const BLOCKED_GEMINI_SUBDIRS = new Set([
+  'brain',
+  'scratch',
+  'playground',
+  'code_tracker',
+  'implicit',
+  'conversations',
+  'sessions',
+  'logs',
+  'cache',
+  'tmp',
+  'auth',
+  'credentials',
+  'tokens',
+]);
+
+const BLOCKED_SECRET_FILENAMES = new Set([
+  '.mock-agy-auth.json',
+  '.env',
+  '.netrc',
+  '.git-credentials',
+  '.gitcookies',
+  '.npmrc',
+  '.pypirc',
+  '.bash_history',
+  '.zsh_history',
+  '.sh_history',
+  'oauth_creds.json',
+  'google_accounts.json',
+  'credentials.json',
+  'client_secret.json',
+  'client_secrets.json',
+  'service_account.json',
+  'service-account.json',
+  'application_default_credentials.json',
+  'installation_id',
+  'mcp_config.json',
+  'settings.json',
+  'auth.json',
+  'token.json',
+  'tokens.json',
+  'id_rsa',
+  'id_ed25519',
+  'id_ecdsa',
+  'id_dsa',
+]);
+
+const BLOCKED_SECRET_EXTENSIONS = new Set([
+  '.pem',
+  '.key',
+  '.p12',
+  '.pfx',
+  '.jks',
+  '.keystore',
+  '.kdbx',
+  '.pb',
+  '.sqlite',
+  '.sqlite3',
+  '.db',
+  '.ldb',
+]);
+
+function isBlockedProfileRelPath(relPath: string): boolean {
+  const segments = relPath.split('/').filter(Boolean);
+  if (segments.length === 0) return true;
+
+  const top = segments[0];
+  if (BLOCKED_PROFILE_TOP_DIRS.has(top) || top.startsWith('.usage-home-')) {
+    return true;
+  }
+
+  if (top === '.gemini') {
+    const sub = segments[1];
+    const vendorSub =
+      sub === 'antigravity-cli' || sub === 'antigravity' || sub === 'jetski'
+        ? segments[2]
+        : sub;
+    if (vendorSub && BLOCKED_GEMINI_SUBDIRS.has(vendorSub.toLowerCase())) {
+      return true;
+    }
+  }
+
+  for (const segment of segments) {
+    const lower = segment.toLowerCase();
+    if (lower === '.ssh' || lower === '.gnupg') return true;
+  }
+
+  const basename = segments[segments.length - 1].toLowerCase();
+  if (
+    BLOCKED_SECRET_FILENAMES.has(basename) ||
+    basename.startsWith('.env.') ||
+    /(?:^|[._-])(?:oauth|cred|creds|credential|credentials|secret|secrets|token|tokens|auth)\.json$/.test(basename)
+  ) {
+    return true;
+  }
+
+  const ext = path.extname(basename);
+  if (BLOCKED_SECRET_EXTENSIONS.has(ext)) {
+    return true;
+  }
+
+  return false;
+}
+
 function workspaceRelativePath(candidate: string): string {
   return candidate.startsWith(`${SANDBOX_WORKSPACE_MOUNT}/`)
     ? candidate.slice(SANDBOX_WORKSPACE_MOUNT.length).replace(/^\/+/, '') : candidate;
 }
 
-/** Map native paths to this chat's private roots without moving the file. */
+/** Map native paths to this chat's private roots or non-sensitive user profile files without moving them. */
 function resolveChatFile(db: AppDatabase, chat: ChatRecord, candidate: string): ResolvedChatFile | null {
   try {
     const resolved = resolveContainedExistingPath(chat.workspaceDir, workspaceRelativePath(candidate));
@@ -80,19 +203,39 @@ function resolveChatFile(db: AppDatabase, chat: ChatRecord, candidate: string): 
   const workspaceKey = path.basename(path.resolve(chat.workspaceDir));
   const chatHome = path.join(home, '.chat-homes', workspaceKey);
   const homePrefix = [SANDBOX_HOME_MOUNT, chatHome, home].find(root => candidate.startsWith(`${root}/`));
-  const relative = candidate.startsWith('~/') ? candidate.slice(2)
+  const rawRelative = candidate.startsWith('~/') ? candidate.slice(2)
     : homePrefix ? candidate.slice(homePrefix.length + 1) : '';
+  if (!rawRelative) return null;
+
+  let relative: string;
+  try {
+    relative = normalizeRelPath(rawRelative);
+  } catch {
+    return null;
+  }
+
   const alias = /^\.gemini\/(?:antigravity-cli\/|antigravity\/|jetski\/)?(brain|scratch|playground)\/(.+)$/.exec(relative);
   const directory = alias?.[1] ?? /^\.chat-(brains|scratch|playground)\//.exec(relative)?.[1];
-  if (!directory) return null;
-  const kind = directory === 'brains' ? 'brain' : directory;
-  const root = kind === 'brain' ? getChatBrainHostDir(home, chat.workspaceDir)
-    : path.join(home, `.chat-${kind}`, workspaceKey);
+  if (directory) {
+    const kind = directory === 'brains' ? 'brain' : directory;
+    const root = kind === 'brain' ? getChatBrainHostDir(home, chat.workspaceDir)
+      : path.join(home, `.chat-${kind}`, workspaceKey);
+    try {
+      if (fs.realpathSync(root) !== path.join(fs.realpathSync(home), path.relative(home, root))) return null;
+      const resolved = resolveContainedExistingPath(root, alias ? alias[2] : candidate);
+      if (!fs.statSync(resolved.absPath).isFile()) return null;
+      return { absPath: resolved.absPath, relPath: `${SANDBOX_HOME_MOUNT}/.gemini/${kind}/${resolved.relPath}` };
+    } catch {
+      return null;
+    }
+  }
+
+  if (isBlockedProfileRelPath(relative)) return null;
   try {
-    if (fs.realpathSync(root) !== path.join(fs.realpathSync(home), path.relative(home, root))) return null;
-    const resolved = resolveContainedExistingPath(root, alias ? alias[2] : candidate);
+    const resolved = resolveContainedExistingPath(home, relative);
+    if (isBlockedProfileRelPath(resolved.relPath)) return null;
     if (!fs.statSync(resolved.absPath).isFile()) return null;
-    return { absPath: resolved.absPath, relPath: `${SANDBOX_HOME_MOUNT}/.gemini/${kind}/${resolved.relPath}` };
+    return { absPath: resolved.absPath, relPath: `${SANDBOX_HOME_MOUNT}/${resolved.relPath}` };
   } catch {
     return null;
   }
