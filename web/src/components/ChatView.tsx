@@ -112,7 +112,7 @@ function formatContextPercent(used: number, size: number): string {
 }
 
 function formatTokenCount(count: number): string {
-  return new Intl.NumberFormat('en-US').format(Math.max(0, Math.round(count)));
+  return new Intl.NumberFormat(undefined).format(Math.max(0, Math.round(count)));
 }
 
 const ContextUsageControl: React.FC<{
