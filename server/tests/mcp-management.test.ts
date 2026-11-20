@@ -831,34 +831,45 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
       }
 
       if (reqUrl.pathname === '/mcp-stream-sse' && req.method === 'POST') {
-        const rpc = JSON.parse(bodyStr) as { id?: number | string; method: string };
+        const parsed = JSON.parse(bodyStr) as
+          | { id?: number | string; method: string; params?: { name?: string } }
+          | Array<{ id?: number | string; method: string; params?: { name?: string } }>;
+        const items = Array.isArray(parsed) ? parsed : [parsed];
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
-        if (rpc.method === 'initialize') {
-          res.end(
-            `event: message\ndata: ${JSON.stringify({
-              jsonrpc: '2.0',
-              id: rpc.id,
-              result: { protocolVersion: '2025-03-26', capabilities: {}, serverInfo: { name: 'http-sse-mcp', version: '1.0' } },
-            })}\n\n`
-          );
-          return;
+        for (const rpc of items) {
+          if (rpc.method === 'initialize') {
+            res.write(
+              `event: message\ndata: ${JSON.stringify({
+                jsonrpc: '2.0',
+                id: rpc.id,
+                result: { protocolVersion: '2025-03-26', capabilities: {}, serverInfo: { name: 'http-sse-mcp', version: '1.0' } },
+              })}\n\n`
+            );
+          } else if (rpc.method === 'tools/list') {
+            res.write(
+              `event: message\ndata: ${JSON.stringify({
+                jsonrpc: '2.0',
+                id: rpc.id,
+                result: {
+                  tools: [
+                    { name: 'safe_read', description: 'Read only' },
+                    { name: 'danger_delete', description: 'Destructive delete' },
+                  ],
+                },
+              })}\n\n`
+            );
+          } else if (rpc.method === 'tools/call') {
+            upstreamCalls.push(`http-sse:${rpc.params?.name ?? ''}`);
+            res.write(
+              `event: message\ndata: ${JSON.stringify({
+                jsonrpc: '2.0',
+                id: rpc.id,
+                result: { content: [{ type: 'text', text: `sse-ran:${rpc.params?.name ?? ''}` }] },
+              })}\n\n`
+            );
+          }
         }
-        if (rpc.method === 'tools/list') {
-          res.end(
-            `event: message\ndata: ${JSON.stringify({
-              jsonrpc: '2.0',
-              id: rpc.id,
-              result: {
-                tools: [
-                  { name: 'safe_read', description: 'Read only' },
-                  { name: 'danger_delete', description: 'Destructive delete' },
-                ],
-              },
-            })}\n\n`
-          );
-          return;
-        }
-        res.end('\n');
+        res.end();
         return;
       }
 
@@ -1163,6 +1174,21 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
     const streamListText = await streamListResp.text();
     expect(streamListText).toContain('safe_read');
     expect(streamListText).not.toContain('danger_delete');
+
+    const streamBatchResp = await fetch(streamSseAcp.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify([
+        { jsonrpc: '2.0', id: 21, method: 'tools/call', params: { name: 'safe_read' } },
+        { jsonrpc: '2.0', id: 22, method: 'tools/call', params: { name: 'danger_delete' } },
+      ]),
+    });
+    const streamBatchText = await streamBatchResp.text();
+    expect(streamBatchText).toContain('"id":21');
+    expect(streamBatchText).toContain('sse-ran:safe_read');
+    expect(streamBatchText).toContain('"id":22');
+    expect(streamBatchText).toContain('-32602');
+    expect(upstreamCalls).not.toContain('http-sse:danger_delete');
 
     // D) Exercise legacy SSE GET stream endpoint rewrite + async tools/list filter + POST call block
     const sseAcp = filteredServers.find((s) => s.name === 'sse-filtered') as { url: string };

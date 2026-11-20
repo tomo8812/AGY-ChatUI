@@ -528,6 +528,7 @@ function createPinnedLookup(target: PinnedOutboundTarget) {
 interface ForwardedMcpTarget extends PinnedOutboundTarget {
   allowedTools?: ReadonlySet<string>;
   trackedToolsListIds?: Set<string>;
+  activeSseResponses?: Set<http.ServerResponse>;
 }
 
 const MAX_FORWARDED_BODY_BYTES = 16 * 1024 * 1024;
@@ -735,6 +736,17 @@ class PinnedHttpsForwarder {
         delete respHeaders['content-encoding'];
         delete respHeaders['transfer-encoding'];
         res.writeHead(status, respHeaders);
+        if (req.method !== 'POST' && target.activeSseResponses) {
+          target.activeSseResponses.add(res);
+          res.once('close', () => {
+            target.activeSseResponses?.delete(res);
+          });
+        }
+        if (blockedBatchErrors.length > 0 && !res.writableEnded) {
+          for (const errPayload of blockedBatchErrors) {
+            res.write(`event: message\ndata: ${JSON.stringify(errPayload)}\n\n`);
+          }
+        }
         const { stream } = createDecodedResponseStream(upRes);
         const sseFilter = createSseMcpToolFilterTransform({
           allowedTools: target.allowedTools,
@@ -742,6 +754,9 @@ class PinnedHttpsForwarder {
           localToolsListIds,
           routeToken: token,
           upstreamOrigin: target.parsed.origin,
+        });
+        stream.on('error', () => {
+          if (!res.writableEnded) res.end();
         });
         sseFilter.on('error', () => {
           if (!res.writableEnded) res.end();
@@ -806,6 +821,15 @@ class PinnedHttpsForwarder {
             if (!res.writableEnded) res.end('Upstream MCP response error');
           });
         return;
+      }
+
+      if (blockedBatchErrors.length > 0 && target.activeSseResponses && target.activeSseResponses.size > 0) {
+        for (const sseRes of target.activeSseResponses) {
+          if (sseRes.writableEnded) continue;
+          for (const errPayload of blockedBatchErrors) {
+            sseRes.write(`event: message\ndata: ${JSON.stringify(errPayload)}\n\n`);
+          }
+        }
       }
 
       res.writeHead(status, upRes.headers);
@@ -2725,6 +2749,7 @@ export class McpService {
           ...target,
           allowedTools: new Set(allowedTools),
           trackedToolsListIds: new Set(),
+          activeSseResponses: new Set(),
         });
       } else if (needsPinnedForwarder && target.pinnedAddress) {
         if (target.parsed.protocol === 'http:') {
