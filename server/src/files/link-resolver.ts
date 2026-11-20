@@ -69,6 +69,16 @@ const BLOCKED_KEY_OR_ENV_EXTENSIONS = new Set([
   '.jks',
   '.keystore',
   '.kdbx',
+  '.ppk',
+  '.gpg',
+  '.der',
+]);
+
+const BLOCKED_PRIVATE_KEY_FILENAMES = new Set([
+  'id_rsa',
+  'id_ed25519',
+  'id_ecdsa',
+  'id_dsa',
 ]);
 
 const ALLOWED_GEMINI_USER_CONTENT_RE =
@@ -79,14 +89,18 @@ const ALLOWED_GEMINI_USER_CONTENT_RE =
  * - Under `.gemini/`, allow only user-authored content roots (skills, workflows, rules, agents, prompts, GEMINI.md),
  *   so Antigravity credentials and internal state (`oauth_creds.json`, `settings.json`, `mcp_config.json`, etc.) are denied by default.
  * - Outside `.gemini/`, deny all hidden dotfiles/dotdirs (`.ssh`, `.aws`, `.config`, `.local`, `.env*`, `.chat-*`, `.mock-agy-auth.json`, etc.).
- * - Always deny raw private-key / dotenv extensions (`.pem`, `.key`, `.p12`, `.env`, etc.).
+ * - Always deny standard SSH private key files and raw private-key / dotenv extensions (including compound suffixes like `.env.local`).
  */
 function isAllowedProfileRelPath(relPath: string): boolean {
   const segments = relPath.split('/').filter(Boolean);
   if (segments.length === 0) return false;
 
   const basename = segments[segments.length - 1].toLowerCase();
-  if (BLOCKED_KEY_OR_ENV_EXTENSIONS.has(path.extname(basename))) {
+  if (BLOCKED_PRIVATE_KEY_FILENAMES.has(basename)) {
+    return false;
+  }
+  const dotParts = basename.split('.');
+  if (dotParts.slice(1).some((part) => BLOCKED_KEY_OR_ENV_EXTENSIONS.has(`.${part}`))) {
     return false;
   }
 

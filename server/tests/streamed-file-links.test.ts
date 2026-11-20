@@ -349,7 +349,10 @@ describe('native and legacy file links', () => {
       '.gemini/config/skills/theme-factory/.env',
       'notes/private.pem',
       'notes/server.key',
+      'notes/key.ppk',
+      'notes/id_rsa',
       'notes/production.env',
+      'notes/app.env.local',
     ];
     for (const rel of secretPaths) {
       const full = path.join(aliceProfile, rel);
