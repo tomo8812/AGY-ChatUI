@@ -573,4 +573,70 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
 
     admin.closeWs();
   });
+
+  it('auto-detects Tailscale HTTPS callback origin safely without trusting arbitrary Host headers', async () => {
+    const { parseTailscaleDnsName, resolveRequestOriginWithTailscale } = await import(
+      '../src/routes/mcp-routes.js'
+    );
+    const { loadConfig } = await import('../src/config.js');
+    const cfg = loadConfig({ publicOrigin: null, allowedHosts: [] });
+
+    expect(
+      parseTailscaleDnsName(JSON.stringify({ Self: { DNSName: 'oracle-vm.tail1234.ts.net.' } }))
+    ).toBe('oracle-vm.tail1234.ts.net');
+    expect(parseTailscaleDnsName(JSON.stringify({ Self: { DNSName: 'evil.example.com.' } }))).toBeNull();
+
+    // Direct Tailscale Host header -> https://<tsHostname>
+    expect(
+      resolveRequestOriginWithTailscale(
+        {
+          protocol: 'https',
+          headers: { host: 'oracle-vm.tail1234.ts.net' },
+          socket: { localPort: 3000 } as never,
+        },
+        cfg,
+        'oracle-vm.tail1234.ts.net'
+      )
+    ).toBe('https://oracle-vm.tail1234.ts.net');
+
+    // Tailscale Serve rewriting Host to 127.0.0.1:3000 with X-Forwarded-Proto: https -> https://<tsHostname>
+    expect(
+      resolveRequestOriginWithTailscale(
+        {
+          protocol: 'https',
+          headers: { host: '127.0.0.1:3000' },
+          socket: { localPort: 3000 } as never,
+        },
+        cfg,
+        'oracle-vm.tail1234.ts.net'
+      )
+    ).toBe('https://oracle-vm.tail1234.ts.net');
+
+    // Spoofed Host header is never used
+    expect(
+      resolveRequestOriginWithTailscale(
+        {
+          protocol: 'http',
+          headers: { host: 'evil.example.com' },
+          socket: { localPort: 3000 } as never,
+        },
+        cfg,
+        'oracle-vm.tail1234.ts.net'
+      )
+    ).toBe('http://127.0.0.1:3000');
+
+    // Explicit PUBLIC_ORIGIN always takes precedence
+    const explicitCfg = loadConfig({ publicOrigin: 'https://chat.custom.example.com' });
+    expect(
+      resolveRequestOriginWithTailscale(
+        {
+          protocol: 'https',
+          headers: { host: 'oracle-vm.tail1234.ts.net' },
+          socket: { localPort: 3000 } as never,
+        },
+        explicitCfg,
+        'oracle-vm.tail1234.ts.net'
+      )
+    ).toBe('https://chat.custom.example.com');
+  });
 });

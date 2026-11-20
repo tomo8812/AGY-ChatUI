@@ -1,3 +1,5 @@
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import type { AcpClientManager } from '../acp/client-manager.js';
@@ -8,9 +10,56 @@ import { McpService, McpValidationError } from '../mcp/mcp-service.js';
 import type { McpScope } from '../types.js';
 import { requireAuth, type RouteDeps } from './auth-routes.js';
 
+const execFileAsync = promisify(execFile);
+
 export interface McpRouteDeps extends RouteDeps {
   mcpService: McpService;
   acp: AcpClientManager;
+}
+
+const TAILSCALE_HOST_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.ts\.net$/;
+const TAILSCALE_CACHE_OK_MS = 5 * 60 * 1000;
+const TAILSCALE_CACHE_MISS_MS = 30 * 1000;
+
+let cachedTailscaleHost: { value: string | null; expiresAt: number } | null = null;
+
+export function parseTailscaleDnsName(rawJson: string): string | null {
+  try {
+    const parsed = JSON.parse(rawJson) as { Self?: { DNSName?: unknown } };
+    const dnsName = parsed?.Self?.DNSName;
+    if (typeof dnsName !== 'string') return null;
+    const normalized = dnsName.trim().toLowerCase().replace(/\.+$/, '');
+    if (!TAILSCALE_HOST_RE.test(normalized)) return null;
+    return normalized;
+  } catch {
+    return null;
+  }
+}
+
+async function detectTailscaleHostname(config: AppConfig): Promise<string | null> {
+  if (config.nodeEnv === 'test') return null;
+  const now = Date.now();
+  if (cachedTailscaleHost && cachedTailscaleHost.expiresAt > now) {
+    return cachedTailscaleHost.value;
+  }
+  try {
+    const { stdout } = await execFileAsync('tailscale', ['status', '--json'], {
+      timeout: 1500,
+      maxBuffer: 1024 * 1024,
+    });
+    const hostname = parseTailscaleDnsName(stdout);
+    cachedTailscaleHost = {
+      value: hostname,
+      expiresAt: now + (hostname ? TAILSCALE_CACHE_OK_MS : TAILSCALE_CACHE_MISS_MS),
+    };
+    return hostname;
+  } catch {
+    cachedTailscaleHost = {
+      value: null,
+      expiresAt: now + TAILSCALE_CACHE_MISS_MS,
+    };
+    return null;
+  }
 }
 
 const secretEntrySchema = z.object({
@@ -109,11 +158,22 @@ function parseAllowlistedHost(
   }
 }
 
-function resolveRequestOrigin(req: FastifyRequest, config: AppConfig): string {
+export function resolveRequestOriginWithTailscale(
+  req: Pick<FastifyRequest, 'protocol' | 'headers' | 'socket'>,
+  config: AppConfig,
+  tailscaleHostname: string | null
+): string {
   if (config.publicOrigin) {
     return config.publicOrigin;
   }
   const proto = req.protocol === 'https' ? 'https' : 'http';
+  if (tailscaleHostname) {
+    const tsAllowlist = new Set<string>([tailscaleHostname]);
+    const matchedTsHost = parseAllowlistedHost(req.headers.host, tsAllowlist);
+    if (matchedTsHost || proto === 'https') {
+      return `https://${matchedTsHost ?? tailscaleHostname}`;
+    }
+  }
   const allowedHostnames = new Set<string>([
     '127.0.0.1',
     'localhost',
@@ -126,6 +186,14 @@ function resolveRequestOrigin(req: FastifyRequest, config: AppConfig): string {
   const fallbackHost = `${config.host}:${fallbackPort}`;
   const host = parseAllowlistedHost(req.headers.host, allowedHostnames) ?? fallbackHost;
   return `${proto}://${host}`;
+}
+
+async function resolveRequestOrigin(req: FastifyRequest, config: AppConfig): Promise<string> {
+  if (config.publicOrigin) {
+    return config.publicOrigin;
+  }
+  const tsHostname = await detectTailscaleHostname(config);
+  return resolveRequestOriginWithTailscale(req, config, tsHostname);
 }
 
 function escapeHtml(text: string): string {
@@ -233,9 +301,10 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
     const session = requireAdmin(req, reply, db);
     if (!session) return;
     const servers = mcpService.listServersForAdmin(session.user.id);
+    const origin = await resolveRequestOrigin(req, config);
     return {
       servers,
-      callbackUrl: `${resolveRequestOrigin(req, config)}/api/mcp/oauth/callback`,
+      callbackUrl: `${origin}/api/mcp/oauth/callback`,
     };
   });
 
@@ -335,7 +404,7 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
     if (!session) return;
     const { id } = req.params as { id: string };
     try {
-      const origin = resolveRequestOrigin(req, config);
+      const origin = await resolveRequestOrigin(req, config);
       const flow = await mcpService.startOAuthFlow(session.user.id, id, origin);
       return flow;
     } catch (err) {
