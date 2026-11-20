@@ -79,17 +79,31 @@ function handleMcpError(reply: FastifyReply, err: unknown) {
   });
 }
 
-function resolveRequestOrigin(req: FastifyRequest): string {
-  const xfProto = req.headers['x-forwarded-proto'];
-  const proto =
-    typeof xfProto === 'string' && xfProto.trim()
-      ? xfProto.split(',')[0].trim()
-      : req.protocol || 'http';
-  const xfHost = req.headers['x-forwarded-host'];
-  const host =
-    typeof xfHost === 'string' && xfHost.trim()
-      ? xfHost.split(',')[0].trim()
-      : req.headers.host || '127.0.0.1:3000';
+function parseValidatedHost(rawHost: string | undefined): string | null {
+  if (!rawHost) return null;
+  const trimmed = rawHost.trim().toLowerCase();
+  if (!trimmed || /[\s/\\@?#]/.test(trimmed)) return null;
+  try {
+    const parsed = new URL(`http://${trimmed}`);
+    if (
+      parsed.username ||
+      parsed.password ||
+      parsed.pathname !== '/' ||
+      parsed.search ||
+      parsed.hash ||
+      parsed.host !== trimmed
+    ) {
+      return null;
+    }
+    return parsed.host;
+  } catch {
+    return null;
+  }
+}
+
+function resolveRequestOrigin(req: FastifyRequest, fallbackPort: number): string {
+  const proto = req.protocol === 'https' ? 'https' : 'http';
+  const host = parseValidatedHost(req.headers.host) ?? `127.0.0.1:${fallbackPort}`;
   return `${proto}://${host}`;
 }
 
@@ -184,7 +198,7 @@ function renderOAuthCallbackHtml(payload: {
 }
 
 export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps): Promise<void> {
-  const { db, mcpService, acp } = deps;
+  const { config, db, mcpService, acp } = deps;
 
   const refreshWorkersForScope = async (scope: McpScope, ownerUserId: string | null) => {
     if (scope === 'shared') {
@@ -200,7 +214,7 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
     const servers = mcpService.listServersForAdmin(session.user.id);
     return {
       servers,
-      callbackUrl: `${resolveRequestOrigin(req)}/api/mcp/oauth/callback`,
+      callbackUrl: `${resolveRequestOrigin(req, config.port)}/api/mcp/oauth/callback`,
     };
   });
 
@@ -300,7 +314,7 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
     if (!session) return;
     const { id } = req.params as { id: string };
     try {
-      const origin = resolveRequestOrigin(req);
+      const origin = resolveRequestOrigin(req, config.port);
       const flow = await mcpService.startOAuthFlow(session.user.id, id, origin);
       return flow;
     } catch (err) {

@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import dns from 'node:dns/promises';
+import net from 'node:net';
 import type { McpCapabilities, McpServer } from '@agentclientprotocol/sdk';
 import { resolveHostExecutable } from '../acp/env-isolation.js';
 import { decryptSmallSecret, encryptSmallSecret } from '../auth/password.js';
@@ -122,7 +124,67 @@ export function validateMcpName(raw: string): string {
   return name;
 }
 
-export function validateRemoteUrl(raw: string, fieldLabel = 'URL'): string {
+function normalizeHostnameForIpCheck(hostname: string): string {
+  const lower = hostname.trim().toLowerCase();
+  if (lower.startsWith('[') && lower.endsWith(']')) {
+    return lower.slice(1, -1);
+  }
+  return lower;
+}
+
+function isBlockedIpv4(ip: string): boolean {
+  const parts = ip.split('.').map((p) => Number.parseInt(p, 10));
+  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
+    return true;
+  }
+  const [a, b] = parts;
+  if (a === 0) return true; // 0.0.0.0/8 ("this network")
+  if (a === 10) return true; // 10.0.0.0/8 (private)
+  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 (CGNAT)
+  if (a === 127) return true; // 127.0.0.0/8 (loopback)
+  if (a === 169 && b === 254) return true; // 169.254.0.0/16 (link-local / cloud metadata)
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 (private)
+  if (a === 192 && b === 168) return true; // 192.168.0.0/16 (private)
+  if (a >= 224) return true; // multicast / reserved
+  return false;
+}
+
+export function isBlockedIpAddress(rawIp: string): boolean {
+  const ip = normalizeHostnameForIpCheck(rawIp).split('%')[0];
+  const ipVersion = net.isIP(ip);
+  if (ipVersion === 4) {
+    return isBlockedIpv4(ip);
+  }
+  if (ipVersion === 6) {
+    const lower = ip.toLowerCase();
+    if (lower === '::' || lower === '::1') return true;
+    // IPv4-mapped IPv6 (dotted or hex form)
+    const mappedDotted = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(lower);
+    if (mappedDotted) {
+      return isBlockedIpv4(mappedDotted[1]);
+    }
+    const mappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(lower);
+    if (mappedHex) {
+      const hi = Number.parseInt(mappedHex[1], 16);
+      const lo = Number.parseInt(mappedHex[2], 16);
+      const v4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+      return isBlockedIpv4(v4);
+    }
+    // Unique local (fc00::/7), link-local (fe80::/10), multicast (ff00::/8)
+    const firstHextet = Number.parseInt(lower.split(':')[0] || '0', 16);
+    if ((firstHextet & 0xfe00) === 0xfc00) return true;
+    if ((firstHextet & 0xffc0) === 0xfe80) return true;
+    if ((firstHextet & 0xff00) === 0xff00) return true;
+    return false;
+  }
+  return false;
+}
+
+export function validateRemoteUrl(
+  raw: string,
+  fieldLabel = 'URL',
+  opts: { allowPrivate?: boolean } = {}
+): string {
   const trimmed = raw.trim();
   if (!trimmed) {
     throw new McpValidationError('INVALID_URL', `${fieldLabel}を入力してください。`);
@@ -139,7 +201,68 @@ export function validateRemoteUrl(raw: string, fieldLabel = 'URL'): string {
       `${fieldLabel}は http:// または https:// で始まる URL を指定してください。`
     );
   }
+  if (!opts.allowPrivate) {
+    const host = normalizeHostnameForIpCheck(parsed.hostname);
+    if (!host || host === 'localhost' || host.endsWith('.localhost')) {
+      throw new McpValidationError(
+        'BLOCKED_PRIVATE_URL',
+        `${fieldLabel}にループバック・プライベート・リンクローカルアドレスは指定できません。`
+      );
+    }
+    if (net.isIP(host) !== 0 && isBlockedIpAddress(host)) {
+      throw new McpValidationError(
+        'BLOCKED_PRIVATE_URL',
+        `${fieldLabel}にループバック・プライベート・リンクローカルアドレスは指定できません。`
+      );
+    }
+  }
   return parsed.toString();
+}
+
+function tryValidateRemoteUrl(
+  raw: string | null | undefined,
+  opts: { allowPrivate?: boolean } = {}
+): string | null {
+  if (!raw || !raw.trim()) return null;
+  try {
+    return validateRemoteUrl(raw, 'URL', opts);
+  } catch {
+    return null;
+  }
+}
+
+export async function assertSafeOutboundUrl(
+  rawUrl: string,
+  opts: { allowPrivate?: boolean } = {}
+): Promise<string> {
+  const normalized = validateRemoteUrl(rawUrl, 'URL', opts);
+  if (opts.allowPrivate) return normalized;
+
+  const parsed = new URL(normalized);
+  const host = normalizeHostnameForIpCheck(parsed.hostname);
+  if (net.isIP(host) !== 0) {
+    if (isBlockedIpAddress(host)) {
+      throw new McpValidationError(
+        'BLOCKED_PRIVATE_URL',
+        'ループバック・プライベート・リンクローカルアドレスへの接続は許可されていません。'
+      );
+    }
+    return normalized;
+  }
+
+  let resolved: Array<{ address: string }>;
+  try {
+    resolved = await dns.lookup(host, { all: true });
+  } catch {
+    throw new McpValidationError('DNS_RESOLUTION_FAILED', `ホスト名 "${host}" を名前解決できませんでした。`);
+  }
+  if (resolved.length === 0 || resolved.some((entry) => isBlockedIpAddress(entry.address))) {
+    throw new McpValidationError(
+      'BLOCKED_PRIVATE_URL',
+      'ループバック・プライベート・リンクローカルアドレスへの接続は許可されていません。'
+    );
+  }
+  return normalized;
 }
 
 function assertNoControlChars(value: string, label: string): void {
@@ -192,12 +315,13 @@ function extractResourceMetadataUrlFromWwwAuthenticate(headerVal: string | null)
 async function fetchJsonWithTimeout(
   url: string,
   init: RequestInit = {},
-  timeoutMs = DISCOVERY_TIMEOUT_MS
+  opts: { timeoutMs?: number; allowPrivate?: boolean } = {}
 ): Promise<{ status: number; headers: Headers; json: Record<string, unknown> | null; text: string }> {
+  const safeUrl = await assertSafeOutboundUrl(url, { allowPrivate: opts.allowPrivate });
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? DISCOVERY_TIMEOUT_MS);
   try {
-    const res = await fetch(url, { ...init, signal: controller.signal });
+    const res = await fetch(safeUrl, { ...init, redirect: 'error', signal: controller.signal });
     const text = await res.text().catch(() => '');
     let json: Record<string, unknown> | null = null;
     try {
@@ -306,25 +430,26 @@ export class McpService {
   ): McpOAuthConfig | null {
     if (input === null) return null;
     if (input === undefined) return existing;
+    const urlOpts = { allowPrivate: this.config.allowPrivateMcpUrls };
 
     const merged: McpOAuthConfig = {
       clientId: input.clientId !== undefined ? (input.clientId?.trim() || null) : (existing?.clientId ?? null),
       authorizationUrl:
         input.authorizationUrl !== undefined
-          ? (input.authorizationUrl?.trim() ? validateRemoteUrl(input.authorizationUrl, 'Authorization URL') : null)
+          ? (input.authorizationUrl?.trim() ? validateRemoteUrl(input.authorizationUrl, 'Authorization URL', urlOpts) : null)
           : (existing?.authorizationUrl ?? null),
       tokenUrl:
         input.tokenUrl !== undefined
-          ? (input.tokenUrl?.trim() ? validateRemoteUrl(input.tokenUrl, 'Token URL') : null)
+          ? (input.tokenUrl?.trim() ? validateRemoteUrl(input.tokenUrl, 'Token URL', urlOpts) : null)
           : (existing?.tokenUrl ?? null),
       registrationUrl:
         input.registrationUrl !== undefined
-          ? (input.registrationUrl?.trim() ? validateRemoteUrl(input.registrationUrl, 'Registration URL') : null)
+          ? (input.registrationUrl?.trim() ? validateRemoteUrl(input.registrationUrl, 'Registration URL', urlOpts) : null)
           : (existing?.registrationUrl ?? null),
       scopes: input.scopes !== undefined ? (input.scopes?.trim() || null) : (existing?.scopes ?? null),
       resource:
         input.resource !== undefined
-          ? (input.resource?.trim() ? validateRemoteUrl(input.resource, 'Resource URL') : null)
+          ? (input.resource?.trim() ? validateRemoteUrl(input.resource, 'Resource URL', urlOpts) : null)
           : (existing?.resource ?? null),
       extraAuthParams:
         input.extraAuthParams !== undefined
@@ -484,7 +609,9 @@ export class McpService {
       encryptedEnvJson = this.encryptRecord(envMap);
       authType = 'none';
     } else {
-      url = validateRemoteUrl(input.url ?? '', 'リモートMCP URL');
+      url = validateRemoteUrl(input.url ?? '', 'リモートMCP URL', {
+        allowPrivate: this.config.allowPrivateMcpUrls,
+      });
       authType = input.authType ?? 'none';
       const headerMap = this.mergeSecretEntries(input.headers, {}, 'HTTPヘッダー');
       encryptedHeadersJson = this.encryptRecord(headerMap);
@@ -595,7 +722,9 @@ export class McpService {
       nextOAuthError = null;
     } else {
       const rawUrl = input.url !== undefined ? (input.url ?? '') : (existing.url ?? '');
-      nextUrl = validateRemoteUrl(rawUrl, 'リモートMCP URL');
+      nextUrl = validateRemoteUrl(rawUrl, 'リモートMCP URL', {
+        allowPrivate: this.config.allowPrivateMcpUrls,
+      });
       nextAuthType = input.authType !== undefined ? input.authType : existing.authType;
       nextCommand = null;
       nextArgsJson = '[]';
@@ -722,118 +851,122 @@ export class McpService {
         skipped.push(rawName);
         continue;
       }
-      const cfg = rawCfg as Record<string, unknown>;
-      const name = validateMcpName(rawName);
+      try {
+        const cfg = rawCfg as Record<string, unknown>;
+        const name = validateMcpName(rawName);
 
-      const remoteUrlRaw =
-        (typeof cfg.serverUrl === 'string' && cfg.serverUrl.trim()) ||
-        (typeof cfg.url === 'string' && cfg.url.trim()) ||
-        (typeof cfg.httpUrl === 'string' && cfg.httpUrl.trim()) ||
-        null;
-      const commandRaw = typeof cfg.command === 'string' && cfg.command.trim() ? cfg.command.trim() : null;
+        const remoteUrlRaw =
+          (typeof cfg.serverUrl === 'string' && cfg.serverUrl.trim()) ||
+          (typeof cfg.url === 'string' && cfg.url.trim()) ||
+          (typeof cfg.httpUrl === 'string' && cfg.httpUrl.trim()) ||
+          null;
+        const commandRaw = typeof cfg.command === 'string' && cfg.command.trim() ? cfg.command.trim() : null;
 
-      if (!remoteUrlRaw && !commandRaw) {
-        skipped.push(rawName);
-        continue;
-      }
-
-      const rawType = typeof cfg.type === 'string' ? cfg.type.toLowerCase() : typeof cfg.transport === 'string' ? cfg.transport.toLowerCase() : '';
-      let transport: McpTransport;
-      if (commandRaw && rawType !== 'http' && rawType !== 'sse') {
-        transport = 'stdio';
-      } else if (rawType === 'sse' || (remoteUrlRaw && /\/sse\/?(?:\?|$)/i.test(remoteUrlRaw))) {
-        transport = 'sse';
-      } else {
-        transport = 'http';
-      }
-
-      const args = Array.isArray(cfg.args) ? cfg.args.filter((a): a is string => typeof a === 'string') : [];
-      const envEntries: SecretKeyValueInput[] = [];
-      if (cfg.env && typeof cfg.env === 'object' && !Array.isArray(cfg.env)) {
-        for (const [k, v] of Object.entries(cfg.env as Record<string, unknown>)) {
-          if (typeof v === 'string') envEntries.push({ name: k, value: v });
-        }
-      }
-
-      const headerEntries: SecretKeyValueInput[] = [];
-      if (cfg.headers && typeof cfg.headers === 'object' && !Array.isArray(cfg.headers)) {
-        for (const [k, v] of Object.entries(cfg.headers as Record<string, unknown>)) {
-          if (typeof v === 'string') headerEntries.push({ name: k, value: v });
-        }
-      }
-
-      let authType: McpAuthType = 'none';
-      let oauthConfig: McpOAuthConfigInput | null = null;
-      if (transport !== 'stdio') {
-        if (cfg.oauth && typeof cfg.oauth === 'object' && !Array.isArray(cfg.oauth)) {
-          const o = cfg.oauth as Record<string, unknown>;
-          authType = 'oauth';
-          oauthConfig = {
-            clientId: typeof o.clientId === 'string' ? o.clientId : typeof o.client_id === 'string' ? o.client_id : null,
-            clientSecret:
-              typeof o.clientSecret === 'string' ? o.clientSecret : typeof o.client_secret === 'string' ? o.client_secret : null,
-            authorizationUrl:
-              typeof o.authorizationUrl === 'string'
-                ? o.authorizationUrl
-                : typeof o.authorization_url === 'string'
-                  ? o.authorization_url
-                  : null,
-            tokenUrl:
-              typeof o.tokenUrl === 'string' ? o.tokenUrl : typeof o.token_url === 'string' ? o.token_url : null,
-            scopes:
-              typeof o.scopes === 'string'
-                ? o.scopes
-                : Array.isArray(o.scopes)
-                  ? o.scopes.filter((s): s is string => typeof s === 'string').join(' ')
-                  : null,
-          };
-        } else if (headerEntries.length > 0) {
-          const authHeader = headerEntries.find((h) => h.name.toLowerCase() === 'authorization');
-          if (authHeader && /^bearer\s+/i.test(authHeader.value ?? '')) {
-            authType = 'bearer';
-          } else if (headerEntries.length === 1 && /api[-_]?key/i.test(headerEntries[0].name)) {
-            authType = 'api_key';
-          } else {
-            authType = 'headers';
-          }
-        }
-      }
-
-      const existing = this.db.findMcpServerByScopeAndName(params.scope, ownerUserId, name);
-      if (existing) {
-        if (!params.overwrite) {
-          skipped.push(name);
+        if (!remoteUrlRaw && !commandRaw) {
+          skipped.push(rawName);
           continue;
         }
-        const updated = this.updateServer(adminUserId, existing.id, {
-          description: typeof cfg.description === 'string' ? cfg.description : existing.description,
-          transport,
-          enabled: typeof cfg.disabled === 'boolean' ? !cfg.disabled : true,
-          command: commandRaw,
-          args,
-          env: envEntries,
-          url: remoteUrlRaw,
-          authType,
-          headers: headerEntries,
-          oauthConfig,
-        });
-        imported.push(updated);
-      } else {
-        const created = this.createServer(adminUserId, {
-          name,
-          description: typeof cfg.description === 'string' ? cfg.description : '',
-          scope: params.scope,
-          transport,
-          enabled: typeof cfg.disabled === 'boolean' ? !cfg.disabled : true,
-          command: commandRaw,
-          args,
-          env: envEntries,
-          url: remoteUrlRaw,
-          authType,
-          headers: headerEntries,
-          oauthConfig,
-        });
-        imported.push(created);
+
+        const rawType = typeof cfg.type === 'string' ? cfg.type.toLowerCase() : typeof cfg.transport === 'string' ? cfg.transport.toLowerCase() : '';
+        let transport: McpTransport;
+        if (commandRaw && rawType !== 'http' && rawType !== 'sse') {
+          transport = 'stdio';
+        } else if (rawType === 'sse' || (remoteUrlRaw && /\/sse\/?(?:\?|$)/i.test(remoteUrlRaw))) {
+          transport = 'sse';
+        } else {
+          transport = 'http';
+        }
+
+        const args = Array.isArray(cfg.args) ? cfg.args.filter((a): a is string => typeof a === 'string') : [];
+        const envEntries: SecretKeyValueInput[] = [];
+        if (cfg.env && typeof cfg.env === 'object' && !Array.isArray(cfg.env)) {
+          for (const [k, v] of Object.entries(cfg.env as Record<string, unknown>)) {
+            if (typeof v === 'string') envEntries.push({ name: k, value: v });
+          }
+        }
+
+        const headerEntries: SecretKeyValueInput[] = [];
+        if (cfg.headers && typeof cfg.headers === 'object' && !Array.isArray(cfg.headers)) {
+          for (const [k, v] of Object.entries(cfg.headers as Record<string, unknown>)) {
+            if (typeof v === 'string') headerEntries.push({ name: k, value: v });
+          }
+        }
+
+        let authType: McpAuthType = 'none';
+        let oauthConfig: McpOAuthConfigInput | null = null;
+        if (transport !== 'stdio') {
+          if (cfg.oauth && typeof cfg.oauth === 'object' && !Array.isArray(cfg.oauth)) {
+            const o = cfg.oauth as Record<string, unknown>;
+            authType = 'oauth';
+            oauthConfig = {
+              clientId: typeof o.clientId === 'string' ? o.clientId : typeof o.client_id === 'string' ? o.client_id : null,
+              clientSecret:
+                typeof o.clientSecret === 'string' ? o.clientSecret : typeof o.client_secret === 'string' ? o.client_secret : null,
+              authorizationUrl:
+                typeof o.authorizationUrl === 'string'
+                  ? o.authorizationUrl
+                  : typeof o.authorization_url === 'string'
+                    ? o.authorization_url
+                    : null,
+              tokenUrl:
+                typeof o.tokenUrl === 'string' ? o.tokenUrl : typeof o.token_url === 'string' ? o.token_url : null,
+              scopes:
+                typeof o.scopes === 'string'
+                  ? o.scopes
+                  : Array.isArray(o.scopes)
+                    ? o.scopes.filter((s): s is string => typeof s === 'string').join(' ')
+                    : null,
+            };
+          } else if (headerEntries.length > 0) {
+            const authHeader = headerEntries.find((h) => h.name.toLowerCase() === 'authorization');
+            if (authHeader && /^bearer\s+/i.test(authHeader.value ?? '')) {
+              authType = 'bearer';
+            } else if (headerEntries.length === 1 && /api[-_]?key/i.test(headerEntries[0].name)) {
+              authType = 'api_key';
+            } else {
+              authType = 'headers';
+            }
+          }
+        }
+
+        const existing = this.db.findMcpServerByScopeAndName(params.scope, ownerUserId, name);
+        if (existing) {
+          if (!params.overwrite) {
+            skipped.push(name);
+            continue;
+          }
+          const updated = this.updateServer(adminUserId, existing.id, {
+            description: typeof cfg.description === 'string' ? cfg.description : existing.description,
+            transport,
+            enabled: typeof cfg.disabled === 'boolean' ? !cfg.disabled : true,
+            command: commandRaw,
+            args,
+            env: envEntries,
+            url: remoteUrlRaw,
+            authType,
+            headers: headerEntries,
+            oauthConfig,
+          });
+          imported.push(updated);
+        } else {
+          const created = this.createServer(adminUserId, {
+            name,
+            description: typeof cfg.description === 'string' ? cfg.description : '',
+            scope: params.scope,
+            transport,
+            enabled: typeof cfg.disabled === 'boolean' ? !cfg.disabled : true,
+            command: commandRaw,
+            args,
+            env: envEntries,
+            url: remoteUrlRaw,
+            authType,
+            headers: headerEntries,
+            oauthConfig,
+          });
+          imported.push(created);
+        }
+      } catch {
+        skipped.push(rawName);
       }
     }
 
@@ -850,7 +983,9 @@ export class McpService {
   // ---- OAuth 2.0 / 2.1 Discovery, DCR, PKCE Flow & Refresh ----
 
   async discoverOAuthMetadata(mcpUrl: string): Promise<DiscoveredOAuthMetadata> {
-    const parsedUrl = new URL(mcpUrl);
+    const urlOpts = { allowPrivate: this.config.allowPrivateMcpUrls };
+    const safeMcpUrl = validateRemoteUrl(mcpUrl, 'リモートMCP URL', urlOpts);
+    const parsedUrl = new URL(safeMcpUrl);
     const origin = parsedUrl.origin;
     const pathSuffix = parsedUrl.pathname === '/' ? '' : parsedUrl.pathname.replace(/\/+$/, '');
 
@@ -858,23 +993,27 @@ export class McpService {
 
     // 1) Probe MCP URL for WWW-Authenticate resource_metadata header (RFC 9728)
     try {
-      const probe = await fetchJsonWithTimeout(mcpUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json, text/event-stream',
-        },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'initialize',
-          params: {
-            protocolVersion: '2025-03-26',
-            capabilities: {},
-            clientInfo: { name: 'antigravity-chat-ui', version: this.config.appVersion },
+      const probe = await fetchJsonWithTimeout(
+        safeMcpUrl,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json, text/event-stream',
           },
-        }),
-      });
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'initialize',
+            params: {
+              protocolVersion: '2025-03-26',
+              capabilities: {},
+              clientInfo: { name: 'antigravity-chat-ui', version: this.config.appVersion },
+            },
+          }),
+        },
+        urlOpts
+      );
       if (probe.status === 401) {
         resourceMetadataUrl = extractResourceMetadataUrlFromWwwAuthenticate(
           probe.headers.get('www-authenticate')
@@ -887,7 +1026,8 @@ export class McpService {
     const prmCandidates: string[] = [];
     if (resourceMetadataUrl) {
       try {
-        prmCandidates.push(new URL(resourceMetadataUrl, mcpUrl).toString());
+        const resolved = tryValidateRemoteUrl(new URL(resourceMetadataUrl, safeMcpUrl).toString(), urlOpts);
+        if (resolved) prmCandidates.push(resolved);
       } catch {
         // ignore invalid URL
       }
@@ -899,21 +1039,27 @@ export class McpService {
 
     let authServerIssuer: string | null = null;
     let scopes: string[] = [];
-    let resource: string | null = mcpUrl;
+    let resource: string | null = safeMcpUrl;
 
     for (const candidate of prmCandidates) {
       try {
-        const res = await fetchJsonWithTimeout(candidate, { method: 'GET', headers: { Accept: 'application/json' } });
+        const res = await fetchJsonWithTimeout(
+          candidate,
+          { method: 'GET', headers: { Accept: 'application/json' } },
+          urlOpts
+        );
         if (res.status >= 200 && res.status < 300 && res.json) {
           const servers = res.json.authorization_servers;
-          if (Array.isArray(servers) && typeof servers[0] === 'string' && servers[0].trim()) {
-            authServerIssuer = servers[0].trim();
+          if (Array.isArray(servers) && typeof servers[0] === 'string') {
+            const validIssuer = tryValidateRemoteUrl(servers[0], urlOpts);
+            if (validIssuer) authServerIssuer = validIssuer;
           }
           if (Array.isArray(res.json.scopes_supported)) {
             scopes = res.json.scopes_supported.filter((s): s is string => typeof s === 'string');
           }
-          if (typeof res.json.resource === 'string' && res.json.resource.trim()) {
-            resource = res.json.resource.trim();
+          if (typeof res.json.resource === 'string') {
+            const validResource = tryValidateRemoteUrl(res.json.resource, urlOpts);
+            if (validResource) resource = validResource;
           }
           if (authServerIssuer) break;
         }
@@ -944,16 +1090,20 @@ export class McpService {
 
     for (const candidate of asCandidates) {
       try {
-        const res = await fetchJsonWithTimeout(candidate, { method: 'GET', headers: { Accept: 'application/json' } });
+        const res = await fetchJsonWithTimeout(
+          candidate,
+          { method: 'GET', headers: { Accept: 'application/json' } },
+          urlOpts
+        );
         if (res.status >= 200 && res.status < 300 && res.json) {
           if (typeof res.json.authorization_endpoint === 'string') {
-            authorizationUrl = res.json.authorization_endpoint;
+            authorizationUrl = tryValidateRemoteUrl(res.json.authorization_endpoint, urlOpts);
           }
           if (typeof res.json.token_endpoint === 'string') {
-            tokenUrl = res.json.token_endpoint;
+            tokenUrl = tryValidateRemoteUrl(res.json.token_endpoint, urlOpts);
           }
           if (typeof res.json.registration_endpoint === 'string') {
-            registrationUrl = res.json.registration_endpoint;
+            registrationUrl = tryValidateRemoteUrl(res.json.registration_endpoint, urlOpts);
           }
           if (scopes.length === 0 && Array.isArray(res.json.scopes_supported)) {
             scopes = res.json.scopes_supported.filter((s): s is string => typeof s === 'string');
@@ -1001,6 +1151,7 @@ export class McpService {
       throw new McpValidationError('OAUTH_NOT_ENABLED', '認証方式を OAuth に設定してから認証を開始してください。');
     }
 
+    const urlOpts = { allowPrivate: this.config.allowPrivateMcpUrls };
     const redirectUri = `${origin.replace(/\/+$/, '')}/api/mcp/oauth/callback`;
     const existingCfg = parseJsonObject<McpOAuthConfig>(row.oauthConfigJson) ?? {};
     let authorizationUrl = existingCfg.authorizationUrl ?? null;
@@ -1031,19 +1182,29 @@ export class McpService {
       );
     }
 
+    authorizationUrl = validateRemoteUrl(authorizationUrl, 'Authorization URL', urlOpts);
+    tokenUrl = validateRemoteUrl(tokenUrl, 'Token URL', urlOpts);
+    if (registrationUrl) {
+      registrationUrl = validateRemoteUrl(registrationUrl, 'Registration URL', urlOpts);
+    }
+
     // Dynamic Client Registration (RFC 7591) when clientId is not configured
     if (!clientId && registrationUrl) {
-      const dcrRes = await fetchJsonWithTimeout(registrationUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({
-          client_name: 'AGY-ChatUI',
-          redirect_uris: [redirectUri],
-          grant_types: ['authorization_code', 'refresh_token'],
-          response_types: ['code'],
-          token_endpoint_auth_method: 'none',
-        }),
-      });
+      const dcrRes = await fetchJsonWithTimeout(
+        registrationUrl,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify({
+            client_name: 'AGY-ChatUI',
+            redirect_uris: [redirectUri],
+            grant_types: ['authorization_code', 'refresh_token'],
+            response_types: ['code'],
+            token_endpoint_auth_method: 'none',
+          }),
+        },
+        urlOpts
+      );
       if (dcrRes.status < 200 || dcrRes.status >= 300 || !dcrRes.json || typeof dcrRes.json.client_id !== 'string') {
         throw new McpValidationError(
           'OAUTH_DCR_FAILED',
@@ -1183,11 +1344,15 @@ export class McpService {
       Accept: 'application/json',
     };
 
-    const tokenRes = await fetchJsonWithTimeout(flow.tokenUrl, {
-      method: 'POST',
-      headers: tokenHeaders,
-      body: body.toString(),
-    });
+    const tokenRes = await fetchJsonWithTimeout(
+      flow.tokenUrl,
+      {
+        method: 'POST',
+        headers: tokenHeaders,
+        body: body.toString(),
+      },
+      { allowPrivate: this.config.allowPrivateMcpUrls }
+    );
 
     if (tokenRes.status < 200 || tokenRes.status >= 300 || !tokenRes.json || typeof tokenRes.json.access_token !== 'string') {
       const detail =
@@ -1278,14 +1443,18 @@ export class McpService {
         body.set('resource', cfg.resource);
       }
 
-      const res = await fetchJsonWithTimeout(cfg.tokenUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Accept: 'application/json',
+      const res = await fetchJsonWithTimeout(
+        cfg.tokenUrl,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Accept: 'application/json',
+          },
+          body: body.toString(),
         },
-        body: body.toString(),
-      });
+        { allowPrivate: this.config.allowPrivateMcpUrls }
+      );
 
       if (res.status < 200 || res.status >= 300 || !res.json || typeof res.json.access_token !== 'string') {
         const detail =
@@ -1375,12 +1544,17 @@ export class McpService {
       }
     }
 
+    const urlOpts = { allowPrivate: this.config.allowPrivateMcpUrls };
     try {
       if (row.transport === 'sse') {
-        const res = await fetchJsonWithTimeout(row.url, {
-          method: 'GET',
-          headers: { Accept: 'text/event-stream', ...headers },
-        });
+        const res = await fetchJsonWithTimeout(
+          row.url,
+          {
+            method: 'GET',
+            headers: { Accept: 'text/event-stream', ...headers },
+          },
+          urlOpts
+        );
         if (res.status === 401) {
           const discovered = await this.discoverOAuthMetadata(row.url);
           return {
@@ -1410,24 +1584,28 @@ export class McpService {
       }
 
       // Streamable HTTP MCP initialize probe
-      const res = await fetchJsonWithTimeout(row.url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json, text/event-stream',
-          ...headers,
-        },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'initialize',
-          params: {
-            protocolVersion: '2025-03-26',
-            capabilities: {},
-            clientInfo: { name: 'antigravity-chat-ui', version: this.config.appVersion },
+      const res = await fetchJsonWithTimeout(
+        row.url,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json, text/event-stream',
+            ...headers,
           },
-        }),
-      });
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'initialize',
+            params: {
+              protocolVersion: '2025-03-26',
+              capabilities: {},
+              clientInfo: { name: 'antigravity-chat-ui', version: this.config.appVersion },
+            },
+          }),
+        },
+        urlOpts
+      );
 
       if (res.status === 401) {
         const discovered = await this.discoverOAuthMetadata(row.url);

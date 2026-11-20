@@ -34,6 +34,7 @@ export interface AppConfig {
   idleWorkerMs: number;
   maxUploadBytes: number;
   allowPublicSignup: boolean;
+  allowPrivateMcpUrls: boolean;
   secureCookies: 'auto' | 'always' | 'never';
   vapidSubject: string;
 }
@@ -107,6 +108,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     idleWorkerMs: parsePositiveInt(process.env.IDLE_WORKER_MS, 10 * 60 * 1000),
     maxUploadBytes: parsePositiveInt(process.env.MAX_UPLOAD_MB, 50) * 1024 * 1024,
     allowPublicSignup: parseBool(process.env.ALLOW_PUBLIC_SIGNUP, true),
+    allowPrivateMcpUrls: parseBool(process.env.ALLOW_PRIVATE_MCP_URLS, false),
     secureCookies,
     vapidSubject: process.env.VAPID_SUBJECT ?? 'https://github.com/tomo8812/AGY-ChatUI',
   };

@@ -231,7 +231,34 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
     const adminSharedApi = adminMcp.find((m) => m.name === 'shared-api') as { url: string };
     expect(adminSharedApi.url).toBe('https://admin-override.example.com/mcp');
 
-    // JSON import supports standard mcpServers format (both stdio and remote serverUrl)
+    // SSRF protection: reject loopback, private, and link-local/metadata URLs by default
+    for (const blockedUrl of [
+      'http://169.254.169.254/latest/meta-data/',
+      'http://127.0.0.1:8080/mcp',
+      'http://localhost:3000/mcp',
+      'http://10.0.0.1/mcp',
+      'http://[::1]/mcp',
+    ]) {
+      const ssrfRes = await admin.request('POST', '/api/mcp/servers', {
+        name: 'ssrf-test',
+        scope: 'profile',
+        transport: 'http',
+        url: blockedUrl,
+      });
+      expect(ssrfRes.status).toBe(400);
+    }
+
+    // X-Forwarded-Host header must not override callbackUrl host
+    const listWithSpoofedHost = await admin.request<{ callbackUrl: string }>(
+      'GET',
+      '/api/mcp/servers',
+      undefined,
+      { headers: { 'x-forwarded-host': 'evil.example.com' } }
+    );
+    expect(listWithSpoofedHost.status).toBe(200);
+    expect(listWithSpoofedHost.data.callbackUrl).not.toContain('evil.example.com');
+
+    // JSON import skips invalid names instead of aborting valid entries
     const importRes = await admin.request<{ imported: Array<{ name: string; transport: string }>; skipped: string[] }>(
       'POST',
       '/api/mcp/import',
@@ -239,6 +266,9 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
         scope: 'profile',
         rawJson: JSON.stringify({
           mcpServers: {
+            'bad name!': {
+              serverUrl: 'https://invalid-name.example.com/mcp',
+            },
             'imported-remote': {
               serverUrl: 'https://imported.example.com/mcp',
               headers: { Authorization: 'Bearer imported-tok' },
@@ -256,13 +286,14 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
       'imported-remote',
       'imported-stdio',
     ]);
+    expect(importRes.data.skipped).toContain('bad name!');
 
     admin.closeWs();
     regular.closeWs();
   });
 
   it('completes full Remote MCP OAuth 2.1 flow (RFC 9728 + RFC 8414 + DCR + PKCE + refresh) and injects Bearer token into ACP', async () => {
-    const srv = await createTestServer();
+    const srv = await createTestServer({ allowPrivateMcpUrls: true });
     servers.push(srv);
 
     const { client: admin } = await registerAndBindAgy(srv.baseUrl, 'oauthadmin', 'user:oauth-a');
