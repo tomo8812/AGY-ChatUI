@@ -770,6 +770,17 @@ export class McpService {
     return merged;
   }
 
+  private static readonly RESERVED_OAUTH_PARAMS = new Set([
+    'response_type',
+    'client_id',
+    'redirect_uri',
+    'state',
+    'code_challenge',
+    'code_challenge_method',
+    'scope',
+    'resource',
+  ]);
+
   private sanitizeExtraAuthParams(raw: Record<string, string> | null | undefined): Record<string, string> | null {
     if (!raw) return null;
     const out: Record<string, string> = {};
@@ -777,6 +788,7 @@ export class McpService {
       const key = k.trim();
       const val = typeof v === 'string' ? v.trim() : '';
       if (!key || !val) continue;
+      if (McpService.RESERVED_OAUTH_PARAMS.has(key.toLowerCase())) continue;
       assertNoControlChars(key, 'OAuthパラメータ名');
       assertNoControlChars(val, 'OAuthパラメータ値');
       out[key] = val;
@@ -1572,6 +1584,12 @@ export class McpService {
     });
 
     const authUrl = new URL(authorizationUrl);
+    if (existingCfg.extraAuthParams) {
+      for (const [k, v] of Object.entries(existingCfg.extraAuthParams)) {
+        if (McpService.RESERVED_OAUTH_PARAMS.has(k.toLowerCase())) continue;
+        authUrl.searchParams.set(k, v);
+      }
+    }
     authUrl.searchParams.set('response_type', 'code');
     authUrl.searchParams.set('client_id', clientId);
     authUrl.searchParams.set('redirect_uri', redirectUri);
@@ -1583,11 +1601,6 @@ export class McpService {
     }
     if (resource) {
       authUrl.searchParams.set('resource', resource);
-    }
-    if (existingCfg.extraAuthParams) {
-      for (const [k, v] of Object.entries(existingCfg.extraAuthParams)) {
-        authUrl.searchParams.set(k, v);
-      }
     }
 
     return {
