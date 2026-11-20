@@ -495,6 +495,7 @@ async function fetchJsonWithTimeout(
 
 export class McpService {
   private readonly pendingOAuthFlows = new Map<string, PendingOAuthFlow>();
+  private readonly inFlightOAuthRefreshes = new Map<string, Promise<string | null>>();
 
   constructor(
     private readonly config: AppConfig,
@@ -1093,7 +1094,7 @@ export class McpService {
           const updated = this.updateServer(adminUserId, existing.id, {
             description: typeof cfg.description === 'string' ? cfg.description : existing.description,
             transport,
-            enabled: typeof cfg.disabled === 'boolean' ? !cfg.disabled : true,
+            enabled: typeof cfg.disabled === 'boolean' ? !cfg.disabled : existing.enabled,
             command: commandRaw,
             args,
             env: envEntries,
@@ -1567,7 +1568,13 @@ export class McpService {
   }
 
   private async ensureFreshOAuthAccessToken(row: StoredMcpServerRow): Promise<string | null> {
-    const tokens = this.decryptTokens(row.encryptedOauthTokensJson);
+    const existingRefresh = this.inFlightOAuthRefreshes.get(row.id);
+    if (existingRefresh) {
+      return existingRefresh;
+    }
+
+    const latestRow = this.db.getMcpServerById(row.id) ?? row;
+    const tokens = this.decryptTokens(latestRow.encryptedOauthTokensJson);
     if (!tokens) return null;
 
     const isExpiring = Boolean(tokens.expiresAt && tokens.expiresAt <= Date.now() + OAUTH_REFRESH_SKEW_MS);
@@ -1575,6 +1582,19 @@ export class McpService {
       return tokens.accessToken;
     }
 
+    const refreshPromise = this.performOAuthTokenRefresh(latestRow, tokens).finally(() => {
+      if (this.inFlightOAuthRefreshes.get(row.id) === refreshPromise) {
+        this.inFlightOAuthRefreshes.delete(row.id);
+      }
+    });
+    this.inFlightOAuthRefreshes.set(row.id, refreshPromise);
+    return refreshPromise;
+  }
+
+  private async performOAuthTokenRefresh(
+    row: StoredMcpServerRow,
+    tokens: StoredOAuthTokens
+  ): Promise<string | null> {
     const cfg = parseJsonObject<McpOAuthConfig>(row.oauthConfigJson);
     if (!tokens.refreshToken || !cfg?.tokenUrl || !cfg?.clientId) {
       this.db.updateMcpServer(row.id, {
@@ -1860,9 +1880,9 @@ export class McpService {
       if (row.transport === 'http' && !supportsHttp) continue;
       if (row.transport === 'sse' && !supportsSse) continue;
 
-      let safeUrl: string;
+      let target: PinnedOutboundTarget;
       try {
-        safeUrl = await assertSafeOutboundUrl(row.url, {
+        target = await resolvePinnedOutboundTarget(row.url, {
           allowPrivate: this.config.allowPrivateMcpUrls,
         });
       } catch {
@@ -1871,6 +1891,22 @@ export class McpService {
       }
 
       const headerMap = this.decryptRecord(row.encryptedHeadersJson);
+
+      let acpUrl = target.url;
+      // For plain HTTP URLs with hostnames, pin the validated IP and forward Host so ACP does not re-resolve DNS.
+      // For HTTPS URLs, TLS SNI and certificate hostname verification require keeping the validated hostname.
+      if (
+        target.parsed.protocol === 'http:' &&
+        target.pinnedAddress &&
+        net.isIP(normalizeHostnameForIpCheck(target.parsed.hostname)) === 0
+      ) {
+        const pinnedUrl = new URL(target.url);
+        pinnedUrl.hostname = target.pinnedFamily === 6 ? `[${target.pinnedAddress}]` : target.pinnedAddress;
+        acpUrl = pinnedUrl.toString();
+        if (!Object.keys(headerMap).some((k) => k.toLowerCase() === 'host')) {
+          headerMap.Host = target.parsed.host;
+        }
+      }
 
       if (row.authType === 'oauth') {
         const accessToken = await this.ensureFreshOAuthAccessToken(row);
@@ -1890,14 +1926,14 @@ export class McpService {
         out.push({
           type: 'http',
           name: row.name,
-          url: safeUrl,
+          url: acpUrl,
           headers,
         });
       } else {
         out.push({
           type: 'sse',
           name: row.name,
-          url: safeUrl,
+          url: acpUrl,
           headers,
         });
       }
