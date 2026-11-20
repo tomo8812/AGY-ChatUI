@@ -1,3 +1,4 @@
+import { ModalDialog } from './ModalDialog';
 import React, { useRef, useState } from 'react';
 import { ApiError, api } from '../api/client';
 import type { ProjectRecord } from '../types';
@@ -26,6 +27,15 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [statusNote, setStatusNote] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const canClose = () => {
+    if (busy) return false;
+    const dirty = name.trim() !== (currentProject?.name ?? '') ||
+      description.trim() !== (currentProject?.description ?? '') ||
+      instructions !== (currentProject?.instructions ?? '');
+    return !dirty || window.confirm('保存していない変更を破棄しますか？');
+  };
+  const requestClose = () => { if (canClose()) onClose(); };
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -79,8 +89,8 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
     }
   };
 
-  const handleDeleteFile = async (fileId: string) => {
-    if (!currentProject) return;
+  const handleDeleteFile = async (fileId: string, filename: string) => {
+    if (!currentProject || !window.confirm(`共有資料「${filename}」を削除しますか？`)) return;
     setBusy(true);
     setError(null);
     try {
@@ -112,8 +122,7 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
   };
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-card modal-lg" onClick={(e) => e.stopPropagation()}>
+    <ModalDialog label={currentProject ? "プロジェクト設定" : "新しいプロジェクト"} size="modal-lg" onClose={requestClose}>
         <div className="modal-head">
           <div>
             <h3>{currentProject ? `プロジェクト設定: ${currentProject.name}` : '新しいプロジェクト'}</h3>
@@ -127,6 +136,7 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
                 type="button"
                 className="btn btn-primary btn-xs"
                 onClick={() => {
+                  if (!canClose()) return;
                   onStartChatInProject(currentProject.id);
                   onClose();
                 }}
@@ -134,7 +144,7 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
                 <PlusIcon size={14} /> この中でチャット開始
               </button>
             )}
-            <button type="button" className="icon-btn" onClick={onClose} aria-label="閉じる">
+            <button type="button" className="icon-btn" onClick={requestClose} aria-label="閉じる">
               <CloseIcon size={18} />
             </button>
           </div>
@@ -196,9 +206,9 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
             <section className="settings-section">
               <div className="row-between" style={{ marginBottom: 8 }}>
                 <div>
-                  <h4>共有ナレッジ資料 (.project-context/)</h4>
+                  <h4>共有資料</h4>
                   <p className="muted-xs">
-                    各チャットの作業領域へコピーオンライトで読み込まれる参照資料です（会話中に原紙が破壊されることはありません）。
+                    このプロジェクトのチャットで参照できます。
                   </p>
                 </div>
                 <button
@@ -241,7 +251,9 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
                         <button
                           type="button"
                           className="icon-btn-sm danger"
-                          onClick={() => handleDeleteFile(f.id)}
+                          onClick={() => handleDeleteFile(f.id, f.filename)}
+                          disabled={busy}
+                          aria-label={`「${f.filename}」を削除`}
                           title="削除"
                         >
                           <TrashIcon size={14} />
@@ -257,7 +269,6 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
           {statusNote && <div className="success-box">{statusNote}</div>}
           {error && <div className="error-box">{error}</div>}
         </div>
-      </div>
-    </div>
+    </ModalDialog>
   );
 };

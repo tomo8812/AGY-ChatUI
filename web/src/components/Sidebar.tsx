@@ -137,7 +137,8 @@ export const Sidebar: React.FC<SidebarProps> = React.memo(({
               onKeyDown={(e) => {
                 if (e.key === 'Escape') toggleSearch();
               }}
-              placeholder="チャット履歴を検索..."
+              aria-label="チャット履歴を検索"
+              placeholder="チャット履歴を検索…"
             />
             {search && (
               <button
@@ -285,6 +286,7 @@ export const Sidebar: React.FC<SidebarProps> = React.memo(({
                               <button
                                 type="button"
                                 className="icon-btn-sm"
+                                aria-label={`「${chat.title}」の名前を変更`}
                                 title="名前を変更"
                                 onClick={(e) => {
                                   e.stopPropagation();
@@ -297,6 +299,7 @@ export const Sidebar: React.FC<SidebarProps> = React.memo(({
                               <button
                                 type="button"
                                 className="icon-btn-sm danger"
+                                aria-label={`「${chat.title}」を削除`}
                                 title="削除"
                                 onClick={(e) => {
                                   e.stopPropagation();

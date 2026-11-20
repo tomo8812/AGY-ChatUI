@@ -1,3 +1,4 @@
+import { ModalDialog } from './ModalDialog';
 import React, { useEffect, useState } from 'react';
 import { ApiError, api, type AgyAgentMode } from '../api/client';
 import type {
@@ -380,24 +381,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   };
 
-  if (showReauth) {
-    return (
-      <div className="modal-backdrop" onClick={onClose}>
-        <div className="modal-card modal-md" onClick={(e) => e.stopPropagation()}>
-          <AgyOnboarding
-            user={user}
-            profile={agyProfile}
-            loginFlow={loginFlow}
-            agyMode={agyMode}
-            isModal
-            onClose={() => setShowReauth(false)}
-            onUpdated={(payload) => onUpdateAgy(payload)}
-          />
-        </div>
-      </div>
-    );
-  }
-
   const needsDeviceActivation =
     preferences.notifyOnResponse &&
     (!isNotificationSupported() || Notification.permission !== 'granted' || (isPushSupported() && !deviceSubscribed));
@@ -405,8 +388,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const selectedAgentMode = AGENT_MODE_OPTIONS.find((option) => option.value === agentMode)?.value;
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-card modal-md" onClick={(e) => e.stopPropagation()}>
+    <ModalDialog label="設定" size="modal-md" onClose={onClose}>
         <div className="modal-head">
           <h3>設定</h3>
           <button type="button" className="icon-btn" onClick={onClose} aria-label="閉じる">
@@ -416,7 +398,24 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
         <div className="modal-body stack-gap">
           <section className="settings-section">
-            <h4>Antigravity アカウント連携</h4>
+            <h4>外観テーマ</h4>
+            <div className="segmented-tabs">
+              {(['system', 'light', 'dark'] as const).map((t) => (
+                <button
+                  key={t}
+                  aria-pressed={preferences.theme === t}
+                  type="button"
+                  className={preferences.theme === t ? 'seg-btn active' : 'seg-btn'}
+                  onClick={() => handlePrefChange({ theme: t })}
+                >
+                  {t === 'system' ? 'システム' : t === 'light' ? 'ライト' : 'ダーク'}
+                </button>
+              ))}
+            </div>
+          </section>
+
+          <details className="settings-section">
+            <summary>Antigravity アカウント連携</summary>
             <div className="settings-kv">
               <div>
                 <div className="kv-label">接続ステータス</div>
@@ -452,7 +451,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </button>
               </div>
             </div>
-          </section>
+          </details>
 
           <section className="settings-section">
             <h4><label htmlFor="agy-agent-mode">Antigravity エージェントモード</label></h4>
@@ -482,22 +481,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <div>Antigravity が対応するモードは、新しい ACP セッションに反映されます。</div>
             </div>
             {agentModeError && <div className="error-box" role="alert">{agentModeError}</div>}
-          </section>
-
-          <section className="settings-section">
-            <h4>外観テーマ</h4>
-            <div className="segmented-tabs">
-              {(['system', 'light', 'dark'] as const).map((t) => (
-                <button
-                  key={t}
-                  type="button"
-                  className={preferences.theme === t ? 'seg-btn active' : 'seg-btn'}
-                  onClick={() => handlePrefChange({ theme: t })}
-                >
-                  {t === 'system' ? 'システム' : t === 'light' ? 'ライト' : 'ダーク'}
-                </button>
-              ))}
-            </div>
           </section>
 
           <section className="settings-section">
@@ -543,11 +526,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
             )}
 
-            {notifStatusMsg && <div className="success-box">{notifStatusMsg}</div>}
+            <div role="status">{notifStatusMsg && <div className="success-box">{notifStatusMsg}</div>}</div>
           </section>
 
-          <section className="settings-section">
-            <h4>バイブレーション / 触覚フィードバック</h4>
+          <details className="settings-section">
+            <summary>バイブレーション / 触覚フィードバック</summary>
             <ToggleSwitch
               checked={preferences.hapticFeedback}
               label="操作・応答完了を振動で区別して知らせる"
@@ -575,11 +558,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 ))}
               </div>
             )}
-          </section>
+          </details>
 
           {sandbox && (
-            <section className="settings-section">
-              <h4>実行環境サンドボックス</h4>
+            <details className="settings-section">
+              <summary>実行環境サンドボックス</summary>
               <div className="settings-kv">
                 <div>
                   <div className="kv-value">
@@ -606,17 +589,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </div>
                 </div>
               )}
-            </section>
+            </details>
           )}
 
           {user.role === 'admin' && (
-            <section className="settings-section">
-              <h4>ユーザー追加（管理者機能）</h4>
+            <details className="settings-section">
+              <summary>ユーザー追加（管理者機能）</summary>
               <form onSubmit={handleAdminCreateUser} className="inline-admin-form">
                 <input
                   type="text"
                   value={newUsername}
                   onChange={(e) => setNewUsername(e.target.value)}
+                  aria-label="新規ユーザー名"
                   placeholder="新規ユーザー名"
                   minLength={2}
                   required
@@ -625,6 +609,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   type="password"
                   value={newPassword}
                   onChange={(e) => setNewPassword(e.target.value)}
+                  aria-label="新規ユーザーのパスワード"
                   placeholder="パスワード (6文字+)"
                   minLength={6}
                   required
@@ -634,11 +619,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </button>
               </form>
               {adminMsg && <div className="success-box">{adminMsg}</div>}
-            </section>
+            </details>
           )}
 
-          <section className="settings-section">
-            <h4>Web セッション ({user.username})</h4>
+          <details className="settings-section">
+            <summary>Web セッション ({user.username})</summary>
             <div className="row-actions">
               <button type="button" className="btn btn-secondary btn-sm" onClick={() => onLogout(false)}>
                 ログアウト
@@ -647,10 +632,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 全端末からログアウト
               </button>
             </div>
-          </section>
+          </details>
 
-          <section className="settings-section">
-            <h4>バージョン情報</h4>
+          <details className="settings-section">
+            <summary>バージョン情報</summary>
             <div className="settings-kv">
               <div>
                 <div className="kv-value">
@@ -674,11 +659,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               </div>
             </div>
-          </section>
+          </details>
 
-          {error && <div className="error-box">{error}</div>}
+          {error && <div className="error-box" role="alert">{error}</div>}
         </div>
-      </div>
-    </div>
+      {showReauth && (
+        <ModalDialog label="Antigravity に接続" size="modal-md" onClose={() => setShowReauth(false)}>
+          <AgyOnboarding
+            user={user}
+            profile={agyProfile}
+            loginFlow={loginFlow}
+            agyMode={agyMode}
+            isModal
+            onClose={() => setShowReauth(false)}
+            onUpdated={(payload) => onUpdateAgy(payload)}
+          />
+        </ModalDialog>
+      )}
+    </ModalDialog>
   );
 };

@@ -1,3 +1,4 @@
+import { ModalDialog } from './ModalDialog';
 import type { StructuredPatch } from 'diff';
 import DOMPurify from 'dompurify';
 import hljs from 'highlight.js';
@@ -447,6 +448,7 @@ const CodeViewer: React.FC<{
         <SearchIcon size={14} />
         <input
           type="text"
+          aria-label="ファイル内を行検索"
           value={searchTerm}
           onChange={(e) => setSearchTerm(e.target.value)}
           placeholder="ファイル内を行検索..."
@@ -511,7 +513,7 @@ const TableViewer: React.FC<{
   const pageRows = dataRows.slice(pageStart, pageStart + TABLE_PAGE_SIZE);
 
   return (
-    <div className="stack-gap">
+    <div className="stack-gap viewer-table">
       <div className="viewer-toolbar">
         <div className="row-actions">
           {sheets.length > 1 &&
@@ -835,34 +837,20 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
 
     switch (artifact.previewKind) {
       case 'image':
+      case 'svg': {
+        const src = artifact.previewKind === 'svg' ? svgBlobUrl : contentUrl;
+        if (!src) return <div className="muted-sm">画像を表示できません</div>;
         return (
           <div className="media-stage">
-            <img
-              src={contentUrl}
-              alt={artifact.filename}
-              decoding="async"
-              className={imageZoom ? 'viewer-img zoomed' : 'viewer-img'}
-              onClick={() => setImageZoom((z) => !z)}
-            />
+            <button type="button" className="image-zoom-button"
+              aria-label={`${artifact.filename} を拡大表示`}
+              aria-pressed={imageZoom} onClick={() => setImageZoom((zoom) => !zoom)}>
+              <img src={src} alt={artifact.filename} decoding="async"
+                className={imageZoom ? 'viewer-img zoomed' : 'viewer-img'} />
+            </button>
           </div>
         );
-
-      case 'svg':
-        return (
-          <div className="media-stage">
-            {svgBlobUrl ? (
-              <img
-                src={svgBlobUrl}
-                alt={artifact.filename}
-                decoding="async"
-                className={imageZoom ? 'viewer-img zoomed' : 'viewer-img'}
-                onClick={() => setImageZoom((z) => !z)}
-              />
-            ) : (
-              <div className="muted-sm">SVGを表示できません</div>
-            )}
-          </div>
-        );
+      }
 
       case 'pdf':
         return <PdfCanvasViewer url={contentUrl} />;
@@ -895,17 +883,12 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
 
       case 'html':
         return (
-          <div className="stack-gap">
-            <div className="info-banner">
-              分離オリジン (<code>sandbox="allow-scripts"</code> + 厳格CSP) で安全にプレビューしています。外部通信や親ページ権限へのアクセスは遮断されています。
-            </div>
-            <iframe
-              sandbox="allow-scripts"
-              src={sandboxUrl}
-              title={artifact.filename}
-              className="html-sandbox-frame"
-            />
-          </div>
+          <iframe
+            sandbox="allow-scripts"
+            src={sandboxUrl}
+            title={artifact.filename}
+            className="html-sandbox-frame"
+          />
         );
 
       case 'mermaid':
@@ -963,8 +946,7 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
   const supportsSourceToggle = ['markdown', 'html', 'mermaid', 'svg'].includes(artifact.previewKind);
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-card modal-xl viewer-modal" onClick={(e) => e.stopPropagation()}>
+    <ModalDialog label={artifact.filename} size="modal-xl viewer-modal" onClose={onClose}>
         <div className="modal-head">
           <div className="viewer-title-group">
             <h3>{artifact.filename}</h3>
@@ -1013,6 +995,7 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
           <div className="viewer-footer">
             <div className="row-actions">
               <select
+                aria-label="保存先プロジェクト"
                 value={targetProjectId}
                 onChange={(e) => setTargetProjectId(e.target.value)}
                 className="compact-select"
@@ -1030,8 +1013,7 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
             </div>
           </div>
         )}
-      </div>
-    </div>
+    </ModalDialog>
   );
 };
 

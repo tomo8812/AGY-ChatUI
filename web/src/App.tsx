@@ -1849,8 +1849,6 @@ export const App: React.FC = () => {
       <AuthScreen
         userCount={bootstrapMeta.userCount}
         allowPublicSignup={bootstrapMeta.allowPublicSignup}
-        agyMode={bootstrapMeta.agyMode}
-        version={appBuildInfo.version}
         onAuthenticated={(payload) => {
           setUser(payload.user);
           setAgyProfile(payload.agyProfile);

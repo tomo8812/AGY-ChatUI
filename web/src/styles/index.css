@@ -1,4 +1,5 @@
 :root {
+  color-scheme: light;
   --bg-canvas: #ffffff;
   --bg-sidebar: #f9f9f9;
   --bg-surface: #ffffff;
@@ -18,11 +19,11 @@
   --accent-soft: #f4f4f5;
   --link-color: #2563eb;
 
-  --ok: #16a34a;
+  --ok: #15703a;
   --ok-soft: #f0fdf4;
-  --warn: #d97706;
+  --warn: #925006;
   --warn-soft: #fffbeb;
-  --danger: #dc2626;
+  --danger: #bd2222;
   --danger-soft: #fef2f2;
 
   --code-bg: #f7f7f8;
@@ -40,6 +41,7 @@
 }
 
 [data-theme='dark'] {
+  color-scheme: dark;
   --bg-canvas: #000000;
   --bg-sidebar: #0a0a0a;
   --bg-surface: #1c1c1e;
@@ -63,7 +65,7 @@
   --ok-soft: rgba(34, 197, 94, 0.12);
   --warn: #f59e0b;
   --warn-soft: rgba(245, 158, 11, 0.12);
-  --danger: #ef4444;
+  --danger: #ff7070;
   --danger-soft: rgba(239, 68, 68, 0.12);
 
   --code-bg: #111113;
@@ -488,8 +490,8 @@ pre {
   color: var(--text-secondary);
 }
 .seg-btn.active {
-  background: var(--bg-surface);
-  color: var(--text-primary);
+  background: var(--text-primary);
+  color: var(--bg-surface);
   box-shadow: var(--shadow-sm);
 }
 
@@ -820,6 +822,7 @@ pre {
   align-items: center;
   gap: 2px;
 }
+.chat-item:focus-within .chat-item-actions,
 .chat-item:hover .chat-item-actions,
 .chat-item.active .chat-item-actions {
   display: flex;
@@ -1869,7 +1872,7 @@ details[open] > .activity-summary > .activity-chevron {
   border-color: var(--border-strong);
 }
 [data-theme='dark'] .composer-box:focus-within {
-  border-color: rgba(255, 255, 255, 0.22);
+  border-color: var(--link-color);
 }
 .composer-box textarea {
   width: 100%;
@@ -3345,6 +3348,7 @@ details[open] > .activity-summary > .activity-chevron {
 
 /* Artifact Viewer specifics */
 .viewer-title-group {
+  overflow-wrap: anywhere;
   min-width: 0;
 }
 .viewer-footer {
@@ -3430,7 +3434,7 @@ details[open] > .activity-summary > .activity-chevron {
 
 .viewer-table-scroll {
   overflow: auto;
-  max-height: 60dvh;
+  min-height: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
 }
@@ -3459,7 +3463,8 @@ details[open] > .activity-summary > .activity-chevron {
 
 .html-sandbox-frame {
   width: 100%;
-  height: 58dvh;
+  display: block;
+  height: 100%;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: #ffffff;
@@ -3565,10 +3570,12 @@ details[open] > .activity-summary > .activity-chevron {
     bottom: 0;
     width: 84vw;
     max-width: 320px;
+    visibility: hidden;
     transform: translateX(-102%);
     transition: transform 180ms ease;
   }
   .sidebar.open {
+    visibility: visible;
     transform: translateX(0);
     box-shadow: var(--shadow-lg);
   }
@@ -3722,4 +3729,48 @@ details[open] > .activity-summary > .activity-chevron {
   .skills-mobile-back {
     display: flex;
   }
+}
+
+.native-dialog {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  border: 0;
+  color: inherit;
+  background: transparent;
+}
+.native-dialog:not([open]) { display: none; }
+.native-dialog::backdrop { background: rgba(0, 0, 0, 0.52); }
+
+.settings-section summary {
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+}
+.settings-section[open] summary { margin-bottom: 10px; }
+
+.viewer-table { height: 100%; }
+.viewer-table .viewer-toolbar { flex-wrap: wrap; }
+.sidebar-search:focus-within,
+.viewer-search-row:focus-within,
+.field input:focus-visible,
+.field textarea:focus-visible,
+.compact-select:focus-visible,
+.code-paste-row input:focus-visible {
+  outline: 2px solid var(--link-color);
+  outline-offset: 2px;
+}
+.image-zoom-button {
+  margin: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  max-width: 100%;
+}
+.image-zoom-button img { display: block; }
+@media (prefers-reduced-motion: reduce) {
+  .pulse-dot, .stream-cursor, .spin { animation: none; }
+  .sidebar { transition: none; }
 }

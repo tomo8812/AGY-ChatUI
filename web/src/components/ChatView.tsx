@@ -1042,7 +1042,7 @@ const ChatComposer = React.memo(
         const trimmed = inputText.trim();
         if ((!trimmed && stagedAttachments.length === 0) || sending || uploading) return;
 
-        // Immediately dismiss smartphone soft keyboard and lock scroll to follow latest response
+        // Dismiss the soft keyboard and show the submitted message
         textareaRef.current?.blur();
         if (
           typeof document !== 'undefined' &&
@@ -1130,14 +1130,16 @@ const ChatComposer = React.memo(
       return (
         <div className="composer-dock">
           <div className="composer-inner" ref={composerInnerRef}>
-            {uiNotice && (
-              <div className="composer-notice">
-                <span>{uiNotice}</span>
-                <button type="button" className="icon-btn-sm" onClick={() => setUiNotice(null)}>
-                  <CloseIcon size={14} />
-                </button>
-              </div>
-            )}
+            <div role="status">
+              {uiNotice && (
+                <div className="composer-notice">
+                  <span>{uiNotice}</span>
+                  <button type="button" className="icon-btn-sm" aria-label="通知を閉じる" onClick={() => setUiNotice(null)}>
+                    <CloseIcon size={14} />
+                  </button>
+                </div>
+              )}
+            </div>
 
             {slashOpen && (
               <div className="slash-palette" role="listbox" aria-label="スキル・スラッシュコマンド候補">
@@ -1253,6 +1255,7 @@ const ChatComposer = React.memo(
 
               <textarea
                 ref={textareaRef}
+                aria-label="メッセージ"
                 rows={1}
                 value={inputText}
                 onChange={(e) => {
@@ -1424,10 +1427,8 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
   const composerRef = useRef<ChatComposerHandle>(null);
 
   const isNearBottomRef = useRef(true);
-  const followLockUntilRef = useRef<number>(0);
   const scrollRafRef = useRef<number | null>(null);
   const prevScrollChatIdRef = useRef<string | undefined>(chat?.id);
-  const prevMsgCountRef = useRef<number>(messages.length);
 
   const artifactsById = useMemo(() => {
     const map = new Map<string, ArtifactRecord>();
@@ -1502,7 +1503,6 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
   }, []);
 
   const handlePromptSubmitting = useCallback(() => {
-    followLockUntilRef.current = Date.now() + 1200;
     isNearBottomRef.current = true;
     const el = messagesScrollRef.current;
     if (el) {
@@ -1514,12 +1514,8 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
   const handleMessagesScroll = useCallback(() => {
     const el = messagesScrollRef.current;
     if (!el) return;
-    if (Date.now() < followLockUntilRef.current) {
-      isNearBottomRef.current = true;
-      return;
-    }
     const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
-    isNearBottomRef.current = distance < 120;
+    isNearBottomRef.current = distance <= 4;
   }, []);
 
   const lastMsg = messages[messages.length - 1];
@@ -1531,11 +1527,8 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
   useEffect(() => {
     const chatChanged = prevScrollChatIdRef.current !== chat?.id;
     prevScrollChatIdRef.current = chat?.id;
-    const newMsgAdded = messages.length > prevMsgCountRef.current;
-    prevMsgCountRef.current = messages.length;
 
-    if (chatChanged || (newMsgAdded && lastMsg?.role === 'user')) {
-      followLockUntilRef.current = Date.now() + 1200;
+    if (chatChanged) {
       isNearBottomRef.current = true;
     }
     scheduleScrollToBottom();
@@ -1558,9 +1551,6 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
     if (!scrollEl || typeof ResizeObserver === 'undefined') return;
 
     const ro = new ResizeObserver(() => {
-      if (Date.now() < followLockUntilRef.current) {
-        isNearBottomRef.current = true;
-      }
       scheduleScrollToBottom();
     });
     ro.observe(scrollEl);
@@ -1568,9 +1558,6 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
 
     const vv = typeof window !== 'undefined' ? window.visualViewport : null;
     const onVvResize = () => {
-      if (Date.now() < followLockUntilRef.current) {
-        isNearBottomRef.current = true;
-      }
       scheduleScrollToBottom();
     };
     vv?.addEventListener('resize', onVvResize);

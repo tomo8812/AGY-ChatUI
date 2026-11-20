@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { ApiError, api } from '../api/client';
 import type { AgyLoginFlowState, AgyProfile, WebUser } from '../types';
-import { CheckIcon, CloseIcon, CopyIcon, ExternalLinkIcon, ShieldIcon } from './Icons';
+import { CheckIcon, CloseIcon, CopyIcon, ExternalLinkIcon } from './Icons';
 
 interface AgyOnboardingProps {
   user: WebUser;
@@ -114,9 +114,9 @@ export const AgyOnboarding: React.FC<AgyOnboardingProps> = ({
       <div className="agy-header">
         <div>
           <span className="pill-badge">Webユーザー: {user.displayName}</span>
-          <h2>Antigravity 公式認証を紐付ける</h2>
+          <h2>Antigravity に接続</h2>
           <p className="muted-sm">
-            初回利用およびチャット実行には、サーバー上の専用プロファイルで公式 Google / Antigravity 認証を行う必要があります。
+            チャットを始めるには、Google アカウントまたは Gemini API キーで認証してください。
           </p>
         </div>
         {isModal && onClose ? (
@@ -132,26 +132,21 @@ export const AgyOnboarding: React.FC<AgyOnboardingProps> = ({
         )}
       </div>
 
-      <div className="info-banner">
-        <ShieldIcon size={16} />
-        <div>
-          公式 CLI (<code>agy</code>) の認証プロセスのみを使用し、トークンファイルの中身をWebサーバーが読み取ったり改変したりすることはありません。
-        </div>
-      </div>
-
       <div className="segmented-tabs">
         <button
           type="button"
+          aria-pressed={tab === 'oauth'}
           className={tab === 'oauth' ? 'seg-btn active' : 'seg-btn'}
           onClick={() => {
             setTab('oauth');
             setError(null);
           }}
         >
-          認証コード貼り付け（推奨）
+          Google アカウント
         </button>
         <button
           type="button"
+          aria-pressed={tab === 'apikey'}
           className={tab === 'apikey' ? 'seg-btn active' : 'seg-btn'}
           onClick={() => {
             setTab('apikey');
@@ -176,17 +171,13 @@ export const AgyOnboarding: React.FC<AgyOnboardingProps> = ({
 
           {!awaitingCode || !activeUrl ? (
             <div className="step-card">
-              <div className="step-title">手順 1: 認証URLを発行する</div>
-              <p className="muted-sm">
-                下のボタンを押すとサーバー上で公式ログインプロセスが起動し、Google ログイン用のURLが表示されます。
-              </p>
               <button
                 type="button"
                 className="btn btn-primary"
                 onClick={handleStartOAuth}
                 disabled={busy}
               >
-                {busy ? '認証プロセス起動中...' : 'Google 認証リンクを発行'}
+                {busy ? 'リンクを発行中…' : 'Google 認証リンクを発行'}
               </button>
             </div>
           ) : (
@@ -194,7 +185,7 @@ export const AgyOnboarding: React.FC<AgyOnboardingProps> = ({
               <div className="step-card">
                 <div className="step-title">手順 1: ブラウザでログインしてコードを取得</div>
                 <p className="muted-sm">
-                  PCまたはiPhoneのブラウザで以下のリンクを開き、Googleアカウントでログイン後に画面へ表示された認証コードをコピーしてください。
+                  Google にログインし、表示された認証コードをコピーしてください。
                 </p>
                 <div className="url-box">
                   <a
@@ -206,7 +197,6 @@ export const AgyOnboarding: React.FC<AgyOnboardingProps> = ({
                     <span>Google 認証ページを開く</span>
                     <ExternalLinkIcon size={14} />
                   </a>
-                  <div className="url-raw">{activeUrl}</div>
                   <div className="row-actions">
                     <button type="button" className="btn btn-secondary btn-sm" onClick={handleCopyUrl}>
                       {copiedUrl ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
@@ -235,7 +225,7 @@ export const AgyOnboarding: React.FC<AgyOnboardingProps> = ({
                     value={authCode}
                     onChange={(e) => setAuthCode(e.target.value)}
                     placeholder="4/0A... のような認証コードを貼り付け"
-                    autoFocus
+                    aria-label="認証コード"
                     required
                   />
                   <button

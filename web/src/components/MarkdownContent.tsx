@@ -1,6 +1,6 @@
 import hljs from 'highlight.js';
 import DOMPurify from 'dompurify';
-import React, { useCallback, useContext, useEffect, useId, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useContext, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import ReactMarkdown, { defaultUrlTransform, type Components } from 'react-markdown';
 import rehypeKatex from 'rehype-katex';
 import remarkGfm from 'remark-gfm';
@@ -32,6 +32,12 @@ const markdownUrlTransform = (url: string): string => {
 function getEffectiveTheme(): 'light' | 'dark' {
   if (typeof document === 'undefined') return 'light';
   return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
+}
+
+function subscribeTheme(onChange: () => void) {
+  const observer = new MutationObserver(onChange);
+  observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+  return () => observer.disconnect();
 }
 
 function extForLang(lang: string): string {
@@ -74,7 +80,7 @@ export const MermaidBlock: React.FC<{ code: string; streaming?: boolean }> = Rea
   ({ code, streaming = false }) => {
     const uid = useId().replace(/:/g, '_');
     const trimmed = code.trim();
-    const theme = getEffectiveTheme();
+    const theme = useSyncExternalStore(subscribeTheme, getEffectiveTheme);
     const cacheKey = `${theme}:${fastTextHash(trimmed)}`;
 
     const [svgHtml, setSvgHtml] = useState<string | null>(() => mermaidSvgCache.get(cacheKey) ?? null);
