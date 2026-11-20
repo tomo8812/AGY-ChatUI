@@ -15,6 +15,7 @@ interface HeaderBarProps {
   agyProfile: AgyProfile | null;
   quota: QuotaSnapshotRecord | null;
   quotaRefreshing: boolean;
+  quotaError?: string | null;
   wsStatus: WsConnectionStatus;
   onOpenSidebar: () => void;
   onNewChat: () => void;
@@ -53,6 +54,7 @@ export const HeaderBar: React.FC<HeaderBarProps> = React.memo(({
   agyProfile,
   quota,
   quotaRefreshing,
+  quotaError,
   wsStatus,
   onOpenSidebar,
   onNewChat,
@@ -145,6 +147,7 @@ export const HeaderBar: React.FC<HeaderBarProps> = React.memo(({
               profile={agyProfile}
               quota={quota}
               refreshing={quotaRefreshing}
+              errorMessage={quotaError}
               onRefresh={onRefreshQuota}
               onClose={() => setQuotaOpen(false)}
             />

@@ -1,6 +1,6 @@
 import hljs from 'highlight.js';
 import DOMPurify from 'dompurify';
-import React, { useCallback, useContext, useEffect, useId, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useContext, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import ReactMarkdown, { defaultUrlTransform, type Components } from 'react-markdown';
 import rehypeKatex from 'rehype-katex';
 import remarkGfm from 'remark-gfm';
@@ -17,8 +17,61 @@ import {
 } from '../utils/viewerCache';
 import { CheckIcon, CopyIcon, DownloadIcon } from './Icons';
 
+interface HastNode {
+  type?: string;
+  tagName?: string;
+  value?: string;
+  properties?: Record<string, unknown>;
+  children?: HastNode[];
+}
+
+function slugifyHeading(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/[\s\u3000]+/g, '-')
+    .replace(/[^\p{L}\p{N}_-]+/gu, '')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+function extractHastText(node: HastNode): string {
+  if (typeof node.value === 'string') return node.value;
+  if (Array.isArray(node.children)) return node.children.map(extractHastText).join('');
+  return '';
+}
+
+const HEADING_TAGS = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']);
+
+function rehypeUniqueHeadingIds() {
+  return (tree: HastNode) => {
+    const usedIds = new Set<string>();
+    const visit = (node: HastNode) => {
+      if (node.type === 'element' && node.tagName && HEADING_TAGS.has(node.tagName)) {
+        const props = (node.properties ??= {});
+        const existingId = typeof props.id === 'string' && props.id.trim() ? props.id.trim() : null;
+        const base = existingId ?? slugifyHeading(extractHastText(node));
+        if (base) {
+          let candidate = base;
+          let suffix = 1;
+          while (usedIds.has(candidate)) {
+            candidate = `${base}-${suffix}`;
+            suffix += 1;
+          }
+          usedIds.add(candidate);
+          props.id = candidate;
+        }
+      }
+      if (Array.isArray(node.children)) {
+        for (const child of node.children) visit(child);
+      }
+    };
+    visit(tree);
+  };
+}
+
 const REMARK_PLUGINS = [remarkGfm, remarkMath];
-const REHYPE_PLUGINS = [rehypeKatex];
+const REHYPE_PLUGINS = [rehypeKatex, rehypeUniqueHeadingIds];
 
 let mermaidRenderSeq = 0;
 
@@ -32,6 +85,12 @@ const markdownUrlTransform = (url: string): string => {
 function getEffectiveTheme(): 'light' | 'dark' {
   if (typeof document === 'undefined') return 'light';
   return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
+}
+
+function subscribeTheme(onChange: () => void) {
+  const observer = new MutationObserver(onChange);
+  observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+  return () => observer.disconnect();
 }
 
 function extForLang(lang: string): string {
@@ -74,7 +133,7 @@ export const MermaidBlock: React.FC<{ code: string; streaming?: boolean }> = Rea
   ({ code, streaming = false }) => {
     const uid = useId().replace(/:/g, '_');
     const trimmed = code.trim();
-    const theme = getEffectiveTheme();
+    const theme = useSyncExternalStore(subscribeTheme, getEffectiveTheme);
     const cacheKey = `${theme}:${fastTextHash(trimmed)}`;
 
     const [svgHtml, setSvgHtml] = useState<string | null>(() => mermaidSvgCache.get(cacheKey) ?? null);
@@ -525,6 +584,43 @@ const FileLinkButton: React.FC<{
 const MarkdownLink: React.FC<{ href?: string; children?: React.ReactNode }> = React.memo(({ href, children }) => {
   const { onWorkspaceHref } = useContext(MarkdownRenderContext);
   const rawHref = (href ?? '').trim();
+  if (rawHref.startsWith('#')) {
+    const rawTarget = rawHref.slice(1);
+    let decodedTarget = rawTarget;
+    try {
+      decodedTarget = decodeURIComponent(rawTarget);
+    } catch {
+      // keep raw
+    }
+    const normalizedTarget = slugifyHeading(decodedTarget);
+    return (
+      <a
+        href={rawHref}
+        className="md-link md-anchor-link"
+        onClick={(e) => {
+          e.preventDefault();
+          const container = e.currentTarget.closest('.md-body');
+          const candidates = container
+            ? Array.from(container.querySelectorAll<HTMLElement>('[id]'))
+            : [];
+          const hit =
+            candidates.find(
+              (el) =>
+                el.id === decodedTarget ||
+                el.id === rawTarget ||
+                (normalizedTarget && el.id === normalizedTarget)
+            ) ??
+            document.getElementById(decodedTarget) ??
+            (normalizedTarget ? document.getElementById(normalizedTarget) : null);
+          if (hit) {
+            hit.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }
+        }}
+      >
+        {children}
+      </a>
+    );
+  }
   const isExternal = /^https?:\/\/|^mailto:/i.test(rawHref);
   if (isExternal) {
     return (

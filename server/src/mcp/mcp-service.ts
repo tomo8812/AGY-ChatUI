@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
 import http from 'node:http';
@@ -1166,11 +1167,14 @@ export class McpService {
 
     const imported: McpServerRecord[] = [];
     const skipped: string[] = [];
+    const duplicateSkipped: string[] = [];
+    const invalidEntries: string[] = [];
     const ownerUserId = params.scope === 'profile' ? adminUserId : null;
 
     for (const [rawName, rawCfg] of entries) {
       if (!rawCfg || typeof rawCfg !== 'object' || Array.isArray(rawCfg)) {
         skipped.push(rawName);
+        invalidEntries.push(`${rawName}（設定がオブジェクト形式ではありません）`);
         continue;
       }
       try {
@@ -1186,6 +1190,7 @@ export class McpService {
 
         if (!remoteUrlRaw && !commandRaw) {
           skipped.push(rawName);
+          invalidEntries.push(`${rawName}（url または command が不足しています）`);
           continue;
         }
 
@@ -1255,6 +1260,7 @@ export class McpService {
         if (existing) {
           if (!params.overwrite) {
             skipped.push(name);
+            duplicateSkipped.push(name);
             continue;
           }
           const updated = this.updateServer(adminUserId, existing.id, {
@@ -1287,16 +1293,30 @@ export class McpService {
           });
           imported.push(created);
         }
-      } catch {
+      } catch (err) {
         skipped.push(rawName);
+        const reason = err instanceof Error ? err.message : '設定が不正です';
+        invalidEntries.push(`${rawName}（${reason}）`);
       }
     }
 
-    if (imported.length === 0 && skipped.length > 0) {
-      throw new McpValidationError(
-        'NOTHING_IMPORTED',
-        `インポートされたサーバーがありませんでした（スキップ: ${skipped.join(', ')}）。既存の同名サーバーを上書きする場合は「上書き」を有効にしてください。`
-      );
+    if (imported.length === 0) {
+      if (invalidEntries.length > 0) {
+        const dupHint =
+          duplicateSkipped.length > 0
+            ? ` また、既存の同名サーバー（${duplicateSkipped.join(', ')}）を上書きする場合は「上書き」を有効にしてください。`
+            : '';
+        throw new McpValidationError(
+          'INVALID_IMPORT_ENTRIES',
+          `インポートできない不正な項目があります: ${invalidEntries.join(' / ')}。${dupHint}`
+        );
+      }
+      if (duplicateSkipped.length > 0) {
+        throw new McpValidationError(
+          'NOTHING_IMPORTED',
+          `インポートされたサーバーがありませんでした（既存の同名サーバー: ${duplicateSkipped.join(', ')}）。上書きする場合は「上書き」を有効にしてください。`
+        );
+      }
     }
 
     return { imported, skipped };
@@ -1842,6 +1862,214 @@ export class McpService {
 
   // ---- Connection Test ----
 
+  private async probeStdioMcpInitialize(
+    resolvedCmd: string,
+    args: string[],
+    env: Record<string, string>
+  ): Promise<McpTestResult> {
+    return new Promise((resolve) => {
+      let settled = false;
+      let exited = false;
+      let killTimer: ReturnType<typeof setTimeout> | null = null;
+      let stdoutBuf = '';
+      let stderrBuf = '';
+
+      const useProcessGroup = process.platform !== 'win32';
+      const child = spawn(resolvedCmd, args, {
+        env: { ...process.env, ...env },
+        stdio: ['pipe', 'pipe', 'pipe'],
+        detached: useProcessGroup,
+      });
+
+      const signalChild = (sig: NodeJS.Signals) => {
+        if (exited) return;
+        if (useProcessGroup && child.pid) {
+          try {
+            process.kill(-child.pid, sig);
+            return;
+          } catch {
+            // fallback to direct child kill
+          }
+        }
+        try {
+          child.kill(sig);
+        } catch {
+          // ignore
+        }
+      };
+
+      const finish = (result: McpTestResult) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try {
+          child.stdin?.end();
+        } catch {
+          // ignore
+        }
+        if (!exited) {
+          signalChild('SIGTERM');
+          killTimer = setTimeout(() => {
+            killTimer = null;
+            signalChild('SIGKILL');
+          }, 1500);
+          killTimer.unref?.();
+        }
+        resolve(result);
+      };
+
+      const tryParseInitializeMessage = (rawObj: unknown): McpTestResult | null => {
+        if (!rawObj || typeof rawObj !== 'object' || Array.isArray(rawObj)) return null;
+        const msg = rawObj as Record<string, unknown>;
+        if (msg.jsonrpc !== '2.0' || msg.id !== 1) return null;
+        if (msg.error && typeof msg.error === 'object') {
+          const errObj = msg.error as Record<string, unknown>;
+          const errMsg = typeof errObj.message === 'string' ? errObj.message : 'MCP initialize エラー';
+          return {
+            ok: false,
+            status: 'error',
+            message: `stdio MCP サーバーが初期化エラーを返しました: ${errMsg}`,
+            resolvedCommand: resolvedCmd,
+          };
+        }
+        if (msg.result && typeof msg.result === 'object' && !Array.isArray(msg.result)) {
+          const resultObj = msg.result as Record<string, unknown>;
+          const serverInfoObj =
+            resultObj.serverInfo && typeof resultObj.serverInfo === 'object' && !Array.isArray(resultObj.serverInfo)
+              ? (resultObj.serverInfo as Record<string, unknown>)
+              : null;
+          const serverInfo = serverInfoObj
+            ? {
+                name: typeof serverInfoObj.name === 'string' ? serverInfoObj.name : undefined,
+                version: typeof serverInfoObj.version === 'string' ? serverInfoObj.version : undefined,
+              }
+            : undefined;
+          return {
+            ok: true,
+            status: 'connected',
+            message: serverInfo?.name
+              ? `stdio MCP 接続成功: ${serverInfo.name}${serverInfo.version ? ` v${serverInfo.version}` : ''} (${resolvedCmd})`
+              : `stdio MCP サーバーの初期化を確認しました (${resolvedCmd})`,
+            resolvedCommand: resolvedCmd,
+            serverInfo,
+          };
+        }
+        return null;
+      };
+
+      const inspectStdout = () => {
+        // 1) Support LSP-style Content-Length framed JSON-RPC
+        const clMatch = /Content-Length:\s*(\d+)\r?\n\r?\n/i.exec(stdoutBuf);
+        if (clMatch) {
+          const len = Number.parseInt(clMatch[1], 10);
+          const bodyStart = clMatch.index + clMatch[0].length;
+          if (Buffer.byteLength(stdoutBuf.slice(bodyStart), 'utf8') >= len) {
+            const payload = Buffer.from(stdoutBuf.slice(bodyStart), 'utf8').subarray(0, len).toString('utf8');
+            try {
+              const hit = tryParseInitializeMessage(JSON.parse(payload));
+              if (hit) {
+                finish(hit);
+                return;
+              }
+            } catch {
+              // continue checking lines
+            }
+          }
+        }
+        // 2) Support newline-delimited JSON-RPC (standard MCP stdio)
+        const lines = stdoutBuf.split(/\r?\n/);
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('{')) continue;
+          try {
+            const hit = tryParseInitializeMessage(JSON.parse(trimmed));
+            if (hit) {
+              finish(hit);
+              return;
+            }
+          } catch {
+            // incomplete or non-JSON line
+          }
+        }
+      };
+
+      const timer = setTimeout(() => {
+        const stderrHint = stderrBuf.trim().slice(0, 200);
+        finish({
+          ok: false,
+          status: 'error',
+          message: stderrHint
+            ? `stdio MCP の初期化応答がタイムアウトしました (${resolvedCmd}): ${stderrHint}`
+            : `stdio MCP の初期化応答がタイムアウトしました (${resolvedCmd})。MCP サーバーとして起動しているか確認してください。`,
+          resolvedCommand: resolvedCmd,
+        });
+      }, 5_000);
+
+      child.stdout?.on('data', (chunk: Buffer) => {
+        if (stdoutBuf.length < 64_000) {
+          stdoutBuf += chunk.toString('utf8');
+        }
+        inspectStdout();
+      });
+
+      child.stderr?.on('data', (chunk: Buffer) => {
+        if (stderrBuf.length < 4_000) {
+          stderrBuf += chunk.toString('utf8');
+        }
+      });
+
+      child.on('error', (err) => {
+        exited = true;
+        if (killTimer) {
+          clearTimeout(killTimer);
+          killTimer = null;
+        }
+        finish({
+          ok: false,
+          status: 'error',
+          message: `stdio MCP プロセスの起動に失敗しました: ${err.message}`,
+          resolvedCommand: resolvedCmd,
+        });
+      });
+
+      child.on('exit', (code, signal) => {
+        exited = true;
+        if (killTimer) {
+          clearTimeout(killTimer);
+          killTimer = null;
+        }
+        inspectStdout();
+        if (!settled) {
+          const stderrHint = stderrBuf.trim().slice(0, 200);
+          finish({
+            ok: false,
+            status: 'error',
+            message: stderrHint
+              ? `stdio MCP プロセスが初期化応答を返さず終了しました (code=${code ?? 'null'}, signal=${signal ?? 'none'}): ${stderrHint}`
+              : `stdio MCP プロセスが初期化応答を返さず終了しました (code=${code ?? 'null'}, signal=${signal ?? 'none'})。`,
+            resolvedCommand: resolvedCmd,
+          });
+        }
+      });
+
+      const initPayload = `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2025-03-26',
+          capabilities: {},
+          clientInfo: { name: 'antigravity-chat-ui', version: this.config.appVersion },
+        },
+      })}\n`;
+      try {
+        child.stdin?.write(initPayload);
+      } catch {
+        // exit/error handler will settle
+      }
+    });
+  }
+
   async testServer(adminUserId: string, serverId: string): Promise<McpTestResult> {
     const row = this.db.getMcpServerById(serverId);
     if (!row) {
@@ -1860,12 +2088,9 @@ export class McpService {
           resolvedCommand: null,
         };
       }
-      return {
-        ok: true,
-        status: 'connected',
-        message: `実行コマンドを確認しました (${resolved})`,
-        resolvedCommand: resolved,
-      };
+      const args = parseArgsJson(row.argsJson);
+      const envMap = this.decryptRecord(row.encryptedEnvJson);
+      return this.probeStdioMcpInitialize(resolved, args, envMap);
     }
 
     if (!row.url) {
@@ -1912,10 +2137,18 @@ export class McpService {
           };
         }
         if (res.status >= 200 && res.status < 300) {
+          const contentType = res.headers.get('content-type') ?? '';
+          if (!contentType.toLowerCase().includes('text/event-stream')) {
+            return {
+              ok: false,
+              status: 'error',
+              message: `HTTP ${res.status} が返されましたが、SSE ストリーム (text/event-stream) ではありませんでした（Content-Type: ${contentType || '未設定'}）。URL または接続方式を確認してください。`,
+            };
+          }
           return {
             ok: true,
             status: 'connected',
-            message: `SSEエンドポイントへの接続を確認しました (HTTP ${res.status})`,
+            message: `SSEエンドポイントへの接続を確認しました (HTTP ${res.status}, text/event-stream)`,
           };
         }
         return {
@@ -1965,12 +2198,56 @@ export class McpService {
       }
 
       if (res.status >= 200 && res.status < 300) {
+        let rpcPayload: Record<string, unknown> | null = res.json;
+        const contentType = (res.headers.get('content-type') ?? '').toLowerCase();
+        if (!rpcPayload && contentType.includes('text/event-stream') && res.text) {
+          for (const line of res.text.split(/\r?\n/)) {
+            if (!line.startsWith('data:')) continue;
+            const dataStr = line.slice(5).trim();
+            if (!dataStr || dataStr === '[DONE]') continue;
+            try {
+              const parsed = JSON.parse(dataStr);
+              if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                rpcPayload = parsed as Record<string, unknown>;
+                break;
+              }
+            } catch {
+              // ignore non-JSON event data
+            }
+          }
+        }
+
+        if (rpcPayload && rpcPayload.jsonrpc === '2.0' && rpcPayload.error && typeof rpcPayload.error === 'object') {
+          const errMsg =
+            typeof (rpcPayload.error as Record<string, unknown>).message === 'string'
+              ? ((rpcPayload.error as Record<string, unknown>).message as string)
+              : 'JSON-RPC エラー';
+          return {
+            ok: false,
+            status: 'error',
+            message: `リモートMCPサーバーが初期化エラーを返しました: ${errMsg}`,
+          };
+        }
+
         const resultObj =
-          res.json && typeof res.json.result === 'object' && res.json.result !== null
-            ? (res.json.result as Record<string, unknown>)
+          rpcPayload &&
+          rpcPayload.jsonrpc === '2.0' &&
+          typeof rpcPayload.result === 'object' &&
+          rpcPayload.result !== null &&
+          !Array.isArray(rpcPayload.result)
+            ? (rpcPayload.result as Record<string, unknown>)
             : null;
+
+        if (!resultObj) {
+          return {
+            ok: false,
+            status: 'error',
+            message: `HTTP ${res.status} が返されましたが、MCPプロトコル (initialize) の応答を確認できませんでした。URL または接続方式を確認してください。`,
+          };
+        }
+
         const serverInfoObj =
-          resultObj && typeof resultObj.serverInfo === 'object' && resultObj.serverInfo !== null
+          typeof resultObj.serverInfo === 'object' && resultObj.serverInfo !== null
             ? (resultObj.serverInfo as Record<string, unknown>)
             : null;
         const serverInfo = serverInfoObj
@@ -1984,7 +2261,7 @@ export class McpService {
           status: 'connected',
           message: serverInfo?.name
             ? `接続成功: ${serverInfo.name}${serverInfo.version ? ` v${serverInfo.version}` : ''}`
-            : `リモートMCPサーバーへの接続を確認しました (HTTP ${res.status})`,
+            : `リモートMCPサーバーの初期化を確認しました (HTTP ${res.status})`,
           serverInfo,
         };
       }

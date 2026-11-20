@@ -68,16 +68,21 @@ export const Sidebar: React.FC<SidebarProps> = React.memo(({
   }, [chats, search]);
 
   const groupedChats = useMemo(() => {
-    const now = Date.now();
+    const nowDate = new Date();
+    const startOfToday = new Date(
+      nowDate.getFullYear(),
+      nowDate.getMonth(),
+      nowDate.getDate()
+    ).getTime();
     const dayMs = 24 * 60 * 60 * 1000;
+    const startOf7Days = startOfToday - 6 * dayMs;
     const today: ChatRecord[] = [];
     const week: ChatRecord[] = [];
     const older: ChatRecord[] = [];
 
     for (const c of filteredChats) {
-      const age = now - c.lastMessageAt;
-      if (age < dayMs) today.push(c);
-      else if (age < 7 * dayMs) week.push(c);
+      if (c.lastMessageAt >= startOfToday) today.push(c);
+      else if (c.lastMessageAt >= startOf7Days) week.push(c);
       else older.push(c);
     }
     return [
@@ -139,7 +144,8 @@ export const Sidebar: React.FC<SidebarProps> = React.memo(({
               onKeyDown={(e) => {
                 if (e.key === 'Escape') toggleSearch();
               }}
-              placeholder="チャット履歴を検索..."
+              aria-label="チャット履歴を検索"
+              placeholder="チャット履歴を検索…"
             />
             {search && (
               <button
@@ -303,6 +309,7 @@ export const Sidebar: React.FC<SidebarProps> = React.memo(({
                               <button
                                 type="button"
                                 className="icon-btn-sm"
+                                aria-label={`「${chat.title}」の名前を変更`}
                                 title="名前を変更"
                                 onClick={(e) => {
                                   e.stopPropagation();
@@ -315,6 +322,7 @@ export const Sidebar: React.FC<SidebarProps> = React.memo(({
                               <button
                                 type="button"
                                 className="icon-btn-sm danger"
+                                aria-label={`「${chat.title}」を削除`}
                                 title="削除"
                                 onClick={(e) => {
                                   e.stopPropagation();

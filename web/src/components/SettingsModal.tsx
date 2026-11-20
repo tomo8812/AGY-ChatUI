@@ -1,3 +1,4 @@
+import { ModalDialog } from './ModalDialog';
 import React, { useEffect, useState } from 'react';
 import { ApiError, api, type AgyAgentMode } from '../api/client';
 import type {
@@ -78,6 +79,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [deviceSubscribed, setDeviceSubscribed] = useState<boolean>(false);
   const [subCount, setSubCount] = useState<number>(0);
   const [notifStatusMsg, setNotifStatusMsg] = useState<string | null>(null);
+  const [themeError, setThemeError] = useState<string | null>(null);
+  const [notifError, setNotifError] = useState<string | null>(null);
+  const [hapticError, setHapticError] = useState<string | null>(null);
   const [newUsername, setNewUsername] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [adminMsg, setAdminMsg] = useState<string | null>(null);
@@ -157,17 +161,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       Pick<UserPreferences, 'theme' | 'notifyOnResponse' | 'hapticFeedback'>
     >
   ) => {
-    setError(null);
+    if ('theme' in patch) setThemeError(null);
+    if ('hapticFeedback' in patch) setHapticError(null);
     try {
       const res = await api.updatePreferences(patch);
       onUpdatePreferences(res.preferences);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '設定更新に失敗しました。');
+      const msg = err instanceof ApiError ? err.message : '設定更新に失敗しました。';
+      if ('theme' in patch) setThemeError(msg);
+      else if ('hapticFeedback' in patch) setHapticError(msg);
+      else setError(msg);
     }
   };
 
   const handleToggleNotification = async (next: boolean) => {
-    setError(null);
+    setNotifError(null);
     setNotifStatusMsg(null);
 
     if (!next) {
@@ -180,7 +188,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         const cfg = await api.getNotificationConfig().catch(() => null);
         if (cfg) setSubCount(cfg.subscriptionCount);
       } catch (err) {
-        setError(err instanceof ApiError ? err.message : '通知設定の更新に失敗しました。');
+        setNotifError(err instanceof ApiError ? err.message : '通知設定の更新に失敗しました。');
       } finally {
         setNotifBusy(false);
       }
@@ -189,11 +197,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
     if (!isNotificationSupported()) {
       if (isAppleMobileBrowser() && !isStandalonePwa()) {
-        setError(
+        setNotifError(
           'iPhone/iPadで通知を受け取るには、Safariの共有ボタンから「ホーム画面に追加」し、ホーム画面のアイコンから開いた状態でオンにしてください。'
         );
       } else {
-        setError(
+        setNotifError(
           'この環境では通知APIが利用できません。HTTPS（Tailscale Serve）または localhost でアクセスしてください。'
         );
       }
@@ -201,7 +209,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
 
     if (Notification.permission === 'denied') {
-      setError(
+      setNotifError(
         'ブラウザ側で通知がブロックされています。ブラウザまたはOSのサイト設定から通知を「許可」に変更してください。'
       );
       return;
@@ -210,7 +218,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     if (Notification.permission === 'default') {
       const permission = await Notification.requestPermission();
       if (permission !== 'granted') {
-        setError('通知が許可されなかったため、オンにできませんでした。');
+        setNotifError('通知が許可されなかったため、オンにできませんでした。');
         return;
       }
     }
@@ -228,38 +236,38 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       if (pushRes.subscribed) {
         setNotifStatusMsg('通知を有効にしました（バックグラウンドでもWeb Pushを受信できます）。');
       } else if (isPushSupported()) {
-        setError(
+        setNotifError(
           `設定は有効にしましたが、この端末のバックグラウンドWeb Push登録に失敗しました: ${formatPushFailureReason(pushRes.reason)}`
         );
       } else {
         setNotifStatusMsg('通知を有効にしました（アプリ・ブラウザを開いている間の応答完了を通知します）。');
       }
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '通知設定の更新に失敗しました。');
+      setNotifError(err instanceof ApiError ? err.message : '通知設定の更新に失敗しました。');
     } finally {
       setNotifBusy(false);
     }
   };
 
   const handleEnablePushOnThisDevice = async () => {
-    setError(null);
+    setNotifError(null);
     setNotifStatusMsg(null);
     if (!isNotificationSupported()) {
       if (isAppleMobileBrowser() && !isStandalonePwa()) {
-        setError('iPhone/iPadでは「ホーム画面に追加」したPWAから有効化してください。');
+        setNotifError('iPhone/iPadでは「ホーム画面に追加」したPWAから有効化してください。');
       } else {
-        setError('このブラウザでは通知がサポートされていません。');
+        setNotifError('このブラウザでは通知がサポートされていません。');
       }
       return;
     }
     if (Notification.permission === 'default') {
       const perm = await Notification.requestPermission();
       if (perm !== 'granted') {
-        setError('通知が許可されませんでした。');
+        setNotifError('通知が許可されませんでした。');
         return;
       }
     } else if (Notification.permission === 'denied') {
-      setError('ブラウザ側で通知がブロックされています。サイト設定から許可してください。');
+      setNotifError('ブラウザ側で通知がブロックされています。サイト設定から許可してください。');
       return;
     }
 
@@ -273,7 +281,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       if (pushRes.subscribed) {
         setNotifStatusMsg('この端末をWeb Push通知に登録しました。');
       } else if (isPushSupported()) {
-        setError(formatPushFailureReason(pushRes.reason));
+        setNotifError(formatPushFailureReason(pushRes.reason));
       } else {
         setNotifStatusMsg('この端末でのブラウザ通知を有効にしました。');
       }
@@ -283,7 +291,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   };
 
   const handleTestNotification = async () => {
-    setError(null);
+    setNotifError(null);
     setNotifStatusMsg(null);
     setNotifBusy(true);
     try {
@@ -291,7 +299,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         await Notification.requestPermission();
       }
       if (!isNotificationSupported() || Notification.permission !== 'granted') {
-        setError('通知権限が許可されていません。先に「この端末で許可」から許可してください。');
+        setNotifError('通知権限が許可されていません。先に「この端末で許可」から許可してください。');
         return;
       }
 
@@ -302,7 +310,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           setSubCount(pushRes.subscriptionCount);
         }
         if (!pushRes.subscribed) {
-          setError(formatPushFailureReason(pushRes.reason));
+          setNotifError(formatPushFailureReason(pushRes.reason));
           return;
         }
 
@@ -323,7 +331,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             res.currentDeviceError ||
             res.lastError ||
             'この端末のPush配信に失敗しました。いったん通知をオフにしてオンにし直してください。';
-          setError(`この端末へのWeb Pushテスト送信に失敗しました: ${detail}`);
+          setNotifError(`この端末へのWeb Pushテスト送信に失敗しました: ${detail}`);
         }
         return;
       }
@@ -339,10 +347,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           'ローカルテスト通知を表示しました（※この環境はWeb Push非対応のため、アプリ/ブラウザを開いている間のみ通知されます）。'
         );
       } else {
-        setError('通知を表示できませんでした。ブラウザの通知設定を確認してください。');
+        setNotifError('通知を表示できませんでした。ブラウザの通知設定を確認してください。');
       }
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'テスト通知の送信に失敗しました。');
+      setNotifError(err instanceof ApiError ? err.message : 'テスト通知の送信に失敗しました。');
     } finally {
       setNotifBusy(false);
     }
@@ -382,24 +390,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   };
 
-  if (showReauth) {
-    return (
-      <div className="modal-backdrop" onClick={onClose}>
-        <div className="modal-card modal-md" onClick={(e) => e.stopPropagation()}>
-          <AgyOnboarding
-            user={user}
-            profile={agyProfile}
-            loginFlow={loginFlow}
-            agyMode={agyMode}
-            isModal
-            onClose={() => setShowReauth(false)}
-            onUpdated={(payload) => onUpdateAgy(payload)}
-          />
-        </div>
-      </div>
-    );
-  }
-
   const needsDeviceActivation =
     preferences.notifyOnResponse &&
     (!isNotificationSupported() || Notification.permission !== 'granted' || (isPushSupported() && !deviceSubscribed));
@@ -407,8 +397,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const selectedAgentMode = AGENT_MODE_OPTIONS.find((option) => option.value === agentMode)?.value;
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-card modal-md" onClick={(e) => e.stopPropagation()}>
+    <ModalDialog label="設定" size="modal-md" onClose={onClose}>
         <div className="modal-head">
           <h3>設定</h3>
           <button type="button" className="icon-btn" onClick={onClose} aria-label="閉じる">
@@ -418,7 +407,25 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
         <div className="modal-body stack-gap">
           <section className="settings-section">
-            <h4>Antigravity アカウント連携</h4>
+            <h4>外観テーマ</h4>
+            <div className="segmented-tabs">
+              {(['system', 'light', 'dark'] as const).map((t) => (
+                <button
+                  key={t}
+                  aria-pressed={preferences.theme === t}
+                  type="button"
+                  className={preferences.theme === t ? 'seg-btn active' : 'seg-btn'}
+                  onClick={() => handlePrefChange({ theme: t })}
+                >
+                  {t === 'system' ? 'システム' : t === 'light' ? 'ライト' : 'ダーク'}
+                </button>
+              ))}
+            </div>
+            {themeError && <div className="error-box" role="alert" style={{ marginTop: 8 }}>{themeError}</div>}
+          </section>
+
+          <details className="settings-section">
+            <summary>Antigravity アカウント連携</summary>
             <div className="settings-kv">
               <div>
                 <div className="kv-label">接続ステータス</div>
@@ -454,7 +461,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </button>
               </div>
             </div>
-          </section>
+          </details>
 
           <section className="settings-section">
             <h4><label htmlFor="agy-agent-mode">Antigravity エージェントモード</label></h4>
@@ -484,22 +491,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <div>Antigravity が対応するモードは、新しい ACP セッションに反映されます。</div>
             </div>
             {agentModeError && <div className="error-box" role="alert">{agentModeError}</div>}
-          </section>
-
-          <section className="settings-section">
-            <h4>外観テーマ</h4>
-            <div className="segmented-tabs">
-              {(['system', 'light', 'dark'] as const).map((t) => (
-                <button
-                  key={t}
-                  type="button"
-                  className={preferences.theme === t ? 'seg-btn active' : 'seg-btn'}
-                  onClick={() => handlePrefChange({ theme: t })}
-                >
-                  {t === 'system' ? 'システム' : t === 'light' ? 'ライト' : 'ダーク'}
-                </button>
-              ))}
-            </div>
           </section>
 
           <section className="settings-section">
@@ -545,16 +536,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
             )}
 
-            {notifStatusMsg && <div className="success-box">{notifStatusMsg}</div>}
+            <div role="status">{notifStatusMsg && <div className="success-box">{notifStatusMsg}</div>}</div>
+            {notifError && <div className="error-box" role="alert" style={{ marginTop: 8 }}>{notifError}</div>}
           </section>
 
-          <section className="settings-section">
-            <h4>バイブレーション / 触覚フィードバック</h4>
+          <details className="settings-section">
+            <summary>バイブレーション / 触覚フィードバック</summary>
             <ToggleSwitch
               checked={preferences.hapticFeedback}
               label="操作・応答完了を振動で区別して知らせる"
               onChange={(next) => void handlePrefChange({ hapticFeedback: next })}
             />
+            {hapticError && <div className="error-box" role="alert" style={{ marginTop: 8 }}>{hapticError}</div>}
 
             {preferences.hapticFeedback && isVibrationApiSupported() && (
               <div className="haptic-pattern-grid">
@@ -577,11 +570,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 ))}
               </div>
             )}
-          </section>
+          </details>
 
           {sandbox && (
-            <section className="settings-section">
-              <h4>実行環境サンドボックス</h4>
+            <details className="settings-section">
+              <summary>実行環境サンドボックス</summary>
               <div className="settings-kv">
                 <div>
                   <div className="kv-value">
@@ -608,7 +601,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </div>
                 </div>
               )}
-            </section>
+            </details>
           )}
 
           {user.role === 'admin' && (
@@ -632,13 +625,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </section>
               )}
 
-              <section className="settings-section">
-                <h4>ユーザー追加（管理者機能）</h4>
+              <details className="settings-section">
+                <summary>ユーザー追加（管理者機能）</summary>
                 <form onSubmit={handleAdminCreateUser} className="inline-admin-form">
                   <input
                     type="text"
                     value={newUsername}
                     onChange={(e) => setNewUsername(e.target.value)}
+                    aria-label="新規ユーザー名"
                     placeholder="新規ユーザー名"
                     minLength={2}
                     required
@@ -647,6 +641,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     type="password"
                     value={newPassword}
                     onChange={(e) => setNewPassword(e.target.value)}
+                    aria-label="新規ユーザーのパスワード"
                     placeholder="パスワード (6文字+)"
                     minLength={6}
                     required
@@ -656,12 +651,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </button>
                 </form>
                 {adminMsg && <div className="success-box">{adminMsg}</div>}
-              </section>
+              </details>
             </>
           )}
 
-          <section className="settings-section">
-            <h4>Web セッション ({user.username})</h4>
+          <details className="settings-section">
+            <summary>Web セッション ({user.username})</summary>
             <div className="row-actions">
               <button type="button" className="btn btn-secondary btn-sm" onClick={() => onLogout(false)}>
                 ログアウト
@@ -670,10 +665,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 全端末からログアウト
               </button>
             </div>
-          </section>
+          </details>
 
-          <section className="settings-section">
-            <h4>バージョン情報</h4>
+          <details className="settings-section">
+            <summary>バージョン情報</summary>
             <div className="settings-kv">
               <div>
                 <div className="kv-value">
@@ -697,11 +692,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               </div>
             </div>
-          </section>
+          </details>
 
-          {error && <div className="error-box">{error}</div>}
+          {error && <div className="error-box" role="alert">{error}</div>}
         </div>
-      </div>
-    </div>
+      {showReauth && (
+        <ModalDialog label="Antigravity に接続" size="modal-md" onClose={() => setShowReauth(false)}>
+          <AgyOnboarding
+            user={user}
+            profile={agyProfile}
+            loginFlow={loginFlow}
+            agyMode={agyMode}
+            isModal
+            onClose={() => setShowReauth(false)}
+            onUpdated={(payload) => onUpdateAgy(payload)}
+          />
+        </ModalDialog>
+      )}
+    </ModalDialog>
   );
 };

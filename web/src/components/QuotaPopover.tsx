@@ -6,6 +6,7 @@ interface QuotaPopoverProps {
   profile: AgyProfile | null;
   quota: QuotaSnapshotRecord | null;
   refreshing: boolean;
+  errorMessage?: string | null;
   onRefresh: () => void;
   onClose: () => void;
 }
@@ -89,6 +90,7 @@ export const QuotaPopover: React.FC<QuotaPopoverProps> = ({
   profile,
   quota,
   refreshing,
+  errorMessage,
   onRefresh,
   onClose,
 }) => {
@@ -140,6 +142,11 @@ export const QuotaPopover: React.FC<QuotaPopoverProps> = ({
       </div>
 
       <div className="popover-body">
+        {errorMessage && (
+          <div className="error-box" role="alert" style={{ marginBottom: 8 }}>
+            {errorMessage}
+          </div>
+        )}
         {!quota || quota.status !== 'ok' ? (
           <div className="quota-unavailable">
             <div className="quota-status-tag">取得不可</div>

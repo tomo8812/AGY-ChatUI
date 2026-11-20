@@ -360,34 +360,65 @@ export const EffortBar: React.FC<EffortBarProps> = React.memo(({
     );
   };
 
-  const renderModelList = () => (
-    <div className="effort-model-list" role="listbox" aria-label="モデルを選択">
-      {safeModelOptions.map((opt) => {
-        const isSelected = opt.value === effectiveModelId;
-        return (
-          <button
-            key={opt.value}
-            type="button"
-            role="option"
-            aria-selected={isSelected}
-            className={`effort-model-item ${isSelected ? 'selected' : ''}`}
-            onClick={() => {
-              if (opt.value !== effectiveModelId) {
-                setPendingModelId(opt.value);
-                onChangeModel?.(opt.value);
-              }
-              setView('effort');
-            }}
-          >
-            <span className="effort-model-name truncate">{opt.name}</span>
-            <span className="effort-model-check" aria-hidden="true">
-              {isSelected ? <CheckIcon size={15} /> : null}
-            </span>
-          </button>
-        );
-      })}
-    </div>
-  );
+  const renderModelList = () => {
+    const handleModelListKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+      const buttons = Array.from(
+        e.currentTarget.querySelectorAll<HTMLButtonElement>('button[role="option"]')
+      );
+      if (buttons.length === 0) return;
+      const currentIdx = buttons.indexOf(document.activeElement as HTMLButtonElement);
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        const nextIdx = currentIdx < 0 ? 0 : (currentIdx + 1) % buttons.length;
+        buttons[nextIdx]?.focus();
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        const prevIdx =
+          currentIdx < 0 ? buttons.length - 1 : (currentIdx - 1 + buttons.length) % buttons.length;
+        buttons[prevIdx]?.focus();
+      } else if (e.key === 'Home') {
+        e.preventDefault();
+        buttons[0]?.focus();
+      } else if (e.key === 'End') {
+        e.preventDefault();
+        buttons[buttons.length - 1]?.focus();
+      }
+    };
+
+    return (
+      <div
+        className="effort-model-list"
+        role="listbox"
+        aria-label="モデルを選択"
+        onKeyDown={handleModelListKeyDown}
+      >
+        {safeModelOptions.map((opt) => {
+          const isSelected = opt.value === effectiveModelId;
+          return (
+            <button
+              key={opt.value}
+              type="button"
+              role="option"
+              aria-selected={isSelected}
+              className={`effort-model-item ${isSelected ? 'selected' : ''}`}
+              onClick={() => {
+                if (opt.value !== effectiveModelId) {
+                  setPendingModelId(opt.value);
+                  onChangeModel?.(opt.value);
+                }
+                setView('effort');
+              }}
+            >
+              <span className="effort-model-name truncate">{opt.name}</span>
+              <span className="effort-model-check" aria-hidden="true">
+                {isSelected ? <CheckIcon size={15} /> : null}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    );
+  };
 
   const activeView = view === 'model' || !hasEffortOptions ? 'model' : 'effort';
 

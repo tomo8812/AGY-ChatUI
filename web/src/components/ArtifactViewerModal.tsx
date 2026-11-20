@@ -1,3 +1,4 @@
+import { ModalDialog } from './ModalDialog';
 import type { StructuredPatch } from 'diff';
 import DOMPurify from 'dompurify';
 import hljs from 'highlight.js';
@@ -108,12 +109,17 @@ function drawBitmapToCanvas(
 
 const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const [pdfDoc, setPdfDoc] = useState<PdfJsTypes.PDFDocumentProxy | null>(null);
   const [pageNum, setPageNum] = useState(1);
   const [numPages, setNumPages] = useState(0);
   const [scale, setScale] = useState(1.25);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: 0, left: 0 });
+  }, [pageNum, url]);
 
   useEffect(() => {
     let active = true;
@@ -234,7 +240,7 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
   }, [pdfDoc, url, pageNum, numPages, scale]);
 
   if (loading) return <div className="viewer-state muted-sm">PDFを読み込み中...</div>;
-  if (error) return <div className="error-box">{error}</div>;
+  if (error) return <div className="error-box" role="alert">{error}</div>;
 
   return (
     <div className="pdf-viewer-wrap">
@@ -264,6 +270,7 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
           <button
             type="button"
             className="btn btn-secondary btn-xs"
+            aria-label="縮小"
             onClick={() => setScale((s) => Math.max(0.6, Math.round((s - 0.2) * 10) / 10))}
           >
             −
@@ -272,13 +279,14 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
           <button
             type="button"
             className="btn btn-secondary btn-xs"
+            aria-label="拡大"
             onClick={() => setScale((s) => Math.min(2.6, Math.round((s + 0.2) * 10) / 10))}
           >
             ＋
           </button>
         </div>
       </div>
-      <div className="pdf-canvas-scroll">
+      <div ref={scrollRef} className="pdf-canvas-scroll">
         <canvas ref={canvasRef} />
       </div>
     </div>
@@ -357,6 +365,31 @@ const DiffPatchView: React.FC<{ versionKey: string; patch: string }> = React.mem
 
 const MAX_CODE_PREVIEW_LINES = 2000;
 const TABLE_PAGE_SIZE = 200;
+
+function looksLikeDataCell(value: string): boolean {
+  const v = value.trim();
+  if (!v) return false;
+  if (/^[+-]?(\d+(\.\d+)?|\.\d+)([eE][+-]?\d+)?%?$/.test(v)) return true;
+  if (/^\d{4}[-/]\d{1,2}[-/]\d{1,2}([ T]\d{1,2}:\d{2}(:\d{2})?)?$/.test(v)) return true;
+  if (/^(true|false|yes|no|null|nan)$/i.test(v)) return true;
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) return true;
+  if (/^https?:\/\//i.test(v)) return true;
+  return false;
+}
+
+function inferHasHeaderRow(rows: string[][]): boolean {
+  if (rows.length < 2) return false;
+  const first = rows[0];
+  if (first.length === 0) return false;
+  const nonEmptyFirst = first.filter((c) => c.trim().length > 0);
+  if (nonEmptyFirst.length === 0) return false;
+  // Duplicate cell values in row 0 strongly suggest data rather than column headers
+  const uniqueFirst = new Set(nonEmptyFirst.map((c) => c.trim().toLowerCase()));
+  if (uniqueFirst.size < nonEmptyFirst.length) return false;
+  // If any cell in row 0 looks like numeric/date/boolean/email/URL data, treat as headerless
+  if (nonEmptyFirst.some(looksLikeDataCell)) return false;
+  return true;
+}
 
 const CodeViewer: React.FC<{
   versionKey: string;
@@ -447,6 +480,7 @@ const CodeViewer: React.FC<{
         <SearchIcon size={14} />
         <input
           type="text"
+          aria-label="ファイル内を行検索"
           value={searchTerm}
           onChange={(e) => setSearchTerm(e.target.value)}
           placeholder="ファイル内を行検索..."
@@ -467,9 +501,15 @@ const CodeViewer: React.FC<{
           </button>
         </div>
       )}
-      <pre className="code-pre hljs viewer-code-pre">
-        {displayHtml ? <code dangerouslySetInnerHTML={{ __html: displayHtml }} /> : <code>{displayText}</code>}
-      </pre>
+      {query && filteredLines && filteredLines.length === 0 ? (
+        <div className="empty-box muted-sm" role="status">
+          「{deferredSearch.trim()}」に一致する行が見つかりませんでした。
+        </div>
+      ) : (
+        <pre className="code-pre hljs viewer-code-pre">
+          {displayHtml ? <code dangerouslySetInnerHTML={{ __html: displayHtml }} /> : <code>{displayText}</code>}
+        </pre>
+      )}
     </div>
   );
 });
@@ -478,16 +518,49 @@ const TableViewer: React.FC<{
   versionKey: string;
   sheets: ParsedSheetData[];
 }> = React.memo(({ versionKey, sheets }) => {
+  const tableScrollRef = useRef<HTMLDivElement>(null);
   const [activeSheetIdx, setActiveSheetIdx] = useState(0);
   const [page, setPage] = useState(0);
   const [copied, setCopied] = useState(false);
+  const [headerOverride, setHeaderOverride] = useState<boolean | null>(null);
 
   useEffect(() => {
     setActiveSheetIdx(0);
     setPage(0);
+    setHeaderOverride(null);
   }, [versionKey]);
 
   const sheet = sheets[activeSheetIdx];
+  const inferredHasHeader = useMemo(
+    () => (sheet ? inferHasHeaderRow(sheet.rows) : false),
+    [sheet]
+  );
+  const hasHeader = headerOverride ?? inferredHasHeader;
+
+  const colCount = useMemo(() => {
+    if (!sheet) return 0;
+    return sheet.rows.reduce((max, row) => Math.max(max, row.length), 0);
+  }, [sheet]);
+
+  const headerRow = useMemo(() => {
+    if (!sheet || sheet.rows.length === 0) return [];
+    if (hasHeader) {
+      return Array.from({ length: colCount }, (_, idx) => sheet.rows[0][idx] ?? '');
+    }
+    return Array.from({ length: colCount }, (_, idx) => `列 ${idx + 1}`);
+  }, [sheet, hasHeader, colCount]);
+
+  const dataRows = useMemo(() => {
+    if (!sheet || sheet.rows.length === 0) return [];
+    return hasHeader ? sheet.rows.slice(1) : sheet.rows;
+  }, [sheet, hasHeader]);
+
+  const totalPages = Math.max(1, Math.ceil(dataRows.length / TABLE_PAGE_SIZE));
+  const safePage = Math.min(page, totalPages - 1);
+
+  useEffect(() => {
+    tableScrollRef.current?.scrollTo({ top: 0, left: 0 });
+  }, [safePage, activeSheetIdx, versionKey, hasHeader]);
 
   const handleCopyCsv = useCallback(async () => {
     if (!sheet) return;
@@ -503,15 +576,11 @@ const TableViewer: React.FC<{
     return <div className="muted-sm">表データが空です</div>;
   }
 
-  const headerRow = sheet.rows[0];
-  const dataRows = sheet.rows.slice(1);
-  const totalPages = Math.max(1, Math.ceil(dataRows.length / TABLE_PAGE_SIZE));
-  const safePage = Math.min(page, totalPages - 1);
   const pageStart = safePage * TABLE_PAGE_SIZE;
   const pageRows = dataRows.slice(pageStart, pageStart + TABLE_PAGE_SIZE);
 
   return (
-    <div className="stack-gap">
+    <div className="stack-gap viewer-table">
       <div className="viewer-toolbar">
         <div className="row-actions">
           {sheets.length > 1 &&
@@ -523,18 +592,30 @@ const TableViewer: React.FC<{
                 onClick={() => {
                   setActiveSheetIdx(idx);
                   setPage(0);
+                  setHeaderOverride(null);
                 }}
               >
                 {s.name}
               </button>
             ))}
+          <button
+            type="button"
+            className={`chip-btn ${hasHeader ? 'active' : ''}`}
+            aria-pressed={hasHeader}
+            onClick={() => {
+              setHeaderOverride(!hasHeader);
+              setPage(0);
+            }}
+          >
+            先頭行を見出しにする: {hasHeader ? 'ON' : 'OFF'}
+          </button>
         </div>
         <button type="button" className="btn btn-secondary btn-xs" onClick={handleCopyCsv}>
           {copied ? <CheckIcon size={13} /> : <CopyIcon size={13} />}
           <span>{copied ? 'コピー済' : 'CSVコピー'}</span>
         </button>
       </div>
-      <div className="md-table-scroll viewer-table-scroll">
+      <div ref={tableScrollRef} className="md-table-scroll viewer-table-scroll">
         <table>
           <thead>
             <tr>
@@ -546,8 +627,8 @@ const TableViewer: React.FC<{
           <tbody>
             {pageRows.map((row, rIdx) => (
               <tr key={pageStart + rIdx}>
-                {row.map((cell, cIdx) => (
-                  <td key={cIdx}>{cell}</td>
+                {Array.from({ length: colCount }, (_, cIdx) => (
+                  <td key={cIdx}>{row[cIdx] ?? ''}</td>
                 ))}
               </tr>
             ))}
@@ -624,6 +705,8 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
     artifact.previewKind === 'diff' ? 'diff' : 'preview'
   );
   const [imageZoom, setImageZoom] = useState(false);
+  const [imageError, setImageError] = useState(false);
+  const [linkError, setLinkError] = useState<string | null>(null);
   const [loading, setLoading] = useState(() => {
     const k = artifact.previewKind;
     if (k === 'image' || k === 'audio' || k === 'video' || k === 'pdf' || k === 'pptx' || k === 'binary') {
@@ -648,10 +731,12 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
 
   useEffect(() => {
     setImageZoom(false);
+    setImageError(false);
+    setLinkError(null);
     setCopyProjectMsg(null);
     setCopied(false);
     setViewMode(artifact.previewKind === 'diff' ? 'diff' : 'preview');
-  }, [artifact.id]);
+  }, [artifact.id, contentUrl]);
 
   useEffect(() => {
     let active = true;
@@ -801,10 +886,15 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
     };
   }, [artifact.id, artifact.previewKind, artifact.filename, versionKey, contentUrl]);
 
+  const copyableText =
+    viewMode === 'diff'
+      ? (artifact.diffPatch ?? (artifact.previewKind === 'diff' ? textContent : null))
+      : textContent;
+  const canCopyText = Boolean(copyableText && copyableText.length > 0);
+
   const handleCopyText = async () => {
-    const data = viewMode === 'diff' && artifact.diffPatch ? artifact.diffPatch : textContent;
-    if (!data) return;
-    await navigator.clipboard.writeText(data);
+    if (!copyableText) return;
+    await navigator.clipboard.writeText(copyableText);
     setCopied(true);
     setTimeout(() => setCopied(false), 1600);
   };
@@ -823,10 +913,13 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
 
   const renderBody = () => {
     if (loading) return <div className="viewer-state muted-sm">ファイルを読み込み中...</div>;
-    if (error) return <div className="error-box">{error}</div>;
+    if (error) return <div className="error-box" role="alert">{error}</div>;
 
-    if (viewMode === 'diff' && artifact.diffPatch) {
-      return <DiffPatchView versionKey={versionKey} patch={artifact.diffPatch} />;
+    if (viewMode === 'diff') {
+      const patchText = artifact.diffPatch ?? (artifact.previewKind === 'diff' ? textContent : null);
+      if (patchText !== null) {
+        return <DiffPatchView versionKey={versionKey} patch={patchText} />;
+      }
     }
 
     if (viewMode === 'source' && textContent !== null) {
@@ -834,35 +927,48 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
     }
 
     switch (artifact.previewKind) {
-      case 'image':
-        return (
-          <div className="media-stage">
-            <img
-              src={contentUrl}
-              alt={artifact.filename}
-              decoding="async"
-              className={imageZoom ? 'viewer-img zoomed' : 'viewer-img'}
-              onClick={() => setImageZoom((z) => !z)}
-            />
-          </div>
-        );
+      case 'diff':
+        return <DiffPatchView versionKey={versionKey} patch={artifact.diffPatch ?? textContent ?? ''} />;
 
-      case 'svg':
+      case 'image':
+      case 'svg': {
+        const src = artifact.previewKind === 'svg' ? svgBlobUrl : contentUrl;
+        if (imageError || (artifact.previewKind !== 'svg' && !src)) {
+          return (
+            <div className="viewer-image-error">
+              <div className="error-box" role="alert">
+                画像の読み込みに失敗しました。ファイルが破損しているか、取得できませんでした。
+              </div>
+              <a href={downloadUrl} className="btn btn-secondary btn-sm" download={artifact.filename}>
+                <DownloadIcon size={14} />
+                <span>原本をダウンロード</span>
+              </a>
+            </div>
+          );
+        }
+        if (!src) {
+          return <div className="viewer-state muted-sm">画像を読み込み中...</div>;
+        }
         return (
-          <div className="media-stage">
-            {svgBlobUrl ? (
+          <div className={`media-stage ${imageZoom ? 'is-zoomed' : ''}`}>
+            <button
+              type="button"
+              className={`image-zoom-button ${imageZoom ? 'is-zoomed' : ''}`}
+              aria-label={imageZoom ? `${artifact.filename} の拡大表示を解除` : `${artifact.filename} を拡大表示`}
+              aria-pressed={imageZoom}
+              onClick={() => setImageZoom((zoom) => !zoom)}
+            >
               <img
-                src={svgBlobUrl}
+                src={src}
                 alt={artifact.filename}
                 decoding="async"
                 className={imageZoom ? 'viewer-img zoomed' : 'viewer-img'}
-                onClick={() => setImageZoom((z) => !z)}
+                onError={() => setImageError(true)}
               />
-            ) : (
-              <div className="muted-sm">SVGを表示できません</div>
-            )}
+            </button>
           </div>
         );
+      }
 
       case 'pdf':
         return <PdfCanvasViewer url={contentUrl} />;
@@ -895,17 +1001,12 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
 
       case 'html':
         return (
-          <div className="stack-gap">
-            <div className="info-banner">
-              分離オリジン (<code>sandbox="allow-scripts"</code> + 厳格CSP) で安全にプレビューしています。外部通信や親ページ権限へのアクセスは遮断されています。
-            </div>
-            <iframe
-              sandbox="allow-scripts"
-              src={sandboxUrl}
-              title={artifact.filename}
-              className="html-sandbox-frame"
-            />
-          </div>
+          <iframe
+            sandbox="allow-scripts"
+            src={sandboxUrl}
+            title={artifact.filename}
+            className="html-sandbox-frame"
+          />
         );
 
       case 'mermaid':
@@ -916,7 +1017,11 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
           <MarkdownContent
             content={textContent ?? ''}
             chatId={artifact.chatId}
-            onOpenArtifact={onOpenArtifact}
+            onOpenArtifact={(nextArt) => {
+              setLinkError(null);
+              onOpenArtifact?.(nextArt);
+            }}
+            onResolveError={(msg) => setLinkError(msg)}
           />
         );
 
@@ -960,24 +1065,29 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
     }
   };
 
-  const supportsSourceToggle = ['markdown', 'html', 'mermaid', 'svg'].includes(artifact.previewKind);
+  const supportsSourceToggle = ['markdown', 'html', 'mermaid', 'svg', 'diff'].includes(artifact.previewKind);
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-card modal-xl viewer-modal" onClick={(e) => e.stopPropagation()}>
+    <ModalDialog label={artifact.filename} size="modal-xl viewer-modal" onClose={onClose}>
         <div className="modal-head">
           <div className="viewer-title-group">
-            <h3>{artifact.filename}</h3>
-            <span className="muted-xs">
+            <h3 className="truncate" title={artifact.filename}>{artifact.filename}</h3>
+            <span className="muted-xs truncate" title={artifact.relPath}>
               {artifact.relPath} ・ {formatBytesCompact(artifact.sizeBytes)}
             </span>
           </div>
-          <div className="row-actions">
+          <div className="row-actions modal-head-actions">
             {supportsSourceToggle && (
               <button
                 type="button"
                 className={`btn btn-secondary btn-xs ${viewMode === 'source' ? 'active' : ''}`}
-                onClick={() => setViewMode(viewMode === 'source' ? 'preview' : 'source')}
+                onClick={() =>
+                  setViewMode(
+                    viewMode === 'source'
+                      ? (artifact.previewKind === 'diff' ? 'diff' : 'preview')
+                      : 'source'
+                  )
+                }
               >
                 {viewMode === 'source' ? 'プレビュー' : 'ソース'}
               </button>
@@ -991,8 +1101,14 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
                 {viewMode === 'diff' ? 'ファイル本体' : '差分 (Diff)'}
               </button>
             )}
-            {textContent !== null && (
-              <button type="button" className="btn btn-secondary btn-xs" onClick={handleCopyText}>
+            {copyableText !== null && (
+              <button
+                type="button"
+                className="btn btn-secondary btn-xs"
+                onClick={handleCopyText}
+                disabled={!canCopyText}
+                title={canCopyText ? '内容をコピー' : 'コピーする内容がありません'}
+              >
                 {copied ? <CheckIcon size={13} /> : <CopyIcon size={13} />}
                 <span>{copied ? 'コピー済' : 'コピー'}</span>
               </button>
@@ -1007,15 +1123,31 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
           </div>
         </div>
 
-        <div className="modal-body viewer-body">{renderBody()}</div>
+        <div className="modal-body viewer-body">
+          {linkError && (
+            <div className="error-box viewer-link-error" role="alert" style={{ marginBottom: 12 }}>
+              <span>{linkError}</span>
+              <button
+                type="button"
+                className="icon-btn-sm"
+                aria-label="エラーを閉じる"
+                onClick={() => setLinkError(null)}
+              >
+                <CloseIcon size={13} />
+              </button>
+            </div>
+          )}
+          {renderBody()}
+        </div>
 
         {projects.length > 0 && (
           <div className="viewer-footer">
-            <div className="row-actions">
+            <div className="row-actions viewer-footer-actions">
               <select
+                aria-label="保存先プロジェクト"
                 value={targetProjectId}
                 onChange={(e) => setTargetProjectId(e.target.value)}
-                className="compact-select"
+                className="compact-select viewer-project-select"
               >
                 {projects.map((p) => (
                   <option key={p.id} value={p.id}>
@@ -1026,12 +1158,11 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
               <button type="button" className="btn btn-secondary btn-xs" onClick={handleSaveToProject}>
                 プロジェクト資料へ保存
               </button>
-              {copyProjectMsg && <span className="muted-xs">{copyProjectMsg}</span>}
+              {copyProjectMsg && <span className="muted-xs" role="status">{copyProjectMsg}</span>}
             </div>
           </div>
         )}
-      </div>
-    </div>
+    </ModalDialog>
   );
 };
 

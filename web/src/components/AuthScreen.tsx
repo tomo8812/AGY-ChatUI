@@ -6,8 +6,6 @@ import { ShieldIcon } from './Icons';
 interface AuthScreenProps {
   userCount: number;
   allowPublicSignup: boolean;
-  agyMode: 'real' | 'mock';
-  version?: string;
   onAuthenticated: (payload: {
     user: WebUser;
     agyProfile: AgyProfile;
@@ -20,8 +18,6 @@ interface AuthScreenProps {
 export const AuthScreen: React.FC<AuthScreenProps> = ({
   userCount,
   allowPublicSignup,
-  agyMode,
-  version,
   onAuthenticated,
 }) => {
   const isInitialSetup = userCount === 0;
@@ -63,29 +59,22 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
         <div className="auth-brand">
           <div>
             <h1>Antigravity Chat</h1>
-            <p className="muted-sm">Self-Hosted AI Workspace</p>
           </div>
         </div>
 
-        <div className="info-banner">
-          <ShieldIcon size={16} />
-          <div>
-            {isInitialSetup ? (
-              <span>
-                最初のサーバー管理者アカウントを作成します。ログイン後、あなた専用の Antigravity アカウントを紐付けます。
-              </span>
-            ) : (
-              <span>
-                Webアカウントごとに独立した Antigravity 認証領域とワークスペースがサーバー上に作成されます。
-              </span>
-            )}
+        {isInitialSetup && (
+          <div className="info-banner">
+            <ShieldIcon size={16} />
+            <span>最初の管理者アカウントを作成してください。</span>
           </div>
-        </div>
+        )}
 
         {!isInitialSetup && allowPublicSignup && (
-          <div className="segmented-tabs">
+          <div className="segmented-tabs" role="tablist" aria-label="認証モード">
             <button
               type="button"
+              role="tab"
+              aria-selected={mode === 'login'}
               className={mode === 'login' ? 'seg-btn active' : 'seg-btn'}
               onClick={() => {
                 setMode('login');
@@ -96,6 +85,8 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
             </button>
             <button
               type="button"
+              role="tab"
+              aria-selected={mode === 'register'}
               className={mode === 'register' ? 'seg-btn active' : 'seg-btn'}
               onClick={() => {
                 setMode('register');
@@ -148,7 +139,11 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
             />
           </label>
 
-          {error && <div className="error-box">{error}</div>}
+          {error && (
+            <div className="error-box" role="alert">
+              {error}
+            </div>
+          )}
 
           <button type="submit" className="btn btn-primary btn-block" disabled={busy}>
             {busy
@@ -161,12 +156,6 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
           </button>
         </form>
 
-        <div className="auth-footnote">
-          <span>
-            バックエンドモード: {agyMode === 'mock' ? 'ACP Mock' : 'Official Antigravity CLI'}
-            {version ? ` • v${version}` : ''}
-          </span>
-        </div>
       </div>
     </div>
   );
