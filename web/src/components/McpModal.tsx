@@ -1066,7 +1066,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                             </div>
                             {selectedServer?.oauth?.expiresAt && (
                               <div className="muted-xs">
-                                有効期限: {new Date(selectedServer.oauth.expiresAt).toLocaleString('ja-JP')}
+                                有効期限: {new Date(selectedServer.oauth.expiresAt).toLocaleString()}
                                 {selectedServer.oauth.hasRefreshToken ? '（自動リフレッシュ対応）' : ''}
                               </div>
                             )}

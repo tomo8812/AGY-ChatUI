@@ -233,6 +233,7 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
     await quotaService.shutdown();
     await agyAuth.shutdown();
     await acp.shutdown();
+    await mcpService.shutdown();
     await app.close();
     db.close();
   };

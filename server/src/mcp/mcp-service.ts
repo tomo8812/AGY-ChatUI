@@ -493,15 +493,169 @@ async function fetchJsonWithTimeout(
   });
 }
 
+function createPinnedLookup(target: PinnedOutboundTarget) {
+  if (!target.pinnedAddress) return undefined;
+  const pinnedIp = target.pinnedAddress;
+  const pinnedFam = target.pinnedFamily ?? (net.isIP(pinnedIp) === 6 ? 6 : 4);
+  return (
+    _hostname: string,
+    options: unknown,
+    callback: (err: NodeJS.ErrnoException | null, address: unknown, family?: number) => void
+  ) => {
+    const allRequested =
+      typeof options === 'object' && options !== null && Boolean((options as { all?: boolean }).all);
+    if (allRequested) {
+      callback(null, [{ address: pinnedIp, family: pinnedFam }]);
+    } else {
+      callback(null, pinnedIp, pinnedFam);
+    }
+  };
+}
+
+class PinnedHttpsForwarder {
+  private server: http.Server | null = null;
+  private port: number | null = null;
+  private starting: Promise<number> | null = null;
+  private readonly routes = new Map<string, PinnedOutboundTarget>();
+  private readonly maxRoutes = 500;
+
+  private async ensureListening(): Promise<number> {
+    if (this.port !== null) return this.port;
+    if (this.starting) return this.starting;
+
+    this.starting = new Promise<number>((resolve, reject) => {
+      const srv = http.createServer((req, res) => {
+        this.handleRequest(req, res);
+      });
+      srv.once('error', (err) => {
+        this.starting = null;
+        reject(err);
+      });
+      srv.listen(0, '127.0.0.1', () => {
+        const addr = srv.address();
+        if (!addr || typeof addr === 'string') {
+          this.starting = null;
+          reject(new Error('Failed to bind pinned HTTPS MCP forwarder'));
+          return;
+        }
+        this.server = srv;
+        this.port = addr.port;
+        this.starting = null;
+        resolve(addr.port);
+      });
+    });
+
+    return this.starting;
+  }
+
+  private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+    const reqUrl = new URL(req.url || '/', 'http://127.0.0.1');
+    const match = /^\/mcp\/([A-Za-z0-9_-]+)(\/.*)?$/.exec(reqUrl.pathname);
+    if (!match) {
+      res.writeHead(404);
+      res.end('Not Found');
+      return;
+    }
+    const token = match[1];
+    const extraPath = match[2] ?? '';
+    const target = this.routes.get(token);
+    if (!target) {
+      res.writeHead(404);
+      res.end('Unknown MCP route');
+      return;
+    }
+
+    const basePath = target.parsed.pathname === '/' && extraPath ? '' : target.parsed.pathname;
+    const mergedQuery = reqUrl.search || target.parsed.search;
+    const upstreamPath = `${basePath}${extraPath}${mergedQuery}`;
+
+    const outHeaders: Record<string, string | string[]> = {};
+    for (const [k, v] of Object.entries(req.headers)) {
+      if (v === undefined) continue;
+      const lower = k.toLowerCase();
+      if (lower === 'host' || lower === 'connection' || lower === 'keep-alive' || lower === 'proxy-connection') {
+        continue;
+      }
+      outHeaders[k] = v;
+    }
+    outHeaders.host = target.parsed.host;
+
+    const pinnedLookup = createPinnedLookup(target);
+    const upReq = https.request(
+      {
+        protocol: 'https:',
+        hostname: target.parsed.hostname,
+        port: target.parsed.port ? Number(target.parsed.port) : 443,
+        path: upstreamPath,
+        method: req.method || 'GET',
+        headers: outHeaders,
+        servername: target.parsed.hostname,
+        ...(pinnedLookup ? { lookup: pinnedLookup as never } : {}),
+      },
+      (upRes) => {
+        const status = upRes.statusCode ?? 502;
+        if (status >= 300 && status < 400 && upRes.headers.location) {
+          upRes.resume();
+          if (!res.headersSent) {
+            res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+          }
+          res.end('Upstream redirect blocked');
+          return;
+        }
+        res.writeHead(status, upRes.headers);
+        upRes.pipe(res);
+      }
+    );
+
+    upReq.on('error', () => {
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+      }
+      res.end('Upstream MCP connection failed');
+    });
+    res.on('close', () => {
+      if (!upReq.destroyed) upReq.destroy();
+    });
+    req.pipe(upReq);
+  }
+
+  async registerRoute(target: PinnedOutboundTarget): Promise<string> {
+    const port = await this.ensureListening();
+    if (this.routes.size >= this.maxRoutes) {
+      const oldestKey = this.routes.keys().next().value;
+      if (oldestKey) this.routes.delete(oldestKey);
+    }
+    const token = crypto.randomBytes(24).toString('base64url');
+    this.routes.set(token, target);
+    return `http://127.0.0.1:${port}/mcp/${token}`;
+  }
+
+  async shutdown(): Promise<void> {
+    this.routes.clear();
+    const srv = this.server;
+    this.server = null;
+    this.port = null;
+    this.starting = null;
+    if (srv) {
+      await new Promise<void>((resolve) => srv.close(() => resolve()));
+    }
+  }
+}
+
 export class McpService {
   private readonly pendingOAuthFlows = new Map<string, PendingOAuthFlow>();
   private readonly inFlightOAuthRefreshes = new Map<string, Promise<string | null>>();
+  private readonly httpsForwarder = new PinnedHttpsForwarder();
 
   constructor(
     private readonly config: AppConfig,
     private readonly db: AppDatabase,
     private readonly hub: SyncHub
   ) {}
+
+  async shutdown(): Promise<void> {
+    await this.httpsForwarder.shutdown();
+  }
 
   private decryptRecord(encrypted: string | null): Record<string, string> {
     if (!encrypted) return {};
@@ -1893,18 +2047,17 @@ export class McpService {
       const headerMap = this.decryptRecord(row.encryptedHeadersJson);
 
       let acpUrl = target.url;
-      // For plain HTTP URLs with hostnames, pin the validated IP and forward Host so ACP does not re-resolve DNS.
-      // For HTTPS URLs, TLS SNI and certificate hostname verification require keeping the validated hostname.
-      if (
-        target.parsed.protocol === 'http:' &&
-        target.pinnedAddress &&
-        net.isIP(normalizeHostnameForIpCheck(target.parsed.hostname)) === 0
-      ) {
-        const pinnedUrl = new URL(target.url);
-        pinnedUrl.hostname = target.pinnedFamily === 6 ? `[${target.pinnedAddress}]` : target.pinnedAddress;
-        acpUrl = pinnedUrl.toString();
-        if (!Object.keys(headerMap).some((k) => k.toLowerCase() === 'host')) {
-          headerMap.Host = target.parsed.host;
+      const isHostnameUrl = net.isIP(normalizeHostnameForIpCheck(target.parsed.hostname)) === 0;
+      if (!this.config.allowPrivateMcpUrls && target.pinnedAddress && isHostnameUrl) {
+        if (target.parsed.protocol === 'http:') {
+          const pinnedUrl = new URL(target.url);
+          pinnedUrl.hostname = target.pinnedFamily === 6 ? `[${target.pinnedAddress}]` : target.pinnedAddress;
+          acpUrl = pinnedUrl.toString();
+          if (!Object.keys(headerMap).some((k) => k.toLowerCase() === 'host')) {
+            headerMap.Host = target.parsed.host;
+          }
+        } else if (target.parsed.protocol === 'https:') {
+          acpUrl = await this.httpsForwarder.registerRoute(target);
         }
       }
 
