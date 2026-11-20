@@ -118,6 +118,7 @@ interface PendingOAuthFlow {
   state: string;
   serverId: string;
   adminUserId: string;
+  authorizationUrl: string;
   codeVerifier: string;
   redirectUri: string;
   tokenUrl: string;
@@ -1892,19 +1893,17 @@ export class McpService {
     }
   }
 
-  resolvePendingOAuthFlowAdminId(state: string | undefined | null): string | null {
-    this.pruneExpiredOAuthFlows();
-    const trimmed = state?.trim() ?? '';
-    if (!trimmed) return null;
-    const flow = this.pendingOAuthFlows.get(trimmed);
-    return flow ? flow.adminUserId : null;
-  }
-
   async startOAuthFlow(
     adminUserId: string,
     serverId: string,
     origin: string
-  ): Promise<{ authorizationUrl: string; redirectUri: string; state: string; mode: 'callback' | 'code_paste' }> {
+  ): Promise<{
+    authorizationUrl: string;
+    launchUrl: string;
+    redirectUri: string;
+    state: string;
+    mode: 'callback' | 'code_paste';
+  }> {
     this.pruneExpiredOAuthFlows();
     const row = this.db.getMcpServerById(serverId);
     if (!row) {
@@ -2038,21 +2037,6 @@ export class McpService {
     const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
     const state = crypto.randomBytes(24).toString('base64url');
 
-    const now = Date.now();
-    this.pendingOAuthFlows.set(state, {
-      state,
-      serverId: row.id,
-      adminUserId,
-      codeVerifier,
-      redirectUri,
-      tokenUrl,
-      clientId,
-      clientSecret,
-      resource,
-      createdAt: now,
-      expiresAt: now + OAUTH_FLOW_TTL_MS,
-    });
-
     const authUrl = new URL(authorizationUrl);
     if (existingCfg.extraAuthParams) {
       for (const [k, v] of Object.entries(existingCfg.extraAuthParams)) {
@@ -2073,12 +2057,49 @@ export class McpService {
       authUrl.searchParams.set('resource', resource);
     }
 
+    const fullAuthorizationUrl = authUrl.toString();
+    const now = Date.now();
+    this.pendingOAuthFlows.set(state, {
+      state,
+      serverId: row.id,
+      adminUserId,
+      authorizationUrl: fullAuthorizationUrl,
+      codeVerifier,
+      redirectUri,
+      tokenUrl,
+      clientId,
+      clientSecret,
+      resource,
+      createdAt: now,
+      expiresAt: now + OAUTH_FLOW_TTL_MS,
+    });
+
     return {
-      authorizationUrl: authUrl.toString(),
+      authorizationUrl: fullAuthorizationUrl,
+      launchUrl: `${origin.replace(/\/+$/, '')}/api/mcp/oauth/launch?state=${encodeURIComponent(state)}`,
       redirectUri,
       state,
       mode: redirectUri === ANTIGRAVITY_CIMD_REDIRECT_URI ? 'code_paste' : 'callback',
     };
+  }
+
+  resolvePendingOAuthLaunchUrl(adminUserId: string, state: string | undefined | null): string {
+    this.pruneExpiredOAuthFlows();
+    const trimmed = state?.trim() ?? '';
+    if (!trimmed) {
+      throw new McpValidationError('OAUTH_INVALID_STATE', 'OAuth state パラメータが不足しています。');
+    }
+    const flow = this.pendingOAuthFlows.get(trimmed);
+    if (!flow) {
+      throw new McpValidationError(
+        'OAUTH_STATE_EXPIRED',
+        'OAuth 認証セッションが見つからないか期限切れです。もう一度開始してください。'
+      );
+    }
+    if (flow.adminUserId !== adminUserId) {
+      throw new McpValidationError('FORBIDDEN', 'このOAuth認証セッションを開始する権限がありません。', 403);
+    }
+    return flow.authorizationUrl;
   }
 
   async completeOAuthManualInput(

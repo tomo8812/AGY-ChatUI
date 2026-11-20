@@ -482,28 +482,41 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
     }
   });
 
-  app.get('/api/mcp/oauth/callback', async (req, reply) => {
-    const query = (req.query ?? {}) as {
-      code?: string;
-      state?: string;
-      error?: string;
-      error_description?: string;
-    };
-
+  app.get('/api/mcp/oauth/launch', async (req, reply) => {
     const session = authenticateRequest(req, db);
-    const flowAdminId = mcpService.resolvePendingOAuthFlowAdminId(query.state);
-    // Allow callback when either:
-    // 1) The browser has an active admin session cookie, OR
-    // 2) No session cookie is present (e.g. iOS Standalone PWA opened an isolated SFSafariViewController/Safari sheet)
-    //    AND the single-use 192-bit cryptographic `state` belongs to an active admin user.
-    const effectiveAdminId =
-      session?.user.role === 'admin'
-        ? session.user.id
-        : !session && flowAdminId && db.listAdminUserIds().includes(flowAdminId)
-          ? flowAdminId
-          : null;
+    if (!session || session.user.role !== 'admin') {
+      return reply
+        .code(403)
+        .header('Cache-Control', 'no-store')
+        .type('text/html; charset=utf-8')
+        .send(
+          renderOAuthCallbackHtml({
+            ok: false,
+            message: '管理者としてログインした状態でOAuth認証を開始してください。',
+          })
+        );
+    }
 
-    if (!effectiveAdminId) {
+    const query = (req.query ?? {}) as { state?: string };
+    try {
+      const targetUrl = mcpService.resolvePendingOAuthLaunchUrl(session.user.id, query.state);
+      return reply
+        .header('Cache-Control', 'no-store')
+        .redirect(targetUrl, 302);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'OAuth認証の開始に失敗しました。';
+      const statusCode = err instanceof McpValidationError ? err.statusCode : 400;
+      return reply
+        .code(statusCode)
+        .header('Cache-Control', 'no-store')
+        .type('text/html; charset=utf-8')
+        .send(renderOAuthCallbackHtml({ ok: false, message }));
+    }
+  });
+
+  app.get('/api/mcp/oauth/callback', async (req, reply) => {
+    const session = authenticateRequest(req, db);
+    if (!session || session.user.role !== 'admin') {
       return reply
         .code(403)
         .header('Cache-Control', 'no-store')
@@ -516,8 +529,15 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
         );
     }
 
+    const query = (req.query ?? {}) as {
+      code?: string;
+      state?: string;
+      error?: string;
+      error_description?: string;
+    };
+
     try {
-      const { server } = await mcpService.completeOAuthCallback(effectiveAdminId, {
+      const { server } = await mcpService.completeOAuthCallback(session.user.id, {
         code: query.code,
         state: query.state,
         error: query.error,

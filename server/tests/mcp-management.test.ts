@@ -1384,38 +1384,52 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
     expect(manualRes.status).toBe(200);
     expect(manualRes.data.server.oauth.status).toBe('connected');
 
-    // C) Start a second OAuth flow and verify iOS Standalone PWA cookie-less GET /api/mcp/oauth/callback succeeds via single-use state
+    // C) Start a second OAuth flow and verify same-origin authenticated /api/mcp/oauth/launch redirect for iOS Standalone PWA
     issuedAccessToken = 'tinyfish-like-token-2';
-    const start2 = await admin.request<{ authorizationUrl: string; state: string }>(
+    const start2 = await admin.request<{ authorizationUrl: string; launchUrl: string; state: string }>(
       'POST',
       `/api/mcp/servers/${serverId}/oauth/start`,
       {}
     );
     expect(start2.status).toBe(200);
+    expect(start2.data.launchUrl).toContain(`/api/mcp/oauth/launch?state=${encodeURIComponent(start2.data.state)}`);
     expectedPkceChallenge = new URL(start2.data.authorizationUrl).searchParams.get('code_challenge') ?? '';
 
-    // Logged-in non-admin session cookie must still be rejected with 403
+    // Unauthenticated or non-admin requests to /api/mcp/oauth/launch and /api/mcp/oauth/callback must be rejected with 403
+    const unauthClient = new TestApiClient(srv.baseUrl);
+    const unauthLaunch = await unauthClient.request(
+      'GET',
+      `/api/mcp/oauth/launch?state=${encodeURIComponent(start2.data.state)}`
+    );
+    expect(unauthLaunch.status).toBe(403);
+
+    const unauthCallback = await unauthClient.request(
+      'GET',
+      `/api/mcp/oauth/callback?code=pwa-code&state=${encodeURIComponent(start2.data.state)}`
+    );
+    expect(unauthCallback.status).toBe(403);
+
     const nonAdminAttempt = await regular.request(
       'GET',
       `/api/mcp/oauth/callback?code=pwa-code&state=${encodeURIComponent(start2.data.state)}`
     );
     expect(nonAdminAttempt.status).toBe(403);
 
-    // Cookie-less browser context (iOS SFSafariViewController opened from Home Screen PWA) succeeds using valid admin state
-    const unauthClient = new TestApiClient(srv.baseUrl);
-    const pwaCallback = await unauthClient.request<string>(
+    // Admin session navigating to same-origin /api/mcp/oauth/launch receives 302 redirect to the authorizationUrl
+    const launchRes = await fetch(`${srv.baseUrl}/api/mcp/oauth/launch?state=${encodeURIComponent(start2.data.state)}`, {
+      redirect: 'manual',
+      headers: { Cookie: admin.cookieHeader },
+    });
+    expect(launchRes.status).toBe(302);
+    expect(launchRes.headers.get('location')).toBe(start2.data.authorizationUrl);
+
+    // Admin session in the PWA WebView completes callback
+    const pwaCallback = await admin.request<string>(
       'GET',
       `/api/mcp/oauth/callback?code=pwa-code&state=${encodeURIComponent(start2.data.state)}`
     );
     expect(pwaCallback.status).toBe(200);
     expect(pwaCallback.data).toContain('OAuth 認証が完了しました');
-
-    // Replaying the same single-use state without cookie is rejected with 403
-    const replayCallback = await unauthClient.request<string>(
-      'GET',
-      `/api/mcp/oauth/callback?code=pwa-code&state=${encodeURIComponent(start2.data.state)}`
-    );
-    expect(replayCallback.status).toBe(403);
   });
 });
 

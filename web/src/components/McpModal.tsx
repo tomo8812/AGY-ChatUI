@@ -732,9 +732,10 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
             : '認証ウィンドウを開きました。ブラウザでログイン・許可を完了してください。'
         );
       } else if (standalone) {
-        // iOS Standalone PWA: navigating directly to an external OAuth URL via location.assign
-        // launches iOS's in-app Safari sheet (SFSafariViewController) without being blocked by async popup blockers.
-        window.location.assign(res.authorizationUrl);
+        // iOS Standalone PWA: navigating to the same-origin authenticated launch endpoint
+        // keeps the flow inside the PWA's own WebView (which holds the admin session cookie)
+        // before 302-redirecting to the external OAuth provider.
+        window.location.assign(res.launchUrl || res.authorizationUrl);
         setStatusNote(
           '認証ページへ移動しました。ログイン・許可が完了すると自動で反映されます（戻った後にURLまたは認可コードを貼り付けてアプリ内で完了することも可能です）。'
         );

@@ -570,10 +570,13 @@ export const api = {
     }),
 
   startMcpOAuth: (id: string) =>
-    apiFetch<{ authorizationUrl: string; redirectUri: string; state: string; mode?: 'callback' | 'code_paste' }>(
-      `/api/mcp/servers/${encodeURIComponent(id)}/oauth/start`,
-      { method: 'POST', body: {} }
-    ),
+    apiFetch<{
+      authorizationUrl: string;
+      launchUrl?: string;
+      redirectUri: string;
+      state: string;
+      mode?: 'callback' | 'code_paste';
+    }>(`/api/mcp/servers/${encodeURIComponent(id)}/oauth/start`, { method: 'POST', body: {} }),
 
   completeMcpOAuth: (id: string, payload: { codeOrUrl: string; state?: string | null }) =>
     apiFetch<{ server: McpServerRecord }>(
