@@ -896,7 +896,6 @@ const ChatComposer = React.memo(
       const [uploading, setUploading] = useState(false);
       const [sending, setSending] = useState(false);
       const [uiNotice, setUiNotice] = useState<string | null>(null);
-      const [slashForceOpen, setSlashForceOpen] = useState(false);
       const [slashDismissed, setSlashDismissed] = useState(false);
       const [slashActiveIdx, setSlashActiveIdx] = useState(0);
       const [contextOpen, setContextOpen] = useState(false);
@@ -951,7 +950,6 @@ const ChatComposer = React.memo(
         setInputText(restored.text);
         setStagedAttachments(restored.attachments);
         setUiNotice(null);
-        setSlashForceOpen(false);
         setSlashDismissed(false);
       }, [draftKey, isDraftChat]);
 
@@ -962,7 +960,6 @@ const ChatComposer = React.memo(
         setStagedAttachments([]);
         setUiNotice(null);
         setContextOpen(false);
-        setSlashForceOpen(false);
         setSlashDismissed(false);
         textareaRef.current?.focus();
       }, [draftResetToken]);
@@ -977,7 +974,6 @@ const ChatComposer = React.memo(
           }
           return `${prefix}${trimmed}`;
         });
-        setSlashForceOpen(false);
         setSlashDismissed(false);
         window.setTimeout(() => textareaRef.current?.focus(), 30);
       }, [externalDraftCommand?.token, externalDraftCommand?.slug]);
@@ -1057,10 +1053,9 @@ const ChatComposer = React.memo(
 
       const slashMatch = /^\/([a-zA-Z0-9_-]*)$/.exec(inputText.normalize('NFKC'));
       const slashQuery = slashMatch ? slashMatch[1].toLowerCase() : '';
-      const slashOpen = !contextOpen && (slashForceOpen || (Boolean(slashMatch) && !slashDismissed));
+      const slashOpen = !contextOpen && Boolean(slashMatch) && !slashDismissed;
 
       const closeSlash = useCallback(() => {
-        setSlashForceOpen(false);
         setSlashDismissed(true);
       }, []);
 
@@ -1105,7 +1100,6 @@ const ChatComposer = React.memo(
       const acceptSlashCommand = (cmd: AvailableCommandItem) => {
         const token = `/${cmd.name} `;
         setInputText(slashMatch ? token : `${token}${inputText.trimStart()}`);
-        setSlashForceOpen(false);
         setSlashDismissed(false);
         window.setTimeout(() => textareaRef.current?.focus(), 10);
       };
@@ -1142,7 +1136,6 @@ const ChatComposer = React.memo(
         setInputText('');
         setStagedAttachments([]);
         setContextOpen(false);
-        setSlashForceOpen(false);
         setSlashDismissed(false);
 
         try {
@@ -1392,17 +1385,30 @@ const ChatComposer = React.memo(
                     type="button"
                     className={`composer-icon-btn ${slashOpen ? 'active' : ''}`}
                     onClick={() => {
+                      const el = textareaRef.current;
+                      const start =
+                        el && typeof el.selectionStart === 'number'
+                          ? el.selectionStart
+                          : inputText.length;
+                      const end =
+                        el && typeof el.selectionEnd === 'number'
+                          ? el.selectionEnd
+                          : inputText.length;
+                      const nextText = `${inputText.slice(0, start)}/${inputText.slice(end)}`;
                       setContextOpen(false);
-                      if (slashOpen) {
-                        closeSlash();
-                      } else {
-                        setSlashForceOpen(true);
-                        setSlashDismissed(false);
-                      }
-                      textareaRef.current?.focus();
+                      setSlashDismissed(false);
+                      setInputText(nextText);
+                      el?.focus();
+                      window.requestAnimationFrame(() => {
+                        const target = textareaRef.current;
+                        if (!target) return;
+                        target.focus();
+                        const caret = start + 1;
+                        target.setSelectionRange(caret, caret);
+                      });
                     }}
-                    title="スキル / スラッシュコマンド一覧"
-                    aria-label="スキル・コマンド一覧"
+                    title="/ を入力（文頭でスキル / コマンド一覧）"
+                    aria-label="/ を入力"
                     aria-expanded={slashOpen}
                   >
                     <SlashIcon size={16} />

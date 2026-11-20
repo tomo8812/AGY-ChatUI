@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { ApiError, api } from '../api/client';
 import type {
   McpAuthType,
+  McpDiscoveredTool,
   McpScope,
   McpServerRecord,
   McpTestResult,
@@ -84,9 +85,11 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
   // Form state
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
-  const [scope, setScope] = useState<McpScope>('shared');
   const [transport, setTransport] = useState<McpTransport>('http');
   const [enabled, setEnabled] = useState(true);
+  const [allowedTools, setAllowedTools] = useState<string[]>([]);
+  const [toolInputDraft, setToolInputDraft] = useState('');
+  const [discoveredTools, setDiscoveredTools] = useState<McpDiscoveredTool[]>([]);
 
   // Local (stdio)
   const [command, setCommand] = useState('');
@@ -117,7 +120,6 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
 
   // JSON import state
   const [importJsonText, setImportJsonText] = useState('');
-  const [importScope, setImportScope] = useState<McpScope>('shared');
   const [importOverwrite, setImportOverwrite] = useState(false);
 
   const loadServers = useCallback(async () => {
@@ -145,9 +147,11 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     setEditorMode('edit');
     setName(srv.name);
     setDescription(srv.description);
-    setScope(srv.scope);
     setTransport(srv.transport);
     setEnabled(srv.enabled);
+    setAllowedTools(srv.allowedTools ?? []);
+    setToolInputDraft('');
+    setDiscoveredTools([]);
     setCommand(srv.command ?? '');
     setArgsText(srv.args.join('\n'));
     setEnvRows(
@@ -276,9 +280,14 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     if (editorMode !== 'edit' || !selectedServer) return false;
     if (name.trim() !== selectedServer.name) return true;
     if (description.trim() !== selectedServer.description) return true;
-    if (scope !== selectedServer.scope) return true;
     if (transport !== selectedServer.transport) return true;
     if (enabled !== selectedServer.enabled) return true;
+    if (
+      allowedTools.length !== selectedServer.allowedTools.length ||
+      allowedTools.some((t, i) => t !== selectedServer.allowedTools[i])
+    ) {
+      return true;
+    }
     if (transport === 'stdio') {
       if (command.trim() !== (selectedServer.command ?? '')) return true;
       const currentArgs = argsText
@@ -336,9 +345,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     selectedServer,
     name,
     description,
-    scope,
     transport,
     enabled,
+    allowedTools,
     command,
     argsText,
     envRows,
@@ -357,14 +366,42 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     oauthExtraParamsText,
   ]);
 
+  const addDraftTools = () => {
+    const tokens = toolInputDraft
+      .split(/[,\s]+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    if (tokens.length === 0) return;
+    setAllowedTools((prev) => {
+      const next = [...prev];
+      const seen = new Set(prev);
+      for (const token of tokens) {
+        if (!seen.has(token)) {
+          seen.add(token);
+          next.push(token);
+        }
+      }
+      return next;
+    });
+    setToolInputDraft('');
+  };
+
+  const toggleAllowedTool = (toolName: string) => {
+    setAllowedTools((prev) =>
+      prev.includes(toolName) ? prev.filter((t) => t !== toolName) : [...prev, toolName]
+    );
+  };
+
   const openNewForm = (initialTransport: McpTransport = 'http') => {
     setSelectedId(null);
     setEditorMode('new');
     setName('');
     setDescription('');
-    setScope(scopeTab);
     setTransport(initialTransport);
     setEnabled(true);
+    setAllowedTools([]);
+    setToolInputDraft('');
+    setDiscoveredTools([]);
     setCommand('');
     setArgsText('');
     setEnvRows([]);
@@ -396,7 +433,6 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
   const openImportForm = () => {
     setSelectedId(null);
     setEditorMode('import');
-    setImportScope(scopeTab);
     setImportJsonText('');
     setImportOverwrite(false);
     setError(null);
@@ -493,9 +529,10 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
         const res = await api.createMcpServer({
           name: name.trim(),
           description: description.trim(),
-          scope,
+          scope: scopeTab,
           transport,
           enabled,
+          allowedTools,
           command: transport === 'stdio' ? command.trim() : null,
           args: transport === 'stdio' ? args : [],
           env: transport === 'stdio' ? env : [],
@@ -509,9 +546,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
         const res = await api.updateMcpServer(selectedId, {
           name: name.trim(),
           description: description.trim(),
-          scope,
           transport,
           enabled,
+          allowedTools,
           command: transport === 'stdio' ? command.trim() : null,
           args: transport === 'stdio' ? args : [],
           env: transport === 'stdio' ? env : [],
@@ -587,6 +624,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     try {
       const res = await api.testMcpServer(selectedServer.id);
       setTestResult(res.result);
+      if (res.result.tools && res.result.tools.length > 0) {
+        setDiscoveredTools(res.result.tools);
+      }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : '接続テストに失敗しました。');
     } finally {
@@ -644,11 +684,10 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     setStatusNote(null);
     try {
       const res = await api.importMcpJson({
-        scope: importScope,
+        scope: scopeTab,
         rawJson: importJsonText,
         overwrite: importOverwrite,
       });
-      setScopeTab(importScope);
       await loadServers();
       if (res.imported.length > 0) {
         populateFormFromServer(res.imported[0]);
@@ -796,6 +835,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                             <strong>{srv.name}</strong>
                             <span className="mcp-badge mcp-badge-transport">{srv.transport.toUpperCase()}</span>
                             <span className={`mcp-badge mcp-badge-${badge.tone}`}>{badge.label}</span>
+                            {srv.allowedTools.length > 0 && (
+                              <span className="mcp-badge mcp-badge-muted">ツール {srv.allowedTools.length}件のみ</span>
+                            )}
                           </div>
                           <div className="muted-xs skill-list-desc">
                             {srv.description || (srv.transport === 'stdio' ? srv.command : srv.url) || ''}
@@ -886,22 +928,10 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
 
             {editorMode === 'import' && (
               <form onSubmit={handleImportJson} className="mcp-form">
-                <h4>標準 MCP JSON からインポート</h4>
+                <h4>標準 MCP JSON からインポート（{SCOPE_LABELS[scopeTab]}）</h4>
                 <p className="muted-xs">
-                  Claude Desktop / Cursor / Antigravity / VS Code などの <code>mcpServers</code> JSON をそのまま貼り付けて登録できます（リモート <code>url</code> / <code>serverUrl</code> およびローカル <code>command</code> 両対応）。
+                  Claude Desktop / Cursor / Antigravity / VS Code などの <code>mcpServers</code> JSON をそのまま貼り付けて登録できます（リモート <code>url</code> / <code>serverUrl</code>、ローカル <code>command</code>、<code>enabledTools</code> 対応）。
                 </p>
-
-                <div className="form-group">
-                  <label htmlFor="mcp-import-scope">登録先スコープ</label>
-                  <select
-                    id="mcp-import-scope"
-                    value={importScope}
-                    onChange={(e) => setImportScope(e.target.value as McpScope)}
-                  >
-                    <option value="shared">全プロファイル共有（他プロファイルにも適用）</option>
-                    <option value="profile">自プロファイルのみ（管理者専用）</option>
-                  </select>
-                </div>
 
                 <div className="form-group">
                   <label htmlFor="mcp-import-json">MCP 設定 JSON</label>
@@ -942,7 +972,11 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
             {(editorMode === 'new' || editorMode === 'edit') && (
               <form onSubmit={handleSave} className="mcp-form">
                 <div className="mcp-form-header">
-                  <h4>{editorMode === 'new' ? '新規 MCP サーバー' : `編集: ${selectedServer?.name ?? name}`}</h4>
+                  <h4>
+                    {editorMode === 'new'
+                      ? `新規 MCP サーバー（${SCOPE_LABELS[scopeTab]}）`
+                      : `編集: ${selectedServer?.name ?? name}（${SCOPE_LABELS[selectedServer?.scope ?? scopeTab]}）`}
+                  </h4>
                   {editorMode === 'edit' && selectedServer && (
                     <div className="row-actions">
                       <button
@@ -983,6 +1017,11 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                     style={{ marginBottom: 12 }}
                   >
                     <div>{testResult.message}</div>
+                    {testResult.tools && testResult.tools.length > 0 && (
+                      <div className="muted-xs" style={{ marginTop: 4 }}>
+                        利用可能ツールを {testResult.tools.length} 件取得しました（「許可するツール」欄から選択できます）。
+                      </div>
+                    )}
                     {testResult.discoveredOAuth?.authorizationUrl && (
                       <div className="muted-xs" style={{ marginTop: 4 }}>
                         OAuth エンドポイント検出済: {testResult.discoveredOAuth.authorizationUrl}
@@ -991,25 +1030,16 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                   </div>
                 )}
 
-                <div className="mcp-grid-2">
-                  <div className="form-group">
-                    <label htmlFor="mcp-name">サーバー名（英数字・._-）</label>
-                    <input
-                      id="mcp-name"
-                      type="text"
-                      value={name}
-                      onChange={(e) => setName(e.target.value)}
-                      placeholder="例: github, linear, google-drive"
-                      required
-                    />
-                  </div>
-                  <div className="form-group">
-                    <label htmlFor="mcp-scope">適用スコープ</label>
-                    <select id="mcp-scope" value={scope} onChange={(e) => setScope(e.target.value as McpScope)}>
-                      <option value="shared">全プロファイル共有（他プロファイルにも持つ）</option>
-                      <option value="profile">自プロファイルのみ</option>
-                    </select>
-                  </div>
+                <div className="form-group">
+                  <label htmlFor="mcp-name">サーバー名（英数字・._-）</label>
+                  <input
+                    id="mcp-name"
+                    type="text"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    placeholder="例: github, linear, google-drive"
+                    required
+                  />
                 </div>
 
                 <div className="form-group">
@@ -1439,6 +1469,118 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                     )}
                   </>
                 )}
+
+                <div className="form-group">
+                  <div className="mcp-kv-header">
+                    <span className="mcp-kv-label">
+                      許可するツール（{allowedTools.length === 0 ? '全ツール許可' : `${allowedTools.length} 個のみ許可`}）
+                    </span>
+                    {allowedTools.length > 0 && (
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-xs"
+                        onClick={() => setAllowedTools([])}
+                      >
+                        全ツール許可に戻す
+                      </button>
+                    )}
+                  </div>
+                  <div className="mcp-tools-box">
+                    <div className="muted-xs">
+                      未設定（空）の場合はこのMCPサーバーの<strong>全ツールが許可</strong>されます。特定のツールのみ利用を許可したい場合に追加・選択してください。
+                    </div>
+
+                    {allowedTools.length > 0 && (
+                      <div className="mcp-tools-chips" aria-label="許可されたツール一覧">
+                        {allowedTools.map((toolName) => (
+                          <button
+                            key={toolName}
+                            type="button"
+                            className="mcp-tool-chip"
+                            onClick={() => toggleAllowedTool(toolName)}
+                            title={`「${toolName}」を許可リストから削除`}
+                          >
+                            <span>{toolName}</span>
+                            <span aria-hidden="true">×</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+
+                    <div className="mcp-tools-add-row">
+                      <input
+                        id="mcp-allowed-tool-input"
+                        type="text"
+                        value={toolInputDraft}
+                        onChange={(e) => setToolInputDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            addDraftTools();
+                          }
+                        }}
+                        placeholder="許可するツール名を入力（カンマ区切り可・Enterで追加）"
+                      />
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-xs"
+                        onClick={addDraftTools}
+                        disabled={!toolInputDraft.trim()}
+                      >
+                        追加
+                      </button>
+                    </div>
+
+                    {discoveredTools.length > 0 ? (
+                      <>
+                        <div className="mcp-kv-header" style={{ marginBottom: 0 }}>
+                          <span className="muted-xs">接続テストで検出されたツール ({discoveredTools.length} 件)</span>
+                          <div className="row-actions">
+                            <button
+                              type="button"
+                              className="btn btn-secondary btn-xs"
+                              onClick={() =>
+                                setAllowedTools((prev) => {
+                                  const next = new Set(prev);
+                                  for (const t of discoveredTools) next.add(t.name);
+                                  return Array.from(next);
+                                })
+                              }
+                            >
+                              検出ツールを全選択
+                            </button>
+                          </div>
+                        </div>
+                        <div className="mcp-tools-discovered">
+                          {discoveredTools.map((t) => {
+                            const checked = allowedTools.includes(t.name);
+                            return (
+                              <label key={t.name} className="mcp-tool-check-row">
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={() => toggleAllowedTool(t.name)}
+                                />
+                                <span className="mcp-tool-check-meta">
+                                  <span className="mcp-tool-check-name">{t.name}</span>
+                                  {t.description && (
+                                    <span className="mcp-tool-check-desc">{t.description}</span>
+                                  )}
+                                </span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      </>
+                    ) : (
+                      <div className="muted-xs">
+                        {editorMode === 'edit'
+                          ? 'ヒント: 上部の「接続テスト」を実行するとサーバーが公開するツール一覧を取得してチェックボックスから選べます。'
+                          : 'ヒント: 先にサーバーを追加して保存し、「接続テスト」を実行するとツール一覧を取得して選べます。'}
+                      </div>
+                    )}
+                  </div>
+                </div>
 
                 <div className="row-actions mcp-form-actions" style={{ marginTop: 14 }}>
                   <button type="submit" className="btn btn-primary btn-sm" disabled={busy}>
