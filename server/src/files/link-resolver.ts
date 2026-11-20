@@ -96,11 +96,11 @@ function isAllowedProfileRelPath(relPath: string): boolean {
   if (segments.length === 0) return false;
 
   const basename = segments[segments.length - 1].toLowerCase();
-  if (BLOCKED_PRIVATE_KEY_FILENAMES.has(basename)) {
-    return false;
-  }
   const dotParts = basename.split('.');
-  if (dotParts.slice(1).some((part) => BLOCKED_KEY_OR_ENV_EXTENSIONS.has(`.${part}`))) {
+  if (
+    BLOCKED_PRIVATE_KEY_FILENAMES.has(dotParts[0]) ||
+    dotParts.slice(1).some((part) => BLOCKED_KEY_OR_ENV_EXTENSIONS.has(`.${part}`))
+  ) {
     return false;
   }
 

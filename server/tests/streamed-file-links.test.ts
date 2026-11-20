@@ -351,6 +351,7 @@ describe('native and legacy file links', () => {
       'notes/server.key',
       'notes/key.ppk',
       'notes/id_rsa',
+      'notes/id_rsa.bak',
       'notes/production.env',
       'notes/app.env.local',
     ];
