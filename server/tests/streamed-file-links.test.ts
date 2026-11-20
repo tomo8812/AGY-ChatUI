@@ -225,4 +225,200 @@ describe('native and legacy file links', () => {
     expect(Buffer.from(await latest.arrayBuffer())).toEqual(large);
     expect(fs.existsSync(path.join(workspaceDir, 'generated'))).toBe(false);
   });
+
+  it('resolves non-sensitive user profile files while blocking secrets, other chats, and other profiles', async () => {
+    const srv = await createTestServer();
+    cleanups.push(srv.cleanup);
+    const { client: alice, userId: aliceId } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+    const { client: bob, userId: bobId } = await registerAndBindAgy(srv.baseUrl, 'bob', 'user:bob@gmail.com');
+
+    const aliceChat = (await alice.request<{ chat: { id: string; workspaceDir: string } }>(
+      'POST', '/api/chats', { title: 'Alice skills' }
+    )).data.chat;
+    const aliceOtherChat = (await alice.request<{ chat: { id: string; workspaceDir: string } }>(
+      'POST', '/api/chats', { title: 'Alice other' }
+    )).data.chat;
+    const bobChat = (await bob.request<{ chat: { id: string; workspaceDir: string } }>(
+      'POST', '/api/chats', { title: 'Bob chat' }
+    )).data.chat;
+
+    const aliceProfile = srv.ctx.db.getAgyProfile(aliceId)!.profileDir;
+    const bobProfile = srv.ctx.db.getAgyProfile(bobId)!.profileDir;
+
+    // 1. Non-sensitive user profile files (skills, docs with "tokens"/"auth" in filename, global instructions, user notes)
+    const skillFile = path.join(aliceProfile, '.gemini', 'config', 'skills', 'algorithmic-art', 'SKILL.md');
+    const designTokensDoc = path.join(aliceProfile, '.gemini', 'config', 'skills', 'theme-factory', 'references', 'design-tokens.md');
+    const authGuideDoc = path.join(aliceProfile, 'notes', 'auth-guide.md');
+    const globalInstructions = path.join(aliceProfile, '.gemini', 'GEMINI.md');
+    const userNote = path.join(aliceProfile, 'notes', 'memo.md');
+    for (const [filePath, body] of [
+      [skillFile, '# Algorithmic Art Skill'],
+      [designTokensDoc, '# Design Tokens'],
+      [authGuideDoc, '# Auth Architecture Guide'],
+      [globalInstructions, '# Global Instructions'],
+      [userNote, '# Personal Note'],
+    ]) {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, body);
+    }
+
+    const resolveAlice = (reference: string, chatId = aliceChat.id) => alice.request<{
+      artifact: ArtifactRecord; previewUrl: string; downloadUrl: string;
+    }>('POST', `/api/chats/${chatId}/resolve-link`, { reference });
+
+    const fromFileUri = await resolveAlice('file:///home/sandbox/.gemini/config/skills/algorithmic-art/SKILL.md');
+    expect(fromFileUri.status).toBe(200);
+    expect(fromFileUri.data.artifact.relPath).toBe('/home/sandbox/.gemini/config/skills/algorithmic-art/SKILL.md');
+    const contentRes = await fetch(`${srv.baseUrl}${fromFileUri.data.previewUrl}`, {
+      headers: { Cookie: alice.cookieHeader },
+    });
+    expect(contentRes.status).toBe(200);
+    expect(await contentRes.text()).toBe('# Algorithmic Art Skill');
+
+    // Equivalent home-relative forms resolve to the same canonical artifact
+    for (const ref of [
+      '~/.gemini/config/skills/algorithmic-art/SKILL.md',
+      '/home/sandbox/.gemini/config/skills/algorithmic-art/SKILL.md',
+      skillFile,
+    ]) {
+      const res = await resolveAlice(ref);
+      expect(res.status).toBe(200);
+      expect(res.data.artifact.id).toBe(fromFileUri.data.artifact.id);
+    }
+
+    // Other non-sensitive profile files (including docs with "tokens"/"auth" in filename) also resolve
+    for (const ref of [
+      'file:///home/sandbox/.gemini/config/skills/theme-factory/references/design-tokens.md',
+      'file:///home/sandbox/notes/auth-guide.md',
+      'file:///home/sandbox/.gemini/GEMINI.md',
+      'file:///home/sandbox/notes/memo.md',
+    ]) {
+      expect((await resolveAlice(ref)).status).toBe(200);
+    }
+
+    // 2. Cross-profile isolation: Bob cannot see Alice's skill file
+    const bobSkill = path.join(bobProfile, '.gemini', 'config', 'skills', 'bob-only', 'SKILL.md');
+    fs.mkdirSync(path.dirname(bobSkill), { recursive: true });
+    fs.writeFileSync(bobSkill, '# Bob Only');
+    expect((await bob.request('POST', `/api/chats/${bobChat.id}/resolve-link`, {
+      reference: `file://${skillFile}`,
+    })).status).toBe(404);
+    expect((await resolveAlice(`file://${bobSkill}`)).status).toBe(404);
+
+    // 3. Per-chat isolation: Alice's chat cannot read another chat's isolated dirs or host .gemini/brain
+    const otherBrain = path.join(getChatBrainHostDir(aliceProfile, aliceOtherChat.workspaceDir), 'session', 'secret.md');
+    const hostBrain = path.join(aliceProfile, '.gemini', 'brain', 'session', 'host.md');
+    const otherChatHomeFile = path.join(
+      aliceProfile, '.chat-homes', path.basename(aliceOtherChat.workspaceDir), 'private.md'
+    );
+    for (const [filePath, body] of [
+      [otherBrain, 'other chat brain'],
+      [hostBrain, 'host brain'],
+      [otherChatHomeFile, 'other chat home'],
+    ]) {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, body);
+    }
+    for (const ref of [
+      `file://${otherBrain}`,
+      `file://${hostBrain}`,
+      'file:///home/sandbox/.gemini/brain/session/host.md',
+      `file://${otherChatHomeFile}`,
+      `file:///home/sandbox/.chat-homes/${path.basename(aliceOtherChat.workspaceDir)}/private.md`,
+    ]) {
+      expect((await resolveAlice(ref)).status).toBe(404);
+    }
+
+    // 4. Dotfiles, .gemini credentials/internals, and raw key/env files must never be exposed
+    const secretPaths = [
+      '.mock-agy-auth.json',
+      '.env',
+      '.env.local',
+      '.envrc',
+      '.AWS/credentials',
+      'notes/.aws/credentials',
+      '.ssh/id_rsa',
+      '.config/gcloud/credentials.db',
+      '.local/share/keyrings/default.keyring',
+      '.gemini/oauth_creds.json',
+      '.gemini/google_accounts.json',
+      '.gemini/antigravity-cli/settings.json',
+      '.gemini/antigravity/mcp_config.json',
+      '.gemini/antigravity/user_settings.pb',
+      '.gemini/antigravity/code_tracker/trace.txt',
+      '.gemini/config/skills/theme-factory/.env',
+      'notes/private.pem',
+      'notes/server.key',
+      'notes/key.ppk',
+      'notes/id_rsa',
+      'notes/id_rsa.bak',
+      'notes/production.env',
+      'notes/app.env.local',
+    ];
+    for (const rel of secretPaths) {
+      const full = path.join(aliceProfile, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, 'top-secret');
+      expect((await resolveAlice(`file:///home/sandbox/${rel}`)).status).toBe(404);
+      expect((await resolveAlice(`~/${rel}`)).status).toBe(404);
+    }
+
+    // 5. Symlink escapes (to secrets or to another user's profile) are blocked after realpath resolution
+    const symlinkToSecret = path.join(aliceProfile, 'notes', 'harmless-alias.md');
+    fs.symlinkSync(path.join(aliceProfile, '.gemini', 'oauth_creds.json'), symlinkToSecret);
+    expect((await resolveAlice('file:///home/sandbox/notes/harmless-alias.md')).status).toBe(404);
+
+    const symlinkToBob = path.join(aliceProfile, 'notes', 'bob-alias.md');
+    fs.symlinkSync(bobSkill, symlinkToBob);
+    expect((await resolveAlice('file:///home/sandbox/notes/bob-alias.md')).status).toBe(404);
+
+    // 6. Per-chat home prefix resolves files from this chat's chatHome (and its symlinks into shared profile)
+    const aliceChatHome = path.join(aliceProfile, '.chat-homes', path.basename(aliceChat.workspaceDir));
+    const chatOnlyFile = path.join(aliceChatHome, 'notes', 'chat-only.md');
+    const shadowedMemo = path.join(aliceChatHome, 'notes', 'memo.md');
+    fs.mkdirSync(path.dirname(chatOnlyFile), { recursive: true });
+    fs.writeFileSync(chatOnlyFile, '# Chat Home Only');
+    fs.writeFileSync(shadowedMemo, '# Chat Home Shadowed Memo');
+    const chatHomeGeminiConfig = path.join(aliceChatHome, '.gemini', 'config');
+    if (!fs.existsSync(chatHomeGeminiConfig)) {
+      fs.mkdirSync(path.dirname(chatHomeGeminiConfig), { recursive: true });
+      fs.symlinkSync(path.join(aliceProfile, '.gemini', 'config'), chatHomeGeminiConfig);
+    }
+
+    const chatOnlyRes = await resolveAlice(`file://${chatOnlyFile}`);
+    expect(chatOnlyRes.status).toBe(200);
+    const chatOnlyBody = await fetch(`${srv.baseUrl}${chatOnlyRes.data.previewUrl}`, {
+      headers: { Cookie: alice.cookieHeader },
+    });
+    expect(chatOnlyBody.status).toBe(200);
+    expect(await chatOnlyBody.text()).toBe('# Chat Home Only');
+    expect((await resolveAlice('file:///home/sandbox/notes/chat-only.md', aliceOtherChat.id)).status).toBe(404);
+
+    const homeMemoRes = await resolveAlice(`file://${userNote}`);
+    expect(homeMemoRes.status).toBe(200);
+    const shadowedRes = await resolveAlice(`file://${shadowedMemo}`);
+    expect(shadowedRes.status).toBe(200);
+    expect(shadowedRes.data.artifact.id).not.toBe(homeMemoRes.data.artifact.id);
+    const homeMemoBody = await fetch(`${srv.baseUrl}${homeMemoRes.data.previewUrl}`, {
+      headers: { Cookie: alice.cookieHeader },
+    });
+    expect(await homeMemoBody.text()).toBe('# Personal Note');
+    const shadowedBody = await fetch(`${srv.baseUrl}${shadowedRes.data.previewUrl}`, {
+      headers: { Cookie: alice.cookieHeader },
+    });
+    expect(await shadowedBody.text()).toBe('# Chat Home Shadowed Memo');
+    const tildeShadowedRes = await resolveAlice('~/notes/memo.md');
+    expect(tildeShadowedRes.status).toBe(200);
+    expect(tildeShadowedRes.data.artifact.id).toBe(shadowedRes.data.artifact.id);
+
+    const homeOnlyFile = path.join(aliceProfile, 'notes', 'home-only.md');
+    fs.writeFileSync(homeOnlyFile, '# Home Only');
+    expect((await resolveAlice(`file://${path.join(aliceChatHome, 'notes', 'home-only.md')}`)).status).toBe(404);
+
+    const viaChatHomeSkill = await resolveAlice(
+      `file://${path.join(aliceChatHome, '.gemini', 'config', 'skills', 'algorithmic-art', 'SKILL.md')}`
+    );
+    expect(viaChatHomeSkill.status).toBe(200);
+    expect(viaChatHomeSkill.data.artifact.id).toBe(fromFileUri.data.artifact.id);
+  });
 });

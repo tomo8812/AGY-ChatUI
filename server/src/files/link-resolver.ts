@@ -6,7 +6,7 @@ import mime from 'mime-types';
 import { getChatBrainHostDir, SANDBOX_HOME_MOUNT, SANDBOX_WORKSPACE_MOUNT } from '../acp/env-isolation.js';
 import type { AppDatabase } from '../db/database.js';
 import type { ArtifactRecord, ChatRecord } from '../types.js';
-import { detectMimeAndPreviewKind, resolveContainedExistingPath, sha256File } from './workspace.js';
+import { detectMimeAndPreviewKind, normalizeRelPath, resolveContainedExistingPath, sha256File } from './workspace.js';
 
 export interface ResolvedWorkspaceLink {
   artifact: ArtifactRecord;
@@ -60,12 +60,64 @@ export function detectContentFileType(filename: string, declaredMime?: string | 
 
 type ResolvedChatFile = { absPath: string; relPath: string };
 
+const BLOCKED_KEY_OR_ENV_EXTENSIONS = new Set([
+  '.env',
+  '.pem',
+  '.key',
+  '.p12',
+  '.pfx',
+  '.jks',
+  '.keystore',
+  '.kdbx',
+  '.ppk',
+  '.gpg',
+  '.der',
+]);
+
+const BLOCKED_PRIVATE_KEY_FILENAMES = new Set([
+  'id_rsa',
+  'id_ed25519',
+  'id_ecdsa',
+  'id_dsa',
+]);
+
+const ALLOWED_GEMINI_USER_CONTENT_RE =
+  /^\.gemini\/(?:(?:config|antigravity|antigravity-cli)\/)?(?:(?:skills|skills-disabled|workflows|global_workflows|rules|agents|prompts)\/.+|GEMINI\.md)$/i;
+
+/**
+ * Structural profile-file boundary (no fragile filename-keyword blocklists):
+ * - Under `.gemini/`, allow only user-authored content roots (skills, workflows, rules, agents, prompts, GEMINI.md),
+ *   so Antigravity credentials and internal state (`oauth_creds.json`, `settings.json`, `mcp_config.json`, etc.) are denied by default.
+ * - Outside `.gemini/`, deny all hidden dotfiles/dotdirs (`.ssh`, `.aws`, `.config`, `.local`, `.env*`, `.chat-*`, `.mock-agy-auth.json`, etc.).
+ * - Always deny standard SSH private key files and raw private-key / dotenv extensions (including compound suffixes like `.env.local`).
+ */
+function isAllowedProfileRelPath(relPath: string): boolean {
+  const segments = relPath.split('/').filter(Boolean);
+  if (segments.length === 0) return false;
+
+  const basename = segments[segments.length - 1].toLowerCase();
+  const dotParts = basename.split('.');
+  if (
+    BLOCKED_PRIVATE_KEY_FILENAMES.has(dotParts[0]) ||
+    dotParts.slice(1).some((part) => BLOCKED_KEY_OR_ENV_EXTENSIONS.has(`.${part}`))
+  ) {
+    return false;
+  }
+
+  if (segments[0].toLowerCase() === '.gemini') {
+    if (!ALLOWED_GEMINI_USER_CONTENT_RE.test(relPath)) return false;
+    return segments.slice(1).every((seg) => !seg.startsWith('.'));
+  }
+
+  return segments.every((seg) => !seg.startsWith('.'));
+}
+
 function workspaceRelativePath(candidate: string): string {
   return candidate.startsWith(`${SANDBOX_WORKSPACE_MOUNT}/`)
     ? candidate.slice(SANDBOX_WORKSPACE_MOUNT.length).replace(/^\/+/, '') : candidate;
 }
 
-/** Map native paths to this chat's private roots without moving the file. */
+/** Map native paths to this chat's private roots or non-sensitive user profile files without moving them. */
 function resolveChatFile(db: AppDatabase, chat: ChatRecord, candidate: string): ResolvedChatFile | null {
   try {
     const resolved = resolveContainedExistingPath(chat.workspaceDir, workspaceRelativePath(candidate));
@@ -80,22 +132,123 @@ function resolveChatFile(db: AppDatabase, chat: ChatRecord, candidate: string): 
   const workspaceKey = path.basename(path.resolve(chat.workspaceDir));
   const chatHome = path.join(home, '.chat-homes', workspaceKey);
   const homePrefix = [SANDBOX_HOME_MOUNT, chatHome, home].find(root => candidate.startsWith(`${root}/`));
-  const relative = candidate.startsWith('~/') ? candidate.slice(2)
+  const rawRelative = candidate.startsWith('~/') ? candidate.slice(2)
     : homePrefix ? candidate.slice(homePrefix.length + 1) : '';
-  const alias = /^\.gemini\/(?:antigravity-cli\/|antigravity\/|jetski\/)?(brain|scratch|playground)\/(.+)$/.exec(relative);
-  const directory = alias?.[1] ?? /^\.chat-(brains|scratch|playground)\//.exec(relative)?.[1];
-  if (!directory) return null;
-  const kind = directory === 'brains' ? 'brain' : directory;
-  const root = kind === 'brain' ? getChatBrainHostDir(home, chat.workspaceDir)
-    : path.join(home, `.chat-${kind}`, workspaceKey);
+  if (!rawRelative) return null;
+
+  let relative: string;
   try {
-    if (fs.realpathSync(root) !== path.join(fs.realpathSync(home), path.relative(home, root))) return null;
-    const resolved = resolveContainedExistingPath(root, alias ? alias[2] : candidate);
-    if (!fs.statSync(resolved.absPath).isFile()) return null;
-    return { absPath: resolved.absPath, relPath: `${SANDBOX_HOME_MOUNT}/.gemini/${kind}/${resolved.relPath}` };
+    relative = normalizeRelPath(rawRelative);
   } catch {
     return null;
   }
+
+  const alias = /^\.gemini\/(?:antigravity-cli\/|antigravity\/|jetski\/)?(brain|scratch|playground)\/(.+)$/.exec(relative);
+  const directory = alias?.[1] ?? /^\.chat-(brains|scratch|playground)\//.exec(relative)?.[1];
+  if (directory) {
+    const kind = directory === 'brains' ? 'brain' : directory;
+    const root = kind === 'brain' ? getChatBrainHostDir(home, chat.workspaceDir)
+      : path.join(home, `.chat-${kind}`, workspaceKey);
+    try {
+      if (fs.realpathSync(root) !== path.join(fs.realpathSync(home), path.relative(home, root))) return null;
+      const resolved = resolveContainedExistingPath(root, alias ? alias[2] : candidate);
+      if (!fs.statSync(resolved.absPath).isFile()) return null;
+      return { absPath: resolved.absPath, relPath: `${SANDBOX_HOME_MOUNT}/.gemini/${kind}/${resolved.relPath}` };
+    } catch {
+      return null;
+    }
+  }
+
+  const chatHomeMatch = /^\.chat-homes\/([^/]+)\/(.+)$/.exec(relative);
+  if (chatHomeMatch) {
+    if (chatHomeMatch[1] !== workspaceKey) return null;
+    const subRelative = chatHomeMatch[2];
+    if (!isAllowedProfileRelPath(subRelative)) return null;
+    try {
+      const homeReal = fs.realpathSync(home);
+      const chatHomeReal = fs.realpathSync(chatHome);
+      if (chatHomeReal !== path.join(homeReal, '.chat-homes', workspaceKey)) return null;
+      const resolved = resolveContainedExistingPath(chatHomeReal, subRelative);
+      if (!isAllowedProfileRelPath(resolved.relPath)) return null;
+      if (!fs.statSync(resolved.absPath).isFile()) return null;
+      return {
+        absPath: resolved.absPath,
+        relPath: `${SANDBOX_HOME_MOUNT}/.chat-homes/${workspaceKey}/${resolved.relPath}`,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  if (!isAllowedProfileRelPath(relative)) return null;
+
+  const resolveFromHome = (): ResolvedChatFile | null => {
+    try {
+      const resolved = resolveContainedExistingPath(home, relative);
+      if (!isAllowedProfileRelPath(resolved.relPath)) return null;
+      if (!fs.statSync(resolved.absPath).isFile()) return null;
+      return { absPath: resolved.absPath, relPath: `${SANDBOX_HOME_MOUNT}/${resolved.relPath}` };
+    } catch {
+      return null;
+    }
+  };
+
+  const resolveFromChatHome = (): ResolvedChatFile | null => {
+    try {
+      const homeReal = fs.realpathSync(home);
+      const chatHomeReal = fs.realpathSync(chatHome);
+      if (chatHomeReal !== path.join(homeReal, '.chat-homes', workspaceKey)) return null;
+      const resolved = resolveContainedExistingPath(chatHomeReal, relative);
+      if (!isAllowedProfileRelPath(resolved.relPath)) return null;
+      if (!fs.statSync(resolved.absPath).isFile()) return null;
+      return {
+        absPath: resolved.absPath,
+        relPath: `${SANDBOX_HOME_MOUNT}/.chat-homes/${workspaceKey}/${resolved.relPath}`,
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  if (homePrefix === chatHome) {
+    try {
+      const homeReal = fs.realpathSync(home);
+      const chatHomeReal = fs.realpathSync(chatHome);
+      if (chatHomeReal !== path.join(homeReal, '.chat-homes', workspaceKey)) return null;
+      const targetReal = fs.realpathSync(path.resolve(chatHomeReal, relative));
+      if (!fs.statSync(targetReal).isFile()) return null;
+
+      if (targetReal.startsWith(chatHomeReal + path.sep)) {
+        const resolvedRelPath = path.relative(chatHomeReal, targetReal).split(path.sep).join('/');
+        if (!resolvedRelPath || !isAllowedProfileRelPath(resolvedRelPath)) return null;
+        return {
+          absPath: targetReal,
+          relPath: `${SANDBOX_HOME_MOUNT}/.chat-homes/${workspaceKey}/${resolvedRelPath}`,
+        };
+      }
+      if (targetReal.startsWith(homeReal + path.sep)) {
+        const resolvedRelPath = path.relative(homeReal, targetReal).split(path.sep).join('/');
+        if (!resolvedRelPath || !isAllowedProfileRelPath(resolvedRelPath)) return null;
+        return { absPath: targetReal, relPath: `${SANDBOX_HOME_MOUNT}/${resolvedRelPath}` };
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  if (candidate.startsWith('~/')) {
+    return resolveFromChatHome() ?? resolveFromHome();
+  }
+
+  const inHome = resolveFromHome();
+  if (inHome) return inHome;
+
+  if (homePrefix === SANDBOX_HOME_MOUNT) {
+    return resolveFromChatHome();
+  }
+
+  return null;
 }
 
 /** Resolve a stored artifact for every file endpoint, using the same chat boundary as link resolution. */
