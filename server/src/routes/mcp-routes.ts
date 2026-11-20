@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import type { AcpClientManager } from '../acp/client-manager.js';
 import { authenticateRequest } from '../auth/session.js';
+import type { AppConfig } from '../config.js';
 import type { AppDatabase } from '../db/database.js';
 import { McpService, McpValidationError } from '../mcp/mcp-service.js';
 import type { McpScope } from '../types.js';
@@ -79,7 +80,10 @@ function handleMcpError(reply: FastifyReply, err: unknown) {
   });
 }
 
-function parseValidatedHost(rawHost: string | undefined): string | null {
+function parseAllowlistedHost(
+  rawHost: string | undefined,
+  allowedHostnames: ReadonlySet<string>
+): string | null {
   if (!rawHost) return null;
   const trimmed = rawHost.trim().toLowerCase();
   if (!trimmed || /[\s/\\@?#]/.test(trimmed)) return null;
@@ -95,15 +99,32 @@ function parseValidatedHost(rawHost: string | undefined): string | null {
     ) {
       return null;
     }
+    const hostname = parsed.hostname.toLowerCase();
+    if (!allowedHostnames.has(hostname) && !allowedHostnames.has(parsed.host)) {
+      return null;
+    }
     return parsed.host;
   } catch {
     return null;
   }
 }
 
-function resolveRequestOrigin(req: FastifyRequest, fallbackPort: number): string {
+function resolveRequestOrigin(req: FastifyRequest, config: AppConfig): string {
+  if (config.publicOrigin) {
+    return config.publicOrigin;
+  }
   const proto = req.protocol === 'https' ? 'https' : 'http';
-  const host = parseValidatedHost(req.headers.host) ?? `127.0.0.1:${fallbackPort}`;
+  const allowedHostnames = new Set<string>([
+    '127.0.0.1',
+    'localhost',
+    '[::1]',
+    '::1',
+    config.host.trim().toLowerCase(),
+    ...config.allowedHosts.map((h) => h.trim().toLowerCase()).filter(Boolean),
+  ]);
+  const fallbackPort = req.socket?.localPort ?? config.port;
+  const fallbackHost = `${config.host}:${fallbackPort}`;
+  const host = parseAllowlistedHost(req.headers.host, allowedHostnames) ?? fallbackHost;
   return `${proto}://${host}`;
 }
 
@@ -214,7 +235,7 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
     const servers = mcpService.listServersForAdmin(session.user.id);
     return {
       servers,
-      callbackUrl: `${resolveRequestOrigin(req, config.port)}/api/mcp/oauth/callback`,
+      callbackUrl: `${resolveRequestOrigin(req, config)}/api/mcp/oauth/callback`,
     };
   });
 
@@ -314,7 +335,7 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
     if (!session) return;
     const { id } = req.params as { id: string };
     try {
-      const origin = resolveRequestOrigin(req, config.port);
+      const origin = resolveRequestOrigin(req, config);
       const flow = await mcpService.startOAuthFlow(session.user.id, id, origin);
       return flow;
     } catch (err) {

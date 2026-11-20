@@ -35,6 +35,8 @@ export interface AppConfig {
   maxUploadBytes: number;
   allowPublicSignup: boolean;
   allowPrivateMcpUrls: boolean;
+  publicOrigin: string | null;
+  allowedHosts: string[];
   secureCookies: 'auto' | 'always' | 'never';
   vapidSubject: string;
 }
@@ -109,6 +111,23 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     maxUploadBytes: parsePositiveInt(process.env.MAX_UPLOAD_MB, 50) * 1024 * 1024,
     allowPublicSignup: parseBool(process.env.ALLOW_PUBLIC_SIGNUP, true),
     allowPrivateMcpUrls: parseBool(process.env.ALLOW_PRIVATE_MCP_URLS, false),
+    publicOrigin: (() => {
+      const raw = process.env.PUBLIC_ORIGIN?.trim();
+      if (!raw) return null;
+      try {
+        const parsed = new URL(raw);
+        if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+          return parsed.origin;
+        }
+      } catch {
+        // ignore invalid PUBLIC_ORIGIN
+      }
+      return null;
+    })(),
+    allowedHosts: (process.env.ALLOWED_HOSTS ?? '')
+      .split(',')
+      .map((h) => h.trim().toLowerCase())
+      .filter(Boolean),
     secureCookies,
     vapidSubject: process.env.VAPID_SUBJECT ?? 'https://github.com/tomo8812/AGY-ChatUI',
   };
