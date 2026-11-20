@@ -1,5 +1,5 @@
 import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api } from './api/client';
+import { ApiError, api } from './api/client';
 import { SyncSocketClient, type WsConnectionStatus } from './api/ws';
 import { AgyOnboarding } from './components/AgyOnboarding';
 import { AuthScreen } from './components/AuthScreen';
@@ -141,6 +141,9 @@ export const App: React.FC = () => {
 
   const [quota, setQuota] = useState<QuotaSnapshotRecord | null>(null);
   const [quotaRefreshing, setQuotaRefreshing] = useState(false);
+  const [quotaError, setQuotaError] = useState<string | null>(null);
+  const [chatLoadError, setChatLoadError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const [pendingUpdateBuild, setPendingUpdateBuild] = useState<string | null>(null);
   const [pendingUpdateVersion, setPendingUpdateVersion] = useState<string | null>(null);
@@ -186,6 +189,12 @@ export const App: React.FC = () => {
   activeRunRef.current = activeRun;
   const draftCreatedChatRef = useRef<ChatRecord | null>(null);
   draftCreatedChatRef.current = draftCreatedChat;
+  const sessionOptionsRef = useRef<ParsedSessionOptions | null>(null);
+  sessionOptionsRef.current = sessionOptions;
+  const userOptionsRef = useRef<ParsedSessionOptions | null>(null);
+  userOptionsRef.current = userOptions;
+  const chatSwitchSeqRef = useRef<number>(0);
+  const urlHydratedUserIdRef = useRef<string | null>(null);
   const effectiveProjectIdRef = useRef<string | null>(null);
   const selectedModelIdRef = useRef<string>('');
   const selectedEffortValueRef = useRef<string>('');
@@ -344,12 +353,22 @@ export const App: React.FC = () => {
     }
     quotaRefreshingRef.current = true;
     setQuotaRefreshing(true);
+    if (!auto) {
+      setQuotaError(null);
+    }
     try {
       const res = await api.refreshQuota(auto, auto ? minAgeMs : undefined);
       quotaRef.current = res.quota;
       setQuota(res.quota);
-    } catch {
-      // Ignore silent auto-refresh failures; manual errors can propagate only if needed
+      setQuotaError(null);
+    } catch (err) {
+      if (!auto) {
+        setQuotaError(
+          err instanceof ApiError
+            ? err.message
+            : '利用枠の更新に失敗しました。通信状態を確認して再試行してください。'
+        );
+      }
     } finally {
       quotaRefreshingRef.current = false;
       setQuotaRefreshing(false);
@@ -388,8 +407,24 @@ export const App: React.FC = () => {
 
   const loadChatDetail = useCallback(async (chatId: string) => {
     const requestedAt = Date.now();
-    const detail = await api.getChat(chatId);
+    if (activeChatIdRef.current === chatId) {
+      setChatLoadError(null);
+    }
+    let detail: Awaited<ReturnType<typeof api.getChat>>;
+    try {
+      detail = await api.getChat(chatId);
+    } catch (err) {
+      if (activeChatIdRef.current === chatId) {
+        setChatLoadError(
+          err instanceof ApiError
+            ? err.message
+            : '会話履歴の読み込みに失敗しました。通信状態を確認して再試行してください。'
+        );
+      }
+      return;
+    }
     if (activeChatIdRef.current !== chatId) return;
+    setChatLoadError(null);
     seedChatArtifacts(chatId, detail.artifacts);
     setMessages((prev) => {
       if (prev.length === 0) return detail.messages;
@@ -656,22 +691,45 @@ export const App: React.FC = () => {
 
   // Open target chat from ?chatId=... query param or notification click events
   useEffect(() => {
-    if (!user) return;
+    if (!user) {
+      urlHydratedUserIdRef.current = null;
+      return;
+    }
     const params = new URLSearchParams(window.location.search);
     const targetChatId = params.get('chatId');
+    urlHydratedUserIdRef.current = user.id;
     if (targetChatId) {
+      chatSwitchSeqRef.current += 1;
       cleanupEmptyDraftChat();
       setDraftProjectId(null);
       setActiveChatId(targetChatId);
       setSidebarMobileOpen(false);
-      window.history.replaceState({}, '', window.location.pathname);
     }
   }, [user?.id, cleanupEmptyDraftChat]);
+
+  // Keep selected chat reflected in URL (?chatId=...) so page reload restores it
+  useEffect(() => {
+    if (!user || urlHydratedUserIdRef.current !== user.id) return;
+    const url = new URL(window.location.href);
+    const isEphemeralDraft = Boolean(activeChatId && draftCreatedChat?.id === activeChatId);
+    const desiredChatId = activeChatId && !isEphemeralDraft ? activeChatId : null;
+    const currentParam = url.searchParams.get('chatId');
+    if (desiredChatId) {
+      if (currentParam !== desiredChatId) {
+        url.searchParams.set('chatId', desiredChatId);
+        window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`);
+      }
+    } else if (currentParam !== null && !isEphemeralDraft) {
+      url.searchParams.delete('chatId');
+      window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`);
+    }
+  }, [user?.id, activeChatId, draftCreatedChat?.id]);
 
   useEffect(() => {
     const onOpenChat = (e: Event) => {
       const chatId = (e as CustomEvent<{ chatId?: string }>).detail?.chatId;
       if (chatId) {
+        chatSwitchSeqRef.current += 1;
         cleanupEmptyDraftChat();
         setDraftProjectId(null);
         setActiveChatId(chatId);
@@ -680,9 +738,22 @@ export const App: React.FC = () => {
     };
     window.addEventListener('agy:open-chat', onOpenChat);
 
+    const onPopState = () => {
+      if (!userIdRef.current) return;
+      const params = new URLSearchParams(window.location.search);
+      const nextChatId = params.get('chatId');
+      chatSwitchSeqRef.current += 1;
+      cleanupEmptyDraftChat();
+      setDraftProjectId(null);
+      setActiveChatId(nextChatId || null);
+      setSidebarMobileOpen(false);
+    };
+    window.addEventListener('popstate', onPopState);
+
     const sw = typeof navigator !== 'undefined' ? navigator.serviceWorker : undefined;
     const onSwMessage = (event: MessageEvent) => {
       if (event.data && event.data.type === 'OPEN_CHAT' && typeof event.data.chatId === 'string') {
+        chatSwitchSeqRef.current += 1;
         cleanupEmptyDraftChat();
         setDraftProjectId(null);
         setActiveChatId(event.data.chatId);
@@ -705,6 +776,7 @@ export const App: React.FC = () => {
 
     return () => {
       window.removeEventListener('agy:open-chat', onOpenChat);
+      window.removeEventListener('popstate', onPopState);
       sw?.removeEventListener('message', onSwMessage);
     };
   }, [cleanupEmptyDraftChat, syncPushSubscription]);
@@ -1419,6 +1491,7 @@ export const App: React.FC = () => {
   selectedEffortValueRef.current = selectedEffortValue;
 
   const handleStartDraftChat = useCallback((projectId: string | null = null) => {
+    chatSwitchSeqRef.current += 1;
     cleanupEmptyDraftChat();
     activeChatIdRef.current = null;
     setActiveChatId(null);
@@ -1429,23 +1502,27 @@ export const App: React.FC = () => {
     setActiveRun(null);
     setSessionOptions(null);
     setContextUsage(null);
+    setChatLoadError(null);
+    setActionError(null);
     setHasComposerDraft(false);
     setDraftResetToken((t) => t + 1);
   }, [cleanupEmptyDraftChat]);
 
-  const createDraftBackedChat = useCallback(async (): Promise<ChatRecord> => {
+  const createDraftBackedChat = useCallback(async (expectedSwitchSeq?: number): Promise<ChatRecord> => {
     const res = await api.createChat({
       projectId: draftProjectIdRef.current,
       modelId: selectedModelIdRef.current || null,
       effortValue: selectedEffortValueRef.current || null,
     });
-    draftCreatedChatRef.current = res.chat;
-    setDraftCreatedChat(res.chat);
-    setDraftProjectId(null);
-    if (res.sessionOptions) setSessionOptions(res.sessionOptions);
-    skipNextLoadChatIdRef.current = res.chat.id;
-    activeChatIdRef.current = res.chat.id;
-    setActiveChatId(res.chat.id);
+    if (expectedSwitchSeq === undefined || chatSwitchSeqRef.current === expectedSwitchSeq) {
+      draftCreatedChatRef.current = res.chat;
+      setDraftCreatedChat(res.chat);
+      setDraftProjectId(null);
+      if (res.sessionOptions) setSessionOptions(res.sessionOptions);
+      skipNextLoadChatIdRef.current = res.chat.id;
+      activeChatIdRef.current = res.chat.id;
+      setActiveChatId(res.chat.id);
+    }
     return res.chat;
   }, []);
 
@@ -1461,8 +1538,11 @@ export const App: React.FC = () => {
   const handleChangeModel = useCallback(async (modelId: string) => {
     const curChat = activeChatRef.current;
     const cachedOpts = optionsByModelRef.current.get(modelId);
+    setActionError(null);
 
     if (curChat) {
+      const prevModelId = curChat.modelId;
+      const prevSessionOpts = sessionOptionsRef.current;
       setChats((prev) => prev.map((c) => (c.id === curChat.id ? { ...c, modelId } : c)));
       setDraftCreatedChat((prev) =>
         prev && prev.id === curChat.id ? { ...prev, modelId } : prev
@@ -1481,18 +1561,35 @@ export const App: React.FC = () => {
         };
       });
 
-      const res = await api.patchChat(curChat.id, { modelId });
-      setChats((prev) => prev.map((c) => (c.id === curChat.id ? { ...c, ...res.chat } : c)));
-      setDraftCreatedChat((prev) =>
-        prev && prev.id === curChat.id ? { ...prev, ...res.chat } : prev
-      );
-      if (res.sessionOptions) {
-        optionsByModelRef.current.set(modelId, res.sessionOptions);
-        setSessionOptions(res.sessionOptions);
+      try {
+        const res = await api.patchChat(curChat.id, { modelId });
+        setChats((prev) => prev.map((c) => (c.id === curChat.id ? { ...c, ...res.chat } : c)));
+        setDraftCreatedChat((prev) =>
+          prev && prev.id === curChat.id ? { ...prev, ...res.chat } : prev
+        );
+        if (res.sessionOptions) {
+          optionsByModelRef.current.set(modelId, res.sessionOptions);
+          if (activeChatIdRef.current === curChat.id) {
+            setSessionOptions(res.sessionOptions);
+          }
+        }
+      } catch (err) {
+        setChats((prev) => prev.map((c) => (c.id === curChat.id ? { ...c, modelId: prevModelId } : c)));
+        setDraftCreatedChat((prev) =>
+          prev && prev.id === curChat.id ? { ...prev, modelId: prevModelId } : prev
+        );
+        if (activeChatIdRef.current === curChat.id) {
+          setSessionOptions(prevSessionOpts);
+        }
+        setActionError(
+          err instanceof ApiError ? err.message : 'モデルの変更を保存できませんでした。'
+        );
       }
       return;
     }
 
+    const prevPrefs = preferencesRef.current;
+    const prevUserOpts = userOptionsRef.current;
     setPreferences((prev) => (prev ? { ...prev, defaultModelId: modelId } : prev));
     setUserOptions((prev) => {
       if (cachedOpts) return cachedOpts;
@@ -1508,40 +1605,54 @@ export const App: React.FC = () => {
       };
     });
 
-    const [prefRes, optRes] = await Promise.all([
-      api.updatePreferences({ defaultModelId: modelId }),
-      api.getAgyOptions(modelId),
-    ]);
-    let nextPrefs = prefRes.preferences;
-    if (optRes.sessionOptions) {
-      optionsByModelRef.current.set(modelId, optRes.sessionOptions);
-      setUserOptions(optRes.sessionOptions);
-      const nextEffortOpt = optRes.sessionOptions.configOptions.find(
-        (o) => o.id === optRes.sessionOptions?.effortOptionId || o.category === 'thought_level'
-      );
-      if (
-        nextEffortOpt &&
-        nextPrefs.defaultEffortValue &&
-        !nextEffortOpt.options.some((o) => o.value === nextPrefs.defaultEffortValue)
-      ) {
-        const fallbackEffort =
-          nextEffortOpt.currentValue || nextEffortOpt.options[0]?.value || null;
-        if (fallbackEffort) {
-          nextPrefs = { ...nextPrefs, defaultEffortValue: fallbackEffort };
-          setPreferences(nextPrefs);
-          void api.updatePreferences({ defaultEffortValue: fallbackEffort }).then((synced) => {
-            setPreferences(synced.preferences);
-          });
-          return;
+    try {
+      const [prefRes, optRes] = await Promise.all([
+        api.updatePreferences({ defaultModelId: modelId }),
+        api.getAgyOptions(modelId),
+      ]);
+      let nextPrefs = prefRes.preferences;
+      if (optRes.sessionOptions) {
+        optionsByModelRef.current.set(modelId, optRes.sessionOptions);
+        setUserOptions(optRes.sessionOptions);
+        const nextEffortOpt = optRes.sessionOptions.configOptions.find(
+          (o) => o.id === optRes.sessionOptions?.effortOptionId || o.category === 'thought_level'
+        );
+        if (
+          nextEffortOpt &&
+          nextPrefs.defaultEffortValue &&
+          !nextEffortOpt.options.some((o) => o.value === nextPrefs.defaultEffortValue)
+        ) {
+          const fallbackEffort =
+            nextEffortOpt.currentValue || nextEffortOpt.options[0]?.value || null;
+          if (fallbackEffort) {
+            nextPrefs = { ...nextPrefs, defaultEffortValue: fallbackEffort };
+            setPreferences(nextPrefs);
+            void api
+              .updatePreferences({ defaultEffortValue: fallbackEffort })
+              .then((synced) => {
+                setPreferences(synced.preferences);
+              })
+              .catch(() => {});
+            return;
+          }
         }
       }
+      setPreferences(nextPrefs);
+    } catch (err) {
+      if (prevPrefs) setPreferences(prevPrefs);
+      setUserOptions(prevUserOpts);
+      setActionError(
+        err instanceof ApiError ? err.message : 'モデルの変更を保存できませんでした。'
+      );
     }
-    setPreferences(nextPrefs);
   }, []);
 
   const handleChangeEffort = useCallback(async (effortValue: string) => {
     const curChat = activeChatRef.current;
+    setActionError(null);
     if (curChat) {
+      const prevEffortValue = curChat.effortValue;
+      const prevSessionOpts = sessionOptionsRef.current;
       setChats((prev) => prev.map((c) => (c.id === curChat.id ? { ...c, effortValue } : c)));
       setDraftCreatedChat((prev) =>
         prev && prev.id === curChat.id ? { ...prev, effortValue } : prev
@@ -1559,15 +1670,32 @@ export const App: React.FC = () => {
         };
       });
 
-      const res = await api.patchChat(curChat.id, { effortValue });
-      setChats((prev) => prev.map((c) => (c.id === curChat.id ? { ...c, ...res.chat } : c)));
-      setDraftCreatedChat((prev) =>
-        prev && prev.id === curChat.id ? { ...prev, ...res.chat } : prev
-      );
-      if (res.sessionOptions) setSessionOptions(res.sessionOptions);
+      try {
+        const res = await api.patchChat(curChat.id, { effortValue });
+        setChats((prev) => prev.map((c) => (c.id === curChat.id ? { ...c, ...res.chat } : c)));
+        setDraftCreatedChat((prev) =>
+          prev && prev.id === curChat.id ? { ...prev, ...res.chat } : prev
+        );
+        if (res.sessionOptions && activeChatIdRef.current === curChat.id) {
+          setSessionOptions(res.sessionOptions);
+        }
+      } catch (err) {
+        setChats((prev) => prev.map((c) => (c.id === curChat.id ? { ...c, effortValue: prevEffortValue } : c)));
+        setDraftCreatedChat((prev) =>
+          prev && prev.id === curChat.id ? { ...prev, effortValue: prevEffortValue } : prev
+        );
+        if (activeChatIdRef.current === curChat.id) {
+          setSessionOptions(prevSessionOpts);
+        }
+        setActionError(
+          err instanceof ApiError ? err.message : '推論レベルの変更を保存できませんでした。'
+        );
+      }
       return;
     }
 
+    const prevPrefs = preferencesRef.current;
+    const prevUserOpts = userOptionsRef.current;
     setPreferences((prev) => (prev ? { ...prev, defaultEffortValue: effortValue } : prev));
     setUserOptions((prev) => {
       if (!prev) return prev;
@@ -1581,8 +1709,16 @@ export const App: React.FC = () => {
         ),
       };
     });
-    const res = await api.updatePreferences({ defaultEffortValue: effortValue });
-    setPreferences(res.preferences);
+    try {
+      const res = await api.updatePreferences({ defaultEffortValue: effortValue });
+      setPreferences(res.preferences);
+    } catch (err) {
+      if (prevPrefs) setPreferences(prevPrefs);
+      setUserOptions(prevUserOpts);
+      setActionError(
+        err instanceof ApiError ? err.message : '推論レベルの変更を保存できませんでした。'
+      );
+    }
   }, []);
 
   const handleChangeModelCb = useCallback(
@@ -1600,6 +1736,12 @@ export const App: React.FC = () => {
   );
 
   const handleManualReloadUpdate = () => {
+    if (hasComposerDraft) {
+      const confirmed = window.confirm(
+        '入力中の下書きや添付は再読み込み後に失われます。今すぐ更新しますか？'
+      );
+      if (!confirmed) return;
+    }
     if (pendingUpdateBuild) {
       try {
         if (pendingUpdateBuild === 'sw-update') {
@@ -1616,7 +1758,8 @@ export const App: React.FC = () => {
 
   const ensureActiveChatForAction = useCallback(async (): Promise<string> => {
     if (activeChatIdRef.current) return activeChatIdRef.current;
-    const created = await createDraftBackedChat();
+    const switchSeq = chatSwitchSeqRef.current;
+    const created = await createDraftBackedChat(switchSeq);
     return created.id;
   }, [createDraftBackedChat]);
 
@@ -1632,6 +1775,7 @@ export const App: React.FC = () => {
   const handleSendPrompt = useCallback(
     async (text: string, files: AttachmentRef[]): Promise<void> => {
       triggerHaptic('send', Boolean(preferencesRef.current?.hapticFeedback ?? true));
+      const switchSeq = chatSwitchSeqRef.current;
       const existingId = activeChatIdRef.current;
       const wasDraft = !existingId || draftCreatedChatRef.current?.id === existingId;
       const clientMessageId =
@@ -1663,7 +1807,7 @@ export const App: React.FC = () => {
       let chatId: string;
       let res: Awaited<ReturnType<typeof api.sendMessage>>;
       try {
-        chatId = existingId || (await createDraftBackedChat()).id;
+        chatId = existingId || (await createDraftBackedChat(switchSeq)).id;
         res = await api.sendMessage(chatId, {
           text,
           attachmentIds: files.map((f) => f.artifactId),
@@ -1697,18 +1841,20 @@ export const App: React.FC = () => {
         });
       }
 
-      setMessages((prev) => {
-        let next = upsertMessage(prev, res.userMessage);
-        next = upsertMessage(next, res.assistantMessage);
-        return next;
-      });
-      setActiveRun((cur) =>
-        cur &&
-        (cur.status === 'running' || cur.status === 'awaiting_permission') &&
-        res.run.status === 'queued'
-          ? cur
-          : res.run
-      );
+      if (activeChatIdRef.current === chatId) {
+        setMessages((prev) => {
+          let next = upsertMessage(prev, res.userMessage);
+          next = upsertMessage(next, res.assistantMessage);
+          return next;
+        });
+        setActiveRun((cur) =>
+          cur &&
+          (cur.status === 'running' || cur.status === 'awaiting_permission') &&
+          res.run.status === 'queued'
+            ? cur
+            : res.run
+        );
+      }
       void triggerQuotaRefresh(true, 5_000);
     },
     [user?.id, createDraftBackedChat, triggerQuotaRefresh]
@@ -1726,9 +1872,12 @@ export const App: React.FC = () => {
 
   const handleSelectChat = useCallback(
     (id: string) => {
+      chatSwitchSeqRef.current += 1;
       if (draftCreatedChatRef.current?.id !== id) {
         cleanupEmptyDraftChat();
       }
+      setActionError(null);
+      setChatLoadError(null);
       setDraftProjectId(null);
       setActiveChatId(id);
     },
@@ -1748,6 +1897,7 @@ export const App: React.FC = () => {
     setChats((prev) => prev.filter((c) => c.id !== chatId));
     setDraftCreatedChat((prev) => (prev && prev.id === chatId ? null : prev));
     if (activeChatIdRef.current === chatId) {
+      chatSwitchSeqRef.current += 1;
       activeChatIdRef.current = null;
       setActiveChatId(null);
     }
@@ -1908,6 +2058,7 @@ export const App: React.FC = () => {
           agyProfile={agyProfile}
           quota={quota}
           quotaRefreshing={quotaRefreshing}
+          quotaError={quotaError}
           wsStatus={wsStatus}
           onOpenSidebar={handleOpenSidebar}
           onNewChat={handleHeaderNewChat}
@@ -1942,11 +2093,16 @@ export const App: React.FC = () => {
             selectedEffortValue={selectedEffortValue}
             contextUsage={contextUsage}
             draftResetToken={draftResetToken}
+            isDraftChat={Boolean(draftCreatedChat && activeChat?.id === draftCreatedChat.id)}
+            chatLoadError={chatLoadError}
+            actionError={actionError}
             clientId={wsClientId}
             hapticEnabled={preferences?.hapticFeedback ?? true}
             onChangeModel={handleChangeModelCb}
             onChangeEffort={handleChangeEffortCb}
             onDraftChange={setHasComposerDraft}
+            onRetryLoadChat={activeChatId ? () => void loadChatDetail(activeChatId) : undefined}
+            onDismissActionError={() => setActionError(null)}
             onSendPrompt={handleSendPrompt}
             onUploadFiles={handleUploadFiles}
             onCancelRun={handleCancelRun}

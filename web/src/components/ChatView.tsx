@@ -55,11 +55,16 @@ interface ChatViewProps {
   selectedEffortValue: string;
   contextUsage?: { used: number; size: number } | null;
   draftResetToken?: number;
+  isDraftChat?: boolean;
+  chatLoadError?: string | null;
+  actionError?: string | null;
   clientId: string;
   hapticEnabled?: boolean;
   onChangeModel: (modelId: string) => void;
   onChangeEffort: (effortValue: string) => void;
   onDraftChange?: (hasDraft: boolean) => void;
+  onRetryLoadChat?: () => void;
+  onDismissActionError?: () => void;
   onSendPrompt: (text: string, files: AttachmentRef[]) => Promise<void>;
   onUploadFiles: (files: File[]) => Promise<AttachmentRef[]>;
   onCancelRun: (runId: string) => Promise<void>;
@@ -831,6 +836,8 @@ interface ChatComposerHandle {
 
 interface ChatComposerProps {
   chatId?: string;
+  isDraftChat?: boolean;
+  actionError?: string | null;
   availableCommands: AvailableCommandItem[];
   modelOptions: NonNullable<ParsedSessionOptions['configOptions']>[number]['options'];
   currentModelValue: string;
@@ -845,6 +852,7 @@ interface ChatComposerProps {
   onChangeModel: (modelId: string) => void;
   onChangeEffort: (effortValue: string) => void;
   onDraftChange?: (hasDraft: boolean) => void;
+  onDismissActionError?: () => void;
   onSendPrompt: (text: string, files: AttachmentRef[]) => Promise<void>;
   onUploadFiles: (files: File[]) => Promise<AttachmentRef[]>;
   onCancelRun: (runId: string) => Promise<void>;
@@ -857,6 +865,8 @@ const ChatComposer = React.memo(
     (
       {
         chatId,
+        isDraftChat = false,
+        actionError,
         availableCommands,
         modelOptions,
         currentModelValue,
@@ -871,6 +881,7 @@ const ChatComposer = React.memo(
         onChangeModel,
         onChangeEffort,
         onDraftChange,
+        onDismissActionError,
         onSendPrompt,
         onUploadFiles,
         onCancelRun,
@@ -891,22 +902,56 @@ const ChatComposer = React.memo(
       const fileInputRef = useRef<HTMLInputElement>(null);
       const textareaRef = useRef<HTMLTextAreaElement>(null);
       const composerInnerRef = useRef<HTMLDivElement>(null);
-      const prevChatIdRef = useRef<string | undefined>(chatId);
+      const draftKey = chatId ?? '__new__';
+      const prevDraftKeyRef = useRef<string>(draftKey);
+      const currentDraftKeyRef = useRef<string>(draftKey);
+      currentDraftKeyRef.current = draftKey;
+      const inputTextRef = useRef(inputText);
+      inputTextRef.current = inputText;
+      const stagedAttachmentsRef = useRef(stagedAttachments);
+      stagedAttachmentsRef.current = stagedAttachments;
+      const draftsByChatRef = useRef<Map<string, { text: string; attachments: AttachmentRef[] }>>(
+        new Map()
+      );
       const lastDraftRef = useRef<boolean | null>(null);
 
       useEffect(() => {
-        const prev = prevChatIdRef.current;
-        prevChatIdRef.current = chatId;
-        if (prev !== undefined && prev !== chatId) {
-          setStagedAttachments([]);
-          setUiNotice(null);
-          setSlashForceOpen(false);
-          setSlashDismissed(false);
+        const prevKey = prevDraftKeyRef.current;
+        if (prevKey === draftKey) return;
+        prevDraftKeyRef.current = draftKey;
+
+        // When a brand-new draft chat is materialized on file upload, preserve current draft under the new ID
+        if (prevKey === '__new__' && isDraftChat) {
+          draftsByChatRef.current.delete('__new__');
+          if (inputTextRef.current || stagedAttachmentsRef.current.length > 0) {
+            draftsByChatRef.current.set(draftKey, {
+              text: inputTextRef.current,
+              attachments: stagedAttachmentsRef.current,
+            });
+          }
+          return;
         }
-      }, [chatId]);
+
+        if (inputTextRef.current || stagedAttachmentsRef.current.length > 0) {
+          draftsByChatRef.current.set(prevKey, {
+            text: inputTextRef.current,
+            attachments: stagedAttachmentsRef.current,
+          });
+        } else {
+          draftsByChatRef.current.delete(prevKey);
+        }
+
+        const restored = draftsByChatRef.current.get(draftKey) ?? { text: '', attachments: [] };
+        setInputText(restored.text);
+        setStagedAttachments(restored.attachments);
+        setUiNotice(null);
+        setSlashForceOpen(false);
+        setSlashDismissed(false);
+      }, [draftKey, isDraftChat]);
 
       useEffect(() => {
         if (!draftResetToken) return;
+        draftsByChatRef.current.delete('__new__');
         setInputText('');
         setStagedAttachments([]);
         setUiNotice(null);
@@ -938,22 +983,36 @@ const ChatComposer = React.memo(
         }
       }, [hasDraft, onDraftChange]);
 
-      // Auto-resize composer textarea
+      // Auto-resize composer textarea (bounded on compact mobile viewports so toolbar stays reachable)
       useEffect(() => {
         const el = textareaRef.current;
         if (!el) return;
+        const viewportH =
+          typeof window !== 'undefined'
+            ? (window.visualViewport?.height ?? window.innerHeight)
+            : 800;
+        const maxTextareaHeight = Math.min(180, Math.max(68, Math.floor(viewportH * 0.22)));
         el.style.height = 'auto';
-        el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
+        el.style.height = `${Math.min(el.scrollHeight, maxTextareaHeight)}px`;
       }, [inputText]);
 
       const handleFilesSelected = useCallback(
         async (files: File[]) => {
           if (files.length === 0) return;
+          const targetKey = currentDraftKeyRef.current;
           setUploading(true);
           setUiNotice(null);
           try {
             const uploaded = await onUploadFiles(files);
-            setStagedAttachments((prev) => [...prev, ...uploaded]);
+            if (currentDraftKeyRef.current === targetKey || targetKey === '__new__') {
+              setStagedAttachments((prev) => [...prev, ...uploaded]);
+            } else {
+              const saved = draftsByChatRef.current.get(targetKey) ?? { text: '', attachments: [] };
+              draftsByChatRef.current.set(targetKey, {
+                text: saved.text,
+                attachments: [...saved.attachments, ...uploaded],
+              });
+            }
           } catch (err) {
             setUiNotice(err instanceof ApiError ? err.message : 'ファイル添付に失敗しました。');
           } finally {
@@ -1033,7 +1092,8 @@ const ChatComposer = React.memo(
 
       const configBusy = sending || uploading || isRunBusy;
       const canSend = !(sending || uploading || (!inputText.trim() && stagedAttachments.length === 0));
-      const showStopInsteadOfSend = isRunBusy && Boolean(activeRunId) && !hasDraft && !sending;
+      const canStopRun = isRunBusy && Boolean(activeRunId);
+      const showStopOnly = canStopRun && !hasDraft && !sending;
       const isFollowupSendMode = isRunBusy && (hasDraft || sending);
       const useIosSwitchOverlay = isAppleTouchHapticsFallback() && hapticEnabled;
 
@@ -1053,8 +1113,10 @@ const ChatComposer = React.memo(
         }
         onPromptSubmitting?.();
 
+        const submitDraftKey = currentDraftKeyRef.current;
         const toSendAttachments = stagedAttachments;
         const savedInput = inputText;
+        draftsByChatRef.current.delete(submitDraftKey);
         setSending(true);
         setUiNotice(null);
         setInputText('');
@@ -1065,9 +1127,16 @@ const ChatComposer = React.memo(
         try {
           await onSendPrompt(savedInput, toSendAttachments);
         } catch (err) {
-          setInputText(savedInput);
-          setStagedAttachments(toSendAttachments);
-          setUiNotice(err instanceof ApiError ? err.message : 'メッセージ送信に失敗しました。');
+          if (currentDraftKeyRef.current === submitDraftKey) {
+            setInputText(savedInput);
+            setStagedAttachments(toSendAttachments);
+            setUiNotice(err instanceof ApiError ? err.message : 'メッセージ送信に失敗しました。');
+          } else {
+            draftsByChatRef.current.set(submitDraftKey, {
+              text: savedInput,
+              attachments: toSendAttachments,
+            });
+          }
         } finally {
           setSending(false);
         }
@@ -1127,14 +1196,24 @@ const ChatComposer = React.memo(
         }
       };
 
+      const activeNotice = uiNotice || actionError;
+
       return (
         <div className="composer-dock">
           <div className="composer-inner" ref={composerInnerRef}>
-            <div role="status">
-              {uiNotice && (
-                <div className="composer-notice">
-                  <span>{uiNotice}</span>
-                  <button type="button" className="icon-btn-sm" aria-label="通知を閉じる" onClick={() => setUiNotice(null)}>
+            <div role={actionError ? 'alert' : 'status'}>
+              {activeNotice && (
+                <div className={`composer-notice ${actionError && !uiNotice ? 'is-error' : ''}`}>
+                  <span>{activeNotice}</span>
+                  <button
+                    type="button"
+                    className="icon-btn-sm"
+                    aria-label="通知を閉じる"
+                    onClick={() => {
+                      if (uiNotice) setUiNotice(null);
+                      else onDismissActionError?.();
+                    }}
+                  >
                     <CloseIcon size={14} />
                   </button>
                 </div>
@@ -1222,7 +1301,7 @@ const ChatComposer = React.memo(
                 {stagedAttachments.map((att) => (
                   <div key={att.artifactId} className="att-chip staged-item">
                     <FileIcon size={13} />
-                    <span>{att.filename}</span>
+                    <span title={att.filename}>{att.filename}</span>
                     <button
                       type="button"
                       className="icon-btn-sm"
@@ -1231,7 +1310,7 @@ const ChatComposer = React.memo(
                           prev.filter((a) => a.artifactId !== att.artifactId)
                         )
                       }
-                      aria-label="添付を除外"
+                      aria-label={`${att.filename} を添付から除外`}
                     >
                       <CloseIcon size={12} />
                     </button>
@@ -1323,7 +1402,7 @@ const ChatComposer = React.memo(
                     </span>
                   )}
 
-                  {showStopInsteadOfSend && activeRunId ? (
+                  {canStopRun && activeRunId && (
                     <div className="haptic-btn-shell">
                       <button
                         type="button"
@@ -1348,7 +1427,9 @@ const ChatComposer = React.memo(
                         </label>
                       )}
                     </div>
-                  ) : (
+                  )}
+
+                  {!showStopOnly && (
                     <div className="haptic-btn-shell">
                       <button
                         type="submit"
@@ -1401,11 +1482,16 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
   selectedEffortValue,
   contextUsage,
   draftResetToken = 0,
+  isDraftChat = false,
+  chatLoadError,
+  actionError,
   clientId,
   hapticEnabled = true,
   onChangeModel,
   onChangeEffort,
   onDraftChange,
+  onRetryLoadChat,
+  onDismissActionError,
   onSendPrompt,
   onUploadFiles,
   onCancelRun,
@@ -1784,19 +1870,35 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
 
       <div ref={messagesScrollRef} className="messages-scroll" onScroll={handleMessagesScroll}>
         <div ref={messagesRailRef} className="messages-rail">
-          {messages.length === 0 ? (
-            <div className="welcome-empty">
-              {project ? (
-                <>
-                  <h2>{project.name}</h2>
-                  {(project.description || project.files.length > 0) && (
-                    <p className="muted-sm">
-                      {project.description || `共有資料 (${project.files.length}件) が参照可能です。`}
-                    </p>
-                  )}
-                </>
-              ) : null}
+          {chatLoadError && (
+            <div className="error-box chat-load-error" role="alert">
+              <span>{chatLoadError}</span>
+              {onRetryLoadChat && (
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-xs"
+                  onClick={onRetryLoadChat}
+                >
+                  再読み込み
+                </button>
+              )}
             </div>
+          )}
+          {messages.length === 0 ? (
+            chatLoadError ? null : (
+              <div className="welcome-empty">
+                {project ? (
+                  <>
+                    <h2>{project.name}</h2>
+                    {(project.description || project.files.length > 0) && (
+                      <p className="muted-sm">
+                        {project.description || `共有資料 (${project.files.length}件) が参照可能です。`}
+                      </p>
+                    )}
+                  </>
+                ) : null}
+              </div>
+            )
           ) : (
             messages.map((msg) => (
               <MessageRow
@@ -1829,6 +1931,8 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
       <ChatComposer
         ref={composerRef}
         chatId={chat?.id}
+        isDraftChat={isDraftChat}
+        actionError={actionError}
         availableCommands={availableCommands}
         modelOptions={modelOptions}
         currentModelValue={currentModelValue}
@@ -1843,6 +1947,7 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
         onChangeModel={onChangeModel}
         onChangeEffort={onChangeEffort}
         onDraftChange={onDraftChange}
+        onDismissActionError={onDismissActionError}
         onSendPrompt={onSendPrompt}
         onUploadFiles={onUploadFiles}
         onCancelRun={onCancelRun}

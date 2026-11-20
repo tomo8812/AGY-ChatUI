@@ -70,10 +70,11 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
         )}
 
         {!isInitialSetup && allowPublicSignup && (
-          <div className="segmented-tabs">
+          <div className="segmented-tabs" role="tablist" aria-label="認証モード">
             <button
               type="button"
-              aria-pressed={mode === 'login'}
+              role="tab"
+              aria-selected={mode === 'login'}
               className={mode === 'login' ? 'seg-btn active' : 'seg-btn'}
               onClick={() => {
                 setMode('login');
@@ -84,7 +85,8 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
             </button>
             <button
               type="button"
-              aria-pressed={mode === 'register'}
+              role="tab"
+              aria-selected={mode === 'register'}
               className={mode === 'register' ? 'seg-btn active' : 'seg-btn'}
               onClick={() => {
                 setMode('register');
@@ -137,7 +139,11 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
             />
           </label>
 
-          {error && <div className="error-box">{error}</div>}
+          {error && (
+            <div className="error-box" role="alert">
+              {error}
+            </div>
+          )}
 
           <button type="submit" className="btn btn-primary btn-block" disabled={busy}>
             {busy

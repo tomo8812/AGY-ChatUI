@@ -10,6 +10,7 @@ import type {
 } from '../types';
 import { invalidateSkillFileCache, makeSkillFileCacheKey, skillFileCache } from '../utils/viewerCache';
 import { CloseIcon, FileIcon, PlusIcon, SparklesIcon, TrashIcon } from './Icons';
+import { ModalDialog } from './ModalDialog';
 import { ToggleSwitch } from './ToggleSwitch';
 
 interface SkillsModalProps {
@@ -29,6 +30,79 @@ const SCOPE_LABELS: Record<SkillScope, string> = {
 
 const RESOURCE_FOLDERS = ['scripts', 'references', 'resources', 'assets'] as const;
 
+function buildRawSkillMd(fields: {
+  name: string;
+  slug: string;
+  description: string;
+  instructions: string;
+  disableModelInvocation: boolean;
+}): string {
+  const fmLines = [
+    '---',
+    `name: ${JSON.stringify(fields.name.trim() || fields.slug.trim() || 'skill-name')}`,
+    `description: ${JSON.stringify(fields.description.trim())}`,
+  ];
+  if (fields.disableModelInvocation) {
+    fmLines.push('disable-model-invocation: true');
+  }
+  fmLines.push('---', '', fields.instructions.trim(), '');
+  return fmLines.join('\n');
+}
+
+function unquoteYamlScalar(rawVal: string): string {
+  const trimmed = rawVal.trim();
+  if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) {
+    try {
+      return String(JSON.parse(trimmed));
+    } catch {
+      return trimmed.slice(1, -1);
+    }
+  }
+  if (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2) {
+    return trimmed.slice(1, -1).replace(/''/g, "'");
+  }
+  return trimmed;
+}
+
+function parseRawSkillMd(raw: string): {
+  name?: string;
+  description?: string;
+  disableModelInvocation?: boolean;
+  instructions: string;
+} {
+  const normalized = raw.replace(/\r\n/g, '\n');
+  const match = /^---\n([\s\S]*?)\n---(?:\n|$)([\s\S]*)$/.exec(normalized);
+  if (!match) {
+    return { instructions: normalized.trim() };
+  }
+  const fmText = match[1];
+  const body = match[2].trim();
+  let parsedName: string | undefined;
+  let parsedDesc: string | undefined;
+  let parsedDisable: boolean | undefined;
+
+  for (const line of fmText.split('\n')) {
+    const kv = /^([a-zA-Z0-9_-]+)\s*:\s*(.*)$/.exec(line.trim());
+    if (!kv) continue;
+    const key = kv[1].toLowerCase();
+    const val = kv[2];
+    if (key === 'name') {
+      parsedName = unquoteYamlScalar(val);
+    } else if (key === 'description') {
+      parsedDesc = unquoteYamlScalar(val);
+    } else if (key === 'disable-model-invocation') {
+      parsedDisable = unquoteYamlScalar(val).toLowerCase() === 'true';
+    }
+  }
+
+  return {
+    name: parsedName,
+    description: parsedDesc,
+    disableModelInvocation: parsedDisable,
+    instructions: body,
+  };
+}
+
 export const SkillsModal: React.FC<SkillsModalProps> = ({
   activeChatId,
   activeProjectId,
@@ -43,6 +117,7 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
   );
   const [skillsData, setSkillsData] = useState<SkillsListResponse | null>(null);
   const [loadingList, setLoadingList] = useState(true);
+  const [listError, setListError] = useState<string | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -77,6 +152,7 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
 
   const refreshSkills = useCallback(async () => {
     setLoadingList(true);
+    setListError(null);
     try {
       const res = await api.listSkills({
         projectId: effectiveProjectId || activeProjectId || null,
@@ -85,7 +161,7 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
       setSkillsData(res);
       return res;
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'スキル一覧の読込に失敗しました。');
+      setListError(err instanceof ApiError ? err.message : 'スキル一覧の読込に失敗しました。');
       return null;
     } finally {
       setLoadingList(false);
@@ -413,8 +489,7 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
     (scope === 'workspace' && Boolean(activeChatId));
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-card modal-xl" onClick={(e) => e.stopPropagation()}>
+    <ModalDialog label="スキル管理" size="modal-xl" onClose={onClose}>
         <div className="modal-head">
           <div className="row-actions">
             <SparklesIcon size={17} />
@@ -426,11 +501,13 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
         </div>
 
         <div className="skills-scope-bar">
-          <div className="segmented-tabs">
+          <div className="segmented-tabs" role="tablist" aria-label="スキル適用範囲">
             {(['global', 'project', 'workspace'] as const).map((s) => (
               <button
                 key={s}
                 type="button"
+                role="tab"
+                aria-selected={scope === s}
                 className={scope === s ? 'seg-btn active' : 'seg-btn'}
                 onClick={() => {
                   setScope(s);
@@ -448,12 +525,13 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
 
           {scope === 'project' && (
             <div className="skills-project-picker">
-              <span className="muted-xs">対象プロジェクト:</span>
+              <label htmlFor="skills-project-select" className="muted-xs">対象プロジェクト:</label>
               {projects.length === 0 ? (
                 <span className="muted-xs">プロジェクトがまだありません</span>
               ) : (
                 <select
-                  className="compact-select"
+                  id="skills-project-select"
+                  className="compact-select skills-project-select"
                   value={selectedProjectId}
                   onChange={(e) => {
                     setSelectedProjectId(e.target.value);
@@ -499,53 +577,74 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
               <div className="muted-sm" style={{ padding: 14 }}>読込中...</div>
             ) : (
               <div className="skills-list-scroll">
-                {currentList.length === 0 ? (
+                {listError && (
+                  <div className="error-box" role="alert" style={{ marginBottom: 12 }}>
+                    <div>{listError}</div>
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-xs"
+                      style={{ marginTop: 8 }}
+                      onClick={() => void refreshSkills()}
+                    >
+                      再読み込み
+                    </button>
+                  </div>
+                )}
+                {!listError && currentList.length === 0 ? (
                   <div className="empty-box muted-xs" style={{ marginBottom: 12 }}>
                     このスコープにスキルはまだありません
                   </div>
-                ) : (
+                ) : currentList.length > 0 ? (
                   <div className="skills-items">
                     {currentList.map((item) => {
                       const isSelected =
                         editorMode === 'edit' &&
                         selectedDetail?.slug === item.slug &&
                         selectedDetail?.scope === item.scope;
+                      const skillLabel = item.name || item.slug;
                       return (
                         <div
                           key={`${item.scope}:${item.slug}`}
                           className={`skill-list-card ${isSelected ? 'active' : ''} ${!item.enabled ? 'is-disabled' : ''}`}
-                          onClick={() => void openSkillDetail(item)}
                         >
                           <div className="skill-list-card-top">
-                            <div className="skill-list-card-title">
-                              <span className="skill-slug-pill">/{item.slug}</span>
-                              {item.storageKind === 'legacy' && (
-                                <span className="skill-tag legacy">legacy</span>
+                            <button
+                              type="button"
+                              className="skill-list-card-btn"
+                              aria-current={isSelected ? 'true' : undefined}
+                              onClick={() => void openSkillDetail(item)}
+                            >
+                              <div className="skill-list-card-title">
+                                <span className="skill-slug-pill">/{item.slug}</span>
+                                {item.storageKind === 'legacy' && (
+                                  <span className="skill-tag legacy">legacy</span>
+                                )}
+                                {item.disableModelInvocation && (
+                                  <span className="skill-tag">手動のみ</span>
+                                )}
+                              </div>
+                              {item.name && item.name !== item.slug && (
+                                <div className="skill-list-name truncate">{item.name}</div>
                               )}
-                              {item.disableModelInvocation && (
-                                <span className="skill-tag">手動のみ</span>
+                              <div className="skill-list-desc">{item.description || '（説明なし）'}</div>
+                              {item.resourceCount > 0 && (
+                                <div className="muted-xs">同梱ファイル {item.resourceCount}件</div>
                               )}
-                            </div>
-                            <div onClick={(e) => e.stopPropagation()}>
+                            </button>
+                            <div className="skill-list-card-toggle">
                               <ToggleSwitch
                                 checked={item.enabled}
                                 label=""
+                                ariaLabel={`スキル「${skillLabel}」を有効にする`}
                                 onChange={(next) => void handleToggleItem(item, next)}
                               />
                             </div>
                           </div>
-                          {item.name && item.name !== item.slug && (
-                            <div className="skill-list-name truncate">{item.name}</div>
-                          )}
-                          <div className="skill-list-desc">{item.description || '（説明なし）'}</div>
-                          {item.resourceCount > 0 && (
-                            <div className="muted-xs">同梱ファイル {item.resourceCount}件</div>
-                          )}
                         </div>
                       );
                     })}
                   </div>
-                )}
+                ) : null}
 
                 {skillsData && skillsData.templates.length > 0 && (
                   <div className="skills-templates-box">
@@ -586,8 +685,8 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
               </div>
             )}
 
-            {error && <div className="error-box" style={{ marginBottom: 10 }}>{error}</div>}
-            {statusNote && <div className="success-box" style={{ marginBottom: 10 }}>{statusNote}</div>}
+            {error && <div className="error-box" role="alert" style={{ marginBottom: 10 }}>{error}</div>}
+            {statusNote && <div className="success-box" role="status" style={{ marginBottom: 10 }}>{statusNote}</div>}
 
             {editorMode === 'idle' ? (
               <div className="skills-editor-empty">
@@ -622,22 +721,27 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
                       type="button"
                       className={`chip-btn ${rawMode ? 'active' : ''}`}
                       onClick={() => {
-                        setRawMode((prev) => {
-                          const next = !prev;
-                          if (next && !rawSkillMd.trim() && (slug || description || instructions)) {
-                            const fmLines = [
-                              '---',
-                              `name: ${JSON.stringify(name.trim() || slug.trim() || 'skill-name')}`,
-                              `description: ${JSON.stringify(description.trim() || '')}`,
-                            ];
-                            if (disableModelInvocation) {
-                              fmLines.push('disable-model-invocation: true');
-                            }
-                            fmLines.push('---', '', instructions.trim(), '');
-                            setRawSkillMd(fmLines.join('\n'));
+                        if (!rawMode) {
+                          setRawSkillMd(
+                            buildRawSkillMd({
+                              name,
+                              slug,
+                              description,
+                              instructions,
+                              disableModelInvocation,
+                            })
+                          );
+                          setRawMode(true);
+                        } else {
+                          const parsed = parseRawSkillMd(rawSkillMd);
+                          if (parsed.name !== undefined) setName(parsed.name);
+                          if (parsed.description !== undefined) setDescription(parsed.description);
+                          if (parsed.disableModelInvocation !== undefined) {
+                            setDisableModelInvocation(parsed.disableModelInvocation);
                           }
-                          return next;
-                        });
+                          setInstructions(parsed.instructions);
+                          setRawMode(false);
+                        }
                       }}
                     >
                       {rawMode ? 'フォーム編集へ' : '直接編集'}
@@ -864,7 +968,6 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
             )}
           </div>
         </div>
-      </div>
-    </div>
+    </ModalDialog>
   );
 };

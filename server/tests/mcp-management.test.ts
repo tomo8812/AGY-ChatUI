@@ -96,7 +96,10 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
         scope: 'shared',
         transport: 'stdio',
         command: 'node',
-        args: ['-e', 'console.log("ok")'],
+        args: [
+          '-e',
+          'process.stdin.once("data", () => { console.log(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-03-26", capabilities: {}, serverInfo: { name: "mock-stdio-mcp", version: "1.0.0" } } })); });',
+        ],
         env: [{ name: 'API_SECRET', value: 'super-secret-env-1234' }],
       }
     );
@@ -105,7 +108,7 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
     expect(stdioEnv).toEqual([{ name: 'API_SECRET', maskedValue: '••••1234', hasValue: true }]);
     expect(JSON.stringify(createStdio.data)).not.toContain('super-secret-env-1234');
 
-    // Admin tests stdio executable resolution
+    // Admin tests stdio MCP initialize handshake
     const testStdio = await admin.request<{ result: { ok: boolean; resolvedCommand?: string } }>(
       'POST',
       `/api/mcp/servers/${createStdio.data.server.id}/test`,
@@ -638,5 +641,123 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
         'oracle-vm.tail1234.ts.net'
       )
     ).toBe('https://chat.custom.example.com');
+  });
+
+  it('rejects non-MCP stdio/HTTP/SSE endpoints in connection tests and reports invalid JSON import entries explicitly', async () => {
+    const mockHttp = http.createServer((req, res) => {
+      if (req.url === '/plain-html') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end('<html><body>Not an MCP server</body></html>');
+        return;
+      }
+      if (req.url === '/fake-sse') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (req.url === '/real-sse') {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write('event: endpoint\ndata: /messages\n\n');
+        res.end();
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise<void>((resolve) => mockHttp.listen(0, '127.0.0.1', () => resolve()));
+    httpServers.push(mockHttp);
+    const addr = mockHttp.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 0;
+
+    const srv = await createTestServer({ allowPrivateMcpUrls: true });
+    servers.push(srv);
+    const { client: admin } = await registerAndBindAgy(srv.baseUrl, 'mcptestadmin', 'user:admin-t');
+
+    // 1) Non-MCP stdio process that just prints "ok" and exits must fail test
+    const badStdio = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'non-mcp-stdio',
+      scope: 'profile',
+      transport: 'stdio',
+      command: 'node',
+      args: ['-e', 'console.log("ok")'],
+    });
+    expect(badStdio.status).toBe(201);
+    const badStdioTest = await admin.request<{ result: { ok: boolean; status: string } }>(
+      'POST',
+      `/api/mcp/servers/${badStdio.data.server.id}/test`,
+      {}
+    );
+    expect(badStdioTest.status).toBe(200);
+    expect(badStdioTest.data.result.ok).toBe(false);
+    expect(badStdioTest.data.result.status).toBe('error');
+
+    // 2) HTTP 200 plain HTML must fail MCP initialize test
+    const badHttp = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'non-mcp-http',
+      scope: 'profile',
+      transport: 'http',
+      url: `http://127.0.0.1:${port}/plain-html`,
+      authType: 'none',
+    });
+    expect(badHttp.status).toBe(201);
+    const badHttpTest = await admin.request<{ result: { ok: boolean; status: string } }>(
+      'POST',
+      `/api/mcp/servers/${badHttp.data.server.id}/test`,
+      {}
+    );
+    expect(badHttpTest.status).toBe(200);
+    expect(badHttpTest.data.result.ok).toBe(false);
+
+    // 3) SSE 200 with application/json (not text/event-stream) must fail, while text/event-stream succeeds
+    const badSse = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'non-mcp-sse',
+      scope: 'profile',
+      transport: 'sse',
+      url: `http://127.0.0.1:${port}/fake-sse`,
+      authType: 'none',
+    });
+    expect(badSse.status).toBe(201);
+    const badSseTest = await admin.request<{ result: { ok: boolean } }>(
+      'POST',
+      `/api/mcp/servers/${badSse.data.server.id}/test`,
+      {}
+    );
+    expect(badSseTest.status).toBe(200);
+    expect(badSseTest.data.result.ok).toBe(false);
+
+    const goodSse = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'valid-mcp-sse',
+      scope: 'profile',
+      transport: 'sse',
+      url: `http://127.0.0.1:${port}/real-sse`,
+      authType: 'none',
+    });
+    expect(goodSse.status).toBe(201);
+    const goodSseTest = await admin.request<{ result: { ok: boolean } }>(
+      'POST',
+      `/api/mcp/servers/${goodSse.data.server.id}/test`,
+      {}
+    );
+    expect(goodSseTest.status).toBe(200);
+    expect(goodSseTest.data.result.ok).toBe(true);
+
+    // 4) JSON import with missing url/command must report the invalid entry, NOT suggest overwrite
+    const badImport = await admin.request<{ error?: string; message?: string }>(
+      'POST',
+      '/api/mcp/import',
+      {
+        scope: 'profile',
+        rawJson: JSON.stringify({
+          mcpServers: {
+            brokenServer: { description: 'missing url and command' },
+          },
+        }),
+      }
+    );
+    expect(badImport.status).toBe(400);
+    expect(badImport.data.error).toBe('INVALID_IMPORT_ENTRIES');
+    expect(badImport.data.message).toContain('brokenServer');
+    expect(badImport.data.message).toContain('url または command');
+    expect(badImport.data.message).not.toContain('上書き');
   });
 });

@@ -7,7 +7,8 @@ import type {
   McpTestResult,
   McpTransport,
 } from '../types';
-import { CloseIcon, PlusIcon, TrashIcon } from './Icons';
+import { CloseIcon, ExternalLinkIcon, PlusIcon, TrashIcon } from './Icons';
+import { ModalDialog } from './ModalDialog';
 import { ToggleSwitch } from './ToggleSwitch';
 
 interface McpModalProps {
@@ -69,9 +70,11 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     `${window.location.origin}/api/mcp/oauth/callback`
   );
   const [loading, setLoading] = useState(true);
+  const [listError, setListError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [statusNote, setStatusNote] = useState<string | null>(null);
+  const [oauthPendingUrl, setOAuthPendingUrl] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<McpTestResult | null>(null);
 
   const [mobileShowEditor, setMobileShowEditor] = useState(false);
@@ -119,13 +122,14 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
 
   const loadServers = useCallback(async () => {
     setLoading(true);
+    setListError(null);
     try {
       const res = await api.listMcpServers();
       setServers(res.servers);
       if (res.callbackUrl) setCallbackUrl(res.callbackUrl);
       return res.servers;
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'MCPサーバー一覧の読込に失敗しました。');
+      setListError(err instanceof ApiError ? err.message : 'MCPサーバー一覧の読込に失敗しました。');
       return null;
     } finally {
       setLoading(false);
@@ -226,12 +230,13 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     setOAuthExtraParamsText(extraPairs.join('\n'));
     setShowOAuthAdvanced(Boolean(srv.oauth?.clientId || srv.oauth?.authorizationUrl || srv.oauth?.scopes));
     setTestResult(null);
+    setOAuthPendingUrl(null);
     setError(null);
     setStatusNote(null);
     setMobileShowEditor(true);
   }, []);
 
-  // Listen for OAuth popup completion
+  // Listen for OAuth popup completion without clobbering unsaved form edits
   useEffect(() => {
     const onMessage = (evt: MessageEvent) => {
       if (evt.origin !== window.location.origin) return;
@@ -243,13 +248,8 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
       } | null;
       if (!data || data.type !== 'agy-mcp-oauth-complete') return;
 
-      void loadServers().then((updatedList) => {
-        if (updatedList && data.serverId) {
-          const hit = updatedList.find((s) => s.id === data.serverId);
-          if (hit && selectedId === hit.id) {
-            populateFormFromServer(hit);
-          }
-        }
+      setOAuthPendingUrl(null);
+      void loadServers().then(() => {
         if (data.ok) {
           setStatusNote(data.message || 'OAuth認証が完了しました。');
           setError(null);
@@ -260,7 +260,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     };
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, [loadServers, populateFormFromServer, selectedId]);
+  }, [loadServers]);
 
   const filteredServers = useMemo(
     () => servers.filter((s) => s.scope === scopeTab),
@@ -271,6 +271,91 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     () => (selectedId ? servers.find((s) => s.id === selectedId) ?? null : null),
     [servers, selectedId]
   );
+
+  const isEditFormDirty = useMemo(() => {
+    if (editorMode !== 'edit' || !selectedServer) return false;
+    if (name.trim() !== selectedServer.name) return true;
+    if (description.trim() !== selectedServer.description) return true;
+    if (scope !== selectedServer.scope) return true;
+    if (transport !== selectedServer.transport) return true;
+    if (enabled !== selectedServer.enabled) return true;
+    if (transport === 'stdio') {
+      if (command.trim() !== (selectedServer.command ?? '')) return true;
+      const currentArgs = argsText
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+      if (
+        currentArgs.length !== selectedServer.args.length ||
+        currentArgs.some((a, i) => a !== selectedServer.args[i])
+      ) {
+        return true;
+      }
+      if (envRows.length !== selectedServer.env.length) return true;
+      for (let i = 0; i < envRows.length; i += 1) {
+        const row = envRows[i];
+        const orig = selectedServer.env[i];
+        if (row.name.trim() !== orig.name || row.value.length > 0) return true;
+      }
+      return false;
+    }
+
+    if (url.trim() !== (selectedServer.url ?? '')) return true;
+    if (authType !== selectedServer.authType) return true;
+    if (bearerToken.trim().length > 0 || apiKeyValue.trim().length > 0) return true;
+    if (authType === 'api_key') {
+      const origHeaderName = selectedServer.headers[0]?.name ?? 'X-API-Key';
+      if ((apiKeyHeaderName.trim() || 'X-API-Key') !== origHeaderName) return true;
+    }
+    const origExtraHeaders =
+      selectedServer.authType === 'bearer'
+        ? selectedServer.headers.filter((h) => h.name.toLowerCase() !== 'authorization')
+        : selectedServer.authType === 'api_key'
+          ? selectedServer.headers.slice(1)
+          : selectedServer.headers;
+    if (headerRows.length !== origExtraHeaders.length) return true;
+    for (let i = 0; i < headerRows.length; i += 1) {
+      const row = headerRows[i];
+      const orig = origExtraHeaders[i];
+      if (row.name.trim() !== orig.name || row.value.length > 0) return true;
+    }
+    if (authType === 'oauth') {
+      if (oauthClientId.trim() !== (selectedServer.oauth?.clientId ?? '')) return true;
+      if (oauthClientSecret.trim().length > 0 || clearClientSecret) return true;
+      if (oauthAuthUrl.trim() !== (selectedServer.oauth?.authorizationUrl ?? '')) return true;
+      if (oauthTokenUrl.trim() !== (selectedServer.oauth?.tokenUrl ?? '')) return true;
+      if (oauthScopes.trim() !== (selectedServer.oauth?.scopes ?? '')) return true;
+      const origExtra = Object.entries(selectedServer.oauth?.extraAuthParams ?? {})
+        .map(([k, v]) => `${k}=${v}`)
+        .join('\n');
+      if (oauthExtraParamsText.trim() !== origExtra.trim()) return true;
+    }
+    return false;
+  }, [
+    editorMode,
+    selectedServer,
+    name,
+    description,
+    scope,
+    transport,
+    enabled,
+    command,
+    argsText,
+    envRows,
+    url,
+    authType,
+    bearerToken,
+    apiKeyHeaderName,
+    apiKeyValue,
+    headerRows,
+    oauthClientId,
+    oauthClientSecret,
+    clearClientSecret,
+    oauthAuthUrl,
+    oauthTokenUrl,
+    oauthScopes,
+    oauthExtraParamsText,
+  ]);
 
   const openNewForm = (initialTransport: McpTransport = 'http') => {
     setSelectedId(null);
@@ -302,6 +387,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     setOAuthScopes('');
     setOAuthExtraParamsText('');
     setTestResult(null);
+    setOAuthPendingUrl(null);
     setError(null);
     setStatusNote(null);
     setMobileShowEditor(true);
@@ -315,6 +401,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     setImportOverwrite(false);
     setError(null);
     setStatusNote(null);
+    setOAuthPendingUrl(null);
     setTestResult(null);
     setMobileShowEditor(true);
   };
@@ -489,6 +576,11 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
 
   const handleTest = async () => {
     if (!selectedServer) return;
+    if (isEditFormDirty) {
+      setError('未保存の変更があります。先に「変更を保存」してから接続テストを実行してください。');
+      setTestResult(null);
+      return;
+    }
     setBusy(true);
     setError(null);
     setTestResult(null);
@@ -507,16 +599,17 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     setBusy(true);
     setError(null);
     setStatusNote(null);
+    setOAuthPendingUrl(null);
     try {
       const res = await api.startMcpOAuth(selectedServer.id);
+      setOAuthPendingUrl(res.authorizationUrl);
       const popup = window.open(
         res.authorizationUrl,
         'agy_mcp_oauth',
         'width=620,height=760'
       );
       if (!popup) {
-        setStatusNote('ポップアップがブロックされました。新しいタブで認証URLを開いてください。');
-        window.open(res.authorizationUrl, '_blank');
+        setStatusNote('ポップアップがブロックされました。下のリンクから認証ページを開いてください。');
       } else {
         setStatusNote('認証ウィンドウを開きました。ブラウザでログイン・許可を完了してください。');
       }
@@ -532,10 +625,10 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     setBusy(true);
     setError(null);
     setStatusNote(null);
+    setOAuthPendingUrl(null);
     try {
-      const res = await api.disconnectMcpOAuth(selectedServer.id);
+      await api.disconnectMcpOAuth(selectedServer.id);
       await loadServers();
-      populateFormFromServer(res.server);
       setStatusNote('OAuthトークンを削除しました。');
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'OAuth切断に失敗しました。');
@@ -581,10 +674,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
   };
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-card modal-xl skills-modal" onClick={(e) => e.stopPropagation()}>
-        <div className="modal-header">
-          <div>
+    <ModalDialog label="MCP サーバー管理" size="modal-xl" onClose={onClose}>
+        <div className="modal-head">
+          <div className="modal-head-title-wrap">
             <h3>MCP サーバー管理（管理者専用）</h3>
             <p className="muted-xs" style={{ marginTop: 2 }}>
               リモート（OAuth / APIキー / Bearer / ヘッダー）およびローカル（stdio）MCPをネイティブACP経由で接続します
@@ -595,7 +687,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
           </button>
         </div>
 
-        <div className="skills-scope-tabs" role="tablist">
+        <div className="skills-scope-tabs" role="tablist" aria-label="MCP適用スコープ">
           {(['shared', 'profile'] as McpScope[]).map((sc) => {
             const count = servers.filter((s) => s.scope === sc).length;
             return (
@@ -607,6 +699,12 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                 className={`skills-scope-tab ${scopeTab === sc ? 'active' : ''}`}
                 onClick={() => {
                   setScopeTab(sc);
+                  setSelectedId(null);
+                  setEditorMode('idle');
+                  setTestResult(null);
+                  setOAuthPendingUrl(null);
+                  setError(null);
+                  setStatusNote(null);
                   setMobileShowEditor(false);
                 }}
               >
@@ -645,6 +743,18 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
 
             {loading ? (
               <div className="muted-xs" style={{ padding: 16 }}>読み込み中...</div>
+            ) : listError ? (
+              <div className="error-box" role="alert" style={{ margin: '0 12px 12px' }}>
+                <div>{listError}</div>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-xs"
+                  style={{ marginTop: 8 }}
+                  onClick={() => void loadServers()}
+                >
+                  再読み込み
+                </button>
+              </div>
             ) : filteredServers.length === 0 ? (
               <div className="skills-empty-list">
                 <p className="muted-xs">このスコープにMCPサーバーはまだありません。</p>
@@ -669,29 +779,34 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
               <div className="skills-list">
                 {filteredServers.map((srv) => {
                   const badge = formatOAuthBadge(srv);
+                  const isSelected = selectedId === srv.id && editorMode === 'edit';
                   return (
                     <div
                       key={srv.id}
-                      className={`skill-list-item ${selectedId === srv.id && editorMode === 'edit' ? 'selected' : ''} ${!srv.enabled ? 'disabled' : ''}`}
-                      onClick={() => populateFormFromServer(srv)}
+                      className={`skill-list-item ${isSelected ? 'selected' : ''} ${!srv.enabled ? 'disabled' : ''}`}
                     >
-                      <div className="skill-list-main">
-                        <div className="skill-list-title">
-                          <strong>{srv.name}</strong>
-                          <span className="mcp-badge mcp-badge-transport">{srv.transport.toUpperCase()}</span>
-                          <span className={`mcp-badge mcp-badge-${badge.tone}`}>{badge.label}</span>
-                        </div>
-                        <div className="muted-xs skill-list-desc">
-                          {srv.description || (srv.transport === 'stdio' ? srv.command : srv.url) || ''}
-                        </div>
-                      </div>
-                      <div
-                        className="skill-list-toggle"
-                        onClick={(e) => e.stopPropagation()}
+                      <button
+                        type="button"
+                        className="skill-list-item-btn"
+                        aria-current={isSelected ? 'true' : undefined}
+                        onClick={() => populateFormFromServer(srv)}
                       >
+                        <div className="skill-list-main">
+                          <div className="skill-list-title">
+                            <strong>{srv.name}</strong>
+                            <span className="mcp-badge mcp-badge-transport">{srv.transport.toUpperCase()}</span>
+                            <span className={`mcp-badge mcp-badge-${badge.tone}`}>{badge.label}</span>
+                          </div>
+                          <div className="muted-xs skill-list-desc">
+                            {srv.description || (srv.transport === 'stdio' ? srv.command : srv.url) || ''}
+                          </div>
+                        </div>
+                      </button>
+                      <div className="skill-list-toggle">
                         <ToggleSwitch
                           checked={srv.enabled}
                           label=""
+                          ariaLabel={`MCPサーバー「${srv.name}」を有効にする`}
                           onChange={(next) => void handleToggleEnabled(srv, next)}
                         />
                       </div>
@@ -705,17 +820,36 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
           {/* Right pane: Editor / Import / Idle */}
           <div className="skills-editor-pane">
             {mobileShowEditor && (
-              <button
-                type="button"
-                className="btn btn-secondary btn-xs mobile-back-btn"
-                onClick={() => setMobileShowEditor(false)}
-              >
-                ← 一覧へ戻る
-              </button>
+              <div className="skills-mobile-back mcp-mobile-back">
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-xs mobile-back-btn"
+                  onClick={() => setMobileShowEditor(false)}
+                >
+                  ← 一覧へ戻る
+                </button>
+              </div>
             )}
 
-            {error && <div className="error-box" style={{ marginBottom: 12 }}>{error}</div>}
-            {statusNote && <div className="success-box" style={{ marginBottom: 12 }}>{statusNote}</div>}
+            {error && <div className="error-box" role="alert" style={{ marginBottom: 12 }}>{error}</div>}
+            {statusNote && (
+              <div className="success-box" role="status" style={{ marginBottom: 12 }}>
+                <div>{statusNote}</div>
+                {oauthPendingUrl && (
+                  <div style={{ marginTop: 8 }}>
+                    <a
+                      href={oauthPendingUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="btn btn-primary btn-xs"
+                    >
+                      <span>認証ページを開く</span>
+                      <ExternalLinkIcon size={12} />
+                    </a>
+                  </div>
+                )}
+              </div>
+            )}
 
             {editorMode === 'idle' && (
               <div className="skills-editor-idle">
@@ -724,7 +858,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                   「全プロファイル共有」に追加したMCPは全ユーザーへ、「自プロファイルのみ」に追加したMCPは管理者自身のみへ適用されます。
                   認証シークレットやOAuthトークンは暗号化して保存され、他ユーザーのホームディレクトリには書き込まれません。
                 </p>
-                <div className="row-actions" style={{ marginTop: 12 }}>
+                <div className="row-actions" style={{ marginTop: 12, flexWrap: 'wrap' }}>
                   <button
                     type="button"
                     className="btn btn-primary btn-sm"
@@ -758,8 +892,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                 </p>
 
                 <div className="form-group">
-                  <label>登録先スコープ</label>
+                  <label htmlFor="mcp-import-scope">登録先スコープ</label>
                   <select
+                    id="mcp-import-scope"
                     value={importScope}
                     onChange={(e) => setImportScope(e.target.value as McpScope)}
                   >
@@ -769,8 +904,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                 </div>
 
                 <div className="form-group">
-                  <label>MCP 設定 JSON</label>
+                  <label htmlFor="mcp-import-json">MCP 設定 JSON</label>
                   <textarea
+                    id="mcp-import-json"
                     rows={11}
                     value={importJsonText}
                     onChange={(e) => setImportJsonText(e.target.value)}
@@ -785,14 +921,17 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                   onChange={setImportOverwrite}
                 />
 
-                <div className="row-actions" style={{ marginTop: 14 }}>
+                <div className="row-actions mcp-form-actions" style={{ marginTop: 14 }}>
                   <button type="submit" className="btn btn-primary btn-sm" disabled={busy}>
                     インポート実行
                   </button>
                   <button
                     type="button"
                     className="btn btn-secondary btn-sm"
-                    onClick={() => setEditorMode('idle')}
+                    onClick={() => {
+                      setEditorMode('idle');
+                      setMobileShowEditor(false);
+                    }}
                   >
                     キャンセル
                   </button>
@@ -811,6 +950,11 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                         className="btn btn-secondary btn-xs"
                         onClick={() => void handleTest()}
                         disabled={busy}
+                        title={
+                          isEditFormDirty
+                            ? '未保存の変更があります。先に「変更を保存」してからテストしてください'
+                            : '保存済みの設定で接続テストを実行'
+                        }
                       >
                         接続テスト
                       </button>
@@ -826,8 +970,18 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                   )}
                 </div>
 
+                {editorMode === 'edit' && isEditFormDirty && (
+                  <div className="muted-xs mcp-dirty-hint" role="status">
+                    未保存の変更があります。接続テストを行う前に「変更を保存」してください。
+                  </div>
+                )}
+
                 {testResult && (
-                  <div className={testResult.ok ? 'success-box' : 'error-box'} style={{ marginBottom: 12 }}>
+                  <div
+                    className={testResult.ok ? 'success-box' : 'error-box'}
+                    role={testResult.ok ? 'status' : 'alert'}
+                    style={{ marginBottom: 12 }}
+                  >
                     <div>{testResult.message}</div>
                     {testResult.discoveredOAuth?.authorizationUrl && (
                       <div className="muted-xs" style={{ marginTop: 4 }}>
@@ -839,8 +993,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
 
                 <div className="mcp-grid-2">
                   <div className="form-group">
-                    <label>サーバー名（英数字・._-）</label>
+                    <label htmlFor="mcp-name">サーバー名（英数字・._-）</label>
                     <input
+                      id="mcp-name"
                       type="text"
                       value={name}
                       onChange={(e) => setName(e.target.value)}
@@ -849,8 +1004,8 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                     />
                   </div>
                   <div className="form-group">
-                    <label>適用スコープ</label>
-                    <select value={scope} onChange={(e) => setScope(e.target.value as McpScope)}>
+                    <label htmlFor="mcp-scope">適用スコープ</label>
+                    <select id="mcp-scope" value={scope} onChange={(e) => setScope(e.target.value as McpScope)}>
                       <option value="shared">全プロファイル共有（他プロファイルにも持つ）</option>
                       <option value="profile">自プロファイルのみ</option>
                     </select>
@@ -858,8 +1013,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                 </div>
 
                 <div className="form-group">
-                  <label>説明（任意）</label>
+                  <label htmlFor="mcp-description">説明（任意）</label>
                   <input
+                    id="mcp-description"
                     type="text"
                     value={description}
                     onChange={(e) => setDescription(e.target.value)}
@@ -869,8 +1025,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
 
                 <div className="mcp-grid-2">
                   <div className="form-group">
-                    <label>接続方式（トランスポート）</label>
+                    <label htmlFor="mcp-transport">接続方式（トランスポート）</label>
                     <select
+                      id="mcp-transport"
                       value={transport}
                       onChange={(e) => {
                         const next = e.target.value as McpTransport;
@@ -892,8 +1049,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                 {transport === 'stdio' ? (
                   <>
                     <div className="form-group">
-                      <label>実行コマンド</label>
+                      <label htmlFor="mcp-command">実行コマンド</label>
                       <input
+                        id="mcp-command"
                         type="text"
                         value={command}
                         onChange={(e) => setCommand(e.target.value)}
@@ -903,8 +1061,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                     </div>
 
                     <div className="form-group">
-                      <label>引数（1行につき1引数）</label>
+                      <label htmlFor="mcp-args">引数（1行につき1引数）</label>
                       <textarea
+                        id="mcp-args"
                         rows={4}
                         value={argsText}
                         onChange={(e) => setArgsText(e.target.value)}
@@ -914,7 +1073,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
 
                     <div className="form-group">
                       <div className="mcp-kv-header">
-                        <label>環境変数（暗号化保存）</label>
+                        <span className="mcp-kv-label">環境変数（暗号化保存）</span>
                         <button
                           type="button"
                           className="btn btn-secondary btn-xs"
@@ -928,10 +1087,11 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                           + 環境変数を追加
                         </button>
                       </div>
-                      {envRows.map((row) => (
+                      {envRows.map((row, idx) => (
                         <div key={row.id} className="mcp-kv-row">
                           <input
                             type="text"
+                            aria-label={`環境変数名 ${idx + 1}`}
                             placeholder="KEY"
                             value={row.name}
                             onChange={(e) =>
@@ -942,6 +1102,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                           />
                           <input
                             type="password"
+                            aria-label={`環境変数の値 ${idx + 1}`}
                             placeholder={
                               row.keepExisting && row.maskedValue
                                 ? `保存済 (${row.maskedValue}) — 変更時のみ入力`
@@ -961,7 +1122,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                           <button
                             type="button"
                             className="icon-btn"
-                            aria-label="削除"
+                            aria-label={`環境変数 ${row.name || idx + 1} を削除`}
                             onClick={() => setEnvRows((prev) => prev.filter((r) => r.id !== row.id))}
                           >
                             <TrashIcon size={14} />
@@ -973,8 +1134,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                 ) : (
                   <>
                     <div className="form-group">
-                      <label>リモート MCP URL</label>
+                      <label htmlFor="mcp-url">リモート MCP URL</label>
                       <input
+                        id="mcp-url"
                         type="url"
                         value={url}
                         onChange={(e) => setUrl(e.target.value)}
@@ -988,8 +1150,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                     </div>
 
                     <div className="form-group">
-                      <label>認証方式</label>
+                      <label htmlFor="mcp-auth-type">認証方式</label>
                       <select
+                        id="mcp-auth-type"
                         value={authType}
                         onChange={(e) => setAuthType(e.target.value as McpAuthType)}
                       >
@@ -1003,13 +1166,15 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
 
                     {authType === 'bearer' && (
                       <div className="form-group">
-                        <label>Bearer トークン</label>
+                        <label htmlFor="mcp-bearer-token">Bearer トークン</label>
                         <input
+                          id="mcp-bearer-token"
                           type="password"
                           value={bearerToken}
                           onChange={(e) => {
-                            setBearerToken(e.target.value);
-                            if (e.target.value) setKeepExistingBearer(false);
+                            const nextVal = e.target.value;
+                            setBearerToken(nextVal);
+                            setKeepExistingBearer(nextVal.length === 0 && Boolean(existingBearerMask));
                           }}
                           placeholder={
                             keepExistingBearer && existingBearerMask
@@ -1023,8 +1188,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                     {authType === 'api_key' && (
                       <div className="mcp-grid-2">
                         <div className="form-group">
-                          <label>APIキー ヘッダー名</label>
+                          <label htmlFor="mcp-api-key-header">APIキー ヘッダー名</label>
                           <input
+                            id="mcp-api-key-header"
                             type="text"
                             value={apiKeyHeaderName}
                             onChange={(e) => setApiKeyHeaderName(e.target.value)}
@@ -1032,13 +1198,15 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                           />
                         </div>
                         <div className="form-group">
-                          <label>APIキー値</label>
+                          <label htmlFor="mcp-api-key-value">APIキー値</label>
                           <input
+                            id="mcp-api-key-value"
                             type="password"
                             value={apiKeyValue}
                             onChange={(e) => {
-                              setApiKeyValue(e.target.value);
-                              if (e.target.value) setKeepExistingApiKey(false);
+                              const nextVal = e.target.value;
+                              setApiKeyValue(nextVal);
+                              setKeepExistingApiKey(nextVal.length === 0 && Boolean(existingApiKeyMask));
                             }}
                             placeholder={
                               keepExistingApiKey && existingApiKeyMask
@@ -1132,8 +1300,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                             </p>
                             <div className="mcp-grid-2">
                               <div className="form-group">
-                                <label>Client ID（任意）</label>
+                                <label htmlFor="mcp-oauth-client-id">Client ID（任意）</label>
                                 <input
+                                  id="mcp-oauth-client-id"
                                   type="text"
                                   value={oauthClientId}
                                   onChange={(e) => setOAuthClientId(e.target.value)}
@@ -1141,8 +1310,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                                 />
                               </div>
                               <div className="form-group">
-                                <label>Client Secret（任意）</label>
+                                <label htmlFor="mcp-oauth-client-secret">Client Secret（任意）</label>
                                 <input
+                                  id="mcp-oauth-client-secret"
                                   type="password"
                                   value={oauthClientSecret}
                                   onChange={(e) => {
@@ -1159,8 +1329,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                             </div>
                             <div className="mcp-grid-2">
                               <div className="form-group">
-                                <label>Authorization URL（任意）</label>
+                                <label htmlFor="mcp-oauth-auth-url">Authorization URL（任意）</label>
                                 <input
+                                  id="mcp-oauth-auth-url"
                                   type="url"
                                   value={oauthAuthUrl}
                                   onChange={(e) => setOAuthAuthUrl(e.target.value)}
@@ -1168,8 +1339,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                                 />
                               </div>
                               <div className="form-group">
-                                <label>Token URL（任意）</label>
+                                <label htmlFor="mcp-oauth-token-url">Token URL（任意）</label>
                                 <input
+                                  id="mcp-oauth-token-url"
                                   type="url"
                                   value={oauthTokenUrl}
                                   onChange={(e) => setOAuthTokenUrl(e.target.value)}
@@ -1178,8 +1350,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                               </div>
                             </div>
                             <div className="form-group">
-                              <label>Scopes（スペース区切り・任意）</label>
+                              <label htmlFor="mcp-oauth-scopes">Scopes（スペース区切り・任意）</label>
                               <input
+                                id="mcp-oauth-scopes"
                                 type="text"
                                 value={oauthScopes}
                                 onChange={(e) => setOAuthScopes(e.target.value)}
@@ -1187,8 +1360,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                               />
                             </div>
                             <div className="form-group">
-                              <label>追加認可パラメータ（1行に key=value・任意）</label>
+                              <label htmlFor="mcp-oauth-extra-params">追加認可パラメータ（1行に key=value・任意）</label>
                               <textarea
+                                id="mcp-oauth-extra-params"
                                 rows={2}
                                 value={oauthExtraParamsText}
                                 onChange={(e) => setOAuthExtraParamsText(e.target.value)}
@@ -1203,9 +1377,9 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                     {(authType === 'headers' || authType === 'bearer' || authType === 'api_key' || authType === 'oauth') && (
                       <div className="form-group">
                         <div className="mcp-kv-header">
-                          <label>
+                          <span className="mcp-kv-label">
                             {authType === 'headers' ? 'HTTP ヘッダー（暗号化保存）' : '追加 HTTP ヘッダー（任意）'}
-                          </label>
+                          </span>
                           <button
                             type="button"
                             className="btn btn-secondary btn-xs"
@@ -1219,10 +1393,11 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                             + ヘッダーを追加
                           </button>
                         </div>
-                        {headerRows.map((row) => (
+                        {headerRows.map((row, idx) => (
                           <div key={row.id} className="mcp-kv-row">
                             <input
                               type="text"
+                              aria-label={`HTTPヘッダー名 ${idx + 1}`}
                               placeholder="Header-Name"
                               value={row.name}
                               onChange={(e) =>
@@ -1233,6 +1408,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                             />
                             <input
                               type="password"
+                              aria-label={`HTTPヘッダー値 ${idx + 1}`}
                               placeholder={
                                 row.keepExisting && row.maskedValue
                                   ? `保存済 (${row.maskedValue}) — 変更時のみ入力`
@@ -1252,7 +1428,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                             <button
                               type="button"
                               className="icon-btn"
-                              aria-label="削除"
+                              aria-label={`HTTPヘッダー ${row.name || idx + 1} を削除`}
                               onClick={() => setHeaderRows((prev) => prev.filter((r) => r.id !== row.id))}
                             >
                               <TrashIcon size={14} />
@@ -1264,7 +1440,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                   </>
                 )}
 
-                <div className="row-actions" style={{ marginTop: 14 }}>
+                <div className="row-actions mcp-form-actions" style={{ marginTop: 14 }}>
                   <button type="submit" className="btn btn-primary btn-sm" disabled={busy}>
                     {editorMode === 'new' ? 'MCPサーバーを追加' : '変更を保存'}
                   </button>
@@ -1283,7 +1459,6 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
             )}
           </div>
         </div>
-      </div>
-    </div>
+    </ModalDialog>
   );
 };

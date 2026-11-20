@@ -80,6 +80,8 @@ export const AgyOnboarding: React.FC<AgyOnboardingProps> = ({
     try {
       const res = await api.cancelAgyLogin();
       onUpdated({ profile: res.profile, loginFlow: res.loginFlow });
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '認証のキャンセルに失敗しました。');
     } finally {
       setBusy(false);
     }
@@ -132,10 +134,11 @@ export const AgyOnboarding: React.FC<AgyOnboardingProps> = ({
         )}
       </div>
 
-      <div className="segmented-tabs">
+      <div className="segmented-tabs" role="tablist" aria-label="Antigravity 認証方式">
         <button
           type="button"
-          aria-pressed={tab === 'oauth'}
+          role="tab"
+          aria-selected={tab === 'oauth'}
           className={tab === 'oauth' ? 'seg-btn active' : 'seg-btn'}
           onClick={() => {
             setTab('oauth');
@@ -146,7 +149,8 @@ export const AgyOnboarding: React.FC<AgyOnboardingProps> = ({
         </button>
         <button
           type="button"
-          aria-pressed={tab === 'apikey'}
+          role="tab"
+          aria-selected={tab === 'apikey'}
           className={tab === 'apikey' ? 'seg-btn active' : 'seg-btn'}
           onClick={() => {
             setTab('apikey');
@@ -278,8 +282,8 @@ export const AgyOnboarding: React.FC<AgyOnboardingProps> = ({
         </form>
       )}
 
-      {(error || profile?.lastError) && (
-        <div className="error-box">
+      {(error || (tab === 'oauth' && profile?.lastError)) && (
+        <div className="error-box" role="alert">
           {error || profile?.lastError}
         </div>
       )}

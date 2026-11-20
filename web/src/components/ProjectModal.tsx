@@ -75,13 +75,40 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
     e.target.value = '';
     if (!currentProject || fileList.length === 0) return;
 
+    const existingNames = new Set(currentProject.files.map((f) => f.filename));
+    const duplicates = Array.from(
+      new Set(fileList.map((f) => f.name).filter((fname) => existingNames.has(fname)))
+    );
+    if (duplicates.length > 0) {
+      const preview =
+        duplicates.length <= 3
+          ? duplicates.join('、')
+          : `${duplicates.slice(0, 3).join('、')} ほか${duplicates.length - 3}件`;
+      if (
+        !window.confirm(
+          `同名の共有資料（${preview}）が既にあります。上書きしますか？`
+        )
+      ) {
+        return;
+      }
+    }
+
     setBusy(true);
     setError(null);
+    setStatusNote(null);
     try {
       const res = await api.uploadProjectFiles(currentProject.id, fileList);
       setCurrentProject(res.project);
       onSaved(res.project);
-      setStatusNote(`${res.uploaded.length}件の資料を追加しました。`);
+      const overwrittenCount = res.uploaded.filter((u) => existingNames.has(u.filename)).length;
+      const addedCount = res.uploaded.length - overwrittenCount;
+      if (overwrittenCount > 0 && addedCount > 0) {
+        setStatusNote(`${addedCount}件の資料を追加し、${overwrittenCount}件を上書きしました。`);
+      } else if (overwrittenCount > 0) {
+        setStatusNote(`${overwrittenCount}件の資料を上書きしました。`);
+      } else {
+        setStatusNote(`${res.uploaded.length}件の資料を追加しました。`);
+      }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'アップロードに失敗しました。');
     } finally {
@@ -123,14 +150,16 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
 
   return (
     <ModalDialog label={currentProject ? "プロジェクト設定" : "新しいプロジェクト"} size="modal-lg" onClose={requestClose}>
-        <div className="modal-head">
-          <div>
-            <h3>{currentProject ? `プロジェクト設定: ${currentProject.name}` : '新しいプロジェクト'}</h3>
+        <div className="modal-head project-modal-head">
+          <div className="modal-head-title-wrap">
+            <h3 className="truncate" title={currentProject ? `プロジェクト設定: ${currentProject.name}` : '新しいプロジェクト'}>
+              {currentProject ? `プロジェクト設定: ${currentProject.name}` : '新しいプロジェクト'}
+            </h3>
             {currentProject && (
               <span className="muted-xs">コンテキスト Ver.{currentProject.contextVersion}</span>
             )}
           </div>
-          <div className="row-actions">
+          <div className="row-actions modal-head-actions">
             {currentProject && onStartChatInProject && (
               <button
                 type="button"
@@ -234,16 +263,19 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
                 <div className="project-files-list">
                   {currentProject.files.map((f) => (
                     <div key={f.id} className="project-file-row">
-                      <div className="row-actions">
+                      <div className="project-file-main">
                         <FileIcon size={15} />
-                        <span>{f.filename}</span>
-                        <span className="muted-xs">({Math.max(1, Math.round(f.sizeBytes / 1024))} KB)</span>
+                        <span className="truncate" title={f.filename}>{f.filename}</span>
+                        <span className="muted-xs project-file-size">
+                          ({Math.max(1, Math.round(f.sizeBytes / 1024))} KB)
+                        </span>
                       </div>
-                      <div className="row-actions">
+                      <div className="row-actions project-file-actions">
                         <a
                           href={`/api/projects/${currentProject.id}/files/${f.id}/content`}
                           className="icon-btn-sm"
                           title="ダウンロード"
+                          aria-label={`「${f.filename}」をダウンロード`}
                           download={f.filename}
                         >
                           <DownloadIcon size={14} />
@@ -266,8 +298,8 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
             </section>
           )}
 
-          {statusNote && <div className="success-box">{statusNote}</div>}
-          {error && <div className="error-box">{error}</div>}
+          {statusNote && <div className="success-box" role="status">{statusNote}</div>}
+          {error && <div className="error-box" role="alert">{error}</div>}
         </div>
     </ModalDialog>
   );

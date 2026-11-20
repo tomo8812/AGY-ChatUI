@@ -3397,8 +3397,9 @@ details[open] > .activity-summary > .activity-chevron {
 
 .media-stage {
   display: flex;
-  justify-content: center;
-  align-items: center;
+  justify-content: flex-start;
+  align-items: flex-start;
+  overflow: auto;
   min-height: 220px;
 }
 .viewer-img {
@@ -3416,18 +3417,22 @@ details[open] > .activity-summary > .activity-chevron {
   max-width: 100%;
   max-height: 64dvh;
   border-radius: var(--radius-sm);
+  margin: auto;
 }
 
 .pdf-canvas-scroll {
   overflow: auto;
   display: flex;
-  justify-content: center;
+  justify-content: flex-start;
+  align-items: flex-start;
   background: var(--bg-subtle);
   padding: 12px;
   border-radius: var(--radius-sm);
   max-height: 62dvh;
 }
 .pdf-canvas-scroll canvas {
+  margin: 0 auto;
+  flex-shrink: 0;
   box-shadow: var(--shadow-sm);
   background: #ffffff;
 }
@@ -4011,7 +4016,7 @@ details[open] > .activity-summary > .activity-chevron {
 
 .mobile-back-btn {
   display: none;
-  margin-bottom: 10px;
+  margin-bottom: 0;
 }
 
 @media (max-width: 760px) {
@@ -4032,3 +4037,272 @@ details[open] > .activity-summary > .activity-chevron {
     grid-template-columns: 1fr;
   }
 }
+
+/* ---- UI/UX & Accessibility Containment Fixes ---- */
+
+/* Chat load error & composer error banner */
+.chat-load-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 12px 0;
+}
+.composer-notice.is-error {
+  border-color: var(--danger, #dc2626);
+  color: var(--danger, #dc2626);
+}
+
+/* Bounded staged attachments & truncation so mobile composer stays reachable on 320x480 */
+.att-chip-row.staged {
+  max-height: 92px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  max-width: 100%;
+  align-content: flex-start;
+}
+.att-chip.staged-item {
+  max-width: 100%;
+  min-width: 0;
+}
+.att-chip.staged-item > svg,
+.att-chip.staged-item > button {
+  flex-shrink: 0;
+}
+.att-chip.staged-item > span {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (max-height: 560px), (max-width: 480px) {
+  .att-chip-row.staged {
+    max-height: 60px;
+  }
+  .composer-dock {
+    max-height: calc(var(--app-vh, 100dvh) - 88px);
+    overflow-y: auto;
+  }
+  .composer-hint {
+    display: none;
+  }
+}
+
+/* Visible keyboard focus on Effort slider & model list */
+.effort-pill-track:has(.effort-pill-sr-range:focus-visible) {
+  outline: 2px solid var(--link-color);
+  outline-offset: 3px;
+}
+.effort-pill-track:has(.effort-pill-sr-range:focus-visible) .effort-pill-thumb {
+  box-shadow: 0 0 0 3px var(--link-color);
+}
+.effort-model-item:focus-visible {
+  outline: 2px solid var(--link-color);
+  outline-offset: -2px;
+}
+
+/* Modal headers, project shared files, and skills project picker containment */
+.modal-head-title-wrap {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+}
+.modal-head-title-wrap h3 {
+  min-width: 0;
+}
+.modal-head-actions {
+  flex-shrink: 0;
+}
+.project-modal-head {
+  gap: 10px;
+}
+.project-file-row {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  gap: 8px;
+}
+.project-file-main {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+}
+.project-file-main > svg,
+.project-file-size,
+.project-file-actions {
+  flex-shrink: 0;
+}
+
+.skills-project-picker {
+  min-width: 0;
+  max-width: 100%;
+  flex: 1 1 200px;
+}
+.skills-project-select {
+  min-width: 0;
+  max-width: 100%;
+  width: 100%;
+  text-overflow: ellipsis;
+}
+
+/* Keyboard-accessible skill and MCP list item buttons */
+.skill-list-card-btn,
+.skill-list-item-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+  flex: 1 1 auto;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.skill-list-card-btn:focus-visible,
+.skill-list-item-btn:focus-visible {
+  outline: 2px solid var(--link-color);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+.skill-list-card-toggle,
+.skill-list-toggle {
+  flex-shrink: 0;
+}
+
+/* Sticky mobile back bar for Skills & MCP editor/import panes */
+.skills-mobile-back {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--bg-surface, var(--bg-primary));
+  padding: 8px 0;
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* MCP dark-theme form inputs, labels, and mobile horizontal containment */
+.skills-editor-pane {
+  min-width: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  touch-action: pan-y;
+}
+.mcp-form {
+  min-width: 0;
+  max-width: 100%;
+}
+.mcp-form .form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+.mcp-form .form-group label,
+.mcp-kv-label {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+.mcp-form input[type='text'],
+.mcp-form input[type='url'],
+.mcp-form input[type='password'],
+.mcp-form select,
+.mcp-form textarea {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+  font-size: 13.5px;
+  font-family: inherit;
+}
+.mcp-form input::placeholder,
+.mcp-form textarea::placeholder {
+  color: var(--text-tertiary, var(--text-secondary));
+  opacity: 0.8;
+}
+.mcp-form input:focus-visible,
+.mcp-form select:focus-visible,
+.mcp-form textarea:focus-visible {
+  outline: 2px solid var(--link-color);
+  outline-offset: 2px;
+}
+.mcp-dirty-hint {
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-subtle);
+}
+.mcp-kv-row {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr) auto;
+  min-width: 0;
+  max-width: 100%;
+}
+.mcp-kv-row > input {
+  min-width: 0;
+  width: 100%;
+}
+.mcp-form-actions {
+  flex-wrap: wrap;
+}
+@media (max-width: 520px) {
+  .mcp-kv-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .mcp-kv-row > input:nth-child(2) {
+    grid-column: 1 / 2;
+  }
+  .mcp-kv-row > button {
+    grid-row: 1 / 3;
+    grid-column: 2 / 3;
+    align-self: center;
+  }
+}
+
+/* File preview zoomed image, error states, and footer project select containment */
+.image-zoom-button {
+  margin: auto;
+  flex-shrink: 0;
+  max-width: 100%;
+}
+.image-zoom-button.is-zoomed {
+  max-width: none;
+}
+.viewer-image-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 24px 12px;
+}
+.viewer-link-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.viewer-footer-actions {
+  flex-wrap: wrap;
+  min-width: 0;
+  width: 100%;
+}
+.viewer-project-select {
+  flex: 1 1 180px;
+  min-width: 0;
+  max-width: 100%;
+  text-overflow: ellipsis;
+}
+

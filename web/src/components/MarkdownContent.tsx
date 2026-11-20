@@ -528,9 +528,79 @@ const FileLinkButton: React.FC<{
   </button>
 );
 
+function slugifyHeading(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/[\s\u3000]+/g, '-')
+    .replace(/[^\p{L}\p{N}_-]+/gu, '')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+const createMarkdownHeading = (Tag: 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6') => {
+  const HeadingComponent: React.FC<React.HTMLAttributes<HTMLHeadingElement>> = ({
+    id,
+    children,
+    ...props
+  }) => {
+    const computedId = id || slugifyHeading(extractReactText(children)) || undefined;
+    return (
+      <Tag id={computedId} {...props}>
+        {children}
+      </Tag>
+    );
+  };
+  return React.memo(HeadingComponent);
+};
+
+const MarkdownH1 = createMarkdownHeading('h1');
+const MarkdownH2 = createMarkdownHeading('h2');
+const MarkdownH3 = createMarkdownHeading('h3');
+const MarkdownH4 = createMarkdownHeading('h4');
+const MarkdownH5 = createMarkdownHeading('h5');
+const MarkdownH6 = createMarkdownHeading('h6');
+
 const MarkdownLink: React.FC<{ href?: string; children?: React.ReactNode }> = React.memo(({ href, children }) => {
   const { onWorkspaceHref } = useContext(MarkdownRenderContext);
   const rawHref = (href ?? '').trim();
+  if (rawHref.startsWith('#')) {
+    const rawTarget = rawHref.slice(1);
+    let decodedTarget = rawTarget;
+    try {
+      decodedTarget = decodeURIComponent(rawTarget);
+    } catch {
+      // keep raw
+    }
+    const normalizedTarget = slugifyHeading(decodedTarget);
+    return (
+      <a
+        href={rawHref}
+        className="md-link md-anchor-link"
+        onClick={(e) => {
+          e.preventDefault();
+          const container = e.currentTarget.closest('.md-body');
+          const candidates = container
+            ? Array.from(container.querySelectorAll<HTMLElement>('[id]'))
+            : [];
+          const hit =
+            candidates.find(
+              (el) =>
+                el.id === decodedTarget ||
+                el.id === rawTarget ||
+                (normalizedTarget && el.id === normalizedTarget)
+            ) ??
+            document.getElementById(decodedTarget) ??
+            (normalizedTarget ? document.getElementById(normalizedTarget) : null);
+          if (hit) {
+            hit.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }
+        }}
+      >
+        {children}
+      </a>
+    );
+  }
   const isExternal = /^https?:\/\/|^mailto:/i.test(rawHref);
   if (isExternal) {
     return (
@@ -561,6 +631,12 @@ const MarkdownImage: React.FC<{ src?: string; alt?: string }> = React.memo(({ sr
 
 // Hoisted module-level component map so React never unmounts nested viewers (images, code, mermaid) across parent re-renders
 const MARKDOWN_COMPONENTS: Components = {
+  h1: MarkdownH1 as Components['h1'],
+  h2: MarkdownH2 as Components['h2'],
+  h3: MarkdownH3 as Components['h3'],
+  h4: MarkdownH4 as Components['h4'],
+  h5: MarkdownH5 as Components['h5'],
+  h6: MarkdownH6 as Components['h6'],
   pre: MarkdownPre,
   code: MarkdownCode as Components['code'],
   table: CopyableTable as Components['table'],
