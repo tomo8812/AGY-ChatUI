@@ -418,6 +418,17 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
         return;
       }
 
+      if (reqUrl.pathname === '/sse' && req.method === 'GET') {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+        });
+        res.write(': keep-alive\n\n');
+        // Keep stream open intentionally to verify SSE test resolves on headers
+        return;
+      }
+
       res.writeHead(404);
       res.end('not found');
     });
@@ -541,6 +552,24 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
     );
     expect(discRes.status).toBe(200);
     expect(discRes.data.server.oauth.status).toBe('disconnected');
+
+    // Open SSE stream test must resolve immediately on 200 headers without timing out
+    const sseCreated = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'open-sse-stream',
+      scope: 'profile',
+      transport: 'sse',
+      url: `${mockBaseUrl}/sse`,
+      authType: 'none',
+    });
+    expect(sseCreated.status).toBe(201);
+    const sseTest = await admin.request<{ result: { ok: boolean; status: string } }>(
+      'POST',
+      `/api/mcp/servers/${sseCreated.data.server.id}/test`,
+      {}
+    );
+    expect(sseTest.status).toBe(200);
+    expect(sseTest.data.result.ok).toBe(true);
+    expect(sseTest.data.result.status).toBe('connected');
 
     admin.closeWs();
   });

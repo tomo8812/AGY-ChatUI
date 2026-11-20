@@ -373,7 +373,7 @@ function normalizeRequestHeaders(headers: RequestInit['headers']): Record<string
 async function fetchJsonWithTimeout(
   url: string,
   init: RequestInit = {},
-  opts: { timeoutMs?: number; allowPrivate?: boolean } = {}
+  opts: { timeoutMs?: number; allowPrivate?: boolean; headersOnly?: boolean } = {}
 ): Promise<{ status: number; headers: Headers; json: Record<string, unknown> | null; text: string }> {
   const target = await resolvePinnedOutboundTarget(url, { allowPrivate: opts.allowPrivate });
   const timeoutMs = opts.timeoutMs ?? DISCOVERY_TIMEOUT_MS;
@@ -445,6 +445,13 @@ async function fetchJsonWithTimeout(
         } else if (typeof v === 'string') {
           headers.set(k, v);
         }
+      }
+
+      if (opts.headersOnly) {
+        finish(null, { status, headers, json: null, text: '' });
+        res.destroy();
+        req.destroy();
+        return;
       }
 
       const chunks: Buffer[] = [];
@@ -1701,7 +1708,7 @@ export class McpService {
             method: 'GET',
             headers: { Accept: 'text/event-stream', ...headers },
           },
-          urlOpts
+          { ...urlOpts, headersOnly: true }
         );
         if (res.status === 401) {
           const discovered = await this.discoverOAuthMetadata(row.url);
