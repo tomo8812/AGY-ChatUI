@@ -512,7 +512,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
       const popup = window.open(
         res.authorizationUrl,
         'agy_mcp_oauth',
-        'width=620,height=760,noopener=false'
+        'width=620,height=760'
       );
       if (!popup) {
         setStatusNote('ポップアップがブロックされました。新しいタブで認証URLを開いてください。');
