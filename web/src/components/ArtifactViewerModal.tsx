@@ -933,7 +933,7 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
       case 'image':
       case 'svg': {
         const src = artifact.previewKind === 'svg' ? svgBlobUrl : contentUrl;
-        if (!src || imageError) {
+        if (imageError || (artifact.previewKind !== 'svg' && !src)) {
           return (
             <div className="viewer-image-error">
               <div className="error-box" role="alert">
@@ -945,6 +945,9 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
               </a>
             </div>
           );
+        }
+        if (!src) {
+          return <div className="viewer-state muted-sm">画像を読み込み中...</div>;
         }
         return (
           <div className={`media-stage ${imageZoom ? 'is-zoomed' : ''}`}>
