@@ -17,8 +17,61 @@ import {
 } from '../utils/viewerCache';
 import { CheckIcon, CopyIcon, DownloadIcon } from './Icons';
 
+interface HastNode {
+  type?: string;
+  tagName?: string;
+  value?: string;
+  properties?: Record<string, unknown>;
+  children?: HastNode[];
+}
+
+function slugifyHeading(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/[\s\u3000]+/g, '-')
+    .replace(/[^\p{L}\p{N}_-]+/gu, '')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+function extractHastText(node: HastNode): string {
+  if (typeof node.value === 'string') return node.value;
+  if (Array.isArray(node.children)) return node.children.map(extractHastText).join('');
+  return '';
+}
+
+const HEADING_TAGS = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']);
+
+function rehypeUniqueHeadingIds() {
+  return (tree: HastNode) => {
+    const usedIds = new Set<string>();
+    const visit = (node: HastNode) => {
+      if (node.type === 'element' && node.tagName && HEADING_TAGS.has(node.tagName)) {
+        const props = (node.properties ??= {});
+        const existingId = typeof props.id === 'string' && props.id.trim() ? props.id.trim() : null;
+        const base = existingId ?? slugifyHeading(extractHastText(node));
+        if (base) {
+          let candidate = base;
+          let suffix = 1;
+          while (usedIds.has(candidate)) {
+            candidate = `${base}-${suffix}`;
+            suffix += 1;
+          }
+          usedIds.add(candidate);
+          props.id = candidate;
+        }
+      }
+      if (Array.isArray(node.children)) {
+        for (const child of node.children) visit(child);
+      }
+    };
+    visit(tree);
+  };
+}
+
 const REMARK_PLUGINS = [remarkGfm, remarkMath];
-const REHYPE_PLUGINS = [rehypeKatex];
+const REHYPE_PLUGINS = [rehypeKatex, rehypeUniqueHeadingIds];
 
 let mermaidRenderSeq = 0;
 
@@ -528,37 +581,6 @@ const FileLinkButton: React.FC<{
   </button>
 );
 
-function slugifyHeading(text: string): string {
-  return text
-    .trim()
-    .toLowerCase()
-    .replace(/[\s\u3000]+/g, '-')
-    .replace(/[^\p{L}\p{N}_-]+/gu, '')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-}
-
-const createMarkdownHeading = (Tag: 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6') => {
-  const HeadingComponent: React.FC<
-    React.HTMLAttributes<HTMLHeadingElement> & { node?: unknown }
-  > = ({ id, children, node: _node, ...props }) => {
-    const computedId = id || slugifyHeading(extractReactText(children)) || undefined;
-    return (
-      <Tag id={computedId} {...props}>
-        {children}
-      </Tag>
-    );
-  };
-  return React.memo(HeadingComponent);
-};
-
-const MarkdownH1 = createMarkdownHeading('h1');
-const MarkdownH2 = createMarkdownHeading('h2');
-const MarkdownH3 = createMarkdownHeading('h3');
-const MarkdownH4 = createMarkdownHeading('h4');
-const MarkdownH5 = createMarkdownHeading('h5');
-const MarkdownH6 = createMarkdownHeading('h6');
-
 const MarkdownLink: React.FC<{ href?: string; children?: React.ReactNode }> = React.memo(({ href, children }) => {
   const { onWorkspaceHref } = useContext(MarkdownRenderContext);
   const rawHref = (href ?? '').trim();
@@ -629,12 +651,6 @@ const MarkdownImage: React.FC<{ src?: string; alt?: string }> = React.memo(({ sr
 
 // Hoisted module-level component map so React never unmounts nested viewers (images, code, mermaid) across parent re-renders
 const MARKDOWN_COMPONENTS: Components = {
-  h1: MarkdownH1 as Components['h1'],
-  h2: MarkdownH2 as Components['h2'],
-  h3: MarkdownH3 as Components['h3'],
-  h4: MarkdownH4 as Components['h4'],
-  h5: MarkdownH5 as Components['h5'],
-  h6: MarkdownH6 as Components['h6'],
   pre: MarkdownPre,
   code: MarkdownCode as Components['code'],
   table: CopyableTable as Components['table'],
