@@ -121,8 +121,9 @@ function formatTokenCount(count: number): string {
 
 const ContextUsageControl: React.FC<{
   contextUsage?: { used: number; size: number } | null;
-}> = React.memo(({ contextUsage }) => {
-  const [open, setOpen] = useState(false);
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}> = React.memo(({ contextUsage, open, onOpenChange }) => {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
 
@@ -152,13 +153,13 @@ const ContextUsageControl: React.FC<{
         !triggerRef.current?.contains(target) &&
         !popoverRef.current?.contains(target)
       ) {
-        setOpen(false);
+        onOpenChange(false);
       }
     };
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
+      if (event.key === 'Escape' && !event.isComposing && event.keyCode !== 229) {
         event.preventDefault();
-        setOpen(false);
+        onOpenChange(false);
       }
     };
     document.addEventListener('pointerdown', onPointerDown, true);
@@ -167,7 +168,7 @@ const ContextUsageControl: React.FC<{
       document.removeEventListener('pointerdown', onPointerDown, true);
       document.removeEventListener('keydown', onKeyDown);
     };
-  }, [open]);
+  }, [open, onOpenChange]);
 
   return (
     <>
@@ -175,7 +176,7 @@ const ContextUsageControl: React.FC<{
         ref={triggerRef}
         type="button"
         className={`context-ring-btn ${toneClass} ${open ? 'active' : ''}`}
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => onOpenChange(!open)}
         aria-expanded={open}
         aria-haspopup="dialog"
         aria-label={
@@ -898,10 +899,12 @@ const ChatComposer = React.memo(
       const [slashForceOpen, setSlashForceOpen] = useState(false);
       const [slashDismissed, setSlashDismissed] = useState(false);
       const [slashActiveIdx, setSlashActiveIdx] = useState(0);
+      const [contextOpen, setContextOpen] = useState(false);
 
       const fileInputRef = useRef<HTMLInputElement>(null);
       const textareaRef = useRef<HTMLTextAreaElement>(null);
       const composerInnerRef = useRef<HTMLDivElement>(null);
+      const slashListRef = useRef<HTMLDivElement>(null);
       const draftKey = chatId ?? '__new__';
       const prevDraftKeyRef = useRef<string>(draftKey);
       const currentDraftKeyRef = useRef<string>(draftKey);
@@ -921,6 +924,7 @@ const ChatComposer = React.memo(
         const prevKey = prevDraftKeyRef.current;
         if (prevKey === draftKey) return;
         prevDraftKeyRef.current = draftKey;
+        setContextOpen(false);
 
         // When a brand-new draft chat is materialized on file upload, preserve current draft under the new ID
         if (prevKey === '__new__' && isDraftChat) {
@@ -957,6 +961,7 @@ const ChatComposer = React.memo(
         setInputText('');
         setStagedAttachments([]);
         setUiNotice(null);
+        setContextOpen(false);
         setSlashForceOpen(false);
         setSlashDismissed(false);
         textareaRef.current?.focus();
@@ -986,16 +991,23 @@ const ChatComposer = React.memo(
       }, [hasDraft, onDraftChange]);
 
       // Auto-resize composer textarea (bounded on compact mobile viewports so toolbar stays reachable)
-      useEffect(() => {
+      useLayoutEffect(() => {
         const el = textareaRef.current;
         if (!el) return;
-        const viewportH =
-          typeof window !== 'undefined'
-            ? (window.visualViewport?.height ?? window.innerHeight)
-            : 800;
-        const maxTextareaHeight = Math.min(180, Math.max(68, Math.floor(viewportH * 0.22)));
-        el.style.height = 'auto';
-        el.style.height = `${Math.min(el.scrollHeight, maxTextareaHeight)}px`;
+        const viewport = window.visualViewport;
+        const resizeTextarea = () => {
+          const viewportHeight = viewport?.height ?? window.innerHeight;
+          const maxHeight = Math.min(180, Math.max(68, Math.floor(viewportHeight * 0.22)));
+          el.style.height = 'auto';
+          el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`;
+        };
+        resizeTextarea();
+        window.addEventListener('resize', resizeTextarea);
+        viewport?.addEventListener('resize', resizeTextarea);
+        return () => {
+          window.removeEventListener('resize', resizeTextarea);
+          viewport?.removeEventListener('resize', resizeTextarea);
+        };
       }, [inputText]);
 
       const handleFilesSelected = useCallback(
@@ -1043,9 +1055,19 @@ const ChatComposer = React.memo(
         [handleFilesSelected]
       );
 
-      const slashMatch = /^\/([a-zA-Z0-9_-]*)$/.exec(inputText);
+      const slashMatch = /^\/([a-zA-Z0-9_-]*)$/.exec(inputText.normalize('NFKC'));
       const slashQuery = slashMatch ? slashMatch[1].toLowerCase() : '';
-      const slashOpen = slashForceOpen || (Boolean(slashMatch) && !slashDismissed);
+      const slashOpen = !contextOpen && (slashForceOpen || (Boolean(slashMatch) && !slashDismissed));
+
+      const closeSlash = useCallback(() => {
+        setSlashForceOpen(false);
+        setSlashDismissed(true);
+      }, []);
+
+      const handleContextOpenChange = useCallback((open: boolean) => {
+        if (open) closeSlash();
+        setContextOpen(open);
+      }, [closeSlash]);
 
       const filteredCommands = useMemo(() => {
         if (!slashOpen) return [];
@@ -1073,23 +1095,16 @@ const ChatComposer = React.memo(
         if (!slashOpen) return;
         const onPointerDown = (e: PointerEvent) => {
           if (composerInnerRef.current && !composerInnerRef.current.contains(e.target as Node)) {
-            setSlashForceOpen(false);
-            setSlashDismissed(true);
+            closeSlash();
           }
         };
         window.addEventListener('pointerdown', onPointerDown);
         return () => window.removeEventListener('pointerdown', onPointerDown);
-      }, [slashOpen]);
+      }, [closeSlash, slashOpen]);
 
       const acceptSlashCommand = (cmd: AvailableCommandItem) => {
         const token = `/${cmd.name} `;
-        setInputText((prev) => {
-          if (/^\/[a-zA-Z0-9_-]*$/.test(prev)) {
-            return token;
-          }
-          const cleaned = prev.trimStart();
-          return cleaned ? `${token}${cleaned}` : token;
-        });
+        setInputText(slashMatch ? token : `${token}${inputText.trimStart()}`);
         setSlashForceOpen(false);
         setSlashDismissed(false);
         window.setTimeout(() => textareaRef.current?.focus(), 10);
@@ -1126,6 +1141,7 @@ const ChatComposer = React.memo(
         setUiNotice(null);
         setInputText('');
         setStagedAttachments([]);
+        setContextOpen(false);
         setSlashForceOpen(false);
         setSlashDismissed(false);
 
@@ -1148,43 +1164,40 @@ const ChatComposer = React.memo(
       };
 
       const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+        if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+
         if (slashOpen) {
           if (e.key === 'Escape') {
             e.preventDefault();
-            setSlashForceOpen(false);
-            setSlashDismissed(true);
+            closeSlash();
             return;
           }
           if (filteredCommands.length > 0) {
-            if (e.key === 'ArrowDown') {
+            if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
               e.preventDefault();
-              setSlashActiveIdx((idx) => (idx + 1) % filteredCommands.length);
+              const step = e.key === 'ArrowDown' ? 1 : -1;
+              const count = filteredCommands.length;
+              const nextIdx = ((slashActiveIdx % count) + step + count) % count;
+              const list = slashListRef.current;
+              const item = list?.children[nextIdx];
+              if (list && item instanceof HTMLElement) {
+                const top = item.offsetTop;
+                const bottom = top + item.offsetHeight;
+                list.scrollTop = Math.max(bottom - list.clientHeight, Math.min(list.scrollTop, top));
+              }
+              setSlashActiveIdx(nextIdx);
               return;
             }
-            if (e.key === 'ArrowUp') {
-              e.preventDefault();
-              setSlashActiveIdx((idx) => (idx - 1 + filteredCommands.length) % filteredCommands.length);
-              return;
-            }
-            if (e.key === 'Tab') {
+            if ((e.key === 'Tab' || (e.key === 'Enter' && slashMatch)) && !e.shiftKey) {
               e.preventDefault();
               const chosen = filteredCommands[slashActiveIdx] ?? filteredCommands[0];
               if (chosen) acceptSlashCommand(chosen);
               return;
             }
-            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229) {
-              if (slashMatch) {
-                e.preventDefault();
-                const chosen = filteredCommands[slashActiveIdx] ?? filteredCommands[0];
-                if (chosen) acceptSlashCommand(chosen);
-                return;
-              }
-            }
           }
         }
 
         if (e.key !== 'Enter') return;
-        if (e.nativeEvent.isComposing || e.keyCode === 229) return;
         const isMobileTouch = 'ontouchstart' in window && window.innerWidth <= 860;
         if (isMobileTouch) return;
         if (!e.shiftKey) {
@@ -1226,7 +1239,7 @@ const ChatComposer = React.memo(
             </div>
 
             {slashOpen && (
-              <div className="slash-palette" role="listbox" aria-label="スキル・スラッシュコマンド候補">
+              <div className="slash-palette">
                 <div className="slash-palette-head">
                   <span className="row-actions">
                     <SparklesIcon size={13} />
@@ -1237,8 +1250,7 @@ const ChatComposer = React.memo(
                       type="button"
                       className="chip-btn"
                       onClick={() => {
-                        setSlashForceOpen(false);
-                        setSlashDismissed(true);
+                        closeSlash();
                         onOpenSkills();
                       }}
                     >
@@ -1258,8 +1270,7 @@ const ChatComposer = React.memo(
                         type="button"
                         className="btn btn-secondary btn-xs"
                         onClick={() => {
-                          setSlashForceOpen(false);
-                          setSlashDismissed(true);
+                          closeSlash();
                           onOpenSkills();
                         }}
                       >
@@ -1268,7 +1279,12 @@ const ChatComposer = React.memo(
                     )}
                   </div>
                 ) : (
-                  <div className="slash-palette-list">
+                  <div
+                    ref={slashListRef}
+                    className="slash-palette-list"
+                    role="listbox"
+                    aria-label="スキル・スラッシュコマンド候補"
+                  >
                     {filteredCommands.map((cmd, idx) => (
                       <button
                         key={`${cmd.name}-${cmd.scope ?? cmd.source ?? 'cmd'}`}
@@ -1344,6 +1360,7 @@ const ChatComposer = React.memo(
                 value={inputText}
                 onChange={(e) => {
                   setInputText(e.target.value);
+                  setContextOpen(false);
                   setSlashDismissed(false);
                 }}
                 onKeyDown={handleKeyDown}
@@ -1375,19 +1392,29 @@ const ChatComposer = React.memo(
                     type="button"
                     className={`composer-icon-btn ${slashOpen ? 'active' : ''}`}
                     onClick={() => {
-                      setSlashForceOpen((v) => !v);
-                      setSlashDismissed(false);
+                      setContextOpen(false);
+                      if (slashOpen) {
+                        closeSlash();
+                      } else {
+                        setSlashForceOpen(true);
+                        setSlashDismissed(false);
+                      }
                       textareaRef.current?.focus();
                     }}
                     title="スキル / スラッシュコマンド一覧"
                     aria-label="スキル・コマンド一覧"
+                    aria-expanded={slashOpen}
                   >
                     <SlashIcon size={16} />
                   </button>
                 </div>
 
                 <div className="composer-toolbar-right">
-                  <ContextUsageControl contextUsage={contextUsage} />
+                  <ContextUsageControl
+                    contextUsage={contextUsage}
+                    open={contextOpen}
+                    onOpenChange={handleContextOpenChange}
+                  />
 
                   {(effortOptions.length > 0 || modelOptions.length > 0) && (
                     <EffortBar
