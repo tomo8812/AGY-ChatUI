@@ -89,6 +89,7 @@ const createMcpSchema = z.object({
   scope: z.enum(['shared', 'profile']).default('shared'),
   transport: z.enum(['stdio', 'http', 'sse']),
   enabled: z.boolean().optional(),
+  allowedTools: z.array(z.string().max(200)).max(500).nullable().optional(),
   command: z.string().max(1024).nullable().optional(),
   args: z.array(z.string().max(4096)).max(100).optional(),
   env: z.array(secretEntrySchema).max(100).optional(),

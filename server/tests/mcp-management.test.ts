@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import http from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -759,5 +760,457 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
     expect(badImport.data.message).toContain('brokenServer');
     expect(badImport.data.message).toContain('url または command');
     expect(badImport.data.message).not.toContain('上書き');
+  });
+
+  it('discovers MCP tools, defaults empty allowedTools to allow-all, and filters stdio/HTTP/SSE tools end-to-end', async () => {
+    const srv = await createTestServer({ allowPrivateMcpUrls: true });
+    servers.push(srv);
+
+    const { client: admin } = await registerAndBindAgy(srv.baseUrl, 'toolsadmin', 'user:tools-a');
+    await admin.connectWs({ clientId: 'tools-admin-ws' });
+
+    const upstreamCalls: string[] = [];
+    const sseClients: Array<http.ServerResponse> = [];
+
+    let remoteBaseUrl = '';
+    const mockRemote = http.createServer(async (req, res) => {
+      const reqUrl = new URL(req.url || '/', remoteBaseUrl);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(Buffer.from(c));
+      const bodyStr = Buffer.concat(chunks).toString('utf8');
+
+      if (reqUrl.pathname === '/sse' && req.method === 'GET') {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+        });
+        res.write('event: endpoint\ndata: /messages?sessionId=s1\n\n');
+        sseClients.push(res);
+        req.on('close', () => {
+          const idx = sseClients.indexOf(res);
+          if (idx >= 0) sseClients.splice(idx, 1);
+        });
+        return;
+      }
+
+      if (reqUrl.pathname === '/messages' && req.method === 'POST') {
+        const rpc = JSON.parse(bodyStr) as { id?: number | string; method: string; params?: { name?: string } };
+        if (rpc.method === 'tools/list') {
+          const payload = {
+            jsonrpc: '2.0',
+            id: rpc.id,
+            result: {
+              tools: [
+                { name: 'sse_safe', description: 'Safe SSE tool' },
+                { name: 'sse_danger', description: 'Dangerous SSE tool' },
+              ],
+            },
+          };
+          for (const clientRes of sseClients) {
+            clientRes.write(`event: message\ndata: ${JSON.stringify(payload)}\n\n`);
+          }
+          res.writeHead(202).end();
+          return;
+        }
+        if (rpc.method === 'tools/call') {
+          upstreamCalls.push(`sse:${rpc.params?.name ?? ''}`);
+          const payload = {
+            jsonrpc: '2.0',
+            id: rpc.id,
+            result: { content: [{ type: 'text', text: `ran:${rpc.params?.name}` }] },
+          };
+          for (const clientRes of sseClients) {
+            clientRes.write(`event: message\ndata: ${JSON.stringify(payload)}\n\n`);
+          }
+          res.writeHead(202).end();
+          return;
+        }
+        res.writeHead(202).end();
+        return;
+      }
+
+      if (reqUrl.pathname === '/mcp-stream-sse' && req.method === 'POST') {
+        const rpc = JSON.parse(bodyStr) as { id?: number | string; method: string };
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        if (rpc.method === 'initialize') {
+          res.end(
+            `event: message\ndata: ${JSON.stringify({
+              jsonrpc: '2.0',
+              id: rpc.id,
+              result: { protocolVersion: '2025-03-26', capabilities: {}, serverInfo: { name: 'http-sse-mcp', version: '1.0' } },
+            })}\n\n`
+          );
+          return;
+        }
+        if (rpc.method === 'tools/list') {
+          res.end(
+            `event: message\ndata: ${JSON.stringify({
+              jsonrpc: '2.0',
+              id: rpc.id,
+              result: {
+                tools: [
+                  { name: 'safe_read', description: 'Read only' },
+                  { name: 'danger_delete', description: 'Destructive delete' },
+                ],
+              },
+            })}\n\n`
+          );
+          return;
+        }
+        res.end('\n');
+        return;
+      }
+
+      if (reqUrl.pathname === '/mcp' && req.method === 'POST') {
+        const parsed = JSON.parse(bodyStr) as
+          | { id?: number | string; method: string; params?: { name?: string } }
+          | Array<{ id?: number | string; method: string; params?: { name?: string } }>;
+        const handleOne = (rpc: { id?: number | string; method: string; params?: { name?: string } }) => {
+          if (rpc.method === 'initialize') {
+            return {
+              jsonrpc: '2.0',
+              id: rpc.id,
+              result: {
+                protocolVersion: '2025-03-26',
+                capabilities: { tools: {} },
+                serverInfo: { name: 'mock-http-mcp', version: '2.0.0' },
+              },
+            };
+          }
+          if (rpc.method === 'tools/list') {
+            return {
+              jsonrpc: '2.0',
+              id: rpc.id,
+              result: {
+                tools: [
+                  { name: 'safe_read', description: 'Read safely' },
+                  { name: 'danger_delete', description: 'Delete permanently' },
+                ],
+              },
+            };
+          }
+          if (rpc.method === 'tools/call') {
+            upstreamCalls.push(`http:${rpc.params?.name ?? ''}`);
+            return {
+              jsonrpc: '2.0',
+              id: rpc.id,
+              result: { content: [{ type: 'text', text: `executed:${rpc.params?.name}` }] },
+            };
+          }
+          return null;
+        };
+
+        if (Array.isArray(parsed)) {
+          const replies = parsed.map(handleOne).filter(Boolean);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(replies));
+          return;
+        }
+        if (parsed.method === 'notifications/initialized') {
+          res.writeHead(202).end();
+          return;
+        }
+        const reply = handleOne(parsed);
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Mcp-Session-Id': 'sess-123' });
+        res.end(JSON.stringify(reply));
+        return;
+      }
+
+      res.writeHead(404).end();
+    });
+
+    await new Promise<void>((resolve) => mockRemote.listen(0, '127.0.0.1', resolve));
+    httpServers.push(mockRemote);
+    const addr = mockRemote.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 0;
+    remoteBaseUrl = `http://127.0.0.1:${port}`;
+
+    // 1) stdio MCP script supporting initialize + tools/list + tools/call
+    const stdioScript =
+      "const rl = require('node:readline').createInterface({ input: process.stdin });" +
+      "rl.on('line', (line) => {" +
+      "if (!line.trim()) return;" +
+      "const msg = JSON.parse(line);" +
+      "if (msg.method === 'initialize') {" +
+      "console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'stdio-tool-mcp', version: '1.0' } } }));" +
+      "} else if (msg.method === 'tools/list') {" +
+      "console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'stdio_read', description: 'Safe stdio read' }, { name: 'stdio_write', description: 'Unsafe stdio write' }] } }));" +
+      "} else if (msg.method === 'tools/call') {" +
+      "console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: 'stdio-ran:' + (msg.params && msg.params.name) }] } }));" +
+      "}" +
+      "});";
+
+    // Default allowedTools is [] (all tools permitted)
+    const createStdio = await admin.request<{ server: { id: string; allowedTools: string[] } }>(
+      'POST',
+      '/api/mcp/servers',
+      {
+        name: 'stdio-filtered',
+        scope: 'profile',
+        transport: 'stdio',
+        command: process.execPath,
+        args: ['-e', stdioScript],
+      }
+    );
+    expect(createStdio.status).toBe(201);
+    expect(createStdio.data.server.allowedTools).toEqual([]);
+
+    // Test stdio discovers all tools even while allowedTools is unset
+    const stdioTest = await admin.request<{ result: { ok: boolean; tools?: Array<{ name: string; description?: string }> } }>(
+      'POST',
+      `/api/mcp/servers/${createStdio.data.server.id}/test`,
+      {}
+    );
+    expect(stdioTest.status).toBe(200);
+    expect(stdioTest.data.result.ok).toBe(true);
+    expect(stdioTest.data.result.tools).toEqual([
+      { name: 'stdio_read', description: 'Safe stdio read' },
+      { name: 'stdio_write', description: 'Unsafe stdio write' },
+    ]);
+
+    // Control characters rejected in allowedTools
+    const badAllowed = await admin.request('PATCH', `/api/mcp/servers/${createStdio.data.server.id}`, {
+      allowedTools: ['good_tool', 'bad\ntool'],
+    });
+    expect(badAllowed.status).toBe(400);
+
+    // HTTP server created with empty allowedTools -> test discovers tools
+    const createHttp = await admin.request<{ server: { id: string; allowedTools: string[] } }>(
+      'POST',
+      '/api/mcp/servers',
+      {
+        name: 'http-filtered',
+        scope: 'profile',
+        transport: 'http',
+        url: `${remoteBaseUrl}/mcp`,
+        authType: 'none',
+      }
+    );
+    expect(createHttp.status).toBe(201);
+    expect(createHttp.data.server.allowedTools).toEqual([]);
+
+    const httpTest = await admin.request<{ result: { ok: boolean; tools?: Array<{ name: string; description?: string }> } }>(
+      'POST',
+      `/api/mcp/servers/${createHttp.data.server.id}/test`,
+      {}
+    );
+    expect(httpTest.status).toBe(200);
+    expect(httpTest.data.result.ok).toBe(true);
+    expect(httpTest.data.result.tools).toEqual([
+      { name: 'safe_read', description: 'Read safely' },
+      { name: 'danger_delete', description: 'Delete permanently' },
+    ]);
+
+    // Verify unfiltered pass-through when allowedTools is []
+    const chatRes = await admin.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'mcp-tools-test' });
+    expect(chatRes.status).toBe(201);
+    const unfilteredServers = await runInspectPrompt(admin, chatRes.data.chat.id);
+    const unfilteredStdio = unfilteredServers.find((s) => s.name === 'stdio-filtered') as {
+      command: string;
+      args: string[];
+    };
+    const unfilteredHttp = unfilteredServers.find((s) => s.name === 'http-filtered') as { url: string };
+    expect(unfilteredStdio.command).toBe(process.execPath);
+    expect(unfilteredStdio.args[0]).toBe('-e');
+    expect(unfilteredHttp.url).toBe(`${remoteBaseUrl}/mcp`);
+
+    // Restrict allowedTools on stdio, HTTP, SSE, plus JSON import enabledTools
+    const patchStdio = await admin.request<{ server: { allowedTools: string[] } }>(
+      'PATCH',
+      `/api/mcp/servers/${createStdio.data.server.id}`,
+      { allowedTools: [' stdio_read ', 'stdio_read'] }
+    );
+    expect(patchStdio.status).toBe(200);
+    expect(patchStdio.data.server.allowedTools).toEqual(['stdio_read']);
+
+    const patchHttp = await admin.request<{ server: { allowedTools: string[] } }>(
+      'PATCH',
+      `/api/mcp/servers/${createHttp.data.server.id}`,
+      { allowedTools: ['safe_read'] }
+    );
+    expect(patchHttp.status).toBe(200);
+    expect(patchHttp.data.server.allowedTools).toEqual(['safe_read']);
+
+    const createSse = await admin.request<{ server: { id: string; allowedTools: string[] } }>(
+      'POST',
+      '/api/mcp/servers',
+      {
+        name: 'sse-filtered',
+        scope: 'profile',
+        transport: 'sse',
+        url: `${remoteBaseUrl}/sse`,
+        authType: 'none',
+        allowedTools: ['sse_safe'],
+      }
+    );
+    expect(createSse.status).toBe(201);
+
+    const importWithEnabledTools = await admin.request<{
+      imported: Array<{ name: string; allowedTools: string[] }>;
+    }>('POST', '/api/mcp/import', {
+      scope: 'profile',
+      rawJson: JSON.stringify({
+        mcpServers: {
+          'http-sse-response-mcp': {
+            url: `${remoteBaseUrl}/mcp-stream-sse`,
+            enabledTools: ['safe_read'],
+          },
+        },
+      }),
+    });
+    expect(importWithEnabledTools.status).toBe(201);
+    expect(importWithEnabledTools.data.imported[0]?.allowedTools).toEqual(['safe_read']);
+
+    // Re-inspect in new chat to get filtered ACP server descriptors
+    const filteredChat = await admin.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'mcp-filtered' });
+    expect(filteredChat.status).toBe(201);
+    const filteredServers = await runInspectPrompt(admin, filteredChat.data.chat.id);
+
+    // A) Exercise real stdio wrapper process from ACP descriptor
+    const stdioAcp = filteredServers.find((s) => s.name === 'stdio-filtered') as {
+      command: string;
+      args: string[];
+    };
+    const stdioReplies = await new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
+      const child = spawn(stdioAcp.command, stdioAcp.args, { stdio: ['pipe', 'pipe', 'pipe'] });
+      let buf = '';
+      const out: Array<Record<string, unknown>> = [];
+      const timer = setTimeout(() => {
+        child.kill();
+        reject(new Error('stdio filter wrapper timeout'));
+      }, 5000);
+      child.stdout.on('data', (d: Buffer) => {
+        buf += d.toString('utf8');
+        const lines = buf.split('\n');
+        buf = lines.pop() ?? '';
+        for (const l of lines) {
+          if (!l.trim()) continue;
+          out.push(JSON.parse(l) as Record<string, unknown>);
+          if (out.length === 4) {
+            clearTimeout(timer);
+            child.kill();
+            resolve(out);
+          }
+        }
+      });
+      child.on('error', reject);
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })}\n`);
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} })}\n`);
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'stdio_write' } })}\n`);
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'stdio_read' } })}\n`);
+    });
+
+    const listMsg = stdioReplies.find((m) => m.id === 2) as { result: { tools: Array<{ name: string }> } };
+    expect(listMsg.result.tools.map((t) => t.name)).toEqual(['stdio_read']);
+    const blockedStdioMsg = stdioReplies.find((m) => m.id === 3) as { error?: { code: number; message: string } };
+    expect(blockedStdioMsg.error?.code).toBe(-32602);
+    const allowedStdioMsg = stdioReplies.find((m) => m.id === 4) as { result?: { content: Array<{ text: string }> } };
+    expect(allowedStdioMsg.result?.content[0]?.text).toBe('stdio-ran:stdio_read');
+
+    // B) Exercise real HTTP forwarder (application/json)
+    const httpAcp = filteredServers.find((s) => s.name === 'http-filtered') as { url: string };
+    expect(httpAcp.url).not.toBe(`${remoteBaseUrl}/mcp`);
+
+    const httpListResp = await fetch(httpAcp.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 10, method: 'tools/list', params: {} }),
+    });
+    expect(httpListResp.status).toBe(200);
+    const httpListJson = (await httpListResp.json()) as { result: { tools: Array<{ name: string }> } };
+    expect(httpListJson.result.tools.map((t) => t.name)).toEqual(['safe_read']);
+
+    const httpBlockedResp = await fetch(httpAcp.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'danger_delete' } }),
+    });
+    const httpBlockedJson = (await httpBlockedResp.json()) as { error?: { code: number } };
+    expect(httpBlockedJson.error?.code).toBe(-32602);
+    expect(upstreamCalls).not.toContain('http:danger_delete');
+
+    const httpAllowedResp = await fetch(httpAcp.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'safe_read' } }),
+    });
+    const httpAllowedJson = (await httpAllowedResp.json()) as { result?: { content: Array<{ text: string }> } };
+    expect(httpAllowedJson.result?.content[0]?.text).toBe('executed:safe_read');
+    expect(upstreamCalls).toContain('http:safe_read');
+
+    // Batch mixed calls on HTTP forwarder
+    const httpBatchResp = await fetch(httpAcp.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify([
+        { jsonrpc: '2.0', id: 13, method: 'tools/call', params: { name: 'safe_read' } },
+        { jsonrpc: '2.0', id: 14, method: 'tools/call', params: { name: 'danger_delete' } },
+      ]),
+    });
+    const httpBatchJson = (await httpBatchResp.json()) as Array<{ id: number; result?: unknown; error?: { code: number } }>;
+    expect(httpBatchJson.find((m) => m.id === 13)?.result).toBeTruthy();
+    expect(httpBatchJson.find((m) => m.id === 14)?.error?.code).toBe(-32602);
+    expect(upstreamCalls).not.toContain('http:danger_delete');
+
+    // C) Exercise Streamable HTTP text/event-stream response filtering
+    const streamSseAcp = filteredServers.find((s) => s.name === 'http-sse-response-mcp') as { url: string };
+    const streamListResp = await fetch(streamSseAcp.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 20, method: 'tools/list', params: {} }),
+    });
+    const streamListText = await streamListResp.text();
+    expect(streamListText).toContain('safe_read');
+    expect(streamListText).not.toContain('danger_delete');
+
+    // D) Exercise legacy SSE GET stream endpoint rewrite + async tools/list filter + POST call block
+    const sseAcp = filteredServers.find((s) => s.name === 'sse-filtered') as { url: string };
+    const sseController = new AbortController();
+    const sseConn = await fetch(sseAcp.url, { signal: sseController.signal });
+    const reader = sseConn.body!.getReader();
+    const dec = new TextDecoder();
+    let sseAccum = '';
+    const readUntil = async (predicate: (text: string) => boolean) => {
+      const deadline = Date.now() + 4000;
+      while (Date.now() < deadline) {
+        if (predicate(sseAccum)) return sseAccum;
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        sseAccum += dec.decode(chunk.value, { stream: true });
+      }
+      throw new Error(`SSE predicate timeout. Received: ${sseAccum}`);
+    };
+
+    try {
+      await readUntil((t) => t.includes('event: endpoint') && t.includes('\n\n'));
+      const epMatch = /event:\s*endpoint\s*\ndata:\s*(\S+)/.exec(sseAccum);
+      expect(epMatch).toBeTruthy();
+      const postTarget = new URL(epMatch![1], sseAcp.url).toString();
+      expect(postTarget).toContain('/mcp/');
+
+      await fetch(postTarget, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 30, method: 'tools/list', params: {} }),
+      });
+
+      await readUntil((t) => t.includes('"id":30'));
+      expect(sseAccum).toContain('sse_safe');
+      expect(sseAccum).not.toContain('sse_danger');
+
+      const sseBlockedCall = await fetch(postTarget, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 31, method: 'tools/call', params: { name: 'sse_danger' } }),
+      });
+      const sseBlockedJson = (await sseBlockedCall.json()) as { error?: { code: number } };
+      expect(sseBlockedJson.error?.code).toBe(-32602);
+      expect(upstreamCalls).not.toContain('sse:sse_danger');
+    } finally {
+      sseController.abort();
+    }
+
+    admin.closeWs();
   });
 });

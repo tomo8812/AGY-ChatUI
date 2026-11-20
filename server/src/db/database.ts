@@ -43,6 +43,7 @@ export interface StoredMcpServerRow {
   ownerUserId: string | null;
   transport: McpTransport;
   enabled: boolean;
+  allowedToolsJson: string;
   command: string | null;
   argsJson: string;
   encryptedEnvJson: string | null;
@@ -289,6 +290,7 @@ export class AppDatabase {
         owner_user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
         transport TEXT NOT NULL,
         enabled INTEGER NOT NULL DEFAULT 1,
+        allowed_tools_json TEXT NOT NULL DEFAULT '[]',
         command TEXT,
         args_json TEXT NOT NULL DEFAULT '[]',
         encrypted_env_json TEXT,
@@ -331,6 +333,10 @@ export class AppDatabase {
     }
     if (!msgCols.some((col) => col.name === 'session_messages_json')) {
       this.db.exec("ALTER TABLE messages ADD COLUMN session_messages_json TEXT NOT NULL DEFAULT '[]';");
+    }
+    const mcpCols = this.db.prepare('PRAGMA table_info(mcp_servers)').all() as Array<{ name: string }>;
+    if (!mcpCols.some((col) => col.name === 'allowed_tools_json')) {
+      this.db.exec("ALTER TABLE mcp_servers ADD COLUMN allowed_tools_json TEXT NOT NULL DEFAULT '[]';");
     }
   }
 
@@ -1681,6 +1687,7 @@ export class AppDatabase {
           ? row.transport
           : 'stdio',
       enabled: Number(row.enabled) === 1,
+      allowedToolsJson: String(row.allowed_tools_json ?? '[]'),
       command: row.command ? String(row.command) : null,
       argsJson: String(row.args_json ?? '[]'),
       encryptedEnvJson: row.encrypted_env_json ? String(row.encrypted_env_json) : null,
@@ -1774,6 +1781,7 @@ export class AppDatabase {
     ownerUserId: string | null;
     transport: McpTransport;
     enabled: boolean;
+    allowedToolsJson?: string;
     command: string | null;
     argsJson: string;
     encryptedEnvJson: string | null;
@@ -1792,13 +1800,13 @@ export class AppDatabase {
     this.db
       .prepare(
         `INSERT INTO mcp_servers (
-          id, name, description, scope, owner_user_id, transport, enabled,
+          id, name, description, scope, owner_user_id, transport, enabled, allowed_tools_json,
           command, args_json, encrypted_env_json,
           url, auth_type, encrypted_headers_json,
           oauth_config_json, encrypted_oauth_client_secret, encrypted_oauth_tokens_json,
           oauth_status, oauth_error, oauth_updated_at,
           created_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         input.id,
@@ -1808,6 +1816,7 @@ export class AppDatabase {
         input.ownerUserId,
         input.transport,
         input.enabled ? 1 : 0,
+        input.allowedToolsJson ?? '[]',
         input.command,
         input.argsJson,
         input.encryptedEnvJson,
@@ -1836,6 +1845,7 @@ export class AppDatabase {
       ownerUserId: string | null;
       transport: McpTransport;
       enabled: boolean;
+      allowedToolsJson: string;
       command: string | null;
       argsJson: string;
       encryptedEnvJson: string | null;
@@ -1862,6 +1872,7 @@ export class AppDatabase {
           owner_user_id = ?,
           transport = ?,
           enabled = ?,
+          allowed_tools_json = ?,
           command = ?,
           args_json = ?,
           encrypted_env_json = ?,
@@ -1884,6 +1895,7 @@ export class AppDatabase {
         patch.ownerUserId !== undefined ? patch.ownerUserId : existing.ownerUserId,
         patch.transport !== undefined ? patch.transport : existing.transport,
         (patch.enabled !== undefined ? patch.enabled : existing.enabled) ? 1 : 0,
+        patch.allowedToolsJson !== undefined ? patch.allowedToolsJson : existing.allowedToolsJson,
         patch.command !== undefined ? patch.command : existing.command,
         patch.argsJson !== undefined ? patch.argsJson : existing.argsJson,
         patch.encryptedEnvJson !== undefined ? patch.encryptedEnvJson : existing.encryptedEnvJson,

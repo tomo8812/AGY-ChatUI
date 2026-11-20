@@ -2943,6 +2943,7 @@ details[open] > .activity-summary > .activity-chevron {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  flex-shrink: 0;
 }
 .modal-head h3 {
   margin: 0;
@@ -3766,6 +3767,38 @@ details[open] > .activity-summary > .activity-chevron {
 .native-dialog:not([open]) { display: none; }
 .native-dialog::backdrop { background: rgba(0, 0, 0, 0.52); }
 
+@media (max-width: 860px) {
+  .modal-backdrop,
+  .modal-backdrop.native-dialog {
+    top: var(--app-vv-top, 0px);
+    bottom: auto;
+    height: var(--app-vh, 100dvh);
+  }
+  html[data-keyboard-open='true'] .modal-backdrop,
+  html[data-keyboard-open='true'] .modal-backdrop.native-dialog {
+    align-items: stretch;
+  }
+  html[data-keyboard-open='true'] .modal-card {
+    border-radius: 0;
+    max-height: var(--app-vh, 100dvh);
+  }
+  html[data-keyboard-open='true'] .modal-xl {
+    height: var(--app-vh, 100dvh);
+  }
+  html[data-keyboard-open='true'] .modal-head {
+    padding: 8px 14px;
+  }
+  html[data-keyboard-open='true'] .modal-head .muted-xs {
+    display: none;
+  }
+  html[data-keyboard-open='true'] .skills-scope-tabs {
+    padding: 6px 12px;
+  }
+  html[data-keyboard-open='true'] .skills-editor-pane {
+    padding-bottom: 18px;
+  }
+}
+
 .settings-section summary {
   cursor: pointer;
   font-size: 14px;
@@ -3804,6 +3837,7 @@ details[open] > .activity-summary > .activity-chevron {
   padding: 10px 18px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-secondary);
+  flex-shrink: 0;
 }
 
 .skills-scope-tab {
@@ -4212,10 +4246,12 @@ details[open] > .activity-summary > .activity-chevron {
   overflow-x: hidden;
   overflow-y: auto;
   touch-action: pan-y;
+  scroll-padding-bottom: 24px;
 }
 .mcp-form {
   min-width: 0;
   max-width: 100%;
+  padding-bottom: 12px;
 }
 .mcp-form .form-group {
   display: flex;
@@ -4245,6 +4281,7 @@ details[open] > .activity-summary > .activity-chevron {
   padding: 7px 10px;
   font-size: 13.5px;
   font-family: inherit;
+  scroll-margin-block: 18px;
 }
 .mcp-form input::placeholder,
 .mcp-form textarea::placeholder {
@@ -4256,6 +4293,87 @@ details[open] > .activity-summary > .activity-chevron {
 .mcp-form textarea:focus-visible {
   outline: 2px solid var(--link-color);
   outline-offset: 2px;
+}
+.mcp-tools-box {
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mcp-tools-add-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.mcp-tools-add-row input {
+  flex: 1;
+  min-width: 0;
+}
+.mcp-tools-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.mcp-tool-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--accent, #2563eb);
+  background: var(--accent-soft, rgba(37, 99, 235, 0.14));
+  color: var(--text-primary);
+  font-size: 12px;
+  cursor: pointer;
+}
+.mcp-tool-chip:hover {
+  opacity: 0.85;
+}
+.mcp-tools-discovered {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 180px;
+  overflow-y: auto;
+  padding: 6px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+}
+.mcp-tool-check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12.5px;
+}
+.mcp-tool-check-row:hover {
+  background: var(--bg-subtle, rgba(128, 128, 128, 0.08));
+}
+.mcp-tool-check-row input[type='checkbox'] {
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+.mcp-tool-check-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.mcp-tool-check-name {
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  word-break: break-all;
+}
+.mcp-tool-check-desc {
+  font-size: 11.5px;
+  color: var(--text-secondary);
 }
 .mcp-dirty-hint {
   padding: 6px 10px;

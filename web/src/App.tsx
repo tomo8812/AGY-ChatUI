@@ -492,12 +492,14 @@ export const App: React.FC = () => {
     let blurTimer: number | undefined;
     let rafId: number | undefined;
     let lastAppliedVh: number | null = null;
+    let lastAppliedVvTop: number | null = null;
     let lastAppliedKeyboardOpen: boolean | null = null;
 
     const applyViewport = () => {
       rafId = undefined;
       const vv = window.visualViewport;
       const vvHeight = vv ? Math.round(vv.height) : window.innerHeight;
+      const vvTop = vv ? Math.max(0, Math.round(vv.offsetTop)) : 0;
       const activeEl = document.activeElement;
       const isTextFocused =
         activeEl instanceof HTMLElement &&
@@ -509,13 +511,19 @@ export const App: React.FC = () => {
       if (!isTextFocused) {
         baseHeight = Math.max(window.innerHeight, vvHeight);
       }
-      if (lastAppliedVh !== vvHeight) {
+      const vhChanged = lastAppliedVh !== vvHeight;
+      if (vhChanged) {
         lastAppliedVh = vvHeight;
         document.documentElement.style.setProperty('--app-vh', `${vvHeight}px`);
       }
+      if (lastAppliedVvTop !== vvTop) {
+        lastAppliedVvTop = vvTop;
+        document.documentElement.style.setProperty('--app-vv-top', `${vvTop}px`);
+      }
       const heightDrop = Math.max(window.innerHeight - vvHeight, baseHeight - vvHeight);
       const keyboardOpen = window.innerWidth <= 860 && (heightDrop > 120 || isTextFocused);
-      if (lastAppliedKeyboardOpen !== keyboardOpen) {
+      const keyboardStateChanged = lastAppliedKeyboardOpen !== keyboardOpen;
+      if (keyboardStateChanged) {
         lastAppliedKeyboardOpen = keyboardOpen;
         if (keyboardOpen) {
           document.documentElement.dataset.keyboardOpen = 'true';
@@ -525,6 +533,18 @@ export const App: React.FC = () => {
       }
       if (keyboardOpen && vv && vv.offsetTop > 0) {
         window.scrollTo(0, 0);
+      }
+      if (
+        keyboardOpen &&
+        (vhChanged || keyboardStateChanged) &&
+        activeEl instanceof HTMLElement &&
+        activeEl.closest('.modal-card')
+      ) {
+        window.requestAnimationFrame(() => {
+          if (document.activeElement === activeEl) {
+            activeEl.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+          }
+        });
       }
     };
 
@@ -555,6 +575,7 @@ export const App: React.FC = () => {
       window.removeEventListener('focusin', scheduleViewportUpdate);
       window.removeEventListener('focusout', onFocusOut);
       document.documentElement.style.removeProperty('--app-vh');
+      document.documentElement.style.removeProperty('--app-vv-top');
       delete document.documentElement.dataset.keyboardOpen;
     };
   }, []);

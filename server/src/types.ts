@@ -380,6 +380,11 @@ export interface McpOAuthSummary {
   updatedAt: number | null;
 }
 
+export interface McpDiscoveredTool {
+  name: string;
+  description?: string;
+}
+
 export interface McpServerRecord {
   id: string;
   name: string;
@@ -388,6 +393,7 @@ export interface McpServerRecord {
   ownerUserId: string | null;
   transport: McpTransport;
   enabled: boolean;
+  allowedTools: string[];
   command: string | null;
   args: string[];
   env: McpSecretEntrySummary[];
@@ -406,6 +412,7 @@ export interface McpTestResult {
   message: string;
   serverInfo?: { name?: string; version?: string };
   resolvedCommand?: string | null;
+  tools?: McpDiscoveredTool[];
   discoveredOAuth?: {
     authorizationUrl?: string | null;
     tokenUrl?: string | null;

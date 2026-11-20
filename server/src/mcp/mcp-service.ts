@@ -4,6 +4,7 @@ import dns from 'node:dns/promises';
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
+import zlib from 'node:zlib';
 import type { McpCapabilities, McpServer } from '@agentclientprotocol/sdk';
 import { resolveHostExecutable } from '../acp/env-isolation.js';
 import { decryptSmallSecret, encryptSmallSecret } from '../auth/password.js';
@@ -12,6 +13,7 @@ import type { AppDatabase, StoredMcpServerRow } from '../db/database.js';
 import type { SyncHub } from '../sync/hub.js';
 import type {
   McpAuthType,
+  McpDiscoveredTool,
   McpOAuthConfig,
   McpOAuthStatus,
   McpOAuthSummary,
@@ -21,6 +23,14 @@ import type {
   McpTestResult,
   McpTransport,
 } from '../types.js';
+import {
+  createSseMcpToolFilterTransform,
+  extractMcpToolsFromJsonRpcPayload,
+  filterMcpServerJsonRpcPayload,
+  inspectMcpClientJsonRpcPayload,
+  normalizeAllowedToolsList,
+  STDIO_MCP_TOOL_FILTER_SCRIPT,
+} from './tool-filter.js';
 
 export class McpValidationError extends Error {
   public readonly statusCode: number;
@@ -58,6 +68,7 @@ export interface CreateMcpServerInput {
   scope: McpScope;
   transport: McpTransport;
   enabled?: boolean;
+  allowedTools?: string[] | null;
   command?: string | null;
   args?: string[];
   env?: SecretKeyValueInput[];
@@ -73,6 +84,7 @@ export interface UpdateMcpServerInput {
   scope?: McpScope;
   transport?: McpTransport;
   enabled?: boolean;
+  allowedTools?: string[] | null;
   command?: string | null;
   args?: string[];
   env?: SecretKeyValueInput[];
@@ -513,11 +525,55 @@ function createPinnedLookup(target: PinnedOutboundTarget) {
   };
 }
 
+interface ForwardedMcpTarget extends PinnedOutboundTarget {
+  allowedTools?: ReadonlySet<string>;
+  trackedToolsListIds?: Set<string>;
+}
+
+const MAX_FORWARDED_BODY_BYTES = 16 * 1024 * 1024;
+
+function readIncomingBody(stream: NodeJS.ReadableStream, maxBytes = MAX_FORWARDED_BODY_BYTES): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    stream.on('data', (chunk: Buffer | string) => {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += buf.byteLength;
+      if (total > maxBytes) {
+        reject(new Error('PAYLOAD_TOO_LARGE'));
+        return;
+      }
+      chunks.push(buf);
+    });
+    stream.on('end', () => resolve(Buffer.concat(chunks)));
+    stream.on('error', reject);
+  });
+}
+
+function createDecodedResponseStream(
+  upRes: http.IncomingMessage
+): { stream: NodeJS.ReadableStream; decoded: boolean } {
+  const enc = String(upRes.headers['content-encoding'] ?? '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  if (enc === 'gzip' || enc === 'x-gzip') {
+    return { stream: upRes.pipe(zlib.createGunzip()), decoded: true };
+  }
+  if (enc === 'deflate') {
+    return { stream: upRes.pipe(zlib.createInflate()), decoded: true };
+  }
+  if (enc === 'br') {
+    return { stream: upRes.pipe(zlib.createBrotliDecompress()), decoded: true };
+  }
+  return { stream: upRes, decoded: false };
+}
+
 class PinnedHttpsForwarder {
   private server: http.Server | null = null;
   private port: number | null = null;
   private starting: Promise<number> | null = null;
-  private readonly routes = new Map<string, PinnedOutboundTarget>();
+  private readonly routes = new Map<string, ForwardedMcpTarget>();
   private readonly maxRoutes = 500;
 
   private async ensureListening(): Promise<number> {
@@ -526,7 +582,14 @@ class PinnedHttpsForwarder {
 
     this.starting = new Promise<number>((resolve, reject) => {
       const srv = http.createServer((req, res) => {
-        this.handleRequest(req, res);
+        void this.handleRequest(req, res).catch(() => {
+          if (!res.headersSent) {
+            res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+          }
+          if (!res.writableEnded) {
+            res.end('Upstream MCP forwarder error');
+          }
+        });
       });
       srv.once('error', (err) => {
         this.starting = null;
@@ -549,7 +612,7 @@ class PinnedHttpsForwarder {
     return this.starting;
   }
 
-  private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+  private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const reqUrl = new URL(req.url || '/', 'http://127.0.0.1');
     const match = /^\/mcp\/([A-Za-z0-9_-]+)(\/.*)?$/.exec(reqUrl.pathname);
     if (!match) {
@@ -566,9 +629,12 @@ class PinnedHttpsForwarder {
       return;
     }
 
-    const basePath = target.parsed.pathname === '/' && extraPath ? '' : target.parsed.pathname;
+    const isRootRelativeRewrite = extraPath.startsWith('/__root/');
+    const resolvedExtraPath = isRootRelativeRewrite ? extraPath.slice('/__root'.length) : extraPath;
     const mergedQuery = reqUrl.search || target.parsed.search;
-    const upstreamPath = `${basePath}${extraPath}${mergedQuery}`;
+    const upstreamPath = isRootRelativeRewrite
+      ? `${resolvedExtraPath}${mergedQuery}`
+      : `${target.parsed.pathname === '/' && resolvedExtraPath ? '' : target.parsed.pathname}${resolvedExtraPath}${mergedQuery}`;
 
     const outHeaders: Record<string, string | string[]> = {};
     for (const [k, v] of Object.entries(req.headers)) {
@@ -577,50 +643,195 @@ class PinnedHttpsForwarder {
       if (lower === 'host' || lower === 'connection' || lower === 'keep-alive' || lower === 'proxy-connection') {
         continue;
       }
+      if (target.allowedTools && target.allowedTools.size > 0 && lower === 'accept-encoding') {
+        continue;
+      }
       outHeaders[k] = v;
     }
     outHeaders.host = target.parsed.host;
 
-    const pinnedLookup = createPinnedLookup(target);
-    const upReq = https.request(
-      {
-        protocol: 'https:',
-        hostname: target.parsed.hostname,
-        port: target.parsed.port ? Number(target.parsed.port) : 443,
-        path: upstreamPath,
-        method: req.method || 'GET',
-        headers: outHeaders,
-        servername: target.parsed.hostname,
-        ...(pinnedLookup ? { lookup: pinnedLookup as never } : {}),
-      },
-      (upRes) => {
-        const status = upRes.statusCode ?? 502;
-        if (status >= 300 && status < 400 && upRes.headers.location) {
-          upRes.resume();
-          if (!res.headersSent) {
-            res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-          }
-          res.end('Upstream redirect blocked');
+    const filterActive = Boolean(target.allowedTools && target.allowedTools.size > 0);
+    if (filterActive) {
+      outHeaders['accept-encoding'] = 'identity';
+    }
+
+    let requestBodyBuf: Buffer | null = null;
+    let localToolsListIds = new Set<string>();
+    let blockedBatchErrors: Record<string, unknown>[] = [];
+
+    if (filterActive && req.method === 'POST' && target.allowedTools) {
+      try {
+        requestBodyBuf = await readIncomingBody(req);
+      } catch (err) {
+        if (err instanceof Error && err.message === 'PAYLOAD_TOO_LARGE') {
+          res.writeHead(413, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('Payload Too Large');
           return;
         }
+        throw err;
+      }
+
+      const inspectRes = inspectMcpClientJsonRpcPayload(
+        requestBodyBuf.toString('utf8'),
+        target.allowedTools,
+        target.trackedToolsListIds
+      );
+      if (inspectRes.kind === 'reject_all') {
+        const respBuf = Buffer.from(inspectRes.responseBody, 'utf8');
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Content-Length': String(respBuf.byteLength),
+        });
+        res.end(respBuf);
+        return;
+      }
+      localToolsListIds = inspectRes.localToolsListIds;
+      if (inspectRes.kind === 'partial') {
+        requestBodyBuf = Buffer.from(inspectRes.forwardBody, 'utf8');
+        blockedBatchErrors = inspectRes.blockedErrors;
+      }
+      for (const k of Object.keys(outHeaders)) {
+        if (k.toLowerCase() === 'transfer-encoding' || k.toLowerCase() === 'content-length') {
+          delete outHeaders[k];
+        }
+      }
+      outHeaders['content-length'] = String(requestBodyBuf.byteLength);
+    }
+
+    const isHttps = target.parsed.protocol === 'https:';
+    const pinnedLookup = createPinnedLookup(target);
+    const reqOptions = {
+      protocol: isHttps ? 'https:' : 'http:',
+      hostname: target.parsed.hostname,
+      port: target.parsed.port ? Number(target.parsed.port) : isHttps ? 443 : 80,
+      path: upstreamPath,
+      method: req.method || 'GET',
+      headers: outHeaders,
+      ...(isHttps ? { servername: target.parsed.hostname } : {}),
+      ...(pinnedLookup ? { lookup: pinnedLookup as never } : {}),
+    };
+
+    const upReq = (isHttps ? https.request : http.request)(reqOptions, (upRes) => {
+      const status = upRes.statusCode ?? 502;
+      if (status >= 300 && status < 400 && upRes.headers.location) {
+        upRes.resume();
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+        }
+        res.end('Upstream redirect blocked');
+        return;
+      }
+
+      if (!filterActive || !target.allowedTools) {
         res.writeHead(status, upRes.headers);
         upRes.pipe(res);
+        return;
       }
-    );
+
+      const contentType = String(upRes.headers['content-type'] ?? '').toLowerCase();
+      if (contentType.includes('text/event-stream')) {
+        const respHeaders: http.OutgoingHttpHeaders = { ...upRes.headers };
+        delete respHeaders['content-length'];
+        delete respHeaders['content-encoding'];
+        delete respHeaders['transfer-encoding'];
+        res.writeHead(status, respHeaders);
+        const { stream } = createDecodedResponseStream(upRes);
+        const sseFilter = createSseMcpToolFilterTransform({
+          allowedTools: target.allowedTools,
+          trackedToolsListIds: target.trackedToolsListIds,
+          localToolsListIds,
+          routeToken: token,
+          upstreamOrigin: target.parsed.origin,
+        });
+        sseFilter.on('error', () => {
+          if (!res.writableEnded) res.end();
+        });
+        stream.pipe(sseFilter).pipe(res);
+        return;
+      }
+
+      const mayNeedJsonFilter =
+        localToolsListIds.size > 0 ||
+        blockedBatchErrors.length > 0 ||
+        ((target.trackedToolsListIds?.size ?? 0) > 0 && contentType.includes('application/json'));
+
+      if (mayNeedJsonFilter && contentType.includes('application/json')) {
+        const { stream } = createDecodedResponseStream(upRes);
+        void readIncomingBody(stream)
+          .then((respBuf) => {
+            let finalText = respBuf.toString('utf8');
+            let modified = false;
+            try {
+              const parsed = JSON.parse(finalText);
+              const combinedIds = new Set<string>([
+                ...(target.trackedToolsListIds ?? []),
+                ...localToolsListIds,
+              ]);
+              const forceList = localToolsListIds.size > 0 && blockedBatchErrors.length === 0;
+              const filtered = filterMcpServerJsonRpcPayload(
+                parsed,
+                target.allowedTools!,
+                combinedIds,
+                forceList
+              );
+              let finalValue = filtered.value;
+              if (filtered.changed) {
+                modified = true;
+                for (const idKey of localToolsListIds) {
+                  target.trackedToolsListIds?.delete(idKey);
+                }
+              }
+              if (blockedBatchErrors.length > 0) {
+                modified = true;
+                finalValue = Array.isArray(finalValue)
+                  ? [...finalValue, ...blockedBatchErrors]
+                  : [finalValue, ...blockedBatchErrors];
+              }
+              if (modified) {
+                finalText = JSON.stringify(finalValue);
+              }
+            } catch {
+              // Forward raw payload if non-JSON
+            }
+            const outBuf = modified ? Buffer.from(finalText, 'utf8') : respBuf;
+            const respHeaders: http.OutgoingHttpHeaders = { ...upRes.headers };
+            delete respHeaders['content-encoding'];
+            delete respHeaders['transfer-encoding'];
+            respHeaders['content-length'] = String(outBuf.byteLength);
+            if (!res.headersSent) res.writeHead(status, respHeaders);
+            res.end(outBuf);
+          })
+          .catch(() => {
+            if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+            if (!res.writableEnded) res.end('Upstream MCP response error');
+          });
+        return;
+      }
+
+      res.writeHead(status, upRes.headers);
+      upRes.pipe(res);
+    });
 
     upReq.on('error', () => {
       if (!res.headersSent) {
         res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
       }
-      res.end('Upstream MCP connection failed');
+      if (!res.writableEnded) {
+        res.end('Upstream MCP connection failed');
+      }
     });
     res.on('close', () => {
       if (!upReq.destroyed) upReq.destroy();
     });
-    req.pipe(upReq);
+
+    if (requestBodyBuf !== null) {
+      upReq.end(requestBodyBuf);
+    } else {
+      req.pipe(upReq);
+    }
   }
 
-  async registerRoute(target: PinnedOutboundTarget): Promise<string> {
+  async registerRoute(target: ForwardedMcpTarget): Promise<string> {
     const port = await this.ensureListening();
     if (this.routes.size >= this.maxRoutes) {
       const oldestKey = this.routes.keys().next().value;
@@ -844,6 +1055,7 @@ export class McpService {
       ownerUserId: row.ownerUserId,
       transport: row.transport,
       enabled: row.enabled,
+      allowedTools: parseArgsJson(row.allowedToolsJson),
       command: row.command,
       args: parseArgsJson(row.argsJson),
       env: envSummary,
@@ -900,6 +1112,9 @@ export class McpService {
     const transport: McpTransport = input.transport;
     const description = (input.description ?? '').trim().slice(0, 500);
     const enabled = input.enabled !== undefined ? Boolean(input.enabled) : true;
+    const allowedTools = normalizeAllowedToolsList(input.allowedTools, (msg) => {
+      throw new McpValidationError('INVALID_ALLOWED_TOOLS', msg);
+    });
 
     const existingDup = this.db.findMcpServerByScopeAndName(scope, ownerUserId, name);
     if (existingDup) {
@@ -957,6 +1172,7 @@ export class McpService {
       ownerUserId,
       transport,
       enabled,
+      allowedToolsJson: JSON.stringify(allowedTools),
       command,
       argsJson: JSON.stringify(args),
       encryptedEnvJson,
@@ -990,6 +1206,14 @@ export class McpService {
     const nextDescription =
       input.description !== undefined ? input.description.trim().slice(0, 500) : existing.description;
     const nextEnabled = input.enabled !== undefined ? Boolean(input.enabled) : existing.enabled;
+    const nextAllowedToolsJson =
+      input.allowedTools !== undefined
+        ? JSON.stringify(
+            normalizeAllowedToolsList(input.allowedTools, (msg) => {
+              throw new McpValidationError('INVALID_ALLOWED_TOOLS', msg);
+            })
+          )
+        : existing.allowedToolsJson;
 
     if (
       nextName !== existing.name ||
@@ -1095,6 +1319,7 @@ export class McpService {
       ownerUserId: nextOwnerUserId,
       transport: nextTransport,
       enabled: nextEnabled,
+      allowedToolsJson: nextAllowedToolsJson,
       command: nextCommand,
       argsJson: nextArgsJson,
       encryptedEnvJson: nextEncryptedEnvJson,
@@ -1256,6 +1481,18 @@ export class McpService {
           }
         }
 
+        const rawAllowedTools = Array.isArray(cfg.enabledTools)
+          ? cfg.enabledTools
+          : Array.isArray(cfg.allowedTools)
+            ? cfg.allowedTools
+            : undefined;
+        const allowedTools =
+          rawAllowedTools !== undefined
+            ? normalizeAllowedToolsList(rawAllowedTools, (msg) => {
+                throw new McpValidationError('INVALID_ALLOWED_TOOLS', msg);
+              })
+            : undefined;
+
         const existing = this.db.findMcpServerByScopeAndName(params.scope, ownerUserId, name);
         if (existing) {
           if (!params.overwrite) {
@@ -1267,6 +1504,7 @@ export class McpService {
             description: typeof cfg.description === 'string' ? cfg.description : existing.description,
             transport,
             enabled: typeof cfg.disabled === 'boolean' ? !cfg.disabled : existing.enabled,
+            ...(allowedTools !== undefined ? { allowedTools } : {}),
             command: commandRaw,
             args,
             env: envEntries,
@@ -1283,6 +1521,7 @@ export class McpService {
             scope: params.scope,
             transport,
             enabled: typeof cfg.disabled === 'boolean' ? !cfg.disabled : true,
+            ...(allowedTools !== undefined ? { allowedTools } : {}),
             command: commandRaw,
             args,
             env: envEntries,
@@ -1871,6 +2110,9 @@ export class McpService {
       let settled = false;
       let exited = false;
       let killTimer: ReturnType<typeof setTimeout> | null = null;
+      let toolsProbeTimer: ReturnType<typeof setTimeout> | null = null;
+      let initSuccessResult: McpTestResult | null = null;
+      let toolsProbeSent = false;
       let stdoutBuf = '';
       let stderrBuf = '';
 
@@ -1902,6 +2144,10 @@ export class McpService {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (toolsProbeTimer) {
+          clearTimeout(toolsProbeTimer);
+          toolsProbeTimer = null;
+        }
         try {
           child.stdin?.end();
         } catch {
@@ -1918,82 +2164,118 @@ export class McpService {
         resolve(result);
       };
 
-      const tryParseInitializeMessage = (rawObj: unknown): McpTestResult | null => {
-        if (!rawObj || typeof rawObj !== 'object' || Array.isArray(rawObj)) return null;
+      const handleRpcObject = (rawObj: unknown): void => {
+        if (!rawObj || typeof rawObj !== 'object' || Array.isArray(rawObj)) return;
         const msg = rawObj as Record<string, unknown>;
-        if (msg.jsonrpc !== '2.0' || msg.id !== 1) return null;
-        if (msg.error && typeof msg.error === 'object') {
-          const errObj = msg.error as Record<string, unknown>;
-          const errMsg = typeof errObj.message === 'string' ? errObj.message : 'MCP initialize エラー';
-          return {
-            ok: false,
-            status: 'error',
-            message: `stdio MCP サーバーが初期化エラーを返しました: ${errMsg}`,
-            resolvedCommand: resolvedCmd,
-          };
-        }
-        if (msg.result && typeof msg.result === 'object' && !Array.isArray(msg.result)) {
-          const resultObj = msg.result as Record<string, unknown>;
-          const serverInfoObj =
-            resultObj.serverInfo && typeof resultObj.serverInfo === 'object' && !Array.isArray(resultObj.serverInfo)
-              ? (resultObj.serverInfo as Record<string, unknown>)
-              : null;
-          const serverInfo = serverInfoObj
-            ? {
-                name: typeof serverInfoObj.name === 'string' ? serverInfoObj.name : undefined,
-                version: typeof serverInfoObj.version === 'string' ? serverInfoObj.version : undefined,
+        if (msg.jsonrpc !== '2.0') return;
+
+        if (msg.id === 1 && !initSuccessResult) {
+          if (msg.error && typeof msg.error === 'object') {
+            const errObj = msg.error as Record<string, unknown>;
+            const errMsg = typeof errObj.message === 'string' ? errObj.message : 'MCP initialize エラー';
+            finish({
+              ok: false,
+              status: 'error',
+              message: `stdio MCP サーバーが初期化エラーを返しました: ${errMsg}`,
+              resolvedCommand: resolvedCmd,
+            });
+            return;
+          }
+          if (msg.result && typeof msg.result === 'object' && !Array.isArray(msg.result)) {
+            const resultObj = msg.result as Record<string, unknown>;
+            const serverInfoObj =
+              resultObj.serverInfo && typeof resultObj.serverInfo === 'object' && !Array.isArray(resultObj.serverInfo)
+                ? (resultObj.serverInfo as Record<string, unknown>)
+                : null;
+            const serverInfo = serverInfoObj
+              ? {
+                  name: typeof serverInfoObj.name === 'string' ? serverInfoObj.name : undefined,
+                  version: typeof serverInfoObj.version === 'string' ? serverInfoObj.version : undefined,
+                }
+              : undefined;
+            initSuccessResult = {
+              ok: true,
+              status: 'connected',
+              message: serverInfo?.name
+                ? `stdio MCP 接続成功: ${serverInfo.name}${serverInfo.version ? ` v${serverInfo.version}` : ''} (${resolvedCmd})`
+                : `stdio MCP サーバーの初期化を確認しました (${resolvedCmd})`,
+              resolvedCommand: resolvedCmd,
+              serverInfo,
+            };
+            if (exited) {
+              finish(initSuccessResult);
+              return;
+            }
+            if (!toolsProbeSent) {
+              toolsProbeSent = true;
+              try {
+                child.stdin?.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
+                child.stdin?.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} })}\n`);
+              } catch {
+                finish(initSuccessResult);
+                return;
               }
-            : undefined;
-          return {
-            ok: true,
-            status: 'connected',
-            message: serverInfo?.name
-              ? `stdio MCP 接続成功: ${serverInfo.name}${serverInfo.version ? ` v${serverInfo.version}` : ''} (${resolvedCmd})`
-              : `stdio MCP サーバーの初期化を確認しました (${resolvedCmd})`,
-            resolvedCommand: resolvedCmd,
-            serverInfo,
-          };
+              toolsProbeTimer = setTimeout(() => {
+                if (initSuccessResult) finish(initSuccessResult);
+              }, 1_200);
+              toolsProbeTimer.unref?.();
+            }
+          }
+          return;
         }
-        return null;
+
+        if (msg.id === 2 && initSuccessResult) {
+          if (msg.error) {
+            finish(initSuccessResult);
+            return;
+          }
+          const tools = extractMcpToolsFromJsonRpcPayload(msg);
+          finish({
+            ...initSuccessResult,
+            ...(tools.length > 0 ? { tools } : {}),
+          });
+        }
       };
 
       const inspectStdout = () => {
         // 1) Support LSP-style Content-Length framed JSON-RPC
-        const clMatch = /Content-Length:\s*(\d+)\r?\n\r?\n/i.exec(stdoutBuf);
-        if (clMatch) {
+        while (stdoutBuf.length > 0) {
+          const clMatch = /Content-Length:\s*(\d+)\r?\n\r?\n/i.exec(stdoutBuf);
+          if (!clMatch) break;
           const len = Number.parseInt(clMatch[1], 10);
           const bodyStart = clMatch.index + clMatch[0].length;
-          if (Buffer.byteLength(stdoutBuf.slice(bodyStart), 'utf8') >= len) {
-            const payload = Buffer.from(stdoutBuf.slice(bodyStart), 'utf8').subarray(0, len).toString('utf8');
-            try {
-              const hit = tryParseInitializeMessage(JSON.parse(payload));
-              if (hit) {
-                finish(hit);
-                return;
-              }
-            } catch {
-              // continue checking lines
-            }
+          const restBuf = Buffer.from(stdoutBuf.slice(bodyStart), 'utf8');
+          if (restBuf.byteLength < len) break;
+          const payload = restBuf.subarray(0, len).toString('utf8');
+          stdoutBuf = restBuf.subarray(len).toString('utf8');
+          try {
+            handleRpcObject(JSON.parse(payload));
+          } catch {
+            // ignore non-JSON payload
           }
+          if (settled) return;
         }
         // 2) Support newline-delimited JSON-RPC (standard MCP stdio)
         const lines = stdoutBuf.split(/\r?\n/);
-        for (const line of lines) {
-          const trimmed = line.trim();
+        const lastIdx = stdoutBuf.endsWith('\n') ? lines.length : lines.length - 1;
+        for (let i = 0; i < lastIdx; i += 1) {
+          const trimmed = lines[i].trim();
           if (!trimmed.startsWith('{')) continue;
           try {
-            const hit = tryParseInitializeMessage(JSON.parse(trimmed));
-            if (hit) {
-              finish(hit);
-              return;
-            }
+            handleRpcObject(JSON.parse(trimmed));
           } catch {
             // incomplete or non-JSON line
           }
+          if (settled) return;
         }
+        stdoutBuf = lastIdx < lines.length ? lines[lastIdx] : '';
       };
 
       const timer = setTimeout(() => {
+        if (initSuccessResult) {
+          finish(initSuccessResult);
+          return;
+        }
         const stderrHint = stderrBuf.trim().slice(0, 200);
         finish({
           ok: false,
@@ -2006,7 +2288,7 @@ export class McpService {
       }, 5_000);
 
       child.stdout?.on('data', (chunk: Buffer) => {
-        if (stdoutBuf.length < 64_000) {
+        if (stdoutBuf.length < 256_000) {
           stdoutBuf += chunk.toString('utf8');
         }
         inspectStdout();
@@ -2038,7 +2320,14 @@ export class McpService {
           clearTimeout(killTimer);
           killTimer = null;
         }
-        inspectStdout();
+        if (stdoutBuf.trim()) {
+          stdoutBuf = `${stdoutBuf}\n`;
+          inspectStdout();
+        }
+        if (initSuccessResult && !settled) {
+          finish(initSuccessResult);
+          return;
+        }
         if (!settled) {
           const stderrHint = stderrBuf.trim().slice(0, 200);
           finish({
@@ -2256,6 +2545,72 @@ export class McpService {
               version: typeof serverInfoObj.version === 'string' ? serverInfoObj.version : undefined,
             }
           : undefined;
+
+        let discoveredTools: McpDiscoveredTool[] | undefined;
+        try {
+          const sessionIdHeader = res.headers.get('mcp-session-id');
+          const probeHeaders: Record<string, string> = {
+            'Content-Type': 'application/json',
+            Accept: 'application/json, text/event-stream',
+            ...headers,
+          };
+          if (sessionIdHeader) {
+            probeHeaders['Mcp-Session-Id'] = sessionIdHeader;
+          }
+
+          await fetchJsonWithTimeout(
+            row.url,
+            {
+              method: 'POST',
+              headers: probeHeaders,
+              body: JSON.stringify({
+                jsonrpc: '2.0',
+                method: 'notifications/initialized',
+              }),
+            },
+            { ...urlOpts, timeoutMs: 1_500 }
+          ).catch(() => null);
+
+          const toolsRes = await fetchJsonWithTimeout(
+            row.url,
+            {
+              method: 'POST',
+              headers: probeHeaders,
+              body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 2,
+                method: 'tools/list',
+                params: {},
+              }),
+            },
+            { ...urlOpts, timeoutMs: 2_500 }
+          );
+
+          if (toolsRes.status >= 200 && toolsRes.status < 300) {
+            let toolsPayload: unknown = toolsRes.json;
+            const toolsCt = (toolsRes.headers.get('content-type') ?? '').toLowerCase();
+            if (!toolsPayload && toolsCt.includes('text/event-stream') && toolsRes.text) {
+              for (const line of toolsRes.text.split(/\r?\n/)) {
+                if (!line.startsWith('data:')) continue;
+                const dataStr = line.slice(5).trim();
+                if (!dataStr || dataStr === '[DONE]') continue;
+                try {
+                  toolsPayload = JSON.parse(dataStr);
+                  break;
+                } catch {
+                  // ignore non-JSON event data
+                }
+              }
+            }
+            const extracted = extractMcpToolsFromJsonRpcPayload(toolsPayload);
+            if (extracted.length > 0) {
+              discoveredTools = extracted;
+            }
+          }
+        } catch {
+          // Best-effort tool discovery; initialize already succeeded
+        }
+
         return {
           ok: true,
           status: 'connected',
@@ -2263,6 +2618,7 @@ export class McpService {
             ? `接続成功: ${serverInfo.name}${serverInfo.version ? ` v${serverInfo.version}` : ''}`
             : `リモートMCPサーバーの初期化を確認しました (HTTP ${res.status})`,
           serverInfo,
+          ...(discoveredTools ? { tools: discoveredTools } : {}),
         };
       }
 
@@ -2305,18 +2661,40 @@ export class McpService {
     const out: McpServer[] = [];
 
     for (const row of byName.values()) {
+      const allowedTools = parseArgsJson(row.allowedToolsJson);
+
       if (row.transport === 'stdio') {
         if (!row.command) continue;
         const resolvedCmd = resolveHostExecutable(row.command) ?? row.command;
         const args = parseArgsJson(row.argsJson);
         const envMap = this.decryptRecord(row.encryptedEnvJson);
         const env = Object.entries(envMap).map(([name, value]) => ({ name, value }));
-        out.push({
-          name: row.name,
-          command: resolvedCmd,
-          args,
-          env,
-        });
+
+        if (allowedTools.length > 0) {
+          const nodeBin = resolveHostExecutable('node') ?? process.execPath;
+          out.push({
+            name: row.name,
+            command: nodeBin,
+            args: [
+              '--input-type=commonjs',
+              '-e',
+              STDIO_MCP_TOOL_FILTER_SCRIPT,
+              JSON.stringify({
+                command: resolvedCmd,
+                args,
+                allowedTools,
+              }),
+            ],
+            env,
+          });
+        } else {
+          out.push({
+            name: row.name,
+            command: resolvedCmd,
+            args,
+            env,
+          });
+        }
         continue;
       }
 
@@ -2338,7 +2716,17 @@ export class McpService {
 
       let acpUrl = target.url;
       const isHostnameUrl = net.isIP(normalizeHostnameForIpCheck(target.parsed.hostname)) === 0;
-      if (!this.config.allowPrivateMcpUrls && target.pinnedAddress && isHostnameUrl) {
+      const hasAllowedToolsFilter = allowedTools.length > 0;
+      const needsPinnedForwarder =
+        !this.config.allowPrivateMcpUrls && target.pinnedAddress && isHostnameUrl;
+
+      if (hasAllowedToolsFilter) {
+        acpUrl = await this.httpsForwarder.registerRoute({
+          ...target,
+          allowedTools: new Set(allowedTools),
+          trackedToolsListIds: new Set(),
+        });
+      } else if (needsPinnedForwarder && target.pinnedAddress) {
         if (target.parsed.protocol === 'http:') {
           const pinnedUrl = new URL(target.url);
           pinnedUrl.hostname = target.pinnedFamily === 6 ? `[${target.pinnedAddress}]` : target.pinnedAddress;

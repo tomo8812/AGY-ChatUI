@@ -495,6 +495,7 @@ export const api = {
     scope: McpScope;
     transport: McpTransport;
     enabled?: boolean;
+    allowedTools?: string[];
     command?: string | null;
     args?: string[];
     env?: Array<{ name: string; value?: string; keepExisting?: boolean }>;
@@ -526,6 +527,7 @@ export const api = {
       scope?: McpScope;
       transport?: McpTransport;
       enabled?: boolean;
+      allowedTools?: string[];
       command?: string | null;
       args?: string[];
       env?: Array<{ name: string; value?: string; keepExisting?: boolean }>;
