@@ -731,16 +731,16 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
             ? '認証ウィンドウを開きました。ログイン後、リダイレクト先URLまたは認可コードを下の入力欄に貼り付けてもアプリ内で完了できます。'
             : '認証ウィンドウを開きました。ブラウザでログイン・許可を完了してください。'
         );
-      } else {
-        // iOS Standalone PWA or popup-blocked fallback:
-        // Opening an external OAuth URL via window.open(_blank) or location.assign
-        // launches iOS's in-app Safari sheet (SFSafariViewController) or system browser.
-        const opened = window.open(res.authorizationUrl, '_blank', 'noopener,noreferrer');
-        if (!opened) {
-          window.location.assign(res.authorizationUrl);
-        }
+      } else if (standalone) {
+        // iOS Standalone PWA: navigating directly to an external OAuth URL via location.assign
+        // launches iOS's in-app Safari sheet (SFSafariViewController) without being blocked by async popup blockers.
+        window.location.assign(res.authorizationUrl);
         setStatusNote(
           '認証ページへ移動しました。ログイン・許可が完了すると自動で反映されます（戻った後にURLまたは認可コードを貼り付けてアプリ内で完了することも可能です）。'
+        );
+      } else {
+        setStatusNote(
+          'ポップアップがブロックされました。下の「認証ページを開く」から認証を完了してください（完了後にURLまたは認可コードを貼り付けることも可能です）。'
         );
       }
     } catch (err) {
