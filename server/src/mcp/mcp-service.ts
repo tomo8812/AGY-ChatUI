@@ -1869,13 +1869,34 @@ export class McpService {
   ): Promise<McpTestResult> {
     return new Promise((resolve) => {
       let settled = false;
+      let exited = false;
+      let killTimer: ReturnType<typeof setTimeout> | null = null;
       let stdoutBuf = '';
       let stderrBuf = '';
 
+      const useProcessGroup = process.platform !== 'win32';
       const child = spawn(resolvedCmd, args, {
         env: { ...process.env, ...env },
         stdio: ['pipe', 'pipe', 'pipe'],
+        detached: useProcessGroup,
       });
+
+      const signalChild = (sig: NodeJS.Signals) => {
+        if (exited) return;
+        if (useProcessGroup && child.pid) {
+          try {
+            process.kill(-child.pid, sig);
+            return;
+          } catch {
+            // fallback to direct child kill
+          }
+        }
+        try {
+          child.kill(sig);
+        } catch {
+          // ignore
+        }
+      };
 
       const finish = (result: McpTestResult) => {
         if (settled) return;
@@ -1886,10 +1907,13 @@ export class McpService {
         } catch {
           // ignore
         }
-        try {
-          child.kill('SIGTERM');
-        } catch {
-          // ignore
+        if (!exited) {
+          signalChild('SIGTERM');
+          killTimer = setTimeout(() => {
+            killTimer = null;
+            signalChild('SIGKILL');
+          }, 1500);
+          killTimer.unref?.();
         }
         resolve(result);
       };
@@ -1995,6 +2019,11 @@ export class McpService {
       });
 
       child.on('error', (err) => {
+        exited = true;
+        if (killTimer) {
+          clearTimeout(killTimer);
+          killTimer = null;
+        }
         finish({
           ok: false,
           status: 'error',
@@ -2004,6 +2033,11 @@ export class McpService {
       });
 
       child.on('exit', (code, signal) => {
+        exited = true;
+        if (killTimer) {
+          clearTimeout(killTimer);
+          killTimer = null;
+        }
         inspectStdout();
         if (!settled) {
           const stderrHint = stderrBuf.trim().slice(0, 200);
