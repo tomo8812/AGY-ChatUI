@@ -2137,7 +2137,15 @@ export class McpService {
     }
 
     let targetState = extractedState;
-    if (!targetState || !this.pendingOAuthFlows.has(targetState)) {
+    const explicitFlow = targetState ? this.pendingOAuthFlows.get(targetState) : undefined;
+    if (explicitFlow && explicitFlow.serverId !== serverId) {
+      throw new McpValidationError(
+        'OAUTH_INVALID_STATE',
+        '指定されたOAuth stateは別のMCPサーバーの認証セッションに属しています。'
+      );
+    }
+
+    if (!explicitFlow) {
       // Find the most recent pending flow for this (adminUserId, serverId)
       let latestFlow: PendingOAuthFlow | null = null;
       for (const flow of this.pendingOAuthFlows.values()) {
@@ -2150,6 +2158,14 @@ export class McpService {
       if (latestFlow) {
         targetState = latestFlow.state;
       }
+    }
+
+    const matchedFlow = targetState ? this.pendingOAuthFlows.get(targetState) : undefined;
+    if (matchedFlow && matchedFlow.serverId !== serverId) {
+      throw new McpValidationError(
+        'OAUTH_INVALID_STATE',
+        '指定されたOAuth stateは別のMCPサーバーの認証セッションに属しています。'
+      );
     }
 
     return this.completeOAuthCallback(adminUserId, {
