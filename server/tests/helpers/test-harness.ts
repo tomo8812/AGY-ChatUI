@@ -160,7 +160,9 @@ export class TestApiClient {
   }
 }
 
-export async function createTestServer(): Promise<{
+export async function createTestServer(
+  configOverrides: Parameters<typeof createApp>[0] = {}
+): Promise<{
   ctx: AppContext;
   baseUrl: string;
   dataRoot: string;
@@ -178,6 +180,7 @@ export async function createTestServer(): Promise<{
     idleWorkerMs: 60_000,
     allowPublicSignup: true,
     secureCookies: 'never',
+    ...configOverrides,
   });
 
   const address = await ctx.app.listen({ host: '127.0.0.1', port: 0 });

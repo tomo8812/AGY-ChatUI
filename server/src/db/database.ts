@@ -8,6 +8,10 @@ import type {
   ArtifactRecord,
   AttachmentRef,
   ChatRecord,
+  McpAuthType,
+  McpOAuthStatus,
+  McpScope,
+  McpTransport,
   MessageActivity,
   MessageRecord,
   PendingPermissionRecord,
@@ -29,6 +33,31 @@ import type {
 
 export interface StoredUserRow extends WebUser {
   passwordHash: string;
+}
+
+export interface StoredMcpServerRow {
+  id: string;
+  name: string;
+  description: string;
+  scope: McpScope;
+  ownerUserId: string | null;
+  transport: McpTransport;
+  enabled: boolean;
+  command: string | null;
+  argsJson: string;
+  encryptedEnvJson: string | null;
+  url: string | null;
+  authType: McpAuthType;
+  encryptedHeadersJson: string | null;
+  oauthConfigJson: string | null;
+  encryptedOauthClientSecret: string | null;
+  encryptedOauthTokensJson: string | null;
+  oauthStatus: McpOAuthStatus;
+  oauthError: string | null;
+  oauthUpdatedAt: number | null;
+  createdBy: string;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export class AppDatabase {
@@ -251,6 +280,34 @@ export class AppDatabase {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_sync_events_user_seq ON sync_events(user_id, seq);
+
+      CREATE TABLE IF NOT EXISTS mcp_servers (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        scope TEXT NOT NULL,
+        owner_user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+        transport TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        command TEXT,
+        args_json TEXT NOT NULL DEFAULT '[]',
+        encrypted_env_json TEXT,
+        url TEXT,
+        auth_type TEXT NOT NULL DEFAULT 'none',
+        encrypted_headers_json TEXT,
+        oauth_config_json TEXT,
+        encrypted_oauth_client_secret TEXT,
+        encrypted_oauth_tokens_json TEXT,
+        oauth_status TEXT NOT NULL DEFAULT 'disconnected',
+        oauth_error TEXT,
+        oauth_updated_at INTEGER,
+        created_by TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_mcp_servers_scope_owner ON mcp_servers(scope, owner_user_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_servers_unique_scope_name
+        ON mcp_servers(scope, COALESCE(owner_user_id, ''), name);
     `);
 
     // Safe additive column migrations for existing databases
@@ -1608,5 +1665,249 @@ export class AppDatabase {
       truncated,
       latestSeq,
     };
+  }
+
+  // ---- MCP Servers ----
+
+  private mapMcpServerRow(row: Record<string, unknown>): StoredMcpServerRow {
+    return {
+      id: String(row.id),
+      name: String(row.name),
+      description: String(row.description ?? ''),
+      scope: row.scope === 'profile' ? 'profile' : 'shared',
+      ownerUserId: row.owner_user_id ? String(row.owner_user_id) : null,
+      transport:
+        row.transport === 'http' || row.transport === 'sse' || row.transport === 'stdio'
+          ? row.transport
+          : 'stdio',
+      enabled: Number(row.enabled) === 1,
+      command: row.command ? String(row.command) : null,
+      argsJson: String(row.args_json ?? '[]'),
+      encryptedEnvJson: row.encrypted_env_json ? String(row.encrypted_env_json) : null,
+      url: row.url ? String(row.url) : null,
+      authType:
+        row.auth_type === 'bearer' ||
+        row.auth_type === 'api_key' ||
+        row.auth_type === 'headers' ||
+        row.auth_type === 'oauth'
+          ? row.auth_type
+          : 'none',
+      encryptedHeadersJson: row.encrypted_headers_json ? String(row.encrypted_headers_json) : null,
+      oauthConfigJson: row.oauth_config_json ? String(row.oauth_config_json) : null,
+      encryptedOauthClientSecret: row.encrypted_oauth_client_secret
+        ? String(row.encrypted_oauth_client_secret)
+        : null,
+      encryptedOauthTokensJson: row.encrypted_oauth_tokens_json
+        ? String(row.encrypted_oauth_tokens_json)
+        : null,
+      oauthStatus:
+        row.oauth_status === 'connected' ||
+        row.oauth_status === 'expired' ||
+        row.oauth_status === 'error'
+          ? row.oauth_status
+          : 'disconnected',
+      oauthError: row.oauth_error ? String(row.oauth_error) : null,
+      oauthUpdatedAt: row.oauth_updated_at !== null && row.oauth_updated_at !== undefined
+        ? Number(row.oauth_updated_at)
+        : null,
+      createdBy: String(row.created_by),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    };
+  }
+
+  listAdminUserIds(): string[] {
+    const rows = this.db
+      .prepare("SELECT id FROM users WHERE role = 'admin'")
+      .all() as Array<{ id: string }>;
+    return rows.map((r) => String(r.id));
+  }
+
+  listMcpServersForAdmin(adminUserId: string): StoredMcpServerRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM mcp_servers
+         WHERE scope = 'shared' OR (scope = 'profile' AND owner_user_id = ?)
+         ORDER BY CASE WHEN scope = 'shared' THEN 0 ELSE 1 END, name ASC`
+      )
+      .all(adminUserId) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapMcpServerRow(r));
+  }
+
+  listEffectiveMcpServersForUser(userId: string): StoredMcpServerRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM mcp_servers
+         WHERE enabled = 1 AND (scope = 'shared' OR (scope = 'profile' AND owner_user_id = ?))
+         ORDER BY CASE WHEN scope = 'shared' THEN 0 ELSE 1 END, name ASC`
+      )
+      .all(userId) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapMcpServerRow(r));
+  }
+
+  getMcpServerById(id: string): StoredMcpServerRow | null {
+    const row = this.db
+      .prepare('SELECT * FROM mcp_servers WHERE id = ?')
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? this.mapMcpServerRow(row) : null;
+  }
+
+  findMcpServerByScopeAndName(
+    scope: McpScope,
+    ownerUserId: string | null,
+    name: string
+  ): StoredMcpServerRow | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM mcp_servers
+         WHERE scope = ? AND COALESCE(owner_user_id, '') = COALESCE(?, '') AND name = ?`
+      )
+      .get(scope, ownerUserId ?? '', name) as Record<string, unknown> | undefined;
+    return row ? this.mapMcpServerRow(row) : null;
+  }
+
+  createMcpServer(input: {
+    id: string;
+    name: string;
+    description: string;
+    scope: McpScope;
+    ownerUserId: string | null;
+    transport: McpTransport;
+    enabled: boolean;
+    command: string | null;
+    argsJson: string;
+    encryptedEnvJson: string | null;
+    url: string | null;
+    authType: McpAuthType;
+    encryptedHeadersJson: string | null;
+    oauthConfigJson: string | null;
+    encryptedOauthClientSecret: string | null;
+    encryptedOauthTokensJson: string | null;
+    oauthStatus: McpOAuthStatus;
+    oauthError: string | null;
+    oauthUpdatedAt: number | null;
+    createdBy: string;
+  }): StoredMcpServerRow {
+    const now = Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO mcp_servers (
+          id, name, description, scope, owner_user_id, transport, enabled,
+          command, args_json, encrypted_env_json,
+          url, auth_type, encrypted_headers_json,
+          oauth_config_json, encrypted_oauth_client_secret, encrypted_oauth_tokens_json,
+          oauth_status, oauth_error, oauth_updated_at,
+          created_by, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        input.id,
+        input.name,
+        input.description,
+        input.scope,
+        input.ownerUserId,
+        input.transport,
+        input.enabled ? 1 : 0,
+        input.command,
+        input.argsJson,
+        input.encryptedEnvJson,
+        input.url,
+        input.authType,
+        input.encryptedHeadersJson,
+        input.oauthConfigJson,
+        input.encryptedOauthClientSecret,
+        input.encryptedOauthTokensJson,
+        input.oauthStatus,
+        input.oauthError,
+        input.oauthUpdatedAt,
+        input.createdBy,
+        now,
+        now
+      );
+    return this.getMcpServerById(input.id)!;
+  }
+
+  updateMcpServer(
+    id: string,
+    patch: Partial<{
+      name: string;
+      description: string;
+      scope: McpScope;
+      ownerUserId: string | null;
+      transport: McpTransport;
+      enabled: boolean;
+      command: string | null;
+      argsJson: string;
+      encryptedEnvJson: string | null;
+      url: string | null;
+      authType: McpAuthType;
+      encryptedHeadersJson: string | null;
+      oauthConfigJson: string | null;
+      encryptedOauthClientSecret: string | null;
+      encryptedOauthTokensJson: string | null;
+      oauthStatus: McpOAuthStatus;
+      oauthError: string | null;
+      oauthUpdatedAt: number | null;
+    }>
+  ): StoredMcpServerRow | null {
+    const existing = this.getMcpServerById(id);
+    if (!existing) return null;
+    const now = Date.now();
+    this.db
+      .prepare(
+        `UPDATE mcp_servers SET
+          name = ?,
+          description = ?,
+          scope = ?,
+          owner_user_id = ?,
+          transport = ?,
+          enabled = ?,
+          command = ?,
+          args_json = ?,
+          encrypted_env_json = ?,
+          url = ?,
+          auth_type = ?,
+          encrypted_headers_json = ?,
+          oauth_config_json = ?,
+          encrypted_oauth_client_secret = ?,
+          encrypted_oauth_tokens_json = ?,
+          oauth_status = ?,
+          oauth_error = ?,
+          oauth_updated_at = ?,
+          updated_at = ?
+         WHERE id = ?`
+      )
+      .run(
+        patch.name !== undefined ? patch.name : existing.name,
+        patch.description !== undefined ? patch.description : existing.description,
+        patch.scope !== undefined ? patch.scope : existing.scope,
+        patch.ownerUserId !== undefined ? patch.ownerUserId : existing.ownerUserId,
+        patch.transport !== undefined ? patch.transport : existing.transport,
+        (patch.enabled !== undefined ? patch.enabled : existing.enabled) ? 1 : 0,
+        patch.command !== undefined ? patch.command : existing.command,
+        patch.argsJson !== undefined ? patch.argsJson : existing.argsJson,
+        patch.encryptedEnvJson !== undefined ? patch.encryptedEnvJson : existing.encryptedEnvJson,
+        patch.url !== undefined ? patch.url : existing.url,
+        patch.authType !== undefined ? patch.authType : existing.authType,
+        patch.encryptedHeadersJson !== undefined ? patch.encryptedHeadersJson : existing.encryptedHeadersJson,
+        patch.oauthConfigJson !== undefined ? patch.oauthConfigJson : existing.oauthConfigJson,
+        patch.encryptedOauthClientSecret !== undefined
+          ? patch.encryptedOauthClientSecret
+          : existing.encryptedOauthClientSecret,
+        patch.encryptedOauthTokensJson !== undefined
+          ? patch.encryptedOauthTokensJson
+          : existing.encryptedOauthTokensJson,
+        patch.oauthStatus !== undefined ? patch.oauthStatus : existing.oauthStatus,
+        patch.oauthError !== undefined ? patch.oauthError : existing.oauthError,
+        patch.oauthUpdatedAt !== undefined ? patch.oauthUpdatedAt : existing.oauthUpdatedAt,
+        now,
+        id
+      );
+    return this.getMcpServerById(id);
+  }
+
+  deleteMcpServer(id: string): boolean {
+    const res = this.db.prepare('DELETE FROM mcp_servers WHERE id = ?').run(id);
+    return Number(res.changes) > 0;
   }
 }

@@ -27,6 +27,7 @@ interface SidebarProps {
   onDeleteChat: (chatId: string) => void;
   onOpenProjectModal: (project: ProjectRecord | null) => void;
   onOpenSkills: () => void;
+  onOpenMcp?: () => void;
   onOpenSettings: () => void;
 }
 
@@ -45,6 +46,7 @@ export const Sidebar: React.FC<SidebarProps> = React.memo(({
   onDeleteChat,
   onOpenProjectModal,
   onOpenSkills,
+  onOpenMcp,
   onOpenSettings,
 }) => {
   const [searchOpen, setSearchOpen] = useState(false);
@@ -168,6 +170,22 @@ export const Sidebar: React.FC<SidebarProps> = React.memo(({
               </span>
               {skillCount > 0 && <span className="count-tag">{skillCount}</span>}
             </button>
+            {user.role === 'admin' && onOpenMcp && (
+              <button
+                type="button"
+                className="sidebar-nav-btn"
+                style={{ marginTop: 4 }}
+                onClick={() => {
+                  onOpenMcp();
+                  onCloseMobile();
+                }}
+              >
+                <span className="sidebar-nav-left">
+                  <SparklesIcon size={15} />
+                  <span>MCP 管理（管理者）</span>
+                </span>
+              </button>
+            )}
           </div>
 
           <div className="sidebar-section">

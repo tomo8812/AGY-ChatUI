@@ -6,6 +6,11 @@ import type {
   BootstrapResponse,
   ChatDetailResponse,
   ChatRecord,
+  McpAuthType,
+  McpScope,
+  McpServerRecord,
+  McpTestResult,
+  McpTransport,
   MessageRecord,
   ParsedSessionOptions,
   PendingPermissionRecord,
@@ -479,4 +484,98 @@ export const api = {
       currentDeviceSent?: boolean;
       currentDeviceError?: string;
     }>('/api/notifications/test', { method: 'POST', body: endpoint ? { endpoint } : {} }),
+
+  // Admin MCP Server Management
+  listMcpServers: () =>
+    apiFetch<{ servers: McpServerRecord[]; callbackUrl: string }>('/api/mcp/servers'),
+
+  createMcpServer: (payload: {
+    name: string;
+    description?: string;
+    scope: McpScope;
+    transport: McpTransport;
+    enabled?: boolean;
+    command?: string | null;
+    args?: string[];
+    env?: Array<{ name: string; value?: string; keepExisting?: boolean }>;
+    url?: string | null;
+    authType?: McpAuthType;
+    headers?: Array<{ name: string; value?: string; keepExisting?: boolean }>;
+    oauthConfig?: {
+      clientId?: string | null;
+      clientSecret?: string | null;
+      clearClientSecret?: boolean;
+      authorizationUrl?: string | null;
+      tokenUrl?: string | null;
+      registrationUrl?: string | null;
+      scopes?: string | null;
+      resource?: string | null;
+      extraAuthParams?: Record<string, string> | null;
+    } | null;
+  }) =>
+    apiFetch<{ server: McpServerRecord }>('/api/mcp/servers', {
+      method: 'POST',
+      body: payload,
+    }),
+
+  updateMcpServer: (
+    id: string,
+    payload: {
+      name?: string;
+      description?: string;
+      scope?: McpScope;
+      transport?: McpTransport;
+      enabled?: boolean;
+      command?: string | null;
+      args?: string[];
+      env?: Array<{ name: string; value?: string; keepExisting?: boolean }>;
+      url?: string | null;
+      authType?: McpAuthType;
+      headers?: Array<{ name: string; value?: string; keepExisting?: boolean }>;
+      oauthConfig?: {
+        clientId?: string | null;
+        clientSecret?: string | null;
+        clearClientSecret?: boolean;
+        authorizationUrl?: string | null;
+        tokenUrl?: string | null;
+        registrationUrl?: string | null;
+        scopes?: string | null;
+        resource?: string | null;
+        extraAuthParams?: Record<string, string> | null;
+      } | null;
+    }
+  ) =>
+    apiFetch<{ server: McpServerRecord }>(`/api/mcp/servers/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: payload,
+    }),
+
+  deleteMcpServer: (id: string) =>
+    apiFetch<{ ok: boolean }>(`/api/mcp/servers/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+
+  importMcpJson: (payload: { scope: McpScope; rawJson: string; overwrite?: boolean }) =>
+    apiFetch<{ imported: McpServerRecord[]; skipped: string[] }>('/api/mcp/import', {
+      method: 'POST',
+      body: payload,
+    }),
+
+  testMcpServer: (id: string) =>
+    apiFetch<{ result: McpTestResult }>(`/api/mcp/servers/${encodeURIComponent(id)}/test`, {
+      method: 'POST',
+      body: {},
+    }),
+
+  startMcpOAuth: (id: string) =>
+    apiFetch<{ authorizationUrl: string; redirectUri: string; state: string }>(
+      `/api/mcp/servers/${encodeURIComponent(id)}/oauth/start`,
+      { method: 'POST', body: {} }
+    ),
+
+  disconnectMcpOAuth: (id: string) =>
+    apiFetch<{ server: McpServerRecord }>(
+      `/api/mcp/servers/${encodeURIComponent(id)}/oauth/disconnect`,
+      { method: 'POST', body: {} }
+    ),
 };

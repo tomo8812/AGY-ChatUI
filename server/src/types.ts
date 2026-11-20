@@ -342,3 +342,75 @@ export interface SyncEventEnvelope {
   payload: unknown;
   createdAt: number;
 }
+
+export type McpScope = 'shared' | 'profile';
+export type McpTransport = 'stdio' | 'http' | 'sse';
+export type McpAuthType = 'none' | 'bearer' | 'api_key' | 'headers' | 'oauth';
+export type McpOAuthStatus = 'disconnected' | 'connected' | 'expired' | 'error';
+
+export interface McpSecretEntrySummary {
+  name: string;
+  maskedValue: string;
+  hasValue: boolean;
+}
+
+export interface McpOAuthConfig {
+  clientId?: string | null;
+  authorizationUrl?: string | null;
+  tokenUrl?: string | null;
+  registrationUrl?: string | null;
+  scopes?: string | null;
+  resource?: string | null;
+  extraAuthParams?: Record<string, string> | null;
+}
+
+export interface McpOAuthSummary {
+  status: McpOAuthStatus;
+  clientId: string | null;
+  hasClientSecret: boolean;
+  authorizationUrl: string | null;
+  tokenUrl: string | null;
+  registrationUrl: string | null;
+  scopes: string | null;
+  resource: string | null;
+  extraAuthParams: Record<string, string>;
+  expiresAt: number | null;
+  hasRefreshToken: boolean;
+  error: string | null;
+  updatedAt: number | null;
+}
+
+export interface McpServerRecord {
+  id: string;
+  name: string;
+  description: string;
+  scope: McpScope;
+  ownerUserId: string | null;
+  transport: McpTransport;
+  enabled: boolean;
+  command: string | null;
+  args: string[];
+  env: McpSecretEntrySummary[];
+  url: string | null;
+  authType: McpAuthType;
+  headers: McpSecretEntrySummary[];
+  oauth: McpOAuthSummary | null;
+  createdBy: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface McpTestResult {
+  ok: boolean;
+  status: 'connected' | 'oauth_required' | 'error';
+  message: string;
+  serverInfo?: { name?: string; version?: string };
+  resolvedCommand?: string | null;
+  discoveredOAuth?: {
+    authorizationUrl?: string | null;
+    tokenUrl?: string | null;
+    registrationUrl?: string | null;
+    scopes?: string[];
+  };
+}
+
