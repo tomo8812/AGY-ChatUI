@@ -245,14 +245,16 @@ describe('native and legacy file links', () => {
     const aliceProfile = srv.ctx.db.getAgyProfile(aliceId)!.profileDir;
     const bobProfile = srv.ctx.db.getAgyProfile(bobId)!.profileDir;
 
-    // 1. Non-sensitive user profile files (skills, skill references, global instructions, user notes)
+    // 1. Non-sensitive user profile files (skills, docs with "tokens"/"auth" in filename, global instructions, user notes)
     const skillFile = path.join(aliceProfile, '.gemini', 'config', 'skills', 'algorithmic-art', 'SKILL.md');
-    const skillRefDoc = path.join(aliceProfile, '.gemini', 'config', 'skills', 'theme-factory', 'references', 'palette-guide.md');
+    const designTokensDoc = path.join(aliceProfile, '.gemini', 'config', 'skills', 'theme-factory', 'references', 'design-tokens.md');
+    const authGuideDoc = path.join(aliceProfile, 'notes', 'auth-guide.md');
     const globalInstructions = path.join(aliceProfile, '.gemini', 'GEMINI.md');
     const userNote = path.join(aliceProfile, 'notes', 'memo.md');
     for (const [filePath, body] of [
       [skillFile, '# Algorithmic Art Skill'],
-      [skillRefDoc, '# Palette Guide'],
+      [designTokensDoc, '# Design Tokens'],
+      [authGuideDoc, '# Auth Architecture Guide'],
       [globalInstructions, '# Global Instructions'],
       [userNote, '# Personal Note'],
     ]) {
@@ -284,9 +286,10 @@ describe('native and legacy file links', () => {
       expect(res.data.artifact.id).toBe(fromFileUri.data.artifact.id);
     }
 
-    // Other non-sensitive profile files also resolve
+    // Other non-sensitive profile files (including docs with "tokens"/"auth" in filename) also resolve
     for (const ref of [
-      'file:///home/sandbox/.gemini/config/skills/theme-factory/references/palette-guide.md',
+      'file:///home/sandbox/.gemini/config/skills/theme-factory/references/design-tokens.md',
+      'file:///home/sandbox/notes/auth-guide.md',
       'file:///home/sandbox/.gemini/GEMINI.md',
       'file:///home/sandbox/notes/memo.md',
     ]) {
@@ -326,7 +329,7 @@ describe('native and legacy file links', () => {
       expect((await resolveAlice(ref)).status).toBe(404);
     }
 
-    // 4. Secret & credential files inside the user's own profile must never be exposed
+    // 4. Dotfiles, .gemini credentials/internals, and raw key/env files must never be exposed
     const secretPaths = [
       '.mock-agy-auth.json',
       '.env',
@@ -343,17 +346,10 @@ describe('native and legacy file links', () => {
       '.gemini/antigravity/mcp_config.json',
       '.gemini/antigravity/user_settings.pb',
       '.gemini/antigravity/code_tracker/trace.txt',
+      '.gemini/config/skills/theme-factory/.env',
       'notes/private.pem',
-      'notes/custom-token.json',
-      'notes/credentials',
-      'notes/key.json',
-      'notes/tokens.yaml',
-      'notes/config.toml',
+      'notes/server.key',
       'notes/production.env',
-      'notes/accessToken.json',
-      'notes/client_secret_12345.json',
-      'notes/credentials.csv',
-      '.gemini/config/skills/theme-factory/oauth_creds.md',
     ];
     for (const rel of secretPaths) {
       const full = path.join(aliceProfile, rel);

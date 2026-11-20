@@ -60,87 +60,7 @@ export function detectContentFileType(filename: string, declaredMime?: string | 
 
 type ResolvedChatFile = { absPath: string; relPath: string };
 
-const BLOCKED_PROFILE_DIRS = new Set([
-  '.chat-brains',
-  '.chat-homes',
-  '.chat-scratch',
-  '.chat-playground',
-  '.probe',
-  '.tmp',
-  '.config',
-  '.local',
-  '.cache',
-  '.ssh',
-  '.gnupg',
-  '.aws',
-  '.kube',
-  '.docker',
-  '.azure',
-  '.gcp',
-]);
-
-const BLOCKED_GEMINI_SUBDIRS = new Set([
-  'brain',
-  'scratch',
-  'playground',
-  'code_tracker',
-  'implicit',
-  'conversations',
-  'sessions',
-  'logs',
-  'cache',
-  'tmp',
-  'auth',
-  'credentials',
-  'tokens',
-]);
-
-const BLOCKED_SECRET_FILENAMES = new Set([
-  '.mock-agy-auth.json',
-  '.env',
-  '.netrc',
-  '.git-credentials',
-  '.gitcookies',
-  '.npmrc',
-  '.pypirc',
-  '.yarnrc',
-  '.yarnrc.yml',
-  '.bash_history',
-  '.zsh_history',
-  '.sh_history',
-  'oauth_creds.json',
-  'google_accounts.json',
-  'credentials',
-  'credentials.json',
-  'client_secret.json',
-  'client_secrets.json',
-  'service_account.json',
-  'service-account.json',
-  'application_default_credentials.json',
-  'installation_id',
-  'mcp_config.json',
-  'config.json',
-  'config.yaml',
-  'config.yml',
-  'config.toml',
-  'settings.json',
-  'settings.yaml',
-  'settings.yml',
-  'settings.toml',
-  'settings.ini',
-  'auth.json',
-  'token.json',
-  'tokens.json',
-  'id_rsa',
-  'id_ed25519',
-  'id_ecdsa',
-  'id_dsa',
-]);
-
-const SECRET_KEYWORD_RE =
-  /(?:oauth|cred|secret|token|apikey|api[_-]?key|private[_-]?key|passwd|password|(?:^|[._-])(?:auth|key|keys)(?:$|[._-]))/;
-
-const BLOCKED_SECRET_EXTENSIONS = new Set([
+const BLOCKED_KEY_OR_ENV_EXTENSIONS = new Set([
   '.env',
   '.pem',
   '.key',
@@ -149,48 +69,33 @@ const BLOCKED_SECRET_EXTENSIONS = new Set([
   '.jks',
   '.keystore',
   '.kdbx',
-  '.pb',
-  '.sqlite',
-  '.sqlite3',
-  '.db',
-  '.ldb',
 ]);
 
-function isBlockedProfileRelPath(relPath: string): boolean {
+const ALLOWED_GEMINI_USER_CONTENT_RE =
+  /^\.gemini\/(?:(?:config|antigravity|antigravity-cli)\/)?(?:(?:skills|skills-disabled|workflows|global_workflows|rules|agents|prompts)\/.+|GEMINI\.md)$/i;
+
+/**
+ * Structural profile-file boundary (no fragile filename-keyword blocklists):
+ * - Under `.gemini/`, allow only user-authored content roots (skills, workflows, rules, agents, prompts, GEMINI.md),
+ *   so Antigravity credentials and internal state (`oauth_creds.json`, `settings.json`, `mcp_config.json`, etc.) are denied by default.
+ * - Outside `.gemini/`, deny all hidden dotfiles/dotdirs (`.ssh`, `.aws`, `.config`, `.local`, `.env*`, `.chat-*`, `.mock-agy-auth.json`, etc.).
+ * - Always deny raw private-key / dotenv extensions (`.pem`, `.key`, `.p12`, `.env`, etc.).
+ */
+function isAllowedProfileRelPath(relPath: string): boolean {
   const segments = relPath.split('/').filter(Boolean);
-  if (segments.length === 0) return true;
-
-  for (const segment of segments) {
-    const lower = segment.toLowerCase();
-    if (BLOCKED_PROFILE_DIRS.has(lower) || lower.startsWith('.usage-home-')) {
-      return true;
-    }
-  }
-
-  const top = segments[0].toLowerCase();
-  if (top === '.gemini') {
-    const sub = segments[1]?.toLowerCase();
-    const vendorSub =
-      sub === 'antigravity-cli' || sub === 'antigravity' || sub === 'jetski'
-        ? segments[2]?.toLowerCase()
-        : sub;
-    if (vendorSub && BLOCKED_GEMINI_SUBDIRS.has(vendorSub)) {
-      return true;
-    }
-  }
+  if (segments.length === 0) return false;
 
   const basename = segments[segments.length - 1].toLowerCase();
-  const ext = path.extname(basename);
-  if (
-    BLOCKED_SECRET_FILENAMES.has(basename) ||
-    basename.startsWith('.env') ||
-    BLOCKED_SECRET_EXTENSIONS.has(ext) ||
-    SECRET_KEYWORD_RE.test(basename)
-  ) {
-    return true;
+  if (BLOCKED_KEY_OR_ENV_EXTENSIONS.has(path.extname(basename))) {
+    return false;
   }
 
-  return false;
+  if (segments[0].toLowerCase() === '.gemini') {
+    if (!ALLOWED_GEMINI_USER_CONTENT_RE.test(relPath)) return false;
+    return segments.slice(1).every((seg) => !seg.startsWith('.'));
+  }
+
+  return segments.every((seg) => !seg.startsWith('.'));
 }
 
 function workspaceRelativePath(candidate: string): string {
@@ -244,13 +149,13 @@ function resolveChatFile(db: AppDatabase, chat: ChatRecord, candidate: string): 
   if (chatHomeMatch) {
     if (chatHomeMatch[1] !== workspaceKey) return null;
     const subRelative = chatHomeMatch[2];
-    if (isBlockedProfileRelPath(subRelative)) return null;
+    if (!isAllowedProfileRelPath(subRelative)) return null;
     try {
       const homeReal = fs.realpathSync(home);
       const chatHomeReal = fs.realpathSync(chatHome);
       if (chatHomeReal !== path.join(homeReal, '.chat-homes', workspaceKey)) return null;
       const resolved = resolveContainedExistingPath(chatHomeReal, subRelative);
-      if (isBlockedProfileRelPath(resolved.relPath)) return null;
+      if (!isAllowedProfileRelPath(resolved.relPath)) return null;
       if (!fs.statSync(resolved.absPath).isFile()) return null;
       return {
         absPath: resolved.absPath,
@@ -261,12 +166,12 @@ function resolveChatFile(db: AppDatabase, chat: ChatRecord, candidate: string): 
     }
   }
 
-  if (isBlockedProfileRelPath(relative)) return null;
+  if (!isAllowedProfileRelPath(relative)) return null;
 
   const resolveFromHome = (): ResolvedChatFile | null => {
     try {
       const resolved = resolveContainedExistingPath(home, relative);
-      if (isBlockedProfileRelPath(resolved.relPath)) return null;
+      if (!isAllowedProfileRelPath(resolved.relPath)) return null;
       if (!fs.statSync(resolved.absPath).isFile()) return null;
       return { absPath: resolved.absPath, relPath: `${SANDBOX_HOME_MOUNT}/${resolved.relPath}` };
     } catch {
@@ -280,7 +185,7 @@ function resolveChatFile(db: AppDatabase, chat: ChatRecord, candidate: string): 
       const chatHomeReal = fs.realpathSync(chatHome);
       if (chatHomeReal !== path.join(homeReal, '.chat-homes', workspaceKey)) return null;
       const resolved = resolveContainedExistingPath(chatHomeReal, relative);
-      if (isBlockedProfileRelPath(resolved.relPath)) return null;
+      if (!isAllowedProfileRelPath(resolved.relPath)) return null;
       if (!fs.statSync(resolved.absPath).isFile()) return null;
       return {
         absPath: resolved.absPath,
@@ -301,7 +206,7 @@ function resolveChatFile(db: AppDatabase, chat: ChatRecord, candidate: string): 
 
       if (targetReal.startsWith(chatHomeReal + path.sep)) {
         const resolvedRelPath = path.relative(chatHomeReal, targetReal).split(path.sep).join('/');
-        if (!resolvedRelPath || isBlockedProfileRelPath(resolvedRelPath)) return null;
+        if (!resolvedRelPath || !isAllowedProfileRelPath(resolvedRelPath)) return null;
         return {
           absPath: targetReal,
           relPath: `${SANDBOX_HOME_MOUNT}/.chat-homes/${workspaceKey}/${resolvedRelPath}`,
@@ -309,7 +214,7 @@ function resolveChatFile(db: AppDatabase, chat: ChatRecord, candidate: string): 
       }
       if (targetReal.startsWith(homeReal + path.sep)) {
         const resolvedRelPath = path.relative(homeReal, targetReal).split(path.sep).join('/');
-        if (!resolvedRelPath || isBlockedProfileRelPath(resolvedRelPath)) return null;
+        if (!resolvedRelPath || !isAllowedProfileRelPath(resolvedRelPath)) return null;
         return { absPath: targetReal, relPath: `${SANDBOX_HOME_MOUNT}/${resolvedRelPath}` };
       }
       return null;
