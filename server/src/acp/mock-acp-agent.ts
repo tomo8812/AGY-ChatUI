@@ -134,6 +134,7 @@ interface SessionState {
   effortValue: string;
   mode: string;
   systemPromptText: string | null;
+  mcpServers: unknown[];
   history: string[];
   cancelled: boolean;
 }
@@ -294,6 +295,10 @@ function runAcpServer(): void {
         protocolVersion: Math.min(params.protocolVersion, PROTOCOL_VERSION),
         agentCapabilities: {
           loadSession: true,
+          mcpCapabilities: {
+            http: true,
+            sse: true,
+          },
           promptCapabilities: {
             image: true,
             audio: false,
@@ -341,6 +346,7 @@ function runAcpServer(): void {
         effortValue: 'medium',
         mode: 'default',
         systemPromptText: sysText,
+        mcpServers: Array.isArray(params.mcpServers) ? params.mcpServers : [],
         history: [],
         cancelled: false,
       };
@@ -372,10 +378,13 @@ function runAcpServer(): void {
           effortValue: 'medium',
           mode: 'default',
           systemPromptText: null,
+          mcpServers: Array.isArray(params.mcpServers) ? params.mcpServers : [],
           history: [],
           cancelled: false,
         };
         sessions.set(params.sessionId, state);
+      } else {
+        state.mcpServers = Array.isArray(params.mcpServers) ? params.mcpServers : [];
       }
       await client.notify(methods.client.session.update, {
         sessionId: state.id,
@@ -402,10 +411,13 @@ function runAcpServer(): void {
           effortValue: 'medium',
           mode: 'default',
           systemPromptText: null,
+          mcpServers: Array.isArray(params.mcpServers) ? params.mcpServers : [],
           history: [],
           cancelled: false,
         };
         sessions.set(params.sessionId, state);
+      } else {
+        state.mcpServers = Array.isArray(params.mcpServers) ? params.mcpServers : [];
       }
       await client.notify(methods.client.session.update, {
         sessionId: state.id,
@@ -505,6 +517,20 @@ function runAcpServer(): void {
 
       if (state.cancelled) {
         return { stopReason: 'cancelled' as const };
+      }
+
+      if (promptText.includes('[MCP_INSPECT]')) {
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: `MCP_SERVERS:${JSON.stringify(state.mcpServers)}`,
+            },
+          },
+        });
+        return { stopReason: 'end_turn' as const };
       }
 
       // Simulate out-of-workspace permission request (must be auto-rejected by client without prompting user)

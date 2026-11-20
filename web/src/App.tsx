@@ -13,6 +13,7 @@ import { ProjectModal } from './components/ProjectModal';
 import { SettingsModal } from './components/SettingsModal';
 import { Sidebar } from './components/Sidebar';
 import { SkillsModal } from './components/SkillsModal';
+import { McpModal } from './components/McpModal';
 import { triggerHaptic, VIBRATION_PATTERNS } from './utils/haptics';
 import {
   ensurePushSubscribed,
@@ -162,6 +163,7 @@ export const App: React.FC = () => {
   const [sidebarMobileOpen, setSidebarMobileOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [skillsOpen, setSkillsOpen] = useState(false);
+  const [mcpOpen, setMcpOpen] = useState(false);
   const [skillsState, setSkillsState] = useState<SkillsListResponse | null>(null);
   const [externalDraftCommand, setExternalDraftCommand] = useState<{ slug: string; token: number } | null>(
     null
@@ -1781,6 +1783,7 @@ export const App: React.FC = () => {
   const handleOpenSidebar = useCallback(() => setSidebarMobileOpen(true), []);
   const handleOpenProjectModal = useCallback((proj: ProjectRecord | null) => setProjectModalTarget(proj), []);
   const handleOpenSkills = useCallback(() => setSkillsOpen(true), []);
+  const handleOpenMcp = useCallback(() => setMcpOpen(true), []);
   const handleOpenSettings = useCallback(() => setSettingsOpen(true), []);
   const handleRefreshQuota = useCallback(() => {
     void triggerQuotaRefresh(false);
@@ -1894,6 +1897,7 @@ export const App: React.FC = () => {
         onDeleteChat={handleDeleteChat}
         onOpenProjectModal={handleOpenProjectModal}
         onOpenSkills={handleOpenSkills}
+        onOpenMcp={user.role === 'admin' ? handleOpenMcp : undefined}
         onOpenSettings={handleOpenSettings}
       />
 
@@ -1972,7 +1976,12 @@ export const App: React.FC = () => {
             if (nextFlow !== undefined) setLoginFlow(nextFlow);
           }}
           onLogout={(all) => void handleLogout(all)}
+          onOpenMcp={user.role === 'admin' ? handleOpenMcp : undefined}
         />
+      )}
+
+      {mcpOpen && user.role === 'admin' && (
+        <McpModal onClose={() => setMcpOpen(false)} />
       )}
 
       {skillsOpen && (

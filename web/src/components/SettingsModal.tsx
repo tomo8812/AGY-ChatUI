@@ -56,6 +56,7 @@ interface SettingsModalProps {
   onUpdatePreferences: (prefs: UserPreferences) => void;
   onUpdateAgy: (payload: { profile: AgyProfile; loginFlow?: AgyLoginFlowState | null }) => void;
   onLogout: (allDevices: boolean) => void;
+  onOpenMcp?: () => void;
 }
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
@@ -70,6 +71,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onUpdatePreferences,
   onUpdateAgy,
   onLogout,
+  onOpenMcp,
 }) => {
   const [showReauth, setShowReauth] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -593,33 +595,54 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           )}
 
           {user.role === 'admin' && (
-            <details className="settings-section">
-              <summary>ユーザー追加（管理者機能）</summary>
-              <form onSubmit={handleAdminCreateUser} className="inline-admin-form">
-                <input
-                  type="text"
-                  value={newUsername}
-                  onChange={(e) => setNewUsername(e.target.value)}
-                  aria-label="新規ユーザー名"
-                  placeholder="新規ユーザー名"
-                  minLength={2}
-                  required
-                />
-                <input
-                  type="password"
-                  value={newPassword}
-                  onChange={(e) => setNewPassword(e.target.value)}
-                  aria-label="新規ユーザーのパスワード"
-                  placeholder="パスワード (6文字+)"
-                  minLength={6}
-                  required
-                />
-                <button type="submit" className="btn btn-secondary btn-sm" disabled={busy}>
-                  追加
-                </button>
-              </form>
-              {adminMsg && <div className="success-box">{adminMsg}</div>}
-            </details>
+            <>
+              {onOpenMcp && (
+                <section className="settings-section">
+                  <h4>MCP サーバー管理（管理者機能）</h4>
+                  <p className="muted-xs" style={{ marginBottom: 10 }}>
+                    全プロファイル共有または管理者プロファイル専用のMCPサーバー（リモート OAuth / APIキー / Bearer / カスタムヘッダー、ローカル stdio）を追加・管理します。
+                  </p>
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    onClick={() => {
+                      onClose();
+                      onOpenMcp();
+                    }}
+                  >
+                    MCP サーバー管理を開く
+                  </button>
+                </section>
+              )}
+
+              <details className="settings-section">
+                <summary>ユーザー追加（管理者機能）</summary>
+                <form onSubmit={handleAdminCreateUser} className="inline-admin-form">
+                  <input
+                    type="text"
+                    value={newUsername}
+                    onChange={(e) => setNewUsername(e.target.value)}
+                    aria-label="新規ユーザー名"
+                    placeholder="新規ユーザー名"
+                    minLength={2}
+                    required
+                  />
+                  <input
+                    type="password"
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                    aria-label="新規ユーザーのパスワード"
+                    placeholder="パスワード (6文字+)"
+                    minLength={6}
+                    required
+                  />
+                  <button type="submit" className="btn btn-secondary btn-sm" disabled={busy}>
+                    追加
+                  </button>
+                </form>
+                {adminMsg && <div className="success-box">{adminMsg}</div>}
+              </details>
+            </>
           )}
 
           <details className="settings-section">
