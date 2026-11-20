@@ -108,7 +108,11 @@ interface DiscoveredOAuthMetadata {
   registrationUrl: string | null;
   scopes: string[];
   resource: string | null;
+  clientIdMetadataDocumentSupported?: boolean;
 }
+
+export const ANTIGRAVITY_CIMD_CLIENT_ID = 'https://antigravity.google/oauth/client-metadata.json';
+export const ANTIGRAVITY_CIMD_REDIRECT_URI = 'https://antigravity.google/oauth-callback';
 
 interface PendingOAuthFlow {
   state: string;
@@ -127,6 +131,7 @@ interface PendingOAuthFlow {
 const OAUTH_FLOW_TTL_MS = 10 * 60 * 1000;
 const OAUTH_REFRESH_SKEW_MS = 60 * 1000;
 const DISCOVERY_TIMEOUT_MS = 10_000;
+const MAX_OUTBOUND_REDIRECTS = 5;
 
 export function validateMcpName(raw: string): string {
   const name = raw.trim();
@@ -246,11 +251,17 @@ function tryValidateRemoteUrl(
   }
 }
 
+interface PinnedAddressEntry {
+  address: string;
+  family: 4 | 6;
+}
+
 interface PinnedOutboundTarget {
   url: string;
   parsed: URL;
   pinnedAddress: string | null;
   pinnedFamily: 4 | 6 | null;
+  pinnedAddresses?: PinnedAddressEntry[];
 }
 
 async function resolvePinnedOutboundTarget(
@@ -263,11 +274,13 @@ async function resolvePinnedOutboundTarget(
   const literalFamily = net.isIP(host);
 
   if (opts.allowPrivate) {
+    const fam = literalFamily === 4 || literalFamily === 6 ? literalFamily : null;
     return {
       url: normalized,
       parsed,
       pinnedAddress: literalFamily !== 0 ? host : null,
-      pinnedFamily: literalFamily === 4 || literalFamily === 6 ? literalFamily : null,
+      pinnedFamily: fam,
+      pinnedAddresses: literalFamily !== 0 && fam ? [{ address: host, family: fam }] : undefined,
     };
   }
 
@@ -278,11 +291,13 @@ async function resolvePinnedOutboundTarget(
         'ループバック・プライベート・リンクローカルアドレスへの接続は許可されていません。'
       );
     }
+    const fam = literalFamily === 6 ? 6 : 4;
     return {
       url: normalized,
       parsed,
       pinnedAddress: host,
-      pinnedFamily: literalFamily === 4 || literalFamily === 6 ? literalFamily : null,
+      pinnedFamily: fam,
+      pinnedAddresses: [{ address: host, family: fam }],
     };
   }
 
@@ -298,12 +313,22 @@ async function resolvePinnedOutboundTarget(
       'ループバック・プライベート・リンクローカルアドレスへの接続は許可されていません。'
     );
   }
-  const primary = resolved[0];
+  // Prefer IPv4 first so IPv4-only Linux hosts don't fail when AAAA records are returned first
+  const ordered: PinnedAddressEntry[] = [
+    ...resolved
+      .filter((r) => r.family !== 6)
+      .map((r) => ({ address: r.address, family: 4 as const })),
+    ...resolved
+      .filter((r) => r.family === 6)
+      .map((r) => ({ address: r.address, family: 6 as const })),
+  ];
+  const primary = ordered[0];
   return {
     url: normalized,
     parsed,
     pinnedAddress: primary.address,
-    pinnedFamily: primary.family === 6 ? 6 : 4,
+    pinnedFamily: primary.family,
+    pinnedAddresses: ordered,
   };
 }
 
@@ -358,8 +383,18 @@ function extractResourceMetadataUrlFromWwwAuthenticate(headerVal: string | null)
   if (!headerVal) return null;
   const match = /resource_metadata\s*=\s*"([^"]+)"/i.exec(headerVal);
   if (match && match[1]) return match[1].trim();
-  const unquoted = /resource_metadata\s*=\s*([^\s,]+)/i.exec(headerVal);
+  const unquoted = /resource_metadata\s*=\s*([^\s,;]+)/i.exec(headerVal);
   return unquoted?.[1]?.trim() ?? null;
+}
+
+function extractScopesFromWwwAuthenticate(headerVal: string | null): string[] {
+  if (!headerVal) return [];
+  const match = /\bscope\s*=\s*"([^"]+)"/i.exec(headerVal);
+  const raw = match?.[1] ?? /\bscope\s*=\s*([^\s,;]+)/i.exec(headerVal)?.[1] ?? '';
+  return raw
+    .split(/\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 const MAX_OUTBOUND_RESPONSE_BYTES = 2 * 1024 * 1024;
@@ -383,133 +418,20 @@ function normalizeRequestHeaders(headers: RequestInit['headers']): Record<string
   return out;
 }
 
-async function fetchJsonWithTimeout(
-  url: string,
-  init: RequestInit = {},
-  opts: { timeoutMs?: number; allowPrivate?: boolean; headersOnly?: boolean } = {}
-): Promise<{ status: number; headers: Headers; json: Record<string, unknown> | null; text: string }> {
-  const target = await resolvePinnedOutboundTarget(url, { allowPrivate: opts.allowPrivate });
-  const timeoutMs = opts.timeoutMs ?? DISCOVERY_TIMEOUT_MS;
-  const method = (init.method ?? 'GET').toUpperCase();
-  const reqHeaders = normalizeRequestHeaders(init.headers);
-  const bodyBuf =
-    typeof init.body === 'string'
-      ? Buffer.from(init.body, 'utf8')
-      : init.body instanceof Uint8Array
-        ? Buffer.from(init.body)
-        : null;
-
-  if (bodyBuf && !Object.keys(reqHeaders).some((k) => k.toLowerCase() === 'content-length')) {
-    reqHeaders['Content-Length'] = String(bodyBuf.byteLength);
-  }
-
-  const pinnedLookup = target.pinnedAddress
-    ? ((
-        _hostname: string,
-        options: unknown,
-        callback: (err: NodeJS.ErrnoException | null, address: unknown, family?: number) => void
-      ) => {
-        const fam = target.pinnedFamily ?? (net.isIP(target.pinnedAddress!) === 6 ? 6 : 4);
-        const allRequested =
-          typeof options === 'object' && options !== null && Boolean((options as { all?: boolean }).all);
-        if (allRequested) {
-          callback(null, [{ address: target.pinnedAddress!, family: fam }]);
-        } else {
-          callback(null, target.pinnedAddress!, fam);
-        }
-      })
-    : undefined;
-
-  return new Promise((resolve, reject) => {
-    const isHttps = target.parsed.protocol === 'https:';
-    const requestFn = isHttps ? https.request : http.request;
-    const reqOptions: https.RequestOptions = {
-      protocol: target.parsed.protocol,
-      hostname: target.parsed.hostname,
-      port: target.parsed.port ? Number(target.parsed.port) : isHttps ? 443 : 80,
-      path: `${target.parsed.pathname}${target.parsed.search}`,
-      method,
-      headers: reqHeaders,
-      ...(isHttps ? { servername: target.parsed.hostname } : {}),
-      ...(pinnedLookup ? { lookup: pinnedLookup as never } : {}),
-    };
-
-    let settled = false;
-    const finish = (err: Error | null, value?: { status: number; headers: Headers; json: Record<string, unknown> | null; text: string }) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (err) reject(err);
-      else resolve(value!);
-    };
-
-    const req = requestFn(reqOptions, (res) => {
-      const status = res.statusCode ?? 0;
-      if (status >= 300 && status < 400 && res.headers.location) {
-        res.resume();
-        finish(new McpValidationError('REDIRECT_BLOCKED', 'リモートMCPからのリダイレクトは許可されていません。'));
-        return;
-      }
-
-      const headers = new Headers();
-      for (const [k, v] of Object.entries(res.headers)) {
-        if (Array.isArray(v)) {
-          for (const item of v) headers.append(k, item);
-        } else if (typeof v === 'string') {
-          headers.set(k, v);
-        }
-      }
-
-      if (opts.headersOnly) {
-        finish(null, { status, headers, json: null, text: '' });
-        res.destroy();
-        req.destroy();
-        return;
-      }
-
-      const chunks: Buffer[] = [];
-      let totalBytes = 0;
-      res.on('data', (chunk: Buffer) => {
-        totalBytes += chunk.byteLength;
-        if (totalBytes > MAX_OUTBOUND_RESPONSE_BYTES) {
-          res.destroy();
-          finish(new Error('Response body exceeded maximum allowed size'));
-          return;
-        }
-        chunks.push(chunk);
-      });
-      res.on('end', () => {
-        const text = Buffer.concat(chunks).toString('utf8');
-        let json: Record<string, unknown> | null = null;
-        try {
-          const parsed = JSON.parse(text);
-          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-            json = parsed as Record<string, unknown>;
-          }
-        } catch {
-          // non-JSON response
-        }
-        finish(null, { status, headers, json, text });
-      });
-      res.on('error', (err) => finish(err));
-    });
-
-    const timer = setTimeout(() => {
-      req.destroy(new Error(`Request timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-
-    req.on('error', (err) => finish(err));
-    if (bodyBuf) {
-      req.write(bodyBuf);
-    }
-    req.end();
-  });
-}
-
 function createPinnedLookup(target: PinnedOutboundTarget) {
-  if (!target.pinnedAddress) return undefined;
-  const pinnedIp = target.pinnedAddress;
-  const pinnedFam = target.pinnedFamily ?? (net.isIP(pinnedIp) === 6 ? 6 : 4);
+  const list =
+    target.pinnedAddresses && target.pinnedAddresses.length > 0
+      ? target.pinnedAddresses
+      : target.pinnedAddress
+        ? [
+            {
+              address: target.pinnedAddress,
+              family: (target.pinnedFamily ?? (net.isIP(target.pinnedAddress) === 6 ? 6 : 4)) as 4 | 6,
+            },
+          ]
+        : null;
+  if (!list || list.length === 0) return undefined;
+  const primary = list[0];
   return (
     _hostname: string,
     options: unknown,
@@ -518,11 +440,196 @@ function createPinnedLookup(target: PinnedOutboundTarget) {
     const allRequested =
       typeof options === 'object' && options !== null && Boolean((options as { all?: boolean }).all);
     if (allRequested) {
-      callback(null, [{ address: pinnedIp, family: pinnedFam }]);
+      callback(null, list);
     } else {
-      callback(null, pinnedIp, pinnedFam);
+      callback(null, primary.address, primary.family);
     }
   };
+}
+
+async function fetchJsonWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  opts: { timeoutMs?: number; allowPrivate?: boolean; headersOnly?: boolean; maxRedirects?: number } = {}
+): Promise<{ status: number; headers: Headers; json: Record<string, unknown> | null; text: string }> {
+  const maxRedirects = opts.maxRedirects ?? MAX_OUTBOUND_REDIRECTS;
+  let currentUrl = url;
+  let currentMethod = (init.method ?? 'GET').toUpperCase();
+  let currentHeaders = normalizeRequestHeaders(init.headers);
+  let currentBodyBuf =
+    typeof init.body === 'string'
+      ? Buffer.from(init.body, 'utf8')
+      : init.body instanceof Uint8Array
+        ? Buffer.from(init.body)
+        : null;
+
+  for (let hop = 0; hop <= maxRedirects; hop += 1) {
+    const target = await resolvePinnedOutboundTarget(currentUrl, { allowPrivate: opts.allowPrivate });
+    const timeoutMs = opts.timeoutMs ?? DISCOVERY_TIMEOUT_MS;
+    const reqHeaders = { ...currentHeaders };
+
+    if (currentBodyBuf && !Object.keys(reqHeaders).some((k) => k.toLowerCase() === 'content-length')) {
+      reqHeaders['Content-Length'] = String(currentBodyBuf.byteLength);
+    }
+
+    const pinnedLookup = createPinnedLookup(target);
+    const bodyForHop = currentBodyBuf;
+    const methodForHop = currentMethod;
+
+    const hopResult = await new Promise<{
+      redirectLocation?: string;
+      status: number;
+      headers: Headers;
+      json: Record<string, unknown> | null;
+      text: string;
+    }>((resolve, reject) => {
+      const isHttps = target.parsed.protocol === 'https:';
+      const requestFn = isHttps ? https.request : http.request;
+      const reqOptions: https.RequestOptions = {
+        protocol: target.parsed.protocol,
+        hostname: target.parsed.hostname,
+        port: target.parsed.port ? Number(target.parsed.port) : isHttps ? 443 : 80,
+        path: `${target.parsed.pathname}${target.parsed.search}`,
+        method: methodForHop,
+        headers: reqHeaders,
+        ...(isHttps ? { servername: target.parsed.hostname } : {}),
+        ...(pinnedLookup ? { lookup: pinnedLookup as never } : {}),
+      };
+
+      let settled = false;
+      const finish = (
+        err: Error | null,
+        value?: {
+          redirectLocation?: string;
+          status: number;
+          headers: Headers;
+          json: Record<string, unknown> | null;
+          text: string;
+        }
+      ) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (err) reject(err);
+        else resolve(value!);
+      };
+
+      const req = requestFn(reqOptions, (res) => {
+        const status = res.statusCode ?? 0;
+        const headers = new Headers();
+        for (const [k, v] of Object.entries(res.headers)) {
+          if (Array.isArray(v)) {
+            for (const item of v) headers.append(k, item);
+          } else if (typeof v === 'string') {
+            headers.set(k, v);
+          }
+        }
+
+        if (status >= 300 && status < 400 && res.headers.location) {
+          const location = Array.isArray(res.headers.location)
+            ? res.headers.location[0]
+            : res.headers.location;
+          res.resume();
+          finish(null, { redirectLocation: location, status, headers, json: null, text: '' });
+          return;
+        }
+
+        if (opts.headersOnly) {
+          finish(null, { status, headers, json: null, text: '' });
+          res.destroy();
+          req.destroy();
+          return;
+        }
+
+        const chunks: Buffer[] = [];
+        let totalBytes = 0;
+        res.on('data', (chunk: Buffer) => {
+          totalBytes += chunk.byteLength;
+          if (totalBytes > MAX_OUTBOUND_RESPONSE_BYTES) {
+            res.destroy();
+            finish(new Error('Response body exceeded maximum allowed size'));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          let json: Record<string, unknown> | null = null;
+          try {
+            const parsed = JSON.parse(text);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              json = parsed as Record<string, unknown>;
+            }
+          } catch {
+            // non-JSON response
+          }
+          finish(null, { status, headers, json, text });
+        });
+        res.on('error', (err) => finish(err));
+      });
+
+      const timer = setTimeout(() => {
+        req.destroy(new Error(`Request timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      req.on('error', (err) => finish(err));
+      if (bodyForHop) {
+        req.write(bodyForHop);
+      }
+      req.end();
+    });
+
+    if (hopResult.redirectLocation) {
+      if (hop >= maxRedirects) {
+        throw new McpValidationError('REDIRECT_LIMIT_EXCEEDED', 'リモートMCPからのリダイレクト回数が上限を超えました。');
+      }
+      let resolvedNextUrl: string;
+      try {
+        resolvedNextUrl = new URL(hopResult.redirectLocation, target.url).toString();
+      } catch {
+        throw new McpValidationError('INVALID_URL', 'リダイレクト先URLの形式が正しくありません。');
+      }
+      // Validate next URL immediately so SSRF to private/loopback via redirect is blocked
+      const nextTarget = await resolvePinnedOutboundTarget(resolvedNextUrl, {
+        allowPrivate: opts.allowPrivate,
+      });
+      if (nextTarget.parsed.origin !== target.parsed.origin) {
+        const stripped: Record<string, string> = {};
+        for (const [k, v] of Object.entries(currentHeaders)) {
+          const low = k.toLowerCase();
+          if (low === 'authorization' || low === 'cookie' || low === 'x-api-key') continue;
+          stripped[k] = v;
+        }
+        currentHeaders = stripped;
+      }
+      if (
+        (hopResult.status === 301 || hopResult.status === 302 || hopResult.status === 303) &&
+        currentMethod !== 'GET' &&
+        currentMethod !== 'HEAD'
+      ) {
+        currentMethod = 'GET';
+        currentBodyBuf = null;
+        const stripped: Record<string, string> = {};
+        for (const [k, v] of Object.entries(currentHeaders)) {
+          const low = k.toLowerCase();
+          if (low === 'content-type' || low === 'content-length' || low === 'transfer-encoding') continue;
+          stripped[k] = v;
+        }
+        currentHeaders = stripped;
+      }
+      currentUrl = nextTarget.url;
+      continue;
+    }
+
+    return {
+      status: hopResult.status,
+      headers: hopResult.headers,
+      json: hopResult.json,
+      text: hopResult.text,
+    };
+  }
+
+  throw new McpValidationError('REDIRECT_LIMIT_EXCEEDED', 'リモートMCPからのリダイレクト回数が上限を超えました。');
 }
 
 interface ForwardedMcpTarget extends PinnedOutboundTarget {
@@ -1595,8 +1702,51 @@ export class McpService {
     const pathSuffix = parsedUrl.pathname === '/' ? '' : parsedUrl.pathname.replace(/\/+$/, '');
 
     let resourceMetadataUrl: string | null = null;
+    let authorizationUrl: string | null = null;
+    let tokenUrl: string | null = null;
+    let registrationUrl: string | null = null;
+    let clientIdMetadataDocumentSupported = false;
+    let scopes: string[] = [];
+    let resource: string | null = safeMcpUrl;
+    const authServerIssuers: string[] = [];
 
-    // 1) Probe MCP URL for WWW-Authenticate resource_metadata header (RFC 9728)
+    const addUniqueCandidate = (list: string[], rawCandidate: string | null | undefined) => {
+      const valid = tryValidateRemoteUrl(rawCandidate, urlOpts);
+      if (valid && !list.includes(valid)) {
+        list.push(valid);
+      }
+    };
+
+    const inspectMetadataJson = (json: Record<string, unknown> | null) => {
+      if (!json) return;
+      const servers = json.authorization_servers;
+      if (Array.isArray(servers)) {
+        for (const s of servers) {
+          if (typeof s === 'string') addUniqueCandidate(authServerIssuers, s);
+        }
+      }
+      if (typeof json.authorization_endpoint === 'string' && !authorizationUrl) {
+        authorizationUrl = tryValidateRemoteUrl(json.authorization_endpoint, urlOpts);
+      }
+      if (typeof json.token_endpoint === 'string' && !tokenUrl) {
+        tokenUrl = tryValidateRemoteUrl(json.token_endpoint, urlOpts);
+      }
+      if (typeof json.registration_endpoint === 'string' && !registrationUrl) {
+        registrationUrl = tryValidateRemoteUrl(json.registration_endpoint, urlOpts);
+      }
+      if (json.client_id_metadata_document_supported === true) {
+        clientIdMetadataDocumentSupported = true;
+      }
+      if (scopes.length === 0 && Array.isArray(json.scopes_supported)) {
+        scopes = json.scopes_supported.filter((s): s is string => typeof s === 'string');
+      }
+      if (typeof json.resource === 'string') {
+        const validResource = tryValidateRemoteUrl(json.resource, urlOpts);
+        if (validResource) resource = validResource;
+      }
+    };
+
+    // 1) Probe MCP URL for WWW-Authenticate resource_metadata / scope header (RFC 9728)
     try {
       const probe = await fetchJsonWithTimeout(
         safeMcpUrl,
@@ -1619,32 +1769,55 @@ export class McpService {
         },
         urlOpts
       );
-      if (probe.status === 401) {
-        resourceMetadataUrl = extractResourceMetadataUrlFromWwwAuthenticate(
-          probe.headers.get('www-authenticate')
-        );
+      if (probe.status === 401 || probe.status === 403) {
+        const wwwAuth = probe.headers.get('www-authenticate');
+        resourceMetadataUrl = extractResourceMetadataUrlFromWwwAuthenticate(wwwAuth);
+        const headerScopes = extractScopesFromWwwAuthenticate(wwwAuth);
+        if (headerScopes.length > 0 && scopes.length === 0) {
+          scopes = headerScopes;
+        }
+        inspectMetadataJson(probe.json);
       }
     } catch {
-      // Fall through to well-known probes
+      // Fall through to GET probe and well-known probes
+    }
+
+    if (!resourceMetadataUrl && (!authorizationUrl || !tokenUrl)) {
+      try {
+        const getProbe = await fetchJsonWithTimeout(
+          safeMcpUrl,
+          {
+            method: 'GET',
+            headers: { Accept: 'application/json, text/event-stream' },
+          },
+          { ...urlOpts, headersOnly: true }
+        );
+        if (getProbe.status === 401 || getProbe.status === 403) {
+          const wwwAuth = getProbe.headers.get('www-authenticate');
+          resourceMetadataUrl = extractResourceMetadataUrlFromWwwAuthenticate(wwwAuth);
+          const headerScopes = extractScopesFromWwwAuthenticate(wwwAuth);
+          if (headerScopes.length > 0 && scopes.length === 0) {
+            scopes = headerScopes;
+          }
+        }
+      } catch {
+        // ignore
+      }
     }
 
     const prmCandidates: string[] = [];
     if (resourceMetadataUrl) {
       try {
-        const resolved = tryValidateRemoteUrl(new URL(resourceMetadataUrl, safeMcpUrl).toString(), urlOpts);
-        if (resolved) prmCandidates.push(resolved);
+        addUniqueCandidate(prmCandidates, new URL(resourceMetadataUrl, safeMcpUrl).toString());
       } catch {
         // ignore invalid URL
       }
     }
     if (pathSuffix) {
-      prmCandidates.push(`${origin}/.well-known/oauth-protected-resource${pathSuffix}`);
+      addUniqueCandidate(prmCandidates, `${origin}/.well-known/oauth-protected-resource${pathSuffix}`);
+      addUniqueCandidate(prmCandidates, `${origin}${pathSuffix}/.well-known/oauth-protected-resource`);
     }
-    prmCandidates.push(`${origin}/.well-known/oauth-protected-resource`);
-
-    let authServerIssuer: string | null = null;
-    let scopes: string[] = [];
-    let resource: string | null = safeMcpUrl;
+    addUniqueCandidate(prmCandidates, `${origin}/.well-known/oauth-protected-resource`);
 
     for (const candidate of prmCandidates) {
       try {
@@ -1654,46 +1827,37 @@ export class McpService {
           urlOpts
         );
         if (res.status >= 200 && res.status < 300 && res.json) {
-          const servers = res.json.authorization_servers;
-          if (Array.isArray(servers) && typeof servers[0] === 'string') {
-            const validIssuer = tryValidateRemoteUrl(servers[0], urlOpts);
-            if (validIssuer) authServerIssuer = validIssuer;
-          }
-          if (Array.isArray(res.json.scopes_supported)) {
-            scopes = res.json.scopes_supported.filter((s): s is string => typeof s === 'string');
-          }
-          if (typeof res.json.resource === 'string') {
-            const validResource = tryValidateRemoteUrl(res.json.resource, urlOpts);
-            if (validResource) resource = validResource;
-          }
-          if (authServerIssuer) break;
+          inspectMetadataJson(res.json);
+          if (authServerIssuers.length > 0 || (authorizationUrl && tokenUrl)) break;
         }
       } catch {
         // try next candidate
       }
     }
 
-    const issuerBase = (authServerIssuer ?? origin).replace(/\/+$/, '');
-    const issuerUrl = new URL(issuerBase);
-    const issuerPath = issuerUrl.pathname === '/' ? '' : issuerUrl.pathname.replace(/\/+$/, '');
-    const asCandidates = [
-      ...(issuerPath
-        ? [
-            `${issuerUrl.origin}/.well-known/oauth-authorization-server${issuerPath}`,
-            `${issuerUrl.origin}/.well-known/openid-configuration${issuerPath}`,
-            `${issuerBase}/.well-known/openid-configuration`,
-          ]
-        : [
-            `${issuerUrl.origin}/.well-known/oauth-authorization-server`,
-            `${issuerUrl.origin}/.well-known/openid-configuration`,
-          ]),
-    ];
+    const issuerBases: string[] = [...authServerIssuers];
+    if (pathSuffix) {
+      addUniqueCandidate(issuerBases, `${origin}${pathSuffix}`);
+    }
+    addUniqueCandidate(issuerBases, origin);
 
-    let authorizationUrl: string | null = null;
-    let tokenUrl: string | null = null;
-    let registrationUrl: string | null = null;
+    const asCandidates: string[] = [];
+    for (const rawIssuer of issuerBases) {
+      const issuerBase = rawIssuer.replace(/\/+$/, '');
+      const issuerUrl = new URL(issuerBase);
+      const issuerPath = issuerUrl.pathname === '/' ? '' : issuerUrl.pathname.replace(/\/+$/, '');
+      if (issuerPath) {
+        addUniqueCandidate(asCandidates, `${issuerUrl.origin}/.well-known/oauth-authorization-server${issuerPath}`);
+        addUniqueCandidate(asCandidates, `${issuerBase}/.well-known/oauth-authorization-server`);
+        addUniqueCandidate(asCandidates, `${issuerUrl.origin}/.well-known/openid-configuration${issuerPath}`);
+        addUniqueCandidate(asCandidates, `${issuerBase}/.well-known/openid-configuration`);
+      }
+      addUniqueCandidate(asCandidates, `${issuerUrl.origin}/.well-known/oauth-authorization-server`);
+      addUniqueCandidate(asCandidates, `${issuerUrl.origin}/.well-known/openid-configuration`);
+    }
 
     for (const candidate of asCandidates) {
+      if (authorizationUrl && tokenUrl) break;
       try {
         const res = await fetchJsonWithTimeout(
           candidate,
@@ -1701,18 +1865,7 @@ export class McpService {
           urlOpts
         );
         if (res.status >= 200 && res.status < 300 && res.json) {
-          if (typeof res.json.authorization_endpoint === 'string') {
-            authorizationUrl = tryValidateRemoteUrl(res.json.authorization_endpoint, urlOpts);
-          }
-          if (typeof res.json.token_endpoint === 'string') {
-            tokenUrl = tryValidateRemoteUrl(res.json.token_endpoint, urlOpts);
-          }
-          if (typeof res.json.registration_endpoint === 'string') {
-            registrationUrl = tryValidateRemoteUrl(res.json.registration_endpoint, urlOpts);
-          }
-          if (scopes.length === 0 && Array.isArray(res.json.scopes_supported)) {
-            scopes = res.json.scopes_supported.filter((s): s is string => typeof s === 'string');
-          }
+          inspectMetadataJson(res.json);
           if (authorizationUrl && tokenUrl) break;
         }
       } catch {
@@ -1726,6 +1879,7 @@ export class McpService {
       registrationUrl,
       scopes,
       resource,
+      clientIdMetadataDocumentSupported,
     };
   }
 
@@ -1738,11 +1892,19 @@ export class McpService {
     }
   }
 
+  resolvePendingOAuthFlowAdminId(state: string | undefined | null): string | null {
+    this.pruneExpiredOAuthFlows();
+    const trimmed = state?.trim() ?? '';
+    if (!trimmed) return null;
+    const flow = this.pendingOAuthFlows.get(trimmed);
+    return flow ? flow.adminUserId : null;
+  }
+
   async startOAuthFlow(
     adminUserId: string,
     serverId: string,
     origin: string
-  ): Promise<{ authorizationUrl: string; redirectUri: string; state: string }> {
+  ): Promise<{ authorizationUrl: string; redirectUri: string; state: string; mode: 'callback' | 'code_paste' }> {
     this.pruneExpiredOAuthFlows();
     const row = this.db.getMcpServerById(serverId);
     if (!row) {
@@ -1757,7 +1919,7 @@ export class McpService {
     }
 
     const urlOpts = { allowPrivate: this.config.allowPrivateMcpUrls };
-    const redirectUri = `${origin.replace(/\/+$/, '')}/api/mcp/oauth/callback`;
+    const defaultRedirectUri = `${origin.replace(/\/+$/, '')}/api/mcp/oauth/callback`;
     const existingCfg = parseJsonObject<McpOAuthConfig>(row.oauthConfigJson) ?? {};
     let authorizationUrl = existingCfg.authorizationUrl ?? null;
     let tokenUrl = existingCfg.tokenUrl ?? null;
@@ -1766,12 +1928,14 @@ export class McpService {
     let resource = existingCfg.resource ?? row.url;
     let clientId = existingCfg.clientId ?? null;
     let clientSecret = this.decryptClientSecret(row.encryptedOauthClientSecret);
+    let cimdSupported = false;
 
     if (!authorizationUrl || !tokenUrl || (!clientId && !registrationUrl)) {
       const discovered = await this.discoverOAuthMetadata(row.url);
       authorizationUrl = authorizationUrl || discovered.authorizationUrl;
       tokenUrl = tokenUrl || discovered.tokenUrl;
       registrationUrl = registrationUrl || discovered.registrationUrl;
+      cimdSupported = Boolean(discovered.clientIdMetadataDocumentSupported);
       if (!scopes && discovered.scopes.length > 0) {
         scopes = discovered.scopes.join(' ');
       }
@@ -1793,33 +1957,56 @@ export class McpService {
       registrationUrl = validateRemoteUrl(registrationUrl, 'Registration URL', urlOpts);
     }
 
+    let redirectUri =
+      clientId === ANTIGRAVITY_CIMD_CLIENT_ID ? ANTIGRAVITY_CIMD_REDIRECT_URI : defaultRedirectUri;
+
     // Dynamic Client Registration (RFC 7591) when clientId is not configured
     if (!clientId && registrationUrl) {
-      const dcrRes = await fetchJsonWithTimeout(
-        registrationUrl,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-          body: JSON.stringify({
-            client_name: 'AGY-ChatUI',
-            redirect_uris: [redirectUri],
-            grant_types: ['authorization_code', 'refresh_token'],
-            response_types: ['code'],
-            token_endpoint_auth_method: 'none',
-          }),
-        },
-        urlOpts
-      );
-      if (dcrRes.status < 200 || dcrRes.status >= 300 || !dcrRes.json || typeof dcrRes.json.client_id !== 'string') {
-        throw new McpValidationError(
-          'OAUTH_DCR_FAILED',
-          `動的クライアント登録（DCR）に失敗しました (HTTP ${dcrRes.status})。詳細設定で Client ID を手動入力してください。`
+      try {
+        const dcrRes = await fetchJsonWithTimeout(
+          registrationUrl,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({
+              client_name: 'AGY-ChatUI',
+              redirect_uris: [defaultRedirectUri],
+              grant_types: ['authorization_code', 'refresh_token'],
+              response_types: ['code'],
+              token_endpoint_auth_method: 'none',
+            }),
+          },
+          urlOpts
         );
+        if (dcrRes.status >= 200 && dcrRes.status < 300 && dcrRes.json && typeof dcrRes.json.client_id === 'string') {
+          clientId = dcrRes.json.client_id;
+          redirectUri = defaultRedirectUri;
+          if (typeof dcrRes.json.client_secret === 'string' && dcrRes.json.client_secret.trim()) {
+            clientSecret = dcrRes.json.client_secret.trim();
+          }
+        } else if (cimdSupported) {
+          clientId = ANTIGRAVITY_CIMD_CLIENT_ID;
+          redirectUri = ANTIGRAVITY_CIMD_REDIRECT_URI;
+        } else {
+          throw new McpValidationError(
+            'OAUTH_DCR_FAILED',
+            `動的クライアント登録（DCR）に失敗しました (HTTP ${dcrRes.status})。詳細設定で Client ID を手動入力してください。`
+          );
+        }
+      } catch (err) {
+        if (cimdSupported) {
+          clientId = ANTIGRAVITY_CIMD_CLIENT_ID;
+          redirectUri = ANTIGRAVITY_CIMD_REDIRECT_URI;
+        } else {
+          throw err;
+        }
       }
-      clientId = dcrRes.json.client_id;
-      if (typeof dcrRes.json.client_secret === 'string' && dcrRes.json.client_secret.trim()) {
-        clientSecret = dcrRes.json.client_secret.trim();
-      }
+    }
+
+    // Native Antigravity CIMD fallback when server supports Client ID Metadata Documents without DCR
+    if (!clientId && cimdSupported) {
+      clientId = ANTIGRAVITY_CIMD_CLIENT_ID;
+      redirectUri = ANTIGRAVITY_CIMD_REDIRECT_URI;
     }
 
     if (!clientId) {
@@ -1890,7 +2077,66 @@ export class McpService {
       authorizationUrl: authUrl.toString(),
       redirectUri,
       state,
+      mode: redirectUri === ANTIGRAVITY_CIMD_REDIRECT_URI ? 'code_paste' : 'callback',
     };
+  }
+
+  async completeOAuthManualInput(
+    adminUserId: string,
+    serverId: string,
+    params: { codeOrUrl: string; state?: string | null }
+  ): Promise<{ server: McpServerRecord }> {
+    this.pruneExpiredOAuthFlows();
+    const raw = params.codeOrUrl.trim();
+    if (!raw) {
+      throw new McpValidationError('OAUTH_CODE_MISSING', '認可コードまたはコールバックURLを入力してください。');
+    }
+
+    let code = raw;
+    let extractedState = params.state?.trim() || '';
+    let error: string | undefined;
+    let errorDescription: string | undefined;
+
+    if (/^https?:\/\//i.test(raw) || (raw.includes('code=') && (raw.includes('?') || raw.includes('&')))) {
+      try {
+        const parsed = /^https?:\/\//i.test(raw)
+          ? new URL(raw)
+          : new URL(raw.startsWith('?') ? `http://localhost/${raw}` : `http://localhost/?${raw}`);
+        const qCode = parsed.searchParams.get('code');
+        const qState = parsed.searchParams.get('state');
+        const qErr = parsed.searchParams.get('error');
+        const qErrDesc = parsed.searchParams.get('error_description');
+        if (qCode) code = qCode.trim();
+        if (qState) extractedState = qState.trim();
+        if (qErr) error = qErr.trim();
+        if (qErrDesc) errorDescription = qErrDesc.trim();
+      } catch {
+        // Treat as raw code if URL parsing fails
+      }
+    }
+
+    let targetState = extractedState;
+    if (!targetState || !this.pendingOAuthFlows.has(targetState)) {
+      // Find the most recent pending flow for this (adminUserId, serverId)
+      let latestFlow: PendingOAuthFlow | null = null;
+      for (const flow of this.pendingOAuthFlows.values()) {
+        if (flow.adminUserId === adminUserId && flow.serverId === serverId) {
+          if (!latestFlow || flow.createdAt >= latestFlow.createdAt) {
+            latestFlow = flow;
+          }
+        }
+      }
+      if (latestFlow) {
+        targetState = latestFlow.state;
+      }
+    }
+
+    return this.completeOAuthCallback(adminUserId, {
+      code,
+      state: targetState,
+      error,
+      errorDescription,
+    });
   }
 
   async completeOAuthCallback(
@@ -2739,10 +2985,7 @@ export class McpService {
       const headerMap = this.decryptRecord(row.encryptedHeadersJson);
 
       let acpUrl = target.url;
-      const isHostnameUrl = net.isIP(normalizeHostnameForIpCheck(target.parsed.hostname)) === 0;
       const hasAllowedToolsFilter = allowedTools.length > 0;
-      const needsPinnedForwarder =
-        !this.config.allowPrivateMcpUrls && target.pinnedAddress && isHostnameUrl;
 
       if (hasAllowedToolsFilter) {
         acpUrl = await this.httpsForwarder.registerRoute({
@@ -2751,17 +2994,6 @@ export class McpService {
           trackedToolsListIds: new Set(),
           activeSseResponses: new Set(),
         });
-      } else if (needsPinnedForwarder && target.pinnedAddress) {
-        if (target.parsed.protocol === 'http:') {
-          const pinnedUrl = new URL(target.url);
-          pinnedUrl.hostname = target.pinnedFamily === 6 ? `[${target.pinnedAddress}]` : target.pinnedAddress;
-          acpUrl = pinnedUrl.toString();
-          if (!Object.keys(headerMap).some((k) => k.toLowerCase() === 'host')) {
-            headerMap.Host = target.parsed.host;
-          }
-        } else if (target.parsed.protocol === 'https:') {
-          acpUrl = await this.httpsForwarder.registerRoute(target);
-        }
       }
 
       if (row.authType === 'oauth') {

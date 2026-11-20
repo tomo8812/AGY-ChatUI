@@ -11,6 +11,7 @@ import type {
 import { CloseIcon, ExternalLinkIcon, PlusIcon, TrashIcon } from './Icons';
 import { ModalDialog } from './ModalDialog';
 import { ToggleSwitch } from './ToggleSwitch';
+import { isStandalonePwa } from '../utils/notifications';
 
 interface McpModalProps {
   onClose: () => void;
@@ -76,6 +77,8 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
   const [error, setError] = useState<string | null>(null);
   const [statusNote, setStatusNote] = useState<string | null>(null);
   const [oauthPendingUrl, setOAuthPendingUrl] = useState<string | null>(null);
+  const [oauthPendingState, setOAuthPendingState] = useState<string | null>(null);
+  const [oauthManualInput, setOAuthManualInput] = useState('');
   const [testResult, setTestResult] = useState<McpTestResult | null>(null);
 
   const [mobileShowEditor, setMobileShowEditor] = useState(false);
@@ -235,24 +238,25 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     setShowOAuthAdvanced(Boolean(srv.oauth?.clientId || srv.oauth?.authorizationUrl || srv.oauth?.scopes));
     setTestResult(null);
     setOAuthPendingUrl(null);
+    setOAuthPendingState(null);
+    setOAuthManualInput('');
     setError(null);
     setStatusNote(null);
     setMobileShowEditor(true);
   }, []);
 
-  // Listen for OAuth popup completion without clobbering unsaved form edits
+  // Listen for OAuth completion across postMessage, BroadcastChannel, localStorage, SyncHub WS, and iOS PWA visibility/focus
   useEffect(() => {
-    const onMessage = (evt: MessageEvent) => {
-      if (evt.origin !== window.location.origin) return;
-      const data = evt.data as {
-        type?: string;
-        ok?: boolean;
-        serverId?: string;
-        message?: string;
-      } | null;
+    const handleCompletePayload = (data: {
+      type?: string;
+      ok?: boolean;
+      serverId?: string;
+      message?: string;
+    } | null) => {
       if (!data || data.type !== 'agy-mcp-oauth-complete') return;
-
       setOAuthPendingUrl(null);
+      setOAuthPendingState(null);
+      setOAuthManualInput('');
       void loadServers().then(() => {
         if (data.ok) {
           setStatusNote(data.message || 'OAuth認証が完了しました。');
@@ -262,9 +266,76 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
         }
       });
     };
+
+    const onMessage = (evt: MessageEvent) => {
+      if (evt.origin !== window.location.origin) return;
+      handleCompletePayload(evt.data);
+    };
+
+    const onStorage = (evt: StorageEvent) => {
+      if (evt.key !== 'agy_mcp_oauth_complete' || !evt.newValue) return;
+      try {
+        handleCompletePayload(JSON.parse(evt.newValue));
+      } catch {
+        // ignore
+      }
+    };
+
+    let bc: BroadcastChannel | null = null;
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        bc = new BroadcastChannel('agy_mcp_oauth');
+        bc.onmessage = (evt) => handleCompletePayload(evt.data);
+      }
+    } catch {
+      bc = null;
+    }
+
+    const refreshAndDetectConnection = () => {
+      void loadServers().then((latest) => {
+        if (!latest || !selectedId) return;
+        const target = latest.find((s) => s.id === selectedId);
+        if (!target || target.authType !== 'oauth') return;
+        if (target.oauth?.status === 'connected' && oauthPendingUrl) {
+          setOAuthPendingUrl(null);
+          setOAuthPendingState(null);
+          setOAuthManualInput('');
+          setStatusNote(`MCPサーバー「${target.name}」のOAuth認証が完了しました。`);
+          setError(null);
+        } else if (target.oauth?.status === 'error' && target.oauth?.error && oauthPendingUrl) {
+          setError(target.oauth.error);
+        }
+      });
+    };
+
+    const onMcpUpdated = () => {
+      refreshAndDetectConnection();
+    };
+
+    const onVisibilityOrFocus = () => {
+      if (document.visibilityState === 'visible' && oauthPendingUrl) {
+        refreshAndDetectConnection();
+      }
+    };
+
     window.addEventListener('message', onMessage);
-    return () => window.removeEventListener('message', onMessage);
-  }, [loadServers]);
+    window.addEventListener('storage', onStorage);
+    window.addEventListener('agy:mcp-updated', onMcpUpdated);
+    document.addEventListener('visibilitychange', onVisibilityOrFocus);
+    window.addEventListener('focus', onVisibilityOrFocus);
+    return () => {
+      window.removeEventListener('message', onMessage);
+      window.removeEventListener('storage', onStorage);
+      window.removeEventListener('agy:mcp-updated', onMcpUpdated);
+      document.removeEventListener('visibilitychange', onVisibilityOrFocus);
+      window.removeEventListener('focus', onVisibilityOrFocus);
+      try {
+        bc?.close();
+      } catch {
+        // ignore
+      }
+    };
+  }, [loadServers, selectedId, oauthPendingUrl]);
 
   const filteredServers = useMemo(
     () => servers.filter((s) => s.scope === scopeTab),
@@ -636,25 +707,77 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
 
   const handleStartOAuth = async () => {
     if (!selectedServer) return;
+    const standalone = isStandalonePwa();
+    // Pre-open a popup synchronously within the user tap gesture on non-standalone browsers
+    // so WebKit / Safari popup blockers do not block navigation after the async API call.
+    const popup = !standalone
+      ? window.open('about:blank', 'agy_mcp_oauth', 'width=620,height=760')
+      : null;
+
     setBusy(true);
     setError(null);
     setStatusNote(null);
     setOAuthPendingUrl(null);
+    setOAuthPendingState(null);
     try {
       const res = await api.startMcpOAuth(selectedServer.id);
       setOAuthPendingUrl(res.authorizationUrl);
-      const popup = window.open(
-        res.authorizationUrl,
-        'agy_mcp_oauth',
-        'width=620,height=760'
-      );
-      if (!popup) {
-        setStatusNote('ポップアップがブロックされました。下のリンクから認証ページを開いてください。');
+      setOAuthPendingState(res.state);
+
+      if (popup && !popup.closed) {
+        popup.location.replace(res.authorizationUrl);
+        setStatusNote(
+          res.mode === 'code_paste'
+            ? '認証ウィンドウを開きました。ログイン後、リダイレクト先URLまたは認可コードを下の入力欄に貼り付けてもアプリ内で完了できます。'
+            : '認証ウィンドウを開きました。ブラウザでログイン・許可を完了してください。'
+        );
       } else {
-        setStatusNote('認証ウィンドウを開きました。ブラウザでログイン・許可を完了してください。');
+        // iOS Standalone PWA or popup-blocked fallback:
+        // Opening an external OAuth URL via window.open(_blank) or location.assign
+        // launches iOS's in-app Safari sheet (SFSafariViewController) or system browser.
+        const opened = window.open(res.authorizationUrl, '_blank', 'noopener,noreferrer');
+        if (!opened) {
+          window.location.assign(res.authorizationUrl);
+        }
+        setStatusNote(
+          '認証ページへ移動しました。ログイン・許可が完了すると自動で反映されます（戻った後にURLまたは認可コードを貼り付けてアプリ内で完了することも可能です）。'
+        );
       }
     } catch (err) {
+      if (popup && !popup.closed) {
+        try {
+          popup.close();
+        } catch {
+          // ignore
+        }
+      }
       setError(err instanceof ApiError ? err.message : 'OAuth認証の開始に失敗しました。');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleCompleteOAuthManual = async () => {
+    if (!selectedServer || !oauthManualInput.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await api.completeMcpOAuth(selectedServer.id, {
+        codeOrUrl: oauthManualInput.trim(),
+        state: oauthPendingState,
+      });
+      setOAuthPendingUrl(null);
+      setOAuthPendingState(null);
+      setOAuthManualInput('');
+      await loadServers();
+      populateFormFromServer(res.server);
+      setStatusNote(`MCPサーバー「${res.server.name}」のOAuth認証が完了しました。`);
+    } catch (err) {
+      setError(
+        err instanceof ApiError
+          ? err.message
+          : '認可コードまたはコールバックURLからの認証完了に失敗しました。'
+      );
     } finally {
       setBusy(false);
     }
@@ -666,6 +789,8 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     setError(null);
     setStatusNote(null);
     setOAuthPendingUrl(null);
+    setOAuthPendingState(null);
+    setOAuthManualInput('');
     try {
       await api.disconnectMcpOAuth(selectedServer.id);
       await loadServers();
@@ -1313,6 +1438,31 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
                             </button>
                           </div>
                         </div>
+
+                        {editorMode === 'edit' && selectedServer && oauthPendingUrl && (
+                          <div className="form-group" style={{ marginTop: 10 }}>
+                            <label htmlFor="mcp-oauth-manual-code" className="muted-xs">
+                              アプリ内で認証を完了（認可コードまたはリダイレクト先URLを貼り付け）:
+                            </label>
+                            <div className="mcp-kv-row" style={{ marginTop: 4 }}>
+                              <input
+                                id="mcp-oauth-manual-code"
+                                type="text"
+                                value={oauthManualInput}
+                                onChange={(e) => setOAuthManualInput(e.target.value)}
+                                placeholder="https://.../oauth-callback?code=...&state=... または code"
+                              />
+                              <button
+                                type="button"
+                                className="btn btn-primary btn-xs"
+                                disabled={busy || !oauthManualInput.trim()}
+                                onClick={() => void handleCompleteOAuthManual()}
+                              >
+                                認証を完了
+                              </button>
+                            </div>
+                          </div>
+                        )}
 
                         <button
                           type="button"

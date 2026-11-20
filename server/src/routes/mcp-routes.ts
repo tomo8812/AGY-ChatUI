@@ -197,6 +197,11 @@ async function resolveRequestOrigin(req: FastifyRequest, config: AppConfig): Pro
   return resolveRequestOriginWithTailscale(req, config, tsHostname);
 }
 
+const completeMcpOAuthSchema = z.object({
+  codeOrUrl: z.string().trim().min(1).max(8192),
+  state: z.string().trim().max(512).nullable().optional(),
+});
+
 function escapeHtml(text: string): string {
   return text
     .replace(/&/g, '&amp;')
@@ -218,6 +223,7 @@ function renderOAuthCallbackHtml(payload: {
     serverId: payload.serverId ?? null,
     serverName: payload.serverName ?? null,
     message: payload.message,
+    ts: Date.now(),
   }).replace(/</g, '\\u003c');
 
   const title = payload.ok ? 'OAuth 認証が完了しました' : 'OAuth 認証に失敗しました';
@@ -250,8 +256,10 @@ function renderOAuthCallbackHtml(payload: {
       text-align: center;
     }
     h1 { font-size: 18px; margin: 0 0 10px; color: ${payload.ok ? '#4ade80' : '#f87171'}; }
-    p { font-size: 14px; line-height: 1.5; color: #cbd5e1; margin: 0 0 18px; word-break: break-word; }
-    button {
+    p { font-size: 14px; line-height: 1.5; color: #cbd5e1; margin: 0 0 14px; word-break: break-word; }
+    .hint { font-size: 12px; color: #94a3b8; margin: 0 0 18px; }
+    .actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+    button, a.btn-link {
       background: #2563eb;
       color: #fff;
       border: none;
@@ -259,6 +267,12 @@ function renderOAuthCallbackHtml(payload: {
       padding: 9px 18px;
       font-size: 14px;
       cursor: pointer;
+      text-decoration: none;
+      display: inline-block;
+    }
+    a.btn-secondary {
+      background: #2b3140;
+      color: #e2e8f0;
     }
   </style>
 </head>
@@ -266,9 +280,21 @@ function renderOAuthCallbackHtml(payload: {
   <div class="card">
     <h1>${escapeHtml(title)}</h1>
     <p>${escapeHtml(payload.message)}</p>
-    <button type="button" onclick="window.close()">このウィンドウを閉じる</button>
+    <p class="hint">iOS PWA（ホーム画面アプリ）の場合は画面端の「完了」をタップするか、下のボタンでアプリへ戻ると自動的に反映されます。</p>
+    <div class="actions">
+      <button type="button" onclick="closeOrReturn()">このウィンドウを閉じる</button>
+      <a class="btn-link btn-secondary" href="/">チャット画面へ戻る</a>
+    </div>
   </div>
   <script>
+    function closeOrReturn() {
+      try { window.close(); } catch (_) {}
+      setTimeout(function () {
+        if (!document.hidden) {
+          window.location.replace('/');
+        }
+      }, 300);
+    }
     (function () {
       var data = ${safeJson};
       try {
@@ -276,10 +302,20 @@ function renderOAuthCallbackHtml(payload: {
           window.opener.postMessage(data, window.location.origin);
         }
       } catch (_) {}
-      if (data.ok) {
+      try {
+        if (typeof BroadcastChannel !== 'undefined') {
+          var bc = new BroadcastChannel('agy_mcp_oauth');
+          bc.postMessage(data);
+          bc.close();
+        }
+      } catch (_) {}
+      try {
+        localStorage.setItem('agy_mcp_oauth_complete', JSON.stringify(data));
+      } catch (_) {}
+      if (data.ok && window.opener && !window.opener.closed) {
         setTimeout(function () {
           try { window.close(); } catch (_) {}
-        }, 1200);
+        }, 900);
       }
     })();
   </script>
@@ -413,6 +449,26 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
     }
   });
 
+  app.post('/api/mcp/servers/:id/oauth/complete', async (req, reply) => {
+    const session = requireAdmin(req, reply, db);
+    if (!session) return;
+    const { id } = req.params as { id: string };
+    const parsed = completeMcpOAuthSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: 'INVALID_INPUT',
+        message: parsed.error.issues[0]?.message ?? '認可コードまたはコールバックURLを入力してください。',
+      });
+    }
+    try {
+      const { server } = await mcpService.completeOAuthManualInput(session.user.id, id, parsed.data);
+      await refreshWorkersForScope(server.scope, server.ownerUserId);
+      return { server };
+    } catch (err) {
+      return handleMcpError(reply, err);
+    }
+  });
+
   app.post('/api/mcp/servers/:id/oauth/disconnect', async (req, reply) => {
     const session = requireAdmin(req, reply, db);
     if (!session) return;
@@ -427,8 +483,27 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
   });
 
   app.get('/api/mcp/oauth/callback', async (req, reply) => {
+    const query = (req.query ?? {}) as {
+      code?: string;
+      state?: string;
+      error?: string;
+      error_description?: string;
+    };
+
     const session = authenticateRequest(req, db);
-    if (!session || session.user.role !== 'admin') {
+    const flowAdminId = mcpService.resolvePendingOAuthFlowAdminId(query.state);
+    // Allow callback when either:
+    // 1) The browser has an active admin session cookie, OR
+    // 2) No session cookie is present (e.g. iOS Standalone PWA opened an isolated SFSafariViewController/Safari sheet)
+    //    AND the single-use 192-bit cryptographic `state` belongs to an active admin user.
+    const effectiveAdminId =
+      session?.user.role === 'admin'
+        ? session.user.id
+        : !session && flowAdminId && db.listAdminUserIds().includes(flowAdminId)
+          ? flowAdminId
+          : null;
+
+    if (!effectiveAdminId) {
       return reply
         .code(403)
         .header('Cache-Control', 'no-store')
@@ -441,15 +516,8 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
         );
     }
 
-    const query = (req.query ?? {}) as {
-      code?: string;
-      state?: string;
-      error?: string;
-      error_description?: string;
-    };
-
     try {
-      const { server } = await mcpService.completeOAuthCallback(session.user.id, {
+      const { server } = await mcpService.completeOAuthCallback(effectiveAdminId, {
         code: query.code,
         state: query.state,
         error: query.error,
