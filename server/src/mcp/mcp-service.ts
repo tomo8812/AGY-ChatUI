@@ -1,5 +1,7 @@
 import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
+import http from 'node:http';
+import https from 'node:https';
 import net from 'node:net';
 import type { McpCapabilities, McpServer } from '@agentclientprotocol/sdk';
 import { resolveHostExecutable } from '../acp/env-isolation.js';
@@ -231,26 +233,47 @@ function tryValidateRemoteUrl(
   }
 }
 
-export async function assertSafeOutboundUrl(
+interface PinnedOutboundTarget {
+  url: string;
+  parsed: URL;
+  pinnedAddress: string | null;
+  pinnedFamily: 4 | 6 | null;
+}
+
+async function resolvePinnedOutboundTarget(
   rawUrl: string,
   opts: { allowPrivate?: boolean } = {}
-): Promise<string> {
+): Promise<PinnedOutboundTarget> {
   const normalized = validateRemoteUrl(rawUrl, 'URL', opts);
-  if (opts.allowPrivate) return normalized;
-
   const parsed = new URL(normalized);
   const host = normalizeHostnameForIpCheck(parsed.hostname);
-  if (net.isIP(host) !== 0) {
+  const literalFamily = net.isIP(host);
+
+  if (opts.allowPrivate) {
+    return {
+      url: normalized,
+      parsed,
+      pinnedAddress: literalFamily !== 0 ? host : null,
+      pinnedFamily: literalFamily === 4 || literalFamily === 6 ? literalFamily : null,
+    };
+  }
+
+  if (literalFamily !== 0) {
     if (isBlockedIpAddress(host)) {
       throw new McpValidationError(
         'BLOCKED_PRIVATE_URL',
         'ループバック・プライベート・リンクローカルアドレスへの接続は許可されていません。'
       );
     }
-    return normalized;
+    return {
+      url: normalized,
+      parsed,
+      pinnedAddress: host,
+      pinnedFamily: literalFamily === 4 || literalFamily === 6 ? literalFamily : null,
+    };
   }
 
-  let resolved: Array<{ address: string }>;
+  let resolved: Array<{ address: string; family: number }>;
   try {
     resolved = await dns.lookup(host, { all: true });
   } catch {
@@ -262,7 +285,21 @@ export async function assertSafeOutboundUrl(
       'ループバック・プライベート・リンクローカルアドレスへの接続は許可されていません。'
     );
   }
-  return normalized;
+  const primary = resolved[0];
+  return {
+    url: normalized,
+    parsed,
+    pinnedAddress: primary.address,
+    pinnedFamily: primary.family === 6 ? 6 : 4,
+  };
+}
+
+export async function assertSafeOutboundUrl(
+  rawUrl: string,
+  opts: { allowPrivate?: boolean } = {}
+): Promise<string> {
+  const target = await resolvePinnedOutboundTarget(rawUrl, opts);
+  return target.url;
 }
 
 function assertNoControlChars(value: string, label: string): void {
@@ -312,30 +349,141 @@ function extractResourceMetadataUrlFromWwwAuthenticate(headerVal: string | null)
   return unquoted?.[1]?.trim() ?? null;
 }
 
+const MAX_OUTBOUND_RESPONSE_BYTES = 2 * 1024 * 1024;
+
+function normalizeRequestHeaders(headers: RequestInit['headers']): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!headers) return out;
+  if (headers instanceof Headers) {
+    headers.forEach((v, k) => {
+      out[k] = v;
+    });
+  } else if (Array.isArray(headers)) {
+    for (const [k, v] of headers) {
+      out[k] = v;
+    }
+  } else {
+    for (const [k, v] of Object.entries(headers)) {
+      if (typeof v === 'string') out[k] = v;
+    }
+  }
+  return out;
+}
+
 async function fetchJsonWithTimeout(
   url: string,
   init: RequestInit = {},
   opts: { timeoutMs?: number; allowPrivate?: boolean } = {}
 ): Promise<{ status: number; headers: Headers; json: Record<string, unknown> | null; text: string }> {
-  const safeUrl = await assertSafeOutboundUrl(url, { allowPrivate: opts.allowPrivate });
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? DISCOVERY_TIMEOUT_MS);
-  try {
-    const res = await fetch(safeUrl, { ...init, redirect: 'error', signal: controller.signal });
-    const text = await res.text().catch(() => '');
-    let json: Record<string, unknown> | null = null;
-    try {
-      const parsed = JSON.parse(text);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        json = parsed as Record<string, unknown>;
-      }
-    } catch {
-      // non-JSON response
-    }
-    return { status: res.status, headers: res.headers, json, text };
-  } finally {
-    clearTimeout(timer);
+  const target = await resolvePinnedOutboundTarget(url, { allowPrivate: opts.allowPrivate });
+  const timeoutMs = opts.timeoutMs ?? DISCOVERY_TIMEOUT_MS;
+  const method = (init.method ?? 'GET').toUpperCase();
+  const reqHeaders = normalizeRequestHeaders(init.headers);
+  const bodyBuf =
+    typeof init.body === 'string'
+      ? Buffer.from(init.body, 'utf8')
+      : init.body instanceof Uint8Array
+        ? Buffer.from(init.body)
+        : null;
+
+  if (bodyBuf && !Object.keys(reqHeaders).some((k) => k.toLowerCase() === 'content-length')) {
+    reqHeaders['Content-Length'] = String(bodyBuf.byteLength);
   }
+
+  const pinnedLookup = target.pinnedAddress
+    ? ((
+        _hostname: string,
+        options: unknown,
+        callback: (err: NodeJS.ErrnoException | null, address: unknown, family?: number) => void
+      ) => {
+        const fam = target.pinnedFamily ?? (net.isIP(target.pinnedAddress!) === 6 ? 6 : 4);
+        const allRequested =
+          typeof options === 'object' && options !== null && Boolean((options as { all?: boolean }).all);
+        if (allRequested) {
+          callback(null, [{ address: target.pinnedAddress!, family: fam }]);
+        } else {
+          callback(null, target.pinnedAddress!, fam);
+        }
+      })
+    : undefined;
+
+  return new Promise((resolve, reject) => {
+    const isHttps = target.parsed.protocol === 'https:';
+    const requestFn = isHttps ? https.request : http.request;
+    const reqOptions: https.RequestOptions = {
+      protocol: target.parsed.protocol,
+      hostname: target.parsed.hostname,
+      port: target.parsed.port ? Number(target.parsed.port) : isHttps ? 443 : 80,
+      path: `${target.parsed.pathname}${target.parsed.search}`,
+      method,
+      headers: reqHeaders,
+      ...(isHttps ? { servername: target.parsed.hostname } : {}),
+      ...(pinnedLookup ? { lookup: pinnedLookup as never } : {}),
+    };
+
+    let settled = false;
+    const finish = (err: Error | null, value?: { status: number; headers: Headers; json: Record<string, unknown> | null; text: string }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) reject(err);
+      else resolve(value!);
+    };
+
+    const req = requestFn(reqOptions, (res) => {
+      const status = res.statusCode ?? 0;
+      if (status >= 300 && status < 400 && res.headers.location) {
+        res.resume();
+        finish(new McpValidationError('REDIRECT_BLOCKED', 'リモートMCPからのリダイレクトは許可されていません。'));
+        return;
+      }
+
+      const headers = new Headers();
+      for (const [k, v] of Object.entries(res.headers)) {
+        if (Array.isArray(v)) {
+          for (const item of v) headers.append(k, item);
+        } else if (typeof v === 'string') {
+          headers.set(k, v);
+        }
+      }
+
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
+      res.on('data', (chunk: Buffer) => {
+        totalBytes += chunk.byteLength;
+        if (totalBytes > MAX_OUTBOUND_RESPONSE_BYTES) {
+          res.destroy();
+          finish(new Error('Response body exceeded maximum allowed size'));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        let json: Record<string, unknown> | null = null;
+        try {
+          const parsed = JSON.parse(text);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            json = parsed as Record<string, unknown>;
+          }
+        } catch {
+          // non-JSON response
+        }
+        finish(null, { status, headers, json, text });
+      });
+      res.on('error', (err) => finish(err));
+    });
+
+    const timer = setTimeout(() => {
+      req.destroy(new Error(`Request timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    req.on('error', (err) => finish(err));
+    if (bodyBuf) {
+      req.write(bodyBuf);
+    }
+    req.end();
+  });
 }
 
 export class McpService {
