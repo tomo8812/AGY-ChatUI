@@ -68,6 +68,7 @@ import type {
   ToolCallItem,
 } from '../types.js';
 import type { SkillService } from '../skills/skill-service.js';
+import type { McpService } from '../mcp/mcp-service.js';
 import {
   buildAgyCommandSpec,
   probeBwrapSandbox,
@@ -416,7 +417,8 @@ export class AcpClientManager {
     private readonly db: AppDatabase,
     private readonly hub: SyncHub,
     private readonly skillService?: SkillService,
-    private readonly pushService?: PushNotificationService
+    private readonly pushService?: PushNotificationService,
+    private readonly mcpService?: McpService
   ) {
     this.cleanupTimer = setInterval(() => this.evictIdleWorkers(), 30_000);
     this.cleanupTimer.unref();
@@ -445,6 +447,14 @@ export class AcpClientManager {
     this.invalidateUserOptionsCache(userId);
     const keys = [...this.workers.values()]
       .filter((w) => w.userId === userId && !this.isWorkerBusy(w))
+      .map((w) => w.key);
+    await Promise.allSettled(keys.map((k) => this.stopWorkerByKey(k)));
+  }
+
+  async stopIdleWorkersForAllUsers(): Promise<void> {
+    this.userOptionsCache.clear();
+    const keys = [...this.workers.values()]
+      .filter((w) => !this.isWorkerBusy(w))
       .map((w) => w.key);
     await Promise.allSettled(keys.map((k) => this.stopWorkerByKey(k)));
   }
@@ -1412,6 +1422,13 @@ export class AcpClientManager {
       currentEffortValue: null,
     };
 
+    const mcpServers = this.mcpService
+      ? await this.mcpService.resolveAcpMcpServersForUser(
+          userId,
+          init.agentCapabilities?.mcpCapabilities
+        )
+      : [];
+
     // Try load / resume existing ACP session seamlessly
     if (chat.acpSessionId) {
       isRestoringSession = true;
@@ -1420,7 +1437,7 @@ export class AcpClientManager {
           const loadRes = (await conn.agent.request(methods.agent.session.load, {
             sessionId: chat.acpSessionId,
             cwd: spec.sandboxWorkspaceRoot,
-            mcpServers: [],
+            mcpServers,
             ...(systemPromptPayload ? { systemPrompt: systemPromptPayload } : {}),
           })) as LoadSessionResponse | undefined;
           acpSessionId = chat.acpSessionId;
@@ -1433,7 +1450,7 @@ export class AcpClientManager {
           const resumeRes = (await conn.agent.request(methods.agent.session.resume, {
             sessionId: chat.acpSessionId,
             cwd: spec.sandboxWorkspaceRoot,
-            mcpServers: [],
+            mcpServers,
             ...(systemPromptPayload ? { systemPrompt: systemPromptPayload } : {}),
           })) as ResumeSessionResponse | undefined;
           acpSessionId = chat.acpSessionId;
@@ -1454,7 +1471,7 @@ export class AcpClientManager {
       try {
         const newRes = (await conn.agent.request(methods.agent.session.new, {
           cwd: spec.sandboxWorkspaceRoot,
-          mcpServers: [],
+          mcpServers,
           ...(systemPromptPayload ? { systemPrompt: systemPromptPayload } : {}),
         })) as NewSessionResponse;
         acpSessionId = newRes.sessionId;

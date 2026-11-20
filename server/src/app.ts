@@ -21,6 +21,8 @@ import { registerNotificationRoutes } from './routes/notification-routes.js';
 import { registerProjectRoutes } from './routes/project-routes.js';
 import { registerQuotaRoutes } from './routes/quota-routes.js';
 import { registerSkillRoutes } from './routes/skill-routes.js';
+import { registerMcpRoutes } from './routes/mcp-routes.js';
+import { McpService } from './mcp/mcp-service.js';
 import { SkillService } from './skills/skill-service.js';
 import { PushNotificationService } from './notifications/web-push.js';
 import { SyncHub } from './sync/hub.js';
@@ -38,6 +40,7 @@ export interface AppContext {
   quotaService: QuotaService;
   pushService: PushNotificationService;
   skillService: SkillService;
+  mcpService: McpService;
   shutdown: () => Promise<void>;
 }
 
@@ -64,7 +67,8 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
   const pushService = new PushNotificationService(config, db, hub);
   const quotaService = new QuotaService(config, db, hub);
   const skillService = new SkillService(config, db, hub);
-  const acp = new AcpClientManager(config, db, hub, skillService, pushService);
+  const mcpService = new McpService(config, db, hub);
+  const acp = new AcpClientManager(config, db, hub, skillService, pushService, mcpService);
   const agyAuth = new AgyAuthManager(config, db, hub, acp);
   const scheduler = new ExecutionScheduler(config, db, hub, acp, pushService, quotaService);
 
@@ -111,6 +115,7 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
   await registerQuotaRoutes(app, { config, db, hub, agyAuth, quotaService });
   await registerNotificationRoutes(app, { config, db, hub, agyAuth, pushService });
   await registerSkillRoutes(app, { config, db, hub, agyAuth, skillService, acp });
+  await registerMcpRoutes(app, { config, db, hub, agyAuth, mcpService, acp });
 
   app.get('/api/ws', { websocket: true }, (socket, req) => {
     const session = authenticateRequest(req, db);
@@ -244,6 +249,7 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
     quotaService,
     pushService,
     skillService,
+    mcpService,
     shutdown,
   };
 }
