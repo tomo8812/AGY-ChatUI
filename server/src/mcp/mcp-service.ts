@@ -594,15 +594,7 @@ async function fetchJsonWithTimeout(
       const nextTarget = await resolvePinnedOutboundTarget(resolvedNextUrl, {
         allowPrivate: opts.allowPrivate,
       });
-      if (nextTarget.parsed.origin !== target.parsed.origin) {
-        const stripped: Record<string, string> = {};
-        for (const [k, v] of Object.entries(currentHeaders)) {
-          const low = k.toLowerCase();
-          if (low === 'authorization' || low === 'cookie' || low === 'x-api-key') continue;
-          stripped[k] = v;
-        }
-        currentHeaders = stripped;
-      }
+      const isCrossOrigin = nextTarget.parsed.origin !== target.parsed.origin;
       if (
         (hopResult.status === 301 || hopResult.status === 302 || hopResult.status === 303) &&
         currentMethod !== 'GET' &&
@@ -614,6 +606,21 @@ async function fetchJsonWithTimeout(
         for (const [k, v] of Object.entries(currentHeaders)) {
           const low = k.toLowerCase();
           if (low === 'content-type' || low === 'content-length' || low === 'transfer-encoding') continue;
+          stripped[k] = v;
+        }
+        currentHeaders = stripped;
+      }
+      if (isCrossOrigin) {
+        if (currentBodyBuf !== null) {
+          throw new McpValidationError(
+            'CROSS_ORIGIN_BODY_REDIRECT_BLOCKED',
+            'リクエストボディを含むクロスオリジンリダイレクトはセキュリティ上許可されていません。'
+          );
+        }
+        const stripped: Record<string, string> = {};
+        for (const [k, v] of Object.entries(currentHeaders)) {
+          const low = k.toLowerCase();
+          if (low === 'authorization' || low === 'cookie' || low === 'x-api-key') continue;
           stripped[k] = v;
         }
         currentHeaders = stripped;
