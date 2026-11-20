@@ -123,7 +123,7 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
         name: 'shared-api',
         scope: 'shared',
         transport: 'http',
-        url: 'https://shared.example.com/mcp',
+        url: 'https://93.184.216.34/mcp',
         authType: 'api_key',
         headers: [{ name: 'X-API-Key', value: 'shared-key-9876' }],
       }
@@ -138,7 +138,7 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
         name: 'shared-sse',
         scope: 'shared',
         transport: 'sse',
-        url: 'https://sse.example.com/sse',
+        url: 'https://93.184.216.34/sse',
         authType: 'bearer',
         headers: [{ name: 'Authorization', value: 'Bearer shared-bearer-token' }],
       }
@@ -153,7 +153,7 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
         name: 'admin-private',
         scope: 'profile',
         transport: 'http',
-        url: 'https://private.example.com/mcp',
+        url: 'https://93.184.216.35/mcp',
         authType: 'headers',
         headers: [{ name: 'X-Admin-Token', value: 'admin-secret-token' }],
       }
@@ -168,7 +168,7 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
         name: 'shared-api',
         scope: 'profile',
         transport: 'http',
-        url: 'https://admin-override.example.com/mcp',
+        url: 'https://93.184.216.36/mcp',
         authType: 'api_key',
         headers: [{ name: 'X-API-Key', value: 'admin-override-key' }],
       }
@@ -207,7 +207,7 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
       headers: Array<{ name: string; value: string }>;
     };
     expect(userSharedApi.type).toBe('http');
-    expect(userSharedApi.url).toBe('https://shared.example.com/mcp');
+    expect(userSharedApi.url).toBe('https://93.184.216.34/mcp');
     expect(userSharedApi.headers).toEqual([{ name: 'X-API-Key', value: 'shared-key-9876' }]);
 
     const userSharedLocal = userMcp.find((m) => m.name === 'shared-local') as {
@@ -229,13 +229,14 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
 
     // Profile-scoped override wins for admin
     const adminSharedApi = adminMcp.find((m) => m.name === 'shared-api') as { url: string };
-    expect(adminSharedApi.url).toBe('https://admin-override.example.com/mcp');
+    expect(adminSharedApi.url).toBe('https://93.184.216.36/mcp');
 
     // SSRF protection: reject loopback, private, and link-local/metadata URLs by default
     for (const blockedUrl of [
       'http://169.254.169.254/latest/meta-data/',
       'http://127.0.0.1:8080/mcp',
       'http://localhost:3000/mcp',
+      'http://localhost./mcp',
       'http://10.0.0.1/mcp',
       'http://[::1]/mcp',
     ]) {

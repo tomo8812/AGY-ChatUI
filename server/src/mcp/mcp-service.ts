@@ -129,7 +129,7 @@ function normalizeHostnameForIpCheck(hostname: string): string {
   if (lower.startsWith('[') && lower.endsWith(']')) {
     return lower.slice(1, -1);
   }
-  return lower;
+  return lower.replace(/\.+$/, '');
 }
 
 function isBlockedIpv4(ip: string): boolean {
@@ -1705,6 +1705,16 @@ export class McpService {
       if (row.transport === 'http' && !supportsHttp) continue;
       if (row.transport === 'sse' && !supportsSse) continue;
 
+      let safeUrl: string;
+      try {
+        safeUrl = await assertSafeOutboundUrl(row.url, {
+          allowPrivate: this.config.allowPrivateMcpUrls,
+        });
+      } catch {
+        // Skip remote server whose URL fails SSRF/DNS validation
+        continue;
+      }
+
       const headerMap = this.decryptRecord(row.encryptedHeadersJson);
 
       if (row.authType === 'oauth') {
@@ -1725,14 +1735,14 @@ export class McpService {
         out.push({
           type: 'http',
           name: row.name,
-          url: row.url,
+          url: safeUrl,
           headers,
         });
       } else {
         out.push({
           type: 'sse',
           name: row.name,
-          url: row.url,
+          url: safeUrl,
           headers,
         });
       }
