@@ -906,6 +906,8 @@ const ChatComposer = React.memo(
       const prevDraftKeyRef = useRef<string>(draftKey);
       const currentDraftKeyRef = useRef<string>(draftKey);
       currentDraftKeyRef.current = draftKey;
+      const isDraftChatRef = useRef<boolean>(isDraftChat);
+      isDraftChatRef.current = isDraftChat;
       const inputTextRef = useRef(inputText);
       inputTextRef.current = inputText;
       const stagedAttachmentsRef = useRef(stagedAttachments);
@@ -1004,7 +1006,10 @@ const ChatComposer = React.memo(
           setUiNotice(null);
           try {
             const uploaded = await onUploadFiles(files);
-            if (currentDraftKeyRef.current === targetKey || targetKey === '__new__') {
+            const stillSameTarget =
+              currentDraftKeyRef.current === targetKey ||
+              (targetKey === '__new__' && isDraftChatRef.current);
+            if (stillSameTarget) {
               setStagedAttachments((prev) => [...prev, ...uploaded]);
             } else {
               const saved = draftsByChatRef.current.get(targetKey) ?? { text: '', attachments: [] };

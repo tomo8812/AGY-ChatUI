@@ -539,11 +539,9 @@ function slugifyHeading(text: string): string {
 }
 
 const createMarkdownHeading = (Tag: 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6') => {
-  const HeadingComponent: React.FC<React.HTMLAttributes<HTMLHeadingElement>> = ({
-    id,
-    children,
-    ...props
-  }) => {
+  const HeadingComponent: React.FC<
+    React.HTMLAttributes<HTMLHeadingElement> & { node?: unknown }
+  > = ({ id, children, node: _node, ...props }) => {
     const computedId = id || slugifyHeading(extractReactText(children)) || undefined;
     return (
       <Tag id={computedId} {...props}>
