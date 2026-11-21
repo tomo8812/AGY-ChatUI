@@ -968,31 +968,19 @@ function applyDocRuntimeToEnv(
   mountRoot: string,
   layout: DocRuntimeLayout
 ): void {
-  const pathPrefix: string[] = [];
+  // Preserve default PATH, PYTHONPATH, NODE_PATH, and PYTHONIOENCODING so normal ACP
+  // processes, subagents, and user-installed tools keep exact standard binary and import
+  // resolution. Document skills can opt in explicitly to the shared read-only runtime.
+  env.AGY_DOC_RUNTIME_DIR = mountRoot;
   if (layout.venvBinRel) {
-    pathPrefix.push(path.posix.join(mountRoot, layout.venvBinRel.split(path.sep).join(path.posix.sep)));
+    const venvBin = path.posix.join(mountRoot, layout.venvBinRel.split(path.sep).join(path.posix.sep));
+    env.AGY_DOC_RUNTIME_VENV_BIN = venvBin;
+    env.AGY_DOC_RUNTIME_PYTHON = path.posix.join(venvBin, 'python3');
   }
-  if (layout.nodeBinRel) {
-    pathPrefix.push(path.posix.join(mountRoot, layout.nodeBinRel.split(path.sep).join(path.posix.sep)));
-  }
-  if (pathPrefix.length > 0) {
-    env.PATH = `${pathPrefix.join(path.delimiter)}:${env.PATH || '/usr/local/bin:/usr/bin:/bin'}`;
-  }
-
   if (layout.nodeModulesRel) {
-    const nm = path.posix.join(mountRoot, layout.nodeModulesRel.split(path.sep).join(path.posix.sep));
-    env.NODE_PATH = env.NODE_PATH ? `${nm}${path.delimiter}${env.NODE_PATH}` : nm;
-  }
-
-  if (layout.pythonSiteRels.length > 0) {
-    const sites = layout.pythonSiteRels.map((r) =>
-      path.posix.join(mountRoot, r.split(path.sep).join(path.posix.sep))
+    env.AGY_DOC_RUNTIME_NODE_PATH = path.posix.join(
+      mountRoot,
+      layout.nodeModulesRel.split(path.sep).join(path.posix.sep)
     );
-    env.PYTHONPATH = env.PYTHONPATH
-      ? `${sites.join(path.delimiter)}${path.delimiter}${env.PYTHONPATH}`
-      : sites.join(path.delimiter);
   }
-
-  env.PYTHONIOENCODING = 'utf-8';
-  env.SAL_USE_VCLPLUGIN = 'svp';
 }

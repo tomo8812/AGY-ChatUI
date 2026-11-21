@@ -1,9 +1,11 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
 export const BUILTIN_STATE_FILENAME = '.builtin-skills-state.json';
 export const LEGACY_BUILTIN_SYNC_MARKER = '.agy-builtin-skill';
 const BUILTIN_MANIFEST_FILENAME = '.builtin-skills-manifest.json';
+const BACKUP_DIR_NAME = '.builtin-migration-backups';
 
 const VALID_SKILL_SLUG_RE = /^(?:[a-z0-9]|[a-z0-9][a-z0-9-]{0,62}[a-z0-9])$/;
 
@@ -11,6 +13,19 @@ export interface BuiltinSkillEntry {
   slug: string;
   dir: string;
   sha256: string | null;
+}
+
+export interface PreservedLegacySkillNotice {
+  slug: string;
+  skillDir: string;
+  backupDir: string;
+  reason: 'digest_mismatch' | 'missing_digest' | 'unreadable';
+  migratedAt: number;
+}
+
+export interface LegacyMigrationResult {
+  removed: string[];
+  preservedCustom: PreservedLegacySkillNotice[];
 }
 
 export function isValidSkillSlug(rawSlug: string): boolean {
@@ -26,6 +41,102 @@ export function getProfileCustomSkillScanDirs(profileDir: string): string[] {
     path.join(profileAbs, '.gemini', 'skills'),
     path.join(profileAbs, '.gemini', 'antigravity', 'skills'),
   ];
+}
+
+/**
+ * Computes the same deterministic SHA-256 directory digest as `scripts/fetch-anthropic-skills.mjs`
+ * (excluding sync marker and VCS/cache metadata). Returns `null` if symlinks or read errors occur.
+ */
+export function computeSkillDirectoryDigest(skillDir: string): string | null {
+  let rootReal: string;
+  try {
+    rootReal = fs.realpathSync(skillDir);
+  } catch {
+    return null;
+  }
+
+  const files: Array<{ rel: string; abs: string }> = [];
+  let unsafeOrUnreadable = false;
+
+  const walk = (currentDir: string, relBase = '') => {
+    const entries = fs.readdirSync(currentDir, { withFileTypes: true });
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (
+        entry.name === LEGACY_BUILTIN_SYNC_MARKER ||
+        entry.name === '.agy-project-skill' ||
+        entry.name === '.git' ||
+        entry.name === '__pycache__' ||
+        entry.name === '.DS_Store'
+      ) {
+        continue;
+      }
+      if (entry.isSymbolicLink()) {
+        unsafeOrUnreadable = true;
+        continue;
+      }
+      const full = path.join(currentDir, entry.name);
+      const real = fs.realpathSync(full);
+      if (!real.startsWith(rootReal + path.sep)) {
+        unsafeOrUnreadable = true;
+        continue;
+      }
+      const rel = relBase ? `${relBase}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        walk(real, rel);
+      } else if (entry.isFile()) {
+        files.push({ rel, abs: real });
+      }
+    }
+  };
+
+  try {
+    walk(rootReal);
+  } catch {
+    return null;
+  }
+  if (unsafeOrUnreadable) return null;
+
+  files.sort((a, b) => a.rel.localeCompare(b.rel));
+  const hash = crypto.createHash('sha256');
+  try {
+    for (const item of files) {
+      const data = fs.readFileSync(item.abs);
+      hash.update(item.rel);
+      hash.update('\0');
+      hash.update(String(data.byteLength));
+      hash.update('\0');
+      hash.update(data);
+      hash.update('\0');
+    }
+  } catch {
+    return null;
+  }
+
+  return hash.digest('hex');
+}
+
+function copyTreeSafeForBackup(srcDir: string, dstDir: string): void {
+  fs.mkdirSync(dstDir, { recursive: true, mode: 0o700 });
+  const rootReal = fs.realpathSync(srcDir);
+  const walk = (dir: string, relBase = '') => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === LEGACY_BUILTIN_SYNC_MARKER || entry.isSymbolicLink()) continue;
+      const full = path.join(dir, entry.name);
+      const real = fs.realpathSync(full);
+      if (!real.startsWith(rootReal + path.sep)) continue;
+      const rel = relBase ? `${relBase}/${entry.name}` : entry.name;
+      const target = path.join(dstDir, rel);
+      if (entry.isDirectory()) {
+        fs.mkdirSync(target, { recursive: true, mode: 0o700 });
+        walk(real, rel);
+      } else if (entry.isFile()) {
+        fs.copyFileSync(real, target);
+        fs.chmodSync(target, 0o600);
+      }
+    }
+  };
+  walk(rootReal);
 }
 
 /**
@@ -94,68 +205,103 @@ export function readBuiltinSkillsCatalog(builtinSkillsDir?: string | null): Map<
   return catalog;
 }
 
+function readExistingProfileStateRaw(configDir: string): {
+  disabled?: unknown;
+  manifestDigest?: unknown;
+  skills?: Record<string, { status?: unknown; sha256?: unknown }>;
+  migratedCustomNotices?: PreservedLegacySkillNotice[];
+} | null {
+  const statePath = path.join(configDir, BUILTIN_STATE_FILENAME);
+  if (!fs.existsSync(statePath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(statePath, 'utf8')) as {
+      disabled?: unknown;
+      manifestDigest?: unknown;
+      skills?: Record<string, { status?: unknown; sha256?: unknown }>;
+      migratedCustomNotices?: PreservedLegacySkillNotice[];
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Reads per-profile Built-in disabled slugs from `.gemini/config/.builtin-skills-state.json`.
  */
 export function readProfileDisabledBuiltins(profileDir: string): Set<string> {
   const disabled = new Set<string>();
-  const statePath = path.join(path.resolve(profileDir), '.gemini', 'config', BUILTIN_STATE_FILENAME);
-  if (!fs.existsSync(statePath)) return disabled;
+  const configDir = path.join(path.resolve(profileDir), '.gemini', 'config');
+  const parsed = readExistingProfileStateRaw(configDir);
+  if (!parsed) return disabled;
 
-  try {
-    const parsed = JSON.parse(fs.readFileSync(statePath, 'utf8')) as {
-      disabled?: unknown;
-      skills?: Record<string, { status?: unknown }>;
-    };
-    if (parsed && Array.isArray(parsed.disabled)) {
-      for (const item of parsed.disabled) {
-        if (typeof item === 'string' && isValidSkillSlug(item)) {
-          disabled.add(item);
-        }
+  if (Array.isArray(parsed.disabled)) {
+    for (const item of parsed.disabled) {
+      if (typeof item === 'string' && isValidSkillSlug(item)) {
+        disabled.add(item);
       }
     }
-    // Support reading legacy state shape if present before migration
-    if (parsed && parsed.skills && typeof parsed.skills === 'object') {
-      for (const [slug, meta] of Object.entries(parsed.skills)) {
-        if (
-          isValidSkillSlug(slug) &&
-          meta &&
-          (meta.status === 'disabled' || meta.status === 'deleted')
-        ) {
-          disabled.add(slug);
-        }
+  }
+  // Support reading legacy state shape if present before migration
+  if (parsed.skills && typeof parsed.skills === 'object') {
+    for (const [slug, meta] of Object.entries(parsed.skills)) {
+      if (
+        isValidSkillSlug(slug) &&
+        meta &&
+        (meta.status === 'disabled' || meta.status === 'deleted')
+      ) {
+        disabled.add(slug);
       }
     }
-  } catch {
-    // ignore corrupt state file
   }
   return disabled;
 }
 
-export function writeProfileDisabledBuiltins(profileDir: string, disabledSet: ReadonlySet<string>): void {
+export function writeProfileDisabledBuiltins(
+  profileDir: string,
+  disabledSet: ReadonlySet<string>,
+  extraNotices?: PreservedLegacySkillNotice[]
+): void {
   const configDir = path.join(path.resolve(profileDir), '.gemini', 'config');
   fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
+  const existing = readExistingProfileStateRaw(configDir);
+  const priorNotices = Array.isArray(existing?.migratedCustomNotices)
+    ? existing.migratedCustomNotices
+    : [];
+  const mergedNotices = [...priorNotices, ...(extraNotices ?? [])];
+
   const statePath = path.join(configDir, BUILTIN_STATE_FILENAME);
   const tmpPath = `${statePath}.tmp.${process.pid}`;
-  const payload = {
+  const payload: {
+    disabled: string[];
+    migratedCustomNotices?: PreservedLegacySkillNotice[];
+  } = {
     disabled: [...disabledSet].filter(isValidSkillSlug).sort(),
   };
+  if (mergedNotices.length > 0) {
+    payload.migratedCustomNotices = mergedNotices;
+  }
   fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2) + '\n', { mode: 0o600 });
   fs.renameSync(tmpPath, statePath);
 }
 
 /**
- * Migrates any legacy `.agy-builtin-skill` mutable copies out of user skill directories
- * into `.builtin-skills-state.json` disabled state so Built-in skills live solely in
- * the read-only catalog.
+ * Migrates legacy `.agy-builtin-skill` copies out of user skill directories:
+ * - Only removes a legacy copy if its current directory SHA-256 strictly matches
+ *   the distributed digest recorded in `.agy-builtin-skill` (or legacy state).
+ * - If any file (`SKILL.md` or attached scripts/references/assets) was modified or added,
+ *   or the recorded digest is missing/unverifiable, creates a backup and converts the
+ *   directory into a Custom skill by stripping `.agy-builtin-skill` instead of deleting it.
  */
-export function migrateLegacySyncedBuiltins(profileDir: string): void {
+export function migrateLegacySyncedBuiltins(profileDir: string): LegacyMigrationResult {
   const profileAbs = path.resolve(profileDir);
   const configDir = path.join(profileAbs, '.gemini', 'config');
   const enabledDir = path.join(configDir, 'skills');
   const disabledDir = path.join(configDir, 'skills-disabled');
+  const existingState = readExistingProfileStateRaw(configDir);
   const disabledSet = readProfileDisabledBuiltins(profileAbs);
-  let changed = false;
+  const removed: string[] = [];
+  const preservedCustom: PreservedLegacySkillNotice[] = [];
+  let stateNeedsRewrite = Boolean(existingState && existingState.manifestDigest !== undefined);
 
   for (const [dir, isDisabledDir] of [
     [enabledDir, false],
@@ -173,18 +319,76 @@ export function migrateLegacySyncedBuiltins(profileDir: string): void {
       const skillDir = path.join(dir, entry.name);
       const markerPath = path.join(skillDir, LEGACY_BUILTIN_SYNC_MARKER);
       if (!fs.existsSync(markerPath)) continue;
-      if (isDisabledDir && isValidSkillSlug(entry.name)) {
-        disabledSet.add(entry.name);
+
+      let markerSha: string | null = null;
+      try {
+        const parsedMarker = JSON.parse(fs.readFileSync(markerPath, 'utf8')) as { sha256?: unknown };
+        if (typeof parsedMarker?.sha256 === 'string' && /^[a-f0-9]{64}$/i.test(parsedMarker.sha256)) {
+          markerSha = parsedMarker.sha256.toLowerCase();
+        }
+      } catch {
+        markerSha = null;
       }
-      fs.rmSync(skillDir, { recursive: true, force: true });
-      changed = true;
+
+      if (!markerSha && existingState?.skills && typeof existingState.skills === 'object') {
+        const legacyMeta = existingState.skills[entry.name];
+        if (
+          legacyMeta &&
+          typeof legacyMeta.sha256 === 'string' &&
+          /^[a-f0-9]{64}$/i.test(legacyMeta.sha256)
+        ) {
+          markerSha = legacyMeta.sha256.toLowerCase();
+        }
+      }
+
+      const actualSha = computeSkillDirectoryDigest(skillDir);
+      if (markerSha && actualSha && actualSha.toLowerCase() === markerSha) {
+        if (isDisabledDir && isValidSkillSlug(entry.name)) {
+          disabledSet.add(entry.name);
+        }
+        fs.rmSync(skillDir, { recursive: true, force: true });
+        removed.push(entry.name);
+        stateNeedsRewrite = true;
+        continue;
+      }
+
+      const reason: PreservedLegacySkillNotice['reason'] = !markerSha
+        ? 'missing_digest'
+        : actualSha === null
+          ? 'unreadable'
+          : 'digest_mismatch';
+
+      const backupDir = path.join(
+        configDir,
+        BACKUP_DIR_NAME,
+        `${entry.name}-${Date.now()}-${preservedCustom.length}`
+      );
+      try {
+        copyTreeSafeForBackup(skillDir, backupDir);
+      } catch {
+        // Backup best-effort failed; still preserve the original directory in place and do not delete
+      }
+      fs.rmSync(markerPath, { force: true });
+      const notice: PreservedLegacySkillNotice = {
+        slug: entry.name,
+        skillDir,
+        backupDir,
+        reason,
+        migratedAt: Date.now(),
+      };
+      preservedCustom.push(notice);
+      stateNeedsRewrite = true;
+      console.warn(
+        `[builtin-skills] Preserved modified legacy skill "${entry.name}" as custom (${reason}); backup: ${backupDir}`
+      );
     }
   }
 
-  const statePath = path.join(configDir, BUILTIN_STATE_FILENAME);
-  if (changed || (fs.existsSync(statePath) && fs.readFileSync(statePath, 'utf8').includes('"manifestDigest"'))) {
-    writeProfileDisabledBuiltins(profileAbs, disabledSet);
+  if (stateNeedsRewrite) {
+    writeProfileDisabledBuiltins(profileAbs, disabledSet, preservedCustom);
   }
+
+  return { removed, preservedCustom };
 }
 
 /**

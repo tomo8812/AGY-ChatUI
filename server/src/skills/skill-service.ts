@@ -803,8 +803,8 @@ export class SkillService {
     return affectedChatIds;
   }
 
-  syncBuiltinSkillsToProfile(profileDir: string): void {
-    migrateLegacySyncedBuiltins(profileDir);
+  syncBuiltinSkillsToProfile(profileDir: string): import('./builtin-skills.js').LegacyMigrationResult {
+    return migrateLegacySyncedBuiltins(profileDir);
   }
 
   saveSkill(

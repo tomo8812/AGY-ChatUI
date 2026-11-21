@@ -1,10 +1,15 @@
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { describe, expect, test } from 'vitest';
+
+const execFileAsync = promisify(execFile);
 import {
   buildAgyCommandSpec,
+  buildIsolatedAgyEnv,
   ensurePerChatHomeDir,
   SANDBOX_DOC_RUNTIME_MOUNT,
   SANDBOX_HOME_MOUNT,
@@ -13,13 +18,13 @@ import type { AppConfig } from '../src/config.js';
 import { resolveAuthorizedChatFileReference } from '../src/files/link-resolver.js';
 import {
   BUILTIN_STATE_FILENAME,
+  computeSkillDirectoryDigest,
   LEGACY_BUILTIN_SYNC_MARKER,
   listCustomGlobalSkillSlugs,
   migrateLegacySyncedBuiltins,
   readProfileDisabledBuiltins,
   resolveActiveBuiltinSkillsForProfile,
 } from '../src/skills/builtin-skills.js';
-import type { SkillsListResponse } from '../src/types.js';
 import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
 
 function writeSkillDir(
@@ -30,7 +35,7 @@ function writeSkillDir(
     description?: string;
     instructions?: string;
     files?: Record<string, string>;
-    legacyMarker?: boolean;
+    legacyMarker?: boolean | 'auto' | { sha256?: string };
   } = {},
 ): string {
   const dir = path.join(parentDir, slug);
@@ -50,7 +55,20 @@ function writeSkillDir(
       fs.writeFileSync(target, content, 'utf8');
     }
   }
-  if (opts.legacyMarker) {
+  if (opts.legacyMarker === 'auto') {
+    const sha256 = computeSkillDirectoryDigest(dir);
+    fs.writeFileSync(
+      path.join(dir, LEGACY_BUILTIN_SYNC_MARKER),
+      JSON.stringify({ slug, sha256 }) + '\n',
+      'utf8',
+    );
+  } else if (typeof opts.legacyMarker === 'object' && opts.legacyMarker !== null) {
+    fs.writeFileSync(
+      path.join(dir, LEGACY_BUILTIN_SYNC_MARKER),
+      JSON.stringify({ slug, ...opts.legacyMarker }) + '\n',
+      'utf8',
+    );
+  } else if (opts.legacyMarker) {
     fs.writeFileSync(path.join(dir, LEGACY_BUILTIN_SYNC_MARKER), 'builtin-sync-v1', 'utf8');
   }
   return dir;
@@ -321,7 +339,7 @@ describe('Anthropic doc skills and runtime isolation', () => {
     }
   });
 
-  test('Legacy .agy-builtin-skill migration and read-only Built-in link resolution', async () => {
+  test('Legacy .agy-builtin-skill migration verifies digest, preserves modified SKILL.md and attachment-only edits as Custom with backups, and resolves active Built-in links', async () => {
     const builtinRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-builtin-migrate-'));
     const builtinSkillsDir = seedBuiltinCatalog(builtinRoot, 'v1');
     const srv = await createTestServer({ builtinSkillsDir });
@@ -329,38 +347,81 @@ describe('Anthropic doc skills and runtime isolation', () => {
     try {
       const alice = await registerAndBindAgy(srv.baseUrl, 'alice_migrate', 'alice-mig');
       const aliceProfile = srv.ctx.db.getAgyProfile(alice.userId)!;
+      const enabledDir = path.join(aliceProfile.profileDir, '.gemini', 'config', 'skills');
+      const disabledDir = path.join(aliceProfile.profileDir, '.gemini', 'config', 'skills-disabled');
 
-      // Seed old copied built-in artifacts inside profileDir
-      writeSkillDir(path.join(aliceProfile.profileDir, '.gemini', 'config', 'skills-disabled'), 'docx', {
-        legacyMarker: true,
-      });
-      writeSkillDir(path.join(aliceProfile.profileDir, '.gemini', 'config', 'skills'), 'pptx', {
-        legacyMarker: true,
-      });
-      // Also place a Custom skill named xlsx WITHOUT the legacy marker (must NOT be removed)
-      writeSkillDir(path.join(aliceProfile.profileDir, '.gemini', 'config', 'skills'), 'xlsx', {
-        legacyMarker: false,
-      });
+      // 1. Unmodified disabled legacy copy with matching digest -> deleted & disabled state persisted
+      writeSkillDir(disabledDir, 'docx', { legacyMarker: 'auto' });
 
-      migrateLegacySyncedBuiltins(aliceProfile.profileDir);
+      // 2. Unmodified enabled legacy copy with matching digest -> deleted & served from read-only catalog
+      writeSkillDir(enabledDir, 'pptx', { legacyMarker: 'auto' });
 
-      expect(
-        fs.existsSync(path.join(aliceProfile.profileDir, '.gemini', 'config', 'skills-disabled', 'docx')),
-      ).toBe(false);
-      expect(
-        fs.existsSync(path.join(aliceProfile.profileDir, '.gemini', 'config', 'skills', 'pptx')),
-      ).toBe(false);
-      expect(
-        fs.existsSync(path.join(aliceProfile.profileDir, '.gemini', 'config', 'skills', 'xlsx', 'SKILL.md')),
-      ).toBe(true);
+      // 3. SKILL.md edited directly on disk after legacy sync -> preserved as Custom + backed up
+      const editedSkillMdDir = writeSkillDir(enabledDir, 'xlsx', { legacyMarker: 'auto' });
+      fs.appendFileSync(path.join(editedSkillMdDir, 'SKILL.md'), '\n# User local edits\n', 'utf8');
+
+      // 4. SKILL.md untouched, ONLY an attached file modified/added directly on disk -> preserved as Custom + backed up
+      const editedAttachDir = writeSkillDir(enabledDir, 'pdf', {
+        files: { 'scripts/helper.py': 'print("v1")\n' },
+        legacyMarker: 'auto',
+      });
+      fs.writeFileSync(path.join(editedAttachDir, 'scripts', 'helper.py'), 'print("user-custom")\n', 'utf8');
+
+      // 5. Legacy marker with missing/unverifiable digest -> must NOT be deleted
+      writeSkillDir(enabledDir, 'legacy-no-digest', { legacyMarker: true });
+
+      const migration = migrateLegacySyncedBuiltins(aliceProfile.profileDir);
+
+      // Unmodified copies are removed
+      expect(fs.existsSync(path.join(disabledDir, 'docx'))).toBe(false);
+      expect(fs.existsSync(path.join(enabledDir, 'pptx'))).toBe(false);
+      expect(migration.removed.sort()).toEqual(['docx', 'pptx']);
+
+      // Modified (SKILL.md or attachment-only) and unverifiable copies stay as Custom with marker stripped
+      expect(fs.existsSync(path.join(enabledDir, 'xlsx', 'SKILL.md'))).toBe(true);
+      expect(fs.readFileSync(path.join(enabledDir, 'xlsx', 'SKILL.md'), 'utf8')).toContain('# User local edits');
+      expect(fs.existsSync(path.join(enabledDir, 'xlsx', LEGACY_BUILTIN_SYNC_MARKER))).toBe(false);
+
+      expect(fs.existsSync(path.join(enabledDir, 'pdf', 'scripts', 'helper.py'))).toBe(true);
+      expect(fs.readFileSync(path.join(enabledDir, 'pdf', 'scripts', 'helper.py'), 'utf8')).toContain('user-custom');
+      expect(fs.existsSync(path.join(enabledDir, 'pdf', LEGACY_BUILTIN_SYNC_MARKER))).toBe(false);
+
+      expect(fs.existsSync(path.join(enabledDir, 'legacy-no-digest', 'SKILL.md'))).toBe(true);
+      expect(fs.existsSync(path.join(enabledDir, 'legacy-no-digest', LEGACY_BUILTIN_SYNC_MARKER))).toBe(false);
+
+      // Backups and migration notices were generated for all preserved skills
+      expect(migration.preservedCustom.map((p) => p.slug).sort()).toEqual([
+        'legacy-no-digest',
+        'pdf',
+        'xlsx',
+      ]);
+      for (const notice of migration.preservedCustom) {
+        expect(fs.existsSync(path.join(notice.backupDir, 'SKILL.md'))).toBe(true);
+      }
+      const persistedState = JSON.parse(
+        fs.readFileSync(path.join(aliceProfile.profileDir, '.gemini', 'config', BUILTIN_STATE_FILENAME), 'utf8'),
+      ) as { disabled: string[]; migratedCustomNotices?: Array<{ slug: string }> };
+      expect(persistedState.disabled).toEqual(['docx']);
+      expect(persistedState.migratedCustomNotices?.map((n) => n.slug).sort()).toEqual([
+        'legacy-no-digest',
+        'pdf',
+        'xlsx',
+      ]);
 
       const disabledSet = readProfileDisabledBuiltins(aliceProfile.profileDir);
       const customSlugs = listCustomGlobalSkillSlugs(aliceProfile.profileDir);
       const resolvedState = resolveActiveBuiltinSkillsForProfile(aliceProfile.profileDir, builtinSkillsDir);
       expect(disabledSet.has('docx')).toBe(true);
       expect(customSlugs.has('xlsx')).toBe(true);
-      expect(resolvedState.conflicts).toEqual(['xlsx']);
-      expect(resolvedState.active.map((entry) => entry.slug).sort()).toEqual(['pdf', 'pptx']);
+      expect(customSlugs.has('pdf')).toBe(true);
+      expect(resolvedState.conflicts.sort()).toEqual(['pdf', 'xlsx']);
+      expect(resolvedState.active.map((entry) => entry.slug)).toEqual(['pptx']);
+
+      // API reports preserved xlsx & pdf as editable Custom skills with conflict badge
+      const apiList = await alice.client.request<ApiSkillsList>('GET', '/api/skills');
+      const apiPdf = apiList.data.global.find((s) => s.slug === 'pdf');
+      expect(apiPdf?.origin).toBe('custom');
+      expect(apiPdf?.hasBuiltinConflict).toBe(true);
 
       // Chat file link resolution resolves active Built-in files read-only (but not disabled/custom-shadowed ones)
       const projRes = await alice.client.request<{ project: { id: string } }>('POST', '/api/projects', {
@@ -394,7 +455,7 @@ describe('Anthropic doc skills and runtime isolation', () => {
     }
   });
 
-  test('Sandbox bwrap mounts active Built-in skills read-only, Custom skills read-write, and shared doc-runtime read-only', () => {
+  test('Sandbox bwrap mounts Built-in skills & doc-runtime read-only without mutating default ACP PATH/PYTHONPATH/NODE_PATH', () => {
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-bwrap-mount-'));
     try {
       const builtinSkillsDir = seedBuiltinCatalog(tmpRoot, 'v1');
@@ -402,7 +463,14 @@ describe('Anthropic doc skills and runtime isolation', () => {
       fs.mkdirSync(path.join(docRuntimeDir, 'venv', 'bin'), { recursive: true });
       fs.mkdirSync(path.join(docRuntimeDir, 'venv', 'lib', 'python3.11', 'site-packages'), { recursive: true });
       fs.mkdirSync(path.join(docRuntimeDir, 'node', 'node_modules', '.bin'), { recursive: true });
-      fs.writeFileSync(path.join(docRuntimeDir, 'venv', 'bin', 'python3'), '#!/bin/sh\n', { mode: 0o755 });
+      fs.writeFileSync(path.join(docRuntimeDir, 'venv', 'bin', 'python3'), '#!/bin/sh\necho SHADOWED_DOC_PY\n', {
+        mode: 0o755,
+      });
+      fs.writeFileSync(
+        path.join(docRuntimeDir, 'venv', 'lib', 'python3.11', 'site-packages', 'pptx.py'),
+        'MARKER = "doc_runtime"\n',
+        'utf8',
+      );
       fs.writeFileSync(path.join(docRuntimeDir, 'manifest.json'), JSON.stringify({ version: 1 }), 'utf8');
 
       const profileDir = path.join(tmpRoot, 'profile');
@@ -437,7 +505,7 @@ describe('Anthropic doc skills and runtime isolation', () => {
       );
       expect(fs.existsSync(path.join(chatHome, '.gemini', 'config', 'skills', 'pdf'))).toBe(false);
 
-      const cfg: AppConfig = {
+      const baseCfg: AppConfig = {
         nodeEnv: 'test',
         host: '127.0.0.1',
         port: 0,
@@ -447,7 +515,7 @@ describe('Anthropic doc skills and runtime isolation', () => {
         agyBin: fakeAgy,
         mockAgentPath: '',
         builtinSkillsDir,
-        docRuntimeDir,
+        docRuntimeDir: '',
         maxConcurrentAcp: 2,
         maxAcpPerUser: 1,
         idleWorkerMs: 60_000,
@@ -459,8 +527,16 @@ describe('Anthropic doc skills and runtime isolation', () => {
         artifactsCacheRoot: path.join(tmpRoot, 'cache'),
       };
 
+      const specWithoutRuntime = buildAgyCommandSpec({
+        config: baseCfg,
+        subcommandArgs: ['acp'],
+        profileDir,
+        workspaceDir,
+        enableSandboxBwrap: true,
+      });
+
       const spec = buildAgyCommandSpec({
-        config: cfg,
+        config: { ...baseCfg, docRuntimeDir },
         subcommandArgs: ['acp'],
         profileDir,
         workspaceDir,
@@ -479,16 +555,37 @@ describe('Anthropic doc skills and runtime isolation', () => {
       expect(argsStr).not.toContain(`${SANDBOX_HOME_MOUNT}/.gemini/config/skills/pdf`);
       expect(argsStr).not.toContain(`--ro-bind\n${fs.realpathSync(path.join(builtinSkillsDir, 'xlsx'))}`);
       expect(argsStr).toContain(`--ro-bind\n${fs.realpathSync(docRuntimeDir)}\n${SANDBOX_DOC_RUNTIME_MOUNT}`);
-      expect(spec.env.NODE_PATH).toContain(`${SANDBOX_DOC_RUNTIME_MOUNT}/node/node_modules`);
-      expect(spec.env.PYTHONPATH).toContain(`${SANDBOX_DOC_RUNTIME_MOUNT}/venv/lib/python3.11/site-packages`);
-      expect(spec.env.PATH).toContain(`${SANDBOX_DOC_RUNTIME_MOUNT}/venv/bin`);
-      expect(spec.env.SAL_USE_VCLPLUGIN).toBe('svp');
+
+      // Global Python/Node resolution must remain identical to baseline ACP without doc-runtime
+      expect(spec.env.PATH).toBe(specWithoutRuntime.env.PATH);
+      expect(spec.env.PYTHONPATH).toBe(specWithoutRuntime.env.PYTHONPATH);
+      expect(spec.env.NODE_PATH).toBe(specWithoutRuntime.env.NODE_PATH);
+      expect(spec.env.PYTHONIOENCODING).toBe(specWithoutRuntime.env.PYTHONIOENCODING);
+      expect(spec.env.PATH).not.toContain(SANDBOX_DOC_RUNTIME_MOUNT);
+
+      // Verify actual Python & Node resolution matches baseline ACP identically
+      const baselinePy = execFileSync(
+        'python3',
+        ['-c', 'import json, shutil, sys; print(json.dumps({"which": shutil.which("python3"), "path": sys.path}))'],
+        { env: buildIsolatedAgyEnv({ profileDir }), encoding: 'utf8' },
+      );
+      const docEnabledPy = execFileSync(
+        'python3',
+        ['-c', 'import json, shutil, sys; print(json.dumps({"which": shutil.which("python3"), "path": sys.path}))'],
+        { env: spec.env, encoding: 'utf8' },
+      );
+      expect(docEnabledPy).toBe(baselinePy);
+
+      // Opt-in references are exposed cleanly for explicit use by document skills
+      expect(spec.env.AGY_DOC_RUNTIME_DIR).toBe(SANDBOX_DOC_RUNTIME_MOUNT);
+      expect(spec.env.AGY_DOC_RUNTIME_PYTHON).toBe(`${SANDBOX_DOC_RUNTIME_MOUNT}/venv/bin/python3`);
+      expect(spec.env.AGY_DOC_RUNTIME_NODE_PATH).toBe(`${SANDBOX_DOC_RUNTIME_MOUNT}/node/node_modules`);
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
   });
 
-  test('Deploy scripts unify under INSTALL_DOC_RUNTIME=auto|0|1 and protect builtin-skills permissions', () => {
+  test('Deploy scripts unify under INSTALL_DOC_RUNTIME=auto|0|1 and auto-update swaps read-only builtin-skills safely without hiding failures', async () => {
     const repoRoot = path.resolve(import.meta.dirname, '..', '..');
 
     // Ensure legacy split flags are completely gone from deploy scripts & README
@@ -505,6 +602,7 @@ describe('Anthropic doc skills and runtime isolation', () => {
     }
 
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-doc-runtime-script-'));
+    let tarballServer: http.Server | null = null;
     try {
       const setupScript = path.join(repoRoot, 'deploy', 'setup-doc-runtime.sh');
       const emptyEnvFile = path.join(tmpRoot, 'missing-env');
@@ -539,7 +637,7 @@ describe('Anthropic doc skills and runtime isolation', () => {
       });
       expect(skipViaEnvFile).toMatch(/Skipping setup \(INSTALL_DOC_RUNTIME=0\)/);
 
-      // apply-bundle.sh preserves read-only go-w on builtin-skills and skips doc-runtime when INSTALL_DOC_RUNTIME=0
+      // apply-bundle.sh preserves read-only go-w on builtin-skills
       const appDir = path.join(tmpRoot, 'app');
       const bundleSrc = path.join(tmpRoot, 'bundle-src');
       const bundleTar = path.join(tmpRoot, 'antigravity-chat-bundle.tar.gz');
@@ -584,12 +682,150 @@ describe('Anthropic doc skills and runtime isolation', () => {
         encoding: 'utf8',
       });
       expect(applyOut).toMatch(/Bundle deployed cleanly/);
-      expect(fs.readFileSync(path.join(repoRoot, 'deploy', 'apply-bundle.sh'), 'utf8')).toContain(
-        'setup-doc-runtime.sh',
-      );
       const skillMode = fs.statSync(path.join(appDir, 'builtin-skills', 'docx', 'SKILL.md')).mode & 0o777;
       expect(skillMode & 0o022).toBe(0);
+
+      // auto-update.sh git-fallback stages Built-in skills via unprivileged user, replaces read-only existing builtin-skills cleanly, and propagates errors
+      const gitRemoteDir = path.join(tmpRoot, 'remote.git');
+      const gitSeedDir = path.join(tmpRoot, 'seed');
+      const gitAppDir = path.join(tmpRoot, 'git-app');
+      fs.mkdirSync(path.join(gitSeedDir, 'scripts'), { recursive: true });
+      fs.writeFileSync(path.join(gitSeedDir, '.gitignore'), 'node_modules/\nbuiltin-skills/\n');
+      fs.writeFileSync(
+        path.join(gitSeedDir, 'package.json'),
+        JSON.stringify({ name: 'agy-chatui-test', version: '1.2.3', scripts: { build: 'true' } }) + '\n',
+      );
+      fs.copyFileSync(
+        path.join(repoRoot, 'scripts', 'fetch-anthropic-skills.mjs'),
+        path.join(gitSeedDir, 'scripts', 'fetch-anthropic-skills.mjs'),
+      );
+      execFileSync('git', ['init', '--bare', gitRemoteDir]);
+      execFileSync('git', ['init', '-b', 'main', gitSeedDir]);
+      execFileSync('git', ['-C', gitSeedDir, 'config', 'user.email', 'test@example.com']);
+      execFileSync('git', ['-C', gitSeedDir, 'config', 'user.name', 'Test']);
+      execFileSync('git', ['-C', gitSeedDir, 'add', '.']);
+      execFileSync('git', ['-C', gitSeedDir, 'commit', '-m', 'init']);
+      execFileSync('git', ['-C', gitSeedDir, 'remote', 'add', 'origin', gitRemoteDir]);
+      execFileSync('git', ['-C', gitSeedDir, 'push', 'origin', 'main']);
+
+      execFileSync('git', ['clone', '--branch', 'main', gitRemoteDir, gitAppDir]);
+      fs.mkdirSync(path.join(gitAppDir, 'node_modules'), { recursive: true });
+      // Seed pre-existing read-only builtin-skills (simulating root-owned protected install)
+      const oldBuiltin = seedBuiltinCatalog(gitAppDir, 'v1');
+      fs.chmodSync(path.join(oldBuiltin, 'docx', 'SKILL.md'), 0o444);
+      fs.chmodSync(path.join(oldBuiltin, 'docx'), 0o555);
+
+      // Push a new commit to remote so git pull advances
+      fs.writeFileSync(path.join(gitSeedDir, 'CHANGELOG.md'), 'v2\n');
+      execFileSync('git', ['-C', gitSeedDir, 'add', '.']);
+      execFileSync('git', ['-C', gitSeedDir, 'commit', '-m', 'update']);
+      execFileSync('git', ['-C', gitSeedDir, 'push', 'origin', 'main']);
+
+      // Build skills-v2 tarball served over local HTTP
+      const skillsV2Src = path.join(tmpRoot, 'skills-v2-tar-src', 'anthropics-skills-main');
+      fs.mkdirSync(path.join(skillsV2Src, 'skills'), { recursive: true });
+      const crypto = await import('node:crypto');
+      for (const slug of ['docx', 'pptx', 'xlsx', 'pdf']) {
+        writeSkillDir(path.join(skillsV2Src, 'skills'), slug, {
+          name: `${slug}-v2`,
+          description: `v2 ${slug}`,
+          instructions: `Updated v2 ${slug}`,
+          files: slug === 'docx' ? { 'references/data.txt': crypto.randomBytes(2048).toString('base64') } : undefined,
+        });
+      }
+      const skillsTarPath = path.join(tmpRoot, 'skills-v2.tar.gz');
+      execFileSync('tar', ['-czf', skillsTarPath, '-C', path.dirname(skillsV2Src), 'anthropics-skills-main']);
+      const skillsTarBytes = fs.readFileSync(skillsTarPath);
+
+      let serveOk = true;
+      tarballServer = http.createServer((_req, res) => {
+        if (!serveOk) {
+          res.writeHead(500);
+          res.end('fail');
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/gzip', 'Content-Length': skillsTarBytes.byteLength });
+        res.end(skillsTarBytes);
+      });
+      await new Promise<void>((resolve) => tarballServer!.listen(0, '127.0.0.1', () => resolve()));
+      const addr = tarballServer.address() as { port: number };
+      const tarballUrl = `http://127.0.0.1:${addr.port}/skills.tar.gz`;
+
+      // Success case: updates read-only builtin-skills to v2 cleanly with go-w permissions
+      const { stdout: updateOkOut } = await execFileAsync(
+        'bash',
+        [path.join(repoRoot, 'deploy', 'auto-update.sh')],
+        {
+          env: {
+            ...process.env,
+            PATH: `${binDir}:${process.env.PATH ?? '/usr/bin:/bin'}`,
+            APP_DIR: gitAppDir,
+            DEPLOY_MODE: 'git',
+            GITHUB_REPO: '',
+            ENV_FILE: emptyEnvFile,
+            LOCK_FILE: path.join(tmpRoot, 'git-update.lock'),
+            AGY_AUTO_UPDATE: 'false',
+            SYSTEMCTL_BIN: fakeSystemctl,
+            ANTHROPIC_SKILLS_TARBALL_URL: tarballUrl,
+          },
+          encoding: 'utf8',
+        },
+      );
+      expect(updateOkOut).toContain('Updated successfully');
+      expect(fs.readFileSync(path.join(gitAppDir, 'builtin-skills', 'docx', 'SKILL.md'), 'utf8')).toContain(
+        'Updated v2 docx',
+      );
+      expect((fs.statSync(path.join(gitAppDir, 'builtin-skills', 'docx', 'SKILL.md')).mode & 0o022)).toBe(0);
+
+      // Failure case: push another commit while tarball endpoint returns 500 -> auto-update must fail (not mask error)
+      fs.writeFileSync(path.join(gitSeedDir, 'CHANGELOG.md'), 'v3\n');
+      execFileSync('git', ['-C', gitSeedDir, 'add', '.']);
+      execFileSync('git', ['-C', gitSeedDir, 'commit', '-m', 'update3']);
+      execFileSync('git', ['-C', gitSeedDir, 'push', 'origin', 'main']);
+      serveOk = false;
+
+      let failedAsExpected = false;
+      try {
+        await execFileAsync('bash', [path.join(repoRoot, 'deploy', 'auto-update.sh')], {
+          env: {
+            ...process.env,
+            PATH: `${binDir}:${process.env.PATH ?? '/usr/bin:/bin'}`,
+            APP_DIR: gitAppDir,
+            DEPLOY_MODE: 'git',
+            GITHUB_REPO: '',
+            ENV_FILE: emptyEnvFile,
+            LOCK_FILE: path.join(tmpRoot, 'git-update.lock'),
+            AGY_AUTO_UPDATE: 'false',
+            SYSTEMCTL_BIN: fakeSystemctl,
+            ANTHROPIC_SKILLS_TARBALL_URL: tarballUrl,
+          },
+          encoding: 'utf8',
+        });
+      } catch (err) {
+        failedAsExpected = true;
+        const stderr = (err as { stderr?: string }).stderr ?? '';
+        const stdout = (err as { stdout?: string }).stdout ?? '';
+        expect(stdout).not.toContain('Updated successfully');
+        expect(stderr).toContain('Failed to fetch Built-in Anthropic document skills');
+      }
+      expect(failedAsExpected).toBe(true);
+      // Existing v2 builtin-skills remains intact on failure
+      expect(fs.readFileSync(path.join(gitAppDir, 'builtin-skills', 'docx', 'SKILL.md'), 'utf8')).toContain(
+        'Updated v2 docx',
+      );
     } finally {
+      if (tarballServer) {
+        await new Promise<void>((resolve) => tarballServer!.close(() => resolve()));
+      }
+      // Restore write bits so rmSync cleans up read-only test dirs smoothly
+      const oldDocx = path.join(tmpRoot, 'git-app', 'builtin-skills', 'docx');
+      if (fs.existsSync(oldDocx)) {
+        try {
+          fs.chmodSync(oldDocx, 0o755);
+        } catch {
+          // ignore
+        }
+      }
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
   });

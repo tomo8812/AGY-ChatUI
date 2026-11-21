@@ -85,7 +85,13 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
       app.log.error({ err, profileDir }, 'Failed to initialize Antigravity profile settings');
     }
     try {
-      skillService.syncBuiltinSkillsToProfile(profileDir);
+      const migration = skillService.syncBuiltinSkillsToProfile(profileDir);
+      if (migration.preservedCustom.length > 0) {
+        app.log.warn(
+          { profileDir, preservedCustom: migration.preservedCustom },
+          'Preserved modified legacy built-in skills as custom skills with backups'
+        );
+      }
     } catch (err) {
       app.log.error({ err, profileDir }, 'Failed to sync built-in skills to profile');
     }
