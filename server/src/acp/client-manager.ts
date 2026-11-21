@@ -88,40 +88,40 @@ import {
   isValidAgyPermissionRule,
 } from './profile-settings.js';
 
-function normalizeTargetPathForRule(
-  rawPath: string,
-  workspaceDir: string,
-  sandboxWorkspaceRoot: string
-): string | null {
-  const trimmed = rawPath.trim();
-  if (!trimmed || /[\r\n\0)]/.test(trimmed)) return null;
-  const hostPath = toHostWorkspacePath(workspaceDir, sandboxWorkspaceRoot, trimmed);
-  const resolvedWorkspace = path.resolve(workspaceDir);
-  const resolvedHost = path.resolve(hostPath);
-  if (
-    resolvedHost === resolvedWorkspace ||
-    resolvedHost.startsWith(`${resolvedWorkspace}${path.sep}`)
-  ) {
-    const rel = path.relative(resolvedWorkspace, resolvedHost);
-    return rel ? rel.replace(/\\/g, '/') : '.';
-  }
-  return hostPath;
+export interface KnownMcpServerPermissionTarget {
+  name: string;
+  discoveredTools?: string[];
 }
 
 export function deriveAgyPermissionRule(params: {
   toolCall: ToolCallItem;
-  workspaceDir: string;
-  sandboxWorkspaceRoot: string;
+  knownMcpServers?: Array<string | KnownMcpServerPermissionTarget>;
   knownMcpServerNames?: string[];
 }): string | null {
-  const { toolCall, workspaceDir, sandboxWorkspaceRoot, knownMcpServerNames = [] } = params;
+  const { toolCall } = params;
   if (!toolCall || toolCall.toolCallId.startsWith('interaction_')) {
     return null;
   }
 
+  const serverMap = new Map<string, Set<string> | null>();
+  const addKnown = (entry: string | KnownMcpServerPermissionTarget) => {
+    const rawName = typeof entry === 'string' ? entry : entry.name;
+    const cleanName = rawName.trim();
+    if (!cleanName) return;
+    const tools =
+      typeof entry === 'object' && Array.isArray(entry.discoveredTools)
+        ? entry.discoveredTools.map((t) => t.trim()).filter(Boolean)
+        : [];
+    serverMap.set(cleanName, tools.length > 0 ? new Set(tools) : null);
+  };
+  for (const s of params.knownMcpServers ?? []) addKnown(s);
+  for (const s of params.knownMcpServerNames ?? []) addKnown(s);
+
+  if (serverMap.size === 0) {
+    return null;
+  }
+
   const name = (toolCall.name ?? '').trim();
-  const title = (toolCall.title ?? '').trim();
-  const kind = (toolCall.kind ?? '').trim().toLowerCase();
   const rawObj =
     toolCall.rawInput && typeof toolCall.rawInput === 'object' && !Array.isArray(toolCall.rawInput)
       ? (toolCall.rawInput as Record<string, unknown>)
@@ -134,156 +134,45 @@ export function deriveAgyPermissionRule(params: {
     return null;
   };
 
-  // 1) Explicit mcp(server/tool) in title/name
-  const explicitMcp = /\bmcp\(([^/\r\n\0)]+)\/([^)\r\n\0]+)\)/.exec(`${name} ${title}`);
-  if (explicitMcp) {
-    const rule = formatMcpPermissionRule(explicitMcp[1], explicitMcp[2]);
+  const matchKnownServerTool = (serverName: string, toolName: string): string | null => {
+    if (!serverMap.has(serverName) || !toolName) return null;
+    const discovered = serverMap.get(serverName) ?? null;
+    if (discovered && !discovered.has(toolName)) return null;
+    const rule = formatMcpPermissionRule(serverName, toolName);
     return isValidAgyPermissionRule(rule) ? rule : null;
-  }
+  };
 
-  // 2) MCP tool calls via call_mcp_tool or rawInput { ServerName, ToolName }
+  // 1) Explicit structured MCP metadata matching a registered known MCP server
   const mcpServerFromInput = firstStr(
     rawObj?.ServerName,
     rawObj?.serverName,
-    rawObj?.server,
     rawObj?.mcpServer
   );
   const mcpToolFromInput = firstStr(
     rawObj?.ToolName,
     rawObj?.toolName,
-    rawObj?.tool,
     rawObj?.mcpTool
   );
   if (mcpServerFromInput && mcpToolFromInput) {
-    const rule = formatMcpPermissionRule(mcpServerFromInput, mcpToolFromInput);
-    return isValidAgyPermissionRule(rule) ? rule : null;
+    return matchKnownServerTool(mcpServerFromInput, mcpToolFromInput);
   }
 
-  // 3) Eager-loaded MCP tools: mcp__<server>__<tool> or mcp_<server>_<tool>
-  if (name.startsWith('mcp__')) {
-    const rest = name.slice('mcp__'.length);
-    const sepIdx = rest.indexOf('__');
-    if (sepIdx > 0 && sepIdx + 2 < rest.length) {
-      const rule = formatMcpPermissionRule(rest.slice(0, sepIdx), rest.slice(sepIdx + 2));
-      if (isValidAgyPermissionRule(rule)) return rule;
+  // 2) Prefixed eager MCP tool name matching an unambiguous known MCP server
+  for (const [prefix, sep] of [
+    ['mcp__', '__'],
+    ['mcp_', '_'],
+  ] as const) {
+    if (!name.startsWith(prefix)) continue;
+    const rest = name.slice(prefix.length);
+    const matches: string[] = [];
+    for (const srvName of serverMap.keys()) {
+      if (!rest.startsWith(`${srvName}${sep}`)) continue;
+      const candidateTool = rest.slice(srvName.length + sep.length);
+      const rule = matchKnownServerTool(srvName, candidateTool);
+      if (rule) matches.push(rule);
     }
-  }
-  if (name.startsWith('mcp_')) {
-    const rest = name.slice('mcp_'.length);
-    const sortedKnown = [...knownMcpServerNames].sort((a, b) => b.length - a.length);
-    for (const srv of sortedKnown) {
-      if (rest.startsWith(`${srv}_`) && rest.length > srv.length + 1) {
-        const rule = formatMcpPermissionRule(srv, rest.slice(srv.length + 1));
-        if (isValidAgyPermissionRule(rule)) return rule;
-      }
-    }
-    const firstUnderscore = rest.indexOf('_');
-    if (firstUnderscore > 0 && firstUnderscore + 1 < rest.length) {
-      const rule = formatMcpPermissionRule(rest.slice(0, firstUnderscore), rest.slice(firstUnderscore + 1));
-      if (isValidAgyPermissionRule(rule)) return rule;
-    }
-  }
-
-  // 4) Terminal commands
-  if (
-    kind === 'execute' ||
-    name === 'run_command' ||
-    name === 'bash' ||
-    name === 'execute_command'
-  ) {
-    const rawCmd = firstStr(rawObj?.CommandLine, rawObj?.command, rawObj?.cmd);
-    if (rawCmd) {
-      const cleanLine = rawCmd.split(/[\r\n\0]/)[0]?.trim() ?? '';
-      if (cleanLine && !cleanLine.includes(')')) {
-        const rule = `command(${cleanLine})`;
-        if (isValidAgyPermissionRule(rule)) return rule;
-      }
-    }
-    return null;
-  }
-
-  // 5) File write / edit
-  if (
-    kind === 'edit' ||
-    kind === 'delete' ||
-    kind === 'move' ||
-    [
-      'write_to_file',
-      'replace_file_content',
-      'multi_replace_file_content',
-      'write_file',
-      'edit_file',
-      'writeTextFile',
-    ].includes(name)
-  ) {
-    const rawPath = firstStr(
-      toolCall.locations?.[0]?.path,
-      rawObj?.TargetFile,
-      rawObj?.targetFile,
-      rawObj?.file_path,
-      rawObj?.path
-    );
-    if (rawPath) {
-      const target = normalizeTargetPathForRule(rawPath, workspaceDir, sandboxWorkspaceRoot);
-      if (target) {
-        const rule = `write_file(${target})`;
-        if (isValidAgyPermissionRule(rule)) return rule;
-      }
-    }
-    return null;
-  }
-
-  // 6) File read / search
-  if (
-    kind === 'read' ||
-    kind === 'search' ||
-    [
-      'view_file',
-      'read_file',
-      'readTextFile',
-      'grep_search',
-      'find_by_name',
-      'list_dir',
-    ].includes(name)
-  ) {
-    const rawPath = firstStr(
-      toolCall.locations?.[0]?.path,
-      rawObj?.AbsolutePath,
-      rawObj?.SearchPath,
-      rawObj?.DirectoryPath,
-      rawObj?.file_path,
-      rawObj?.path
-    );
-    if (rawPath) {
-      const target = normalizeTargetPathForRule(rawPath, workspaceDir, sandboxWorkspaceRoot);
-      if (target) {
-        const rule = `read_file(${target})`;
-        if (isValidAgyPermissionRule(rule)) return rule;
-      }
-    }
-    return null;
-  }
-
-  // 7) URL fetch / browser
-  if (
-    kind === 'fetch' ||
-    ['read_url_content', 'read_url', 'fetch_url', 'browse', 'execute_url'].includes(name)
-  ) {
-    const firstUrl = Array.isArray(rawObj?.urls) ? rawObj.urls[0] : undefined;
-    const rawUrl = firstStr(rawObj?.Url, rawObj?.url, firstUrl);
-    if (rawUrl) {
-      try {
-        const host = new URL(rawUrl).hostname.trim();
-        if (host) {
-          const action = name.includes('execute') || name.includes('browse') ? 'execute_url' : 'read_url';
-          const rule = `${action}(${host})`;
-          if (isValidAgyPermissionRule(rule)) return rule;
-        }
-      } catch {
-        // ignore invalid URL
-      }
-    }
-    return null;
+    // Only return a rule when the known server + tool identification is completely unambiguous
+    return matches.length === 1 ? matches[0] : null;
   }
 
   return null;
@@ -1809,15 +1698,33 @@ export class AcpClientManager {
           !isQuestion &&
           options.some((o) => o.kind.startsWith('allow')) &&
           options.some((o) => o.kind.startsWith('reject'));
-        const knownMcpServerNames = isToolApproval
-          ? this.db.listEffectiveMcpServersForUser(turn.userId).map((s) => s.name)
-          : [];
+        const knownMcpServers: KnownMcpServerPermissionTarget[] = (() => {
+          if (!isToolApproval) return [];
+          const byName = new Map<string, KnownMcpServerPermissionTarget>();
+          for (const s of this.db.listEffectiveMcpServersForUser(turn.userId)) {
+            let discoveredTools: string[] = [];
+            try {
+              const parsed = JSON.parse(s.discoveredToolsJson);
+              if (Array.isArray(parsed)) {
+                discoveredTools = parsed
+                  .map((t) =>
+                    t && typeof t === 'object' && typeof (t as { name?: unknown }).name === 'string'
+                      ? (t as { name: string }).name.trim()
+                      : ''
+                  )
+                  .filter(Boolean);
+              }
+            } catch {
+              // ignore malformed cached discovery json
+            }
+            byName.set(s.name, { name: s.name, discoveredTools });
+          }
+          return [...byName.values()];
+        })();
         const alwaysAllowRule = isToolApproval
           ? deriveAgyPermissionRule({
               toolCall,
-              workspaceDir: workerRef.workspaceDir,
-              sandboxWorkspaceRoot: workerRef.sandboxWorkspaceRoot,
-              knownMcpServerNames,
+              knownMcpServers,
             })
           : null;
 
