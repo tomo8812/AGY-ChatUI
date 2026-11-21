@@ -905,8 +905,6 @@ interface DocRuntimeLayout {
   hostDir: string;
   venvBinRel: string | null;
   nodeModulesRel: string | null;
-  nodeBinRel: string | null;
-  pythonSiteRels: string[];
 }
 
 function resolveDocRuntimeLayout(rawDir?: string | null): DocRuntimeLayout | null {
@@ -930,27 +928,8 @@ function resolveDocRuntimeLayout(rawDir?: string | null): DocRuntimeLayout | nul
 
   const venvBinRel = hasDir(path.join('venv', 'bin'));
   const nodeModulesRel = hasDir(path.join('node', 'node_modules')) ?? hasDir('node_modules');
-  const nodeBinRel =
-    hasDir(path.join('node', 'node_modules', '.bin')) ?? hasDir(path.join('node_modules', '.bin'));
 
-  const pythonSiteRels: string[] = [];
-  for (const libName of ['lib', 'lib64']) {
-    const libDir = path.join(hostDir, 'venv', libName);
-    try {
-      if (!fs.statSync(libDir).isDirectory()) continue;
-      for (const entry of fs.readdirSync(libDir, { withFileTypes: true })) {
-        if (!entry.isDirectory() || !entry.name.startsWith('python')) continue;
-        const siteRel = path.join('venv', libName, entry.name, 'site-packages');
-        if (hasDir(siteRel)) {
-          pythonSiteRels.push(siteRel);
-        }
-      }
-    } catch {
-      // ignore missing python lib dir
-    }
-  }
-
-  if (!venvBinRel && !nodeModulesRel && pythonSiteRels.length === 0) {
+  if (!venvBinRel && !nodeModulesRel) {
     return null;
   }
 
@@ -958,8 +937,6 @@ function resolveDocRuntimeLayout(rawDir?: string | null): DocRuntimeLayout | nul
     hostDir,
     venvBinRel,
     nodeModulesRel,
-    nodeBinRel,
-    pythonSiteRels,
   };
 }
 
