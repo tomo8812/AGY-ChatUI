@@ -581,20 +581,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     <span className={`status-dot ${sandbox.active ? 'ok' : 'warn'}`} />
                     <span>
                       {sandbox.active
-                        ? '有効 — 作業フォルダのみ可視'
+                        ? '有効 — 作業フォルダとチャット別実行環境を隔離'
                         : sandbox.backend === 'mock'
-                          ? 'モックモード'
+                          ? 'モックモード（非隔離・未保証）'
                           : sandbox.mode === 'off'
-                            ? '無効'
-                            : '未有効化'}
+                            ? '無効（非隔離・未保証）'
+                            : '未有効化（非隔離・未保証）'}
                     </span>
                   </div>
                 </div>
               </div>
-              {sandbox.reason && !sandbox.active && (
+              {!sandbox.active && (
                 <div className="notif-meta-row">
                   <div className="muted-xs">
-                    <div>{sandbox.reason}</div>
+                    <div>
+                      {sandbox.reason ??
+                        '非隔離モードのため、共通ベースの読み取り専用保護およびチャット単位のパッケージ差分・プロセス隔離は保証されません。'}
+                    </div>
                     {sandbox.remediation && (
                       <div style={{ marginTop: 4 }}>{sandbox.remediation}</div>
                     )}

@@ -254,7 +254,9 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
       expect(hasContiguousSlice(spec.args, ['--dir', '/home'])).toBe(true);
       expect(hasContiguousSlice(spec.args, ['--dir', '/root'])).toBe(true);
       expect(hasContiguousSlice(spec.args, ['--bind', workspaceDir, '/workspace'])).toBe(true);
-      expect(hasContiguousSlice(spec.args, ['--bind', profileDir, SANDBOX_HOME_MOUNT])).toBe(true);
+      const chatHomeHostDir = path.join(profileDir, '.chat-homes', path.basename(workspaceDir));
+      expect(hasContiguousSlice(spec.args, ['--bind', chatHomeHostDir, SANDBOX_HOME_MOUNT])).toBe(true);
+      expect(hasContiguousSlice(spec.args, ['--bind', profileDir, SANDBOX_HOME_MOUNT])).toBe(false);
       const chatBrainHostDir = getChatBrainHostDir(profileDir, workspaceDir);
       expect(
         hasContiguousSlice(spec.args, [
@@ -448,7 +450,7 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
     const workspaceDir = path.join(tmpDir, 'workspaces', 'chat');
     fs.mkdirSync(workspaceDir, { recursive: true });
 
-    // Real bwrap command spec masks .chat-brains / .chat-homes / .chat-scratch / .chat-playground
+    // Real bwrap command spec binds persistent per-chat home instead of profileDir, keeping .chat-* unmounted
     const realCfg = loadConfig({ agyMode: 'real', sandboxMode: 'auto', agyBin: 'echo' });
     const spec = buildAgyCommandSpec({
       config: realCfg,
@@ -458,10 +460,9 @@ describe('Draft Chat History Filtering & Workspace Sandbox', () => {
       enableSandboxBwrap: true,
     });
     if (spec.sandboxed) {
-      expect(hasContiguousSlice(spec.args, ['--tmpfs', `${SANDBOX_HOME_MOUNT}/.chat-brains`])).toBe(true);
-      expect(hasContiguousSlice(spec.args, ['--tmpfs', `${SANDBOX_HOME_MOUNT}/.chat-homes`])).toBe(true);
-      expect(hasContiguousSlice(spec.args, ['--tmpfs', `${SANDBOX_HOME_MOUNT}/.chat-scratch`])).toBe(true);
-      expect(hasContiguousSlice(spec.args, ['--tmpfs', `${SANDBOX_HOME_MOUNT}/.chat-playground`])).toBe(true);
+      const chatHomeHostDir = path.join(profileDir, '.chat-homes', path.basename(workspaceDir));
+      expect(hasContiguousSlice(spec.args, ['--bind', chatHomeHostDir, SANDBOX_HOME_MOUNT])).toBe(true);
+      expect(hasContiguousSlice(spec.args, ['--bind', profileDir, SANDBOX_HOME_MOUNT])).toBe(false);
     }
 
     // API workspace check: chat-1 has generated artifact, chat-2 has none

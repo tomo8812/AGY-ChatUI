@@ -84,6 +84,17 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
     } catch (err) {
       app.log.error({ err, profileDir }, 'Failed to initialize Antigravity profile settings');
     }
+    try {
+      const migration = skillService.syncBuiltinSkillsToProfile(profileDir);
+      if (migration.preservedCustom.length > 0) {
+        app.log.warn(
+          { profileDir, preservedCustom: migration.preservedCustom },
+          'Preserved modified legacy built-in skills as custom skills with backups'
+        );
+      }
+    } catch (err) {
+      app.log.error({ err, profileDir }, 'Failed to sync built-in skills to profile');
+    }
   }
 
   await app.register(cookie);
@@ -108,7 +119,7 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
     };
   });
 
-  await registerAuthRoutes(app, { config, db, hub, agyAuth, buildId, buildInfo });
+  await registerAuthRoutes(app, { config, db, hub, agyAuth, skillService, buildId, buildInfo });
   await registerProjectRoutes(app, { config, db, hub, agyAuth });
   await registerChatRoutes(app, { config, db, hub, agyAuth, acp, scheduler, skillService });
   await registerFileRoutes(app, { config, db, hub, agyAuth });
