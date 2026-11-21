@@ -619,6 +619,7 @@ interface WorkerInstance {
   needsConfigReload: boolean;
   mcpConfigEpoch: number;
   detachedElicitationResolvers: Map<string, (resp: CreateElicitationResponse) => void>;
+  idleWaiters: Set<() => void>;
 }
 
 export class AcpClientManager {
@@ -646,9 +647,46 @@ export class AcpClientManager {
     return this.globalMcpConfigEpoch + (this.userMcpConfigEpoch.get(userId) ?? 0);
   }
 
+  private notifyWorkerIdleWaiters(w: WorkerInstance): void {
+    if (w.idleWaiters.size === 0) return;
+    for (const notify of w.idleWaiters) {
+      notify();
+    }
+    w.idleWaiters.clear();
+  }
+
+  private waitForWorkerIdleOrExit(w: WorkerInstance, abortSignal?: AbortSignal): Promise<void> {
+    if (!this.isWorkerBusy(w) || w.process.killed || w.process.exitCode !== null) {
+      return Promise.resolve();
+    }
+    if (abortSignal?.aborted) {
+      return Promise.reject(
+        new Error('バックグラウンド処理完了後の設定反映待機中にキャンセルされました。')
+      );
+    }
+    return new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        w.idleWaiters.delete(onIdle);
+        abortSignal?.removeEventListener('abort', onAbort);
+      };
+      const onIdle = () => {
+        cleanup();
+        resolve();
+      };
+      const onAbort = () => {
+        cleanup();
+        reject(new Error('バックグラウンド処理完了後の設定反映待機中にキャンセルされました。'));
+      };
+      w.idleWaiters.add(onIdle);
+      abortSignal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
   private maybeReloadIdleFlaggedWorker(w: WorkerInstance): void {
+    if (this.isWorkerBusy(w)) return;
+    this.notifyWorkerIdleWaiters(w);
     const stale = w.needsConfigReload || w.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(w.userId);
-    if (stale && !this.isWorkerBusy(w)) {
+    if (stale) {
       void this.stopWorkerByKey(w.key);
     }
   }
@@ -1357,7 +1395,7 @@ export class AcpClientManager {
       this.skillService.syncProjectSkillsToChat(params.userId, chat.projectId, chat.workspaceDir);
     }
 
-    const worker = await this.getOrStartWorker(params.userId, params.chatId);
+    const worker = await this.getOrStartWorker(params.userId, params.chatId, params.abortSignal);
     if (worker.userId !== params.userId || !worker.acpSessionId) {
       throw new Error('ACP session mismatch or unavailable');
     }
@@ -1569,38 +1607,62 @@ export class AcpClientManager {
     }
   }
 
-  private async getOrStartWorker(userId: string, chatId: string): Promise<WorkerInstance> {
+  private async getOrStartWorker(
+    userId: string,
+    chatId: string,
+    abortSignal?: AbortSignal
+  ): Promise<WorkerInstance> {
     const key = `${userId}:${chatId}`;
-    const existing = this.workers.get(key);
-    if (existing && !existing.process.killed && existing.process.exitCode === null) {
-      const staleConfig =
-        existing.needsConfigReload || existing.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId);
-      if (staleConfig && !this.isWorkerBusy(existing)) {
+    while (true) {
+      const existing = this.workers.get(key);
+      if (existing && !existing.process.killed && existing.process.exitCode === null) {
+        const staleConfig =
+          existing.needsConfigReload ||
+          existing.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId);
+        if (!staleConfig) {
+          existing.lastUsedAt = Date.now();
+          return existing;
+        }
+        if (this.isWorkerBusy(existing)) {
+          await this.waitForWorkerIdleOrExit(existing, abortSignal);
+          continue;
+        }
         await this.stopWorkerByKey(key);
-      } else {
-        existing.lastUsedAt = Date.now();
-        return existing;
       }
-    }
 
-    const pendingConnect = this.connecting.get(key);
-    if (pendingConnect) {
-      const connected = await pendingConnect;
-      const staleConfig =
-        connected.needsConfigReload ||
-        connected.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId);
-      if (staleConfig && !this.isWorkerBusy(connected)) {
+      const pendingConnect = this.connecting.get(key);
+      if (pendingConnect) {
+        const connected = await pendingConnect;
+        const staleConfig =
+          connected.needsConfigReload ||
+          connected.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId);
+        if (!staleConfig) {
+          return connected;
+        }
+        if (this.isWorkerBusy(connected)) {
+          await this.waitForWorkerIdleOrExit(connected, abortSignal);
+          continue;
+        }
         await this.stopWorkerByKey(key);
-      } else {
-        return connected;
       }
-    }
 
-    const promise = this.startWorker(userId, chatId).finally(() => {
-      this.connecting.delete(key);
-    });
-    this.connecting.set(key, promise);
-    return promise;
+      const promise = this.startWorker(userId, chatId).finally(() => {
+        this.connecting.delete(key);
+      });
+      this.connecting.set(key, promise);
+      const started = await promise;
+      const staleAfterStart =
+        started.needsConfigReload ||
+        started.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId);
+      if (!staleAfterStart || this.isWorkerBusy(started)) {
+        if (staleAfterStart && this.isWorkerBusy(started)) {
+          await this.waitForWorkerIdleOrExit(started, abortSignal);
+          continue;
+        }
+        return started;
+      }
+      await this.stopWorkerByKey(key);
+    }
   }
 
   private async startWorker(userId: string, chatId: string): Promise<WorkerInstance> {
@@ -1968,6 +2030,9 @@ export class AcpClientManager {
     const conn = acpClientApp.connect(stream);
 
     child.once('exit', () => {
+      if (workerRef) {
+        this.notifyWorkerIdleWaiters(workerRef);
+      }
       if (this.workers.get(workerKey) === workerRef) {
         this.workers.delete(workerKey);
       }
@@ -2192,6 +2257,7 @@ export class AcpClientManager {
       needsConfigReload: startMcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId),
       mcpConfigEpoch: startMcpConfigEpoch,
       detachedElicitationResolvers: new Map(),
+      idleWaiters: new Set(),
     };
 
     this.workers.set(workerKey, workerRef);
@@ -3029,9 +3095,7 @@ export class AcpClientManager {
       if (isBackgroundTurn) {
         this.flushBackgroundBridgeToMessage(worker, turn, syncArtifacts);
       }
-      if (syncArtifacts) {
-        this.maybeReloadIdleFlaggedWorker(worker);
-      }
+      this.maybeReloadIdleFlaggedWorker(worker);
     };
 
     // Route child subagent session notifications cleanly without mixing child scratch output into parent text
@@ -3419,6 +3483,7 @@ export class AcpClientManager {
     const w = this.workers.get(key);
     if (!w) return;
     this.workers.delete(key);
+    this.notifyWorkerIdleWaiters(w);
     try {
       w.conn.close();
     } catch {

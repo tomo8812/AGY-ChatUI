@@ -1910,7 +1910,29 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
     expect(adminAllowAfterStartupSync).toContain('mcp(shared-or-profile/profile_tool)');
     expect(adminAllowAfterStartupSync).not.toContain('mcp(shared-or-profile/shared_tool_2)');
 
-    // 4) Deleting admin's profile override restores shared server's rules for admin cleanly
+    // 4) Disabling admin's profile override falls back to shared server -> clears profile rules & restores shared rules
+    const disableProfile = await admin.request('PATCH', `/api/mcp/servers/${profileId}`, {
+      enabled: false,
+    });
+    expect(disableProfile.status).toBe(200);
+
+    const adminAllowAfterDisable = getAgyPermissionRules(adminProfile.profileDir).allow;
+    expect(adminAllowAfterDisable).not.toContain('mcp(shared-or-profile/profile_tool)');
+    expect(adminAllowAfterDisable).toContain('mcp(shared-or-profile/shared_tool)');
+    expect(adminAllowAfterDisable).toContain('mcp(shared-or-profile/shared_tool_2)');
+
+    // Re-enabling admin's profile override switches back to profile rules cleanly
+    const reenableProfile = await admin.request('PATCH', `/api/mcp/servers/${profileId}`, {
+      enabled: true,
+    });
+    expect(reenableProfile.status).toBe(200);
+
+    const adminAllowAfterReenable = getAgyPermissionRules(adminProfile.profileDir).allow;
+    expect(adminAllowAfterReenable).toContain('mcp(shared-or-profile/profile_tool)');
+    expect(adminAllowAfterReenable).not.toContain('mcp(shared-or-profile/shared_tool)');
+    expect(adminAllowAfterReenable).not.toContain('mcp(shared-or-profile/shared_tool_2)');
+
+    // 5) Deleting admin's profile override restores shared server's rules for admin cleanly
     const delProfile = await admin.request('DELETE', `/api/mcp/servers/${profileId}`);
     expect(delProfile.status).toBe(200);
 
@@ -1918,6 +1940,139 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
     expect(adminAllowAfterDelete).not.toContain('mcp(shared-or-profile/profile_tool)');
     expect(adminAllowAfterDelete).toContain('mcp(shared-or-profile/shared_tool)');
     expect(adminAllowAfterDelete).toContain('mcp(shared-or-profile/shared_tool_2)');
+  });
+
+  it('waits for an active background task to finish undisturbed before reloading disabled MCP tools for a new turn', async () => {
+    const srv = await createTestServer({ allowPrivateMcpUrls: true });
+    servers.push(srv);
+
+    const mockHttpMcp = http.createServer(async (req, res) => {
+      if (req.method === 'POST') {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(Buffer.from(c));
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+          id?: unknown;
+          method?: string;
+          params?: { name?: string };
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        if (body.method === 'tools/list') {
+          res.end(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: body.id,
+              result: {
+                tools: [
+                  { name: 'safe_tool', description: 'Safe' },
+                  { name: 'danger_tool', description: 'Danger' },
+                ],
+              },
+            })
+          );
+          return;
+        }
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: body.id,
+            result: { content: [{ type: 'text', text: `ran:${body.params?.name ?? ''}` }] },
+          })
+        );
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => mockHttpMcp.listen(0, '127.0.0.1', resolve));
+    httpServers.push(mockHttpMcp);
+    const port = (mockHttpMcp.address() as { port: number }).port;
+    const upstreamUrl = `http://127.0.0.1:${port}`;
+
+    const { client: admin } = await registerAndBindAgy(srv.baseUrl, 'bgmcpadmin', 'user:bg-mcp-admin@gmail.com');
+    await admin.connectWs();
+
+    const createRes = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'bg-reload-mcp',
+      scope: 'profile',
+      transport: 'http',
+      url: upstreamUrl,
+    });
+    expect(createRes.status).toBe(201);
+    const mcpId = createRes.data.server.id;
+
+    const chatRes = await admin.request<{ chat: { id: string } }>('POST', '/api/chats', {
+      title: 'Background Task MCP Reload Chat',
+    });
+    const chatId = chatRes.data.chat.id;
+
+    // Turn 1 finishes prompt immediately while leaving a background subagent running for 300ms
+    const turn1Res = await admin.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
+      text: '[BG_MCP_RELOAD_TASK]',
+    });
+    const turn1RunId = turn1Res.data.run.id;
+    await admin.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { run?: { id: string } } }).type === 'run.finished' &&
+        (f.event as { payload?: { run?: { id: string } } }).payload?.run?.id === turn1RunId
+    );
+
+    // While Turn 1's background subagent is still running (inFlight === false, worker busy via background subagent),
+    // admin disables `danger_tool`
+    const patchRes = await admin.request('PATCH', `/api/mcp/servers/${mcpId}`, {
+      disabledTools: ['danger_tool'],
+    });
+    expect(patchRes.status).toBe(200);
+
+    // Start Turn 2 immediately in the same chat while Turn 1's background task is still running
+    const turn2Res = await admin.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
+      text: '[MCP_INSPECT]',
+    });
+    const turn2RunId = turn2Res.data.run.id;
+    await admin.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { run?: { id: string } } }).type === 'run.finished' &&
+        (f.event as { payload?: { run?: { id: string } } }).payload?.run?.id === turn2RunId
+    );
+
+    const detailRes = await admin.request<{
+      messages: Array<{
+        role: string;
+        contentText: string;
+        toolCalls: Array<{ subagentContentText?: string; subagentState?: string }>;
+      }>;
+    }>('GET', `/api/chats/${chatId}`);
+    const assistantMsgs = detailRes.data.messages.filter((m) => m.role === 'assistant');
+
+    // Verify Turn 1's background task finished undisturbed before worker restarted
+    const turn1Logs = assistantMsgs[0]?.toolCalls.map((t) => t.subagentContentText ?? '').join('\n') ?? '';
+    expect(turn1Logs).toContain('背景タスク完了通知');
+    expect(assistantMsgs[0]?.toolCalls[0]?.subagentState).toBe('idle');
+
+    // Verify Turn 2 waited safely and reloaded into a fresh ACP worker with `danger_tool` blocked
+    const turn2Line = assistantMsgs[1]?.contentText ?? '';
+    expect(turn2Line.startsWith('MCP_SERVERS:')).toBe(true);
+    const turn2Servers = JSON.parse(turn2Line.slice('MCP_SERVERS:'.length)) as Array<{ name: string; url: string }>;
+    const updatedProxy = turn2Servers.find((s) => s.name === 'bg-reload-mcp');
+    expect(updatedProxy?.url).toBeTruthy();
+
+    const listResp = await fetch(updatedProxy!.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+    });
+    const listJson = (await listResp.json()) as { result: { tools: Array<{ name: string }> } };
+    expect(listJson.result.tools.map((t) => t.name)).toEqual(['safe_tool']);
+
+    const dangerCall = await fetch(updatedProxy!.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'danger_tool', arguments: {} } }),
+    });
+    const dangerJson = (await dangerCall.json()) as { error?: { code: number } };
+    expect(dangerJson.error?.code).toBe(-32602);
+
+    admin.closeWs();
   });
 });
 
