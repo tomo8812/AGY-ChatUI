@@ -16,6 +16,8 @@ import {
   type AvailableCommand,
   type ClientConnection,
   type ContentBlock,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
   type InitializeResponse,
   type LoadSessionResponse,
   type NewSessionResponse,
@@ -61,7 +63,10 @@ import type {
   AttachmentRef,
   AvailableCommandItem,
   ChatRecord,
+  ElicitationContentValue,
+  ElicitationFormSchema,
   MessageActivity,
+  PendingElicitationRecord,
   PendingPermissionRecord,
   SessionMessageItem,
   SubagentActivityItem,
@@ -75,7 +80,103 @@ import {
   SANDBOX_HOME_MOUNT,
   SANDBOX_WORKSPACE_MOUNT,
 } from './env-isolation.js';
-import { AGY_AGENT_MODES, getAgyAgentMode } from './profile-settings.js';
+import {
+  addAgyAllowPermissionRule,
+  AGY_AGENT_MODES,
+  formatMcpPermissionRule,
+  getAgyAgentMode,
+  isValidAgyPermissionRule,
+} from './profile-settings.js';
+
+export interface KnownMcpServerPermissionTarget {
+  name: string;
+  discoveredTools?: string[];
+}
+
+export function deriveAgyPermissionRule(params: {
+  toolCall: ToolCallItem;
+  knownMcpServers?: Array<string | KnownMcpServerPermissionTarget>;
+  knownMcpServerNames?: string[];
+}): string | null {
+  const { toolCall } = params;
+  if (!toolCall || toolCall.toolCallId.startsWith('interaction_')) {
+    return null;
+  }
+
+  const serverMap = new Map<string, Set<string> | null>();
+  const addKnown = (entry: string | KnownMcpServerPermissionTarget) => {
+    const rawName = typeof entry === 'string' ? entry : entry.name;
+    const cleanName = rawName.trim();
+    if (!cleanName) return;
+    const tools =
+      typeof entry === 'object' && Array.isArray(entry.discoveredTools)
+        ? entry.discoveredTools.map((t) => t.trim()).filter(Boolean)
+        : [];
+    serverMap.set(cleanName, tools.length > 0 ? new Set(tools) : null);
+  };
+  for (const s of params.knownMcpServers ?? []) addKnown(s);
+  for (const s of params.knownMcpServerNames ?? []) addKnown(s);
+
+  if (serverMap.size === 0) {
+    return null;
+  }
+
+  const name = (toolCall.name ?? '').trim();
+  const rawObj =
+    toolCall.rawInput && typeof toolCall.rawInput === 'object' && !Array.isArray(toolCall.rawInput)
+      ? (toolCall.rawInput as Record<string, unknown>)
+      : null;
+
+  const firstStr = (...candidates: unknown[]): string | null => {
+    for (const c of candidates) {
+      if (typeof c === 'string' && c.trim()) return c.trim();
+    }
+    return null;
+  };
+
+  const matchKnownServerTool = (serverName: string, toolName: string): string | null => {
+    if (!serverMap.has(serverName) || !toolName) return null;
+    const discovered = serverMap.get(serverName) ?? null;
+    if (discovered && !discovered.has(toolName)) return null;
+    const rule = formatMcpPermissionRule(serverName, toolName);
+    return isValidAgyPermissionRule(rule) ? rule : null;
+  };
+
+  // 1) Explicit structured MCP metadata matching a registered known MCP server
+  const mcpServerFromInput = firstStr(
+    rawObj?.ServerName,
+    rawObj?.serverName,
+    rawObj?.mcpServer
+  );
+  const mcpToolFromInput = firstStr(
+    rawObj?.ToolName,
+    rawObj?.toolName,
+    rawObj?.mcpTool
+  );
+  if (mcpServerFromInput && mcpToolFromInput) {
+    return matchKnownServerTool(mcpServerFromInput, mcpToolFromInput);
+  }
+
+  // 2) Prefixed eager MCP tool name matching an unambiguous known MCP server
+  for (const [prefix, sep] of [
+    ['mcp__', '__'],
+    ['mcp_', '_'],
+  ] as const) {
+    if (!name.startsWith(prefix)) continue;
+    const rest = name.slice(prefix.length);
+    const matches: string[] = [];
+    for (const srvName of serverMap.keys()) {
+      if (!rest.startsWith(`${srvName}${sep}`)) continue;
+      const candidateTool = rest.slice(srvName.length + sep.length);
+      const rule = matchKnownServerTool(srvName, candidateTool);
+      if (rule) matches.push(rule);
+    }
+    // Only return a rule when the known server + tool identification is completely unambiguous
+    return matches.length === 1 ? matches[0] : null;
+  }
+
+  return null;
+}
 
 export function classifySubagentToolCall(params: {
   name?: string;
@@ -367,6 +468,7 @@ interface ActiveTurnBridge {
   sessionMessages: SessionMessageItem[];
   lastDbFlushAt: number;
   pendingResolvers: Map<string, (outcome: RequestPermissionResponse) => void>;
+  pendingElicitationResolvers: Map<string, (resp: CreateElicitationResponse) => void>;
   beforeWorkspaceSnap: WorkspaceSnapshot;
   emittedArtifactIds: Set<string>;
   lastActivityAt: number;
@@ -403,6 +505,10 @@ interface WorkerInstance {
   turnBridges: Map<string, ActiveTurnBridge>;
   lastBackgroundActivityAt: number;
   stderrTail: string[];
+  needsConfigReload: boolean;
+  mcpConfigEpoch: number;
+  detachedElicitationResolvers: Map<string, (resp: CreateElicitationResponse) => void>;
+  idleWaiters: Set<() => void>;
 }
 
 export class AcpClientManager {
@@ -410,6 +516,8 @@ export class AcpClientManager {
   private readonly connecting = new Map<string, Promise<WorkerInstance>>();
   private readonly userOptionsCache = new Map<string, { options: ParsedSessionOptions; cachedAt: number }>();
   private readonly userOptionProbes = new Map<string, Promise<ParsedSessionOptions | null>>();
+  private globalMcpConfigEpoch = 0;
+  private readonly userMcpConfigEpoch = new Map<string, number>();
   private readonly cleanupTimer: NodeJS.Timeout;
 
   constructor(
@@ -422,6 +530,54 @@ export class AcpClientManager {
   ) {
     this.cleanupTimer = setInterval(() => this.evictIdleWorkers(), 30_000);
     this.cleanupTimer.unref();
+  }
+
+  private getExpectedMcpConfigEpoch(userId: string): number {
+    return this.globalMcpConfigEpoch + (this.userMcpConfigEpoch.get(userId) ?? 0);
+  }
+
+  private notifyWorkerIdleWaiters(w: WorkerInstance): void {
+    if (w.idleWaiters.size === 0) return;
+    for (const notify of w.idleWaiters) {
+      notify();
+    }
+    w.idleWaiters.clear();
+  }
+
+  private waitForWorkerIdleOrExit(w: WorkerInstance, abortSignal?: AbortSignal): Promise<void> {
+    if (!this.isWorkerBusy(w) || w.process.killed || w.process.exitCode !== null) {
+      return Promise.resolve();
+    }
+    if (abortSignal?.aborted) {
+      return Promise.reject(
+        new Error('バックグラウンド処理完了後の設定反映待機中にキャンセルされました。')
+      );
+    }
+    return new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        w.idleWaiters.delete(onIdle);
+        abortSignal?.removeEventListener('abort', onAbort);
+      };
+      const onIdle = () => {
+        cleanup();
+        resolve();
+      };
+      const onAbort = () => {
+        cleanup();
+        reject(new Error('バックグラウンド処理完了後の設定反映待機中にキャンセルされました。'));
+      };
+      w.idleWaiters.add(onIdle);
+      abortSignal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  private maybeReloadIdleFlaggedWorker(w: WorkerInstance): void {
+    if (this.isWorkerBusy(w)) return;
+    this.notifyWorkerIdleWaiters(w);
+    const stale = w.needsConfigReload || w.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(w.userId);
+    if (stale) {
+      void this.stopWorkerByKey(w.key);
+    }
   }
 
   async shutdown(): Promise<void> {
@@ -445,18 +601,31 @@ export class AcpClientManager {
 
   async stopIdleWorkersForUser(userId: string): Promise<void> {
     this.invalidateUserOptionsCache(userId);
-    const keys = [...this.workers.values()]
-      .filter((w) => w.userId === userId && !this.isWorkerBusy(w))
-      .map((w) => w.key);
-    await Promise.allSettled(keys.map((k) => this.stopWorkerByKey(k)));
+    this.userMcpConfigEpoch.set(userId, (this.userMcpConfigEpoch.get(userId) ?? 0) + 1);
+    const idleKeys: string[] = [];
+    for (const w of this.workers.values()) {
+      if (w.userId !== userId) continue;
+      if (this.isWorkerBusy(w)) {
+        w.needsConfigReload = true;
+      } else {
+        idleKeys.push(w.key);
+      }
+    }
+    await Promise.allSettled(idleKeys.map((k) => this.stopWorkerByKey(k)));
   }
 
   async stopIdleWorkersForAllUsers(): Promise<void> {
     this.userOptionsCache.clear();
-    const keys = [...this.workers.values()]
-      .filter((w) => !this.isWorkerBusy(w))
-      .map((w) => w.key);
-    await Promise.allSettled(keys.map((k) => this.stopWorkerByKey(k)));
+    this.globalMcpConfigEpoch += 1;
+    const idleKeys: string[] = [];
+    for (const w of this.workers.values()) {
+      if (this.isWorkerBusy(w)) {
+        w.needsConfigReload = true;
+      } else {
+        idleKeys.push(w.key);
+      }
+    }
+    await Promise.allSettled(idleKeys.map((k) => this.stopWorkerByKey(k)));
   }
 
   async stopChatWorker(userId: string, chatId: string): Promise<void> {
@@ -838,19 +1007,70 @@ export class AcpClientManager {
     chatId: string;
     permissionId: string;
     selectedOptionId: string | null;
+    alwaysAllow?: boolean;
     cancel?: boolean;
     clientId?: string | null;
   }): PendingPermissionRecord | null {
+    const existing = this.db.getPermission(params.userId, params.permissionId);
+    if (!existing || existing.chatId !== params.chatId || existing.status !== 'pending') {
+      return null;
+    }
+
+    const explicitlyRequestedOption =
+      !params.cancel && params.selectedOptionId
+        ? existing.options.find((o) => o.optionId === params.selectedOptionId) ?? null
+        : null;
+    const explicitNonAllow = Boolean(
+      explicitlyRequestedOption && !explicitlyRequestedOption.kind.startsWith('allow')
+    );
+
+    let effectiveOptionId = params.cancel ? null : params.selectedOptionId;
+    if (!params.cancel && params.alwaysAllow && !explicitNonAllow) {
+      const nativeAlwaysOpt = existing.options.find((o) => o.kind === 'allow_always');
+      const allowOnceOpt = existing.options.find((o) => o.kind.startsWith('allow'));
+      if (nativeAlwaysOpt) {
+        effectiveOptionId = nativeAlwaysOpt.optionId;
+      } else if (!effectiveOptionId && allowOnceOpt) {
+        effectiveOptionId = allowOnceOpt.optionId;
+      }
+    }
+
+    const chosenOption = effectiveOptionId
+      ? existing.options.find((o) => o.optionId === effectiveOptionId) ?? null
+      : null;
+    const isChosenAllow = Boolean(chosenOption && chosenOption.kind.startsWith('allow'));
+    const isAlwaysAllow =
+      !params.cancel &&
+      isChosenAllow &&
+      (chosenOption?.kind === 'allow_always' || Boolean(params.alwaysAllow));
+
     const status = params.cancel ? 'cancelled' : 'resolved';
     const updated = this.db.resolvePermissionAtomically({
       userId: params.userId,
       permissionId: params.permissionId,
-      selectedOptionId: params.cancel ? null : params.selectedOptionId,
+      selectedOptionId: effectiveOptionId,
       status,
       clientId: params.clientId,
     });
     if (!updated) {
       return null;
+    }
+
+    if (isAlwaysAllow && existing.alwaysAllowRule) {
+      const profile = this.db.getAgyProfile(params.userId);
+      if (profile) {
+        try {
+          this.db.withAgyProfileSettingsWrite(() => {
+            addAgyAllowPermissionRule(profile.profileDir, existing.alwaysAllowRule!);
+          });
+          const mcpMatch = /^mcp\(([^/]+)\/(.+)\)$/.exec(existing.alwaysAllowRule);
+          if (mcpMatch) {
+            this.mcpService?.recordToolAlwaysAllowFromChat(params.userId, mcpMatch[1], mcpMatch[2]);
+          }
+        } catch (err) {
+          console.warn('[acp] Failed to persist always-allow permission rule:', err);
+        }
+      }
     }
 
     const worker = this.workers.get(`${params.userId}:${params.chatId}`);
@@ -873,15 +1093,26 @@ export class AcpClientManager {
     const resolver = targetBridge?.pendingResolvers.get(params.permissionId);
     if (resolver && targetBridge) {
       targetBridge.pendingResolvers.delete(params.permissionId);
-      if (params.cancel || !params.selectedOptionId) {
+      if (params.cancel || !effectiveOptionId) {
         resolver({ outcome: { outcome: 'cancelled' } });
       } else {
-        resolver({ outcome: { outcome: 'selected', optionId: params.selectedOptionId } });
+        resolver({ outcome: { outcome: 'selected', optionId: effectiveOptionId } });
       }
     }
 
+    const hasPendingForRun =
+      (targetBridge
+        ? targetBridge.pendingResolvers.size > 0 || targetBridge.pendingElicitationResolvers.size > 0
+        : false) ||
+      this.db
+        .listPendingPermissionsForChat(params.userId, params.chatId)
+        .some((p) => p.runId === updated.runId) ||
+      this.db
+        .listPendingElicitationsForChat(params.userId, params.chatId)
+        .some((e) => e.runId === updated.runId);
+
     const run = this.db.getRun(params.userId, updated.runId);
-    if (run && run.status === 'awaiting_permission') {
+    if (run && run.status === 'awaiting_permission' && !hasPendingForRun) {
       this.db.updateRun(params.userId, run.id, { status: 'running' });
     }
 
@@ -890,8 +1121,106 @@ export class AcpClientManager {
       type: 'permission.resolved',
       chatId: params.chatId,
       runId: updated.runId,
-      payload: { permission: updated },
+      payload: { permission: updated, hasPendingForRun },
     });
+    if (worker) {
+      this.maybeReloadIdleFlaggedWorker(worker);
+    }
+    return updated;
+  }
+
+  resolvePendingElicitation(params: {
+    userId: string;
+    chatId: string;
+    elicitationId: string;
+    action: 'accept' | 'decline' | 'cancel';
+    content?: Record<string, ElicitationContentValue> | null;
+    clientId?: string | null;
+  }): PendingElicitationRecord | null {
+    const existing = this.db.getElicitation(params.userId, params.elicitationId);
+    if (!existing || existing.chatId !== params.chatId || existing.status !== 'pending') {
+      return null;
+    }
+
+    const status: PendingElicitationRecord['status'] =
+      params.action === 'cancel' ? 'cancelled' : 'resolved';
+    const responseContent =
+      params.action === 'accept' ? (params.content ?? null) : null;
+
+    const updated = this.db.resolveElicitationAtomically({
+      userId: params.userId,
+      elicitationId: params.elicitationId,
+      selectedAction: params.action,
+      responseContent,
+      status,
+      clientId: params.clientId,
+    });
+    if (!updated) {
+      return null;
+    }
+
+    const worker = this.workers.get(`${params.userId}:${params.chatId}`);
+    let targetBridge: ActiveTurnBridge | null = null;
+    if (worker) {
+      if (worker.activeTurn?.pendingElicitationResolvers.has(params.elicitationId)) {
+        targetBridge = worker.activeTurn;
+      } else {
+        for (const b of worker.turnBridges.values()) {
+          if (b.pendingElicitationResolvers.has(params.elicitationId)) {
+            targetBridge = b;
+            break;
+          }
+        }
+        if (!targetBridge && worker.backgroundBridge?.pendingElicitationResolvers.has(params.elicitationId)) {
+          targetBridge = worker.backgroundBridge;
+        }
+      }
+    }
+    let resolver = targetBridge?.pendingElicitationResolvers.get(params.elicitationId);
+    if (resolver && targetBridge) {
+      targetBridge.pendingElicitationResolvers.delete(params.elicitationId);
+    } else if (worker?.detachedElicitationResolvers.has(params.elicitationId)) {
+      resolver = worker.detachedElicitationResolvers.get(params.elicitationId);
+      worker.detachedElicitationResolvers.delete(params.elicitationId);
+    }
+    if (resolver) {
+      if (params.action === 'accept') {
+        resolver({
+          action: 'accept',
+          ...(responseContent !== null ? { content: responseContent } : {}),
+        });
+      } else {
+        resolver({ action: params.action });
+      }
+    }
+
+    const hasPendingForRun = updated.runId
+      ? (targetBridge
+          ? targetBridge.pendingResolvers.size > 0 || targetBridge.pendingElicitationResolvers.size > 0
+          : false) ||
+        this.db
+          .listPendingPermissionsForChat(params.userId, params.chatId)
+          .some((p) => p.runId === updated.runId) ||
+        this.db
+          .listPendingElicitationsForChat(params.userId, params.chatId)
+          .some((e) => e.runId === updated.runId)
+      : false;
+
+    const run = updated.runId ? this.db.getRun(params.userId, updated.runId) : null;
+    if (run && run.status === 'awaiting_permission' && !hasPendingForRun) {
+      this.db.updateRun(params.userId, run.id, { status: 'running' });
+    }
+
+    this.hub.emitDurable({
+      userId: params.userId,
+      type: 'elicitation.resolved',
+      chatId: params.chatId,
+      runId: updated.runId,
+      payload: { elicitation: updated, hasPendingForRun },
+    });
+    if (worker) {
+      this.maybeReloadIdleFlaggedWorker(worker);
+    }
     return updated;
   }
 
@@ -900,7 +1229,7 @@ export class AcpClientManager {
     if (!worker || !worker.activeTurn || worker.activeTurn.runId !== runId) {
       return;
     }
-    // Reject any awaiting permissions for this run first so prompt returns immediately
+    // Reject any awaiting permissions and elicitations for this run first so prompt returns immediately
     for (const [permId, resolver] of worker.activeTurn.pendingResolvers.entries()) {
       this.db.resolvePermissionAtomically({
         userId,
@@ -911,6 +1240,26 @@ export class AcpClientManager {
       resolver({ outcome: { outcome: 'cancelled' } });
     }
     worker.activeTurn.pendingResolvers.clear();
+
+    for (const [elicitId, resolver] of worker.activeTurn.pendingElicitationResolvers.entries()) {
+      const updated = this.db.resolveElicitationAtomically({
+        userId,
+        elicitationId: elicitId,
+        selectedAction: 'cancel',
+        status: 'cancelled',
+      });
+      if (updated) {
+        this.hub.emitDurable({
+          userId,
+          type: 'elicitation.resolved',
+          chatId,
+          runId,
+          payload: { elicitation: updated },
+        });
+      }
+      resolver({ action: 'cancel' });
+    }
+    worker.activeTurn.pendingElicitationResolvers.clear();
 
     if (worker.acpSessionId) {
       await worker.conn.agent
@@ -935,7 +1284,7 @@ export class AcpClientManager {
       this.skillService.syncProjectSkillsToChat(params.userId, chat.projectId, chat.workspaceDir);
     }
 
-    const worker = await this.getOrStartWorker(params.userId, params.chatId);
+    const worker = await this.getOrStartWorker(params.userId, params.chatId, params.abortSignal);
     if (worker.userId !== params.userId || !worker.acpSessionId) {
       throw new Error('ACP session mismatch or unavailable');
     }
@@ -966,6 +1315,7 @@ export class AcpClientManager {
       sessionMessages: [],
       lastDbFlushAt: nowInit,
       pendingResolvers: new Map(),
+      pendingElicitationResolvers: new Map(),
       beforeWorkspaceSnap: beforeSnap,
       emittedArtifactIds: new Set(),
       lastActivityAt: nowInit,
@@ -1037,11 +1387,13 @@ export class AcpClientManager {
         prompt: promptBlocks,
       });
 
+      // Yield to macrotask queue BEFORE marking initialPromptDone so any trailing
+      // notifications flushed alongside the session/prompt response belong to the
+      // initial turn rather than triggering Reactive Wakeup state transitions.
+      await new Promise((r) => setImmediate(r));
       bridge.initialPromptDone = true;
       bridge.parentState = 'idle';
       bridge.wakeupContentOffset = bridge.contentText.length;
-      // Yield to macrotask queue so any notifications queued in the same stdio frame are processed
-      await new Promise((r) => setImmediate(r));
 
       const hintPaths = bridge.toolCalls.flatMap(tool => (tool.locations ?? [])
         .map(location => toHostWorkspacePath(worker.workspaceDir, worker.sandboxWorkspaceRoot, location.path)));
@@ -1140,28 +1492,70 @@ export class AcpClientManager {
       worker.activeTurn = null;
       worker.inFlight = false;
       worker.lastUsedAt = Date.now();
+      this.maybeReloadIdleFlaggedWorker(worker);
     }
   }
 
-  private async getOrStartWorker(userId: string, chatId: string): Promise<WorkerInstance> {
+  private async getOrStartWorker(
+    userId: string,
+    chatId: string,
+    abortSignal?: AbortSignal
+  ): Promise<WorkerInstance> {
     const key = `${userId}:${chatId}`;
-    const existing = this.workers.get(key);
-    if (existing && !existing.process.killed && existing.process.exitCode === null) {
-      existing.lastUsedAt = Date.now();
-      return existing;
+    while (true) {
+      const existing = this.workers.get(key);
+      if (existing && !existing.process.killed && existing.process.exitCode === null) {
+        const staleConfig =
+          existing.needsConfigReload ||
+          existing.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId);
+        if (!staleConfig) {
+          existing.lastUsedAt = Date.now();
+          return existing;
+        }
+        if (this.isWorkerBusy(existing)) {
+          await this.waitForWorkerIdleOrExit(existing, abortSignal);
+          continue;
+        }
+        await this.stopWorkerByKey(key);
+      }
+
+      const pendingConnect = this.connecting.get(key);
+      if (pendingConnect) {
+        const connected = await pendingConnect;
+        const staleConfig =
+          connected.needsConfigReload ||
+          connected.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId);
+        if (!staleConfig) {
+          return connected;
+        }
+        if (this.isWorkerBusy(connected)) {
+          await this.waitForWorkerIdleOrExit(connected, abortSignal);
+          continue;
+        }
+        await this.stopWorkerByKey(key);
+      }
+
+      const promise = this.startWorker(userId, chatId).finally(() => {
+        this.connecting.delete(key);
+      });
+      this.connecting.set(key, promise);
+      const started = await promise;
+      const staleAfterStart =
+        started.needsConfigReload ||
+        started.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId);
+      if (!staleAfterStart || this.isWorkerBusy(started)) {
+        if (staleAfterStart && this.isWorkerBusy(started)) {
+          await this.waitForWorkerIdleOrExit(started, abortSignal);
+          continue;
+        }
+        return started;
+      }
+      await this.stopWorkerByKey(key);
     }
-
-    const pendingConnect = this.connecting.get(key);
-    if (pendingConnect) return pendingConnect;
-
-    const promise = this.startWorker(userId, chatId).finally(() => {
-      this.connecting.delete(key);
-    });
-    this.connecting.set(key, promise);
-    return promise;
   }
 
   private async startWorker(userId: string, chatId: string): Promise<WorkerInstance> {
+    const startMcpConfigEpoch = this.getExpectedMcpConfigEpoch(userId);
     const profile = this.db.getAgyProfile(userId);
     if (!profile || profile.authStatus !== 'authenticated') {
       throw new Error('Antigravity認証が完了していません。設定から公式認証を完了してください。');
@@ -1288,7 +1682,11 @@ export class AcpClientManager {
         });
         const toolCall: ToolCallItem = {
           toolCallId: params.toolCall.toolCallId,
-          title: params.toolCall.title ?? 'ツール実行の許可',
+          title:
+            params.toolCall.title ??
+            (params.toolCall.toolCallId.startsWith('interaction_')
+              ? 'エージェントからの質問'
+              : 'ツール実行の許可'),
           ...((params.toolCall as { name?: string }).name
             ? { name: (params.toolCall as { name?: string }).name }
             : {}),
@@ -1305,6 +1703,40 @@ export class AcpClientManager {
           name: o.name,
           kind: o.kind,
         }));
+        const isQuestion = toolCall.toolCallId.startsWith('interaction_');
+        const isToolApproval =
+          !isQuestion &&
+          options.some((o) => o.kind.startsWith('allow')) &&
+          options.some((o) => o.kind.startsWith('reject'));
+        const knownMcpServers: KnownMcpServerPermissionTarget[] = (() => {
+          if (!isToolApproval) return [];
+          const byName = new Map<string, KnownMcpServerPermissionTarget>();
+          for (const s of this.db.listEffectiveMcpServersForUser(turn.userId)) {
+            let discoveredTools: string[] = [];
+            try {
+              const parsed = JSON.parse(s.discoveredToolsJson);
+              if (Array.isArray(parsed)) {
+                discoveredTools = parsed
+                  .map((t) =>
+                    t && typeof t === 'object' && typeof (t as { name?: unknown }).name === 'string'
+                      ? (t as { name: string }).name.trim()
+                      : ''
+                  )
+                  .filter(Boolean);
+              }
+            } catch {
+              // ignore malformed cached discovery json
+            }
+            byName.set(s.name, { name: s.name, discoveredTools });
+          }
+          return [...byName.values()];
+        })();
+        const alwaysAllowRule = isToolApproval
+          ? deriveAgyPermissionRule({
+              toolCall,
+              knownMcpServers,
+            })
+          : null;
 
         const record = this.db.createPendingPermission({
           id: permId,
@@ -1313,6 +1745,7 @@ export class AcpClientManager {
           userId: turn.userId,
           toolCall,
           options,
+          alwaysAllowRule,
         });
 
         const existingRun = turn.runId ? this.db.getRun(turn.userId, turn.runId) : null;
@@ -1336,6 +1769,7 @@ export class AcpClientManager {
             runId: turn.runId,
             permissionId: record.id,
             toolTitle: toolCall.title,
+            isQuestion,
           })
           .catch((err) => {
             console.warn('[acp] Push permission notification failed:', err);
@@ -1356,6 +1790,127 @@ export class AcpClientManager {
           };
           signal.addEventListener('abort', onCancelSignal, { once: true });
         });
+      })
+      .onRequest(
+        methods.client.elicitation.create,
+        async ({ params, signal }): Promise<CreateElicitationResponse> => {
+          if (!workerRef) {
+            return { action: 'cancel' };
+          }
+          const activeWorker = workerRef;
+          const req = params as CreateElicitationRequest;
+          const sessionId =
+            'sessionId' in req && typeof req.sessionId === 'string' ? req.sessionId : undefined;
+          const toolCallId =
+            'toolCallId' in req && typeof req.toolCallId === 'string' ? req.toolCallId : undefined;
+          const turn = this.resolveBridgeForElicitation(activeWorker, toolCallId, sessionId);
+          activeWorker.lastUsedAt = Date.now();
+          activeWorker.lastBackgroundActivityAt = Date.now();
+
+          const elicitId = crypto.randomUUID();
+          const targetRunId = turn?.runId ?? null;
+          const targetUserId = turn?.userId ?? activeWorker.userId;
+          const targetChatId = turn?.chatId ?? activeWorker.chatId;
+          const mode: 'form' | 'url' = req.mode === 'url' ? 'url' : 'form';
+          const requestedSchema: ElicitationFormSchema | null =
+            mode === 'form' && 'requestedSchema' in req && req.requestedSchema
+              ? (req.requestedSchema as unknown as ElicitationFormSchema)
+              : null;
+          const externalElicitationId =
+            mode === 'url' && 'elicitationId' in req && typeof req.elicitationId === 'string'
+              ? req.elicitationId
+              : null;
+          const url =
+            mode === 'url' && 'url' in req && typeof req.url === 'string' ? req.url : null;
+
+          const record = this.db.createPendingElicitation({
+            id: elicitId,
+            runId: targetRunId,
+            chatId: targetChatId,
+            userId: targetUserId,
+            toolCallId: toolCallId ?? null,
+            externalElicitationId,
+            mode,
+            message: req.message,
+            requestedSchema,
+            url,
+          });
+
+          const existingRun = targetRunId ? this.db.getRun(targetUserId, targetRunId) : null;
+          if (
+            existingRun &&
+            targetRunId &&
+            (existingRun.status === 'running' || existingRun.status === 'queued')
+          ) {
+            this.db.updateRun(targetUserId, targetRunId, { status: 'awaiting_permission' });
+          }
+
+          this.hub.emitDurable({
+            userId: targetUserId,
+            type: 'elicitation.requested',
+            chatId: targetChatId,
+            runId: targetRunId,
+            payload: { elicitation: record },
+          });
+
+          void this.pushService
+            ?.notifyElicitationRequested({
+              userId: targetUserId,
+              chatId: targetChatId,
+              runId: targetRunId ?? '',
+              elicitationId: record.id,
+              message: record.message,
+            })
+            .catch((err) => {
+              console.warn('[acp] Push elicitation notification failed:', err);
+            });
+
+          return new Promise<CreateElicitationResponse>((resolve) => {
+            const resolverMap = turn
+              ? turn.pendingElicitationResolvers
+              : activeWorker.detachedElicitationResolvers;
+            resolverMap.set(elicitId, resolve);
+            const onCancelSignal = () => {
+              if (resolverMap.delete(elicitId)) {
+                const updated = this.db.resolveElicitationAtomically({
+                  userId: targetUserId,
+                  elicitationId: elicitId,
+                  selectedAction: 'cancel',
+                  status: 'cancelled',
+                });
+                if (updated) {
+                  this.hub.emitDurable({
+                    userId: targetUserId,
+                    type: 'elicitation.resolved',
+                    chatId: targetChatId,
+                    runId: updated.runId,
+                    payload: { elicitation: updated },
+                  });
+                }
+                this.maybeReloadIdleFlaggedWorker(activeWorker);
+                resolve({ action: 'cancel' });
+              }
+            };
+            signal.addEventListener('abort', onCancelSignal, { once: true });
+          });
+        }
+      )
+      .onNotification(methods.client.elicitation.complete, async ({ params }) => {
+        if (!workerRef || !params?.elicitationId) return;
+        const updated = this.db.markElicitationUrlCompleted(
+          workerRef.userId,
+          workerRef.chatId,
+          params.elicitationId
+        );
+        if (updated) {
+          this.hub.emitDurable({
+            userId: workerRef.userId,
+            type: 'elicitation.completed',
+            chatId: workerRef.chatId,
+            runId: updated.runId,
+            payload: { elicitation: updated },
+          });
+        }
       })
       .onNotification(
         methods.client.session.update as unknown as `_${string}`,
@@ -1382,6 +1937,9 @@ export class AcpClientManager {
     const conn = acpClientApp.connect(stream);
 
     child.once('exit', () => {
+      if (workerRef) {
+        this.notifyWorkerIdleWaiters(workerRef);
+      }
       if (this.workers.get(workerKey) === workerRef) {
         this.workers.delete(workerKey);
       }
@@ -1395,6 +1953,7 @@ export class AcpClientManager {
           fs: { readTextFile: true, writeTextFile: supportsWorkspaceTextWrites },
           terminal: false,
           session: { configOptions: { boolean: {} } },
+          elicitation: { form: {}, url: {} },
           subagents: {},
           plan: {},
           auth: { terminal: true },
@@ -1602,6 +2161,10 @@ export class AcpClientManager {
       turnBridges: new Map(),
       lastBackgroundActivityAt: 0,
       stderrTail,
+      needsConfigReload: startMcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId),
+      mcpConfigEpoch: startMcpConfigEpoch,
+      detachedElicitationResolvers: new Map(),
+      idleWaiters: new Set(),
     };
 
     this.workers.set(workerKey, workerRef);
@@ -1783,7 +2346,7 @@ export class AcpClientManager {
   }
 
   private isBridgeBusy(b: ActiveTurnBridge): boolean {
-    if (b.pendingResolvers.size > 0) return true;
+    if (b.pendingResolvers.size > 0 || b.pendingElicitationResolvers.size > 0) return true;
     if (
       b.parentState === 'running' ||
       b.parentState === 'requires_action' ||
@@ -1837,6 +2400,39 @@ export class AcpClientManager {
       if (byTool) return byTool;
     }
     return worker.activeTurn ?? this.ensureBackgroundBridge(worker);
+  }
+
+  private resolveBridgeForElicitation(
+    worker: WorkerInstance,
+    toolCallId?: string,
+    sessionId?: string
+  ): ActiveTurnBridge | null {
+    const bridges = this.getBridgesNewestFirst(worker);
+
+    // Explicit child sessionId must match a tracked subagent bridge; never guess activeTurn.
+    if (sessionId && worker.acpSessionId && sessionId !== worker.acpSessionId) {
+      return bridges.find((b) => b.subagents.has(sessionId)) ?? null;
+    }
+
+    // Explicit toolCallId must match a bridge that owns that tool call; never guess activeTurn.
+    if (toolCallId) {
+      return (
+        bridges.find(
+          (b) =>
+            b.asyncSubagentToolIds.has(toolCallId) ||
+            b.toolCalls.some((tc) => tc.toolCallId === toolCallId)
+        ) ?? null
+      );
+    }
+
+    // Without toolCallId / child sessionId, do not attach to activeTurn if any prior
+    // bridge still has background work running (ambiguous origin).
+    const hasOtherBusyBridge = bridges.some((b) => b !== worker.activeTurn && this.isBridgeBusy(b));
+    if (hasOtherBusyBridge) {
+      return null;
+    }
+
+    return worker.activeTurn ?? null;
   }
 
   private resolveBridgeForNotification(
@@ -2231,6 +2827,7 @@ export class AcpClientManager {
       sessionMessages: [...(latestAssistant.sessionMessages ?? [])],
       lastDbFlushAt: 0,
       pendingResolvers: new Map(),
+      pendingElicitationResolvers: new Map(),
       beforeWorkspaceSnap,
       emittedArtifactIds: new Set(latestAssistant.artifactIds),
       lastActivityAt: Date.now(),
@@ -2405,6 +3002,7 @@ export class AcpClientManager {
       if (isBackgroundTurn) {
         this.flushBackgroundBridgeToMessage(worker, turn, syncArtifacts);
       }
+      this.maybeReloadIdleFlaggedWorker(worker);
     };
 
     // Route child subagent session notifications cleanly without mixing child scratch output into parent text
@@ -2580,6 +3178,7 @@ export class AcpClientManager {
     const anotherForegroundTurnActive = Boolean(worker.activeTurn && turn !== worker.activeTurn);
     if (
       turn.initialPromptDone &&
+      worker.activeTurn !== turn &&
       !isTerminalToolUpdate &&
       !anotherForegroundTurnActive &&
       (update.sessionUpdate === 'agent_message_chunk' ||
@@ -2791,6 +3390,7 @@ export class AcpClientManager {
     const w = this.workers.get(key);
     if (!w) return;
     this.workers.delete(key);
+    this.notifyWorkerIdleWaiters(w);
     try {
       w.conn.close();
     } catch {
@@ -2803,6 +3403,7 @@ export class AcpClientManager {
 
   private isWorkerBusy(w: WorkerInstance): boolean {
     if (w.inFlight || w.activeTurn !== null) return true;
+    if (w.detachedElicitationResolvers.size > 0) return true;
     for (const b of w.turnBridges.values()) {
       if (this.isBridgeBusy(b)) return true;
     }
@@ -2828,7 +3429,8 @@ export class AcpClientManager {
   private evictIdleWorkers(): void {
     const cutoff = Date.now() - this.config.idleWorkerMs;
     for (const w of this.workers.values()) {
-      if (!this.isWorkerBusy(w) && w.lastUsedAt < cutoff) {
+      const stale = w.needsConfigReload || w.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(w.userId);
+      if (!this.isWorkerBusy(w) && (stale || w.lastUsedAt < cutoff)) {
         void this.stopWorkerByKey(w.key);
       }
     }

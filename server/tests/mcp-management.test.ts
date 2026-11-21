@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import http from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
+import { getAgyPermissionRules } from '../src/acp/profile-settings.js';
 import {
   createTestServer,
   registerAndBindAgy,
@@ -1446,5 +1447,633 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
     );
     expect(resolvedExplicitFalse.some((s) => s.name === 'tinyfish-cimd')).toBe(false);
   });
+
+  it('persists discoveredTools, filters disabledTools, and syncs alwaysAllowTools to settings.json permissions.allow', async () => {
+    const srv = await createTestServer({ allowPrivateMcpUrls: true });
+    servers.push(srv);
+
+    const { client: admin, userId: adminUserId } = await registerAndBindAgy(srv.baseUrl, 'syncadmin', 'user:sync-admin');
+    const { userId: memberUserId } = await registerAndBindAgy(srv.baseUrl, 'syncmember', 'user:sync-member');
+
+    let remoteBaseUrl = '';
+    const mockHttpMcp = http.createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(Buffer.from(c));
+      const rpc = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+        id?: number | string;
+        method: string;
+        params?: { name?: string };
+      };
+      if (rpc.method === 'initialize') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: rpc.id,
+          result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'perm-mcp', version: '1.0' } },
+        }));
+        return;
+      }
+      if (rpc.method === 'notifications/initialized') {
+        res.writeHead(202).end();
+        return;
+      }
+      if (rpc.method === 'tools/list') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: rpc.id,
+          result: {
+            tools: [
+              { name: 'tool_alpha', description: 'Alpha tool full description' },
+              { name: 'tool_beta', description: 'Beta tool full description' },
+              { name: 'tool_gamma', description: 'Gamma tool full description' },
+            ],
+          },
+        }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => mockHttpMcp.listen(0, '127.0.0.1', resolve));
+    httpServers.push(mockHttpMcp);
+    const port = (mockHttpMcp.address() as { port: number }).port;
+    remoteBaseUrl = `http://127.0.0.1:${port}`;
+
+    // 1) Create shared MCP server
+    const createRes = await admin.request<{ server: { id: string; discoveredTools: unknown[] } }>(
+      'POST',
+      '/api/mcp/servers',
+      {
+        name: 'perm-sync-mcp',
+        scope: 'shared',
+        transport: 'http',
+        url: `${remoteBaseUrl}/mcp`,
+        authType: 'none',
+      }
+    );
+    expect(createRes.status).toBe(201);
+    const serverId = createRes.data.server.id;
+    expect(createRes.data.server.discoveredTools).toEqual([]);
+
+    // 2) Test persists discoveredTools in DB and returns updated server
+    const testRes = await admin.request<{
+      result: { ok: boolean; tools?: Array<{ name: string; description?: string }> };
+      server?: { discoveredTools: Array<{ name: string; description?: string }> };
+    }>('POST', `/api/mcp/servers/${serverId}/test`, {});
+    expect(testRes.status).toBe(200);
+    expect(testRes.data.result.ok).toBe(true);
+    expect(testRes.data.server?.discoveredTools).toHaveLength(3);
+
+    // 3) Setting tool_alpha to alwaysAllow writes mcp(perm-sync-mcp/tool_alpha) to all profiles' settings.json
+    const allowRes = await admin.request<{ server: { alwaysAllowTools: string[] } }>(
+      'PATCH',
+      `/api/mcp/servers/${serverId}`,
+      { alwaysAllowTools: ['tool_alpha'] }
+    );
+    expect(allowRes.status).toBe(200);
+    expect(allowRes.data.server.alwaysAllowTools).toEqual(['tool_alpha']);
+
+    const adminProfile = srv.ctx.db.getAgyProfile(adminUserId)!;
+    const memberProfile = srv.ctx.db.getAgyProfile(memberUserId)!;
+    expect(getAgyPermissionRules(adminProfile.profileDir).allow).toContain('mcp(perm-sync-mcp/tool_alpha)');
+    expect(getAgyPermissionRules(memberProfile.profileDir).allow).toContain('mcp(perm-sync-mcp/tool_alpha)');
+
+    // 4) Reverting back to Ask (alwaysAllowTools: []) removes the rule from settings.json
+    const askRes = await admin.request<{ server: { alwaysAllowTools: string[] } }>(
+      'PATCH',
+      `/api/mcp/servers/${serverId}`,
+      { alwaysAllowTools: [] }
+    );
+    expect(askRes.status).toBe(200);
+    expect(getAgyPermissionRules(adminProfile.profileDir).allow).not.toContain('mcp(perm-sync-mcp/tool_alpha)');
+    expect(getAgyPermissionRules(memberProfile.profileDir).allow).not.toContain('mcp(perm-sync-mcp/tool_alpha)');
+
+    // 5) Disabling tool_beta excludes it from ACP tools AND excludes it from permissions.allow even if listed
+    const disableRes = await admin.request<{
+      server: { disabledTools: string[]; alwaysAllowTools: string[] };
+    }>('PATCH', `/api/mcp/servers/${serverId}`, {
+      disabledTools: ['tool_beta'],
+      alwaysAllowTools: ['tool_alpha', 'tool_beta'],
+    });
+    expect(disableRes.status).toBe(200);
+    expect(getAgyPermissionRules(adminProfile.profileDir).allow).toContain('mcp(perm-sync-mcp/tool_alpha)');
+    expect(getAgyPermissionRules(adminProfile.profileDir).allow).not.toContain('mcp(perm-sync-mcp/tool_beta)');
+
+    const acpServers = await srv.ctx.mcpService.resolveAcpMcpServersForUser(memberUserId);
+    const acpTarget = acpServers.find((s) => s.name === 'perm-sync-mcp') as { url: string };
+    const listResp = await fetch(acpTarget.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+    });
+    const listJson = (await listResp.json()) as { result: { tools: Array<{ name: string }> } };
+    expect(listJson.result.tools.map((t) => t.name)).toEqual(['tool_alpha', 'tool_gamma']);
+
+    // 6) Newly registered user also receives shared alwaysAllow rules in settings.json
+    const { userId: newUserId } = await registerAndBindAgy(srv.baseUrl, 'latejoiner', 'user:late@gmail.com');
+    const lateProfile = srv.ctx.db.getAgyProfile(newUserId)!;
+    expect(getAgyPermissionRules(lateProfile.profileDir).allow).toContain('mcp(perm-sync-mcp/tool_alpha)');
+
+    // 7) Deleting the MCP server cleans up its mcp(...) rules from settings.json
+    const delRes = await admin.request('DELETE', `/api/mcp/servers/${serverId}`);
+    expect(delRes.status).toBe(200);
+    expect(getAgyPermissionRules(adminProfile.profileDir).allow).not.toContain('mcp(perm-sync-mcp/tool_alpha)');
+    expect(getAgyPermissionRules(memberProfile.profileDir).allow).not.toContain('mcp(perm-sync-mcp/tool_alpha)');
+    expect(getAgyPermissionRules(lateProfile.profileDir).allow).not.toContain('mcp(perm-sync-mcp/tool_alpha)');
+  });
+
+  it('enforces disabledTools before tool discovery and prevents non-owners from mutating shared alwaysAllowTools from chat', async () => {
+    const srv = await createTestServer({ allowPrivateMcpUrls: true });
+    servers.push(srv);
+
+    const mockHttpMcp = http.createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(Buffer.from(c));
+      const rpc = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+        id?: number | string;
+        method: string;
+        params?: { name?: string };
+      };
+      if (rpc.method === 'initialize') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: rpc.id,
+          result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'pre-disc-mcp', version: '1.0' } },
+        }));
+        return;
+      }
+      if (rpc.method === 'notifications/initialized') {
+        res.writeHead(202).end();
+        return;
+      }
+      if (rpc.method === 'tools/list') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: rpc.id,
+          result: {
+            tools: [
+              { name: 'safe_tool', description: 'Safe tool' },
+              { name: 'danger_tool', description: 'Dangerous tool' },
+            ],
+          },
+        }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => mockHttpMcp.listen(0, '127.0.0.1', resolve));
+    httpServers.push(mockHttpMcp);
+    const port = (mockHttpMcp.address() as { port: number }).port;
+    const upstreamUrl = `http://127.0.0.1:${port}`;
+
+    const { client: admin, userId: adminUserId } = await registerAndBindAgy(srv.baseUrl, 'admin', 'user:admin@gmail.com');
+    const { client: member, userId: memberUserId } = await registerAndBindAgy(srv.baseUrl, 'member', 'user:member@gmail.com');
+
+    // Create shared MCP with disabledTools BEFORE any discovery (discoveredToolsJson stays '[]')
+    const sharedCreate = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'pre-discovery-shared',
+      scope: 'shared',
+      transport: 'http',
+      url: upstreamUrl,
+      disabledTools: ['danger_tool'],
+    });
+    expect(sharedCreate.status).toBe(201);
+    const sharedId = sharedCreate.data.server.id;
+    expect(srv.ctx.db.getMcpServerById(sharedId)?.discoveredToolsJson).toBe('[]');
+
+    const acpServers = await srv.ctx.mcpService.resolveAcpMcpServersForUser(memberUserId);
+    const acpTarget = acpServers.find((s) => s.name === 'pre-discovery-shared') as { url: string };
+    expect(acpTarget?.url).toBeTruthy();
+
+    const listResp = await fetch(acpTarget.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+    });
+    const listJson = (await listResp.json()) as { result: { tools: Array<{ name: string }> } };
+    expect(listJson.result.tools.map((t) => t.name)).toEqual(['safe_tool']);
+
+    const callDisabledResp = await fetch(acpTarget.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'danger_tool', arguments: {} } }),
+    });
+    const callDisabledJson = (await callDisabledResp.json()) as { error?: { code: number } };
+    expect(callDisabledJson.error?.code).toBe(-32602);
+
+    // Profile server owned by admin gets updated only by admin, while shared server is untouched
+    const profileCreate = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'admin-profile-mcp',
+      scope: 'profile',
+      transport: 'http',
+      url: upstreamUrl,
+    });
+    expect(profileCreate.status).toBe(201);
+    const profileId = profileCreate.data.server.id;
+
+    srv.ctx.mcpService.recordToolAlwaysAllowFromChat(memberUserId, 'pre-discovery-shared', 'safe_tool');
+    srv.ctx.mcpService.recordToolAlwaysAllowFromChat(adminUserId, 'pre-discovery-shared', 'safe_tool');
+    expect(JSON.parse(srv.ctx.db.getMcpServerById(sharedId)!.alwaysAllowToolsJson)).toEqual([]);
+
+    srv.ctx.mcpService.recordToolAlwaysAllowFromChat(memberUserId, 'admin-profile-mcp', 'safe_tool');
+    expect(JSON.parse(srv.ctx.db.getMcpServerById(profileId)!.alwaysAllowToolsJson)).toEqual([]);
+
+    srv.ctx.mcpService.recordToolAlwaysAllowFromChat(adminUserId, 'admin-profile-mcp', 'safe_tool');
+    expect(JSON.parse(srv.ctx.db.getMcpServerById(profileId)!.alwaysAllowToolsJson)).toEqual(['safe_tool']);
+
+    // Personal chat allow rule on a shared server stays in member's settings.json without leaking into shared toPublicRecord
+    const { addAgyAllowPermissionRule } = await import('../src/acp/profile-settings.js');
+    const memberProfile = srv.ctx.db.getAgyProfile(memberUserId)!;
+    addAgyAllowPermissionRule(memberProfile.profileDir, 'mcp(pre-discovery-shared/safe_tool)');
+
+    const adminList = await admin.request<{ servers: Array<{ id: string; alwaysAllowTools: string[] }> }>(
+      'GET',
+      '/api/mcp/servers'
+    );
+    const sharedFromApi = adminList.data.servers.find((s) => s.id === sharedId);
+    expect(sharedFromApi?.alwaysAllowTools).toEqual([]);
+
+    // Admin PATCH or startup sync preserves member's personal chat allow rule on pre-discovery-shared
+    const patchShared = await admin.request('PATCH', `/api/mcp/servers/${sharedId}`, {
+      description: 'Updated description',
+    });
+    expect(patchShared.status).toBe(200);
+    srv.ctx.mcpService.syncAllSharedMcpPermissionsToProfile(memberProfile.profileDir);
+    expect(getAgyPermissionRules(memberProfile.profileDir).allow).toContain('mcp(pre-discovery-shared/safe_tool)');
+
+    admin.closeWs();
+    member.closeWs();
+  });
+
+  it('reloads MCP tool filters on the next turn after an in-flight busy turn finishes undisturbed', async () => {
+    const srv = await createTestServer({ allowPrivateMcpUrls: true });
+    servers.push(srv);
+
+    const mockHttpMcp = http.createServer(async (req, res) => {
+      if (req.method === 'POST') {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(Buffer.from(c));
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+          id?: unknown;
+          method?: string;
+          params?: { name?: string };
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        if (body.method === 'tools/list') {
+          res.end(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: body.id,
+              result: {
+                tools: [
+                  { name: 'safe_tool', description: 'Safe' },
+                  { name: 'danger_tool', description: 'Danger' },
+                ],
+              },
+            })
+          );
+          return;
+        }
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: body.id,
+            result: { content: [{ type: 'text', text: `ran:${body.params?.name ?? ''}` }] },
+          })
+        );
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => mockHttpMcp.listen(0, '127.0.0.1', resolve));
+    httpServers.push(mockHttpMcp);
+    const port = (mockHttpMcp.address() as { port: number }).port;
+    const upstreamUrl = `http://127.0.0.1:${port}`;
+
+    const { client: admin } = await registerAndBindAgy(srv.baseUrl, 'busyadmin', 'user:busy-admin@gmail.com');
+    await admin.connectWs();
+
+    const createRes = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'busy-reload-mcp',
+      scope: 'profile',
+      transport: 'http',
+      url: upstreamUrl,
+    });
+    expect(createRes.status).toBe(201);
+    const mcpId = createRes.data.server.id;
+
+    const chatRes = await admin.request<{ chat: { id: string } }>('POST', '/api/chats', {
+      title: 'Busy MCP Reload Chat',
+    });
+    const chatId = chatRes.data.chat.id;
+
+    // Start Turn 1 (sleeps 400ms so worker stays actively busy)
+    const turn1Res = await admin.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
+      text: '[SLEEP_MS:400] [MCP_INSPECT]',
+    });
+    const turn1RunId = turn1Res.data.run.id;
+    await admin.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { run?: { id: string } } }).type === 'run.started' &&
+        (f.event as { payload?: { run?: { id: string } } }).payload?.run?.id === turn1RunId
+    );
+
+    // Disable `danger_tool` while Turn 1 is still active/busy
+    const patchRes = await admin.request('PATCH', `/api/mcp/servers/${mcpId}`, {
+      disabledTools: ['danger_tool'],
+    });
+    expect(patchRes.status).toBe(200);
+
+    // Turn 1 must complete cleanly without being killed mid-turn
+    const turn1Finished = await admin.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { run?: { id: string; status: string } } }).type === 'run.finished' &&
+        (f.event as { payload?: { run?: { id: string; status: string } } }).payload?.run?.id === turn1RunId
+    );
+    expect(
+      (turn1Finished.event as { payload: { run: { status: string } } }).payload.run.status
+    ).toBe('completed');
+
+    // Wait briefly for `executeTurn` finally to stop the flagged idle worker before Turn 2
+    const turn2Res = await admin.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
+      text: '[MCP_INSPECT]',
+    });
+    const turn2RunId = turn2Res.data.run.id;
+    await admin.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { run?: { id: string } } }).type === 'run.finished' &&
+        (f.event as { payload?: { run?: { id: string } } }).payload?.run?.id === turn2RunId
+    );
+
+    const detailRes = await admin.request<{ messages: Array<{ role: string; contentText: string }> }>(
+      'GET',
+      `/api/chats/${chatId}`
+    );
+    const assistantMsgs = detailRes.data.messages.filter((m) => m.role === 'assistant');
+    const turn2Line = assistantMsgs[1]?.contentText ?? '';
+    expect(turn2Line.startsWith('MCP_SERVERS:')).toBe(true);
+    const turn2Servers = JSON.parse(turn2Line.slice('MCP_SERVERS:'.length)) as Array<{ name: string; url: string }>;
+    const updatedProxy = turn2Servers.find((s) => s.name === 'busy-reload-mcp');
+    expect(updatedProxy?.url).toBeTruthy();
+
+    // Verify Turn 2's ACP worker received the filtered route where `danger_tool` is blocked
+    const listResp = await fetch(updatedProxy!.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+    });
+    const listJson = (await listResp.json()) as { result: { tools: Array<{ name: string }> } };
+    expect(listJson.result.tools.map((t) => t.name)).toEqual(['safe_tool']);
+
+    const dangerCall = await fetch(updatedProxy!.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'danger_tool', arguments: {} } }),
+    });
+    const dangerJson = (await dangerCall.json()) as { error?: { code: number } };
+    expect(dangerJson.error?.code).toBe(-32602);
+
+    admin.closeWs();
+  });
+
+  it('isolates same-name shared and profile MCP alwaysAllow permissions per user in settings.json', async () => {
+    const srv = await createTestServer({ allowPrivateMcpUrls: true });
+    servers.push(srv);
+
+    const { client: admin, userId: adminUserId } = await registerAndBindAgy(
+      srv.baseUrl,
+      'iso_admin',
+      'user:iso-admin@gmail.com'
+    );
+    const { userId: memberUserId } = await registerAndBindAgy(
+      srv.baseUrl,
+      'iso_member',
+      'user:iso-member@gmail.com'
+    );
+    const adminProfile = srv.ctx.db.getAgyProfile(adminUserId)!;
+    const memberProfile = srv.ctx.db.getAgyProfile(memberUserId)!;
+
+    // 1) Shared server with `shared_tool` always-allowed
+    const sharedCreate = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'shared-or-profile',
+      scope: 'shared',
+      transport: 'http',
+      url: 'http://127.0.0.1:4100/mcp',
+      alwaysAllowTools: ['shared_tool'],
+    });
+    expect(sharedCreate.status).toBe(201);
+    const sharedId = sharedCreate.data.server.id;
+
+    expect(getAgyPermissionRules(adminProfile.profileDir).allow).toContain('mcp(shared-or-profile/shared_tool)');
+    expect(getAgyPermissionRules(memberProfile.profileDir).allow).toContain('mcp(shared-or-profile/shared_tool)');
+
+    // 2) Admin creates same-name profile server with `profile_tool` always-allowed (overrides shared)
+    const profileCreate = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'shared-or-profile',
+      scope: 'profile',
+      transport: 'http',
+      url: 'http://127.0.0.1:4200/mcp',
+      alwaysAllowTools: ['profile_tool'],
+    });
+    expect(profileCreate.status).toBe(201);
+    const profileId = profileCreate.data.server.id;
+
+    const adminAllowAfterOverride = getAgyPermissionRules(adminProfile.profileDir).allow;
+    expect(adminAllowAfterOverride).toContain('mcp(shared-or-profile/profile_tool)');
+    expect(adminAllowAfterOverride).not.toContain('mcp(shared-or-profile/shared_tool)');
+    expect(getAgyPermissionRules(memberProfile.profileDir).allow).toContain('mcp(shared-or-profile/shared_tool)');
+
+    // 3) Updating shared server's alwaysAllowTools must NOT leak into admin's profile override
+    const sharedPatch = await admin.request('PATCH', `/api/mcp/servers/${sharedId}`, {
+      alwaysAllowTools: ['shared_tool', 'shared_tool_2'],
+    });
+    expect(sharedPatch.status).toBe(200);
+
+    const adminAllowAfterSharedPatch = getAgyPermissionRules(adminProfile.profileDir).allow;
+    expect(adminAllowAfterSharedPatch).toContain('mcp(shared-or-profile/profile_tool)');
+    expect(adminAllowAfterSharedPatch).not.toContain('mcp(shared-or-profile/shared_tool)');
+    expect(adminAllowAfterSharedPatch).not.toContain('mcp(shared-or-profile/shared_tool_2)');
+
+    const memberAllowAfterSharedPatch = getAgyPermissionRules(memberProfile.profileDir).allow;
+    expect(memberAllowAfterSharedPatch).toContain('mcp(shared-or-profile/shared_tool)');
+    expect(memberAllowAfterSharedPatch).toContain('mcp(shared-or-profile/shared_tool_2)');
+    expect(memberAllowAfterSharedPatch).not.toContain('mcp(shared-or-profile/profile_tool)');
+
+    // Startup sync must also preserve admin's profile isolation
+    srv.ctx.mcpService.syncAllSharedMcpPermissionsToProfile(adminProfile.profileDir);
+    const adminAllowAfterStartupSync = getAgyPermissionRules(adminProfile.profileDir).allow;
+    expect(adminAllowAfterStartupSync).toContain('mcp(shared-or-profile/profile_tool)');
+    expect(adminAllowAfterStartupSync).not.toContain('mcp(shared-or-profile/shared_tool_2)');
+
+    // 4) Disabling admin's profile override falls back to shared server -> clears profile rules & restores shared rules
+    const disableProfile = await admin.request('PATCH', `/api/mcp/servers/${profileId}`, {
+      enabled: false,
+    });
+    expect(disableProfile.status).toBe(200);
+
+    const adminAllowAfterDisable = getAgyPermissionRules(adminProfile.profileDir).allow;
+    expect(adminAllowAfterDisable).not.toContain('mcp(shared-or-profile/profile_tool)');
+    expect(adminAllowAfterDisable).toContain('mcp(shared-or-profile/shared_tool)');
+    expect(adminAllowAfterDisable).toContain('mcp(shared-or-profile/shared_tool_2)');
+
+    // Re-enabling admin's profile override switches back to profile rules cleanly
+    const reenableProfile = await admin.request('PATCH', `/api/mcp/servers/${profileId}`, {
+      enabled: true,
+    });
+    expect(reenableProfile.status).toBe(200);
+
+    const adminAllowAfterReenable = getAgyPermissionRules(adminProfile.profileDir).allow;
+    expect(adminAllowAfterReenable).toContain('mcp(shared-or-profile/profile_tool)');
+    expect(adminAllowAfterReenable).not.toContain('mcp(shared-or-profile/shared_tool)');
+    expect(adminAllowAfterReenable).not.toContain('mcp(shared-or-profile/shared_tool_2)');
+
+    // 5) Deleting admin's profile override restores shared server's rules for admin cleanly
+    const delProfile = await admin.request('DELETE', `/api/mcp/servers/${profileId}`);
+    expect(delProfile.status).toBe(200);
+
+    const adminAllowAfterDelete = getAgyPermissionRules(adminProfile.profileDir).allow;
+    expect(adminAllowAfterDelete).not.toContain('mcp(shared-or-profile/profile_tool)');
+    expect(adminAllowAfterDelete).toContain('mcp(shared-or-profile/shared_tool)');
+    expect(adminAllowAfterDelete).toContain('mcp(shared-or-profile/shared_tool_2)');
+  });
+
+  it('waits for an active background task to finish undisturbed before reloading disabled MCP tools for a new turn', async () => {
+    const srv = await createTestServer({ allowPrivateMcpUrls: true });
+    servers.push(srv);
+
+    const mockHttpMcp = http.createServer(async (req, res) => {
+      if (req.method === 'POST') {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(Buffer.from(c));
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+          id?: unknown;
+          method?: string;
+          params?: { name?: string };
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        if (body.method === 'tools/list') {
+          res.end(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: body.id,
+              result: {
+                tools: [
+                  { name: 'safe_tool', description: 'Safe' },
+                  { name: 'danger_tool', description: 'Danger' },
+                ],
+              },
+            })
+          );
+          return;
+        }
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: body.id,
+            result: { content: [{ type: 'text', text: `ran:${body.params?.name ?? ''}` }] },
+          })
+        );
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => mockHttpMcp.listen(0, '127.0.0.1', resolve));
+    httpServers.push(mockHttpMcp);
+    const port = (mockHttpMcp.address() as { port: number }).port;
+    const upstreamUrl = `http://127.0.0.1:${port}`;
+
+    const { client: admin } = await registerAndBindAgy(srv.baseUrl, 'bgmcpadmin', 'user:bg-mcp-admin@gmail.com');
+    await admin.connectWs();
+
+    const createRes = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'bg-reload-mcp',
+      scope: 'profile',
+      transport: 'http',
+      url: upstreamUrl,
+    });
+    expect(createRes.status).toBe(201);
+    const mcpId = createRes.data.server.id;
+
+    const chatRes = await admin.request<{ chat: { id: string } }>('POST', '/api/chats', {
+      title: 'Background Task MCP Reload Chat',
+    });
+    const chatId = chatRes.data.chat.id;
+
+    // Turn 1 finishes prompt immediately while leaving a background subagent running for 300ms
+    const turn1Res = await admin.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
+      text: '[BG_MCP_RELOAD_TASK]',
+    });
+    const turn1RunId = turn1Res.data.run.id;
+    await admin.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { run?: { id: string } } }).type === 'run.finished' &&
+        (f.event as { payload?: { run?: { id: string } } }).payload?.run?.id === turn1RunId
+    );
+
+    // While Turn 1's background subagent is still running (inFlight === false, worker busy via background subagent),
+    // admin disables `danger_tool`
+    const patchRes = await admin.request('PATCH', `/api/mcp/servers/${mcpId}`, {
+      disabledTools: ['danger_tool'],
+    });
+    expect(patchRes.status).toBe(200);
+
+    // Start Turn 2 immediately in the same chat while Turn 1's background task is still running
+    const turn2Res = await admin.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
+      text: '[MCP_INSPECT]',
+    });
+    const turn2RunId = turn2Res.data.run.id;
+    await admin.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { run?: { id: string } } }).type === 'run.finished' &&
+        (f.event as { payload?: { run?: { id: string } } }).payload?.run?.id === turn2RunId
+    );
+
+    const detailRes = await admin.request<{
+      messages: Array<{
+        role: string;
+        contentText: string;
+        toolCalls: Array<{ subagentContentText?: string; subagentState?: string }>;
+      }>;
+    }>('GET', `/api/chats/${chatId}`);
+    const assistantMsgs = detailRes.data.messages.filter((m) => m.role === 'assistant');
+
+    // Verify Turn 1's background task finished undisturbed before worker restarted
+    const turn1Logs = assistantMsgs[0]?.toolCalls.map((t) => t.subagentContentText ?? '').join('\n') ?? '';
+    expect(turn1Logs).toContain('背景タスク完了通知');
+    expect(assistantMsgs[0]?.toolCalls[0]?.subagentState).toBe('idle');
+
+    // Verify Turn 2 waited safely and reloaded into a fresh ACP worker with `danger_tool` blocked
+    const turn2Line = assistantMsgs[1]?.contentText ?? '';
+    expect(turn2Line.startsWith('MCP_SERVERS:')).toBe(true);
+    const turn2Servers = JSON.parse(turn2Line.slice('MCP_SERVERS:'.length)) as Array<{ name: string; url: string }>;
+    const updatedProxy = turn2Servers.find((s) => s.name === 'bg-reload-mcp');
+    expect(updatedProxy?.url).toBeTruthy();
+
+    const listResp = await fetch(updatedProxy!.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+    });
+    const listJson = (await listResp.json()) as { result: { tools: Array<{ name: string }> } };
+    expect(listJson.result.tools.map((t) => t.name)).toEqual(['safe_tool']);
+
+    const dangerCall = await fetch(updatedProxy!.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'danger_tool', arguments: {} } }),
+    });
+    const dangerJson = (await dangerCall.json()) as { error?: { code: number } };
+    expect(dangerJson.error?.code).toBe(-32602);
+
+    admin.closeWs();
+  });
 });
+
 
