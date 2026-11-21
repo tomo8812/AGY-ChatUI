@@ -885,19 +885,23 @@ const ElicitationCard: React.FC<{
         setNotice(`「${label}」は${strProp.maxLength}文字以内で入力してください。`);
         return;
       }
-      if (
-        typeof strProp.pattern === 'string' &&
-        text.length <= MAX_ELICITATION_PATTERN_INPUT_LEN &&
-        isSafeElicitationPattern(strProp.pattern)
-      ) {
-        try {
-          const patternRegex = new RegExp(strProp.pattern);
-          if (!patternRegex.test(text)) {
-            setNotice(`「${label}」の入力形式が一致しません。`);
-            return;
+      if (typeof strProp.pattern === 'string' && strProp.pattern.length > 0) {
+        if (text.length > MAX_ELICITATION_PATTERN_INPUT_LEN) {
+          setNotice(
+            `「${label}」は${MAX_ELICITATION_PATTERN_INPUT_LEN}文字以内で入力してください。`
+          );
+          return;
+        }
+        if (isSafeElicitationPattern(strProp.pattern)) {
+          try {
+            const patternRegex = new RegExp(strProp.pattern);
+            if (!patternRegex.test(text)) {
+              setNotice(`「${label}」の入力形式が一致しません。`);
+              return;
+            }
+          } catch {
+            // Ignore malformed schema regex rather than blocking submission
           }
-        } catch {
-          // Ignore malformed schema regex rather than blocking submission
         }
       }
       content[key] = text;
