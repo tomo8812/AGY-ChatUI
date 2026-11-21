@@ -737,15 +737,52 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
         (f.event as { payload?: { run?: { id: string } } }).payload?.run?.id === fRun.data.run.id
     );
 
-    // 3) ACP elicitation/create (url mode) + elicitation/complete notification
+    // 3) ACP elicitation/create (url mode) + elicitation/complete notification must NOT auto-accept
     const uRun = await alice.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
       text: '[ELICITATION_URL] [AUTO_COMPLETE_URL]',
     });
+    const uReqFrame = await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; runId: string | null }).type === 'elicitation.requested' &&
+        (f.event as { runId: string | null }).runId === uRun.data.run.id
+    );
+    const uElicitId = (
+      uReqFrame.event as { payload: { elicitation: { id: string; urlCompleted: boolean } } }
+    ).payload.elicitation.id;
+    expect(
+      (uReqFrame.event as { payload: { elicitation: { urlCompleted: boolean } } }).payload.elicitation
+        .urlCompleted
+    ).toBe(false);
+
+    const uCompletedFrame = await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; runId: string | null }).type === 'elicitation.completed' &&
+        (f.event as { runId: string | null }).runId === uRun.data.run.id
+    );
+    const completedElicit = (
+      uCompletedFrame.event as { payload: { elicitation: { id: string; status: string; urlCompleted: boolean } } }
+    ).payload.elicitation;
+    expect(completedElicit.id).toBe(uElicitId);
+    expect(completedElicit.urlCompleted).toBe(true);
+    expect(completedElicit.status).toBe('pending');
+
+    // Confirm run stays awaiting explicit user consent rather than auto-accepting
+    await new Promise((r) => setTimeout(r, 120));
+    expect(srv.ctx.db.getElicitation(userId, uElicitId)?.status).toBe('pending');
+    expect(srv.ctx.db.getRun(userId, uRun.data.run.id)?.status).toBe('awaiting_permission');
+
+    const uAcceptRes = await alice.request('POST', `/api/chats/${chatId}/elicitations/${uElicitId}`, {
+      action: 'accept',
+    });
+    expect(uAcceptRes.status).toBe(200);
+
     await alice.waitForFrame(
       (f) =>
         f.kind === 'event' &&
-        (f.event as { type: string; runId: string }).type === 'elicitation.resolved' &&
-        (f.event as { runId: string }).runId === uRun.data.run.id
+        (f.event as { type: string; runId: string | null }).type === 'elicitation.resolved' &&
+        (f.event as { runId: string | null }).runId === uRun.data.run.id
     );
     await alice.waitForFrame(
       (f) =>
@@ -843,6 +880,83 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     );
     const profileAfterReject = srv.ctx.db.getAgyProfile(userId)!;
     expect(getAgyPermissionRules(profileAfterReject.profileDir).allow).not.toContain('write_file(created-by-tool.md)');
+
+    alice.closeWs();
+  });
+
+  it('does not misattribute unverified background elicitation/create to a concurrently active next turn', async () => {
+    const srv = await createTestServer();
+    cleanups.push(srv.cleanup);
+
+    const { client: alice } = await registerAndBindAgy(srv.baseUrl, 'alicebgelicit', 'user:alice-bg-elicit');
+    await alice.connectWs();
+
+    const chatRes = await alice.request<{ chat: { id: string } }>('POST', '/api/chats', {
+      title: 'Concurrent BG Elicitation Test',
+    });
+    const chatId = chatRes.data.chat.id;
+
+    // Turn 1 leaves a background subagent running, then finishes its prompt
+    const turn1Res = await alice.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
+      text: '[BG_ELICITATION_CONCURRENT]',
+    });
+    const turn1RunId = turn1Res.data.run.id;
+    await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { run?: { id: string } } }).type === 'run.finished' &&
+        (f.event as { payload?: { run?: { id: string } } }).payload?.run?.id === turn1RunId
+    );
+
+    // Immediately start Turn 2 so Turn 2 is actively running when Turn 1's unattributed elicitation arrives
+    const turn2Res = await alice.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
+      text: '[SLEEP_MS:400] Turn 2 active',
+    });
+    const turn2RunId = turn2Res.data.run.id;
+
+    const elicitFrame = await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string }).type === 'elicitation.requested'
+    );
+    const requestedElicit = (
+      elicitFrame.event as {
+        runId: string | null;
+        payload: { elicitation: { id: string; runId: string | null; message: string } };
+      }
+    );
+    expect(requestedElicit.runId).toBeNull();
+    expect(requestedElicit.payload.elicitation.runId).toBeNull();
+    expect(requestedElicit.payload.elicitation.runId).not.toBe(turn2RunId);
+
+    // Wait for Turn 2 to finish undisturbed even before resolving the detached background elicitation
+    await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { run?: { id: string; status: string } } }).type === 'run.finished' &&
+        (f.event as { payload?: { run?: { id: string } } }).payload?.run?.id === turn2RunId
+    );
+
+    // Now answer the isolated background elicitation and verify it resolves cleanly
+    const detailWhilePending = await alice.request<{
+      pendingElicitations: Array<{ id: string; runId: string | null }>;
+    }>('GET', `/api/chats/${chatId}`);
+    expect(detailWhilePending.data.pendingElicitations.some((e) => e.id === requestedElicit.payload.elicitation.id)).toBe(true);
+
+    const resolveRes = await alice.request(
+      'POST',
+      `/api/chats/${chatId}/elicitations/${requestedElicit.payload.elicitation.id}`,
+      { action: 'accept', content: { answer: 'isolated-ok' } }
+    );
+    expect(resolveRes.status).toBe(200);
+
+    await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string }).type === 'elicitation.resolved' &&
+        (f.event as { payload?: { elicitation?: { id: string } } }).payload?.elicitation?.id ===
+          requestedElicit.payload.elicitation.id
+    );
 
     alice.closeWs();
   });

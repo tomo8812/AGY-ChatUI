@@ -616,6 +616,9 @@ interface WorkerInstance {
   turnBridges: Map<string, ActiveTurnBridge>;
   lastBackgroundActivityAt: number;
   stderrTail: string[];
+  needsConfigReload: boolean;
+  mcpConfigEpoch: number;
+  detachedElicitationResolvers: Map<string, (resp: CreateElicitationResponse) => void>;
 }
 
 export class AcpClientManager {
@@ -623,6 +626,8 @@ export class AcpClientManager {
   private readonly connecting = new Map<string, Promise<WorkerInstance>>();
   private readonly userOptionsCache = new Map<string, { options: ParsedSessionOptions; cachedAt: number }>();
   private readonly userOptionProbes = new Map<string, Promise<ParsedSessionOptions | null>>();
+  private globalMcpConfigEpoch = 0;
+  private readonly userMcpConfigEpoch = new Map<string, number>();
   private readonly cleanupTimer: NodeJS.Timeout;
 
   constructor(
@@ -635,6 +640,17 @@ export class AcpClientManager {
   ) {
     this.cleanupTimer = setInterval(() => this.evictIdleWorkers(), 30_000);
     this.cleanupTimer.unref();
+  }
+
+  private getExpectedMcpConfigEpoch(userId: string): number {
+    return this.globalMcpConfigEpoch + (this.userMcpConfigEpoch.get(userId) ?? 0);
+  }
+
+  private maybeReloadIdleFlaggedWorker(w: WorkerInstance): void {
+    const stale = w.needsConfigReload || w.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(w.userId);
+    if (stale && !this.isWorkerBusy(w)) {
+      void this.stopWorkerByKey(w.key);
+    }
   }
 
   async shutdown(): Promise<void> {
@@ -658,18 +674,31 @@ export class AcpClientManager {
 
   async stopIdleWorkersForUser(userId: string): Promise<void> {
     this.invalidateUserOptionsCache(userId);
-    const keys = [...this.workers.values()]
-      .filter((w) => w.userId === userId && !this.isWorkerBusy(w))
-      .map((w) => w.key);
-    await Promise.allSettled(keys.map((k) => this.stopWorkerByKey(k)));
+    this.userMcpConfigEpoch.set(userId, (this.userMcpConfigEpoch.get(userId) ?? 0) + 1);
+    const idleKeys: string[] = [];
+    for (const w of this.workers.values()) {
+      if (w.userId !== userId) continue;
+      if (this.isWorkerBusy(w)) {
+        w.needsConfigReload = true;
+      } else {
+        idleKeys.push(w.key);
+      }
+    }
+    await Promise.allSettled(idleKeys.map((k) => this.stopWorkerByKey(k)));
   }
 
   async stopIdleWorkersForAllUsers(): Promise<void> {
     this.userOptionsCache.clear();
-    const keys = [...this.workers.values()]
-      .filter((w) => !this.isWorkerBusy(w))
-      .map((w) => w.key);
-    await Promise.allSettled(keys.map((k) => this.stopWorkerByKey(k)));
+    this.globalMcpConfigEpoch += 1;
+    const idleKeys: string[] = [];
+    for (const w of this.workers.values()) {
+      if (this.isWorkerBusy(w)) {
+        w.needsConfigReload = true;
+      } else {
+        idleKeys.push(w.key);
+      }
+    }
+    await Promise.allSettled(idleKeys.map((k) => this.stopWorkerByKey(k)));
   }
 
   async stopChatWorker(userId: string, chatId: string): Promise<void> {
@@ -1166,6 +1195,9 @@ export class AcpClientManager {
       runId: updated.runId,
       payload: { permission: updated, hasPendingForRun },
     });
+    if (worker) {
+      this.maybeReloadIdleFlaggedWorker(worker);
+    }
     return updated;
   }
 
@@ -1216,9 +1248,14 @@ export class AcpClientManager {
         }
       }
     }
-    const resolver = targetBridge?.pendingElicitationResolvers.get(params.elicitationId);
+    let resolver = targetBridge?.pendingElicitationResolvers.get(params.elicitationId);
     if (resolver && targetBridge) {
       targetBridge.pendingElicitationResolvers.delete(params.elicitationId);
+    } else if (worker?.detachedElicitationResolvers.has(params.elicitationId)) {
+      resolver = worker.detachedElicitationResolvers.get(params.elicitationId);
+      worker.detachedElicitationResolvers.delete(params.elicitationId);
+    }
+    if (resolver) {
       if (params.action === 'accept') {
         resolver({
           action: 'accept',
@@ -1229,18 +1266,19 @@ export class AcpClientManager {
       }
     }
 
-    const hasPendingForRun =
-      (targetBridge
-        ? targetBridge.pendingResolvers.size > 0 || targetBridge.pendingElicitationResolvers.size > 0
-        : false) ||
-      this.db
-        .listPendingPermissionsForChat(params.userId, params.chatId)
-        .some((p) => p.runId === updated.runId) ||
-      this.db
-        .listPendingElicitationsForChat(params.userId, params.chatId)
-        .some((e) => e.runId === updated.runId);
+    const hasPendingForRun = updated.runId
+      ? (targetBridge
+          ? targetBridge.pendingResolvers.size > 0 || targetBridge.pendingElicitationResolvers.size > 0
+          : false) ||
+        this.db
+          .listPendingPermissionsForChat(params.userId, params.chatId)
+          .some((p) => p.runId === updated.runId) ||
+        this.db
+          .listPendingElicitationsForChat(params.userId, params.chatId)
+          .some((e) => e.runId === updated.runId)
+      : false;
 
-    const run = this.db.getRun(params.userId, updated.runId);
+    const run = updated.runId ? this.db.getRun(params.userId, updated.runId) : null;
     if (run && run.status === 'awaiting_permission' && !hasPendingForRun) {
       this.db.updateRun(params.userId, run.id, { status: 'running' });
     }
@@ -1252,6 +1290,9 @@ export class AcpClientManager {
       runId: updated.runId,
       payload: { elicitation: updated, hasPendingForRun },
     });
+    if (worker) {
+      this.maybeReloadIdleFlaggedWorker(worker);
+    }
     return updated;
   }
 
@@ -1418,11 +1459,13 @@ export class AcpClientManager {
         prompt: promptBlocks,
       });
 
+      // Yield to macrotask queue BEFORE marking initialPromptDone so any trailing
+      // notifications flushed alongside the session/prompt response belong to the
+      // initial turn rather than triggering Reactive Wakeup state transitions.
+      await new Promise((r) => setImmediate(r));
       bridge.initialPromptDone = true;
       bridge.parentState = 'idle';
       bridge.wakeupContentOffset = bridge.contentText.length;
-      // Yield to macrotask queue so any notifications queued in the same stdio frame are processed
-      await new Promise((r) => setImmediate(r));
 
       const hintPaths = bridge.toolCalls.flatMap(tool => (tool.locations ?? [])
         .map(location => toHostWorkspacePath(worker.workspaceDir, worker.sandboxWorkspaceRoot, location.path)));
@@ -1521,6 +1564,7 @@ export class AcpClientManager {
       worker.activeTurn = null;
       worker.inFlight = false;
       worker.lastUsedAt = Date.now();
+      this.maybeReloadIdleFlaggedWorker(worker);
     }
   }
 
@@ -1528,12 +1572,28 @@ export class AcpClientManager {
     const key = `${userId}:${chatId}`;
     const existing = this.workers.get(key);
     if (existing && !existing.process.killed && existing.process.exitCode === null) {
-      existing.lastUsedAt = Date.now();
-      return existing;
+      const staleConfig =
+        existing.needsConfigReload || existing.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId);
+      if (staleConfig && !this.isWorkerBusy(existing)) {
+        await this.stopWorkerByKey(key);
+      } else {
+        existing.lastUsedAt = Date.now();
+        return existing;
+      }
     }
 
     const pendingConnect = this.connecting.get(key);
-    if (pendingConnect) return pendingConnect;
+    if (pendingConnect) {
+      const connected = await pendingConnect;
+      const staleConfig =
+        connected.needsConfigReload ||
+        connected.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId);
+      if (staleConfig && !this.isWorkerBusy(connected)) {
+        await this.stopWorkerByKey(key);
+      } else {
+        return connected;
+      }
+    }
 
     const promise = this.startWorker(userId, chatId).finally(() => {
       this.connecting.delete(key);
@@ -1543,6 +1603,7 @@ export class AcpClientManager {
   }
 
   private async startWorker(userId: string, chatId: string): Promise<WorkerInstance> {
+    const startMcpConfigEpoch = this.getExpectedMcpConfigEpoch(userId);
     const profile = this.db.getAgyProfile(userId);
     if (!profile || profile.authStatus !== 'authenticated') {
       throw new Error('Antigravity認証が完了していません。設定から公式認証を完了してください。');
@@ -1754,21 +1815,23 @@ export class AcpClientManager {
       .onRequest(
         methods.client.elicitation.create,
         async ({ params, signal }): Promise<CreateElicitationResponse> => {
+          if (!workerRef) {
+            return { action: 'cancel' };
+          }
+          const activeWorker = workerRef;
           const req = params as CreateElicitationRequest;
           const sessionId =
             'sessionId' in req && typeof req.sessionId === 'string' ? req.sessionId : undefined;
           const toolCallId =
             'toolCallId' in req && typeof req.toolCallId === 'string' ? req.toolCallId : undefined;
-          const turn = workerRef
-            ? this.resolveBridgeForPermission(workerRef, toolCallId, sessionId)
-            : null;
-          if (!workerRef || !turn) {
-            return { action: 'cancel' };
-          }
-          workerRef.lastUsedAt = Date.now();
-          workerRef.lastBackgroundActivityAt = Date.now();
+          const turn = this.resolveBridgeForElicitation(activeWorker, toolCallId, sessionId);
+          activeWorker.lastUsedAt = Date.now();
+          activeWorker.lastBackgroundActivityAt = Date.now();
 
           const elicitId = crypto.randomUUID();
+          const targetRunId = turn?.runId ?? null;
+          const targetUserId = turn?.userId ?? activeWorker.userId;
+          const targetChatId = turn?.chatId ?? activeWorker.chatId;
           const mode: 'form' | 'url' = req.mode === 'url' ? 'url' : 'form';
           const requestedSchema: ElicitationFormSchema | null =
             mode === 'form' && 'requestedSchema' in req && req.requestedSchema
@@ -1783,9 +1846,9 @@ export class AcpClientManager {
 
           const record = this.db.createPendingElicitation({
             id: elicitId,
-            runId: turn.runId,
-            chatId: turn.chatId,
-            userId: turn.userId,
+            runId: targetRunId,
+            chatId: targetChatId,
+            userId: targetUserId,
             toolCallId: toolCallId ?? null,
             externalElicitationId,
             mode,
@@ -1794,27 +1857,28 @@ export class AcpClientManager {
             url,
           });
 
-          const existingRun = turn.runId ? this.db.getRun(turn.userId, turn.runId) : null;
+          const existingRun = targetRunId ? this.db.getRun(targetUserId, targetRunId) : null;
           if (
             existingRun &&
+            targetRunId &&
             (existingRun.status === 'running' || existingRun.status === 'queued')
           ) {
-            this.db.updateRun(turn.userId, turn.runId, { status: 'awaiting_permission' });
+            this.db.updateRun(targetUserId, targetRunId, { status: 'awaiting_permission' });
           }
 
           this.hub.emitDurable({
-            userId: turn.userId,
+            userId: targetUserId,
             type: 'elicitation.requested',
-            chatId: turn.chatId,
-            runId: turn.runId,
+            chatId: targetChatId,
+            runId: targetRunId,
             payload: { elicitation: record },
           });
 
           void this.pushService
             ?.notifyElicitationRequested({
-              userId: turn.userId,
-              chatId: turn.chatId,
-              runId: turn.runId,
+              userId: targetUserId,
+              chatId: targetChatId,
+              runId: targetRunId ?? '',
               elicitationId: record.id,
               message: record.message,
             })
@@ -1823,24 +1887,28 @@ export class AcpClientManager {
             });
 
           return new Promise<CreateElicitationResponse>((resolve) => {
-            turn.pendingElicitationResolvers.set(elicitId, resolve);
+            const resolverMap = turn
+              ? turn.pendingElicitationResolvers
+              : activeWorker.detachedElicitationResolvers;
+            resolverMap.set(elicitId, resolve);
             const onCancelSignal = () => {
-              if (turn.pendingElicitationResolvers.delete(elicitId)) {
+              if (resolverMap.delete(elicitId)) {
                 const updated = this.db.resolveElicitationAtomically({
-                  userId: turn.userId,
+                  userId: targetUserId,
                   elicitationId: elicitId,
                   selectedAction: 'cancel',
                   status: 'cancelled',
                 });
                 if (updated) {
                   this.hub.emitDurable({
-                    userId: turn.userId,
+                    userId: targetUserId,
                     type: 'elicitation.resolved',
-                    chatId: turn.chatId,
-                    runId: turn.runId,
+                    chatId: targetChatId,
+                    runId: updated.runId,
                     payload: { elicitation: updated },
                   });
                 }
+                this.maybeReloadIdleFlaggedWorker(activeWorker);
                 resolve({ action: 'cancel' });
               }
             };
@@ -1850,18 +1918,18 @@ export class AcpClientManager {
       )
       .onNotification(methods.client.elicitation.complete, async ({ params }) => {
         if (!workerRef || !params?.elicitationId) return;
-        const pending = this.db.getPendingElicitationByExternalId(
+        const updated = this.db.markElicitationUrlCompleted(
           workerRef.userId,
           workerRef.chatId,
           params.elicitationId
         );
-        if (pending) {
-          this.resolvePendingElicitation({
+        if (updated) {
+          this.hub.emitDurable({
             userId: workerRef.userId,
+            type: 'elicitation.completed',
             chatId: workerRef.chatId,
-            elicitationId: pending.id,
-            action: 'accept',
-            content: null,
+            runId: updated.runId,
+            payload: { elicitation: updated },
           });
         }
       })
@@ -2111,6 +2179,9 @@ export class AcpClientManager {
       turnBridges: new Map(),
       lastBackgroundActivityAt: 0,
       stderrTail,
+      needsConfigReload: startMcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId),
+      mcpConfigEpoch: startMcpConfigEpoch,
+      detachedElicitationResolvers: new Map(),
     };
 
     this.workers.set(workerKey, workerRef);
@@ -2345,6 +2416,39 @@ export class AcpClientManager {
       if (byTool) return byTool;
     }
     return worker.activeTurn ?? this.ensureBackgroundBridge(worker);
+  }
+
+  private resolveBridgeForElicitation(
+    worker: WorkerInstance,
+    toolCallId?: string,
+    sessionId?: string
+  ): ActiveTurnBridge | null {
+    const bridges = this.getBridgesNewestFirst(worker);
+
+    // Explicit child sessionId must match a tracked subagent bridge; never guess activeTurn.
+    if (sessionId && worker.acpSessionId && sessionId !== worker.acpSessionId) {
+      return bridges.find((b) => b.subagents.has(sessionId)) ?? null;
+    }
+
+    // Explicit toolCallId must match a bridge that owns that tool call; never guess activeTurn.
+    if (toolCallId) {
+      return (
+        bridges.find(
+          (b) =>
+            b.asyncSubagentToolIds.has(toolCallId) ||
+            b.toolCalls.some((tc) => tc.toolCallId === toolCallId)
+        ) ?? null
+      );
+    }
+
+    // Without toolCallId / child sessionId, do not attach to activeTurn if any prior
+    // bridge still has background work running (ambiguous origin).
+    const hasOtherBusyBridge = bridges.some((b) => b !== worker.activeTurn && this.isBridgeBusy(b));
+    if (hasOtherBusyBridge) {
+      return null;
+    }
+
+    return worker.activeTurn ?? null;
   }
 
   private resolveBridgeForNotification(
@@ -2914,6 +3018,9 @@ export class AcpClientManager {
       if (isBackgroundTurn) {
         this.flushBackgroundBridgeToMessage(worker, turn, syncArtifacts);
       }
+      if (syncArtifacts) {
+        this.maybeReloadIdleFlaggedWorker(worker);
+      }
     };
 
     // Route child subagent session notifications cleanly without mixing child scratch output into parent text
@@ -3089,6 +3196,7 @@ export class AcpClientManager {
     const anotherForegroundTurnActive = Boolean(worker.activeTurn && turn !== worker.activeTurn);
     if (
       turn.initialPromptDone &&
+      worker.activeTurn !== turn &&
       !isTerminalToolUpdate &&
       !anotherForegroundTurnActive &&
       (update.sessionUpdate === 'agent_message_chunk' ||
@@ -3312,6 +3420,7 @@ export class AcpClientManager {
 
   private isWorkerBusy(w: WorkerInstance): boolean {
     if (w.inFlight || w.activeTurn !== null) return true;
+    if (w.detachedElicitationResolvers.size > 0) return true;
     for (const b of w.turnBridges.values()) {
       if (this.isBridgeBusy(b)) return true;
     }
@@ -3337,7 +3446,8 @@ export class AcpClientManager {
   private evictIdleWorkers(): void {
     const cutoff = Date.now() - this.config.idleWorkerMs;
     for (const w of this.workers.values()) {
-      if (!this.isWorkerBusy(w) && w.lastUsedAt < cutoff) {
+      const stale = w.needsConfigReload || w.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(w.userId);
+      if (!this.isWorkerBusy(w) && (stale || w.lastUsedAt < cutoff)) {
         void this.stopWorkerByKey(w.key);
       }
     }

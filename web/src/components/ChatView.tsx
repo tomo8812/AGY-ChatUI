@@ -932,6 +932,11 @@ const ElicitationCard: React.FC<{
         ) : elicit.url ? (
           <div className="question-notice">安全でない URL 形式のためリンクを開けません。</div>
         ) : null}
+        {elicit.urlCompleted && (
+          <div className="question-notice">
+            外部手順の完了通知を受信しました。内容を確認して「同意して続行」を押してください。
+          </div>
+        )}
         <div className="question-actions">
           <button
             type="button"
@@ -939,7 +944,7 @@ const ElicitationCard: React.FC<{
             className="btn btn-secondary btn-sm"
             onClick={() => void submitAction('accept', null)}
           >
-            完了
+            同意して続行
           </button>
           <button
             type="button"
@@ -2328,7 +2333,7 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
   const pendingElicitationsByRunId = useMemo(() => {
     const grouped = new Map<string, PendingElicitationRecord[]>();
     for (const e of pendingElicitations) {
-      if (e.status !== 'pending') continue;
+      if (e.status !== 'pending' || !e.runId) continue;
       let bucket = grouped.get(e.runId);
       if (!bucket) {
         bucket = [];

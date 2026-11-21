@@ -1315,13 +1315,15 @@ export const App: React.FC = () => {
       case 'elicitation.requested': {
         const elicit = p.elicitation as PendingElicitationRecord | undefined;
         if (elicit) {
-          setChats((prev) =>
-            prev.map((c) =>
-              c.id === elicit.chatId && c.activeRun?.id === elicit.runId
-                ? { ...c, activeRun: { ...c.activeRun, status: 'awaiting_permission' } }
-                : c
-            )
-          );
+          if (elicit.runId) {
+            setChats((prev) =>
+              prev.map((c) =>
+                c.id === elicit.chatId && c.activeRun?.id === elicit.runId
+                  ? { ...c, activeRun: { ...c.activeRun, status: 'awaiting_permission' } }
+                  : c
+              )
+            );
+          }
           if (evt.chatId === curChatId) {
             if (!pendingElicitationsRef.current.some((x) => x.id === elicit.id)) {
               pendingElicitationsRef.current = [...pendingElicitationsRef.current, elicit];
@@ -1329,9 +1331,11 @@ export const App: React.FC = () => {
             setPendingElicitations((prev) =>
               prev.some((x) => x.id === elicit.id) ? prev : [...prev, elicit]
             );
-            setActiveRun((cur) =>
-              cur && cur.id === elicit.runId ? { ...cur, status: 'awaiting_permission' } : cur
-            );
+            if (elicit.runId) {
+              setActiveRun((cur) =>
+                cur && cur.id === elicit.runId ? { ...cur, status: 'awaiting_permission' } : cur
+              );
+            }
           }
           const hapticOn = Boolean(preferencesRef.current?.hapticFeedback ?? true);
           if (
@@ -1360,6 +1364,18 @@ export const App: React.FC = () => {
         }
         break;
       }
+      case 'elicitation.completed': {
+        const elicit = p.elicitation as PendingElicitationRecord | undefined;
+        if (elicit && evt.chatId === curChatId) {
+          pendingElicitationsRef.current = pendingElicitationsRef.current.map((x) =>
+            x.id === elicit.id ? elicit : x
+          );
+          setPendingElicitations((prev) =>
+            prev.map((x) => (x.id === elicit.id ? elicit : x))
+          );
+        }
+        break;
+      }
       case 'elicitation.resolved': {
         const elicit = p.elicitation as PendingElicitationRecord | undefined;
         if (elicit) {
@@ -1371,10 +1387,11 @@ export const App: React.FC = () => {
           }
           const stillPendingForRun =
             Boolean(p.hasPendingForRun) ||
-            (evt.chatId === curChatId &&
+            (Boolean(elicit.runId) &&
+              evt.chatId === curChatId &&
               (pendingPermissionsRef.current.some((x) => x.runId === elicit.runId) ||
                 pendingElicitationsRef.current.some((x) => x.runId === elicit.runId)));
-          if (!stillPendingForRun) {
+          if (elicit.runId && !stillPendingForRun) {
             setChats((prev) =>
               prev.map((c) =>
                 c.id === elicit.chatId &&

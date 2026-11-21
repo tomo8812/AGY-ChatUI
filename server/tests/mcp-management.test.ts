@@ -1702,6 +1702,222 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
     expect(patchShared.status).toBe(200);
     srv.ctx.mcpService.syncAllSharedMcpPermissionsToProfile(memberProfile.profileDir);
     expect(getAgyPermissionRules(memberProfile.profileDir).allow).toContain('mcp(pre-discovery-shared/safe_tool)');
+
+    admin.closeWs();
+    member.closeWs();
+  });
+
+  it('reloads MCP tool filters on the next turn after an in-flight busy turn finishes undisturbed', async () => {
+    const srv = await createTestServer({ allowPrivateMcpUrls: true });
+    servers.push(srv);
+
+    const mockHttpMcp = http.createServer(async (req, res) => {
+      if (req.method === 'POST') {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(Buffer.from(c));
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+          id?: unknown;
+          method?: string;
+          params?: { name?: string };
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        if (body.method === 'tools/list') {
+          res.end(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: body.id,
+              result: {
+                tools: [
+                  { name: 'safe_tool', description: 'Safe' },
+                  { name: 'danger_tool', description: 'Danger' },
+                ],
+              },
+            })
+          );
+          return;
+        }
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: body.id,
+            result: { content: [{ type: 'text', text: `ran:${body.params?.name ?? ''}` }] },
+          })
+        );
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => mockHttpMcp.listen(0, '127.0.0.1', resolve));
+    httpServers.push(mockHttpMcp);
+    const port = (mockHttpMcp.address() as { port: number }).port;
+    const upstreamUrl = `http://127.0.0.1:${port}`;
+
+    const { client: admin } = await registerAndBindAgy(srv.baseUrl, 'busyadmin', 'user:busy-admin@gmail.com');
+    await admin.connectWs();
+
+    const createRes = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'busy-reload-mcp',
+      scope: 'profile',
+      transport: 'http',
+      url: upstreamUrl,
+    });
+    expect(createRes.status).toBe(201);
+    const mcpId = createRes.data.server.id;
+
+    const chatRes = await admin.request<{ chat: { id: string } }>('POST', '/api/chats', {
+      title: 'Busy MCP Reload Chat',
+    });
+    const chatId = chatRes.data.chat.id;
+
+    // Start Turn 1 (sleeps 400ms so worker stays actively busy)
+    const turn1Res = await admin.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
+      text: '[SLEEP_MS:400] [MCP_INSPECT]',
+    });
+    const turn1RunId = turn1Res.data.run.id;
+    await admin.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { run?: { id: string } } }).type === 'run.started' &&
+        (f.event as { payload?: { run?: { id: string } } }).payload?.run?.id === turn1RunId
+    );
+
+    // Disable `danger_tool` while Turn 1 is still active/busy
+    const patchRes = await admin.request('PATCH', `/api/mcp/servers/${mcpId}`, {
+      disabledTools: ['danger_tool'],
+    });
+    expect(patchRes.status).toBe(200);
+
+    // Turn 1 must complete cleanly without being killed mid-turn
+    const turn1Finished = await admin.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { run?: { id: string; status: string } } }).type === 'run.finished' &&
+        (f.event as { payload?: { run?: { id: string; status: string } } }).payload?.run?.id === turn1RunId
+    );
+    expect(
+      (turn1Finished.event as { payload: { run: { status: string } } }).payload.run.status
+    ).toBe('completed');
+
+    // Wait briefly for `executeTurn` finally to stop the flagged idle worker before Turn 2
+    const turn2Res = await admin.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
+      text: '[MCP_INSPECT]',
+    });
+    const turn2RunId = turn2Res.data.run.id;
+    await admin.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { run?: { id: string } } }).type === 'run.finished' &&
+        (f.event as { payload?: { run?: { id: string } } }).payload?.run?.id === turn2RunId
+    );
+
+    const detailRes = await admin.request<{ messages: Array<{ role: string; contentText: string }> }>(
+      'GET',
+      `/api/chats/${chatId}`
+    );
+    const assistantMsgs = detailRes.data.messages.filter((m) => m.role === 'assistant');
+    const turn2Line = assistantMsgs[1]?.contentText ?? '';
+    expect(turn2Line.startsWith('MCP_SERVERS:')).toBe(true);
+    const turn2Servers = JSON.parse(turn2Line.slice('MCP_SERVERS:'.length)) as Array<{ name: string; url: string }>;
+    const updatedProxy = turn2Servers.find((s) => s.name === 'busy-reload-mcp');
+    expect(updatedProxy?.url).toBeTruthy();
+
+    // Verify Turn 2's ACP worker received the filtered route where `danger_tool` is blocked
+    const listResp = await fetch(updatedProxy!.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+    });
+    const listJson = (await listResp.json()) as { result: { tools: Array<{ name: string }> } };
+    expect(listJson.result.tools.map((t) => t.name)).toEqual(['safe_tool']);
+
+    const dangerCall = await fetch(updatedProxy!.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'danger_tool', arguments: {} } }),
+    });
+    const dangerJson = (await dangerCall.json()) as { error?: { code: number } };
+    expect(dangerJson.error?.code).toBe(-32602);
+
+    admin.closeWs();
+  });
+
+  it('isolates same-name shared and profile MCP alwaysAllow permissions per user in settings.json', async () => {
+    const srv = await createTestServer({ allowPrivateMcpUrls: true });
+    servers.push(srv);
+
+    const { client: admin, userId: adminUserId } = await registerAndBindAgy(
+      srv.baseUrl,
+      'iso_admin',
+      'user:iso-admin@gmail.com'
+    );
+    const { userId: memberUserId } = await registerAndBindAgy(
+      srv.baseUrl,
+      'iso_member',
+      'user:iso-member@gmail.com'
+    );
+    const adminProfile = srv.ctx.db.getAgyProfile(adminUserId)!;
+    const memberProfile = srv.ctx.db.getAgyProfile(memberUserId)!;
+
+    // 1) Shared server with `shared_tool` always-allowed
+    const sharedCreate = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'shared-or-profile',
+      scope: 'shared',
+      transport: 'http',
+      url: 'http://127.0.0.1:4100/mcp',
+      alwaysAllowTools: ['shared_tool'],
+    });
+    expect(sharedCreate.status).toBe(201);
+    const sharedId = sharedCreate.data.server.id;
+
+    expect(getAgyPermissionRules(adminProfile.profileDir).allow).toContain('mcp(shared-or-profile/shared_tool)');
+    expect(getAgyPermissionRules(memberProfile.profileDir).allow).toContain('mcp(shared-or-profile/shared_tool)');
+
+    // 2) Admin creates same-name profile server with `profile_tool` always-allowed (overrides shared)
+    const profileCreate = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'shared-or-profile',
+      scope: 'profile',
+      transport: 'http',
+      url: 'http://127.0.0.1:4200/mcp',
+      alwaysAllowTools: ['profile_tool'],
+    });
+    expect(profileCreate.status).toBe(201);
+    const profileId = profileCreate.data.server.id;
+
+    const adminAllowAfterOverride = getAgyPermissionRules(adminProfile.profileDir).allow;
+    expect(adminAllowAfterOverride).toContain('mcp(shared-or-profile/profile_tool)');
+    expect(adminAllowAfterOverride).not.toContain('mcp(shared-or-profile/shared_tool)');
+    expect(getAgyPermissionRules(memberProfile.profileDir).allow).toContain('mcp(shared-or-profile/shared_tool)');
+
+    // 3) Updating shared server's alwaysAllowTools must NOT leak into admin's profile override
+    const sharedPatch = await admin.request('PATCH', `/api/mcp/servers/${sharedId}`, {
+      alwaysAllowTools: ['shared_tool', 'shared_tool_2'],
+    });
+    expect(sharedPatch.status).toBe(200);
+
+    const adminAllowAfterSharedPatch = getAgyPermissionRules(adminProfile.profileDir).allow;
+    expect(adminAllowAfterSharedPatch).toContain('mcp(shared-or-profile/profile_tool)');
+    expect(adminAllowAfterSharedPatch).not.toContain('mcp(shared-or-profile/shared_tool)');
+    expect(adminAllowAfterSharedPatch).not.toContain('mcp(shared-or-profile/shared_tool_2)');
+
+    const memberAllowAfterSharedPatch = getAgyPermissionRules(memberProfile.profileDir).allow;
+    expect(memberAllowAfterSharedPatch).toContain('mcp(shared-or-profile/shared_tool)');
+    expect(memberAllowAfterSharedPatch).toContain('mcp(shared-or-profile/shared_tool_2)');
+    expect(memberAllowAfterSharedPatch).not.toContain('mcp(shared-or-profile/profile_tool)');
+
+    // Startup sync must also preserve admin's profile isolation
+    srv.ctx.mcpService.syncAllSharedMcpPermissionsToProfile(adminProfile.profileDir);
+    const adminAllowAfterStartupSync = getAgyPermissionRules(adminProfile.profileDir).allow;
+    expect(adminAllowAfterStartupSync).toContain('mcp(shared-or-profile/profile_tool)');
+    expect(adminAllowAfterStartupSync).not.toContain('mcp(shared-or-profile/shared_tool_2)');
+
+    // 4) Deleting admin's profile override restores shared server's rules for admin cleanly
+    const delProfile = await admin.request('DELETE', `/api/mcp/servers/${profileId}`);
+    expect(delProfile.status).toBe(200);
+
+    const adminAllowAfterDelete = getAgyPermissionRules(adminProfile.profileDir).allow;
+    expect(adminAllowAfterDelete).not.toContain('mcp(shared-or-profile/profile_tool)');
+    expect(adminAllowAfterDelete).toContain('mcp(shared-or-profile/shared_tool)');
+    expect(adminAllowAfterDelete).toContain('mcp(shared-or-profile/shared_tool_2)');
   });
 });
 

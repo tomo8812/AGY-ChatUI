@@ -249,7 +249,7 @@ export class AppDatabase {
 
       CREATE TABLE IF NOT EXISTS pending_elicitations (
         id TEXT PRIMARY KEY,
-        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
         chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         tool_call_id TEXT,
@@ -258,6 +258,7 @@ export class AppDatabase {
         message TEXT NOT NULL,
         requested_schema_json TEXT,
         url TEXT,
+        url_completed INTEGER NOT NULL DEFAULT 0,
         status TEXT NOT NULL DEFAULT 'pending',
         selected_action TEXT,
         response_content_json TEXT,
@@ -381,6 +382,51 @@ export class AppDatabase {
     }
     if (!mcpCols.some((col) => col.name === 'discovered_tools_json')) {
       this.db.exec("ALTER TABLE mcp_servers ADD COLUMN discovered_tools_json TEXT NOT NULL DEFAULT '[]';");
+    }
+    const elicitCols = this.db.prepare('PRAGMA table_info(pending_elicitations)').all() as Array<{
+      name: string;
+      notnull: number;
+    }>;
+    if (!elicitCols.some((col) => col.name === 'url_completed')) {
+      this.db.exec('ALTER TABLE pending_elicitations ADD COLUMN url_completed INTEGER NOT NULL DEFAULT 0;');
+    }
+    const elicitRunCol = elicitCols.find((col) => col.name === 'run_id');
+    if (elicitRunCol && Number(elicitRunCol.notnull) === 1) {
+      this.db.exec(`
+        PRAGMA foreign_keys = OFF;
+        CREATE TABLE pending_elicitations_new (
+          id TEXT PRIMARY KEY,
+          run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
+          chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          tool_call_id TEXT,
+          external_elicitation_id TEXT,
+          mode TEXT NOT NULL,
+          message TEXT NOT NULL,
+          requested_schema_json TEXT,
+          url TEXT,
+          url_completed INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'pending',
+          selected_action TEXT,
+          response_content_json TEXT,
+          resolved_by_client_id TEXT,
+          created_at INTEGER NOT NULL,
+          resolved_at INTEGER
+        );
+        INSERT INTO pending_elicitations_new (
+          id, run_id, chat_id, user_id, tool_call_id, external_elicitation_id, mode, message,
+          requested_schema_json, url, url_completed, status, selected_action,
+          response_content_json, resolved_by_client_id, created_at, resolved_at
+        )
+        SELECT
+          id, run_id, chat_id, user_id, tool_call_id, external_elicitation_id, mode, message,
+          requested_schema_json, url, COALESCE(url_completed, 0), status, selected_action,
+          response_content_json, resolved_by_client_id, created_at, resolved_at
+        FROM pending_elicitations;
+        DROP TABLE pending_elicitations;
+        ALTER TABLE pending_elicitations_new RENAME TO pending_elicitations;
+        PRAGMA foreign_keys = ON;
+      `);
     }
   }
 
@@ -570,6 +616,14 @@ export class AppDatabase {
   listAgyProfileDirs(): string[] {
     const rows = this.db.prepare('SELECT profile_dir FROM agy_profiles').all() as { profile_dir: string }[];
     return rows.map((row) => row.profile_dir);
+  }
+
+  listAgyProfiles(): Array<{ userId: string; profileDir: string }> {
+    const rows = this.db.prepare('SELECT user_id, profile_dir FROM agy_profiles').all() as Array<{
+      user_id: string;
+      profile_dir: string;
+    }>;
+    return rows.map((row) => ({ userId: String(row.user_id), profileDir: String(row.profile_dir) }));
   }
 
   withAgyProfileSettingsWrite(write: () => void): void {
@@ -1377,7 +1431,7 @@ export class AppDatabase {
 
   createPendingElicitation(params: {
     id: string;
-    runId: string;
+    runId?: string | null;
     chatId: string;
     userId: string;
     toolCallId?: string | null;
@@ -1392,12 +1446,12 @@ export class AppDatabase {
       .prepare(
         `INSERT INTO pending_elicitations (
            id, run_id, chat_id, user_id, tool_call_id, external_elicitation_id, mode, message,
-           requested_schema_json, url, status, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`
+           requested_schema_json, url, url_completed, status, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', ?)`
       )
       .run(
         params.id,
-        params.runId,
+        params.runId ?? null,
         params.chatId,
         params.userId,
         params.toolCallId ?? null,
@@ -1431,6 +1485,19 @@ export class AppDatabase {
       )
       .get(userId, chatId, externalElicitationId) as Record<string, unknown> | undefined;
     return row ? this.mapElicitation(row) : null;
+  }
+
+  markElicitationUrlCompleted(
+    userId: string,
+    chatId: string,
+    externalElicitationId: string
+  ): PendingElicitationRecord | null {
+    const existing = this.getPendingElicitationByExternalId(userId, chatId, externalElicitationId);
+    if (!existing) return null;
+    this.db
+      .prepare("UPDATE pending_elicitations SET url_completed = 1 WHERE id = ? AND user_id = ? AND status = 'pending'")
+      .run(existing.id, userId);
+    return this.getElicitation(userId, existing.id);
   }
 
   listPendingElicitationsForChat(userId: string, chatId: string): PendingElicitationRecord[] {
@@ -1473,7 +1540,7 @@ export class AppDatabase {
   private mapElicitation(r: Record<string, unknown>): PendingElicitationRecord {
     return {
       id: String(r.id),
-      runId: String(r.run_id),
+      runId: r.run_id ? String(r.run_id) : null,
       chatId: String(r.chat_id),
       userId: String(r.user_id),
       toolCallId: r.tool_call_id ? String(r.tool_call_id) : null,
@@ -1484,6 +1551,7 @@ export class AppDatabase {
         ? (JSON.parse(String(r.requested_schema_json)) as ElicitationFormSchema)
         : null,
       url: r.url ? String(r.url) : null,
+      urlCompleted: Boolean(r.url_completed),
       status: r.status as PendingElicitationRecord['status'],
       selectedAction: (r.selected_action ? String(r.selected_action) : null) as PendingElicitationRecord['selectedAction'],
       responseContent: r.response_content_json
