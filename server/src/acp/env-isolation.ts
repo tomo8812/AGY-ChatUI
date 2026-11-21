@@ -17,7 +17,6 @@ export const SANDBOX_WORKSPACE_MOUNT = '/workspace';
 export const SANDBOX_HOME_MOUNT = '/home/sandbox';
 export const SANDBOX_DOC_RUNTIME_MOUNT = '/opt/agy-doc-runtime';
 export const SANDBOX_CHAT_RUNTIME_MOUNT = '/opt/agy-chat-runtime';
-export const SANDBOX_CHAT_HOOKS_MOUNT = '/opt/agy-chat-hooks';
 
 export function getChatBrainHostDir(profileDir: string, workspaceDir?: string | null): string {
   const profileAbs = path.resolve(profileDir);
@@ -462,7 +461,12 @@ function symlinkIfMissing(targetPath: string, linkPath: string): void {
   if (!fs.existsSync(targetPath)) return;
   try {
     const st = fs.lstatSync(linkPath);
-    if (st.isSymbolicLink() || st.isFile() || st.isDirectory()) return;
+    if (st.isSymbolicLink() || st.isDirectory()) return;
+    if (st.isFile()) {
+      const targetStat = fs.statSync(targetPath);
+      if (st.size > 0 || !targetStat.isFile() || targetStat.size === 0) return;
+      fs.rmSync(linkPath, { force: true });
+    }
   } catch {
     // does not exist
   }
@@ -500,6 +504,40 @@ export function prepareAgyUsageHome(profileDir: string, usageHome: string): void
   }
 }
 
+function ensurePrivateDir(dirPath: string): void {
+  try {
+    if (fs.lstatSync(dirPath).isSymbolicLink()) {
+      fs.rmSync(dirPath, { force: true });
+    }
+  } catch {
+    // missing
+  }
+  fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+}
+
+function clearSymlinkMountPoint(mountHostPath: string): void {
+  try {
+    if (fs.lstatSync(mountHostPath).isSymbolicLink()) {
+      fs.rmSync(mountHostPath, { force: true });
+    }
+  } catch {
+    // missing
+  }
+}
+
+function resolveBindableHostPath(candidate: string): { resolved: string; isDir: boolean } | null {
+  try {
+    const resolved = fs.realpathSync(candidate);
+    const st = fs.statSync(resolved);
+    if (st.isFile() || st.isDirectory()) {
+      return { resolved, isDir: st.isDirectory() };
+    }
+  } catch {
+    // missing or broken symlink
+  }
+  return null;
+}
+
 export function ensurePerChatHomeDir(
   profileDir: string,
   workspaceDir: string,
@@ -513,24 +551,33 @@ export function ensurePerChatHomeDir(
   const chatScratchHostDir = path.join(profileAbs, '.chat-scratch', wsKey);
   const chatPlaygroundHostDir = path.join(profileAbs, '.chat-playground', wsKey);
 
-  fs.mkdirSync(chatHomeDir, { recursive: true, mode: 0o700 });
-  fs.mkdirSync(chatBrainHostDir, { recursive: true, mode: 0o700 });
-  fs.mkdirSync(chatScratchHostDir, { recursive: true, mode: 0o700 });
-  fs.mkdirSync(chatPlaygroundHostDir, { recursive: true, mode: 0o700 });
+  ensurePrivateDir(chatHomeDir);
+  ensurePrivateDir(chatBrainHostDir);
+  ensurePrivateDir(chatScratchHostDir);
+  ensurePrivateDir(chatPlaygroundHostDir);
 
-  // Symlink top-level shared auth/XDG items from profileAbs
-  for (const name of ['.mock-agy-auth.json', '.config', '.local', '.cache']) {
-    symlinkIfMissing(path.join(profileAbs, name), path.join(chatHomeDir, name));
+  // Isolate XDG directories per chat persistently; share only Antigravity auth/user config
+  for (const rel of ['.config', '.local', '.local/share', '.local/state', '.cache']) {
+    ensurePrivateDir(path.join(chatHomeDir, rel));
   }
+  symlinkIfMissing(
+    path.join(profileAbs, '.mock-agy-auth.json'),
+    path.join(chatHomeDir, '.mock-agy-auth.json')
+  );
 
   // Isolate .gemini per chat while sharing auth/config/skills
   const profileGemini = path.join(profileAbs, '.gemini');
   const chatGemini = path.join(chatHomeDir, '.gemini');
-  fs.mkdirSync(chatGemini, { recursive: true, mode: 0o700 });
+  ensurePrivateDir(chatGemini);
 
   const { active: activeBuiltins } = resolveActiveBuiltinSkillsForProfile(profileAbs, builtinSkillsDir);
   const isolatedVendorDirs = new Set(['antigravity', 'antigravity-cli', 'jetski']);
-  const isolatedLeafDirs = new Set(['brain', 'scratch', 'playground']);
+  const isolatedLeafDirs = new Set(['brain', 'scratch', 'playground', 'tmp', 'logs']);
+  const internalConfigEntries = new Set([
+    'skills',
+    '.builtin-skills-state.json',
+    '.builtin-migration-backups',
+  ]);
 
   if (fs.existsSync(profileGemini)) {
     for (const entry of fs.readdirSync(profileGemini, { withFileTypes: true })) {
@@ -543,17 +590,10 @@ export function ensurePerChatHomeDir(
   const chatConfigDir = path.join(chatGemini, 'config');
   const profileConfigDir = path.join(profileGemini, 'config');
   if (activeBuiltins.length > 0) {
-    try {
-      if (fs.lstatSync(chatConfigDir).isSymbolicLink()) {
-        fs.rmSync(chatConfigDir, { force: true });
-      }
-    } catch {
-      // does not exist
-    }
-    fs.mkdirSync(chatConfigDir, { recursive: true, mode: 0o700 });
+    ensurePrivateDir(chatConfigDir);
     if (fs.existsSync(profileConfigDir)) {
       for (const entry of fs.readdirSync(profileConfigDir, { withFileTypes: true })) {
-        if (entry.name === 'skills') continue;
+        if (internalConfigEntries.has(entry.name)) continue;
         symlinkIfMissing(path.join(profileConfigDir, entry.name), path.join(chatConfigDir, entry.name));
       }
     }
@@ -754,24 +794,41 @@ export function buildAgyCommandSpec(params: {
     }
 
     const chatRuntimeHostDir = ensurePerChatRuntimeDir(profileAbs, workspaceAbs, docRuntime);
-    const hooksHostDir = ensureSandboxNodeHooks(profileAbs);
-    bwrapArgs.push(
-      '--bind',
-      chatRuntimeHostDir,
-      SANDBOX_CHAT_RUNTIME_MOUNT,
-      '--ro-bind',
-      hooksHostDir,
-      SANDBOX_CHAT_HOOKS_MOUNT
-    );
+    bwrapArgs.push('--bind', chatRuntimeHostDir, SANDBOX_CHAT_RUNTIME_MOUNT);
+    if (docRuntime?.nodeModulesRel) {
+      bwrapArgs.push(
+        '--bind',
+        path.join(chatRuntimeHostDir, 'node', 'lib', 'node_modules'),
+        '/node_modules'
+      );
+    }
     applySandboxLayeredRuntime(env, docRuntime, sandboxAgyBinDir);
 
-    const chatBrainHostDir = getChatBrainHostDir(profileAbs, workspaceAbs);
     const wsKey = path.basename(workspaceAbs) || 'default';
+    const chatHomeHostDir = path.join(profileAbs, '.chat-homes', wsKey);
+    const chatBrainHostDir = getChatBrainHostDir(profileAbs, workspaceAbs);
     const chatScratchHostDir = path.join(profileAbs, '.chat-scratch', wsKey);
     const chatPlaygroundHostDir = path.join(profileAbs, '.chat-playground', wsKey);
-    fs.mkdirSync(chatBrainHostDir, { recursive: true, mode: 0o700 });
-    fs.mkdirSync(chatScratchHostDir, { recursive: true, mode: 0o700 });
-    fs.mkdirSync(chatPlaygroundHostDir, { recursive: true, mode: 0o700 });
+
+    ensurePrivateDir(chatHomeHostDir);
+    for (const rel of [
+      '.config',
+      '.local',
+      '.local/share',
+      '.local/state',
+      '.cache',
+      '.gemini',
+      '.gemini/antigravity',
+      '.gemini/antigravity-cli',
+      '.gemini/jetski',
+      '.gemini/config',
+    ]) {
+      ensurePrivateDir(path.join(chatHomeHostDir, rel));
+    }
+    ensurePrivateDir(chatBrainHostDir);
+    ensurePrivateDir(chatScratchHostDir);
+    ensurePrivateDir(chatPlaygroundHostDir);
+
     const brainSubdirs = [
       ['.gemini', 'antigravity-cli', 'brain'],
       ['.gemini', 'antigravity', 'brain'],
@@ -790,32 +847,83 @@ export function buildAgyCommandSpec(params: {
       ['.gemini', 'playground'],
     ] as const;
     for (const rel of [...brainSubdirs, ...scratchSubdirs, ...playgroundSubdirs]) {
-      fs.mkdirSync(path.join(profileAbs, ...rel), { recursive: true, mode: 0o700 });
+      ensurePrivateDir(path.join(chatHomeHostDir, ...rel));
     }
-    for (const hiddenDir of [
-      '.chat-brains',
-      '.chat-homes',
-      '.chat-scratch',
-      '.chat-playground',
-      '.chat-runtime',
-    ]) {
-      fs.mkdirSync(path.join(profileAbs, hiddenDir), { recursive: true, mode: 0o700 });
+
+    bwrapArgs.push('--bind', chatHomeHostDir, SANDBOX_HOME_MOUNT);
+
+    const pushSharedBindMount = (hostSource: string, relUnderHome: string, readonly = false) => {
+      const target = resolveBindableHostPath(hostSource);
+      if (!target) return;
+      const stubHostPath = path.join(chatHomeHostDir, relUnderHome);
+      if (target.isDir) {
+        ensurePrivateDir(stubHostPath);
+      } else {
+        ensurePrivateDir(path.dirname(stubHostPath));
+        clearSymlinkMountPoint(stubHostPath);
+        if (!fs.existsSync(stubHostPath)) {
+          fs.writeFileSync(stubHostPath, '', { mode: 0o600 });
+        }
+      }
+      bwrapArgs.push(
+        readonly ? '--ro-bind' : '--bind',
+        target.resolved,
+        `${SANDBOX_HOME_MOUNT}/${relUnderHome}`
+      );
+    };
+
+    // Selectively share ONLY Antigravity authentication and explicitly shared profile config/skills
+    pushSharedBindMount(path.join(profileAbs, '.mock-agy-auth.json'), '.mock-agy-auth.json');
+
+    const profileGemini = path.join(profileAbs, '.gemini');
+    const excludedGeminiRootEntries = new Set([
+      'antigravity',
+      'antigravity-cli',
+      'jetski',
+      'config',
+      'brain',
+      'scratch',
+      'playground',
+      'tmp',
+      'logs',
+    ]);
+    if (fs.existsSync(profileGemini)) {
+      for (const entry of fs.readdirSync(profileGemini, { withFileTypes: true })) {
+        if (excludedGeminiRootEntries.has(entry.name)) continue;
+        pushSharedBindMount(path.join(profileGemini, entry.name), `.gemini/${entry.name}`);
+      }
+    }
+
+    const excludedVendorEntries = new Set(['brain', 'scratch', 'playground', 'tmp', 'logs']);
+    for (const vendor of ['antigravity', 'antigravity-cli', 'jetski'] as const) {
+      const profileVendorDir = path.join(profileGemini, vendor);
+      if (!fs.existsSync(profileVendorDir)) continue;
+      for (const entry of fs.readdirSync(profileVendorDir, { withFileTypes: true })) {
+        if (excludedVendorEntries.has(entry.name)) continue;
+        pushSharedBindMount(
+          path.join(profileVendorDir, entry.name),
+          `.gemini/${vendor}/${entry.name}`
+        );
+      }
+    }
+
+    const profileConfigDir = path.join(profileGemini, 'config');
+    const excludedConfigEntries = new Set([
+      'skills',
+      '.builtin-skills-state.json',
+      '.builtin-migration-backups',
+    ]);
+    if (fs.existsSync(profileConfigDir)) {
+      for (const entry of fs.readdirSync(profileConfigDir, { withFileTypes: true })) {
+        if (excludedConfigEntries.has(entry.name)) continue;
+        pushSharedBindMount(
+          path.join(profileConfigDir, entry.name),
+          `.gemini/config/${entry.name}`
+        );
+      }
     }
 
     bwrapArgs.push(
-      '--bind',
-      profileAbs,
-      SANDBOX_HOME_MOUNT,
-      '--tmpfs',
-      `${SANDBOX_HOME_MOUNT}/.chat-brains`,
-      '--tmpfs',
-      `${SANDBOX_HOME_MOUNT}/.chat-homes`,
-      '--tmpfs',
-      `${SANDBOX_HOME_MOUNT}/.chat-scratch`,
-      '--tmpfs',
-      `${SANDBOX_HOME_MOUNT}/.chat-playground`,
-      '--tmpfs',
-      `${SANDBOX_HOME_MOUNT}/.chat-runtime`,
       '--bind',
       chatBrainHostDir,
       `${SANDBOX_HOME_MOUNT}/.gemini/antigravity-cli/brain`,
@@ -854,31 +962,34 @@ export function buildAgyCommandSpec(params: {
           profileAbs,
           params.config.builtinSkillsDir
         );
-        if (activeBuiltins.length === 0) return [];
         const customSkillsDir = path.join(profileAbs, '.gemini', 'config', 'skills');
-        fs.mkdirSync(customSkillsDir, { recursive: true, mode: 0o700 });
+        const hasCustomSkillsDir = fs.existsSync(customSkillsDir);
+        if (activeBuiltins.length === 0 && !hasCustomSkillsDir) return [];
+        ensurePrivateDir(path.join(chatHomeHostDir, '.gemini', 'config', 'skills'));
         const skillMounts: string[] = [
           '--tmpfs',
           `${SANDBOX_HOME_MOUNT}/.gemini/config/skills`,
         ];
-        const customEntries = fs.readdirSync(customSkillsDir, { withFileTypes: true });
-        for (const entry of customEntries) {
-          if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-          if (!isValidSkillSlug(entry.name)) continue;
-          const candidate = path.join(customSkillsDir, entry.name);
-          if (fs.existsSync(path.join(candidate, LEGACY_BUILTIN_SYNC_MARKER))) continue;
-          if (!fs.existsSync(path.join(candidate, 'SKILL.md'))) continue;
-          let resolvedHostDir: string;
-          try {
-            resolvedHostDir = fs.realpathSync(candidate);
-          } catch {
-            continue;
+        if (hasCustomSkillsDir) {
+          const customEntries = fs.readdirSync(customSkillsDir, { withFileTypes: true });
+          for (const entry of customEntries) {
+            if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+            if (!isValidSkillSlug(entry.name)) continue;
+            const candidate = path.join(customSkillsDir, entry.name);
+            if (fs.existsSync(path.join(candidate, LEGACY_BUILTIN_SYNC_MARKER))) continue;
+            if (!fs.existsSync(path.join(candidate, 'SKILL.md'))) continue;
+            let resolvedHostDir: string;
+            try {
+              resolvedHostDir = fs.realpathSync(candidate);
+            } catch {
+              continue;
+            }
+            skillMounts.push(
+              '--bind',
+              resolvedHostDir,
+              `${SANDBOX_HOME_MOUNT}/.gemini/config/skills/${entry.name}`
+            );
           }
-          skillMounts.push(
-            '--bind',
-            resolvedHostDir,
-            `${SANDBOX_HOME_MOUNT}/.gemini/config/skills/${entry.name}`
-          );
         }
         for (const builtin of activeBuiltins) {
           skillMounts.push(
@@ -1065,60 +1176,107 @@ function ensureSymlinkTarget(targetPath: string, linkPath: string): void {
   fs.symlinkSync(targetPath, linkPath);
 }
 
-const ESM_REGISTER_SCRIPT = `import * as nodeModule from 'node:module';
-if (typeof nodeModule.register === 'function') {
-  nodeModule.register(new URL('./esm-hook.mjs', import.meta.url));
-}
-`;
+function reconcileBaseNodeModulesSymlinks(
+  chatNodeModulesDir: string,
+  docRuntime: DocRuntimeLayout | null,
+  docRuntimeMountRoot: string
+): void {
+  const toPosix = (rel: string) => rel.split(path.sep).join(path.posix.sep);
+  const managedPrefixes = Array.from(
+    new Set([
+      `${toPosix(SANDBOX_DOC_RUNTIME_MOUNT).replace(/\/+$/, '')}/`,
+      `${toPosix(docRuntimeMountRoot).replace(/\/+$/, '')}/`,
+    ])
+  );
+  const isManagedBaseTarget = (target: string): boolean => {
+    const normalized = toPosix(target);
+    return managedPrefixes.some((prefix) => normalized.startsWith(prefix));
+  };
 
-const ESM_HOOK_SCRIPT = `import path from 'node:path';
-import { pathToFileURL } from 'node:url';
-
-const fallbackRoots = (process.env.AGY_NODE_LAYER_PATHS || '')
-  .split(path.delimiter)
-  .map((p) => p.trim())
-  .filter(Boolean);
-
-function isBareSpecifier(specifier) {
-  if (!specifier) return false;
-  if (
-    specifier.startsWith('./') ||
-    specifier.startsWith('../') ||
-    specifier.startsWith('/') ||
-    specifier.startsWith('#')
-  ) {
-    return false;
-  }
-  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(specifier)) return false;
-  return true;
-}
-
-export async function resolve(specifier, context, nextResolve) {
-  try {
-    return await nextResolve(specifier, context);
-  } catch (err) {
-    if (!err || err.code !== 'ERR_MODULE_NOT_FOUND' || !isBareSpecifier(specifier)) {
-      throw err;
-    }
-    for (const root of fallbackRoots) {
-      try {
-        const anchorUrl = pathToFileURL(path.join(root, '_agy_layer_anchor.mjs')).href;
-        return await nextResolve(specifier, { ...context, parentURL: anchorUrl });
-      } catch {
-        // Try next layer
+  const expectedLinks = new Map<string, string>();
+  if (docRuntime?.nodeModulesRel) {
+    const hostBaseNodeModules = path.join(docRuntime.hostDir, docRuntime.nodeModulesRel);
+    const targetBaseRoot = path.posix.join(
+      toPosix(docRuntimeMountRoot),
+      toPosix(docRuntime.nodeModulesRel)
+    );
+    if (fs.existsSync(hostBaseNodeModules)) {
+      for (const entry of fs.readdirSync(hostBaseNodeModules, { withFileTypes: true })) {
+        if (entry.name.startsWith('.')) continue;
+        if (entry.name.startsWith('@')) {
+          const hostScopeDir = path.join(hostBaseNodeModules, entry.name);
+          try {
+            if (!fs.statSync(hostScopeDir).isDirectory()) continue;
+          } catch {
+            continue;
+          }
+          for (const sub of fs.readdirSync(hostScopeDir, { withFileTypes: true })) {
+            if (sub.name.startsWith('.')) continue;
+            expectedLinks.set(
+              `${entry.name}/${sub.name}`,
+              path.posix.join(targetBaseRoot, entry.name, sub.name)
+            );
+          }
+        } else {
+          expectedLinks.set(entry.name, path.posix.join(targetBaseRoot, entry.name));
+        }
       }
     }
-    throw err;
   }
-}
-`;
 
-export function ensureSandboxNodeHooks(profileDir: string): string {
-  const hooksDir = path.join(path.dirname(path.resolve(profileDir)), '.sandbox-etc', 'esm-hooks');
-  fs.mkdirSync(hooksDir, { recursive: true, mode: 0o755 });
-  writeFileIfChanged(path.join(hooksDir, 'esm-register.mjs'), ESM_REGISTER_SCRIPT, 0o644);
-  writeFileIfChanged(path.join(hooksDir, 'esm-hook.mjs'), ESM_HOOK_SCRIPT, 0o644);
-  return hooksDir;
+  // Remove stale or removed base-runtime symlinks while preserving per-chat installs
+  for (const entry of fs.readdirSync(chatNodeModulesDir, { withFileTypes: true })) {
+    const entryPath = path.join(chatNodeModulesDir, entry.name);
+    if (entry.isSymbolicLink()) {
+      try {
+        const target = fs.readlinkSync(entryPath);
+        if (isManagedBaseTarget(target) && expectedLinks.get(entry.name) !== target) {
+          fs.rmSync(entryPath, { force: true });
+        }
+      } catch {
+        // ignore readlink race
+      }
+      continue;
+    }
+    if (entry.name.startsWith('@') && entry.isDirectory()) {
+      for (const sub of fs.readdirSync(entryPath, { withFileTypes: true })) {
+        if (!sub.isSymbolicLink()) continue;
+        const subPath = path.join(entryPath, sub.name);
+        const rel = `${entry.name}/${sub.name}`;
+        try {
+          const target = fs.readlinkSync(subPath);
+          if (isManagedBaseTarget(target) && expectedLinks.get(rel) !== target) {
+            fs.rmSync(subPath, { force: true });
+          }
+        } catch {
+          // ignore readlink race
+        }
+      }
+      try {
+        if (fs.readdirSync(entryPath).length === 0) {
+          fs.rmdirSync(entryPath);
+        }
+      } catch {
+        // ignore non-empty or concurrent write
+      }
+    }
+  }
+
+  for (const [rel, targetPath] of expectedLinks.entries()) {
+    const linkPath = path.join(chatNodeModulesDir, rel);
+    fs.mkdirSync(path.dirname(linkPath), { recursive: true, mode: 0o700 });
+    try {
+      const st = fs.lstatSync(linkPath);
+      // Preserve real directories or user-installed symlinks (e.g. per-chat npm install -g)
+      if (!st.isSymbolicLink()) continue;
+      if (!isManagedBaseTarget(fs.readlinkSync(linkPath))) continue;
+      if (fs.readlinkSync(linkPath) === targetPath) continue;
+      fs.rmSync(linkPath, { force: true });
+    } catch {
+      // missing -> create symlink below
+    }
+    fs.symlinkSync(targetPath, linkPath);
+  }
 }
 
 export function ensurePerChatRuntimeDir(
@@ -1136,6 +1294,7 @@ export function ensurePerChatRuntimeDir(
   const venvBinDir = path.join(venvDir, 'bin');
   const sitePackagesDir = path.join(venvDir, 'lib', pyVerDir, 'site-packages');
   const nodePrefixDir = path.join(chatRuntimeDir, 'node');
+  const chatNodeModulesDir = path.join(nodePrefixDir, 'lib', 'node_modules');
   const pipCacheDir = path.join(chatRuntimeDir, 'pip-cache');
   const npmCacheDir = path.join(chatRuntimeDir, 'npm-cache');
 
@@ -1145,7 +1304,7 @@ export function ensurePerChatRuntimeDir(
     venvBinDir,
     sitePackagesDir,
     nodePrefixDir,
-    path.join(nodePrefixDir, 'lib', 'node_modules'),
+    chatNodeModulesDir,
     path.join(nodePrefixDir, 'node_modules'),
     path.join(nodePrefixDir, 'bin'),
     path.join(chatRuntimeDir, 'bin'),
@@ -1183,6 +1342,8 @@ export function ensurePerChatRuntimeDir(
     fs.rmSync(pthPath, { force: true });
   }
 
+  reconcileBaseNodeModulesSymlinks(chatNodeModulesDir, docRuntime, docRuntimeMountRoot);
+
   return chatRuntimeDir;
 }
 
@@ -1192,13 +1353,13 @@ export function applySandboxLayeredRuntime(
   sandboxAgyBinDir: string | null = null,
   mounts?: {
     chatRuntimeMount?: string;
-    hooksMount?: string;
     docRuntimeMount?: string;
+    nodeModulesMount?: string;
   }
 ): void {
   const chatMount = mounts?.chatRuntimeMount ?? SANDBOX_CHAT_RUNTIME_MOUNT;
-  const hooksMount = mounts?.hooksMount ?? SANDBOX_CHAT_HOOKS_MOUNT;
   const docMount = mounts?.docRuntimeMount ?? SANDBOX_DOC_RUNTIME_MOUNT;
+  const nodeModulesMount = mounts?.nodeModulesMount ?? '/node_modules';
   const toPosix = (rel: string) => rel.split(path.sep).join(path.posix.sep);
 
   env.VIRTUAL_ENV = `${chatMount}/venv`;
@@ -1208,21 +1369,14 @@ export function applySandboxLayeredRuntime(
   env.NPM_CONFIG_CACHE = `${chatMount}/npm-cache`;
   env.NPM_CONFIG_USERCONFIG = `${chatMount}/npmrc`;
 
-  const nodePathEntries = [
-    `${chatMount}/node/lib/node_modules`,
-    `${chatMount}/node/node_modules`,
-  ];
-  const nodeLayerRoots = [`${chatMount}/node/lib`, `${chatMount}/node`];
-  if (docRuntime?.nodeModulesRel) {
-    const docNodeModules = path.posix.join(docMount, toPosix(docRuntime.nodeModulesRel));
-    nodePathEntries.push(docNodeModules);
-    nodeLayerRoots.push(path.posix.dirname(docNodeModules));
-  }
-  env.NODE_PATH = nodePathEntries.join(path.delimiter);
-  env.AGY_NODE_LAYER_PATHS = nodeLayerRoots.join(path.delimiter);
+  delete env.NODE_OPTIONS;
+  delete env.AGY_NODE_LAYER_PATHS;
 
-  const registerArg = `--import=${hooksMount}/esm-register.mjs`;
-  env.NODE_OPTIONS = env.NODE_OPTIONS ? `${registerArg} ${env.NODE_OPTIONS}` : registerArg;
+  if (docRuntime?.nodeModulesRel) {
+    env.NODE_PATH = nodeModulesMount;
+  } else {
+    delete env.NODE_PATH;
+  }
 
   const pathEntries = [
     ...(sandboxAgyBinDir ? [sandboxAgyBinDir] : []),

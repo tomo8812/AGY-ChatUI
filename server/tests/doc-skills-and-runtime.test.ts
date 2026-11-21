@@ -13,10 +13,8 @@ import {
   detectHostPythonVersionDir,
   ensurePerChatHomeDir,
   ensurePerChatRuntimeDir,
-  ensureSandboxNodeHooks,
   probeBwrapSandbox,
   resolveDocRuntimeLayout,
-  SANDBOX_CHAT_HOOKS_MOUNT,
   SANDBOX_CHAT_RUNTIME_MOUNT,
   SANDBOX_DOC_RUNTIME_MOUNT,
   SANDBOX_HOME_MOUNT,
@@ -496,7 +494,7 @@ describe('Anthropic doc skills and runtime isolation', () => {
         );
       }
 
-      // Seed base document Node libraries (docx, pptxgenjs, pdf-lib) with BOTH CJS and ESM exports
+      // Seed base document Node libraries (docx, pptxgenjs, pdf-lib, @myscope/doc-scoped) with BOTH CJS and ESM exports
       const baseNodeModules = path.join(docRuntimeDir, 'node', 'node_modules');
       for (const pkgName of ['docx', 'pptxgenjs', 'pdf-lib']) {
         const pkgDir = path.join(baseNodeModules, pkgName);
@@ -513,6 +511,13 @@ describe('Anthropic doc skills and runtime isolation', () => {
         fs.writeFileSync(path.join(pkgDir, 'index.cjs'), `module.exports = { source: 'base-${pkgName}-cjs' };\n`);
         fs.writeFileSync(path.join(pkgDir, 'index.mjs'), `export default { source: 'base-${pkgName}-esm' };\n`);
       }
+      const scopedPkgDir = path.join(baseNodeModules, '@myscope', 'doc-scoped');
+      fs.mkdirSync(scopedPkgDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(scopedPkgDir, 'package.json'),
+        JSON.stringify({ name: '@myscope/doc-scoped', version: '1.0.0', type: 'module', main: './index.mjs' }),
+      );
+      fs.writeFileSync(path.join(scopedPkgDir, 'index.mjs'), `import pdf from 'pdf-lib'; export default { source: 'base-scoped-' + pdf.source };\n`);
       fs.writeFileSync(path.join(docRuntimeDir, 'manifest.json'), JSON.stringify({ version: 1 }), 'utf8');
 
       // Lock base doc-runtime strictly read-only to prove immutability
@@ -530,6 +535,11 @@ describe('Anthropic doc skills and runtime isolation', () => {
       const workspaceA = path.join(tmpRoot, 'workspace-a');
       const workspaceB = path.join(tmpRoot, 'workspace-b');
       fs.mkdirSync(path.join(profileDir, '.gemini', 'config'), { recursive: true });
+      fs.mkdirSync(path.join(profileDir, '.gemini', 'antigravity-cli'), { recursive: true });
+      fs.mkdirSync(path.join(profileDir, '.config'), { recursive: true });
+      fs.writeFileSync(path.join(profileDir, '.gemini', 'oauth_creds.json'), '{"access_token":"shared"}\n', 'utf8');
+      fs.writeFileSync(path.join(profileDir, '.gemini', 'antigravity-cli', 'settings.json'), '{"theme":"dark"}\n', 'utf8');
+      fs.writeFileSync(path.join(profileDir, '.config', 'profile-only-xdg.txt'), 'must-not-leak-via-home-bind\n', 'utf8');
       fs.mkdirSync(workspaceA, { recursive: true });
       fs.mkdirSync(workspaceB, { recursive: true });
 
@@ -593,8 +603,19 @@ describe('Anthropic doc skills and runtime isolation', () => {
       expect(spec.sandboxed).toBe(true);
       expect(spec.layeredRuntimeIsolated).toBe(true);
       const argsStr = spec.args.join('\n');
+      const chatHomeA = path.join(profileDir, '.chat-homes', 'workspace-a');
+      expect(argsStr).toContain(`--bind\n${chatHomeA}\n${SANDBOX_HOME_MOUNT}`);
+      expect(argsStr).not.toContain(`--bind\n${profileDir}\n${SANDBOX_HOME_MOUNT}`);
       expect(argsStr).toContain(`--tmpfs\n${SANDBOX_HOME_MOUNT}/.gemini/config/skills`);
-      expect(argsStr).toContain(`--tmpfs\n${SANDBOX_HOME_MOUNT}/.chat-runtime`);
+      expect(argsStr).not.toContain(`.chat-runtime\n${SANDBOX_HOME_MOUNT}`);
+      expect(argsStr).not.toContain('esm-hooks');
+      expect(argsStr).toContain(
+        `--bind\n${fs.realpathSync(path.join(profileDir, '.gemini', 'oauth_creds.json'))}\n${SANDBOX_HOME_MOUNT}/.gemini/oauth_creds.json`,
+      );
+      expect(argsStr).toContain(
+        `--bind\n${fs.realpathSync(path.join(profileDir, '.gemini', 'antigravity-cli', 'settings.json'))}\n${SANDBOX_HOME_MOUNT}/.gemini/antigravity-cli/settings.json`,
+      );
+      expect(argsStr).not.toContain('profile-only-xdg.txt');
       expect(argsStr).toContain(
         `--bind\n${fs.realpathSync(path.join(profileDir, '.gemini', 'config', 'skills', 'my-custom'))}\n${SANDBOX_HOME_MOUNT}/.gemini/config/skills/my-custom`,
       );
@@ -608,27 +629,118 @@ describe('Anthropic doc skills and runtime isolation', () => {
         `--bind\n${path.join(profileDir, '.chat-runtime', 'workspace-a')}\n${SANDBOX_CHAT_RUNTIME_MOUNT}`,
       );
       expect(argsStr).toContain(
-        `--ro-bind\n${path.join(path.dirname(profileDir), '.sandbox-etc', 'esm-hooks')}\n${SANDBOX_CHAT_HOOKS_MOUNT}`,
+        `--bind\n${path.join(profileDir, '.chat-runtime', 'workspace-a', 'node', 'lib', 'node_modules')}\n/node_modules`,
       );
 
-      // Inside sandbox, standard command env resolves chat layer -> shared read-only base -> system
+      // Inside sandbox, zero custom NODE_OPTIONS hooks; standard env resolves /node_modules + venv
       expect(spec.env.VIRTUAL_ENV).toBe(`${SANDBOX_CHAT_RUNTIME_MOUNT}/venv`);
       expect(spec.env.PYTHONNOUSERSITE).toBe('1');
       expect(spec.env.NPM_CONFIG_PREFIX).toBe(`${SANDBOX_CHAT_RUNTIME_MOUNT}/node`);
-      expect(spec.env.NODE_OPTIONS).toContain(`--import=${SANDBOX_CHAT_HOOKS_MOUNT}/esm-register.mjs`);
+      expect(spec.env.NODE_OPTIONS).toBeUndefined();
+      expect(spec.env.AGY_NODE_LAYER_PATHS).toBeUndefined();
       expect(spec.env.PATH).toContain(`${SANDBOX_CHAT_RUNTIME_MOUNT}/venv/bin:${SANDBOX_CHAT_RUNTIME_MOUNT}/node/bin`);
       expect(
         spec.env.PATH!.indexOf(`${SANDBOX_CHAT_RUNTIME_MOUNT}/venv/bin`),
       ).toBeLessThan(spec.env.PATH!.indexOf(`${SANDBOX_DOC_RUNTIME_MOUNT}/venv/bin`));
-      expect(spec.env.NODE_PATH).toContain(`${SANDBOX_CHAT_RUNTIME_MOUNT}/node/lib/node_modules`);
-      expect(spec.env.NODE_PATH).toContain(`${SANDBOX_DOC_RUNTIME_MOUNT}/node/node_modules`);
+      expect(spec.env.NODE_PATH).toBe('/node_modules');
+
+      // When docRuntime is unavailable (null), inject NO doc mounts, NO /node_modules, and NO NODE_OPTIONS/NODE_PATH
+      const noDocSpec = buildAgyCommandSpec({
+        config: { ...baseCfg, docRuntimeDir: null },
+        subcommandArgs: ['acp'],
+        profileDir,
+        workspaceDir: workspaceA,
+        enableSandboxBwrap: true,
+      });
+      expect(noDocSpec.env.NODE_OPTIONS).toBeUndefined();
+      expect(noDocSpec.env.NODE_PATH).toBeUndefined();
+      expect(noDocSpec.env.SAL_USE_VCLPLUGIN).toBeUndefined();
+      const noDocArgsStr = noDocSpec.args.join('\n');
+      expect(noDocArgsStr).not.toContain(SANDBOX_DOC_RUNTIME_MOUNT);
+      expect(noDocArgsStr).not.toContain('\n/node_modules');
+      // Normal agy acp launch and standard Node ESM execution stay unaffected without docRuntime
+      const fakeEsmAgy = path.join(mockBinDir, 'agy-esm.mjs');
+      fs.writeFileSync(
+        fakeEsmAgy,
+        '#!/usr/bin/env node\nimport path from "node:path";\nconsole.log("AGY_ESM_OK", process.env.NODE_OPTIONS ?? "NO_HOOK", path.basename("/a/b"), process.argv.slice(2).join(","));\n',
+        { mode: 0o755 },
+      );
+      const cleanNodeRes = execFileSync(
+        fakeEsmAgy,
+        ['acp', '--disable-telemetry'],
+        { cwd: workspaceA, env: { ...process.env, ...noDocSpec.env }, encoding: 'utf8' },
+      );
+      expect(cleanNodeRes.trim()).toBe('AGY_ESM_OK NO_HOOK b acp,--disable-telemetry');
+
+      // Per-chat persistent HOME isolation test: Chat A writes stay persistent in Chat A and invisible in Chat B
+      ensurePerChatHomeDir(profileDir, workspaceA, builtinSkillsDir);
+      const chatHomeB = ensurePerChatHomeDir(profileDir, workspaceB, builtinSkillsDir);
+      expect(fs.existsSync(path.join(chatHome, '.config', 'profile-only-xdg.txt'))).toBe(false);
+      expect(fs.readFileSync(path.join(chatHome, '.gemini', 'oauth_creds.json'), 'utf8')).toContain('shared');
+      expect(fs.readFileSync(path.join(chatHomeB, '.gemini', 'oauth_creds.json'), 'utf8')).toContain('shared');
+      expect(fs.readFileSync(path.join(chatHome, '.gemini', 'antigravity-cli', 'settings.json'), 'utf8')).toContain('dark');
+      execFileSync(
+        'sh',
+        [
+          '-c',
+          'mkdir -p "$HOME/.config" "$HOME/.local/share" && printf "A" > "$HOME/.config/example" && printf "persist-A" > "$HOME/chat-note.txt" && printf "db-A" > "$HOME/.local/share/tool.db"',
+        ],
+        { cwd: workspaceA, env: { ...process.env, HOME: chatHome }, encoding: 'utf8' },
+      );
+      // Re-running ensurePerChatHomeDir & buildAgyCommandSpec preserves Chat A's HOME files
+      ensurePerChatHomeDir(profileDir, workspaceA, builtinSkillsDir);
+      buildAgyCommandSpec({
+        config: baseCfg,
+        subcommandArgs: ['acp'],
+        profileDir,
+        workspaceDir: workspaceA,
+        enableSandboxBwrap: true,
+      });
+      const homeIsolationCheck = execFileSync(
+        'sh',
+        [
+          '-c',
+          [
+            'cat "$CHAT_A_HOME/.config/example"',
+            'cat "$CHAT_A_HOME/chat-note.txt"',
+            'test ! -e "$CHAT_B_HOME/.config/example" && echo B_CONFIG_ISOLATED',
+            'test ! -e "$CHAT_B_HOME/chat-note.txt" && echo B_HOME_ISOLATED',
+            'test ! -e "$CHAT_B_HOME/.local/share/tool.db" && echo B_LOCAL_ISOLATED',
+            'test ! -e "$PROFILE_DIR/.config/example" && echo PROFILE_UNTOUCHED',
+          ].join(' && '),
+        ],
+        {
+          cwd: tmpRoot,
+          env: {
+            ...process.env,
+            CHAT_A_HOME: chatHome,
+            CHAT_B_HOME: chatHomeB,
+            PROFILE_DIR: profileDir,
+          },
+          encoding: 'utf8',
+        },
+      );
+      expect(homeIsolationCheck).toContain('A');
+      expect(homeIsolationCheck).toContain('persist-A');
+      expect(homeIsolationCheck).toContain('B_CONFIG_ISOLATED');
+      expect(homeIsolationCheck).toContain('B_HOME_ISOLATED');
+      expect(homeIsolationCheck).toContain('B_LOCAL_ISOLATED');
+      expect(homeIsolationCheck).toContain('PROFILE_UNTOUCHED');
 
       // Live execution acceptance test: Chat A & Chat B with real python, pip, node CJS & ESM, npm, and shell subshells
+      // Mirror bwrap root `/node_modules` + `/workspace` per chat with ZERO NODE_OPTIONS hooks
       const layout = resolveDocRuntimeLayout(docRuntimeDir);
       expect(layout).toBeTruthy();
-      const hooksDir = ensureSandboxNodeHooks(profileDir);
       const chatRuntimeA = ensurePerChatRuntimeDir(profileDir, workspaceA, layout, docRuntimeDir);
       const chatRuntimeB = ensurePerChatRuntimeDir(profileDir, workspaceB, layout, docRuntimeDir);
+      const simRootA = path.join(tmpRoot, 'sim-root-a');
+      const simRootB = path.join(tmpRoot, 'sim-root-b');
+      const simWorkspaceA = path.join(simRootA, 'workspace');
+      const simWorkspaceB = path.join(simRootB, 'workspace');
+      fs.mkdirSync(simWorkspaceA, { recursive: true });
+      fs.mkdirSync(simWorkspaceB, { recursive: true });
+      fs.symlinkSync(path.join(chatRuntimeA, 'node', 'lib', 'node_modules'), path.join(simRootA, 'node_modules'));
+      fs.symlinkSync(path.join(chatRuntimeB, 'node', 'lib', 'node_modules'), path.join(simRootB, 'node_modules'));
 
       const buildTestLayerEnv = (chatRuntime: string): NodeJS.ProcessEnv => {
         const env: NodeJS.ProcessEnv = { ...process.env };
@@ -637,34 +749,49 @@ describe('Anthropic doc skills and runtime isolation', () => {
         delete env.PYTHONPATH;
         applySandboxLayeredRuntime(env, layout, null, {
           chatRuntimeMount: chatRuntime,
-          hooksMount: hooksDir,
           docRuntimeMount: docRuntimeDir,
+          nodeModulesMount: path.join(chatRuntime, 'node', 'lib', 'node_modules'),
         });
         return env;
       };
 
       const envA = buildTestLayerEnv(chatRuntimeA);
       const envB = buildTestLayerEnv(chatRuntimeB);
+      expect(envA.NODE_OPTIONS).toBeUndefined();
 
-      // 1. Standard python import + Node CJS require() + Node ESM import resolve DOCX/PPTX/XLSX/PDF base packages
+      fs.writeFileSync(
+        path.join(simWorkspaceA, 'check-base.mjs'),
+        [
+          "import d from 'docx';",
+          "import p from 'pptxgenjs';",
+          "import l from 'pdf-lib';",
+          "import s from '@myscope/doc-scoped';",
+          "console.log('ESM_FILE:', d.source, p.source, l.source, s.source);",
+        ].join('\n'),
+      );
+
+      // 1. Standard python import + Node CJS require() + Node ESM import (stdin & .mjs file + scoped) resolve base packages with ZERO NODE_OPTIONS
       const baseCheckA = execFileSync(
         'sh',
         [
           '-c',
           [
+            'test -z "${NODE_OPTIONS:-}"',
             'python -c "import docx, pptx, openpyxl, pypdf; print(docx.SOURCE, pptx.SOURCE, openpyxl.SOURCE, pypdf.SOURCE)"',
             'node -e "const d = require(\'docx\'); const p = require(\'pptxgenjs\'); const l = require(\'pdf-lib\'); console.log(\'CJS:\', d.source, p.source, l.source)"',
-            'node --input-type=module -e "import d from \'docx\'; import p from \'pptxgenjs\'; import l from \'pdf-lib\'; console.log(\'ESM:\', d.source, p.source, l.source)"',
+            'node --input-type=module -e "import d from \'docx\'; import p from \'pptxgenjs\'; import l from \'pdf-lib\'; import s from \'@myscope/doc-scoped\'; console.log(\'ESM:\', d.source, p.source, l.source, s.source)"',
+            'node check-base.mjs',
           ].join(' && '),
         ],
-        { cwd: workspaceA, env: envA, encoding: 'utf8' },
+        { cwd: simWorkspaceA, env: envA, encoding: 'utf8' },
       );
       expect(baseCheckA).toContain('base-docx-1.0 base-pptx-1.0 base-openpyxl-1.0 base-pypdf-1.0');
       expect(baseCheckA).toContain('CJS: base-docx-cjs base-pptxgenjs-cjs base-pdf-lib-cjs');
-      expect(baseCheckA).toContain('ESM: base-docx-esm base-pptxgenjs-esm base-pdf-lib-esm');
+      expect(baseCheckA).toContain('ESM: base-docx-esm base-pptxgenjs-esm base-pdf-lib-esm base-scoped-base-pdf-lib-esm');
+      expect(baseCheckA).toContain('ESM_FILE: base-docx-esm base-pptxgenjs-esm base-pdf-lib-esm base-scoped-base-pdf-lib-esm');
 
       // 2. Chat A installs a custom Python package and overrides base openpyxl via standard `pip install`,
-      //    and installs a Node package globally into chat A diff via `npm install -g`
+      //    and installs Node packages globally (both new & base override) via `npm install -g`
       const pyAddonSrc = path.join(tmpRoot, 'py-addon-src');
       fs.mkdirSync(path.join(pyAddonSrc, 'chat_only_py'), { recursive: true });
       fs.writeFileSync(
@@ -681,7 +808,6 @@ describe('Anthropic doc skills and runtime isolation', () => {
       );
       fs.writeFileSync(path.join(pyOverrideSrc, 'openpyxl', '__init__.py'), 'SOURCE = "chat-a-openpyxl-2.0"\n');
 
-      // Run pip install against Chat A (when system pip is installed on the host)
       const hasPip = (() => {
         try {
           execFileSync('sh', ['-c', 'python -m pip --version'], { env: envA, stdio: 'ignore' });
@@ -694,10 +820,9 @@ describe('Anthropic doc skills and runtime isolation', () => {
         execFileSync(
           'sh',
           ['-c', `pip install --no-build-isolation --no-deps "${pyAddonSrc}" "${pyOverrideSrc}"`],
-          { cwd: workspaceA, env: envA, encoding: 'utf8' },
+          { cwd: simWorkspaceA, env: envA, encoding: 'utf8' },
         );
       } else {
-        // Fallback if host lacks python3-pip package: install directly via standard site-packages layout check
         const sp = path.join(chatRuntimeA, 'venv', 'lib', pyVerDir, 'site-packages');
         fs.mkdirSync(path.join(sp, 'chat_only_py'), { recursive: true });
         fs.writeFileSync(path.join(sp, 'chat_only_py', '__init__.py'), 'TAG = "chat-a-addon"\n');
@@ -718,11 +843,34 @@ describe('Anthropic doc skills and runtime isolation', () => {
       );
       fs.writeFileSync(path.join(nodeAddonSrc, 'index.cjs'), 'module.exports = { tag: "chat-a-node-cjs" };\n');
       fs.writeFileSync(path.join(nodeAddonSrc, 'index.mjs'), 'export default { tag: "chat-a-node-esm" };\n');
-      execFileSync('sh', ['-c', `npm install -g --no-audit --no-fund "${nodeAddonSrc}"`], {
-        cwd: workspaceA,
-        env: envA,
+
+      const nodeOverrideSrc = path.join(tmpRoot, 'node-override-src');
+      fs.mkdirSync(nodeOverrideSrc, { recursive: true });
+      fs.writeFileSync(
+        path.join(nodeOverrideSrc, 'package.json'),
+        JSON.stringify({
+          name: 'pptxgenjs',
+          version: '2.0.0',
+          main: './index.cjs',
+          exports: { '.': { import: './index.mjs', require: './index.cjs' } },
+        }),
+      );
+      fs.writeFileSync(path.join(nodeOverrideSrc, 'index.cjs'), 'module.exports = { source: "chat-a-pptx-2.0-cjs" };\n');
+      fs.writeFileSync(path.join(nodeOverrideSrc, 'index.mjs'), 'export default { source: "chat-a-pptx-2.0-esm" };\n');
+      const pptxOverrideTgz = execFileSync('npm', ['pack', '--silent', nodeOverrideSrc], {
+        cwd: tmpRoot,
         encoding: 'utf8',
-      });
+      }).trim();
+
+      execFileSync(
+        'sh',
+        ['-c', `npm install -g --no-audit --no-fund "${nodeAddonSrc}" "${path.join(tmpRoot, pptxOverrideTgz)}"`],
+        {
+          cwd: simWorkspaceA,
+          env: envA,
+          encoding: 'utf8',
+        },
+      );
 
       // Simulate worker restart: re-run ensurePerChatRuntimeDir + fresh env
       const chatRuntimeAAfterRestart = ensurePerChatRuntimeDir(profileDir, workspaceA, layout, docRuntimeDir);
@@ -735,15 +883,15 @@ describe('Anthropic doc skills and runtime isolation', () => {
           '-c',
           [
             'python -c "import chat_only_py, openpyxl, pptx; print(chat_only_py.TAG, openpyxl.SOURCE, pptx.SOURCE)"',
-            'node -e "console.log(require(\'chat-only-node\').tag)"',
-            'node --input-type=module -e "import n from \'chat-only-node\'; console.log(n.tag)"',
+            'node -e "console.log(require(\'chat-only-node\').tag, require(\'pptxgenjs\').source)"',
+            'node --input-type=module -e "import n from \'chat-only-node\'; import p from \'pptxgenjs\'; import d from \'docx\'; console.log(n.tag, p.source, d.source)"',
           ].join(' && '),
         ],
-        { cwd: workspaceA, env: envAAfterRestart, encoding: 'utf8' },
+        { cwd: simWorkspaceA, env: envAAfterRestart, encoding: 'utf8' },
       );
       expect(checkAAfterRestart).toContain('chat-a-addon chat-a-openpyxl-2.0 base-pptx-1.0');
-      expect(checkAAfterRestart).toContain('chat-a-node-cjs');
-      expect(checkAAfterRestart).toContain('chat-a-node-esm');
+      expect(checkAAfterRestart).toContain('chat-a-node-cjs chat-a-pptx-2.0-cjs');
+      expect(checkAAfterRestart).toContain('chat-a-node-esm chat-a-pptx-2.0-esm base-docx-esm');
 
       // Chat B cannot see Chat A's installed pip or npm packages and still gets untouched base v1
       const checkB = execFileSync(
@@ -753,16 +901,26 @@ describe('Anthropic doc skills and runtime isolation', () => {
           [
             'python -c "import openpyxl; print(openpyxl.SOURCE)"',
             'python -c "import chat_only_py" 2>/dev/null && echo LEAK_PY || echo ISOLATED_PY',
+            'node -e "console.log(require(\'pptxgenjs\').source)"',
+            'node --input-type=module -e "import p from \'pptxgenjs\'; console.log(p.source)"',
             'node -e "try { require(\'chat-only-node\'); console.log(\'LEAK_CJS\'); } catch { console.log(\'ISOLATED_CJS\'); }"',
             'node --input-type=module -e "try { await import(\'chat-only-node\'); console.log(\'LEAK_ESM\'); } catch { console.log(\'ISOLATED_ESM\'); }"',
           ].join(' && '),
         ],
-        { cwd: workspaceB, env: envB, encoding: 'utf8' },
+        { cwd: simWorkspaceB, env: envB, encoding: 'utf8' },
       );
       expect(checkB).toContain('base-openpyxl-1.0');
+      expect(checkB).toContain('base-pptxgenjs-cjs');
+      expect(checkB).toContain('base-pptxgenjs-esm');
       expect(checkB).toContain('ISOLATED_PY');
       expect(checkB).toContain('ISOLATED_CJS');
       expect(checkB).toContain('ISOLATED_ESM');
+
+      // Reconcile when docRuntime becomes null cleans base symlinks without deleting per-chat packages
+      ensurePerChatRuntimeDir(profileDir, workspaceA, null, docRuntimeDir);
+      expect(fs.existsSync(path.join(chatRuntimeA, 'node', 'lib', 'node_modules', 'docx'))).toBe(false);
+      expect(fs.existsSync(path.join(chatRuntimeA, 'node', 'lib', 'node_modules', 'chat-only-node'))).toBe(true);
+      expect(fs.existsSync(path.join(chatRuntimeA, 'node', 'lib', 'node_modules', 'pptxgenjs'))).toBe(true);
 
       // 3. Non-isolated mode explicitly refuses equivalence guarantees
       const offSpec = buildAgyCommandSpec({
