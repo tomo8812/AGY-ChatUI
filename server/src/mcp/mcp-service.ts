@@ -1186,15 +1186,13 @@ export class McpService {
     return Object.keys(out).length > 0 ? out : null;
   }
 
-  private resolveTargetProfileDirs(scope: McpScope, ownerUserId: string | null): string[] {
-    if (scope === 'shared') {
-      return this.db.listAgyProfileDirs();
+  private getEffectiveMcpServerByNameForUser(userId: string): Map<string, StoredMcpServerRow> {
+    const byName = new Map<string, StoredMcpServerRow>();
+    // listEffectiveMcpServersForUser orders shared first, profile second, so profile overrides shared.
+    for (const row of this.db.listEffectiveMcpServersForUser(userId)) {
+      byName.set(row.name, row);
     }
-    if (ownerUserId) {
-      const profile = this.db.getAgyProfile(ownerUserId);
-      return profile ? [profile.profileDir] : [];
-    }
-    return [];
+    return byName;
   }
 
   private computeEffectiveAlwaysAllowTools(row: StoredMcpServerRow): string[] {
@@ -1211,61 +1209,127 @@ export class McpService {
     });
   }
 
+  private syncEffectiveServerNamesForProfiles(
+    serverNames: string[],
+    profiles: Array<{ userId: string; profileDir: string }>,
+    options?: {
+      previousRow?: StoredMcpServerRow | null;
+      sourceRow?: StoredMcpServerRow | null;
+      clearNonMatchingEntityRules?: boolean;
+    }
+  ): void {
+    const uniqueNames = Array.from(new Set(serverNames.map((n) => n.trim()).filter((n) => n.length > 0)));
+    if (uniqueNames.length === 0 || profiles.length === 0) return;
+
+    const prevRow = options?.previousRow ?? null;
+    const prevEffectiveTools = prevRow ? this.computeEffectiveAlwaysAllowTools(prevRow) : [];
+
+    this.db.withAgyProfileSettingsWrite(() => {
+      for (const profile of profiles) {
+        if (!profile.profileDir) continue;
+        const effectiveByName = this.getEffectiveMcpServerByNameForUser(profile.userId);
+        for (const name of uniqueNames) {
+          const effective = effectiveByName.get(name);
+          if (!effective) {
+            syncMcpServerAlwaysAllowRules({
+              profileDirs: [profile.profileDir],
+              serverName: name,
+              alwaysAllowTools: [],
+              removeAllForServer: true,
+            });
+            continue;
+          }
+          // If this sync was triggered for a specific sourceRow (e.g. shared edit),
+          // skip profiles whose effective server for this name is a different row (e.g. a profile override).
+          if (
+            options?.sourceRow &&
+            options.sourceRow.name === name &&
+            effective.id !== options.sourceRow.id
+          ) {
+            continue;
+          }
+
+          const effectiveAlwaysAllow = this.computeEffectiveAlwaysAllowTools(effective);
+          const effectiveSet = new Set(effectiveAlwaysAllow);
+          const revokeTools = [
+            ...(prevRow && prevRow.id === effective.id
+              ? prevEffectiveTools.filter((tool) => !effectiveSet.has(tool))
+              : []),
+            ...parseArgsJson(effective.disabledToolsJson),
+          ];
+
+          syncMcpServerAlwaysAllowRules({
+            profileDirs: [profile.profileDir],
+            serverName: name,
+            previousServerName:
+              prevRow && prevRow.id === effective.id && prevRow.name !== name ? prevRow.name : null,
+            alwaysAllowTools: effectiveAlwaysAllow,
+            revokeTools,
+            clearExistingForServer:
+              Boolean(options?.clearNonMatchingEntityRules) || effective.scope === 'profile',
+            removeAllForServer: !effective.enabled,
+          });
+        }
+      }
+    });
+  }
+
   private syncRowPermissionsToSettings(
     row: StoredMcpServerRow,
     previousRow?: StoredMcpServerRow | null
   ): void {
-    const currentDirs = this.resolveTargetProfileDirs(row.scope, row.ownerUserId);
-    const effectiveAlwaysAllow = this.computeEffectiveAlwaysAllowTools(row);
-    const effectiveSet = new Set(effectiveAlwaysAllow);
-    const prevEffective = previousRow ? this.computeEffectiveAlwaysAllowTools(previousRow) : [];
-    const revokeTools = [
-      ...prevEffective.filter((tool) => !effectiveSet.has(tool)),
-      ...parseArgsJson(row.disabledToolsJson),
-    ];
+    const serverNames = [row.name];
+    if (previousRow && previousRow.name !== row.name) {
+      serverNames.push(previousRow.name);
+    }
 
-    this.db.withAgyProfileSettingsWrite(() => {
-      if (
-        previousRow &&
-        (previousRow.scope !== row.scope ||
-          previousRow.ownerUserId !== row.ownerUserId ||
-          previousRow.name !== row.name)
-      ) {
-        const prevDirs = this.resolveTargetProfileDirs(previousRow.scope, previousRow.ownerUserId);
-        syncMcpServerAlwaysAllowRules({
-          profileDirs: prevDirs,
-          serverName: previousRow.name,
-          alwaysAllowTools: [],
-          removeAllForServer: true,
-        });
-      }
+    const allProfiles = this.db.listAgyProfiles();
+    let targetProfiles: Array<{ userId: string; profileDir: string }>;
+    if (row.scope === 'shared' || previousRow?.scope === 'shared') {
+      targetProfiles = allProfiles;
+    } else {
+      const ownerIds = new Set<string>();
+      if (row.ownerUserId) ownerIds.add(row.ownerUserId);
+      if (previousRow?.ownerUserId) ownerIds.add(previousRow.ownerUserId);
+      targetProfiles = allProfiles.filter((p) => ownerIds.has(p.userId));
+    }
 
-      syncMcpServerAlwaysAllowRules({
-        profileDirs: currentDirs,
-        serverName: row.name,
-        previousServerName: previousRow?.name ?? null,
-        alwaysAllowTools: effectiveAlwaysAllow,
-        revokeTools,
-        removeAllForServer: !row.enabled,
-      });
+    const entityBoundaryChanged =
+      !previousRow ||
+      previousRow.scope !== row.scope ||
+      previousRow.ownerUserId !== row.ownerUserId;
+
+    this.syncEffectiveServerNamesForProfiles(serverNames, targetProfiles, {
+      previousRow: previousRow ?? null,
+      sourceRow: row,
+      clearNonMatchingEntityRules: entityBoundaryChanged && row.scope === 'profile',
     });
   }
 
   syncAllSharedMcpPermissionsToProfile(profileDir: string): void {
     if (!profileDir) return;
-    const rows = this.db.listMcpServersForAdmin('');
-    this.db.withAgyProfileSettingsWrite(() => {
-      for (const row of rows) {
-        if (row.scope !== 'shared') continue;
-        syncMcpServerAlwaysAllowRules({
-          profileDirs: [profileDir],
-          serverName: row.name,
-          alwaysAllowTools: this.computeEffectiveAlwaysAllowTools(row),
-          revokeTools: parseArgsJson(row.disabledToolsJson),
-          removeAllForServer: !row.enabled,
-        });
-      }
-    });
+    const matchedProfile = this.db.listAgyProfiles().find((p) => p.profileDir === profileDir);
+    if (!matchedProfile) {
+      // Called during brand-new user signup before user/profile row is persisted: only shared servers apply.
+      const rows = this.db.listMcpServersForAdmin('');
+      this.db.withAgyProfileSettingsWrite(() => {
+        for (const row of rows) {
+          if (row.scope !== 'shared') continue;
+          syncMcpServerAlwaysAllowRules({
+            profileDirs: [profileDir],
+            serverName: row.name,
+            alwaysAllowTools: this.computeEffectiveAlwaysAllowTools(row),
+            revokeTools: parseArgsJson(row.disabledToolsJson),
+            removeAllForServer: !row.enabled,
+          });
+        }
+      });
+      return;
+    }
+
+    const allRows = this.db.listMcpServersForAdmin(matchedProfile.userId);
+    const serverNames = allRows.map((row) => row.name);
+    this.syncEffectiveServerNamesForProfiles(serverNames, [matchedProfile]);
   }
 
   recordToolAlwaysAllowFromChat(userId: string, serverName: string, toolName: string): void {
@@ -1331,7 +1395,8 @@ export class McpService {
     // For profile-scoped servers, reflect any mcp(server/tool) rules in the owner's settings.json.
     // Shared servers keep the shared DB policy authoritative so one user's chat rule isn't promoted server-wide.
     if (row.scope === 'profile' && row.ownerUserId) {
-      const checkDirs = this.resolveTargetProfileDirs(row.scope, row.ownerUserId);
+      const profile = this.db.getAgyProfile(row.ownerUserId);
+      const checkDirs = profile ? [profile.profileDir] : [];
       const prefix = `mcp(${row.name}/`;
       for (const dir of checkDirs) {
         try {
@@ -1685,14 +1750,13 @@ export class McpService {
     this.assertAdminCanAccessRow(adminUserId, existing);
     const deleted = this.db.deleteMcpServer(existing.id);
     if (deleted) {
-      const targetDirs = this.resolveTargetProfileDirs(existing.scope, existing.ownerUserId);
-      this.db.withAgyProfileSettingsWrite(() => {
-        syncMcpServerAlwaysAllowRules({
-          profileDirs: targetDirs,
-          serverName: existing.name,
-          alwaysAllowTools: [],
-          removeAllForServer: true,
-        });
+      const targetProfiles =
+        existing.scope === 'shared'
+          ? this.db.listAgyProfiles()
+          : this.db.listAgyProfiles().filter((p) => p.userId === existing.ownerUserId);
+      this.syncEffectiveServerNamesForProfiles([existing.name], targetProfiles, {
+        previousRow: existing,
+        clearNonMatchingEntityRules: existing.scope === 'profile',
       });
       this.emitUpdated(existing.scope, existing.ownerUserId, existing.id);
     }

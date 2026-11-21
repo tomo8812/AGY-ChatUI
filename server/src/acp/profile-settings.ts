@@ -286,6 +286,7 @@ export function syncMcpServerAlwaysAllowRules(params: {
   alwaysAllowTools: string[];
   revokeTools?: string[];
   removeAllForServer?: boolean;
+  clearExistingForServer?: boolean;
 }): void {
   const prefixCurrent = `mcp(${params.serverName.trim()}/`;
   const prefixPrev =
@@ -314,7 +315,7 @@ export function syncMcpServerAlwaysAllowRules(params: {
     updateAgyPermissionRules(profileDir, (current) => {
       const filteredAllow = current.allow.filter((rule) => {
         if (prefixPrev && rule.startsWith(prefixPrev) && rule.endsWith(')')) return false;
-        if (params.removeAllForServer && rule.startsWith(prefixCurrent) && rule.endsWith(')')) return false;
+        if ((params.removeAllForServer || params.clearExistingForServer) && rule.startsWith(prefixCurrent) && rule.endsWith(')')) return false;
         if (revokeSet.has(rule)) return false;
         if (desiredSet.has(rule)) return false;
         return true;

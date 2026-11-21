@@ -1122,6 +1122,81 @@ function runAcpServer(): void {
         return { stopReason: 'end_turn' as const };
       }
 
+      // [BG_ELICITATION_CONCURRENT]: Turn 1 spawns a background subagent, finishes prompt,
+      // then sends an unattributed elicitation/create while Turn 2 is active.
+      if (promptText.includes('[BG_ELICITATION_CONCURRENT]')) {
+        const subToolId = `tc-bg-elicit-${Date.now()}`;
+        const childSessionId = `${state.id}-bg-elicit-sub`;
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: subToolId,
+            title: 'invoke_subagent',
+            kind: 'other',
+            status: 'completed',
+            rawInput: { Subagents: [{ TypeName: 'research', Role: 'BG Elicit Worker', Prompt: 'BG' }] },
+          },
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'subagent_update',
+            sessionId: childSessionId,
+            toolCallId: subToolId,
+            title: 'BG Elicit Worker',
+            state: { state: 'running' },
+          },
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: '背景質問テスト開始' },
+          },
+        });
+
+        void (async () => {
+          await delay(150);
+          if (state.cancelled) return;
+          const bgRes = await ctx.client.request(methods.client.elicitation.create, {
+            sessionId: state.id,
+            mode: 'form',
+            message: '背景タスクからの確認質問',
+            requestedSchema: {
+              type: 'object',
+              properties: {
+                answer: { type: 'string', title: '回答' },
+              },
+              required: ['answer'],
+            },
+          });
+          if (state.cancelled) return;
+          await sendUpdate({
+            sessionId: childSessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: {
+                type: 'text',
+                text: `背景Elicitation応答:${bgRes.action}:${JSON.stringify('content' in bgRes ? (bgRes.content ?? null) : null)}`,
+              },
+            },
+          });
+          await sendUpdate({
+            sessionId: state.id,
+            update: {
+              sessionUpdate: 'subagent_update',
+              sessionId: childSessionId,
+              toolCallId: subToolId,
+              title: 'BG Elicit Worker',
+              state: { state: 'idle', stopReason: 'end_turn' },
+            },
+          });
+        })();
+
+        return { stopReason: 'end_turn' as const };
+      }
+
       if (promptText.includes('[ACTIVITY_SEQUENCE]')) {
         const sequenceId = randomUUID();
         for (const [index, title] of ['pwd', 'rg --files'].entries()) {

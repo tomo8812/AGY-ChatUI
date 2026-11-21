@@ -354,7 +354,7 @@ export type ElicitationContentValue = string | number | boolean | string[];
 
 export interface PendingElicitationRecord {
   id: string;
-  runId: string;
+  runId: string | null;
   chatId: string;
   userId: string;
   toolCallId: string | null;
@@ -363,6 +363,7 @@ export interface PendingElicitationRecord {
   message: string;
   requestedSchema: ElicitationFormSchema | null;
   url: string | null;
+  urlCompleted: boolean;
   status: 'pending' | 'resolved' | 'cancelled';
   selectedAction: 'accept' | 'decline' | 'cancel' | null;
   responseContent: Record<string, ElicitationContentValue> | null;
