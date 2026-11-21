@@ -1197,6 +1197,65 @@ function runAcpServer(): void {
         return { stopReason: 'end_turn' as const };
       }
 
+      // [BG_MCP_RELOAD_TASK]: Turn 1 finishes prompt immediately while leaving a background
+      // subagent active for 300ms so callers can test deferred reload across background tasks.
+      if (promptText.includes('[BG_MCP_RELOAD_TASK]')) {
+        const subToolId = `tc-bg-mcp-${Date.now()}`;
+        const childSessionId = `${state.id}-bg-mcp-sub`;
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: subToolId,
+            title: 'invoke_subagent',
+            kind: 'other',
+            status: 'completed',
+            rawInput: { Subagents: [{ TypeName: 'research', Role: 'BG MCP Worker', Prompt: 'BG' }] },
+          },
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'subagent_update',
+            sessionId: childSessionId,
+            toolCallId: subToolId,
+            title: 'BG MCP Worker',
+            state: { state: 'running' },
+          },
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: '背景タスク開始' },
+          },
+        });
+
+        void (async () => {
+          await delay(300);
+          if (state.cancelled) return;
+          await sendUpdate({
+            sessionId: childSessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: '背景タスク完了通知' },
+            },
+          });
+          await sendUpdate({
+            sessionId: state.id,
+            update: {
+              sessionUpdate: 'subagent_update',
+              sessionId: childSessionId,
+              toolCallId: subToolId,
+              title: 'BG MCP Worker',
+              state: { state: 'idle', stopReason: 'end_turn' },
+            },
+          });
+        })();
+
+        return { stopReason: 'end_turn' as const };
+      }
+
       if (promptText.includes('[ACTIVITY_SEQUENCE]')) {
         const sequenceId = randomUUID();
         for (const [index, title] of ['pwd', 'rg --files'].entries()) {

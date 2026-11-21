@@ -1239,10 +1239,12 @@ export class McpService {
             });
             continue;
           }
-          // If this sync was triggered for a specific sourceRow (e.g. shared edit),
-          // skip profiles whose effective server for this name is a different row (e.g. a profile override).
+          // Skip profiles with their own override ONLY when syncing an edit on a `shared` row
+          // (where the shared row isn't the profile owner's effective server).
+          // When a `profile` row is disabled/renamed/changed in scope, we MUST resync the owner's
+          // profile so the newly effective shared server (or removal) clears the old profile rules.
           if (
-            options?.sourceRow &&
+            options?.sourceRow?.scope === 'shared' &&
             options.sourceRow.name === name &&
             effective.id !== options.sourceRow.id
           ) {
@@ -1251,6 +1253,7 @@ export class McpService {
 
           const effectiveAlwaysAllow = this.computeEffectiveAlwaysAllowTools(effective);
           const effectiveSet = new Set(effectiveAlwaysAllow);
+          const entitySwitched = prevRow !== null && prevRow.id !== effective.id;
           const revokeTools = [
             ...(prevRow && prevRow.id === effective.id
               ? prevEffectiveTools.filter((tool) => !effectiveSet.has(tool))
@@ -1266,7 +1269,9 @@ export class McpService {
             alwaysAllowTools: effectiveAlwaysAllow,
             revokeTools,
             clearExistingForServer:
-              Boolean(options?.clearNonMatchingEntityRules) || effective.scope === 'profile',
+              Boolean(options?.clearNonMatchingEntityRules) ||
+              effective.scope === 'profile' ||
+              entitySwitched,
             removeAllForServer: !effective.enabled,
           });
         }
@@ -1302,7 +1307,8 @@ export class McpService {
     this.syncEffectiveServerNamesForProfiles(serverNames, targetProfiles, {
       previousRow: previousRow ?? null,
       sourceRow: row,
-      clearNonMatchingEntityRules: entityBoundaryChanged && row.scope === 'profile',
+      clearNonMatchingEntityRules:
+        entityBoundaryChanged || row.scope === 'profile',
     });
   }
 
