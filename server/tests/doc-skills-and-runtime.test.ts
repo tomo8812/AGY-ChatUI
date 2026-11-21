@@ -8,9 +8,16 @@ import { describe, expect, test } from 'vitest';
 
 const execFileAsync = promisify(execFile);
 import {
+  applySandboxLayeredRuntime,
   buildAgyCommandSpec,
-  buildIsolatedAgyEnv,
+  detectHostPythonVersionDir,
   ensurePerChatHomeDir,
+  ensurePerChatRuntimeDir,
+  ensureSandboxNodeHooks,
+  probeBwrapSandbox,
+  resolveDocRuntimeLayout,
+  SANDBOX_CHAT_HOOKS_MOUNT,
+  SANDBOX_CHAT_RUNTIME_MOUNT,
   SANDBOX_DOC_RUNTIME_MOUNT,
   SANDBOX_HOME_MOUNT,
 } from '../src/acp/env-isolation.js';
@@ -455,28 +462,76 @@ describe('Anthropic doc skills and runtime isolation', () => {
     }
   });
 
-  test('Sandbox bwrap mounts Built-in skills & doc-runtime read-only without mutating default ACP PATH/PYTHONPATH/NODE_PATH', () => {
+  test('Sandbox bwrap mounts shared read-only base + persistent per-chat diff runtime with normal python/pip/node CJS+ESM and explicit non-isolated warnings', () => {
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-bwrap-mount-'));
+    const pyVerDir = detectHostPythonVersionDir();
+    const docRuntimeDir = path.join(tmpRoot, 'doc-runtime');
     try {
       const builtinSkillsDir = seedBuiltinCatalog(tmpRoot, 'v1');
-      const docRuntimeDir = path.join(tmpRoot, 'doc-runtime');
       fs.mkdirSync(path.join(docRuntimeDir, 'venv', 'bin'), { recursive: true });
-      fs.mkdirSync(path.join(docRuntimeDir, 'venv', 'lib', 'python3.11', 'site-packages'), { recursive: true });
+      fs.mkdirSync(path.join(docRuntimeDir, 'venv', 'lib', pyVerDir, 'site-packages'), { recursive: true });
       fs.mkdirSync(path.join(docRuntimeDir, 'node', 'node_modules', '.bin'), { recursive: true });
-      fs.writeFileSync(path.join(docRuntimeDir, 'venv', 'bin', 'python3'), '#!/bin/sh\necho SHADOWED_DOC_PY\n', {
+      fs.writeFileSync(path.join(docRuntimeDir, 'venv', 'bin', 'python3'), '#!/bin/sh\nexec /usr/bin/python3 "$@"\n', {
         mode: 0o755,
       });
-      fs.writeFileSync(
-        path.join(docRuntimeDir, 'venv', 'lib', 'python3.11', 'site-packages', 'pptx.py'),
-        'MARKER = "doc_runtime"\n',
-        'utf8',
-      );
+
+      // Seed base document Python libraries (docx, pptx, openpyxl, pypdf)
+      const baseSite = path.join(docRuntimeDir, 'venv', 'lib', pyVerDir, 'site-packages');
+      for (const [modName, version] of [
+        ['docx', '1.0'],
+        ['pptx', '1.0'],
+        ['openpyxl', '1.0'],
+        ['pypdf', '1.0'],
+      ]) {
+        fs.mkdirSync(path.join(baseSite, modName), { recursive: true });
+        fs.writeFileSync(path.join(baseSite, modName, '__init__.py'), `SOURCE = "base-${modName}-${version}"\n`);
+        fs.mkdirSync(path.join(baseSite, `${modName}-${version}.dist-info`), { recursive: true });
+        fs.writeFileSync(
+          path.join(baseSite, `${modName}-${version}.dist-info`, 'METADATA'),
+          `Metadata-Version: 2.1\nName: ${modName}\nVersion: ${version}\n`,
+        );
+        fs.writeFileSync(
+          path.join(baseSite, `${modName}-${version}.dist-info`, 'RECORD'),
+          `${modName}/__init__.py,,\n`,
+        );
+      }
+
+      // Seed base document Node libraries (docx, pptxgenjs, pdf-lib) with BOTH CJS and ESM exports
+      const baseNodeModules = path.join(docRuntimeDir, 'node', 'node_modules');
+      for (const pkgName of ['docx', 'pptxgenjs', 'pdf-lib']) {
+        const pkgDir = path.join(baseNodeModules, pkgName);
+        fs.mkdirSync(pkgDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(pkgDir, 'package.json'),
+          JSON.stringify({
+            name: pkgName,
+            version: '1.0.0',
+            main: './index.cjs',
+            exports: { '.': { import: './index.mjs', require: './index.cjs' } },
+          }),
+        );
+        fs.writeFileSync(path.join(pkgDir, 'index.cjs'), `module.exports = { source: 'base-${pkgName}-cjs' };\n`);
+        fs.writeFileSync(path.join(pkgDir, 'index.mjs'), `export default { source: 'base-${pkgName}-esm' };\n`);
+      }
       fs.writeFileSync(path.join(docRuntimeDir, 'manifest.json'), JSON.stringify({ version: 1 }), 'utf8');
 
+      // Lock base doc-runtime strictly read-only to prove immutability
+      const chmodTreeReadOnly = (dir: string) => {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) chmodTreeReadOnly(full);
+          else fs.chmodSync(full, (fs.statSync(full).mode & 0o111) ? 0o555 : 0o444);
+        }
+        fs.chmodSync(dir, 0o555);
+      };
+      chmodTreeReadOnly(docRuntimeDir);
+
       const profileDir = path.join(tmpRoot, 'profile');
-      const workspaceDir = path.join(tmpRoot, 'workspace-1');
+      const workspaceA = path.join(tmpRoot, 'workspace-a');
+      const workspaceB = path.join(tmpRoot, 'workspace-b');
       fs.mkdirSync(path.join(profileDir, '.gemini', 'config'), { recursive: true });
-      fs.mkdirSync(workspaceDir, { recursive: true });
+      fs.mkdirSync(workspaceA, { recursive: true });
+      fs.mkdirSync(workspaceB, { recursive: true });
 
       // Disable pdf; collide xlsx with a Custom skill; add my-custom skill
       fs.writeFileSync(
@@ -496,7 +551,7 @@ describe('Anthropic doc skills and runtime isolation', () => {
       fs.writeFileSync(fakeBwrap, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
       fs.writeFileSync(fakeAgy, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
 
-      const chatHome = ensurePerChatHomeDir(profileDir, workspaceDir, builtinSkillsDir);
+      const chatHome = ensurePerChatHomeDir(profileDir, workspaceA, builtinSkillsDir);
       expect(fs.readlinkSync(path.join(chatHome, '.gemini', 'config', 'skills', 'docx'))).toBe(
         path.join(builtinSkillsDir, 'docx'),
       );
@@ -515,7 +570,7 @@ describe('Anthropic doc skills and runtime isolation', () => {
         agyBin: fakeAgy,
         mockAgentPath: '',
         builtinSkillsDir,
-        docRuntimeDir: '',
+        docRuntimeDir,
         maxConcurrentAcp: 2,
         maxAcpPerUser: 1,
         idleWorkerMs: 60_000,
@@ -527,25 +582,19 @@ describe('Anthropic doc skills and runtime isolation', () => {
         artifactsCacheRoot: path.join(tmpRoot, 'cache'),
       };
 
-      const specWithoutRuntime = buildAgyCommandSpec({
+      const spec = buildAgyCommandSpec({
         config: baseCfg,
         subcommandArgs: ['acp'],
         profileDir,
-        workspaceDir,
-        enableSandboxBwrap: true,
-      });
-
-      const spec = buildAgyCommandSpec({
-        config: { ...baseCfg, docRuntimeDir },
-        subcommandArgs: ['acp'],
-        profileDir,
-        workspaceDir,
+        workspaceDir: workspaceA,
         enableSandboxBwrap: true,
       });
 
       expect(spec.sandboxed).toBe(true);
+      expect(spec.layeredRuntimeIsolated).toBe(true);
       const argsStr = spec.args.join('\n');
       expect(argsStr).toContain(`--tmpfs\n${SANDBOX_HOME_MOUNT}/.gemini/config/skills`);
+      expect(argsStr).toContain(`--tmpfs\n${SANDBOX_HOME_MOUNT}/.chat-runtime`);
       expect(argsStr).toContain(
         `--bind\n${fs.realpathSync(path.join(profileDir, '.gemini', 'config', 'skills', 'my-custom'))}\n${SANDBOX_HOME_MOUNT}/.gemini/config/skills/my-custom`,
       );
@@ -555,32 +604,205 @@ describe('Anthropic doc skills and runtime isolation', () => {
       expect(argsStr).not.toContain(`${SANDBOX_HOME_MOUNT}/.gemini/config/skills/pdf`);
       expect(argsStr).not.toContain(`--ro-bind\n${fs.realpathSync(path.join(builtinSkillsDir, 'xlsx'))}`);
       expect(argsStr).toContain(`--ro-bind\n${fs.realpathSync(docRuntimeDir)}\n${SANDBOX_DOC_RUNTIME_MOUNT}`);
-
-      // Global Python/Node resolution must remain identical to baseline ACP without doc-runtime
-      expect(spec.env.PATH).toBe(specWithoutRuntime.env.PATH);
-      expect(spec.env.PYTHONPATH).toBe(specWithoutRuntime.env.PYTHONPATH);
-      expect(spec.env.NODE_PATH).toBe(specWithoutRuntime.env.NODE_PATH);
-      expect(spec.env.PYTHONIOENCODING).toBe(specWithoutRuntime.env.PYTHONIOENCODING);
-      expect(spec.env.PATH).not.toContain(SANDBOX_DOC_RUNTIME_MOUNT);
-
-      // Verify actual Python & Node resolution matches baseline ACP identically
-      const baselinePy = execFileSync(
-        'python3',
-        ['-c', 'import json, shutil, sys; print(json.dumps({"which": shutil.which("python3"), "path": sys.path}))'],
-        { env: buildIsolatedAgyEnv({ profileDir }), encoding: 'utf8' },
+      expect(argsStr).toContain(
+        `--bind\n${path.join(profileDir, '.chat-runtime', 'workspace-a')}\n${SANDBOX_CHAT_RUNTIME_MOUNT}`,
       );
-      const docEnabledPy = execFileSync(
-        'python3',
-        ['-c', 'import json, shutil, sys; print(json.dumps({"which": shutil.which("python3"), "path": sys.path}))'],
-        { env: spec.env, encoding: 'utf8' },
+      expect(argsStr).toContain(
+        `--ro-bind\n${path.join(path.dirname(profileDir), '.sandbox-etc', 'esm-hooks')}\n${SANDBOX_CHAT_HOOKS_MOUNT}`,
       );
-      expect(docEnabledPy).toBe(baselinePy);
 
-      // Opt-in references are exposed cleanly for explicit use by document skills
-      expect(spec.env.AGY_DOC_RUNTIME_DIR).toBe(SANDBOX_DOC_RUNTIME_MOUNT);
-      expect(spec.env.AGY_DOC_RUNTIME_PYTHON).toBe(`${SANDBOX_DOC_RUNTIME_MOUNT}/venv/bin/python3`);
-      expect(spec.env.AGY_DOC_RUNTIME_NODE_PATH).toBe(`${SANDBOX_DOC_RUNTIME_MOUNT}/node/node_modules`);
+      // Inside sandbox, standard command env resolves chat layer -> shared read-only base -> system
+      expect(spec.env.VIRTUAL_ENV).toBe(`${SANDBOX_CHAT_RUNTIME_MOUNT}/venv`);
+      expect(spec.env.PYTHONNOUSERSITE).toBe('1');
+      expect(spec.env.NPM_CONFIG_PREFIX).toBe(`${SANDBOX_CHAT_RUNTIME_MOUNT}/node`);
+      expect(spec.env.NODE_OPTIONS).toContain(`--import=${SANDBOX_CHAT_HOOKS_MOUNT}/esm-register.mjs`);
+      expect(spec.env.PATH).toContain(`${SANDBOX_CHAT_RUNTIME_MOUNT}/venv/bin:${SANDBOX_CHAT_RUNTIME_MOUNT}/node/bin`);
+      expect(
+        spec.env.PATH!.indexOf(`${SANDBOX_CHAT_RUNTIME_MOUNT}/venv/bin`),
+      ).toBeLessThan(spec.env.PATH!.indexOf(`${SANDBOX_DOC_RUNTIME_MOUNT}/venv/bin`));
+      expect(spec.env.NODE_PATH).toContain(`${SANDBOX_CHAT_RUNTIME_MOUNT}/node/lib/node_modules`);
+      expect(spec.env.NODE_PATH).toContain(`${SANDBOX_DOC_RUNTIME_MOUNT}/node/node_modules`);
+
+      // Live execution acceptance test: Chat A & Chat B with real python, pip, node CJS & ESM, npm, and shell subshells
+      const layout = resolveDocRuntimeLayout(docRuntimeDir);
+      expect(layout).toBeTruthy();
+      const hooksDir = ensureSandboxNodeHooks(profileDir);
+      const chatRuntimeA = ensurePerChatRuntimeDir(profileDir, workspaceA, layout, docRuntimeDir);
+      const chatRuntimeB = ensurePerChatRuntimeDir(profileDir, workspaceB, layout, docRuntimeDir);
+
+      const buildTestLayerEnv = (chatRuntime: string): NodeJS.ProcessEnv => {
+        const env: NodeJS.ProcessEnv = { ...process.env };
+        delete env.NODE_OPTIONS;
+        delete env.NODE_PATH;
+        delete env.PYTHONPATH;
+        applySandboxLayeredRuntime(env, layout, null, {
+          chatRuntimeMount: chatRuntime,
+          hooksMount: hooksDir,
+          docRuntimeMount: docRuntimeDir,
+        });
+        return env;
+      };
+
+      const envA = buildTestLayerEnv(chatRuntimeA);
+      const envB = buildTestLayerEnv(chatRuntimeB);
+
+      // 1. Standard python import + Node CJS require() + Node ESM import resolve DOCX/PPTX/XLSX/PDF base packages
+      const baseCheckA = execFileSync(
+        'sh',
+        [
+          '-c',
+          [
+            'python -c "import docx, pptx, openpyxl, pypdf; print(docx.SOURCE, pptx.SOURCE, openpyxl.SOURCE, pypdf.SOURCE)"',
+            'node -e "const d = require(\'docx\'); const p = require(\'pptxgenjs\'); const l = require(\'pdf-lib\'); console.log(\'CJS:\', d.source, p.source, l.source)"',
+            'node --input-type=module -e "import d from \'docx\'; import p from \'pptxgenjs\'; import l from \'pdf-lib\'; console.log(\'ESM:\', d.source, p.source, l.source)"',
+          ].join(' && '),
+        ],
+        { cwd: workspaceA, env: envA, encoding: 'utf8' },
+      );
+      expect(baseCheckA).toContain('base-docx-1.0 base-pptx-1.0 base-openpyxl-1.0 base-pypdf-1.0');
+      expect(baseCheckA).toContain('CJS: base-docx-cjs base-pptxgenjs-cjs base-pdf-lib-cjs');
+      expect(baseCheckA).toContain('ESM: base-docx-esm base-pptxgenjs-esm base-pdf-lib-esm');
+
+      // 2. Chat A installs a custom Python package and overrides base openpyxl via standard `pip install`,
+      //    and installs a Node package globally into chat A diff via `npm install -g`
+      const pyAddonSrc = path.join(tmpRoot, 'py-addon-src');
+      fs.mkdirSync(path.join(pyAddonSrc, 'chat_only_py'), { recursive: true });
+      fs.writeFileSync(
+        path.join(pyAddonSrc, 'setup.py'),
+        'from setuptools import setup\nsetup(name="chat-only-py", version="1.0", packages=["chat_only_py"])\n',
+      );
+      fs.writeFileSync(path.join(pyAddonSrc, 'chat_only_py', '__init__.py'), 'TAG = "chat-a-addon"\n');
+
+      const pyOverrideSrc = path.join(tmpRoot, 'py-override-src');
+      fs.mkdirSync(path.join(pyOverrideSrc, 'openpyxl'), { recursive: true });
+      fs.writeFileSync(
+        path.join(pyOverrideSrc, 'setup.py'),
+        'from setuptools import setup\nsetup(name="openpyxl", version="2.0", packages=["openpyxl"])\n',
+      );
+      fs.writeFileSync(path.join(pyOverrideSrc, 'openpyxl', '__init__.py'), 'SOURCE = "chat-a-openpyxl-2.0"\n');
+
+      // Run pip install against Chat A (when system pip is installed on the host)
+      const hasPip = (() => {
+        try {
+          execFileSync('sh', ['-c', 'python -m pip --version'], { env: envA, stdio: 'ignore' });
+          return true;
+        } catch {
+          return false;
+        }
+      })();
+      if (hasPip) {
+        execFileSync(
+          'sh',
+          ['-c', `pip install --no-build-isolation --no-deps "${pyAddonSrc}" "${pyOverrideSrc}"`],
+          { cwd: workspaceA, env: envA, encoding: 'utf8' },
+        );
+      } else {
+        // Fallback if host lacks python3-pip package: install directly via standard site-packages layout check
+        const sp = path.join(chatRuntimeA, 'venv', 'lib', pyVerDir, 'site-packages');
+        fs.mkdirSync(path.join(sp, 'chat_only_py'), { recursive: true });
+        fs.writeFileSync(path.join(sp, 'chat_only_py', '__init__.py'), 'TAG = "chat-a-addon"\n');
+        fs.mkdirSync(path.join(sp, 'openpyxl'), { recursive: true });
+        fs.writeFileSync(path.join(sp, 'openpyxl', '__init__.py'), 'SOURCE = "chat-a-openpyxl-2.0"\n');
+      }
+
+      const nodeAddonSrc = path.join(tmpRoot, 'node-addon-src');
+      fs.mkdirSync(nodeAddonSrc, { recursive: true });
+      fs.writeFileSync(
+        path.join(nodeAddonSrc, 'package.json'),
+        JSON.stringify({
+          name: 'chat-only-node',
+          version: '1.0.0',
+          main: './index.cjs',
+          exports: { '.': { import: './index.mjs', require: './index.cjs' } },
+        }),
+      );
+      fs.writeFileSync(path.join(nodeAddonSrc, 'index.cjs'), 'module.exports = { tag: "chat-a-node-cjs" };\n');
+      fs.writeFileSync(path.join(nodeAddonSrc, 'index.mjs'), 'export default { tag: "chat-a-node-esm" };\n');
+      execFileSync('sh', ['-c', `npm install -g --no-audit --no-fund "${nodeAddonSrc}"`], {
+        cwd: workspaceA,
+        env: envA,
+        encoding: 'utf8',
+      });
+
+      // Simulate worker restart: re-run ensurePerChatRuntimeDir + fresh env
+      const chatRuntimeAAfterRestart = ensurePerChatRuntimeDir(profileDir, workspaceA, layout, docRuntimeDir);
+      const envAAfterRestart = buildTestLayerEnv(chatRuntimeAAfterRestart);
+
+      // Chat A keeps its additions/overrides after restart across subshell python + node CJS/ESM
+      const checkAAfterRestart = execFileSync(
+        'bash',
+        [
+          '-c',
+          [
+            'python -c "import chat_only_py, openpyxl, pptx; print(chat_only_py.TAG, openpyxl.SOURCE, pptx.SOURCE)"',
+            'node -e "console.log(require(\'chat-only-node\').tag)"',
+            'node --input-type=module -e "import n from \'chat-only-node\'; console.log(n.tag)"',
+          ].join(' && '),
+        ],
+        { cwd: workspaceA, env: envAAfterRestart, encoding: 'utf8' },
+      );
+      expect(checkAAfterRestart).toContain('chat-a-addon chat-a-openpyxl-2.0 base-pptx-1.0');
+      expect(checkAAfterRestart).toContain('chat-a-node-cjs');
+      expect(checkAAfterRestart).toContain('chat-a-node-esm');
+
+      // Chat B cannot see Chat A's installed pip or npm packages and still gets untouched base v1
+      const checkB = execFileSync(
+        'bash',
+        [
+          '-c',
+          [
+            'python -c "import openpyxl; print(openpyxl.SOURCE)"',
+            'python -c "import chat_only_py" 2>/dev/null && echo LEAK_PY || echo ISOLATED_PY',
+            'node -e "try { require(\'chat-only-node\'); console.log(\'LEAK_CJS\'); } catch { console.log(\'ISOLATED_CJS\'); }"',
+            'node --input-type=module -e "try { await import(\'chat-only-node\'); console.log(\'LEAK_ESM\'); } catch { console.log(\'ISOLATED_ESM\'); }"',
+          ].join(' && '),
+        ],
+        { cwd: workspaceB, env: envB, encoding: 'utf8' },
+      );
+      expect(checkB).toContain('base-openpyxl-1.0');
+      expect(checkB).toContain('ISOLATED_PY');
+      expect(checkB).toContain('ISOLATED_CJS');
+      expect(checkB).toContain('ISOLATED_ESM');
+
+      // 3. Non-isolated mode explicitly refuses equivalence guarantees
+      const offSpec = buildAgyCommandSpec({
+        config: { ...baseCfg, sandboxMode: 'off' },
+        subcommandArgs: ['acp'],
+        profileDir,
+        workspaceDir: workspaceA,
+        enableSandboxBwrap: false,
+      });
+      expect(offSpec.sandboxed).toBe(false);
+      expect(offSpec.layeredRuntimeIsolated).toBe(false);
+      expect(offSpec.env.NODE_OPTIONS).toBeUndefined();
+
+      const offProbe = probeBwrapSandbox({ ...baseCfg, sandboxMode: 'off' }, false);
+      expect(offProbe.active).toBe(false);
+      expect(offProbe.layeredRuntimeIsolated).toBe(false);
+      expect(offProbe.reason).toContain('保証されません');
+
+      const missingBwrapProbe = probeBwrapSandbox(
+        { ...baseCfg, sandboxMode: 'auto', bwrapBin: '/nonexistent/bwrap-bin' },
+        false,
+      );
+      expect(missingBwrapProbe.active).toBe(false);
+      expect(missingBwrapProbe.layeredRuntimeIsolated).toBe(false);
+      expect(missingBwrapProbe.reason).toContain('保証されません');
     } finally {
+      const restoreWriteTree = (dir: string) => {
+        if (!fs.existsSync(dir)) return;
+        try {
+          fs.chmodSync(dir, 0o755);
+          for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+            const full = path.join(dir, entry.name);
+            if (entry.isDirectory()) restoreWriteTree(full);
+            else fs.chmodSync(full, 0o644);
+          }
+        } catch {
+          // ignore
+        }
+      };
+      restoreWriteTree(docRuntimeDir);
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
   });

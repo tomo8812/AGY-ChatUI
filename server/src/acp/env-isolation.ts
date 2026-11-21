@@ -16,6 +16,8 @@ const require = createRequire(import.meta.url);
 export const SANDBOX_WORKSPACE_MOUNT = '/workspace';
 export const SANDBOX_HOME_MOUNT = '/home/sandbox';
 export const SANDBOX_DOC_RUNTIME_MOUNT = '/opt/agy-doc-runtime';
+export const SANDBOX_CHAT_RUNTIME_MOUNT = '/opt/agy-chat-runtime';
+export const SANDBOX_CHAT_HOOKS_MOUNT = '/opt/agy-chat-hooks';
 
 export function getChatBrainHostDir(profileDir: string, workspaceDir?: string | null): string {
   const profileAbs = path.resolve(profileDir);
@@ -322,6 +324,7 @@ export interface SpawnCommandSpec {
   args: string[];
   env: NodeJS.ProcessEnv;
   sandboxed: boolean;
+  layeredRuntimeIsolated: boolean;
   sandboxWorkspaceRoot: string;
 }
 
@@ -331,13 +334,17 @@ export function clearSandboxProbeCache(): void {
   sandboxProbeCache.clear();
 }
 
+const NON_ISOLATED_GUARANTEE_NOTE =
+  '非隔離モードのため、共通ベースの読み取り専用保護およびチャット単位のパッケージ差分・プロセス隔離は保証されません。';
+
 export function probeBwrapSandbox(config: AppConfig, useCache = true): SandboxStatus {
   if (config.agyMode === 'mock') {
     return {
       mode: config.sandboxMode,
       active: false,
       backend: 'mock',
-      reason: 'モックモード（AGY_MODE=mock）で動作中です。',
+      layeredRuntimeIsolated: false,
+      reason: `モックモード（AGY_MODE=mock）で動作中です。${NON_ISOLATED_GUARANTEE_NOTE}`,
       remediation: null,
     };
   }
@@ -346,7 +353,8 @@ export function probeBwrapSandbox(config: AppConfig, useCache = true): SandboxSt
       mode: 'off',
       active: false,
       backend: 'none',
-      reason: '設定（SANDBOX_MODE=off）によりOSレベルの隔離が無効化されています。',
+      layeredRuntimeIsolated: false,
+      reason: `設定（SANDBOX_MODE=off）によりOSレベルの隔離が無効化されています。${NON_ISOLATED_GUARANTEE_NOTE}`,
       remediation: '/etc/antigravity-chat/env から SANDBOX_MODE=off / ENABLE_BWRAP=false を外して再起動してください。',
     };
   }
@@ -355,7 +363,8 @@ export function probeBwrapSandbox(config: AppConfig, useCache = true): SandboxSt
       mode: config.sandboxMode,
       active: false,
       backend: 'none',
-      reason: `bubblewrap サンドボックスは Linux 専用です（現在: ${process.platform}）。`,
+      layeredRuntimeIsolated: false,
+      reason: `bubblewrap サンドボックスは Linux 専用です（現在: ${process.platform}）。${NON_ISOLATED_GUARANTEE_NOTE}`,
       remediation: null,
     };
   }
@@ -372,7 +381,8 @@ export function probeBwrapSandbox(config: AppConfig, useCache = true): SandboxSt
       mode: config.sandboxMode,
       active: false,
       backend: 'none',
-      reason: `bubblewrap (${config.bwrapBin}) が見つかりません。`,
+      layeredRuntimeIsolated: false,
+      reason: `bubblewrap (${config.bwrapBin}) が見つかりません。${NON_ISOLATED_GUARANTEE_NOTE}`,
       remediation: 'Ubuntu サーバーで sudo apt-get update && sudo apt-get install -y bubblewrap を実行してください。',
     };
     sandboxProbeCache.set(cacheKey, res);
@@ -387,7 +397,8 @@ export function probeBwrapSandbox(config: AppConfig, useCache = true): SandboxSt
       mode: config.sandboxMode,
       active: false,
       backend: 'none',
-      reason: 'サンドボックス検証用バイナリ（true / sh）が見つかりません。',
+      layeredRuntimeIsolated: false,
+      reason: `サンドボックス検証用バイナリ（true / sh）が見つかりません。${NON_ISOLATED_GUARANTEE_NOTE}`,
       remediation: null,
     };
     sandboxProbeCache.set(cacheKey, res);
@@ -416,6 +427,7 @@ export function probeBwrapSandbox(config: AppConfig, useCache = true): SandboxSt
       mode: config.sandboxMode,
       active: true,
       backend: 'bwrap',
+      layeredRuntimeIsolated: true,
       reason: null,
       remediation: null,
     };
@@ -427,9 +439,10 @@ export function probeBwrapSandbox(config: AppConfig, useCache = true): SandboxSt
       mode: config.sandboxMode,
       active: false,
       backend: 'none',
+      layeredRuntimeIsolated: false,
       reason: isPermissionIssue
-        ? 'Ubuntu AppArmor またはカーネル名前空間の制限により bubblewrap の起動が拒否されました。'
-        : `bubblewrap の起動テストに失敗しました: ${stderr.slice(0, 180) || 'unknown error'}`,
+        ? `Ubuntu AppArmor またはカーネル名前空間の制限により bubblewrap の起動が拒否されました。${NON_ISOLATED_GUARANTEE_NOTE}`
+        : `bubblewrap の起動テストに失敗しました: ${stderr.slice(0, 180) || 'unknown error'}。${NON_ISOLATED_GUARANTEE_NOTE}`,
       remediation: isPermissionIssue
         ? 'Ubuntu サーバーで最新の sudo bash deploy/ubuntu-setup.sh を実行し、/etc/apparmor.d/bwrap の作成と systemd の NoNewPrivileges=false を反映してください。'
         : 'sudo systemctl restart antigravity-chat と bubblewrap の動作を確認してください。',
@@ -653,6 +666,7 @@ export function buildAgyCommandSpec(params: {
       args: mockArgs,
       env,
       sandboxed: false,
+      layeredRuntimeIsolated: false,
       sandboxWorkspaceRoot: workspaceFallback,
     };
   }
@@ -719,14 +733,9 @@ export function buildAgyCommandSpec(params: {
       }
     };
 
-    if (docRuntime) {
-      ensureOptDir();
-      bwrapArgs.push('--ro-bind', docRuntime.hostDir, SANDBOX_DOC_RUNTIME_MOUNT);
-      applyDocRuntimeToEnv(env, SANDBOX_DOC_RUNTIME_MOUNT, docRuntime);
-    }
-
     const resolvedAgy = resolveCanonicalAgyBin(params.config.agyBin, env.PATH);
     let sandboxAgyCommand = resolvedAgy;
+    let sandboxAgyBinDir: string | null = null;
 
     if (resolvedAgy.includes('/')) {
       if (isInsideSystemMountTree(resolvedAgy, mountedSystemDirs)) {
@@ -734,10 +743,27 @@ export function buildAgyCommandSpec(params: {
       } else {
         ensureOptDir();
         bwrapArgs.push('--dir', '/opt/agy', '--ro-bind', resolvedAgy, '/opt/agy/agy');
-        env.PATH = `/opt/agy:${env.PATH || '/usr/local/bin:/usr/bin:/bin'}`;
+        sandboxAgyBinDir = '/opt/agy';
         sandboxAgyCommand = '/opt/agy/agy';
       }
     }
+
+    ensureOptDir();
+    if (docRuntime) {
+      bwrapArgs.push('--ro-bind', docRuntime.hostDir, SANDBOX_DOC_RUNTIME_MOUNT);
+    }
+
+    const chatRuntimeHostDir = ensurePerChatRuntimeDir(profileAbs, workspaceAbs, docRuntime);
+    const hooksHostDir = ensureSandboxNodeHooks(profileAbs);
+    bwrapArgs.push(
+      '--bind',
+      chatRuntimeHostDir,
+      SANDBOX_CHAT_RUNTIME_MOUNT,
+      '--ro-bind',
+      hooksHostDir,
+      SANDBOX_CHAT_HOOKS_MOUNT
+    );
+    applySandboxLayeredRuntime(env, docRuntime, sandboxAgyBinDir);
 
     const chatBrainHostDir = getChatBrainHostDir(profileAbs, workspaceAbs);
     const wsKey = path.basename(workspaceAbs) || 'default';
@@ -766,7 +792,13 @@ export function buildAgyCommandSpec(params: {
     for (const rel of [...brainSubdirs, ...scratchSubdirs, ...playgroundSubdirs]) {
       fs.mkdirSync(path.join(profileAbs, ...rel), { recursive: true, mode: 0o700 });
     }
-    for (const hiddenDir of ['.chat-brains', '.chat-homes', '.chat-scratch', '.chat-playground']) {
+    for (const hiddenDir of [
+      '.chat-brains',
+      '.chat-homes',
+      '.chat-scratch',
+      '.chat-playground',
+      '.chat-runtime',
+    ]) {
       fs.mkdirSync(path.join(profileAbs, hiddenDir), { recursive: true, mode: 0o700 });
     }
 
@@ -782,6 +814,8 @@ export function buildAgyCommandSpec(params: {
       `${SANDBOX_HOME_MOUNT}/.chat-scratch`,
       '--tmpfs',
       `${SANDBOX_HOME_MOUNT}/.chat-playground`,
+      '--tmpfs',
+      `${SANDBOX_HOME_MOUNT}/.chat-runtime`,
       '--bind',
       chatBrainHostDir,
       `${SANDBOX_HOME_MOUNT}/.gemini/antigravity-cli/brain`,
@@ -870,6 +904,7 @@ export function buildAgyCommandSpec(params: {
       args: bwrapArgs,
       env,
       sandboxed: true,
+      layeredRuntimeIsolated: true,
       sandboxWorkspaceRoot: SANDBOX_WORKSPACE_MOUNT,
     };
   }
@@ -888,26 +923,28 @@ export function buildAgyCommandSpec(params: {
       : undefined,
   });
 
-  if (docRuntime) {
-    applyDocRuntimeToEnv(env, docRuntime.hostDir, docRuntime);
-  }
-
+  // Non-isolated fallback intentionally does NOT claim or simulate layered per-chat
+  // read-only base + writable diff guarantees.
   return {
     command: resolveCanonicalAgyBin(params.config.agyBin, env.PATH),
     args: agyArgs,
     env,
     sandboxed: false,
+    layeredRuntimeIsolated: false,
     sandboxWorkspaceRoot: workspaceFallback,
   };
 }
 
-interface DocRuntimeLayout {
+export interface DocRuntimeLayout {
   hostDir: string;
   venvBinRel: string | null;
   nodeModulesRel: string | null;
+  nodeBinRel: string | null;
+  pythonSiteRels: string[];
+  pythonVersionDir: string | null;
 }
 
-function resolveDocRuntimeLayout(rawDir?: string | null): DocRuntimeLayout | null {
+export function resolveDocRuntimeLayout(rawDir?: string | null): DocRuntimeLayout | null {
   if (!rawDir || !rawDir.trim()) return null;
   let hostDir: string;
   try {
@@ -928,8 +965,36 @@ function resolveDocRuntimeLayout(rawDir?: string | null): DocRuntimeLayout | nul
 
   const venvBinRel = hasDir(path.join('venv', 'bin'));
   const nodeModulesRel = hasDir(path.join('node', 'node_modules')) ?? hasDir('node_modules');
+  const nodeBinRel =
+    hasDir(path.join('node', 'node_modules', '.bin')) ?? hasDir(path.join('node_modules', '.bin'));
 
-  if (!venvBinRel && !nodeModulesRel) {
+  const pythonSiteRels: string[] = [];
+  const seenSiteReals = new Set<string>();
+  let pythonVersionDir: string | null = null;
+  for (const libName of ['lib', 'lib64']) {
+    const libDir = path.join(hostDir, 'venv', libName);
+    try {
+      if (!fs.statSync(libDir).isDirectory()) continue;
+      for (const entry of fs.readdirSync(libDir, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !/^python\d+\.\d+$/.test(entry.name)) continue;
+        const siteRel = path.join('venv', libName, entry.name, 'site-packages');
+        if (!hasDir(siteRel)) continue;
+        try {
+          const siteReal = fs.realpathSync(path.join(hostDir, siteRel));
+          if (seenSiteReals.has(siteReal)) continue;
+          seenSiteReals.add(siteReal);
+        } catch {
+          continue;
+        }
+        if (!pythonVersionDir) pythonVersionDir = entry.name;
+        pythonSiteRels.push(siteRel);
+      }
+    } catch {
+      // ignore missing python lib dir
+    }
+  }
+
+  if (!venvBinRel && !nodeModulesRel && pythonSiteRels.length === 0) {
     return null;
   }
 
@@ -937,27 +1002,244 @@ function resolveDocRuntimeLayout(rawDir?: string | null): DocRuntimeLayout | nul
     hostDir,
     venvBinRel,
     nodeModulesRel,
+    nodeBinRel,
+    pythonSiteRels,
+    pythonVersionDir,
   };
 }
 
-function applyDocRuntimeToEnv(
-  env: NodeJS.ProcessEnv,
-  mountRoot: string,
-  layout: DocRuntimeLayout
-): void {
-  // Preserve default PATH, PYTHONPATH, NODE_PATH, and PYTHONIOENCODING so normal ACP
-  // processes, subagents, and user-installed tools keep exact standard binary and import
-  // resolution. Document skills can opt in explicitly to the shared read-only runtime.
-  env.AGY_DOC_RUNTIME_DIR = mountRoot;
-  if (layout.venvBinRel) {
-    const venvBin = path.posix.join(mountRoot, layout.venvBinRel.split(path.sep).join(path.posix.sep));
-    env.AGY_DOC_RUNTIME_VENV_BIN = venvBin;
-    env.AGY_DOC_RUNTIME_PYTHON = path.posix.join(venvBin, 'python3');
+let cachedHostPythonVersionDir: string | null = null;
+
+export function detectHostPythonVersionDir(): string {
+  if (cachedHostPythonVersionDir) return cachedHostPythonVersionDir;
+  const pyBin = resolveHostExecutable('python3') ?? '/usr/bin/python3';
+  try {
+    const out = execFileSync(
+      pyBin,
+      ['-c', 'import sys; print(f"python{sys.version_info[0]}.{sys.version_info[1]}")'],
+      { encoding: 'utf8', timeout: 2000 }
+    ).trim();
+    if (/^python\d+\.\d+$/.test(out)) {
+      cachedHostPythonVersionDir = out;
+      return out;
+    }
+  } catch {
+    // fallback below
   }
-  if (layout.nodeModulesRel) {
-    env.AGY_DOC_RUNTIME_NODE_PATH = path.posix.join(
-      mountRoot,
-      layout.nodeModulesRel.split(path.sep).join(path.posix.sep)
+  try {
+    for (const entry of fs.readdirSync('/usr/lib', { withFileTypes: true })) {
+      if (entry.isDirectory() && /^python\d+\.\d+$/.test(entry.name)) {
+        cachedHostPythonVersionDir = entry.name;
+        return entry.name;
+      }
+    }
+  } catch {
+    // ignore
+  }
+  cachedHostPythonVersionDir = 'python3.11';
+  return cachedHostPythonVersionDir;
+}
+
+function writeFileIfChanged(filePath: string, content: string, mode: number): void {
+  try {
+    if (fs.existsSync(filePath) && fs.readFileSync(filePath, 'utf8') === content) {
+      fs.chmodSync(filePath, mode);
+      return;
+    }
+  } catch {
+    // rewrite
+  }
+  fs.writeFileSync(filePath, content, { mode });
+}
+
+function ensureSymlinkTarget(targetPath: string, linkPath: string): void {
+  try {
+    const st = fs.lstatSync(linkPath);
+    if (st.isSymbolicLink() && fs.readlinkSync(linkPath) === targetPath) {
+      return;
+    }
+    fs.rmSync(linkPath, { recursive: true, force: true });
+  } catch {
+    // does not exist
+  }
+  fs.symlinkSync(targetPath, linkPath);
+}
+
+const ESM_REGISTER_SCRIPT = `import * as nodeModule from 'node:module';
+if (typeof nodeModule.register === 'function') {
+  nodeModule.register(new URL('./esm-hook.mjs', import.meta.url));
+}
+`;
+
+const ESM_HOOK_SCRIPT = `import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const fallbackRoots = (process.env.AGY_NODE_LAYER_PATHS || '')
+  .split(path.delimiter)
+  .map((p) => p.trim())
+  .filter(Boolean);
+
+function isBareSpecifier(specifier) {
+  if (!specifier) return false;
+  if (
+    specifier.startsWith('./') ||
+    specifier.startsWith('../') ||
+    specifier.startsWith('/') ||
+    specifier.startsWith('#')
+  ) {
+    return false;
+  }
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(specifier)) return false;
+  return true;
+}
+
+export async function resolve(specifier, context, nextResolve) {
+  try {
+    return await nextResolve(specifier, context);
+  } catch (err) {
+    if (!err || err.code !== 'ERR_MODULE_NOT_FOUND' || !isBareSpecifier(specifier)) {
+      throw err;
+    }
+    for (const root of fallbackRoots) {
+      try {
+        const anchorUrl = pathToFileURL(path.join(root, '_agy_layer_anchor.mjs')).href;
+        return await nextResolve(specifier, { ...context, parentURL: anchorUrl });
+      } catch {
+        // Try next layer
+      }
+    }
+    throw err;
+  }
+}
+`;
+
+export function ensureSandboxNodeHooks(profileDir: string): string {
+  const hooksDir = path.join(path.dirname(path.resolve(profileDir)), '.sandbox-etc', 'esm-hooks');
+  fs.mkdirSync(hooksDir, { recursive: true, mode: 0o755 });
+  writeFileIfChanged(path.join(hooksDir, 'esm-register.mjs'), ESM_REGISTER_SCRIPT, 0o644);
+  writeFileIfChanged(path.join(hooksDir, 'esm-hook.mjs'), ESM_HOOK_SCRIPT, 0o644);
+  return hooksDir;
+}
+
+export function ensurePerChatRuntimeDir(
+  profileDir: string,
+  workspaceDir: string,
+  docRuntime: DocRuntimeLayout | null,
+  docRuntimeMountRoot = SANDBOX_DOC_RUNTIME_MOUNT
+): string {
+  const profileAbs = path.resolve(profileDir);
+  const wsKey = path.basename(path.resolve(workspaceDir)) || 'default';
+  const chatRuntimeDir = path.join(profileAbs, '.chat-runtime', wsKey);
+
+  const pyVerDir = docRuntime?.pythonVersionDir ?? detectHostPythonVersionDir();
+  const venvDir = path.join(chatRuntimeDir, 'venv');
+  const venvBinDir = path.join(venvDir, 'bin');
+  const sitePackagesDir = path.join(venvDir, 'lib', pyVerDir, 'site-packages');
+  const nodePrefixDir = path.join(chatRuntimeDir, 'node');
+  const pipCacheDir = path.join(chatRuntimeDir, 'pip-cache');
+  const npmCacheDir = path.join(chatRuntimeDir, 'npm-cache');
+
+  for (const dir of [
+    chatRuntimeDir,
+    venvDir,
+    venvBinDir,
+    sitePackagesDir,
+    nodePrefixDir,
+    path.join(nodePrefixDir, 'lib', 'node_modules'),
+    path.join(nodePrefixDir, 'node_modules'),
+    path.join(nodePrefixDir, 'bin'),
+    path.join(chatRuntimeDir, 'bin'),
+    pipCacheDir,
+    npmCacheDir,
+  ]) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  }
+
+  let pythonTarget = '/usr/bin/python3';
+  if (!fs.existsSync(pythonTarget)) {
+    pythonTarget = resolveHostExecutable('python3') ?? '/usr/bin/python3';
+  }
+  ensureSymlinkTarget(pythonTarget, path.join(venvBinDir, 'python3'));
+  ensureSymlinkTarget('python3', path.join(venvBinDir, 'python'));
+
+  const pipWrapper = '#!/bin/sh\nexec "$(dirname "$0")/python3" -m pip "$@"\n';
+  writeFileIfChanged(path.join(venvBinDir, 'pip'), pipWrapper, 0o755);
+  writeFileIfChanged(path.join(venvBinDir, 'pip3'), pipWrapper, 0o755);
+
+  const pyvenvCfg = [
+    `home = ${path.posix.dirname(pythonTarget.split(path.sep).join(path.posix.sep))}`,
+    'include-system-site-packages = true',
+    '',
+  ].join('\n');
+  writeFileIfChanged(path.join(venvDir, 'pyvenv.cfg'), pyvenvCfg, 0o644);
+
+  const pthPath = path.join(sitePackagesDir, 'zz_agy_doc_base.pth');
+  if (docRuntime && docRuntime.pythonSiteRels.length > 0) {
+    const lines = docRuntime.pythonSiteRels.map((rel) =>
+      path.posix.join(docRuntimeMountRoot, rel.split(path.sep).join(path.posix.sep))
     );
+    writeFileIfChanged(pthPath, lines.join('\n') + '\n', 0o644);
+  } else if (fs.existsSync(pthPath)) {
+    fs.rmSync(pthPath, { force: true });
+  }
+
+  return chatRuntimeDir;
+}
+
+export function applySandboxLayeredRuntime(
+  env: NodeJS.ProcessEnv,
+  docRuntime: DocRuntimeLayout | null,
+  sandboxAgyBinDir: string | null = null,
+  mounts?: {
+    chatRuntimeMount?: string;
+    hooksMount?: string;
+    docRuntimeMount?: string;
+  }
+): void {
+  const chatMount = mounts?.chatRuntimeMount ?? SANDBOX_CHAT_RUNTIME_MOUNT;
+  const hooksMount = mounts?.hooksMount ?? SANDBOX_CHAT_HOOKS_MOUNT;
+  const docMount = mounts?.docRuntimeMount ?? SANDBOX_DOC_RUNTIME_MOUNT;
+  const toPosix = (rel: string) => rel.split(path.sep).join(path.posix.sep);
+
+  env.VIRTUAL_ENV = `${chatMount}/venv`;
+  env.PYTHONNOUSERSITE = '1';
+  env.PIP_CACHE_DIR = `${chatMount}/pip-cache`;
+  env.NPM_CONFIG_PREFIX = `${chatMount}/node`;
+  env.NPM_CONFIG_CACHE = `${chatMount}/npm-cache`;
+  env.NPM_CONFIG_USERCONFIG = `${chatMount}/npmrc`;
+
+  const nodePathEntries = [
+    `${chatMount}/node/lib/node_modules`,
+    `${chatMount}/node/node_modules`,
+  ];
+  const nodeLayerRoots = [`${chatMount}/node/lib`, `${chatMount}/node`];
+  if (docRuntime?.nodeModulesRel) {
+    const docNodeModules = path.posix.join(docMount, toPosix(docRuntime.nodeModulesRel));
+    nodePathEntries.push(docNodeModules);
+    nodeLayerRoots.push(path.posix.dirname(docNodeModules));
+  }
+  env.NODE_PATH = nodePathEntries.join(path.delimiter);
+  env.AGY_NODE_LAYER_PATHS = nodeLayerRoots.join(path.delimiter);
+
+  const registerArg = `--import=${hooksMount}/esm-register.mjs`;
+  env.NODE_OPTIONS = env.NODE_OPTIONS ? `${registerArg} ${env.NODE_OPTIONS}` : registerArg;
+
+  const pathEntries = [
+    ...(sandboxAgyBinDir ? [sandboxAgyBinDir] : []),
+    `${chatMount}/venv/bin`,
+    `${chatMount}/node/bin`,
+    `${chatMount}/bin`,
+  ];
+  if (docRuntime?.venvBinRel) {
+    pathEntries.push(path.posix.join(docMount, toPosix(docRuntime.venvBinRel)));
+  }
+  if (docRuntime?.nodeBinRel) {
+    pathEntries.push(path.posix.join(docMount, toPosix(docRuntime.nodeBinRel)));
+  }
+  pathEntries.push(env.PATH || '/usr/local/bin:/usr/bin:/bin');
+  env.PATH = pathEntries.join(path.delimiter);
+
+  if (docRuntime) {
+    env.SAL_USE_VCLPLUGIN = 'svp';
   }
 }

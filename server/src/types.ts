@@ -330,6 +330,7 @@ export interface SandboxStatus {
   mode: 'auto' | 'strict' | 'off';
   active: boolean;
   backend: 'bwrap' | 'mock' | 'none';
+  layeredRuntimeIsolated?: boolean;
   reason: string | null;
   remediation: string | null;
 }

@@ -1201,6 +1201,12 @@ export class AcpClientManager {
       enableSandboxBwrap: sandboxStatus.active,
     });
 
+    if (this.config.agyMode === 'real' && !spec.layeredRuntimeIsolated) {
+      console.warn(
+        `[acp] Starting non-isolated ACP worker for chat ${chatId}: read-only shared runtime base and per-chat package diff isolation are NOT guaranteed.`
+      );
+    }
+
     const child = spawn(spec.command, spec.args, {
       cwd: chat.workspaceDir,
       env: spec.env,
