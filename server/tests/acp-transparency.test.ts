@@ -503,8 +503,8 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     alice.closeWs();
   });
 
-  it('derives native Antigravity permission rules and persists Always Allow into settings.json transparently', async () => {
-    const ws = '/tmp/ws-demo';
+  it('derives native Antigravity permission rules strictly for unambiguously identified known MCP tools without guessing', async () => {
+    // 1) Structured ServerName + ToolName must match an effective known MCP server
     expect(
       deriveAgyPermissionRule({
         toolCall: {
@@ -514,11 +514,37 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
           status: 'pending',
           rawInput: { ServerName: 'linear', ToolName: 'create_issue' },
         },
-        workspaceDir: ws,
-        sandboxWorkspaceRoot: '/workspace',
+        knownMcpServers: [{ name: 'linear', discoveredTools: ['create_issue'] }],
       })
     ).toBe('mcp(linear/create_issue)');
 
+    // Unknown server or unknown discovered tool must return null (no guessing)
+    expect(
+      deriveAgyPermissionRule({
+        toolCall: {
+          toolCallId: 'tc-1b',
+          title: 'call_mcp_tool',
+          name: 'call_mcp_tool',
+          status: 'pending',
+          rawInput: { ServerName: 'unregistered', ToolName: 'create_issue' },
+        },
+        knownMcpServers: [{ name: 'linear', discoveredTools: ['create_issue'] }],
+      })
+    ).toBeNull();
+    expect(
+      deriveAgyPermissionRule({
+        toolCall: {
+          toolCallId: 'tc-1c',
+          title: 'call_mcp_tool',
+          name: 'call_mcp_tool',
+          status: 'pending',
+          rawInput: { ServerName: 'linear', ToolName: 'unlisted_tool' },
+        },
+        knownMcpServers: [{ name: 'linear', discoveredTools: ['create_issue'] }],
+      })
+    ).toBeNull();
+
+    // 2) Prefixed eager MCP names match known server unambiguously without underscore-splitting fallback
     expect(
       deriveAgyPermissionRule({
         toolCall: {
@@ -527,12 +553,51 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
           name: 'mcp_my_srv_fetch',
           status: 'pending',
         },
-        workspaceDir: ws,
-        sandboxWorkspaceRoot: '/workspace',
         knownMcpServerNames: ['my_srv'],
       })
     ).toBe('mcp(my_srv/fetch)');
 
+    // Must NOT fall back to splitting on first '_' for unknown servers
+    expect(
+      deriveAgyPermissionRule({
+        toolCall: {
+          toolCallId: 'tc-2b',
+          title: 'mcp_my_srv_fetch',
+          name: 'mcp_my_srv_fetch',
+          status: 'pending',
+        },
+        knownMcpServerNames: [],
+      })
+    ).toBeNull();
+
+    // Ambiguous server prefixes return null unless discoveredTools disambiguates uniquely
+    expect(
+      deriveAgyPermissionRule({
+        toolCall: {
+          toolCallId: 'tc-2c',
+          title: 'mcp_foo_bar_baz',
+          name: 'mcp_foo_bar_baz',
+          status: 'pending',
+        },
+        knownMcpServers: [{ name: 'foo' }, { name: 'foo_bar' }],
+      })
+    ).toBeNull();
+    expect(
+      deriveAgyPermissionRule({
+        toolCall: {
+          toolCallId: 'tc-2d',
+          title: 'mcp_foo_bar_baz',
+          name: 'mcp_foo_bar_baz',
+          status: 'pending',
+        },
+        knownMcpServers: [
+          { name: 'foo', discoveredTools: ['other'] },
+          { name: 'foo_bar', discoveredTools: ['baz'] },
+        ],
+      })
+    ).toBe('mcp(foo_bar/baz)');
+
+    // 3) Must NOT heuristically guess rules for commands, file edits, URLs, or questions
     expect(
       deriveAgyPermissionRule({
         toolCall: {
@@ -543,26 +608,9 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
           status: 'pending',
           rawInput: { CommandLine: 'git status' },
         },
-        workspaceDir: ws,
-        sandboxWorkspaceRoot: '/workspace',
-      })
-    ).toBe('command(git status)');
-
-    expect(
-      deriveAgyPermissionRule({
-        toolCall: {
-          toolCallId: 'tc-3b',
-          title: 'Run command with parens',
-          name: 'run_command',
-          kind: 'execute',
-          status: 'pending',
-          rawInput: { CommandLine: 'node -e "console.log(1)"' },
-        },
-        workspaceDir: ws,
-        sandboxWorkspaceRoot: '/workspace',
+        knownMcpServerNames: ['linear'],
       })
     ).toBeNull();
-
     expect(
       deriveAgyPermissionRule({
         toolCall: {
@@ -573,11 +621,9 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
           status: 'pending',
           rawInput: { Url: 'https://docs.example.com/guide' },
         },
-        workspaceDir: ws,
-        sandboxWorkspaceRoot: '/workspace',
+        knownMcpServerNames: ['linear'],
       })
-    ).toBe('read_url(docs.example.com)');
-
+    ).toBeNull();
     expect(
       deriveAgyPermissionRule({
         toolCall: {
@@ -585,16 +631,27 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
           title: 'Ask question',
           status: 'pending',
         },
-        workspaceDir: ws,
-        sandboxWorkspaceRoot: '/workspace',
+        knownMcpServerNames: ['linear'],
       })
     ).toBeNull();
 
-    const srv = await createTestServer();
+    const srv = await createTestServer({ allowPrivateMcpUrls: true });
     cleanups.push(srv.cleanup);
 
     const { client: alice, userId } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
     await alice.connectWs();
+
+    // Register known MCP server for Alice with cached discovered tool `safe_fetch`
+    const mcpCreate = await alice.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'known_mcp',
+      scope: 'profile',
+      transport: 'http',
+      url: 'http://127.0.0.1:4999/mcp',
+    });
+    expect(mcpCreate.status).toBe(201);
+    srv.ctx.db.updateMcpServer(mcpCreate.data.server.id, {
+      discoveredToolsJson: JSON.stringify([{ name: 'safe_fetch', description: 'Safe fetch' }]),
+    });
 
     const chatRes = await alice.request<{ chat: { id: string; workspaceDir: string } }>(
       'POST',
@@ -604,10 +661,10 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     const chatId = chatRes.data.chat.id;
     const workspaceDir = chatRes.data.chat.workspaceDir;
 
+    // A) File write without native allow_always must NOT synthesize write_file(...) rule
     await alice.request('POST', `/api/chats/${chatId}/messages`, {
       text: 'Run [PERMISSION]',
     });
-
     const permFrame = await alice.waitForFrame(
       (f) => f.kind === 'event' && (f.event as { type: string }).type === 'permission.requested'
     );
@@ -615,21 +672,50 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
       permFrame.event as { payload?: { permission?: { id: string; alwaysAllowRule?: string | null } } }
     ).payload?.permission;
     expect(perm?.id).toBeTruthy();
-    expect(perm?.alwaysAllowRule).toBe('write_file(created-by-tool.md)');
+    expect(perm?.alwaysAllowRule).toBeNull();
 
     const resolveRes = await alice.request('POST', `/api/chats/${chatId}/permissions/${perm!.id}`, {
       optionId: 'allow_once',
       alwaysAllow: true,
     });
     expect(resolveRes.status).toBe(200);
-
     await alice.waitForFrame(
       (f) => f.kind === 'event' && (f.event as { type: string }).type === 'run.finished'
     );
-
     expect(fs.existsSync(path.join(workspaceDir, 'created-by-tool.md'))).toBe(true);
-    const profile = srv.ctx.db.getAgyProfile(userId)!;
-    expect(getAgyPermissionRules(profile.profileDir).allow).toContain('write_file(created-by-tool.md)');
+    const profileAfterWrite = srv.ctx.db.getAgyProfile(userId)!;
+    expect(getAgyPermissionRules(profileAfterWrite.profileDir).allow).not.toContain('write_file(created-by-tool.md)');
+
+    // B) Verified known MCP server + tool derives mcp(known_mcp/safe_fetch) and persists on explicit Always Allow
+    const mcpRun = await alice.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
+      text: '[MCP_PERMISSION]',
+    });
+    const mcpPermFrame = await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; runId: string }).type === 'permission.requested' &&
+        (f.event as { runId: string }).runId === mcpRun.data.run.id
+    );
+    const mcpPerm = (
+      mcpPermFrame.event as { payload?: { permission?: { id: string; alwaysAllowRule?: string | null } } }
+    ).payload?.permission;
+    expect(mcpPerm?.alwaysAllowRule).toBe('mcp(known_mcp/safe_fetch)');
+
+    const mcpResolve = await alice.request('POST', `/api/chats/${chatId}/permissions/${mcpPerm!.id}`, {
+      optionId: 'allow_once',
+      alwaysAllow: true,
+    });
+    expect(mcpResolve.status).toBe(200);
+    await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { run?: { id: string } } }).type === 'run.finished' &&
+        (f.event as { payload?: { run?: { id: string } } }).payload?.run?.id === mcpRun.data.run.id
+    );
+
+    const profileAfterMcp = srv.ctx.db.getAgyProfile(userId)!;
+    expect(getAgyPermissionRules(profileAfterMcp.profileDir).allow).toContain('mcp(known_mcp/safe_fetch)');
+    expect(JSON.parse(srv.ctx.db.getMcpServerById(mcpCreate.data.server.id)!.alwaysAllowToolsJson)).toContain('safe_fetch');
 
     alice.closeWs();
   });
@@ -857,8 +943,19 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     expect(srv.ctx.db.getElicitation(userId, 'elicit-recover-1')?.status).toBe('cancelled');
 
     // 6) Selecting a reject option with alwaysAllow=true must NOT persist alwaysAllowRule
+    const rejectMcp = await alice.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'known_mcp',
+      scope: 'profile',
+      transport: 'http',
+      url: 'https://example.com/mcp',
+    });
+    expect(rejectMcp.status).toBe(201);
+    srv.ctx.db.updateMcpServer(rejectMcp.data.server.id, {
+      discoveredToolsJson: JSON.stringify([{ name: 'safe_fetch', description: 'Safe fetch' }]),
+    });
+
     const rejectRun = await alice.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
-      text: 'Reject [PERMISSION]',
+      text: 'Reject [MCP_PERMISSION]',
     });
     const rPermFrame = await alice.waitForFrame(
       (f) =>
@@ -866,8 +963,11 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
         (f.event as { type: string; runId: string }).type === 'permission.requested' &&
         (f.event as { runId: string }).runId === rejectRun.data.run.id
     );
-    const rPermId = (rPermFrame.event as { payload: { permission: { id: string } } }).payload.permission.id;
-    const rejectRes = await alice.request('POST', `/api/chats/${chatId}/permissions/${rPermId}`, {
+    const rPerm = (
+      rPermFrame.event as { payload: { permission: { id: string; alwaysAllowRule?: string | null } } }
+    ).payload.permission;
+    expect(rPerm.alwaysAllowRule).toBe('mcp(known_mcp/safe_fetch)');
+    const rejectRes = await alice.request('POST', `/api/chats/${chatId}/permissions/${rPerm.id}`, {
       optionId: 'reject_once',
       alwaysAllow: true,
     });
@@ -879,7 +979,7 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
         (f.event as { payload?: { run?: { id: string } } }).payload?.run?.id === rejectRun.data.run.id
     );
     const profileAfterReject = srv.ctx.db.getAgyProfile(userId)!;
-    expect(getAgyPermissionRules(profileAfterReject.profileDir).allow).not.toContain('write_file(created-by-tool.md)');
+    expect(getAgyPermissionRules(profileAfterReject.profileDir).allow).not.toContain('mcp(known_mcp/safe_fetch)');
 
     alice.closeWs();
   });

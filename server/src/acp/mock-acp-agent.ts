@@ -1278,6 +1278,39 @@ function runAcpServer(): void {
         });
       }
 
+      // Known MCP tool interactive permission check (for testing verified MCP alwaysAllowRule)
+      if (promptText.includes('[MCP_PERMISSION]')) {
+        const toolCallId = `tc-mcp-${Date.now()}`;
+        const permRes = await ctx.client.request(methods.client.session.requestPermission, {
+          sessionId: state.id,
+          toolCall: {
+            toolCallId,
+            title: 'known_mcp: safe_fetch',
+            name: 'mcp_known_mcp_safe_fetch',
+            status: 'pending',
+            rawInput: { ServerName: 'known_mcp', ToolName: 'safe_fetch' },
+          } as never,
+          options: [
+            { optionId: 'allow_once', name: '今回のみ許可', kind: 'allow_once' },
+            { optionId: 'reject_once', name: '拒否', kind: 'reject_once' },
+          ],
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text:
+                permRes.outcome.outcome === 'selected'
+                  ? `MCP許可応答: optionId=${permRes.outcome.optionId}`
+                  : `MCP許可キャンセル: ${permRes.outcome.outcome}`,
+            },
+          },
+        });
+        return { stopReason: 'end_turn' as const };
+      }
+
       // Tool call & interactive permission check
       if (promptText.includes('[PERMISSION]')) {
         const toolCallId = `tc-${Date.now()}`;
