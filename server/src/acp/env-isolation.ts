@@ -4,12 +4,19 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { AppConfig } from '../config.js';
+import {
+  isValidSkillSlug,
+  LEGACY_BUILTIN_SYNC_MARKER,
+  resolveActiveBuiltinSkillsForProfile,
+} from '../skills/builtin-skills.js';
 import type { SandboxStatus } from '../types.js';
 
 const require = createRequire(import.meta.url);
 
 export const SANDBOX_WORKSPACE_MOUNT = '/workspace';
 export const SANDBOX_HOME_MOUNT = '/home/sandbox';
+export const SANDBOX_DOC_RUNTIME_MOUNT = '/opt/agy-doc-runtime';
+export const SANDBOX_CHAT_RUNTIME_MOUNT = '/opt/agy-chat-runtime';
 
 export function getChatBrainHostDir(profileDir: string, workspaceDir?: string | null): string {
   const profileAbs = path.resolve(profileDir);
@@ -56,6 +63,10 @@ const ETC_WHITELIST_DIRS = [
   '/etc/ld.so.conf.d',
   '/etc/alternatives',
   '/etc/terminfo',
+  '/etc/fonts',
+  '/etc/libreoffice',
+  '/etc/ImageMagick-6',
+  '/etc/ImageMagick-7',
 ] as const;
 
 const ETC_WHITELIST_FILES = [
@@ -312,6 +323,7 @@ export interface SpawnCommandSpec {
   args: string[];
   env: NodeJS.ProcessEnv;
   sandboxed: boolean;
+  layeredRuntimeIsolated: boolean;
   sandboxWorkspaceRoot: string;
 }
 
@@ -321,13 +333,17 @@ export function clearSandboxProbeCache(): void {
   sandboxProbeCache.clear();
 }
 
+const NON_ISOLATED_GUARANTEE_NOTE =
+  '非隔離モードのため、共通ベースの読み取り専用保護およびチャット単位のパッケージ差分・プロセス隔離は保証されません。';
+
 export function probeBwrapSandbox(config: AppConfig, useCache = true): SandboxStatus {
   if (config.agyMode === 'mock') {
     return {
       mode: config.sandboxMode,
       active: false,
       backend: 'mock',
-      reason: 'モックモード（AGY_MODE=mock）で動作中です。',
+      layeredRuntimeIsolated: false,
+      reason: `モックモード（AGY_MODE=mock）で動作中です。${NON_ISOLATED_GUARANTEE_NOTE}`,
       remediation: null,
     };
   }
@@ -336,7 +352,8 @@ export function probeBwrapSandbox(config: AppConfig, useCache = true): SandboxSt
       mode: 'off',
       active: false,
       backend: 'none',
-      reason: '設定（SANDBOX_MODE=off）によりOSレベルの隔離が無効化されています。',
+      layeredRuntimeIsolated: false,
+      reason: `設定（SANDBOX_MODE=off）によりOSレベルの隔離が無効化されています。${NON_ISOLATED_GUARANTEE_NOTE}`,
       remediation: '/etc/antigravity-chat/env から SANDBOX_MODE=off / ENABLE_BWRAP=false を外して再起動してください。',
     };
   }
@@ -345,7 +362,8 @@ export function probeBwrapSandbox(config: AppConfig, useCache = true): SandboxSt
       mode: config.sandboxMode,
       active: false,
       backend: 'none',
-      reason: `bubblewrap サンドボックスは Linux 専用です（現在: ${process.platform}）。`,
+      layeredRuntimeIsolated: false,
+      reason: `bubblewrap サンドボックスは Linux 専用です（現在: ${process.platform}）。${NON_ISOLATED_GUARANTEE_NOTE}`,
       remediation: null,
     };
   }
@@ -362,7 +380,8 @@ export function probeBwrapSandbox(config: AppConfig, useCache = true): SandboxSt
       mode: config.sandboxMode,
       active: false,
       backend: 'none',
-      reason: `bubblewrap (${config.bwrapBin}) が見つかりません。`,
+      layeredRuntimeIsolated: false,
+      reason: `bubblewrap (${config.bwrapBin}) が見つかりません。${NON_ISOLATED_GUARANTEE_NOTE}`,
       remediation: 'Ubuntu サーバーで sudo apt-get update && sudo apt-get install -y bubblewrap を実行してください。',
     };
     sandboxProbeCache.set(cacheKey, res);
@@ -377,7 +396,8 @@ export function probeBwrapSandbox(config: AppConfig, useCache = true): SandboxSt
       mode: config.sandboxMode,
       active: false,
       backend: 'none',
-      reason: 'サンドボックス検証用バイナリ（true / sh）が見つかりません。',
+      layeredRuntimeIsolated: false,
+      reason: `サンドボックス検証用バイナリ（true / sh）が見つかりません。${NON_ISOLATED_GUARANTEE_NOTE}`,
       remediation: null,
     };
     sandboxProbeCache.set(cacheKey, res);
@@ -406,6 +426,7 @@ export function probeBwrapSandbox(config: AppConfig, useCache = true): SandboxSt
       mode: config.sandboxMode,
       active: true,
       backend: 'bwrap',
+      layeredRuntimeIsolated: true,
       reason: null,
       remediation: null,
     };
@@ -417,9 +438,10 @@ export function probeBwrapSandbox(config: AppConfig, useCache = true): SandboxSt
       mode: config.sandboxMode,
       active: false,
       backend: 'none',
+      layeredRuntimeIsolated: false,
       reason: isPermissionIssue
-        ? 'Ubuntu AppArmor またはカーネル名前空間の制限により bubblewrap の起動が拒否されました。'
-        : `bubblewrap の起動テストに失敗しました: ${stderr.slice(0, 180) || 'unknown error'}`,
+        ? `Ubuntu AppArmor またはカーネル名前空間の制限により bubblewrap の起動が拒否されました。${NON_ISOLATED_GUARANTEE_NOTE}`
+        : `bubblewrap の起動テストに失敗しました: ${stderr.slice(0, 180) || 'unknown error'}。${NON_ISOLATED_GUARANTEE_NOTE}`,
       remediation: isPermissionIssue
         ? 'Ubuntu サーバーで最新の sudo bash deploy/ubuntu-setup.sh を実行し、/etc/apparmor.d/bwrap の作成と systemd の NoNewPrivileges=false を反映してください。'
         : 'sudo systemctl restart antigravity-chat と bubblewrap の動作を確認してください。',
@@ -439,7 +461,12 @@ function symlinkIfMissing(targetPath: string, linkPath: string): void {
   if (!fs.existsSync(targetPath)) return;
   try {
     const st = fs.lstatSync(linkPath);
-    if (st.isSymbolicLink() || st.isFile() || st.isDirectory()) return;
+    if (st.isSymbolicLink() || st.isDirectory()) return;
+    if (st.isFile()) {
+      const targetStat = fs.statSync(targetPath);
+      if (st.size > 0 || !targetStat.isFile() || targetStat.size === 0) return;
+      fs.rmSync(linkPath, { force: true });
+    }
   } catch {
     // does not exist
   }
@@ -477,7 +504,45 @@ export function prepareAgyUsageHome(profileDir: string, usageHome: string): void
   }
 }
 
-export function ensurePerChatHomeDir(profileDir: string, workspaceDir: string): string {
+function ensurePrivateDir(dirPath: string): void {
+  try {
+    if (fs.lstatSync(dirPath).isSymbolicLink()) {
+      fs.rmSync(dirPath, { force: true });
+    }
+  } catch {
+    // missing
+  }
+  fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+}
+
+function clearSymlinkMountPoint(mountHostPath: string): void {
+  try {
+    if (fs.lstatSync(mountHostPath).isSymbolicLink()) {
+      fs.rmSync(mountHostPath, { force: true });
+    }
+  } catch {
+    // missing
+  }
+}
+
+function resolveBindableHostPath(candidate: string): { resolved: string; isDir: boolean } | null {
+  try {
+    const resolved = fs.realpathSync(candidate);
+    const st = fs.statSync(resolved);
+    if (st.isFile() || st.isDirectory()) {
+      return { resolved, isDir: st.isDirectory() };
+    }
+  } catch {
+    // missing or broken symlink
+  }
+  return null;
+}
+
+export function ensurePerChatHomeDir(
+  profileDir: string,
+  workspaceDir: string,
+  builtinSkillsDir?: string | null
+): string {
   const profileAbs = path.resolve(profileDir);
   const workspaceAbs = path.resolve(workspaceDir);
   const wsKey = path.basename(workspaceAbs) || 'default';
@@ -486,28 +551,100 @@ export function ensurePerChatHomeDir(profileDir: string, workspaceDir: string): 
   const chatScratchHostDir = path.join(profileAbs, '.chat-scratch', wsKey);
   const chatPlaygroundHostDir = path.join(profileAbs, '.chat-playground', wsKey);
 
-  fs.mkdirSync(chatHomeDir, { recursive: true, mode: 0o700 });
-  fs.mkdirSync(chatBrainHostDir, { recursive: true, mode: 0o700 });
-  fs.mkdirSync(chatScratchHostDir, { recursive: true, mode: 0o700 });
-  fs.mkdirSync(chatPlaygroundHostDir, { recursive: true, mode: 0o700 });
+  ensurePrivateDir(chatHomeDir);
+  ensurePrivateDir(chatBrainHostDir);
+  ensurePrivateDir(chatScratchHostDir);
+  ensurePrivateDir(chatPlaygroundHostDir);
 
-  // Symlink top-level shared auth/XDG items from profileAbs
-  for (const name of ['.mock-agy-auth.json', '.config', '.local', '.cache']) {
-    symlinkIfMissing(path.join(profileAbs, name), path.join(chatHomeDir, name));
+  // Isolate XDG directories per chat persistently; share only Antigravity auth/user config
+  for (const rel of ['.config', '.local', '.local/share', '.local/state', '.cache']) {
+    ensurePrivateDir(path.join(chatHomeDir, rel));
   }
+  symlinkIfMissing(
+    path.join(profileAbs, '.mock-agy-auth.json'),
+    path.join(chatHomeDir, '.mock-agy-auth.json')
+  );
 
   // Isolate .gemini per chat while sharing auth/config/skills
   const profileGemini = path.join(profileAbs, '.gemini');
   const chatGemini = path.join(chatHomeDir, '.gemini');
-  fs.mkdirSync(chatGemini, { recursive: true, mode: 0o700 });
+  ensurePrivateDir(chatGemini);
 
+  const { active: activeBuiltins } = resolveActiveBuiltinSkillsForProfile(profileAbs, builtinSkillsDir);
   const isolatedVendorDirs = new Set(['antigravity', 'antigravity-cli', 'jetski']);
-  const isolatedLeafDirs = new Set(['brain', 'scratch', 'playground']);
+  const isolatedLeafDirs = new Set(['brain', 'scratch', 'playground', 'tmp', 'logs']);
+  const internalConfigEntries = new Set([
+    'skills',
+    '.builtin-skills-state.json',
+    '.builtin-migration-backups',
+  ]);
 
   if (fs.existsSync(profileGemini)) {
     for (const entry of fs.readdirSync(profileGemini, { withFileTypes: true })) {
       if (isolatedVendorDirs.has(entry.name) || isolatedLeafDirs.has(entry.name)) continue;
+      if (entry.name === 'config' && activeBuiltins.length > 0) continue;
       symlinkIfMissing(path.join(profileGemini, entry.name), path.join(chatGemini, entry.name));
+    }
+  }
+
+  const chatConfigDir = path.join(chatGemini, 'config');
+  const profileConfigDir = path.join(profileGemini, 'config');
+  if (activeBuiltins.length > 0) {
+    ensurePrivateDir(chatConfigDir);
+    if (fs.existsSync(profileConfigDir)) {
+      for (const entry of fs.readdirSync(profileConfigDir, { withFileTypes: true })) {
+        if (internalConfigEntries.has(entry.name)) continue;
+        symlinkIfMissing(path.join(profileConfigDir, entry.name), path.join(chatConfigDir, entry.name));
+      }
+    }
+
+    const chatSkillsDir = path.join(chatConfigDir, 'skills');
+    fs.mkdirSync(chatSkillsDir, { recursive: true, mode: 0o700 });
+    const desiredSkills = new Map<string, string>();
+    const profileSkillsDir = path.join(profileConfigDir, 'skills');
+    if (fs.existsSync(profileSkillsDir)) {
+      for (const entry of fs.readdirSync(profileSkillsDir, { withFileTypes: true })) {
+        if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+        if (!isValidSkillSlug(entry.name)) continue;
+        const candidate = path.join(profileSkillsDir, entry.name);
+        if (fs.existsSync(path.join(candidate, LEGACY_BUILTIN_SYNC_MARKER))) continue;
+        if (fs.existsSync(path.join(candidate, 'SKILL.md'))) {
+          desiredSkills.set(entry.name, candidate);
+        }
+      }
+    }
+    for (const builtin of activeBuiltins) {
+      if (!desiredSkills.has(builtin.slug)) {
+        desiredSkills.set(builtin.slug, builtin.dir);
+      }
+    }
+    for (const existing of fs.readdirSync(chatSkillsDir, { withFileTypes: true })) {
+      if (!desiredSkills.has(existing.name)) {
+        fs.rmSync(path.join(chatSkillsDir, existing.name), { recursive: true, force: true });
+      }
+    }
+    for (const [slug, targetDir] of desiredSkills.entries()) {
+      const linkPath = path.join(chatSkillsDir, slug);
+      try {
+        const st = fs.lstatSync(linkPath);
+        if (st.isSymbolicLink() && fs.readlinkSync(linkPath) === targetDir) continue;
+        fs.rmSync(linkPath, { recursive: true, force: true });
+      } catch {
+        // missing
+      }
+      symlinkIfMissing(targetDir, linkPath);
+    }
+  } else {
+    try {
+      const st = fs.lstatSync(chatConfigDir);
+      if (!st.isSymbolicLink() && st.isDirectory()) {
+        fs.rmSync(chatConfigDir, { recursive: true, force: true });
+      }
+    } catch {
+      // missing
+    }
+    if (fs.existsSync(profileConfigDir)) {
+      symlinkIfMissing(profileConfigDir, chatConfigDir);
     }
   }
 
@@ -548,7 +685,7 @@ export function buildAgyCommandSpec(params: {
 
   if (params.config.agyMode === 'mock') {
     const effectiveHome = !isProbeWorkspace
-      ? ensurePerChatHomeDir(params.profileDir, params.workspaceDir!)
+      ? ensurePerChatHomeDir(params.profileDir, params.workspaceDir!, params.config.builtinSkillsDir)
       : params.profileDir;
     const env = buildIsolatedAgyEnv({
       profileDir: params.profileDir,
@@ -569,6 +706,7 @@ export function buildAgyCommandSpec(params: {
       args: mockArgs,
       env,
       sandboxed: false,
+      layeredRuntimeIsolated: false,
       sandboxWorkspaceRoot: workspaceFallback,
     };
   }
@@ -577,6 +715,8 @@ export function buildAgyCommandSpec(params: {
     params.subcommandArgs[0] === 'acp'
       ? [...params.subcommandArgs, '--disable-telemetry']
       : params.subcommandArgs;
+
+  const docRuntime = resolveDocRuntimeLayout(params.config.docRuntimeDir);
 
   const wantsSandbox =
     Boolean(params.enableSandboxBwrap) &&
@@ -616,26 +756,79 @@ export function buildAgyCommandSpec(params: {
       '/etc/group',
     ];
 
+    try {
+      const fontCacheReal = fs.realpathSync('/var/cache/fontconfig');
+      if (fs.statSync(fontCacheReal).isDirectory()) {
+        bwrapArgs.push('--dir', '/var/cache', '--ro-bind', fontCacheReal, '/var/cache/fontconfig');
+      }
+    } catch {
+      // Ignore absent host fontconfig cache
+    }
+
+    let optDirMounted = false;
+    const ensureOptDir = () => {
+      if (!optDirMounted) {
+        bwrapArgs.push('--dir', '/opt');
+        optDirMounted = true;
+      }
+    };
+
     const resolvedAgy = resolveCanonicalAgyBin(params.config.agyBin, env.PATH);
     let sandboxAgyCommand = resolvedAgy;
+    let sandboxAgyBinDir: string | null = null;
 
     if (resolvedAgy.includes('/')) {
       if (isInsideSystemMountTree(resolvedAgy, mountedSystemDirs)) {
         sandboxAgyCommand = resolvedAgy;
       } else {
-        bwrapArgs.push('--dir', '/opt', '--dir', '/opt/agy', '--ro-bind', resolvedAgy, '/opt/agy/agy');
-        env.PATH = `/opt/agy:${env.PATH || '/usr/local/bin:/usr/bin:/bin'}`;
+        ensureOptDir();
+        bwrapArgs.push('--dir', '/opt/agy', '--ro-bind', resolvedAgy, '/opt/agy/agy');
+        sandboxAgyBinDir = '/opt/agy';
         sandboxAgyCommand = '/opt/agy/agy';
       }
     }
 
-    const chatBrainHostDir = getChatBrainHostDir(profileAbs, workspaceAbs);
+    ensureOptDir();
+    if (docRuntime) {
+      bwrapArgs.push('--ro-bind', docRuntime.hostDir, SANDBOX_DOC_RUNTIME_MOUNT);
+    }
+
+    const chatRuntimeHostDir = ensurePerChatRuntimeDir(profileAbs, workspaceAbs, docRuntime);
+    bwrapArgs.push('--bind', chatRuntimeHostDir, SANDBOX_CHAT_RUNTIME_MOUNT);
+    if (docRuntime?.nodeModulesRel) {
+      bwrapArgs.push(
+        '--bind',
+        path.join(chatRuntimeHostDir, 'node', 'lib', 'node_modules'),
+        '/node_modules'
+      );
+    }
+    applySandboxLayeredRuntime(env, docRuntime, sandboxAgyBinDir);
+
     const wsKey = path.basename(workspaceAbs) || 'default';
+    const chatHomeHostDir = path.join(profileAbs, '.chat-homes', wsKey);
+    const chatBrainHostDir = getChatBrainHostDir(profileAbs, workspaceAbs);
     const chatScratchHostDir = path.join(profileAbs, '.chat-scratch', wsKey);
     const chatPlaygroundHostDir = path.join(profileAbs, '.chat-playground', wsKey);
-    fs.mkdirSync(chatBrainHostDir, { recursive: true, mode: 0o700 });
-    fs.mkdirSync(chatScratchHostDir, { recursive: true, mode: 0o700 });
-    fs.mkdirSync(chatPlaygroundHostDir, { recursive: true, mode: 0o700 });
+
+    ensurePrivateDir(chatHomeHostDir);
+    for (const rel of [
+      '.config',
+      '.local',
+      '.local/share',
+      '.local/state',
+      '.cache',
+      '.gemini',
+      '.gemini/antigravity',
+      '.gemini/antigravity-cli',
+      '.gemini/jetski',
+      '.gemini/config',
+    ]) {
+      ensurePrivateDir(path.join(chatHomeHostDir, rel));
+    }
+    ensurePrivateDir(chatBrainHostDir);
+    ensurePrivateDir(chatScratchHostDir);
+    ensurePrivateDir(chatPlaygroundHostDir);
+
     const brainSubdirs = [
       ['.gemini', 'antigravity-cli', 'brain'],
       ['.gemini', 'antigravity', 'brain'],
@@ -654,24 +847,83 @@ export function buildAgyCommandSpec(params: {
       ['.gemini', 'playground'],
     ] as const;
     for (const rel of [...brainSubdirs, ...scratchSubdirs, ...playgroundSubdirs]) {
-      fs.mkdirSync(path.join(profileAbs, ...rel), { recursive: true, mode: 0o700 });
+      ensurePrivateDir(path.join(chatHomeHostDir, ...rel));
     }
-    for (const hiddenDir of ['.chat-brains', '.chat-homes', '.chat-scratch', '.chat-playground']) {
-      fs.mkdirSync(path.join(profileAbs, hiddenDir), { recursive: true, mode: 0o700 });
+
+    bwrapArgs.push('--bind', chatHomeHostDir, SANDBOX_HOME_MOUNT);
+
+    const pushSharedBindMount = (hostSource: string, relUnderHome: string, readonly = false) => {
+      const target = resolveBindableHostPath(hostSource);
+      if (!target) return;
+      const stubHostPath = path.join(chatHomeHostDir, relUnderHome);
+      if (target.isDir) {
+        ensurePrivateDir(stubHostPath);
+      } else {
+        ensurePrivateDir(path.dirname(stubHostPath));
+        clearSymlinkMountPoint(stubHostPath);
+        if (!fs.existsSync(stubHostPath)) {
+          fs.writeFileSync(stubHostPath, '', { mode: 0o600 });
+        }
+      }
+      bwrapArgs.push(
+        readonly ? '--ro-bind' : '--bind',
+        target.resolved,
+        `${SANDBOX_HOME_MOUNT}/${relUnderHome}`
+      );
+    };
+
+    // Selectively share ONLY Antigravity authentication and explicitly shared profile config/skills
+    pushSharedBindMount(path.join(profileAbs, '.mock-agy-auth.json'), '.mock-agy-auth.json');
+
+    const profileGemini = path.join(profileAbs, '.gemini');
+    const excludedGeminiRootEntries = new Set([
+      'antigravity',
+      'antigravity-cli',
+      'jetski',
+      'config',
+      'brain',
+      'scratch',
+      'playground',
+      'tmp',
+      'logs',
+    ]);
+    if (fs.existsSync(profileGemini)) {
+      for (const entry of fs.readdirSync(profileGemini, { withFileTypes: true })) {
+        if (excludedGeminiRootEntries.has(entry.name)) continue;
+        pushSharedBindMount(path.join(profileGemini, entry.name), `.gemini/${entry.name}`);
+      }
+    }
+
+    const excludedVendorEntries = new Set(['brain', 'scratch', 'playground', 'tmp', 'logs']);
+    for (const vendor of ['antigravity', 'antigravity-cli', 'jetski'] as const) {
+      const profileVendorDir = path.join(profileGemini, vendor);
+      if (!fs.existsSync(profileVendorDir)) continue;
+      for (const entry of fs.readdirSync(profileVendorDir, { withFileTypes: true })) {
+        if (excludedVendorEntries.has(entry.name)) continue;
+        pushSharedBindMount(
+          path.join(profileVendorDir, entry.name),
+          `.gemini/${vendor}/${entry.name}`
+        );
+      }
+    }
+
+    const profileConfigDir = path.join(profileGemini, 'config');
+    const excludedConfigEntries = new Set([
+      'skills',
+      '.builtin-skills-state.json',
+      '.builtin-migration-backups',
+    ]);
+    if (fs.existsSync(profileConfigDir)) {
+      for (const entry of fs.readdirSync(profileConfigDir, { withFileTypes: true })) {
+        if (excludedConfigEntries.has(entry.name)) continue;
+        pushSharedBindMount(
+          path.join(profileConfigDir, entry.name),
+          `.gemini/config/${entry.name}`
+        );
+      }
     }
 
     bwrapArgs.push(
-      '--bind',
-      profileAbs,
-      SANDBOX_HOME_MOUNT,
-      '--tmpfs',
-      `${SANDBOX_HOME_MOUNT}/.chat-brains`,
-      '--tmpfs',
-      `${SANDBOX_HOME_MOUNT}/.chat-homes`,
-      '--tmpfs',
-      `${SANDBOX_HOME_MOUNT}/.chat-scratch`,
-      '--tmpfs',
-      `${SANDBOX_HOME_MOUNT}/.chat-playground`,
       '--bind',
       chatBrainHostDir,
       `${SANDBOX_HOME_MOUNT}/.gemini/antigravity-cli/brain`,
@@ -705,6 +957,49 @@ export function buildAgyCommandSpec(params: {
       '--bind',
       chatPlaygroundHostDir,
       `${SANDBOX_HOME_MOUNT}/.gemini/playground`,
+      ...(() => {
+        const { active: activeBuiltins } = resolveActiveBuiltinSkillsForProfile(
+          profileAbs,
+          params.config.builtinSkillsDir
+        );
+        const customSkillsDir = path.join(profileAbs, '.gemini', 'config', 'skills');
+        const hasCustomSkillsDir = fs.existsSync(customSkillsDir);
+        if (activeBuiltins.length === 0 && !hasCustomSkillsDir) return [];
+        ensurePrivateDir(path.join(chatHomeHostDir, '.gemini', 'config', 'skills'));
+        const skillMounts: string[] = [
+          '--tmpfs',
+          `${SANDBOX_HOME_MOUNT}/.gemini/config/skills`,
+        ];
+        if (hasCustomSkillsDir) {
+          const customEntries = fs.readdirSync(customSkillsDir, { withFileTypes: true });
+          for (const entry of customEntries) {
+            if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+            if (!isValidSkillSlug(entry.name)) continue;
+            const candidate = path.join(customSkillsDir, entry.name);
+            if (fs.existsSync(path.join(candidate, LEGACY_BUILTIN_SYNC_MARKER))) continue;
+            if (!fs.existsSync(path.join(candidate, 'SKILL.md'))) continue;
+            let resolvedHostDir: string;
+            try {
+              resolvedHostDir = fs.realpathSync(candidate);
+            } catch {
+              continue;
+            }
+            skillMounts.push(
+              '--bind',
+              resolvedHostDir,
+              `${SANDBOX_HOME_MOUNT}/.gemini/config/skills/${entry.name}`
+            );
+          }
+        }
+        for (const builtin of activeBuiltins) {
+          skillMounts.push(
+            '--ro-bind',
+            builtin.dir,
+            `${SANDBOX_HOME_MOUNT}/.gemini/config/skills/${builtin.slug}`
+          );
+        }
+        return skillMounts;
+      })(),
       '--bind',
       workspaceAbs,
       SANDBOX_WORKSPACE_MOUNT,
@@ -720,12 +1015,13 @@ export function buildAgyCommandSpec(params: {
       args: bwrapArgs,
       env,
       sandboxed: true,
+      layeredRuntimeIsolated: true,
       sandboxWorkspaceRoot: SANDBOX_WORKSPACE_MOUNT,
     };
   }
 
   const effectiveHome = params.workspaceDir
-    ? ensurePerChatHomeDir(params.profileDir, params.workspaceDir)
+    ? ensurePerChatHomeDir(params.profileDir, params.workspaceDir, params.config.builtinSkillsDir)
     : params.profileDir;
   const env = buildIsolatedAgyEnv({
     profileDir: params.profileDir,
@@ -738,11 +1034,366 @@ export function buildAgyCommandSpec(params: {
       : undefined,
   });
 
+  // Non-isolated fallback intentionally does NOT claim or simulate layered per-chat
+  // read-only base + writable diff guarantees.
   return {
     command: resolveCanonicalAgyBin(params.config.agyBin, env.PATH),
     args: agyArgs,
     env,
     sandboxed: false,
+    layeredRuntimeIsolated: false,
     sandboxWorkspaceRoot: workspaceFallback,
   };
+}
+
+export interface DocRuntimeLayout {
+  hostDir: string;
+  venvBinRel: string | null;
+  nodeModulesRel: string | null;
+  nodeBinRel: string | null;
+  pythonSiteRels: string[];
+  pythonVersionDir: string | null;
+}
+
+export function resolveDocRuntimeLayout(rawDir?: string | null): DocRuntimeLayout | null {
+  if (!rawDir || !rawDir.trim()) return null;
+  let hostDir: string;
+  try {
+    hostDir = fs.realpathSync(path.resolve(rawDir));
+    if (!fs.statSync(hostDir).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+
+  const hasDir = (rel: string): string | null => {
+    try {
+      const full = path.join(hostDir, rel);
+      return fs.statSync(full).isDirectory() ? rel : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const venvBinRel = hasDir(path.join('venv', 'bin'));
+  const nodeModulesRel = hasDir(path.join('node', 'node_modules')) ?? hasDir('node_modules');
+  const nodeBinRel =
+    hasDir(path.join('node', 'node_modules', '.bin')) ?? hasDir(path.join('node_modules', '.bin'));
+
+  const pythonSiteRels: string[] = [];
+  const seenSiteReals = new Set<string>();
+  let pythonVersionDir: string | null = null;
+  for (const libName of ['lib', 'lib64']) {
+    const libDir = path.join(hostDir, 'venv', libName);
+    try {
+      if (!fs.statSync(libDir).isDirectory()) continue;
+      for (const entry of fs.readdirSync(libDir, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !/^python\d+\.\d+$/.test(entry.name)) continue;
+        const siteRel = path.join('venv', libName, entry.name, 'site-packages');
+        if (!hasDir(siteRel)) continue;
+        try {
+          const siteReal = fs.realpathSync(path.join(hostDir, siteRel));
+          if (seenSiteReals.has(siteReal)) continue;
+          seenSiteReals.add(siteReal);
+        } catch {
+          continue;
+        }
+        if (!pythonVersionDir) pythonVersionDir = entry.name;
+        pythonSiteRels.push(siteRel);
+      }
+    } catch {
+      // ignore missing python lib dir
+    }
+  }
+
+  if (!venvBinRel && !nodeModulesRel && pythonSiteRels.length === 0) {
+    return null;
+  }
+
+  return {
+    hostDir,
+    venvBinRel,
+    nodeModulesRel,
+    nodeBinRel,
+    pythonSiteRels,
+    pythonVersionDir,
+  };
+}
+
+let cachedHostPythonVersionDir: string | null = null;
+
+export function detectHostPythonVersionDir(): string {
+  if (cachedHostPythonVersionDir) return cachedHostPythonVersionDir;
+  const pyBin = resolveHostExecutable('python3') ?? '/usr/bin/python3';
+  try {
+    const out = execFileSync(
+      pyBin,
+      ['-c', 'import sys; print(f"python{sys.version_info[0]}.{sys.version_info[1]}")'],
+      { encoding: 'utf8', timeout: 2000 }
+    ).trim();
+    if (/^python\d+\.\d+$/.test(out)) {
+      cachedHostPythonVersionDir = out;
+      return out;
+    }
+  } catch {
+    // fallback below
+  }
+  try {
+    for (const entry of fs.readdirSync('/usr/lib', { withFileTypes: true })) {
+      if (entry.isDirectory() && /^python\d+\.\d+$/.test(entry.name)) {
+        cachedHostPythonVersionDir = entry.name;
+        return entry.name;
+      }
+    }
+  } catch {
+    // ignore
+  }
+  cachedHostPythonVersionDir = 'python3.11';
+  return cachedHostPythonVersionDir;
+}
+
+function writeFileIfChanged(filePath: string, content: string, mode: number): void {
+  try {
+    if (fs.existsSync(filePath) && fs.readFileSync(filePath, 'utf8') === content) {
+      fs.chmodSync(filePath, mode);
+      return;
+    }
+  } catch {
+    // rewrite
+  }
+  fs.writeFileSync(filePath, content, { mode });
+}
+
+function ensureSymlinkTarget(targetPath: string, linkPath: string): void {
+  try {
+    const st = fs.lstatSync(linkPath);
+    if (st.isSymbolicLink() && fs.readlinkSync(linkPath) === targetPath) {
+      return;
+    }
+    fs.rmSync(linkPath, { recursive: true, force: true });
+  } catch {
+    // does not exist
+  }
+  fs.symlinkSync(targetPath, linkPath);
+}
+
+function reconcileBaseNodeModulesSymlinks(
+  chatNodeModulesDir: string,
+  docRuntime: DocRuntimeLayout | null,
+  docRuntimeMountRoot: string
+): void {
+  const toPosix = (rel: string) => rel.split(path.sep).join(path.posix.sep);
+  const managedPrefixes = Array.from(
+    new Set([
+      `${toPosix(SANDBOX_DOC_RUNTIME_MOUNT).replace(/\/+$/, '')}/`,
+      `${toPosix(docRuntimeMountRoot).replace(/\/+$/, '')}/`,
+    ])
+  );
+  const isManagedBaseTarget = (target: string): boolean => {
+    const normalized = toPosix(target);
+    return managedPrefixes.some((prefix) => normalized.startsWith(prefix));
+  };
+
+  const expectedLinks = new Map<string, string>();
+  if (docRuntime?.nodeModulesRel) {
+    const hostBaseNodeModules = path.join(docRuntime.hostDir, docRuntime.nodeModulesRel);
+    const targetBaseRoot = path.posix.join(
+      toPosix(docRuntimeMountRoot),
+      toPosix(docRuntime.nodeModulesRel)
+    );
+    if (fs.existsSync(hostBaseNodeModules)) {
+      for (const entry of fs.readdirSync(hostBaseNodeModules, { withFileTypes: true })) {
+        if (entry.name.startsWith('.')) continue;
+        if (entry.name.startsWith('@')) {
+          const hostScopeDir = path.join(hostBaseNodeModules, entry.name);
+          try {
+            if (!fs.statSync(hostScopeDir).isDirectory()) continue;
+          } catch {
+            continue;
+          }
+          for (const sub of fs.readdirSync(hostScopeDir, { withFileTypes: true })) {
+            if (sub.name.startsWith('.')) continue;
+            expectedLinks.set(
+              `${entry.name}/${sub.name}`,
+              path.posix.join(targetBaseRoot, entry.name, sub.name)
+            );
+          }
+        } else {
+          expectedLinks.set(entry.name, path.posix.join(targetBaseRoot, entry.name));
+        }
+      }
+    }
+  }
+
+  // Remove stale or removed base-runtime symlinks while preserving per-chat installs
+  for (const entry of fs.readdirSync(chatNodeModulesDir, { withFileTypes: true })) {
+    const entryPath = path.join(chatNodeModulesDir, entry.name);
+    if (entry.isSymbolicLink()) {
+      try {
+        const target = fs.readlinkSync(entryPath);
+        if (isManagedBaseTarget(target) && expectedLinks.get(entry.name) !== target) {
+          fs.rmSync(entryPath, { force: true });
+        }
+      } catch {
+        // ignore readlink race
+      }
+      continue;
+    }
+    if (entry.name.startsWith('@') && entry.isDirectory()) {
+      for (const sub of fs.readdirSync(entryPath, { withFileTypes: true })) {
+        if (!sub.isSymbolicLink()) continue;
+        const subPath = path.join(entryPath, sub.name);
+        const rel = `${entry.name}/${sub.name}`;
+        try {
+          const target = fs.readlinkSync(subPath);
+          if (isManagedBaseTarget(target) && expectedLinks.get(rel) !== target) {
+            fs.rmSync(subPath, { force: true });
+          }
+        } catch {
+          // ignore readlink race
+        }
+      }
+      try {
+        if (fs.readdirSync(entryPath).length === 0) {
+          fs.rmdirSync(entryPath);
+        }
+      } catch {
+        // ignore non-empty or concurrent write
+      }
+    }
+  }
+
+  for (const [rel, targetPath] of expectedLinks.entries()) {
+    const linkPath = path.join(chatNodeModulesDir, rel);
+    fs.mkdirSync(path.dirname(linkPath), { recursive: true, mode: 0o700 });
+    try {
+      const st = fs.lstatSync(linkPath);
+      // Preserve real directories or user-installed symlinks (e.g. per-chat npm install -g)
+      if (!st.isSymbolicLink()) continue;
+      if (!isManagedBaseTarget(fs.readlinkSync(linkPath))) continue;
+      if (fs.readlinkSync(linkPath) === targetPath) continue;
+      fs.rmSync(linkPath, { force: true });
+    } catch {
+      // missing -> create symlink below
+    }
+    fs.symlinkSync(targetPath, linkPath);
+  }
+}
+
+export function ensurePerChatRuntimeDir(
+  profileDir: string,
+  workspaceDir: string,
+  docRuntime: DocRuntimeLayout | null,
+  docRuntimeMountRoot = SANDBOX_DOC_RUNTIME_MOUNT
+): string {
+  const profileAbs = path.resolve(profileDir);
+  const wsKey = path.basename(path.resolve(workspaceDir)) || 'default';
+  const chatRuntimeDir = path.join(profileAbs, '.chat-runtime', wsKey);
+
+  const pyVerDir = docRuntime?.pythonVersionDir ?? detectHostPythonVersionDir();
+  const venvDir = path.join(chatRuntimeDir, 'venv');
+  const venvBinDir = path.join(venvDir, 'bin');
+  const sitePackagesDir = path.join(venvDir, 'lib', pyVerDir, 'site-packages');
+  const nodePrefixDir = path.join(chatRuntimeDir, 'node');
+  const chatNodeModulesDir = path.join(nodePrefixDir, 'lib', 'node_modules');
+  const pipCacheDir = path.join(chatRuntimeDir, 'pip-cache');
+  const npmCacheDir = path.join(chatRuntimeDir, 'npm-cache');
+
+  for (const dir of [
+    chatRuntimeDir,
+    venvDir,
+    venvBinDir,
+    sitePackagesDir,
+    nodePrefixDir,
+    chatNodeModulesDir,
+    path.join(nodePrefixDir, 'node_modules'),
+    path.join(nodePrefixDir, 'bin'),
+    path.join(chatRuntimeDir, 'bin'),
+    pipCacheDir,
+    npmCacheDir,
+  ]) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  }
+
+  let pythonTarget = '/usr/bin/python3';
+  if (!fs.existsSync(pythonTarget)) {
+    pythonTarget = resolveHostExecutable('python3') ?? '/usr/bin/python3';
+  }
+  ensureSymlinkTarget(pythonTarget, path.join(venvBinDir, 'python3'));
+  ensureSymlinkTarget('python3', path.join(venvBinDir, 'python'));
+
+  const pipWrapper = '#!/bin/sh\nexec "$(dirname "$0")/python3" -m pip "$@"\n';
+  writeFileIfChanged(path.join(venvBinDir, 'pip'), pipWrapper, 0o755);
+  writeFileIfChanged(path.join(venvBinDir, 'pip3'), pipWrapper, 0o755);
+
+  const pyvenvCfg = [
+    `home = ${path.posix.dirname(pythonTarget.split(path.sep).join(path.posix.sep))}`,
+    'include-system-site-packages = true',
+    '',
+  ].join('\n');
+  writeFileIfChanged(path.join(venvDir, 'pyvenv.cfg'), pyvenvCfg, 0o644);
+
+  const pthPath = path.join(sitePackagesDir, 'zz_agy_doc_base.pth');
+  if (docRuntime && docRuntime.pythonSiteRels.length > 0) {
+    const lines = docRuntime.pythonSiteRels.map((rel) =>
+      path.posix.join(docRuntimeMountRoot, rel.split(path.sep).join(path.posix.sep))
+    );
+    writeFileIfChanged(pthPath, lines.join('\n') + '\n', 0o644);
+  } else if (fs.existsSync(pthPath)) {
+    fs.rmSync(pthPath, { force: true });
+  }
+
+  reconcileBaseNodeModulesSymlinks(chatNodeModulesDir, docRuntime, docRuntimeMountRoot);
+
+  return chatRuntimeDir;
+}
+
+export function applySandboxLayeredRuntime(
+  env: NodeJS.ProcessEnv,
+  docRuntime: DocRuntimeLayout | null,
+  sandboxAgyBinDir: string | null = null,
+  mounts?: {
+    chatRuntimeMount?: string;
+    docRuntimeMount?: string;
+    nodeModulesMount?: string;
+  }
+): void {
+  const chatMount = mounts?.chatRuntimeMount ?? SANDBOX_CHAT_RUNTIME_MOUNT;
+  const docMount = mounts?.docRuntimeMount ?? SANDBOX_DOC_RUNTIME_MOUNT;
+  const nodeModulesMount = mounts?.nodeModulesMount ?? '/node_modules';
+  const toPosix = (rel: string) => rel.split(path.sep).join(path.posix.sep);
+
+  env.VIRTUAL_ENV = `${chatMount}/venv`;
+  env.PYTHONNOUSERSITE = '1';
+  env.PIP_CACHE_DIR = `${chatMount}/pip-cache`;
+  env.NPM_CONFIG_PREFIX = `${chatMount}/node`;
+  env.NPM_CONFIG_CACHE = `${chatMount}/npm-cache`;
+  env.NPM_CONFIG_USERCONFIG = `${chatMount}/npmrc`;
+
+  delete env.NODE_OPTIONS;
+  delete env.AGY_NODE_LAYER_PATHS;
+
+  if (docRuntime?.nodeModulesRel) {
+    env.NODE_PATH = nodeModulesMount;
+  } else {
+    delete env.NODE_PATH;
+  }
+
+  const pathEntries = [
+    ...(sandboxAgyBinDir ? [sandboxAgyBinDir] : []),
+    `${chatMount}/venv/bin`,
+    `${chatMount}/node/bin`,
+    `${chatMount}/bin`,
+  ];
+  if (docRuntime?.venvBinRel) {
+    pathEntries.push(path.posix.join(docMount, toPosix(docRuntime.venvBinRel)));
+  }
+  if (docRuntime?.nodeBinRel) {
+    pathEntries.push(path.posix.join(docMount, toPosix(docRuntime.nodeBinRel)));
+  }
+  pathEntries.push(env.PATH || '/usr/local/bin:/usr/bin:/bin');
+  env.PATH = pathEntries.join(path.delimiter);
+
+  if (docRuntime) {
+    env.SAL_USE_VCLPLUGIN = 'svp';
+  }
 }

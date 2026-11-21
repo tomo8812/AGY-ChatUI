@@ -691,6 +691,61 @@ run_app_update() {
   echo "[auto-update] Building web and server bundles locally (v${FALLBACK_VERSION})..."
   run_as_owner env VITE_APP_VERSION="${FALLBACK_VERSION}" VITE_APP_COMMIT_SHA="${REMOTE_SHA:0:8}" npm --prefix "${APP_DIR}" run build
 
+  if [[ -f "${APP_DIR}/scripts/fetch-anthropic-skills.mjs" ]]; then
+    echo "[auto-update] Fetching latest Anthropic document skills into ${APP_DIR}/builtin-skills..."
+    local SKILLS_STAGE_ROOT SKILLS_STAGE_DIR SKILLS_NEW_DIR SKILLS_OLD_DIR
+    SKILLS_STAGE_ROOT="$(run_as_owner mktemp -d)"
+    SKILLS_STAGE_DIR="${SKILLS_STAGE_ROOT}/builtin-skills"
+    local -a FETCH_ENV_ARGS=()
+    for var_name in ANTHROPIC_SKILLS_REPO ANTHROPIC_SKILLS_REF ANTHROPIC_SKILLS_TARBALL_URL; do
+      if [[ -n "${!var_name:-}" ]]; then
+        FETCH_ENV_ARGS+=("${var_name}=${!var_name}")
+      fi
+    done
+
+    if ! run_as_owner env ${FETCH_ENV_ARGS[@]+"${FETCH_ENV_ARGS[@]}"} \
+      node "${APP_DIR}/scripts/fetch-anthropic-skills.mjs" --out "${SKILLS_STAGE_DIR}"; then
+      rm -rf "${SKILLS_STAGE_ROOT}" 2>/dev/null || true
+      echo "[auto-update] ERROR: Failed to fetch Built-in Anthropic document skills." >&2
+      return 1
+    fi
+    if [[ ! -f "${SKILLS_STAGE_DIR}/.builtin-skills-manifest.json" ]]; then
+      rm -rf "${SKILLS_STAGE_ROOT}" 2>/dev/null || true
+      echo "[auto-update] ERROR: Staged Built-in skills are missing manifest." >&2
+      return 1
+    fi
+
+    SKILLS_NEW_DIR="${APP_DIR}/.builtin-skills.new.$$"
+    SKILLS_OLD_DIR="${APP_DIR}/.builtin-skills.old.$$"
+    rm -rf "${SKILLS_NEW_DIR}" "${SKILLS_OLD_DIR}"
+    mv "${SKILLS_STAGE_DIR}" "${SKILLS_NEW_DIR}"
+    rm -rf "${SKILLS_STAGE_ROOT}"
+    if [[ "$(id -u)" -eq 0 ]]; then
+      chown -R root:root "${SKILLS_NEW_DIR}"
+    fi
+    chmod -R u+rwX,go+rX,go-w "${SKILLS_NEW_DIR}"
+
+    if [[ -e "${APP_DIR}/builtin-skills" ]]; then
+      mv "${APP_DIR}/builtin-skills" "${SKILLS_OLD_DIR}"
+    fi
+    if ! mv "${SKILLS_NEW_DIR}" "${APP_DIR}/builtin-skills"; then
+      if [[ -e "${SKILLS_OLD_DIR}" ]] && [[ ! -e "${APP_DIR}/builtin-skills" ]]; then
+        mv "${SKILLS_OLD_DIR}" "${APP_DIR}/builtin-skills" || true
+      fi
+      rm -rf "${SKILLS_NEW_DIR}" 2>/dev/null || true
+      echo "[auto-update] ERROR: Failed to swap Built-in skills into ${APP_DIR}/builtin-skills." >&2
+      return 1
+    fi
+    if [[ -e "${SKILLS_OLD_DIR}" ]]; then
+      chmod -R u+rwX "${SKILLS_OLD_DIR}" 2>/dev/null || true
+      rm -rf "${SKILLS_OLD_DIR}"
+    fi
+  fi
+
+  if [[ "$(id -u)" -eq 0 ]] && [[ -f "${APP_DIR}/deploy/setup-doc-runtime.sh" ]]; then
+    bash "${APP_DIR}/deploy/setup-doc-runtime.sh" || echo "[auto-update] WARNING: isolated doc-runtime provisioning failed; continuing." >&2
+  fi
+
   if [[ -f "${APP_DIR}/scripts/version.mjs" ]]; then
     if [[ -f "${APP_DIR}/web/dist/sw.js" ]]; then
       run_as_owner node "${APP_DIR}/scripts/version.mjs" stamp-sw \

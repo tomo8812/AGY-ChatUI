@@ -564,6 +564,7 @@ export class AcpClientManager {
     profileDir: string,
     desiredModelId: string | null
   ): Promise<ParsedSessionOptions | null> {
+    this.skillService?.syncBuiltinSkillsToProfile(profileDir);
     const tempProbeCwd = path.join(profileDir, '.tmp', 'options-probe');
     fs.mkdirSync(tempProbeCwd, { recursive: true, mode: 0o700 });
     const apiKey = this.loadApiKeyForUser(userId);
@@ -1175,6 +1176,9 @@ export class AcpClientManager {
     this.evictOneIdleIfFull();
 
     fs.mkdirSync(chat.workspaceDir, { recursive: true, mode: 0o700 });
+    if (this.skillService) {
+      this.skillService.syncBuiltinSkillsToProfile(profile.profileDir);
+    }
     if (chat.projectId && this.skillService) {
       this.skillService.syncProjectSkillsToChat(userId, chat.projectId, chat.workspaceDir);
     }
@@ -1196,6 +1200,12 @@ export class AcpClientManager {
       geminiApiKey: apiKey,
       enableSandboxBwrap: sandboxStatus.active,
     });
+
+    if (this.config.agyMode === 'real' && !spec.layeredRuntimeIsolated) {
+      console.warn(
+        `[acp] Starting non-isolated ACP worker for chat ${chatId}: read-only shared runtime base and per-chat package diff isolation are NOT guaranteed.`
+      );
+    }
 
     const child = spawn(spec.command, spec.args, {
       cwd: chat.workspaceDir,
@@ -1724,6 +1734,7 @@ export class AcpClientManager {
       reference,
       label,
       mimeType,
+      builtinSkillsDir: this.config.builtinSkillsDir,
     });
     if (!resolved) return false;
     const { artifact } = resolved;
