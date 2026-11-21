@@ -1019,6 +1019,10 @@ export const App: React.FC = () => {
         void loadSkillsList(effectiveProjectIdRef.current, curChatId);
         break;
       }
+      case 'mcp.updated': {
+        window.dispatchEvent(new CustomEvent('agy:mcp-updated', { detail: p }));
+        break;
+      }
       case 'chat.deleted': {
         const chatId = p.chatId as string | undefined;
         if (chatId) {

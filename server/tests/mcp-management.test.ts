@@ -1239,4 +1239,197 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
 
     admin.closeWs();
   });
+
+  it('follows HTTP 3xx redirects during OAuth discovery, supports Antigravity CIMD fallback, cookie-less iOS PWA callback, and in-app manual completion', async () => {
+    const srv = await createTestServer({ allowPrivateMcpUrls: true });
+    servers.push(srv);
+
+    const { client: admin } = await registerAndBindAgy(srv.baseUrl, 'iospwaadmin', 'user:ios-admin');
+    const { client: regular } = await registerAndBindAgy(srv.baseUrl, 'iospwauser', 'user:ios-user');
+
+    let mockBaseUrl = '';
+    let expectedPkceChallenge = '';
+    let issuedAccessToken = 'tinyfish-like-token-1';
+
+    const mockServer = http.createServer(async (req, res) => {
+      const reqUrl = new URL(req.url || '/', mockBaseUrl);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(Buffer.from(c));
+      const rawBody = Buffer.concat(chunks).toString('utf8');
+
+      // 1) Simulate 307 redirect on /.well-known/oauth-protected-resource/mcp -> /redirected-prm
+      if (reqUrl.pathname === '/.well-known/oauth-protected-resource/mcp') {
+        res.writeHead(307, { Location: `${mockBaseUrl}/redirected-prm` });
+        res.end();
+        return;
+      }
+
+      if (reqUrl.pathname === '/redirected-prm') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            resource: `${mockBaseUrl}/mcp`,
+            authorization_servers: [`${mockBaseUrl}/auth-tenant`],
+            scopes_supported: ['mcp:tools'],
+          })
+        );
+        return;
+      }
+
+      // 2) Simulate path-inserted RFC 8414 endpoint redirecting (302) to tenant well-known with CIMD support (no DCR registration_endpoint)
+      if (reqUrl.pathname === '/.well-known/oauth-authorization-server/auth-tenant') {
+        res.writeHead(302, {
+          Location: `${mockBaseUrl}/auth-tenant/.well-known/oauth-authorization-server`,
+        });
+        res.end();
+        return;
+      }
+
+      if (reqUrl.pathname === '/auth-tenant/.well-known/oauth-authorization-server') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            issuer: `${mockBaseUrl}/auth-tenant`,
+            authorization_endpoint: `${mockBaseUrl}/auth-tenant/authorize`,
+            token_endpoint: `${mockBaseUrl}/auth-tenant/token`,
+            client_id_metadata_document_supported: true,
+            code_challenge_methods_supported: ['S256'],
+          })
+        );
+        return;
+      }
+
+      if (reqUrl.pathname === '/auth-tenant/token' && req.method === 'POST') {
+        const form = new URLSearchParams(rawBody);
+        const verifier = form.get('code_verifier') ?? '';
+        const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
+        if (challenge !== expectedPkceChallenge) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid_grant', error_description: 'PKCE mismatch' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            access_token: issuedAccessToken,
+            token_type: 'Bearer',
+            expires_in: 3600,
+          })
+        );
+        return;
+      }
+
+      if (reqUrl.pathname === '/mcp' && req.method === 'POST') {
+        if (req.headers.authorization !== `Bearer ${issuedAccessToken}`) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'unauthorized' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            result: {
+              protocolVersion: '2025-03-26',
+              serverInfo: { name: 'tinyfish-mock', version: '1.0.0' },
+              capabilities: {},
+            },
+          })
+        );
+        return;
+      }
+
+      res.writeHead(404).end();
+    });
+
+    await new Promise<void>((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    httpServers.push(mockServer);
+    const addr = mockServer.address() as { port: number };
+    mockBaseUrl = `http://127.0.0.1:${addr.port}`;
+
+    const created = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'tinyfish-cimd',
+      scope: 'shared',
+      transport: 'http',
+      url: `${mockBaseUrl}/mcp`,
+      authType: 'oauth',
+    });
+    expect(created.status).toBe(201);
+    const serverId = created.data.server.id;
+
+    // A) Start OAuth flow: should follow 307/302 redirects and use Antigravity CIMD client_id when DCR is absent
+    const start1 = await admin.request<{
+      authorizationUrl: string;
+      state: string;
+      mode: 'callback' | 'code_paste';
+    }>('POST', `/api/mcp/servers/${serverId}/oauth/start`, {});
+    expect(start1.status).toBe(200);
+    expect(start1.data.mode).toBe('code_paste');
+    const parsedAuth1 = new URL(start1.data.authorizationUrl);
+    expect(parsedAuth1.origin + parsedAuth1.pathname).toBe(`${mockBaseUrl}/auth-tenant/authorize`);
+    expect(parsedAuth1.searchParams.get('client_id')).toBe(
+      'https://antigravity.google/oauth/client-metadata.json'
+    );
+    expectedPkceChallenge = parsedAuth1.searchParams.get('code_challenge') ?? '';
+
+    // B) Complete in-app via POST /api/mcp/servers/:id/oauth/complete with full redirect URL
+    const manualRes = await admin.request<{ server: { oauth: { status: string } } }>(
+      'POST',
+      `/api/mcp/servers/${serverId}/oauth/complete`,
+      {
+        codeOrUrl: `https://antigravity.google/oauth-callback?code=manual-code-123&state=${encodeURIComponent(start1.data.state)}`,
+      }
+    );
+    expect(manualRes.status).toBe(200);
+    expect(manualRes.data.server.oauth.status).toBe('connected');
+
+    // C) Start a second OAuth flow and verify same-origin authenticated /api/mcp/oauth/launch redirect for iOS Standalone PWA
+    issuedAccessToken = 'tinyfish-like-token-2';
+    const start2 = await admin.request<{ authorizationUrl: string; launchUrl: string; state: string }>(
+      'POST',
+      `/api/mcp/servers/${serverId}/oauth/start`,
+      {}
+    );
+    expect(start2.status).toBe(200);
+    expect(start2.data.launchUrl).toContain(`/api/mcp/oauth/launch?state=${encodeURIComponent(start2.data.state)}`);
+    expectedPkceChallenge = new URL(start2.data.authorizationUrl).searchParams.get('code_challenge') ?? '';
+
+    // Unauthenticated or non-admin requests to /api/mcp/oauth/launch and /api/mcp/oauth/callback must be rejected with 403
+    const unauthClient = new TestApiClient(srv.baseUrl);
+    const unauthLaunch = await unauthClient.request(
+      'GET',
+      `/api/mcp/oauth/launch?state=${encodeURIComponent(start2.data.state)}`
+    );
+    expect(unauthLaunch.status).toBe(403);
+
+    const unauthCallback = await unauthClient.request(
+      'GET',
+      `/api/mcp/oauth/callback?code=pwa-code&state=${encodeURIComponent(start2.data.state)}`
+    );
+    expect(unauthCallback.status).toBe(403);
+
+    const nonAdminAttempt = await regular.request(
+      'GET',
+      `/api/mcp/oauth/callback?code=pwa-code&state=${encodeURIComponent(start2.data.state)}`
+    );
+    expect(nonAdminAttempt.status).toBe(403);
+
+    // Admin session navigating to same-origin /api/mcp/oauth/launch receives 302 redirect to the authorizationUrl
+    const launchRes = await fetch(`${srv.baseUrl}/api/mcp/oauth/launch?state=${encodeURIComponent(start2.data.state)}`, {
+      redirect: 'manual',
+      headers: { Cookie: admin.cookieHeader },
+    });
+    expect(launchRes.status).toBe(302);
+    expect(launchRes.headers.get('location')).toBe(start2.data.authorizationUrl);
+
+    // Admin session in the PWA WebView completes callback
+    const pwaCallback = await admin.request<string>(
+      'GET',
+      `/api/mcp/oauth/callback?code=pwa-code&state=${encodeURIComponent(start2.data.state)}`
+    );
+    expect(pwaCallback.status).toBe(200);
+    expect(pwaCallback.data).toContain('OAuth 認証が完了しました');
+  });
 });
+
