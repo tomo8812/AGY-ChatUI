@@ -1430,6 +1430,21 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
     );
     expect(pwaCallback.status).toBe(200);
     expect(pwaCallback.data).toContain('OAuth 認証が完了しました');
+
+    // D) Verify that when `agy acp` omits `mcpCapabilities` (undefined) in its initialize response,
+    // `resolveAcpMcpServersForUser` still passes remote HTTP/SSE MCP servers through to ACP session/new
+    const adminMe = await admin.request<{ user: { id: string } }>('GET', '/api/auth/me');
+    const resolvedWithoutCaps = await srv.ctx.mcpService.resolveAcpMcpServersForUser(
+      adminMe.data.user.id,
+      undefined
+    );
+    expect(resolvedWithoutCaps.some((s) => s.name === 'tinyfish-cimd')).toBe(true);
+
+    const resolvedExplicitFalse = await srv.ctx.mcpService.resolveAcpMcpServersForUser(
+      adminMe.data.user.id,
+      { http: false, sse: false }
+    );
+    expect(resolvedExplicitFalse.some((s) => s.name === 'tinyfish-cimd')).toBe(false);
   });
 });
 
