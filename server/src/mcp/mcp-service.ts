@@ -2970,8 +2970,11 @@ export class McpService {
       byName.set(row.name, row);
     }
 
-    const supportsHttp = Boolean(capabilities?.http);
-    const supportsSse = Boolean(capabilities?.sse);
+    // Antigravity CLI (`agy acp` 1.5.x+) supports HTTP/SSE MCP servers in `session/new`, `session/load`,
+    // and `session/resume`, but omits `mcpCapabilities` from its `initialize` response.
+    // Only skip a remote transport when the agent explicitly advertises `false`.
+    const supportsHttp = capabilities?.http !== false;
+    const supportsSse = capabilities?.sse !== false;
     const out: McpServer[] = [];
 
     for (const row of byName.values()) {
