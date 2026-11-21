@@ -7,6 +7,11 @@ import net from 'node:net';
 import zlib from 'node:zlib';
 import type { McpCapabilities, McpServer } from '@agentclientprotocol/sdk';
 import { resolveHostExecutable } from '../acp/env-isolation.js';
+import {
+  formatMcpPermissionRule,
+  getAgyPermissionRules,
+  syncMcpServerAlwaysAllowRules,
+} from '../acp/profile-settings.js';
 import { decryptSmallSecret, encryptSmallSecret } from '../auth/password.js';
 import type { AppConfig } from '../config.js';
 import type { AppDatabase, StoredMcpServerRow } from '../db/database.js';
@@ -69,6 +74,8 @@ export interface CreateMcpServerInput {
   transport: McpTransport;
   enabled?: boolean;
   allowedTools?: string[] | null;
+  disabledTools?: string[] | null;
+  alwaysAllowTools?: string[] | null;
   command?: string | null;
   args?: string[];
   env?: SecretKeyValueInput[];
@@ -85,6 +92,8 @@ export interface UpdateMcpServerInput {
   transport?: McpTransport;
   enabled?: boolean;
   allowedTools?: string[] | null;
+  disabledTools?: string[] | null;
+  alwaysAllowTools?: string[] | null;
   command?: string | null;
   args?: string[];
   env?: SecretKeyValueInput[];
@@ -380,6 +389,31 @@ function parseArgsJson(raw: string): string[] {
   }
 }
 
+function parseDiscoveredToolsJson(raw: string): McpDiscoveredTool[] {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const seen = new Set<string>();
+    const out: McpDiscoveredTool[] = [];
+    for (const item of parsed) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+      const obj = item as Record<string, unknown>;
+      if (typeof obj.name !== 'string') continue;
+      const name = obj.name.trim();
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      const description =
+        typeof obj.description === 'string' && obj.description.trim()
+          ? obj.description.trim().slice(0, 2000)
+          : undefined;
+      out.push(description ? { name, description } : { name });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 function extractResourceMetadataUrlFromWwwAuthenticate(headerVal: string | null): string | null {
   if (!headerVal) return null;
   const match = /resource_metadata\s*=\s*"([^"]+)"/i.exec(headerVal);
@@ -642,6 +676,7 @@ async function fetchJsonWithTimeout(
 
 interface ForwardedMcpTarget extends PinnedOutboundTarget {
   allowedTools?: ReadonlySet<string>;
+  disabledTools?: ReadonlySet<string>;
   trackedToolsListIds?: Set<string>;
   activeSseResponses?: Set<http.ServerResponse>;
 }
@@ -752,6 +787,8 @@ class PinnedHttpsForwarder {
       ? `${resolvedExtraPath}${mergedQuery}`
       : `${target.parsed.pathname === '/' && resolvedExtraPath ? '' : target.parsed.pathname}${resolvedExtraPath}${mergedQuery}`;
 
+    const filterActive =
+      target.allowedTools !== undefined || target.disabledTools !== undefined;
     const outHeaders: Record<string, string | string[]> = {};
     for (const [k, v] of Object.entries(req.headers)) {
       if (v === undefined) continue;
@@ -759,14 +796,13 @@ class PinnedHttpsForwarder {
       if (lower === 'host' || lower === 'connection' || lower === 'keep-alive' || lower === 'proxy-connection') {
         continue;
       }
-      if (target.allowedTools && target.allowedTools.size > 0 && lower === 'accept-encoding') {
+      if (filterActive && lower === 'accept-encoding') {
         continue;
       }
       outHeaders[k] = v;
     }
     outHeaders.host = target.parsed.host;
 
-    const filterActive = Boolean(target.allowedTools && target.allowedTools.size > 0);
     if (filterActive) {
       outHeaders['accept-encoding'] = 'identity';
     }
@@ -775,7 +811,7 @@ class PinnedHttpsForwarder {
     let localToolsListIds = new Set<string>();
     let blockedBatchErrors: Record<string, unknown>[] = [];
 
-    if (filterActive && req.method === 'POST' && target.allowedTools) {
+    if (filterActive && req.method === 'POST') {
       try {
         requestBodyBuf = await readIncomingBody(req);
       } catch (err) {
@@ -789,8 +825,9 @@ class PinnedHttpsForwarder {
 
       const inspectRes = inspectMcpClientJsonRpcPayload(
         requestBodyBuf.toString('utf8'),
-        target.allowedTools,
-        target.trackedToolsListIds
+        target.allowedTools ?? null,
+        target.trackedToolsListIds,
+        target.disabledTools ?? null
       );
       if (inspectRes.kind === 'reject_all') {
         const respBuf = Buffer.from(inspectRes.responseBody, 'utf8');
@@ -838,7 +875,7 @@ class PinnedHttpsForwarder {
         return;
       }
 
-      if (!filterActive || !target.allowedTools) {
+      if (!filterActive) {
         res.writeHead(status, upRes.headers);
         upRes.pipe(res);
         return;
@@ -864,7 +901,8 @@ class PinnedHttpsForwarder {
         }
         const { stream } = createDecodedResponseStream(upRes);
         const sseFilter = createSseMcpToolFilterTransform({
-          allowedTools: target.allowedTools,
+          allowedTools: target.allowedTools ?? null,
+          disabledTools: target.disabledTools ?? null,
           trackedToolsListIds: target.trackedToolsListIds,
           localToolsListIds,
           routeToken: token,
@@ -900,9 +938,10 @@ class PinnedHttpsForwarder {
               const forceList = localToolsListIds.size > 0 && blockedBatchErrors.length === 0;
               const filtered = filterMcpServerJsonRpcPayload(
                 parsed,
-                target.allowedTools!,
+                target.allowedTools ?? null,
                 combinedIds,
-                forceList
+                forceList,
+                target.disabledTools ?? null
               );
               let finalValue = filtered.value;
               if (filtered.changed) {
@@ -1147,6 +1186,177 @@ export class McpService {
     return Object.keys(out).length > 0 ? out : null;
   }
 
+  private getEffectiveMcpServerByNameForUser(userId: string): Map<string, StoredMcpServerRow> {
+    const byName = new Map<string, StoredMcpServerRow>();
+    // listEffectiveMcpServersForUser orders shared first, profile second, so profile overrides shared.
+    for (const row of this.db.listEffectiveMcpServersForUser(userId)) {
+      byName.set(row.name, row);
+    }
+    return byName;
+  }
+
+  private computeEffectiveAlwaysAllowTools(row: StoredMcpServerRow): string[] {
+    if (!row.enabled) return [];
+    const alwaysAllow = parseArgsJson(row.alwaysAllowToolsJson);
+    if (alwaysAllow.length === 0) return [];
+    const disabledSet = new Set(parseArgsJson(row.disabledToolsJson));
+    const allowedList = parseArgsJson(row.allowedToolsJson);
+    const allowedSet = allowedList.length > 0 ? new Set(allowedList) : null;
+    return alwaysAllow.filter((tool) => {
+      if (disabledSet.has(tool)) return false;
+      if (allowedSet && !allowedSet.has(tool)) return false;
+      return true;
+    });
+  }
+
+  private syncEffectiveServerNamesForProfiles(
+    serverNames: string[],
+    profiles: Array<{ userId: string; profileDir: string }>,
+    options?: {
+      previousRow?: StoredMcpServerRow | null;
+      sourceRow?: StoredMcpServerRow | null;
+      clearNonMatchingEntityRules?: boolean;
+    }
+  ): void {
+    const uniqueNames = Array.from(new Set(serverNames.map((n) => n.trim()).filter((n) => n.length > 0)));
+    if (uniqueNames.length === 0 || profiles.length === 0) return;
+
+    const prevRow = options?.previousRow ?? null;
+    const prevEffectiveTools = prevRow ? this.computeEffectiveAlwaysAllowTools(prevRow) : [];
+
+    this.db.withAgyProfileSettingsWrite(() => {
+      for (const profile of profiles) {
+        if (!profile.profileDir) continue;
+        const effectiveByName = this.getEffectiveMcpServerByNameForUser(profile.userId);
+        for (const name of uniqueNames) {
+          const effective = effectiveByName.get(name);
+          if (!effective) {
+            syncMcpServerAlwaysAllowRules({
+              profileDirs: [profile.profileDir],
+              serverName: name,
+              alwaysAllowTools: [],
+              removeAllForServer: true,
+            });
+            continue;
+          }
+          // Skip profiles with their own override ONLY when syncing an edit on a `shared` row
+          // (where the shared row isn't the profile owner's effective server).
+          // When a `profile` row is disabled/renamed/changed in scope, we MUST resync the owner's
+          // profile so the newly effective shared server (or removal) clears the old profile rules.
+          if (
+            options?.sourceRow?.scope === 'shared' &&
+            options.sourceRow.name === name &&
+            effective.id !== options.sourceRow.id
+          ) {
+            continue;
+          }
+
+          const effectiveAlwaysAllow = this.computeEffectiveAlwaysAllowTools(effective);
+          const effectiveSet = new Set(effectiveAlwaysAllow);
+          const entitySwitched = prevRow !== null && prevRow.id !== effective.id;
+          const revokeTools = [
+            ...(prevRow && prevRow.id === effective.id
+              ? prevEffectiveTools.filter((tool) => !effectiveSet.has(tool))
+              : []),
+            ...parseArgsJson(effective.disabledToolsJson),
+          ];
+
+          syncMcpServerAlwaysAllowRules({
+            profileDirs: [profile.profileDir],
+            serverName: name,
+            previousServerName:
+              prevRow && prevRow.id === effective.id && prevRow.name !== name ? prevRow.name : null,
+            alwaysAllowTools: effectiveAlwaysAllow,
+            revokeTools,
+            clearExistingForServer:
+              Boolean(options?.clearNonMatchingEntityRules) ||
+              effective.scope === 'profile' ||
+              entitySwitched,
+            removeAllForServer: !effective.enabled,
+          });
+        }
+      }
+    });
+  }
+
+  private syncRowPermissionsToSettings(
+    row: StoredMcpServerRow,
+    previousRow?: StoredMcpServerRow | null
+  ): void {
+    const serverNames = [row.name];
+    if (previousRow && previousRow.name !== row.name) {
+      serverNames.push(previousRow.name);
+    }
+
+    const allProfiles = this.db.listAgyProfiles();
+    let targetProfiles: Array<{ userId: string; profileDir: string }>;
+    if (row.scope === 'shared' || previousRow?.scope === 'shared') {
+      targetProfiles = allProfiles;
+    } else {
+      const ownerIds = new Set<string>();
+      if (row.ownerUserId) ownerIds.add(row.ownerUserId);
+      if (previousRow?.ownerUserId) ownerIds.add(previousRow.ownerUserId);
+      targetProfiles = allProfiles.filter((p) => ownerIds.has(p.userId));
+    }
+
+    const entityBoundaryChanged =
+      !previousRow ||
+      previousRow.scope !== row.scope ||
+      previousRow.ownerUserId !== row.ownerUserId;
+
+    this.syncEffectiveServerNamesForProfiles(serverNames, targetProfiles, {
+      previousRow: previousRow ?? null,
+      sourceRow: row,
+      clearNonMatchingEntityRules:
+        entityBoundaryChanged || row.scope === 'profile',
+    });
+  }
+
+  syncAllSharedMcpPermissionsToProfile(profileDir: string): void {
+    if (!profileDir) return;
+    const matchedProfile = this.db.listAgyProfiles().find((p) => p.profileDir === profileDir);
+    if (!matchedProfile) {
+      // Called during brand-new user signup before user/profile row is persisted: only shared servers apply.
+      const rows = this.db.listMcpServersForAdmin('');
+      this.db.withAgyProfileSettingsWrite(() => {
+        for (const row of rows) {
+          if (row.scope !== 'shared') continue;
+          syncMcpServerAlwaysAllowRules({
+            profileDirs: [profileDir],
+            serverName: row.name,
+            alwaysAllowTools: this.computeEffectiveAlwaysAllowTools(row),
+            revokeTools: parseArgsJson(row.disabledToolsJson),
+            removeAllForServer: !row.enabled,
+          });
+        }
+      });
+      return;
+    }
+
+    const allRows = this.db.listMcpServersForAdmin(matchedProfile.userId);
+    const serverNames = allRows.map((row) => row.name);
+    this.syncEffectiveServerNamesForProfiles(serverNames, [matchedProfile]);
+  }
+
+  recordToolAlwaysAllowFromChat(userId: string, serverName: string, toolName: string): void {
+    const cleanServer = serverName.trim();
+    const cleanTool = toolName.trim();
+    if (!cleanServer || !cleanTool) return;
+    const rows = this.db
+      .listEffectiveMcpServersForUser(userId)
+      .filter((r) => r.name === cleanServer && r.scope === 'profile' && r.ownerUserId === userId);
+    for (const row of rows) {
+      const curAlways = parseArgsJson(row.alwaysAllowToolsJson);
+      if (!curAlways.includes(cleanTool)) {
+        const nextAlways = [...curAlways, cleanTool];
+        this.db.updateMcpServer(row.id, {
+          alwaysAllowToolsJson: JSON.stringify(nextAlways),
+        });
+        this.emitUpdated(row.scope, row.ownerUserId, row.id);
+      }
+    }
+  }
+
   private toPublicRecord(row: StoredMcpServerRow): McpServerRecord {
     const envMap = this.decryptRecord(row.encryptedEnvJson);
     const headerMap = this.decryptRecord(row.encryptedHeadersJson);
@@ -1186,6 +1396,29 @@ export class McpService {
       };
     }
 
+    const storedAlwaysAllow = parseArgsJson(row.alwaysAllowToolsJson);
+    const alwaysAllowSet = new Set(storedAlwaysAllow);
+    // For profile-scoped servers, reflect any mcp(server/tool) rules in the owner's settings.json.
+    // Shared servers keep the shared DB policy authoritative so one user's chat rule isn't promoted server-wide.
+    if (row.scope === 'profile' && row.ownerUserId) {
+      const profile = this.db.getAgyProfile(row.ownerUserId);
+      const checkDirs = profile ? [profile.profileDir] : [];
+      const prefix = `mcp(${row.name}/`;
+      for (const dir of checkDirs) {
+        try {
+          const rules = getAgyPermissionRules(dir, { createIfMissing: false });
+          for (const allowRule of rules.allow) {
+            if (allowRule.startsWith(prefix) && allowRule.endsWith(')')) {
+              const toolName = allowRule.slice(prefix.length, -1).trim();
+              if (toolName) alwaysAllowSet.add(toolName);
+            }
+          }
+        } catch {
+          // ignore read error
+        }
+      }
+    }
+
     return {
       id: row.id,
       name: row.name,
@@ -1195,6 +1428,9 @@ export class McpService {
       transport: row.transport,
       enabled: row.enabled,
       allowedTools: parseArgsJson(row.allowedToolsJson),
+      disabledTools: parseArgsJson(row.disabledToolsJson),
+      alwaysAllowTools: [...alwaysAllowSet],
+      discoveredTools: parseDiscoveredToolsJson(row.discoveredToolsJson),
       command: row.command,
       args: parseArgsJson(row.argsJson),
       env: envSummary,
@@ -1254,6 +1490,12 @@ export class McpService {
     const allowedTools = normalizeAllowedToolsList(input.allowedTools, (msg) => {
       throw new McpValidationError('INVALID_ALLOWED_TOOLS', msg);
     });
+    const disabledTools = normalizeAllowedToolsList(input.disabledTools, (msg) => {
+      throw new McpValidationError('INVALID_DISABLED_TOOLS', msg);
+    });
+    const alwaysAllowTools = normalizeAllowedToolsList(input.alwaysAllowTools, (msg) => {
+      throw new McpValidationError('INVALID_ALWAYS_ALLOW_TOOLS', msg);
+    });
 
     const existingDup = this.db.findMcpServerByScopeAndName(scope, ownerUserId, name);
     if (existingDup) {
@@ -1312,6 +1554,9 @@ export class McpService {
       transport,
       enabled,
       allowedToolsJson: JSON.stringify(allowedTools),
+      disabledToolsJson: JSON.stringify(disabledTools),
+      alwaysAllowToolsJson: JSON.stringify(alwaysAllowTools),
+      discoveredToolsJson: '[]',
       command,
       argsJson: JSON.stringify(args),
       encryptedEnvJson,
@@ -1327,6 +1572,7 @@ export class McpService {
       createdBy: adminUserId,
     });
 
+    this.syncRowPermissionsToSettings(row, null);
     this.emitUpdated(row.scope, row.ownerUserId, row.id);
     return this.toPublicRecord(row);
   }
@@ -1353,6 +1599,22 @@ export class McpService {
             })
           )
         : existing.allowedToolsJson;
+    const nextDisabledToolsJson =
+      input.disabledTools !== undefined
+        ? JSON.stringify(
+            normalizeAllowedToolsList(input.disabledTools, (msg) => {
+              throw new McpValidationError('INVALID_DISABLED_TOOLS', msg);
+            })
+          )
+        : existing.disabledToolsJson;
+    const nextAlwaysAllowToolsJson =
+      input.alwaysAllowTools !== undefined
+        ? JSON.stringify(
+            normalizeAllowedToolsList(input.alwaysAllowTools, (msg) => {
+              throw new McpValidationError('INVALID_ALWAYS_ALLOW_TOOLS', msg);
+            })
+          )
+        : existing.alwaysAllowToolsJson;
 
     if (
       nextName !== existing.name ||
@@ -1459,6 +1721,8 @@ export class McpService {
       transport: nextTransport,
       enabled: nextEnabled,
       allowedToolsJson: nextAllowedToolsJson,
+      disabledToolsJson: nextDisabledToolsJson,
+      alwaysAllowToolsJson: nextAlwaysAllowToolsJson,
       command: nextCommand,
       argsJson: nextArgsJson,
       encryptedEnvJson: nextEncryptedEnvJson,
@@ -1476,6 +1740,7 @@ export class McpService {
       throw new McpValidationError('MCP_NOT_FOUND', '指定されたMCPサーバーが見つかりません。', 404);
     }
 
+    this.syncRowPermissionsToSettings(updated, existing);
     this.emitUpdated(updated.scope, updated.ownerUserId, updated.id);
     if (existing.scope !== updated.scope) {
       this.emitUpdated(existing.scope, existing.ownerUserId, updated.id);
@@ -1491,6 +1756,14 @@ export class McpService {
     this.assertAdminCanAccessRow(adminUserId, existing);
     const deleted = this.db.deleteMcpServer(existing.id);
     if (deleted) {
+      const targetProfiles =
+        existing.scope === 'shared'
+          ? this.db.listAgyProfiles()
+          : this.db.listAgyProfiles().filter((p) => p.userId === existing.ownerUserId);
+      this.syncEffectiveServerNamesForProfiles([existing.name], targetProfiles, {
+        previousRow: existing,
+        clearNonMatchingEntityRules: existing.scope === 'profile',
+      });
       this.emitUpdated(existing.scope, existing.ownerUserId, existing.id);
     }
     return { deleted, scope: existing.scope, ownerUserId: existing.ownerUserId };
@@ -2673,12 +2946,323 @@ export class McpService {
     });
   }
 
-  async testServer(adminUserId: string, serverId: string): Promise<McpTestResult> {
+  private async probeSseMcpInitializeAndTools(
+    sseUrl: string,
+    headers: Record<string, string>,
+    urlOpts: { allowPrivate?: boolean }
+  ): Promise<McpTestResult> {
+    const target = await resolvePinnedOutboundTarget(sseUrl, urlOpts);
+    const isHttps = target.parsed.protocol === 'https:';
+    const pinnedLookup = createPinnedLookup(target);
+    const reqHeaders: Record<string, string> = {
+      Accept: 'text/event-stream',
+      ...headers,
+    };
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let sseHeadersOk = false;
+      let endpointPath: string | null = null;
+      let discoveredServerInfo: { name?: string; version?: string } | undefined;
+      let discoveredTools: McpDiscoveredTool[] | undefined;
+      let probeStarted = false;
+      let lineBuf = '';
+      let eventName = '';
+      let dataLines: string[] = [];
+
+      let probeTimer: ReturnType<typeof setTimeout> | undefined;
+      let headerFallbackTimer: ReturnType<typeof setTimeout> | undefined;
+
+      const finish = (result: McpTestResult) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(overallTimer);
+        clearTimeout(probeTimer);
+        clearTimeout(headerFallbackTimer);
+        try {
+          req.destroy();
+        } catch {
+          // ignore
+        }
+        resolve(result);
+      };
+
+      const overallTimer = setTimeout(() => {
+        if (sseHeadersOk || endpointPath) {
+          finish({
+            ok: true,
+            status: 'connected',
+            message: discoveredServerInfo?.name
+              ? `接続成功: ${discoveredServerInfo.name}${discoveredServerInfo.version ? ` v${discoveredServerInfo.version}` : ''}`
+              : 'SSEエンドポイントへの接続を確認しました',
+            ...(discoveredServerInfo ? { serverInfo: discoveredServerInfo } : {}),
+            ...(discoveredTools ? { tools: discoveredTools } : {}),
+          });
+        } else {
+          finish({
+            ok: false,
+            status: 'error',
+            message: 'SSEエンドポイントへの接続がタイムアウトしました。',
+          });
+        }
+      }, 3_500);
+
+      const sendPostProbe = async (postUrl: string) => {
+        try {
+          await fetchJsonWithTimeout(
+            postUrl,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', ...headers },
+              body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'initialize',
+                params: {
+                  protocolVersion: '2025-03-26',
+                  capabilities: {},
+                  clientInfo: { name: 'antigravity-chat-ui', version: this.config.appVersion },
+                },
+              }),
+            },
+            { ...urlOpts, timeoutMs: 1_500 }
+          ).catch(() => null);
+
+          await fetchJsonWithTimeout(
+            postUrl,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', ...headers },
+              body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }),
+            },
+            { ...urlOpts, timeoutMs: 1_000 }
+          ).catch(() => null);
+
+          await fetchJsonWithTimeout(
+            postUrl,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', ...headers },
+              body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
+            },
+            { ...urlOpts, timeoutMs: 1_500 }
+          ).catch(() => null);
+        } catch {
+          // ignore best-effort tool discovery error
+        }
+      };
+
+      const handleEventBlock = () => {
+        if (!eventName && dataLines.length === 0) return;
+        const dataStr = dataLines.join('\n').trim();
+        const curEvent = eventName;
+        eventName = '';
+        dataLines = [];
+
+        if (curEvent === 'endpoint' && dataStr && !endpointPath) {
+          endpointPath = dataStr;
+          clearTimeout(headerFallbackTimer);
+          if (!probeStarted) {
+            probeStarted = true;
+            try {
+              const postUrl = new URL(dataStr, target.url).toString();
+              void sendPostProbe(postUrl);
+              probeTimer = setTimeout(() => {
+                finish({
+                  ok: true,
+                  status: 'connected',
+                  message: discoveredServerInfo?.name
+                    ? `接続成功: ${discoveredServerInfo.name}${discoveredServerInfo.version ? ` v${discoveredServerInfo.version}` : ''}`
+                    : 'SSEエンドポイントへの接続を確認しました',
+                  ...(discoveredServerInfo ? { serverInfo: discoveredServerInfo } : {}),
+                  ...(discoveredTools ? { tools: discoveredTools } : {}),
+                });
+              }, 1_800);
+            } catch {
+              finish({
+                ok: true,
+                status: 'connected',
+                message: 'SSEエンドポイントへの接続を確認しました',
+              });
+            }
+          }
+          return;
+        }
+
+        if (dataStr.startsWith('{') || dataStr.startsWith('[')) {
+          try {
+            const parsed = JSON.parse(dataStr);
+            const items = Array.isArray(parsed) ? parsed : [parsed];
+            for (const item of items) {
+              if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+              const msg = item as Record<string, unknown>;
+              if (msg.id === 1 && msg.result && typeof msg.result === 'object') {
+                const info = (msg.result as Record<string, unknown>).serverInfo;
+                if (info && typeof info === 'object' && !Array.isArray(info)) {
+                  const infoObj = info as Record<string, unknown>;
+                  discoveredServerInfo = {
+                    name: typeof infoObj.name === 'string' ? infoObj.name : undefined,
+                    version: typeof infoObj.version === 'string' ? infoObj.version : undefined,
+                  };
+                }
+              }
+              if (msg.id === 2 && msg.result && typeof msg.result === 'object') {
+                const extracted = extractMcpToolsFromJsonRpcPayload(msg);
+                if (extracted.length > 0) {
+                  discoveredTools = extracted;
+                }
+                finish({
+                  ok: true,
+                  status: 'connected',
+                  message: discoveredServerInfo?.name
+                    ? `接続成功: ${discoveredServerInfo.name}${discoveredServerInfo.version ? ` v${discoveredServerInfo.version}` : ''}`
+                    : 'SSEエンドポイントへの接続を確認しました',
+                  ...(discoveredServerInfo ? { serverInfo: discoveredServerInfo } : {}),
+                  ...(discoveredTools ? { tools: discoveredTools } : {}),
+                });
+                return;
+              }
+            }
+          } catch {
+            // ignore non-JSON SSE event
+          }
+        }
+      };
+
+      const req = (isHttps ? https.request : http.request)(
+        {
+          protocol: target.parsed.protocol,
+          hostname: target.parsed.hostname,
+          port: target.parsed.port ? Number(target.parsed.port) : isHttps ? 443 : 80,
+          path: `${target.parsed.pathname}${target.parsed.search}`,
+          method: 'GET',
+          headers: reqHeaders,
+          ...(isHttps ? { servername: target.parsed.hostname } : {}),
+          ...(pinnedLookup ? { lookup: pinnedLookup as never } : {}),
+        },
+        (res) => {
+          const status = res.statusCode ?? 0;
+          if (status === 401) {
+            res.resume();
+            void this.discoverOAuthMetadata(sseUrl)
+              .then((discovered) => {
+                finish({
+                  ok: false,
+                  status: 'oauth_required',
+                  message: '認証が必要です (HTTP 401)。OAuth認証または認証ヘッダーを設定してください。',
+                  discoveredOAuth: {
+                    authorizationUrl: discovered.authorizationUrl,
+                    tokenUrl: discovered.tokenUrl,
+                    registrationUrl: discovered.registrationUrl,
+                    scopes: discovered.scopes,
+                  },
+                });
+              })
+              .catch(() => {
+                finish({
+                  ok: false,
+                  status: 'oauth_required',
+                  message: '認証が必要です (HTTP 401)。OAuth認証または認証ヘッダーを設定してください。',
+                });
+              });
+            return;
+          }
+          if (status < 200 || status >= 300) {
+            res.resume();
+            finish({
+              ok: false,
+              status: 'error',
+              message: `リモートMCPサーバーからエラーが返されました (HTTP ${status})`,
+            });
+            return;
+          }
+          const contentType = String(res.headers['content-type'] ?? '');
+          if (!contentType.toLowerCase().includes('text/event-stream')) {
+            res.resume();
+            finish({
+              ok: false,
+              status: 'error',
+              message: `HTTP ${status} が返されましたが、SSE ストリーム (text/event-stream) ではありませんでした（Content-Type: ${contentType || '未設定'}）。URL または接続方式を確認してください。`,
+            });
+            return;
+          }
+
+          sseHeadersOk = true;
+          headerFallbackTimer = setTimeout(() => {
+            finish({
+              ok: true,
+              status: 'connected',
+              message: `SSEエンドポイントへの接続を確認しました (HTTP ${status}, text/event-stream)`,
+            });
+          }, 500);
+
+          res.on('data', (chunk: Buffer) => {
+            if (settled) return;
+            lineBuf += chunk.toString('utf8');
+            let nlIdx = lineBuf.indexOf('\n');
+            while (nlIdx !== -1) {
+              let line = lineBuf.slice(0, nlIdx);
+              lineBuf = lineBuf.slice(nlIdx + 1);
+              if (line.endsWith('\r')) line = line.slice(0, -1);
+              if (line === '') {
+                handleEventBlock();
+              } else if (line.startsWith('event:')) {
+                eventName = line.slice(6).trim();
+              } else if (line.startsWith('data:')) {
+                dataLines.push(line.slice(5).replace(/^ /, ''));
+              }
+              nlIdx = lineBuf.indexOf('\n');
+            }
+          });
+
+          res.on('end', () => {
+            if (settled) return;
+            if (lineBuf.trim()) {
+              const tail = lineBuf.trim();
+              if (tail.startsWith('data:')) dataLines.push(tail.slice(5).replace(/^ /, ''));
+              handleEventBlock();
+            }
+            finish({
+              ok: true,
+              status: 'connected',
+              message: `SSEエンドポイントへの接続を確認しました (HTTP ${status}, text/event-stream)`,
+              ...(discoveredServerInfo ? { serverInfo: discoveredServerInfo } : {}),
+              ...(discoveredTools ? { tools: discoveredTools } : {}),
+            });
+          });
+        }
+      );
+
+      req.on('error', (err) => {
+        finish({
+          ok: false,
+          status: 'error',
+          message: `接続に失敗しました: ${err.message}`,
+        });
+      });
+      req.end();
+    });
+  }
+
+  async testServer(adminUserId: string, serverId: string): Promise<McpTestResult & { server?: McpServerRecord }> {
     const row = this.db.getMcpServerById(serverId);
     if (!row) {
       throw new McpValidationError('MCP_NOT_FOUND', '指定されたMCPサーバーが見つかりません。', 404);
     }
     this.assertAdminCanAccessRow(adminUserId, row);
+
+    const persistDiscoveredTools = (result: McpTestResult): McpTestResult & { server?: McpServerRecord } => {
+      if (result.ok && Array.isArray(result.tools)) {
+        const updated = this.db.updateMcpServer(row.id, {
+          discoveredToolsJson: JSON.stringify(result.tools),
+        });
+        if (updated) {
+          this.emitUpdated(updated.scope, updated.ownerUserId, updated.id);
+          return { ...result, server: this.toPublicRecord(updated) };
+        }
+      }
+      return result;
+    };
 
     if (row.transport === 'stdio') {
       const cmd = row.command ?? '';
@@ -2693,7 +3277,8 @@ export class McpService {
       }
       const args = parseArgsJson(row.argsJson);
       const envMap = this.decryptRecord(row.encryptedEnvJson);
-      return this.probeStdioMcpInitialize(resolved, args, envMap);
+      const result = await this.probeStdioMcpInitialize(resolved, args, envMap);
+      return persistDiscoveredTools(result);
     }
 
     if (!row.url) {
@@ -2717,48 +3302,8 @@ export class McpService {
     const urlOpts = { allowPrivate: this.config.allowPrivateMcpUrls };
     try {
       if (row.transport === 'sse') {
-        const res = await fetchJsonWithTimeout(
-          row.url,
-          {
-            method: 'GET',
-            headers: { Accept: 'text/event-stream', ...headers },
-          },
-          { ...urlOpts, headersOnly: true }
-        );
-        if (res.status === 401) {
-          const discovered = await this.discoverOAuthMetadata(row.url);
-          return {
-            ok: false,
-            status: 'oauth_required',
-            message: '認証が必要です (HTTP 401)。OAuth認証または認証ヘッダーを設定してください。',
-            discoveredOAuth: {
-              authorizationUrl: discovered.authorizationUrl,
-              tokenUrl: discovered.tokenUrl,
-              registrationUrl: discovered.registrationUrl,
-              scopes: discovered.scopes,
-            },
-          };
-        }
-        if (res.status >= 200 && res.status < 300) {
-          const contentType = res.headers.get('content-type') ?? '';
-          if (!contentType.toLowerCase().includes('text/event-stream')) {
-            return {
-              ok: false,
-              status: 'error',
-              message: `HTTP ${res.status} が返されましたが、SSE ストリーム (text/event-stream) ではありませんでした（Content-Type: ${contentType || '未設定'}）。URL または接続方式を確認してください。`,
-            };
-          }
-          return {
-            ok: true,
-            status: 'connected',
-            message: `SSEエンドポイントへの接続を確認しました (HTTP ${res.status}, text/event-stream)`,
-          };
-        }
-        return {
-          ok: false,
-          status: 'error',
-          message: `リモートMCPサーバーからエラーが返されました (HTTP ${res.status})`,
-        };
+        const result = await this.probeSseMcpInitializeAndTools(row.url, headers, urlOpts);
+        return persistDiscoveredTools(result);
       }
 
       // Streamable HTTP MCP initialize probe
@@ -2925,7 +3470,7 @@ export class McpService {
           // Best-effort tool discovery; initialize already succeeded
         }
 
-        return {
+        return persistDiscoveredTools({
           ok: true,
           status: 'connected',
           message: serverInfo?.name
@@ -2933,7 +3478,7 @@ export class McpService {
             : `リモートMCPサーバーの初期化を確認しました (HTTP ${res.status})`,
           serverInfo,
           ...(discoveredTools ? { tools: discoveredTools } : {}),
-        };
+        });
       }
 
       return {
@@ -2948,6 +3493,31 @@ export class McpService {
         message: `接続に失敗しました: ${err instanceof Error ? err.message : String(err)}`,
       };
     }
+  }
+
+  private resolveEffectiveToolPolicy(row: StoredMcpServerRow): {
+    allowedTools: string[] | null;
+    disabledTools: string[] | null;
+  } | null {
+    const allowedTools = parseArgsJson(row.allowedToolsJson);
+    const disabledTools = parseArgsJson(row.disabledToolsJson);
+    const disabledSet = new Set(disabledTools);
+
+    if (allowedTools.length > 0) {
+      return {
+        allowedTools: allowedTools.filter((name) => !disabledSet.has(name)),
+        disabledTools: null,
+      };
+    }
+
+    if (disabledTools.length > 0) {
+      return {
+        allowedTools: null,
+        disabledTools,
+      };
+    }
+
+    return null;
   }
 
   // ---- ACP Native mcpServers Resolution ----
@@ -2978,7 +3548,7 @@ export class McpService {
     const out: McpServer[] = [];
 
     for (const row of byName.values()) {
-      const allowedTools = parseArgsJson(row.allowedToolsJson);
+      const toolPolicy = this.resolveEffectiveToolPolicy(row);
 
       if (row.transport === 'stdio') {
         if (!row.command) continue;
@@ -2987,7 +3557,7 @@ export class McpService {
         const envMap = this.decryptRecord(row.encryptedEnvJson);
         const env = Object.entries(envMap).map(([name, value]) => ({ name, value }));
 
-        if (allowedTools.length > 0) {
+        if (toolPolicy !== null) {
           const nodeBin = resolveHostExecutable('node') ?? process.execPath;
           out.push({
             name: row.name,
@@ -2999,7 +3569,8 @@ export class McpService {
               JSON.stringify({
                 command: resolvedCmd,
                 args,
-                allowedTools,
+                ...(toolPolicy.allowedTools ? { allowedTools: toolPolicy.allowedTools } : {}),
+                ...(toolPolicy.disabledTools ? { disabledTools: toolPolicy.disabledTools } : {}),
               }),
             ],
             env,
@@ -3032,12 +3603,12 @@ export class McpService {
       const headerMap = this.decryptRecord(row.encryptedHeadersJson);
 
       let acpUrl = target.url;
-      const hasAllowedToolsFilter = allowedTools.length > 0;
 
-      if (hasAllowedToolsFilter) {
+      if (toolPolicy !== null) {
         acpUrl = await this.httpsForwarder.registerRoute({
           ...target,
-          allowedTools: new Set(allowedTools),
+          ...(toolPolicy.allowedTools ? { allowedTools: new Set(toolPolicy.allowedTools) } : {}),
+          ...(toolPolicy.disabledTools ? { disabledTools: new Set(toolPolicy.disabledTools) } : {}),
           trackedToolsListIds: new Set(),
           activeSseResponses: new Set(),
         });

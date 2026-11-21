@@ -269,6 +269,7 @@ function buildAvailableCommandsForSession(home: string, cwd: string) {
 function runAcpServer(): void {
   const sessions = new Map<string, SessionState>();
   let seqCounter = 0;
+  let advertisedCapabilities: Record<string, unknown> | undefined;
 
   const requireAuthenticated = () => {
     const auth = readMockAuth();
@@ -280,6 +281,7 @@ function runAcpServer(): void {
 
   const app = agent({ name: 'mock-agy-acp' })
     .onRequest(methods.agent.initialize, async ({ params }) => {
+      advertisedCapabilities = params.clientCapabilities as Record<string, unknown> | undefined;
       if (process.env.MOCK_CLIENT_INFO_PATH) {
         try {
           fs.writeFileSync(
@@ -942,6 +944,126 @@ function runAcpServer(): void {
         return { stopReason: 'end_turn' as const };
       }
 
+      // [QUESTION_INTERACTION]: simulate agy acp ask_question via session/request_permission with interaction_* toolCallId
+      if (promptText.includes('[QUESTION_INTERACTION]')) {
+        const questionRes = await ctx.client.request(methods.client.session.requestPermission, {
+          sessionId: state.id,
+          toolCall: {
+            toolCallId: 'interaction_q1',
+            title: 'どのフレームワークを使用しますか？',
+            status: 'pending',
+          },
+          options: [
+            { optionId: '1', name: 'React + Vite', kind: 'allow_once' },
+            { optionId: '2', name: 'Next.js App Router', kind: 'allow_once' },
+            { optionId: 'skip', name: 'スキップ', kind: 'reject_once' },
+          ],
+        });
+        const text =
+          questionRes.outcome.outcome === 'selected'
+            ? `質問への回答: optionId=${questionRes.outcome.optionId}`
+            : `質問キャンセル: ${questionRes.outcome.outcome}`;
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text },
+          },
+        });
+        return { stopReason: 'end_turn' as const };
+      }
+
+      // [ELICITATION_FORM]: simulate standard ACP elicitation/create (form mode)
+      if (promptText.includes('[ELICITATION_FORM]')) {
+        const elicitCap = (advertisedCapabilities?.elicitation ?? null) as
+          | { form?: unknown; url?: unknown }
+          | null;
+        const elicitRes = await ctx.client.request(methods.client.elicitation.create, {
+          sessionId: state.id,
+          mode: 'form',
+          message: 'プロジェクトの初期設定を選択してください。',
+          requestedSchema: {
+            type: 'object',
+            title: 'プロジェクト設定',
+            properties: {
+              framework: {
+                type: 'string',
+                title: 'フレームワーク',
+                oneOf: [
+                  { const: 'react', title: 'React' },
+                  { const: 'vue', title: 'Vue' },
+                ],
+              },
+              features: {
+                type: 'array',
+                title: '追加機能',
+                items: {
+                  anyOf: [
+                    { const: 'ts', title: 'TypeScript' },
+                    { const: 'test', title: 'Vitest' },
+                  ],
+                },
+              },
+              notes: {
+                type: 'string',
+                title: '自由記述',
+              },
+              strictMode: {
+                type: 'boolean',
+                title: 'Strictモード',
+                default: true,
+              },
+            },
+            required: ['framework'],
+          },
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: `Elicitation結果: action=${elicitRes.action}, content=${JSON.stringify(
+                'content' in elicitRes ? (elicitRes.content ?? null) : null
+              )}, capForm=${Boolean(elicitCap?.form)}, capUrl=${Boolean(elicitCap?.url)}`,
+            },
+          },
+        });
+        return { stopReason: 'end_turn' as const };
+      }
+
+      // [ELICITATION_URL]: simulate standard ACP elicitation/create (url mode) + optional elicitation/complete
+      if (promptText.includes('[ELICITATION_URL]')) {
+        const externalId = 'ext-elicit-123';
+        if (promptText.includes('[AUTO_COMPLETE_URL]')) {
+          void (async () => {
+            await delay(80);
+            if (state.cancelled) return;
+            await ctx.client.notify(methods.client.elicitation.complete, {
+              elicitationId: externalId,
+            });
+          })();
+        }
+        const elicitRes = await ctx.client.request(methods.client.elicitation.create, {
+          sessionId: state.id,
+          mode: 'url',
+          elicitationId: externalId,
+          url: 'https://example.com/auth',
+          message: '外部認証を完了してください。',
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: `URL Elicitation結果: action=${elicitRes.action}`,
+            },
+          },
+        });
+        return { stopReason: 'end_turn' as const };
+      }
+
       // [MULTI_TURN_BG]: Turn A background subagent finishes after Turn B starts (#2)
       if (promptText.includes('[MULTI_TURN_BG]')) {
         const subToolId = `tc-turn-a-${Date.now()}`;
@@ -1000,6 +1122,140 @@ function runAcpServer(): void {
         return { stopReason: 'end_turn' as const };
       }
 
+      // [BG_ELICITATION_CONCURRENT]: Turn 1 spawns a background subagent, finishes prompt,
+      // then sends an unattributed elicitation/create while Turn 2 is active.
+      if (promptText.includes('[BG_ELICITATION_CONCURRENT]')) {
+        const subToolId = `tc-bg-elicit-${Date.now()}`;
+        const childSessionId = `${state.id}-bg-elicit-sub`;
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: subToolId,
+            title: 'invoke_subagent',
+            kind: 'other',
+            status: 'completed',
+            rawInput: { Subagents: [{ TypeName: 'research', Role: 'BG Elicit Worker', Prompt: 'BG' }] },
+          },
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'subagent_update',
+            sessionId: childSessionId,
+            toolCallId: subToolId,
+            title: 'BG Elicit Worker',
+            state: { state: 'running' },
+          },
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: '背景質問テスト開始' },
+          },
+        });
+
+        void (async () => {
+          await delay(150);
+          if (state.cancelled) return;
+          const bgRes = await ctx.client.request(methods.client.elicitation.create, {
+            sessionId: state.id,
+            mode: 'form',
+            message: '背景タスクからの確認質問',
+            requestedSchema: {
+              type: 'object',
+              properties: {
+                answer: { type: 'string', title: '回答' },
+              },
+              required: ['answer'],
+            },
+          });
+          if (state.cancelled) return;
+          await sendUpdate({
+            sessionId: childSessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: {
+                type: 'text',
+                text: `背景Elicitation応答:${bgRes.action}:${JSON.stringify('content' in bgRes ? (bgRes.content ?? null) : null)}`,
+              },
+            },
+          });
+          await sendUpdate({
+            sessionId: state.id,
+            update: {
+              sessionUpdate: 'subagent_update',
+              sessionId: childSessionId,
+              toolCallId: subToolId,
+              title: 'BG Elicit Worker',
+              state: { state: 'idle', stopReason: 'end_turn' },
+            },
+          });
+        })();
+
+        return { stopReason: 'end_turn' as const };
+      }
+
+      // [BG_MCP_RELOAD_TASK]: Turn 1 finishes prompt immediately while leaving a background
+      // subagent active for 300ms so callers can test deferred reload across background tasks.
+      if (promptText.includes('[BG_MCP_RELOAD_TASK]')) {
+        const subToolId = `tc-bg-mcp-${Date.now()}`;
+        const childSessionId = `${state.id}-bg-mcp-sub`;
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: subToolId,
+            title: 'invoke_subagent',
+            kind: 'other',
+            status: 'completed',
+            rawInput: { Subagents: [{ TypeName: 'research', Role: 'BG MCP Worker', Prompt: 'BG' }] },
+          },
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'subagent_update',
+            sessionId: childSessionId,
+            toolCallId: subToolId,
+            title: 'BG MCP Worker',
+            state: { state: 'running' },
+          },
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: '背景タスク開始' },
+          },
+        });
+
+        void (async () => {
+          await delay(300);
+          if (state.cancelled) return;
+          await sendUpdate({
+            sessionId: childSessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: '背景タスク完了通知' },
+            },
+          });
+          await sendUpdate({
+            sessionId: state.id,
+            update: {
+              sessionUpdate: 'subagent_update',
+              sessionId: childSessionId,
+              toolCallId: subToolId,
+              title: 'BG MCP Worker',
+              state: { state: 'idle', stopReason: 'end_turn' },
+            },
+          });
+        })();
+
+        return { stopReason: 'end_turn' as const };
+      }
+
       if (promptText.includes('[ACTIVITY_SEQUENCE]')) {
         const sequenceId = randomUUID();
         for (const [index, title] of ['pwd', 'rg --files'].entries()) {
@@ -1020,6 +1276,39 @@ function runAcpServer(): void {
             content: { type: 'text', text: '作業フォルダを確認しました。レポートを作成します。' },
           },
         });
+      }
+
+      // Known MCP tool interactive permission check (for testing verified MCP alwaysAllowRule)
+      if (promptText.includes('[MCP_PERMISSION]')) {
+        const toolCallId = `tc-mcp-${Date.now()}`;
+        const permRes = await ctx.client.request(methods.client.session.requestPermission, {
+          sessionId: state.id,
+          toolCall: {
+            toolCallId,
+            title: 'known_mcp: safe_fetch',
+            name: 'mcp_known_mcp_safe_fetch',
+            status: 'pending',
+            rawInput: { ServerName: 'known_mcp', ToolName: 'safe_fetch' },
+          } as never,
+          options: [
+            { optionId: 'allow_once', name: '今回のみ許可', kind: 'allow_once' },
+            { optionId: 'reject_once', name: '拒否', kind: 'reject_once' },
+          ],
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text:
+                permRes.outcome.outcome === 'selected'
+                  ? `MCP許可応答: optionId=${permRes.outcome.optionId}`
+                  : `MCP許可キャンセル: ${permRes.outcome.outcome}`,
+            },
+          },
+        });
+        return { stopReason: 'end_turn' as const };
       }
 
       // Tool call & interactive permission check
