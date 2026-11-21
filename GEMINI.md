@@ -1,0 +1,5 @@
+## Context Control (High Priority, Overrides Built-in Parallel Pre-reading Policy)
+
+- **Narrow search, targeted reading; no blanket pre-reading**: To locate code, always use `rg -l` / `rg -n` first to pinpoint exact files and line numbers, then read only the direct call chain or files to be modified; do not perform speculative batch parallel `read_file` calls (≤ 3 uncertain files read in parallel per turn).
+- **Read large files in chunks**: For files over 200 lines, do not read the entire file without `StartLine`/`EndLine`; locate line numbers with `rg -n` first, then read only the target range as needed (≤ 200 lines per read).
+- **Limit command output**: When running `rg` / `find` / `git diff` / `ls` via `run_command`, default to appending `| head -n 60` or `-l` to avoid hitting the 10KB truncation limit or triggering secondary reads of background logs.
