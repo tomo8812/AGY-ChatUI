@@ -1994,7 +1994,8 @@ export class AcpClientManager {
     const mcpServers = this.mcpService
       ? await this.mcpService.resolveAcpMcpServersForUser(
           userId,
-          init.agentCapabilities?.mcpCapabilities
+          init.agentCapabilities?.mcpCapabilities,
+          { projectId: chat.projectId, chatId: chat.id }
         )
       : [];
 

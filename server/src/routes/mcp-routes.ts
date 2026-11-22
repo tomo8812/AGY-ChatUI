@@ -86,7 +86,9 @@ const oauthConfigSchema = z
 const createMcpSchema = z.object({
   name: z.string().trim().min(1).max(64),
   description: z.string().max(500).optional(),
-  scope: z.enum(['shared', 'profile']).default('shared'),
+  scope: z.enum(['shared', 'profile', 'project', 'chat']).default('shared'),
+  projectId: z.string().max(128).nullable().optional(),
+  chatId: z.string().max(128).nullable().optional(),
   transport: z.enum(['stdio', 'http', 'sse']),
   enabled: z.boolean().optional(),
   allowedTools: z.array(z.string().max(200)).max(500).nullable().optional(),
@@ -104,7 +106,9 @@ const createMcpSchema = z.object({
 const updateMcpSchema = createMcpSchema.partial();
 
 const importMcpSchema = z.object({
-  scope: z.enum(['shared', 'profile']).default('shared'),
+  scope: z.enum(['shared', 'profile', 'project', 'chat']).default('shared'),
+  projectId: z.string().max(128).nullable().optional(),
+  chatId: z.string().max(128).nullable().optional(),
   rawJson: z.string().min(2).max(200_000),
   overwrite: z.boolean().optional(),
 });
@@ -339,12 +343,19 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
   app.get('/api/mcp/servers', async (req, reply) => {
     const session = requireAdmin(req, reply, db);
     if (!session) return;
-    const servers = mcpService.listServersForAdmin(session.user.id);
-    const origin = await resolveRequestOrigin(req, config);
-    return {
-      servers,
-      callbackUrl: `${origin}/api/mcp/oauth/callback`,
-    };
+    const query = req.query as { projectId?: string; chatId?: string };
+    const projectId = typeof query.projectId === 'string' && query.projectId.trim() ? query.projectId.trim() : null;
+    const chatId = typeof query.chatId === 'string' && query.chatId.trim() ? query.chatId.trim() : null;
+    try {
+      const servers = mcpService.listServersForAdmin(session.user.id, { projectId, chatId });
+      const origin = await resolveRequestOrigin(req, config);
+      return {
+        servers,
+        callbackUrl: `${origin}/api/mcp/oauth/callback`,
+      };
+    } catch (err) {
+      return handleMcpError(reply, err);
+    }
   });
 
   app.post('/api/mcp/servers', async (req, reply) => {
@@ -418,7 +429,7 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
       const result = mcpService.importFromJson(session.user.id, parsed.data);
       await refreshWorkersForScope(
         parsed.data.scope,
-        parsed.data.scope === 'profile' ? session.user.id : null
+        parsed.data.scope === 'shared' ? null : session.user.id
       );
       return reply.code(201).send(result);
     } catch (err) {

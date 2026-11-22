@@ -225,7 +225,6 @@ export async function showBrowserNotification(params: {
   body: string;
   tag: string;
   chatId?: string;
-  vibrate?: number[];
 }): Promise<boolean> {
   if (!isNotificationSupported() || Notification.permission !== 'granted') {
     return false;
@@ -235,16 +234,13 @@ export async function showBrowserNotification(params: {
   const reg = await getSwRegistration();
   if (reg && typeof reg.showNotification === 'function') {
     try {
-      const options: NotificationOptions & { vibrate?: number[] } = {
+      const options: NotificationOptions = {
         body: params.body,
         icon: '/icon.svg',
         badge: '/icon.svg',
         tag: params.tag,
         data: { chatId: params.chatId ?? '', url },
       };
-      if (params.vibrate && params.vibrate.length > 0) {
-        options.vibrate = params.vibrate;
-      }
       await reg.showNotification(params.title, options);
       return true;
     } catch {

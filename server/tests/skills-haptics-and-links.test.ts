@@ -237,7 +237,7 @@ describe('Brain Image Resolution, Haptics & Push Vibrate, Quota minAgeMs, and Ag
     const chatRes = await alice.request<{ chat: { id: string } }>('POST', '/api/chats', { title: '触覚Push' });
     const chatId = chatRes.data.chat.id;
 
-    // 1) With hapticFeedback = true, completed push carries vibrate array
+    // 1) Even with hapticFeedback = true, completed push omits vibrate (vibration is stop-only)
     const send1 = await alice.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
       text: 'PushバイブON確認',
     });
@@ -257,9 +257,9 @@ describe('Brain Image Resolution, Haptics & Push Vibrate, Quota minAgeMs, and Ag
       };
       poll();
     });
-    expect(receivedPayloads[0].vibrate).toEqual([14, 55, 16, 55, 42]);
+    expect(receivedPayloads[0].vibrate).toBeUndefined();
 
-    // 2) Error notification when hapticFeedback = true carries distinct vibrate pattern
+    // 2) Error notification also omits vibrate
     await srv.ctx.pushService.notifyRunFinished({
       userId,
       chatId,
@@ -268,9 +268,9 @@ describe('Brain Image Resolution, Haptics & Push Vibrate, Quota minAgeMs, and Ag
       errorMessage: 'simulated failure',
     });
     expect(receivedPayloads).toHaveLength(2);
-    expect(receivedPayloads[1].vibrate).toEqual([65, 65, 65, 65, 65]);
+    expect(receivedPayloads[1].vibrate).toBeUndefined();
 
-    // 3) Turn off hapticFeedback -> next notification omits vibrate property
+    // 3) Turn off hapticFeedback -> persists preference cleanly
     const prefOff = await alice.request<{ preferences: { hapticFeedback: boolean } }>(
       'PATCH',
       '/api/preferences',

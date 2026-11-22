@@ -11,7 +11,6 @@ export interface NotificationPayload {
   chatId?: string;
   runId?: string;
   url?: string;
-  vibrate?: number[];
 }
 
 interface StoredVapidKeys {
@@ -388,8 +387,6 @@ export class PushNotificationService {
     const chatTitle = chat?.title || 'Antigravity Chat';
     const cleanTitle = chatTitle.length > 60 ? `${chatTitle.slice(0, 59)}…` : chatTitle;
 
-    const vibrateComplete = prefs.hapticFeedback ? [14, 55, 16, 55, 42] : undefined;
-    const vibrateError = prefs.hapticFeedback ? [65, 65, 65, 65, 65] : undefined;
     const tag = params.tagOverride || `run-${params.runId}`;
 
     const payload: NotificationPayload =
@@ -403,7 +400,6 @@ export class PushNotificationService {
             chatId: params.chatId,
             runId: params.runId,
             url: `/?chatId=${encodeURIComponent(params.chatId)}`,
-            ...(vibrateError ? { vibrate: vibrateError } : {}),
           }
         : {
             title: cleanTitle,
@@ -412,7 +408,6 @@ export class PushNotificationService {
             chatId: params.chatId,
             runId: params.runId,
             url: `/?chatId=${encodeURIComponent(params.chatId)}`,
-            ...(vibrateComplete ? { vibrate: vibrateComplete } : {}),
           };
 
     const skipEndpoints = this.hub?.getVisiblePushEndpoints(params.userId);
@@ -437,7 +432,6 @@ export class PushNotificationService {
     const label =
       truncatePreview(params.toolTitle || undefined, 90) ||
       (isQuestion ? 'エージェントからの質問' : 'ツール実行の許可');
-    const vibratePermission = prefs.hapticFeedback ? [24, 60, 24] : undefined;
 
     const skipEndpoints = this.hub?.getVisiblePushEndpoints(params.userId);
     return this.sendToUser(
@@ -449,7 +443,6 @@ export class PushNotificationService {
         chatId: params.chatId,
         runId: params.runId,
         url: `/?chatId=${encodeURIComponent(params.chatId)}`,
-        ...(vibratePermission ? { vibrate: vibratePermission } : {}),
       },
       { skipEndpoints }
     );
@@ -469,7 +462,6 @@ export class PushNotificationService {
     const chatTitle = chat?.title || 'Antigravity Chat';
     const cleanTitle = chatTitle.length > 52 ? `${chatTitle.slice(0, 51)}…` : chatTitle;
     const label = truncatePreview(params.message || undefined, 90) || 'エージェントからの質問';
-    const vibratePermission = prefs.hapticFeedback ? [24, 60, 24] : undefined;
 
     const skipEndpoints = this.hub?.getVisiblePushEndpoints(params.userId);
     return this.sendToUser(
@@ -481,7 +473,6 @@ export class PushNotificationService {
         chatId: params.chatId,
         runId: params.runId,
         url: `/?chatId=${encodeURIComponent(params.chatId)}`,
-        ...(vibratePermission ? { vibrate: vibratePermission } : {}),
       },
       { skipEndpoints }
     );

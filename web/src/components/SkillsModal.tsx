@@ -17,7 +17,9 @@ interface SkillsModalProps {
   activeChatId: string | null;
   activeProjectId: string | null;
   projects: ProjectRecord[];
-  onClose: () => void;
+  lockedScope?: SkillScope;
+  embedded?: boolean;
+  onClose?: () => void;
   onSkillsChanged?: () => void;
   onInsertSlashCommand?: (slug: string) => void;
 }
@@ -26,6 +28,12 @@ const SCOPE_LABELS: Record<SkillScope, string> = {
   global: 'グローバル',
   project: 'プロジェクト',
   workspace: 'このチャット',
+};
+
+const MODAL_TITLES: Record<SkillScope, string> = {
+  global: 'スキル管理（グローバル）',
+  project: 'プロジェクトスキル',
+  workspace: 'このチャットのスキル',
 };
 
 const RESOURCE_FOLDERS = ['scripts', 'references', 'resources', 'assets'] as const;
@@ -107,11 +115,14 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
   activeChatId,
   activeProjectId,
   projects,
+  lockedScope,
+  embedded = false,
   onClose,
   onSkillsChanged,
   onInsertSlashCommand,
 }) => {
-  const [scope, setScope] = useState<SkillScope>('global');
+  const [scopeState, setScopeState] = useState<SkillScope>(lockedScope ?? 'global');
+  const scope = lockedScope ?? scopeState;
   const [selectedProjectId, setSelectedProjectId] = useState<string>(
     activeProjectId || projects[0]?.id || ''
   );
@@ -148,7 +159,9 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
   const resourceInputRef = useRef<HTMLInputElement>(null);
 
   const effectiveProjectId =
-    scope === 'project' ? (selectedProjectId || null) : activeProjectId;
+    scope === 'project'
+      ? (lockedScope === 'project' ? activeProjectId : (selectedProjectId || activeProjectId || null))
+      : activeProjectId;
 
   const refreshSkills = useCallback(async () => {
     setLoadingList(true);
@@ -174,10 +187,29 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
 
   const currentList: SkillSummary[] = useMemo(() => {
     if (!skillsData) return [];
-    if (scope === 'global') return skillsData.global;
-    if (scope === 'project') return skillsData.project;
-    return skillsData.workspace;
+    const raw =
+      scope === 'global'
+        ? skillsData.global
+        : scope === 'project'
+          ? skillsData.project
+          : skillsData.workspace;
+    // Built-in skills always appear first, followed by custom skills below them
+    return [...raw].sort((a, b) => {
+      const aRank = a.origin === 'builtin' ? 0 : 1;
+      const bRank = b.origin === 'builtin' ? 0 : 1;
+      if (aRank !== bRank) return aRank - bRank;
+      return a.slug.localeCompare(b.slug);
+    });
   }, [skillsData, scope]);
+
+  const builtinList = useMemo(
+    () => currentList.filter((item) => item.origin === 'builtin'),
+    [currentList]
+  );
+  const customList = useMemo(
+    () => currentList.filter((item) => item.origin !== 'builtin'),
+    [currentList]
+  );
 
   const openNewDraft = (tpl?: SkillTemplate) => {
     setError(null);
@@ -491,72 +523,134 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
     (scope === 'project' && Boolean(effectiveProjectId)) ||
     (scope === 'workspace' && Boolean(activeChatId));
 
-  return (
-    <ModalDialog label="スキル管理" size="modal-xl" onClose={onClose}>
-        <div className="modal-head">
-          <div className="row-actions">
-            <SparklesIcon size={17} />
-            <h3>スキル管理</h3>
-          </div>
-          <button type="button" className="icon-btn" onClick={onClose} aria-label="閉じる">
-            <CloseIcon size={18} />
+  const renderSkillCard = (item: SkillSummary) => {
+    const isSelected =
+      editorMode === 'edit' &&
+      selectedDetail?.slug === item.slug &&
+      selectedDetail?.scope === item.scope;
+    const skillLabel = item.name || item.slug;
+    return (
+      <div
+        key={`${item.scope}:${item.slug}`}
+        className={`skill-list-card ${isSelected ? 'active' : ''} ${!item.enabled ? 'is-disabled' : ''}`}
+      >
+        <div className="skill-list-card-top">
+          <button
+            type="button"
+            className="skill-list-card-btn"
+            aria-current={isSelected ? 'true' : undefined}
+            onClick={() => void openSkillDetail(item)}
+          >
+            <div className="skill-list-card-title">
+              <span className="skill-slug-pill">/{item.slug}</span>
+              <span className={`skill-tag ${item.origin === 'builtin' ? 'builtin' : 'custom'}`}>
+                {item.origin === 'builtin' ? 'Built-in' : 'Custom'}
+              </span>
+              {item.hasBuiltinConflict && (
+                <span className="skill-tag conflict">Built-in と同名</span>
+              )}
+              {item.storageKind === 'legacy' && (
+                <span className="skill-tag legacy">legacy</span>
+              )}
+              {item.disableModelInvocation && (
+                <span className="skill-tag">手動のみ</span>
+              )}
+            </div>
+            {item.name && item.name !== item.slug && (
+              <div className="skill-list-name truncate">{item.name}</div>
+            )}
+            <div className="skill-list-desc">{item.description || '（説明なし）'}</div>
+            {item.resourceCount > 0 && (
+              <div className="muted-xs">同梱ファイル {item.resourceCount}件</div>
+            )}
           </button>
-        </div>
-
-        <div className="skills-scope-bar">
-          <div className="segmented-tabs" role="tablist" aria-label="スキル適用範囲">
-            {(['global', 'project', 'workspace'] as const).map((s) => (
-              <button
-                key={s}
-                type="button"
-                role="tab"
-                aria-selected={scope === s}
-                className={scope === s ? 'seg-btn active' : 'seg-btn'}
-                onClick={() => {
-                  setScope(s);
-                  setEditorMode('idle');
-                  setSelectedDetail(null);
-                  setMobileShowEditor(false);
-                  setError(null);
-                  setStatusNote(null);
-                }}
-              >
-                {SCOPE_LABELS[s]}
-              </button>
-            ))}
+          <div className="skill-list-card-toggle">
+            <ToggleSwitch
+              checked={item.enabled}
+              label=""
+              ariaLabel={`スキル「${skillLabel}」を有効にする`}
+              onChange={(next) => void handleToggleItem(item, next)}
+            />
           </div>
+        </div>
+      </div>
+    );
+  };
 
-          {scope === 'project' && (
-            <div className="skills-project-picker">
-              <label htmlFor="skills-project-select" className="muted-xs">対象プロジェクト:</label>
-              {projects.length === 0 ? (
-                <span className="muted-xs">プロジェクトがまだありません</span>
-              ) : (
-                <select
-                  id="skills-project-select"
-                  className="compact-select skills-project-select"
-                  value={selectedProjectId}
-                  onChange={(e) => {
-                    setSelectedProjectId(e.target.value);
+  const modalTitle = lockedScope ? MODAL_TITLES[lockedScope] : 'スキル管理';
+
+  const content = (
+    <>
+        {!embedded && (
+          <div className="modal-head">
+            <div className="row-actions">
+              <SparklesIcon size={17} />
+              <h3>{modalTitle}</h3>
+            </div>
+            {onClose && (
+              <button type="button" className="icon-btn" onClick={onClose} aria-label="閉じる">
+                <CloseIcon size={18} />
+              </button>
+            )}
+          </div>
+        )}
+
+        {!lockedScope && (
+          <div className="skills-scope-bar">
+            <div className="segmented-tabs" role="tablist" aria-label="スキル適用範囲">
+              {(['global', 'project', 'workspace'] as const).map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  role="tab"
+                  aria-selected={scope === s}
+                  className={scope === s ? 'seg-btn active' : 'seg-btn'}
+                  onClick={() => {
+                    setScopeState(s);
                     setEditorMode('idle');
                     setSelectedDetail(null);
                     setMobileShowEditor(false);
+                    setError(null);
+                    setStatusNote(null);
                   }}
                 >
-                  {projects.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name}
-                    </option>
-                  ))}
-                </select>
-              )}
+                  {SCOPE_LABELS[s]}
+                </button>
+              ))}
             </div>
-          )}
 
-          <div className="muted-xs">{scopeHint}</div>
-        </div>
+            {scope === 'project' && (
+              <div className="skills-project-picker">
+                <label htmlFor="skills-project-select" className="muted-xs">対象プロジェクト:</label>
+                {projects.length === 0 ? (
+                  <span className="muted-xs">プロジェクトがまだありません</span>
+                ) : (
+                  <select
+                    id="skills-project-select"
+                    className="compact-select skills-project-select"
+                    value={selectedProjectId}
+                    onChange={(e) => {
+                      setSelectedProjectId(e.target.value);
+                      setEditorMode('idle');
+                      setSelectedDetail(null);
+                      setMobileShowEditor(false);
+                    }}
+                  >
+                    {projects.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
+            )}
 
-        <div className={`skills-workspace ${mobileShowEditor ? 'show-editor' : 'show-list'}`}>
+            <div className="muted-xs">{scopeHint}</div>
+          </div>
+        )}
+
+        <div className={`skills-workspace ${embedded ? 'is-embedded' : ''} ${mobileShowEditor ? 'show-editor' : 'show-list'}`}>
           {/* Left pane: Skill list & templates */}
           <div className="skills-list-pane">
             <div className="skills-list-actions">
@@ -599,59 +693,22 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
                   </div>
                 ) : currentList.length > 0 ? (
                   <div className="skills-items">
-                    {currentList.map((item) => {
-                      const isSelected =
-                        editorMode === 'edit' &&
-                        selectedDetail?.slug === item.slug &&
-                        selectedDetail?.scope === item.scope;
-                      const skillLabel = item.name || item.slug;
-                      return (
-                        <div
-                          key={`${item.scope}:${item.slug}`}
-                          className={`skill-list-card ${isSelected ? 'active' : ''} ${!item.enabled ? 'is-disabled' : ''}`}
-                        >
-                          <div className="skill-list-card-top">
-                            <button
-                              type="button"
-                              className="skill-list-card-btn"
-                              aria-current={isSelected ? 'true' : undefined}
-                              onClick={() => void openSkillDetail(item)}
-                            >
-                              <div className="skill-list-card-title">
-                                <span className="skill-slug-pill">/{item.slug}</span>
-                                <span className={`skill-tag ${item.origin === 'builtin' ? 'builtin' : 'custom'}`}>
-                                  {item.origin === 'builtin' ? 'Built-in' : 'Custom'}
-                                </span>
-                                {item.hasBuiltinConflict && (
-                                  <span className="skill-tag conflict">Built-in と同名</span>
-                                )}
-                                {item.storageKind === 'legacy' && (
-                                  <span className="skill-tag legacy">legacy</span>
-                                )}
-                                {item.disableModelInvocation && (
-                                  <span className="skill-tag">手動のみ</span>
-                                )}
-                              </div>
-                              {item.name && item.name !== item.slug && (
-                                <div className="skill-list-name truncate">{item.name}</div>
-                              )}
-                              <div className="skill-list-desc">{item.description || '（説明なし）'}</div>
-                              {item.resourceCount > 0 && (
-                                <div className="muted-xs">同梱ファイル {item.resourceCount}件</div>
-                              )}
-                            </button>
-                            <div className="skill-list-card-toggle">
-                              <ToggleSwitch
-                                checked={item.enabled}
-                                label=""
-                                ariaLabel={`スキル「${skillLabel}」を有効にする`}
-                                onChange={(next) => void handleToggleItem(item, next)}
-                              />
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })}
+                    {builtinList.length > 0 && (
+                      <>
+                        {customList.length > 0 && (
+                          <div className="skills-group-heading">Built-in ({builtinList.length})</div>
+                        )}
+                        {builtinList.map(renderSkillCard)}
+                      </>
+                    )}
+                    {customList.length > 0 && (
+                      <>
+                        {builtinList.length > 0 && (
+                          <div className="skills-group-heading">Custom ({customList.length})</div>
+                        )}
+                        {customList.map(renderSkillCard)}
+                      </>
+                    )}
                   </div>
                 ) : null}
 
@@ -732,7 +789,7 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
                         className="btn btn-secondary btn-xs"
                         onClick={() => {
                           onInsertSlashCommand(slug);
-                          onClose();
+                          onClose?.();
                         }}
                       >
                         チャットに入力 (/{slug})
@@ -1029,6 +1086,16 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
             )}
           </div>
         </div>
+    </>
+  );
+
+  if (embedded) {
+    return content;
+  }
+
+  return (
+    <ModalDialog label={modalTitle} size="modal-xl" onClose={onClose ?? (() => {})}>
+      {content}
     </ModalDialog>
   );
 };

@@ -71,6 +71,8 @@ export interface CreateMcpServerInput {
   name: string;
   description?: string;
   scope: McpScope;
+  projectId?: string | null;
+  chatId?: string | null;
   transport: McpTransport;
   enabled?: boolean;
   allowedTools?: string[] | null;
@@ -89,6 +91,8 @@ export interface UpdateMcpServerInput {
   name?: string;
   description?: string;
   scope?: McpScope;
+  projectId?: string | null;
+  chatId?: string | null;
   transport?: McpTransport;
   enabled?: boolean;
   allowedTools?: string[] | null;
@@ -1425,6 +1429,8 @@ export class McpService {
       description: row.description,
       scope: row.scope,
       ownerUserId: row.ownerUserId,
+      projectId: row.projectId,
+      chatId: row.chatId,
       transport: row.transport,
       enabled: row.enabled,
       allowedTools: parseArgsJson(row.allowedToolsJson),
@@ -1462,13 +1468,51 @@ export class McpService {
   }
 
   private assertAdminCanAccessRow(adminUserId: string, row: StoredMcpServerRow): void {
-    if (row.scope === 'profile' && row.ownerUserId !== adminUserId) {
-      throw new McpValidationError('FORBIDDEN', '他の管理者の個人プロファイル専用MCPにはアクセスできません。', 403);
+    if (row.scope !== 'shared' && row.ownerUserId !== adminUserId) {
+      throw new McpValidationError('FORBIDDEN', '他の管理者の専用MCPにはアクセスできません。', 403);
     }
   }
 
-  listServersForAdmin(adminUserId: string): McpServerRecord[] {
-    return this.db.listMcpServersForAdmin(adminUserId).map((row) => this.toPublicRecord(row));
+  private resolveScopeTarget(
+    adminUserId: string,
+    scope: McpScope,
+    projectId?: string | null,
+    chatId?: string | null
+  ): { ownerUserId: string | null; projectId: string | null; chatId: string | null } {
+    if (scope === 'shared') {
+      return { ownerUserId: null, projectId: null, chatId: null };
+    }
+    if (scope === 'profile') {
+      return { ownerUserId: adminUserId, projectId: null, chatId: null };
+    }
+    if (scope === 'project') {
+      const pid = (projectId ?? '').trim();
+      if (!pid || !this.db.getProject(adminUserId, pid)) {
+        throw new McpValidationError('PROJECT_NOT_FOUND', '対象プロジェクトが見つかりません。', 404);
+      }
+      return { ownerUserId: adminUserId, projectId: pid, chatId: null };
+    }
+    const cid = (chatId ?? '').trim();
+    if (!cid || !this.db.getChat(adminUserId, cid)) {
+      throw new McpValidationError('CHAT_NOT_FOUND', '対象チャットが見つかりません。', 404);
+    }
+    return { ownerUserId: adminUserId, projectId: null, chatId: cid };
+  }
+
+  listServersForAdmin(
+    adminUserId: string,
+    filter?: { projectId?: string | null; chatId?: string | null }
+  ): McpServerRecord[] {
+    if (filter?.projectId) {
+      if (!this.db.getProject(adminUserId, filter.projectId)) {
+        throw new McpValidationError('PROJECT_NOT_FOUND', '対象プロジェクトが見つかりません。', 404);
+      }
+    } else if (filter?.chatId) {
+      if (!this.db.getChat(adminUserId, filter.chatId)) {
+        throw new McpValidationError('CHAT_NOT_FOUND', '対象チャットが見つかりません。', 404);
+      }
+    }
+    return this.db.listMcpServersForAdmin(adminUserId, filter).map((row) => this.toPublicRecord(row));
   }
 
   getServerForAdmin(adminUserId: string, serverId: string): McpServerRecord {
@@ -1482,8 +1526,16 @@ export class McpService {
 
   createServer(adminUserId: string, input: CreateMcpServerInput): McpServerRecord {
     const name = validateMcpName(input.name);
-    const scope: McpScope = input.scope === 'profile' ? 'profile' : 'shared';
-    const ownerUserId = scope === 'profile' ? adminUserId : null;
+    const scope: McpScope =
+      input.scope === 'profile' || input.scope === 'project' || input.scope === 'chat'
+        ? input.scope
+        : 'shared';
+    const { ownerUserId, projectId, chatId } = this.resolveScopeTarget(
+      adminUserId,
+      scope,
+      input.projectId,
+      input.chatId
+    );
     const transport: McpTransport = input.transport;
     const description = (input.description ?? '').trim().slice(0, 500);
     const enabled = input.enabled !== undefined ? Boolean(input.enabled) : true;
@@ -1497,7 +1549,7 @@ export class McpService {
       throw new McpValidationError('INVALID_ALWAYS_ALLOW_TOOLS', msg);
     });
 
-    const existingDup = this.db.findMcpServerByScopeAndName(scope, ownerUserId, name);
+    const existingDup = this.db.findMcpServerByScopeAndName(scope, ownerUserId, name, projectId, chatId);
     if (existingDup) {
       throw new McpValidationError(
         'MCP_NAME_EXISTS',
@@ -1551,6 +1603,8 @@ export class McpService {
       description,
       scope,
       ownerUserId,
+      projectId,
+      chatId,
       transport,
       enabled,
       allowedToolsJson: JSON.stringify(allowedTools),
@@ -1586,7 +1640,16 @@ export class McpService {
 
     const nextName = input.name !== undefined ? validateMcpName(input.name) : existing.name;
     const nextScope: McpScope = input.scope !== undefined ? input.scope : existing.scope;
-    const nextOwnerUserId = nextScope === 'profile' ? adminUserId : null;
+    const {
+      ownerUserId: nextOwnerUserId,
+      projectId: nextProjectId,
+      chatId: nextChatId,
+    } = this.resolveScopeTarget(
+      adminUserId,
+      nextScope,
+      input.projectId !== undefined ? input.projectId : existing.projectId,
+      input.chatId !== undefined ? input.chatId : existing.chatId
+    );
     const nextTransport: McpTransport = input.transport !== undefined ? input.transport : existing.transport;
     const nextDescription =
       input.description !== undefined ? input.description.trim().slice(0, 500) : existing.description;
@@ -1619,9 +1682,17 @@ export class McpService {
     if (
       nextName !== existing.name ||
       nextScope !== existing.scope ||
-      nextOwnerUserId !== existing.ownerUserId
+      nextOwnerUserId !== existing.ownerUserId ||
+      nextProjectId !== existing.projectId ||
+      nextChatId !== existing.chatId
     ) {
-      const dup = this.db.findMcpServerByScopeAndName(nextScope, nextOwnerUserId, nextName);
+      const dup = this.db.findMcpServerByScopeAndName(
+        nextScope,
+        nextOwnerUserId,
+        nextName,
+        nextProjectId,
+        nextChatId
+      );
       if (dup && dup.id !== existing.id) {
         throw new McpValidationError(
           'MCP_NAME_EXISTS',
@@ -1718,6 +1789,8 @@ export class McpService {
       description: nextDescription,
       scope: nextScope,
       ownerUserId: nextOwnerUserId,
+      projectId: nextProjectId,
+      chatId: nextChatId,
       transport: nextTransport,
       enabled: nextEnabled,
       allowedToolsJson: nextAllowedToolsJson,
@@ -1774,7 +1847,13 @@ export class McpService {
    */
   importFromJson(
     adminUserId: string,
-    params: { scope: McpScope; rawJson: string; overwrite?: boolean }
+    params: {
+      scope: McpScope;
+      projectId?: string | null;
+      chatId?: string | null;
+      rawJson: string;
+      overwrite?: boolean;
+    }
   ): { imported: McpServerRecord[]; skipped: string[] } {
     let parsed: unknown;
     try {
@@ -1806,7 +1885,12 @@ export class McpService {
     const skipped: string[] = [];
     const duplicateSkipped: string[] = [];
     const invalidEntries: string[] = [];
-    const ownerUserId = params.scope === 'profile' ? adminUserId : null;
+    const { ownerUserId, projectId, chatId } = this.resolveScopeTarget(
+      adminUserId,
+      params.scope,
+      params.projectId,
+      params.chatId
+    );
 
     for (const [rawName, rawCfg] of entries) {
       if (!rawCfg || typeof rawCfg !== 'object' || Array.isArray(rawCfg)) {
@@ -1905,7 +1989,13 @@ export class McpService {
               })
             : undefined;
 
-        const existing = this.db.findMcpServerByScopeAndName(params.scope, ownerUserId, name);
+        const existing = this.db.findMcpServerByScopeAndName(
+          params.scope,
+          ownerUserId,
+          name,
+          projectId,
+          chatId
+        );
         if (existing) {
           if (!params.overwrite) {
             skipped.push(name);
@@ -1931,6 +2021,8 @@ export class McpService {
             name,
             description: typeof cfg.description === 'string' ? cfg.description : '',
             scope: params.scope,
+            projectId,
+            chatId,
             transport,
             enabled: typeof cfg.disabled === 'boolean' ? !cfg.disabled : true,
             ...(allowedTools !== undefined ? { allowedTools } : {}),
@@ -3529,9 +3621,10 @@ export class McpService {
    */
   async resolveAcpMcpServersForUser(
     userId: string,
-    capabilities?: McpCapabilities | null
+    capabilities?: McpCapabilities | null,
+    context?: { projectId?: string | null; chatId?: string | null }
   ): Promise<McpServer[]> {
-    const rows = this.db.listEffectiveMcpServersForUser(userId);
+    const rows = this.db.listEffectiveMcpServersForUser(userId, context);
     if (rows.length === 0) return [];
 
     // Deduplicate by name: rows are ordered shared-first, profile-second, so profile overrides shared.
