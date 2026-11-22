@@ -663,7 +663,7 @@ describe('Anthropic doc skills and runtime isolation', () => {
       const fakeEsmAgy = path.join(mockBinDir, 'agy-esm.mjs');
       fs.writeFileSync(
         fakeEsmAgy,
-        '#!/usr/bin/env node\nimport path from "node:path";\nconsole.log("AGY_ESM_OK", process.env.NODE_OPTIONS ?? "NO_HOOK", path.basename("/a/b"), process.argv.slice(2).join(","));\n',
+        '#!/usr/bin/env node\nimport path from "node:path";\nconst hasHook = Boolean(process.env.NODE_OPTIONS) || process.execArgv.some((a) => a.includes("esm-register"));\nconsole.log("AGY_ESM_OK", hasHook ? "HOOKED" : "NO_HOOK", path.basename("/a/b"), process.argv.slice(2).join(","));\n',
         { mode: 0o755 },
       );
       const cleanNodeRes = execFileSync(
@@ -766,6 +766,12 @@ describe('Anthropic doc skills and runtime isolation', () => {
         { cwd: simWorkspaceA, env: envA, encoding: 'utf8' },
       );
       expect(agyBypassCheck.trim()).toBe('AGY_ESM_OK NO_HOOK b acp,--disable-telemetry');
+      const regularNodeHookCheck = execFileSync(
+        'node',
+        ['-e', 'console.log(process.execArgv.some((a) => a.includes("esm-register")))'],
+        { cwd: simWorkspaceA, env: envA, encoding: 'utf8' },
+      );
+      expect(regularNodeHookCheck.trim()).toBe('true');
 
       fs.writeFileSync(
         path.join(simWorkspaceA, 'check-base.mjs'),
