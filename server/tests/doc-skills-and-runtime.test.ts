@@ -938,6 +938,49 @@ describe('Anthropic doc skills and runtime isolation', () => {
       expect(fs.existsSync(path.join(chatRuntimeA, 'node', 'lib', 'node_modules', 'chat-only-node'))).toBe(true);
       expect(fs.existsSync(path.join(chatRuntimeA, 'node', 'lib', 'node_modules', 'pptxgenjs'))).toBe(true);
 
+      // Upgrade regression test: legacy /opt/agy-doc-runtime symlinks from PR #29 are migrated/cleaned
+      // while user-installed real packages and non-managed symlinks are preserved
+      const legacyChatWs = path.join(tmpRoot, 'workspace-legacy');
+      fs.mkdirSync(legacyChatWs, { recursive: true });
+      const legacyNodeModules = path.join(profileDir, '.chat-runtime', 'workspace-legacy', 'node', 'lib', 'node_modules');
+      fs.mkdirSync(path.join(legacyNodeModules, '@myscope'), { recursive: true });
+      fs.mkdirSync(path.join(legacyNodeModules, '@legacy-scope'), { recursive: true });
+      fs.symlinkSync('/opt/agy-doc-runtime/node/node_modules/docx', path.join(legacyNodeModules, 'docx'));
+      fs.symlinkSync('/opt/agy-doc-runtime/node/node_modules/removed-base', path.join(legacyNodeModules, 'removed-base'));
+      fs.symlinkSync('/opt/agy-doc-runtime/node/node_modules/@myscope/doc-scoped', path.join(legacyNodeModules, '@myscope', 'doc-scoped'));
+      fs.symlinkSync('/opt/agy-doc-runtime/node/node_modules/@legacy-scope/stale', path.join(legacyNodeModules, '@legacy-scope', 'stale'));
+
+      // User-installed custom real package & custom symlink must survive migration untouched
+      const userRealPkgDir = path.join(legacyNodeModules, 'pptxgenjs');
+      fs.mkdirSync(userRealPkgDir, { recursive: true });
+      fs.writeFileSync(path.join(userRealPkgDir, 'index.cjs'), 'module.exports = { source: "user-custom-pptx" };\n');
+      const userLinkTarget = path.join(tmpRoot, 'user-custom-link-target');
+      fs.mkdirSync(userLinkTarget, { recursive: true });
+      fs.symlinkSync(userLinkTarget, path.join(legacyNodeModules, 'user-custom-link'));
+      fs.symlinkSync(userLinkTarget, path.join(legacyNodeModules, '@myscope', 'user-scoped-link'));
+
+      ensurePerChatRuntimeDir(profileDir, legacyChatWs, layout);
+      expect(fs.readlinkSync(path.join(legacyNodeModules, 'docx'))).toBe(
+        `${SANDBOX_DOC_RUNTIME_MOUNT}/node/node_modules/docx`,
+      );
+      expect(fs.readlinkSync(path.join(legacyNodeModules, '@myscope', 'doc-scoped'))).toBe(
+        `${SANDBOX_DOC_RUNTIME_MOUNT}/node/node_modules/@myscope/doc-scoped`,
+      );
+      expect(fs.readdirSync(legacyNodeModules)).not.toContain('removed-base');
+      expect(fs.readdirSync(legacyNodeModules)).not.toContain('@legacy-scope');
+      expect(fs.lstatSync(userRealPkgDir).isDirectory()).toBe(true);
+      expect(fs.readFileSync(path.join(userRealPkgDir, 'index.cjs'), 'utf8')).toContain('user-custom-pptx');
+      expect(fs.readlinkSync(path.join(legacyNodeModules, 'user-custom-link'))).toBe(userLinkTarget);
+      expect(fs.readlinkSync(path.join(legacyNodeModules, '@myscope', 'user-scoped-link'))).toBe(userLinkTarget);
+
+      // Re-seeding a legacy symlink and reconciling with docRuntime=null also cleans it without touching user installs
+      fs.symlinkSync('/opt/agy-doc-runtime/node/node_modules/pdf-lib', path.join(legacyNodeModules, 'legacy-pdf-lib'));
+      ensurePerChatRuntimeDir(profileDir, legacyChatWs, null);
+      expect(fs.readdirSync(legacyNodeModules)).not.toContain('legacy-pdf-lib');
+      expect(fs.readdirSync(legacyNodeModules)).not.toContain('docx');
+      expect(fs.lstatSync(userRealPkgDir).isDirectory()).toBe(true);
+      expect(fs.readlinkSync(path.join(legacyNodeModules, 'user-custom-link'))).toBe(userLinkTarget);
+
       // 3. Non-isolated mode explicitly refuses equivalence guarantees
       const offSpec = buildAgyCommandSpec({
         config: { ...baseCfg, sandboxMode: 'off' },
@@ -979,7 +1022,7 @@ describe('Anthropic doc skills and runtime isolation', () => {
       restoreWriteTree(docRuntimeDir);
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test('Deploy scripts unify under INSTALL_DOC_RUNTIME=auto|0|1 and auto-update swaps read-only builtin-skills safely without hiding failures', async () => {
     const repoRoot = path.resolve(import.meta.dirname, '..', '..');

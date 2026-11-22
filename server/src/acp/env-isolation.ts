@@ -1232,6 +1232,8 @@ function ensureSymlinkTarget(targetPath: string, linkPath: string): void {
   fs.symlinkSync(targetPath, linkPath);
 }
 
+const LEGACY_SANDBOX_DOC_RUNTIME_MOUNTS = ['/opt/agy-doc-runtime'] as const;
+
 function reconcileBaseNodeModulesSymlinks(
   chatNodeModulesDir: string,
   docRuntime: DocRuntimeLayout | null,
@@ -1241,6 +1243,7 @@ function reconcileBaseNodeModulesSymlinks(
   const managedPrefixes = Array.from(
     new Set([
       `${toPosix(SANDBOX_DOC_RUNTIME_MOUNT).replace(/\/+$/, '')}/`,
+      ...LEGACY_SANDBOX_DOC_RUNTIME_MOUNTS.map((root) => `${toPosix(root).replace(/\/+$/, '')}/`),
       `${toPosix(docRuntimeMountRoot).replace(/\/+$/, '')}/`,
     ])
   );
