@@ -788,15 +788,17 @@ export function buildAgyCommandSpec(params: {
       }
     }
 
-    if (docRuntime && fs.existsSync('/usr/local')) {
-      bwrapArgs.push('--tmpfs', '/usr/local');
-      for (const entry of fs.readdirSync('/usr/local', { withFileTypes: true })) {
-        if (entry.name === path.posix.basename(SANDBOX_DOC_RUNTIME_MOUNT)) continue;
-        const entryPath = path.posix.join('/usr/local', entry.name);
-        if (entry.isSymbolicLink()) {
-          bwrapArgs.push('--symlink', fs.readlinkSync(entryPath), entryPath);
-        } else if (entry.isDirectory() || entry.isFile()) {
-          bwrapArgs.push('--ro-bind', entryPath, entryPath);
+    if (docRuntime) {
+      if (fs.existsSync('/usr/local')) {
+        bwrapArgs.push('--tmpfs', '/usr/local');
+        for (const entry of fs.readdirSync('/usr/local', { withFileTypes: true })) {
+          if (entry.name === path.posix.basename(SANDBOX_DOC_RUNTIME_MOUNT)) continue;
+          const entryPath = path.posix.join('/usr/local', entry.name);
+          if (entry.isSymbolicLink()) {
+            bwrapArgs.push('--symlink', fs.readlinkSync(entryPath), entryPath);
+          } else if (entry.isDirectory() || entry.isFile()) {
+            bwrapArgs.push('--ro-bind', entryPath, entryPath);
+          }
         }
       }
       bwrapArgs.push('--ro-bind', docRuntime.hostDir, SANDBOX_DOC_RUNTIME_MOUNT);
@@ -1418,21 +1420,19 @@ export function ensurePerChatRuntimeDir(
     writeFileIfChanged(path.join(hooksDir, 'esm-register.mjs'), ESM_REGISTER_SCRIPT, 0o644);
     writeFileIfChanged(path.join(hooksDir, 'esm-hook.mjs'), buildEsmHookScript(defaultLayerRoots), 0o644);
 
-    const hostNodeBin = (() => {
-      if (
-        process.execPath &&
-        process.execPath !== nodeWrapperPath &&
-        (process.execPath.startsWith('/usr/') || process.execPath.startsWith('/bin/')) &&
-        fs.existsSync(process.execPath)
-      ) {
-        return process.execPath;
-      }
-      const fromPath = resolveHostExecutable('node');
-      if (fromPath && fromPath !== nodeWrapperPath) {
-        return fromPath;
-      }
-      return '/usr/bin/node';
-    })();
+    const isSandboxMountedBin = (binPath: string | null | undefined): binPath is string =>
+      Boolean(
+        binPath &&
+          binPath !== nodeWrapperPath &&
+          (binPath.startsWith('/usr/') || binPath.startsWith('/bin/')) &&
+          fs.existsSync(binPath)
+      );
+    const hostNodeBin = isSandboxMountedBin(process.execPath)
+      ? process.execPath
+      : (() => {
+          const fromPath = resolveHostExecutable('node');
+          return isSandboxMountedBin(fromPath) ? fromPath : '/usr/bin/node';
+        })();
     const shSingleQuote = (val: string) => `'${val.replace(/'/g, "'\\''")}'`;
     const registerInSandbox = `${chatMountPosix}/hooks/esm-register.mjs`;
     const wrapperScript = [
