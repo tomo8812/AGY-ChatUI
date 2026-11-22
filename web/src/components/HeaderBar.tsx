@@ -6,7 +6,7 @@ import type {
   QuotaBucket,
   QuotaSnapshotRecord,
 } from '../types';
-import { ComposeIcon, GaugeIcon, MenuIcon } from './Icons';
+import { ComposeIcon, GaugeIcon, MenuIcon, PlugIcon, SparklesIcon } from './Icons';
 import { QuotaPopover } from './QuotaPopover';
 
 interface HeaderBarProps {
@@ -19,6 +19,8 @@ interface HeaderBarProps {
   wsStatus: WsConnectionStatus;
   onOpenSidebar: () => void;
   onNewChat: () => void;
+  onOpenChatSkills?: () => void;
+  onOpenChatMcp?: () => void;
   onRefreshQuota: () => void;
   onOpenQuotaPopover?: () => void;
 }
@@ -58,6 +60,8 @@ export const HeaderBar: React.FC<HeaderBarProps> = React.memo(({
   wsStatus,
   onOpenSidebar,
   onNewChat,
+  onOpenChatSkills,
+  onOpenChatMcp,
   onRefreshQuota,
   onOpenQuotaPopover,
 }) => {
@@ -156,6 +160,28 @@ export const HeaderBar: React.FC<HeaderBarProps> = React.memo(({
       </div>
 
       <div className="header-right">
+        {onOpenChatSkills && (
+          <button
+            type="button"
+            className="circle-icon-btn"
+            onClick={onOpenChatSkills}
+            aria-label="このチャットのスキル"
+            title="このチャットのスキル"
+          >
+            <SparklesIcon size={16} />
+          </button>
+        )}
+        {onOpenChatMcp && (
+          <button
+            type="button"
+            className="circle-icon-btn"
+            onClick={onOpenChatMcp}
+            aria-label="このチャットのMCP（管理者）"
+            title="このチャットのMCP（管理者）"
+          >
+            <PlugIcon size={16} />
+          </button>
+        )}
         <button
           type="button"
           className="circle-icon-btn"

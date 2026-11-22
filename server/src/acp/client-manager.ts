@@ -518,6 +518,7 @@ export class AcpClientManager {
   private readonly userOptionProbes = new Map<string, Promise<ParsedSessionOptions | null>>();
   private globalMcpConfigEpoch = 0;
   private readonly userMcpConfigEpoch = new Map<string, number>();
+  private readonly chatMcpConfigEpoch = new Map<string, number>();
   private readonly cleanupTimer: NodeJS.Timeout;
 
   constructor(
@@ -532,8 +533,12 @@ export class AcpClientManager {
     this.cleanupTimer.unref();
   }
 
-  private getExpectedMcpConfigEpoch(userId: string): number {
-    return this.globalMcpConfigEpoch + (this.userMcpConfigEpoch.get(userId) ?? 0);
+  private getExpectedMcpConfigEpoch(userId: string, chatId: string): number {
+    return (
+      this.globalMcpConfigEpoch +
+      (this.userMcpConfigEpoch.get(userId) ?? 0) +
+      (this.chatMcpConfigEpoch.get(`${userId}:${chatId}`) ?? 0)
+    );
   }
 
   private notifyWorkerIdleWaiters(w: WorkerInstance): void {
@@ -574,7 +579,9 @@ export class AcpClientManager {
   private maybeReloadIdleFlaggedWorker(w: WorkerInstance): void {
     if (this.isWorkerBusy(w)) return;
     this.notifyWorkerIdleWaiters(w);
-    const stale = w.needsConfigReload || w.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(w.userId);
+    const stale =
+      w.needsConfigReload ||
+      w.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(w.userId, w.chatId);
     if (stale) {
       void this.stopWorkerByKey(w.key);
     }
@@ -609,6 +616,28 @@ export class AcpClientManager {
         w.needsConfigReload = true;
       } else {
         idleKeys.push(w.key);
+      }
+    }
+    await Promise.allSettled(idleKeys.map((k) => this.stopWorkerByKey(k)));
+  }
+
+  async stopIdleWorkersForChats(userId: string, chatIds: Iterable<string>): Promise<void> {
+    const uniqueChatIds = new Set<string>();
+    for (const cid of chatIds) {
+      if (cid) uniqueChatIds.add(cid);
+    }
+    if (uniqueChatIds.size === 0) return;
+
+    const idleKeys: string[] = [];
+    for (const chatId of uniqueChatIds) {
+      const key = `${userId}:${chatId}`;
+      this.chatMcpConfigEpoch.set(key, (this.chatMcpConfigEpoch.get(key) ?? 0) + 1);
+      const w = this.workers.get(key);
+      if (!w) continue;
+      if (this.isWorkerBusy(w)) {
+        w.needsConfigReload = true;
+      } else {
+        idleKeys.push(key);
       }
     }
     await Promise.allSettled(idleKeys.map((k) => this.stopWorkerByKey(k)));
@@ -1507,7 +1536,7 @@ export class AcpClientManager {
       if (existing && !existing.process.killed && existing.process.exitCode === null) {
         const staleConfig =
           existing.needsConfigReload ||
-          existing.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId);
+          existing.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId, chatId);
         if (!staleConfig) {
           existing.lastUsedAt = Date.now();
           return existing;
@@ -1524,7 +1553,7 @@ export class AcpClientManager {
         const connected = await pendingConnect;
         const staleConfig =
           connected.needsConfigReload ||
-          connected.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId);
+          connected.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId, chatId);
         if (!staleConfig) {
           return connected;
         }
@@ -1542,7 +1571,7 @@ export class AcpClientManager {
       const started = await promise;
       const staleAfterStart =
         started.needsConfigReload ||
-        started.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId);
+        started.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId, chatId);
       if (!staleAfterStart || this.isWorkerBusy(started)) {
         if (staleAfterStart && this.isWorkerBusy(started)) {
           await this.waitForWorkerIdleOrExit(started, abortSignal);
@@ -1555,7 +1584,7 @@ export class AcpClientManager {
   }
 
   private async startWorker(userId: string, chatId: string): Promise<WorkerInstance> {
-    const startMcpConfigEpoch = this.getExpectedMcpConfigEpoch(userId);
+    const startMcpConfigEpoch = this.getExpectedMcpConfigEpoch(userId, chatId);
     const profile = this.db.getAgyProfile(userId);
     if (!profile || profile.authStatus !== 'authenticated') {
       throw new Error('Antigravity認証が完了していません。設定から公式認証を完了してください。');
@@ -1994,7 +2023,8 @@ export class AcpClientManager {
     const mcpServers = this.mcpService
       ? await this.mcpService.resolveAcpMcpServersForUser(
           userId,
-          init.agentCapabilities?.mcpCapabilities
+          init.agentCapabilities?.mcpCapabilities,
+          { projectId: chat.projectId, chatId: chat.id }
         )
       : [];
 
@@ -2161,7 +2191,7 @@ export class AcpClientManager {
       turnBridges: new Map(),
       lastBackgroundActivityAt: 0,
       stderrTail,
-      needsConfigReload: startMcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId),
+      needsConfigReload: startMcpConfigEpoch !== this.getExpectedMcpConfigEpoch(userId, chatId),
       mcpConfigEpoch: startMcpConfigEpoch,
       detachedElicitationResolvers: new Map(),
       idleWaiters: new Set(),
@@ -3429,7 +3459,9 @@ export class AcpClientManager {
   private evictIdleWorkers(): void {
     const cutoff = Date.now() - this.config.idleWorkerMs;
     for (const w of this.workers.values()) {
-      const stale = w.needsConfigReload || w.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(w.userId);
+      const stale =
+        w.needsConfigReload ||
+        w.mcpConfigEpoch !== this.getExpectedMcpConfigEpoch(w.userId, w.chatId);
       if (!this.isWorkerBusy(w) && (stale || w.lastUsedAt < cutoff)) {
         void this.stopWorkerByKey(w.key);
       }

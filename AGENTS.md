@@ -11,6 +11,14 @@ This file applies **only** to the `tomo8812/AGY-ChatUI` repository.
 - **Forward the saved agent mode at session creation**: When Antigravity advertises the saved profile `agentMode` as a supported choice, ChatUI may forward it once through native ACP `session/set_config_option` for a newly created session. Antigravity owns mode behavior and approval decisions. Restored sessions retain the mode Antigravity returns.
 - **Disable telemetry for ChatUI-managed ACP processes**: Pass Antigravity's native `--disable-telemetry` flag whenever ChatUI starts `agy acp`. This launch policy is scoped to the ACP process. Google manages the account preference separately.
 
+## Supported Display Targets
+
+Optimize layout, typography, viewers, and controls strictly for the following standard screens. **Do not expand the target matrix** or spend effort adding workarounds for unsupported devices (such as Android phones/browsers, iPads/tablets, or unusual/foldable aspect ratios).
+
+- **PC (Desktop / Laptop)**: Standard horizontal screens with common aspect ratios (**16:9**, **16:10**) and typical viewport resolutions (**1280×720**, **1366×768**, **1440×900**, **1920×1080**, **2560×1440**).
+- **iPhone**: Modern iPhone portrait viewports (**~19.5:9** aspect ratio, **375×812** to **430×932** CSS px, e.g., iPhone SE/mini/Standard/Pro/Pro Max) in iOS Safari and standalone PWA mode.
+- **UI Quality Standard**: Across all supported PC and iPhone screens, buttons, tabs, badges, and interactive controls must not awkwardly wrap text due to insufficient width, and content viewers (including landscape PDFs) must display cleanly without horizontal clipping.
+
 ## Pull Request Review Workflow
 
 Whenever you create a Pull Request in this repository, follow these steps automatically without waiting for additional user instructions:

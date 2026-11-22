@@ -7,6 +7,11 @@ import React, { useCallback, useDeferredValue, useEffect, useMemo, useRef, useSt
 import { ApiError, api } from '../api/client';
 import type { ArtifactRecord, ProjectRecord } from '../types';
 import {
+  computePdfAutoFitScale,
+  PDF_MANUAL_MAX_SCALE,
+  PDF_MANUAL_MIN_SCALE,
+} from '../utils/pdfFit';
+import {
   artifactTextCache,
   artifactVersionKey,
   buildArtifactContentUrl,
@@ -113,13 +118,36 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
   const [pdfDoc, setPdfDoc] = useState<PdfJsTypes.PDFDocumentProxy | null>(null);
   const [pageNum, setPageNum] = useState(1);
   const [numPages, setNumPages] = useState(0);
-  const [scale, setScale] = useState(1.25);
+  const [fitMode, setFitMode] = useState<'auto' | 'manual'>('auto');
+  const [manualScale, setManualScale] = useState(1.25);
+  const [pageNaturalSize, setPageNaturalSize] = useState<{ width: number; height: number } | null>(null);
+  const [containerSize, setContainerSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: 0, left: 0 });
   }, [pageNum, url]);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const measure = () => {
+      const nextW = Math.round(el.clientWidth);
+      const nextH = Math.round(el.clientHeight);
+      setContainerSize((prev) =>
+        prev.width === nextW && prev.height === nextH ? prev : { width: nextW, height: nextH }
+      );
+    };
+    measure();
+    if (typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(measure);
+      ro.observe(el);
+      return () => ro.disconnect();
+    }
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [loading, pdfDoc]);
 
   useEffect(() => {
     let active = true;
@@ -129,6 +157,8 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
     setPdfDoc(null);
     setNumPages(0);
     setPageNum(1);
+    setFitMode('auto');
+    setPageNaturalSize(null);
 
     const load = async () => {
       try {
@@ -171,7 +201,38 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
   }, [url]);
 
   useEffect(() => {
+    if (!pdfDoc) return;
+    let active = true;
+    void pdfDoc
+      .getPage(pageNum)
+      .then((page) => {
+        if (!active) return;
+        const vp = page.getViewport({ scale: 1 });
+        setPageNaturalSize((prev) =>
+          prev && Math.abs(prev.width - vp.width) < 0.5 && Math.abs(prev.height - vp.height) < 0.5
+            ? prev
+            : { width: vp.width, height: vp.height }
+        );
+      })
+      .catch(() => {
+        // ignore page lookup error during teardown
+      });
+    return () => {
+      active = false;
+    };
+  }, [pdfDoc, pageNum]);
+
+  const autoScale = useMemo(
+    () => computePdfAutoFitScale(pageNaturalSize, containerSize),
+    [pageNaturalSize, containerSize]
+  );
+
+  const scale = fitMode === 'auto' ? autoScale : manualScale;
+  const manualMinScale = Math.min(PDF_MANUAL_MIN_SCALE, autoScale);
+
+  useEffect(() => {
     if (!pdfDoc || !canvasRef.current) return;
+    if (fitMode === 'auto' && (!pageNaturalSize || containerSize.width <= 0)) return;
     let cancelled = false;
     let activeTask: PdfJsTypes.RenderTask | null = null;
     let prefetchTimer: number | undefined;
@@ -237,7 +298,7 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
       if (prefetchTimer !== undefined) window.clearTimeout(prefetchTimer);
       activeTask?.cancel();
     };
-  }, [pdfDoc, url, pageNum, numPages, scale]);
+  }, [pdfDoc, url, pageNum, numPages, scale, fitMode, pageNaturalSize, containerSize.width]);
 
   if (loading) return <div className="viewer-state muted-sm">PDFを読み込み中...</div>;
   if (error) return <div className="error-box" role="alert">{error}</div>;
@@ -269,9 +330,20 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
         <div className="row-actions">
           <button
             type="button"
+            className={`btn btn-secondary btn-xs ${fitMode === 'auto' ? 'active' : ''}`}
+            onClick={() => setFitMode('auto')}
+            title="画面サイズに合わせて表示"
+          >
+            画面に合わせる
+          </button>
+          <button
+            type="button"
             className="btn btn-secondary btn-xs"
             aria-label="縮小"
-            onClick={() => setScale((s) => Math.max(0.6, Math.round((s - 0.2) * 10) / 10))}
+            onClick={() => {
+              setFitMode('manual');
+              setManualScale(Math.max(manualMinScale, Math.round((scale - 0.2) * 100) / 100));
+            }}
           >
             −
           </button>
@@ -280,7 +352,10 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
             type="button"
             className="btn btn-secondary btn-xs"
             aria-label="拡大"
-            onClick={() => setScale((s) => Math.min(2.6, Math.round((s + 0.2) * 10) / 10))}
+            onClick={() => {
+              setFitMode('manual');
+              setManualScale(Math.min(PDF_MANUAL_MAX_SCALE, Math.round((scale + 0.2) * 100) / 100));
+            }}
           >
             ＋
           </button>

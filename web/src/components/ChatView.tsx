@@ -1261,7 +1261,6 @@ const MessageRow: React.FC<{
               return;
             }
             suppressContextUntilRef.current = Date.now() + 500;
-            triggerHaptic('send', hapticEnabled);
             onOpenLongPressMenu({
               textToCopy,
               messageKey,
@@ -2031,6 +2030,13 @@ const ChatComposer = React.memo(
                     className={`composer-icon-btn ${slashOpen ? 'active' : ''}`}
                     onClick={() => {
                       const el = textareaRef.current;
+                      setContextOpen(false);
+                      // If input already matches a slash command prefix, toggle the palette without inserting another '/'
+                      if (slashMatch) {
+                        setSlashDismissed((prev) => !prev);
+                        el?.focus();
+                        return;
+                      }
                       const start =
                         el && typeof el.selectionStart === 'number'
                           ? el.selectionStart
@@ -2039,8 +2045,14 @@ const ChatComposer = React.memo(
                         el && typeof el.selectionEnd === 'number'
                           ? el.selectionEnd
                           : inputText.length;
+                      const prevChar = start > 0 ? inputText[start - 1].normalize('NFKC') : '';
+                      const nextChar = end < inputText.length ? inputText[end].normalize('NFKC') : '';
+                      if (start === end && (prevChar === '/' || nextChar === '/')) {
+                        setSlashDismissed(false);
+                        el?.focus();
+                        return;
+                      }
                       const nextText = `${inputText.slice(0, start)}/${inputText.slice(end)}`;
-                      setContextOpen(false);
                       setSlashDismissed(false);
                       setInputText(nextText);
                       el?.focus();
@@ -2113,30 +2125,15 @@ const ChatComposer = React.memo(
                   )}
 
                   {!showStopOnly && (
-                    <div className="haptic-btn-shell">
-                      <button
-                        type="submit"
-                        className={`send-btn ${isFollowupSendMode ? 'followup-btn' : ''}`}
-                        disabled={!canSend}
-                        title={isFollowupSendMode ? 'フォローアップとして送信' : '送信'}
-                        aria-label={isFollowupSendMode ? 'フォローアップとして送信' : '送信'}
-                      >
-                        <SendIcon size={17} />
-                      </button>
-                      {useIosSwitchOverlay && canSend && (
-                        <label
-                          className="ios-haptic-switch-overlay"
-                          title={isFollowupSendMode ? 'フォローアップとして送信' : '送信'}
-                        >
-                          <input
-                            type="checkbox"
-                            {...({ switch: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
-                            aria-label={isFollowupSendMode ? 'フォローアップとして送信' : '送信'}
-                            onChange={() => void handleSubmit()}
-                          />
-                        </label>
-                      )}
-                    </div>
+                    <button
+                      type="submit"
+                      className={`send-btn ${isFollowupSendMode ? 'followup-btn' : ''}`}
+                      disabled={!canSend}
+                      title={isFollowupSendMode ? 'フォローアップとして送信' : '送信'}
+                      aria-label={isFollowupSendMode ? 'フォローアップとして送信' : '送信'}
+                    >
+                      <SendIcon size={17} />
+                    </button>
                   )}
                 </div>
               </div>

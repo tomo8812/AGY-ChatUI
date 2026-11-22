@@ -544,7 +544,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <summary>バイブレーション / 触覚フィードバック</summary>
             <ToggleSwitch
               checked={preferences.hapticFeedback}
-              label="操作・応答完了を振動で区別して知らせる"
+              label="生成停止時に振動でフィードバックする"
               onChange={(next) => void handlePrefChange({ hapticFeedback: next })}
             />
             {hapticError && <div className="error-box" role="alert" style={{ marginTop: 8 }}>{hapticError}</div>}

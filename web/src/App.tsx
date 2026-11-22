@@ -14,7 +14,7 @@ import { SettingsModal } from './components/SettingsModal';
 import { Sidebar } from './components/Sidebar';
 import { SkillsModal } from './components/SkillsModal';
 import { McpModal } from './components/McpModal';
-import { triggerHaptic, VIBRATION_PATTERNS } from './utils/haptics';
+import { triggerHaptic } from './utils/haptics';
 import {
   ensurePushSubscribed,
   getActivePushSubscription,
@@ -167,8 +167,8 @@ export const App: React.FC = () => {
   const [wsClientId, setWsClientId] = useState<string>('local');
   const [sidebarMobileOpen, setSidebarMobileOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [skillsOpen, setSkillsOpen] = useState(false);
-  const [mcpOpen, setMcpOpen] = useState(false);
+  const [skillsModalScope, setSkillsModalScope] = useState<'global' | 'workspace' | null>(null);
+  const [mcpModalMode, setMcpModalMode] = useState<'global' | 'chat' | null>(null);
   const [skillsState, setSkillsState] = useState<SkillsListResponse | null>(null);
   const [externalDraftCommand, setExternalDraftCommand] = useState<{ slug: string; token: number } | null>(
     null
@@ -264,7 +264,6 @@ export const App: React.FC = () => {
       body: string;
       chatId: string;
       createdAt: number;
-      vibrate?: number[];
     }) => {
       if (isReplayingHelloRef.current) return;
       if (!preferencesRef.current?.notifyOnResponse) return;
@@ -287,7 +286,6 @@ export const App: React.FC = () => {
           body: params.body,
           tag: params.tag,
           chatId: params.chatId,
-          vibrate: params.vibrate,
         });
       };
 
@@ -492,11 +490,13 @@ export const App: React.FC = () => {
     setViewerCacheUser(user?.id ?? null);
   }, [user?.id]);
 
-  // Sync CSS --app-vh & data-keyboard-open with iPhone / mobile visualViewport
+  // Sync CSS --app-vh & data-keyboard-open with iPhone visualViewport
   useEffect(() => {
     if (typeof window === 'undefined') return;
     let baseHeight = Math.max(window.innerHeight, window.visualViewport?.height ?? 0);
     let blurTimer: number | undefined;
+    let resumeTimer1: number | undefined;
+    let resumeTimer2: number | undefined;
     let rafId: number | undefined;
     let lastAppliedVh: number | null = null;
     let lastAppliedVvTop: number | null = null;
@@ -507,28 +507,38 @@ export const App: React.FC = () => {
       const vv = window.visualViewport;
       const vvHeight = vv ? Math.round(vv.height) : window.innerHeight;
       const vvTop = vv ? Math.max(0, Math.round(vv.offsetTop)) : 0;
+      const isPinchZoomed = Boolean(vv && vv.scale > 1.02);
       const activeEl = document.activeElement;
       const isTextFocused =
         activeEl instanceof HTMLElement &&
         (activeEl.tagName === 'TEXTAREA' ||
+          activeEl.isContentEditable ||
           (activeEl.tagName === 'INPUT' &&
             !['checkbox', 'radio', 'file', 'button', 'submit', 'reset'].includes(
               (activeEl as HTMLInputElement).type
             )));
+
+      // On iOS Safari/PWA, returning from another app where the keyboard was open can leave
+      // visualViewport.height stuck at the keyboard-shrunk height even though no input is focused.
+      // When no text input is focused (and not pinch-zoomed), trust full window.innerHeight.
+      const effectiveVh =
+        !isTextFocused && !isPinchZoomed ? Math.max(window.innerHeight, vvHeight) : vvHeight;
+      const effectiveVvTop = !isTextFocused && !isPinchZoomed ? 0 : vvTop;
+
       if (!isTextFocused) {
-        baseHeight = Math.max(window.innerHeight, vvHeight);
+        baseHeight = effectiveVh;
       }
-      const vhChanged = lastAppliedVh !== vvHeight;
+      const vhChanged = lastAppliedVh !== effectiveVh;
       if (vhChanged) {
-        lastAppliedVh = vvHeight;
-        document.documentElement.style.setProperty('--app-vh', `${vvHeight}px`);
+        lastAppliedVh = effectiveVh;
+        document.documentElement.style.setProperty('--app-vh', `${effectiveVh}px`);
       }
-      if (lastAppliedVvTop !== vvTop) {
-        lastAppliedVvTop = vvTop;
-        document.documentElement.style.setProperty('--app-vv-top', `${vvTop}px`);
+      if (lastAppliedVvTop !== effectiveVvTop) {
+        lastAppliedVvTop = effectiveVvTop;
+        document.documentElement.style.setProperty('--app-vv-top', `${effectiveVvTop}px`);
       }
-      const heightDrop = Math.max(window.innerHeight - vvHeight, baseHeight - vvHeight);
-      const keyboardOpen = window.innerWidth <= 860 && (heightDrop > 120 || isTextFocused);
+      const heightDrop = Math.max(window.innerHeight - effectiveVh, baseHeight - effectiveVh);
+      const keyboardOpen = window.innerWidth <= 860 && isTextFocused && heightDrop > 120;
       const keyboardStateChanged = lastAppliedKeyboardOpen !== keyboardOpen;
       if (keyboardStateChanged) {
         lastAppliedKeyboardOpen = keyboardOpen;
@@ -538,7 +548,10 @@ export const App: React.FC = () => {
           delete document.documentElement.dataset.keyboardOpen;
         }
       }
-      if (keyboardOpen && vv && vv.offsetTop > 0) {
+      if (
+        (keyboardOpen && vv && vv.offsetTop > 0) ||
+        (!isTextFocused && !isPinchZoomed && (window.scrollY > 0 || (vv && vv.offsetTop > 0)))
+      ) {
         window.scrollTo(0, 0);
       }
       if (
@@ -565,6 +578,15 @@ export const App: React.FC = () => {
       blurTimer = window.setTimeout(scheduleViewportUpdate, 60);
     };
 
+    const onAppResume = () => {
+      if (document.visibilityState === 'hidden') return;
+      scheduleViewportUpdate();
+      if (resumeTimer1 !== undefined) window.clearTimeout(resumeTimer1);
+      if (resumeTimer2 !== undefined) window.clearTimeout(resumeTimer2);
+      resumeTimer1 = window.setTimeout(scheduleViewportUpdate, 120);
+      resumeTimer2 = window.setTimeout(scheduleViewportUpdate, 350);
+    };
+
     applyViewport();
     const vv = window.visualViewport;
     vv?.addEventListener('resize', scheduleViewportUpdate);
@@ -572,15 +594,23 @@ export const App: React.FC = () => {
     window.addEventListener('resize', scheduleViewportUpdate);
     window.addEventListener('focusin', scheduleViewportUpdate);
     window.addEventListener('focusout', onFocusOut);
+    window.addEventListener('pageshow', onAppResume);
+    window.addEventListener('focus', onAppResume);
+    document.addEventListener('visibilitychange', onAppResume);
 
     return () => {
       if (blurTimer !== undefined) window.clearTimeout(blurTimer);
+      if (resumeTimer1 !== undefined) window.clearTimeout(resumeTimer1);
+      if (resumeTimer2 !== undefined) window.clearTimeout(resumeTimer2);
       if (rafId !== undefined) window.cancelAnimationFrame(rafId);
       vv?.removeEventListener('resize', scheduleViewportUpdate);
       vv?.removeEventListener('scroll', scheduleViewportUpdate);
       window.removeEventListener('resize', scheduleViewportUpdate);
       window.removeEventListener('focusin', scheduleViewportUpdate);
       window.removeEventListener('focusout', onFocusOut);
+      window.removeEventListener('pageshow', onAppResume);
+      window.removeEventListener('focus', onAppResume);
+      document.removeEventListener('visibilitychange', onAppResume);
       document.documentElement.style.removeProperty('--app-vh');
       document.documentElement.style.removeProperty('--app-vv-top');
       delete document.documentElement.dataset.keyboardOpen;
@@ -1138,15 +1168,9 @@ export const App: React.FC = () => {
           Math.abs(Date.now() - evt.createdAt) < 60_000;
 
         if (run) {
-          if (isForegroundLive) {
-            if (run.status === 'cancelled') {
-              if (!locallyCancelledRunIdsRef.current.has(run.id)) {
-                triggerHaptic('stop', hapticOn);
-              }
-            } else if (run.status === 'error') {
-              triggerHaptic('error', hapticOn);
-            } else {
-              triggerHaptic('complete', hapticOn);
+          if (isForegroundLive && run.status === 'cancelled') {
+            if (!locallyCancelledRunIdsRef.current.has(run.id)) {
+              triggerHaptic('stop', hapticOn);
             }
           }
           locallyCancelledRunIdsRef.current.delete(run.id);
@@ -1161,9 +1185,6 @@ export const App: React.FC = () => {
               ? run.errorMessage || '応答の生成中にエラーが発生しました。'
               : preview || '応答が完了しました。';
           const title = run.status === 'error' ? `エラーで終了 — ${chatTitle}` : chatTitle;
-          const vibrate = hapticOn
-            ? VIBRATION_PATTERNS[run.status === 'error' ? 'error' : 'complete']
-            : undefined;
 
           notifyDesktopWithPushFallback({
             dedupKey: `run-${run.id}`,
@@ -1172,7 +1193,6 @@ export const App: React.FC = () => {
             body,
             chatId: run.chatId,
             createdAt: evt.createdAt,
-            vibrate,
           });
           void triggerQuotaRefresh(true, 5_000);
         }
@@ -1191,15 +1211,6 @@ export const App: React.FC = () => {
           setMessages((prev) => upsertMessage(prev, msg));
         }
 
-        const hapticOn = Boolean(preferencesRef.current?.hapticFeedback ?? true);
-        if (
-          !isReplayingHelloRef.current &&
-          document.visibilityState === 'visible' &&
-          Math.abs(Date.now() - evt.createdAt) < 60_000
-        ) {
-          triggerHaptic(wakeupStatus === 'error' ? 'error' : 'complete', hapticOn);
-        }
-
         if (evt.chatId) {
           const chatTitle =
             chatsRef.current.find((c) => c.id === evt.chatId)?.title || 'Antigravity Chat';
@@ -1209,9 +1220,6 @@ export const App: React.FC = () => {
               ? preview || 'バックグラウンド処理でエラーが発生しました。'
               : preview || '応答が完了しました。';
           const title = wakeupStatus === 'error' ? `エラーで終了 — ${chatTitle}` : chatTitle;
-          const vibrate = hapticOn
-            ? VIBRATION_PATTERNS[wakeupStatus === 'error' ? 'error' : 'complete']
-            : undefined;
 
           notifyDesktopWithPushFallback({
             dedupKey: notificationTag,
@@ -1220,7 +1228,6 @@ export const App: React.FC = () => {
             body,
             chatId: evt.chatId,
             createdAt: evt.createdAt,
-            vibrate,
           });
         }
         void triggerQuotaRefresh(true, 5_000);
@@ -1247,14 +1254,6 @@ export const App: React.FC = () => {
               cur && cur.id === perm.runId ? { ...cur, status: 'awaiting_permission' } : cur
             );
           }
-          const hapticOn = Boolean(preferencesRef.current?.hapticFeedback ?? true);
-          if (
-            !isReplayingHelloRef.current &&
-            document.visibilityState === 'visible' &&
-            Math.abs(Date.now() - evt.createdAt) < 60_000
-          ) {
-            triggerHaptic('permission', hapticOn);
-          }
 
           const chatTitle =
             chatsRef.current.find((c) => c.id === perm.chatId)?.title || 'Antigravity Chat';
@@ -1272,7 +1271,6 @@ export const App: React.FC = () => {
             body: isQuestion ? toolLabel : `${toolLabel} の承認が必要です。`,
             chatId: perm.chatId,
             createdAt: evt.createdAt,
-            vibrate: hapticOn ? VIBRATION_PATTERNS.permission : undefined,
           });
         }
         break;
@@ -1337,14 +1335,6 @@ export const App: React.FC = () => {
               );
             }
           }
-          const hapticOn = Boolean(preferencesRef.current?.hapticFeedback ?? true);
-          if (
-            !isReplayingHelloRef.current &&
-            document.visibilityState === 'visible' &&
-            Math.abs(Date.now() - evt.createdAt) < 60_000
-          ) {
-            triggerHaptic('permission', hapticOn);
-          }
 
           const chatTitle =
             chatsRef.current.find((c) => c.id === elicit.chatId)?.title || 'Antigravity Chat';
@@ -1359,7 +1349,6 @@ export const App: React.FC = () => {
             body: label,
             chatId: elicit.chatId,
             createdAt: evt.createdAt,
-            vibrate: hapticOn ? VIBRATION_PATTERNS.permission : undefined,
           });
         }
         break;
@@ -1541,7 +1530,8 @@ export const App: React.FC = () => {
         setSessionOptions(null);
         setQuota(null);
         setSkillsState(null);
-        setSkillsOpen(false);
+        setSkillsModalScope(null);
+        setMcpModalMode(null);
         draftCreatedChatRef.current = null;
         setDraftCreatedChat(null);
         setDraftProjectId(null);
@@ -1939,7 +1929,6 @@ export const App: React.FC = () => {
 
   const handleSendPrompt = useCallback(
     async (text: string, files: AttachmentRef[]): Promise<void> => {
-      triggerHaptic('send', Boolean(preferencesRef.current?.hapticFeedback ?? true));
       const switchSeq = chatSwitchSeqRef.current;
       const existingId = activeChatIdRef.current;
       const wasDraft = !existingId || draftCreatedChatRef.current?.id === existingId;
@@ -2101,8 +2090,10 @@ export const App: React.FC = () => {
   const handleCloseSidebarMobile = useCallback(() => setSidebarMobileOpen(false), []);
   const handleOpenSidebar = useCallback(() => setSidebarMobileOpen(true), []);
   const handleOpenProjectModal = useCallback((proj: ProjectRecord | null) => setProjectModalTarget(proj), []);
-  const handleOpenSkills = useCallback(() => setSkillsOpen(true), []);
-  const handleOpenMcp = useCallback(() => setMcpOpen(true), []);
+  const handleOpenSkills = useCallback(() => setSkillsModalScope('global'), []);
+  const handleOpenChatSkills = useCallback(() => setSkillsModalScope('workspace'), []);
+  const handleOpenMcp = useCallback(() => setMcpModalMode('global'), []);
+  const handleOpenChatMcp = useCallback(() => setMcpModalMode('chat'), []);
   const handleOpenSettings = useCallback(() => setSettingsOpen(true), []);
   const handleRefreshQuota = useCallback(() => {
     void triggerQuotaRefresh(false);
@@ -2134,7 +2125,8 @@ export const App: React.FC = () => {
     setSessionOptions(null);
     setQuota(null);
     setSkillsState(null);
-    setSkillsOpen(false);
+    setSkillsModalScope(null);
+    setMcpModalMode(null);
     setHasComposerDraft(false);
     draftCreatedChatRef.current = null;
     setDraftCreatedChat(null);
@@ -2232,6 +2224,8 @@ export const App: React.FC = () => {
           wsStatus={wsStatus}
           onOpenSidebar={handleOpenSidebar}
           onNewChat={handleHeaderNewChat}
+          onOpenChatSkills={handleOpenChatSkills}
+          onOpenChatMcp={user.role === 'admin' ? handleOpenChatMcp : undefined}
           onRefreshQuota={handleRefreshQuota}
           onOpenQuotaPopover={handleOpenQuotaPopover}
         />
@@ -2308,16 +2302,21 @@ export const App: React.FC = () => {
         />
       )}
 
-      {mcpOpen && user.role === 'admin' && (
-        <McpModal onClose={() => setMcpOpen(false)} />
+      {mcpModalMode !== null && user.role === 'admin' && (
+        <McpModal
+          mode={mcpModalMode}
+          chatId={mcpModalMode === 'chat' ? activeChatId : null}
+          onClose={() => setMcpModalMode(null)}
+        />
       )}
 
-      {skillsOpen && (
+      {skillsModalScope !== null && (
         <SkillsModal
           activeChatId={activeChatId}
           activeProjectId={effectiveProjectId}
           projects={projects}
-          onClose={() => setSkillsOpen(false)}
+          lockedScope={skillsModalScope}
+          onClose={() => setSkillsModalScope(null)}
           onSkillsChanged={() => {
             void loadSkillsList(effectiveProjectIdRef.current, activeChatIdRef.current);
           }}
@@ -2330,6 +2329,8 @@ export const App: React.FC = () => {
       {projectModalTarget !== undefined && (
         <ProjectModal
           project={projectModalTarget}
+          projects={projects}
+          isAdmin={user.role === 'admin'}
           onClose={() => setProjectModalTarget(undefined)}
           onSaved={(saved) => {
             setProjects((prev) => {
@@ -2347,6 +2348,9 @@ export const App: React.FC = () => {
           }}
           onStartChatInProject={(projectId) => {
             handleStartDraftChat(projectId);
+          }}
+          onSkillsChanged={() => {
+            void loadSkillsList(effectiveProjectIdRef.current, activeChatIdRef.current);
           }}
         />
       )}

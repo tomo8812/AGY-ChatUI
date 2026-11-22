@@ -44,6 +44,8 @@ export interface StoredMcpServerRow {
   description: string;
   scope: McpScope;
   ownerUserId: string | null;
+  projectId: string | null;
+  chatId: string | null;
   transport: McpTransport;
   enabled: boolean;
   allowedToolsJson: string;
@@ -317,6 +319,8 @@ export class AppDatabase {
         description TEXT NOT NULL DEFAULT '',
         scope TEXT NOT NULL,
         owner_user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+        project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+        chat_id TEXT REFERENCES chats(id) ON DELETE CASCADE,
         transport TEXT NOT NULL,
         enabled INTEGER NOT NULL DEFAULT 1,
         allowed_tools_json TEXT NOT NULL DEFAULT '[]',
@@ -340,8 +344,6 @@ export class AppDatabase {
         updated_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_mcp_servers_scope_owner ON mcp_servers(scope, owner_user_id);
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_servers_unique_scope_name
-        ON mcp_servers(scope, COALESCE(owner_user_id, ''), name);
     `);
 
     // Safe additive column migrations for existing databases
@@ -383,6 +385,19 @@ export class AppDatabase {
     if (!mcpCols.some((col) => col.name === 'discovered_tools_json')) {
       this.db.exec("ALTER TABLE mcp_servers ADD COLUMN discovered_tools_json TEXT NOT NULL DEFAULT '[]';");
     }
+    if (!mcpCols.some((col) => col.name === 'project_id')) {
+      this.db.exec('ALTER TABLE mcp_servers ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE CASCADE;');
+    }
+    if (!mcpCols.some((col) => col.name === 'chat_id')) {
+      this.db.exec('ALTER TABLE mcp_servers ADD COLUMN chat_id TEXT REFERENCES chats(id) ON DELETE CASCADE;');
+    }
+    this.db.exec(`
+      DROP INDEX IF EXISTS idx_mcp_servers_unique_scope_name;
+      CREATE INDEX IF NOT EXISTS idx_mcp_servers_project ON mcp_servers(project_id);
+      CREATE INDEX IF NOT EXISTS idx_mcp_servers_chat ON mcp_servers(chat_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_servers_unique_scope_target_name
+        ON mcp_servers(scope, COALESCE(owner_user_id, ''), COALESCE(project_id, ''), COALESCE(chat_id, ''), name);
+    `);
     const elicitCols = this.db.prepare('PRAGMA table_info(pending_elicitations)').all() as Array<{
       name: string;
       notnull: number;
@@ -835,6 +850,13 @@ export class AppDatabase {
         userId
       );
     return this.getProject(userId, projectId);
+  }
+
+  listChatIdsForProject(userId: string, projectId: string): string[] {
+    const rows = this.db
+      .prepare('SELECT id FROM chats WHERE user_id = ? AND project_id = ?')
+      .all(userId, projectId) as Array<{ id: string }>;
+    return rows.map((r) => String(r.id));
   }
 
   deleteProject(userId: string, projectId: string): boolean {
@@ -1920,12 +1942,18 @@ export class AppDatabase {
   // ---- MCP Servers ----
 
   private mapMcpServerRow(row: Record<string, unknown>): StoredMcpServerRow {
+    const scope: McpScope =
+      row.scope === 'profile' || row.scope === 'project' || row.scope === 'chat'
+        ? row.scope
+        : 'shared';
     return {
       id: String(row.id),
       name: String(row.name),
       description: String(row.description ?? ''),
-      scope: row.scope === 'profile' ? 'profile' : 'shared',
+      scope,
       ownerUserId: row.owner_user_id ? String(row.owner_user_id) : null,
+      projectId: row.project_id ? String(row.project_id) : null,
+      chatId: row.chat_id ? String(row.chat_id) : null,
       transport:
         row.transport === 'http' || row.transport === 'sse' || row.transport === 'stdio'
           ? row.transport
@@ -1977,7 +2005,30 @@ export class AppDatabase {
     return rows.map((r) => String(r.id));
   }
 
-  listMcpServersForAdmin(adminUserId: string): StoredMcpServerRow[] {
+  listMcpServersForAdmin(
+    adminUserId: string,
+    filter?: { projectId?: string | null; chatId?: string | null }
+  ): StoredMcpServerRow[] {
+    if (filter?.projectId) {
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM mcp_servers
+           WHERE scope = 'project' AND owner_user_id = ? AND project_id = ?
+           ORDER BY name ASC`
+        )
+        .all(adminUserId, filter.projectId) as Array<Record<string, unknown>>;
+      return rows.map((r) => this.mapMcpServerRow(r));
+    }
+    if (filter?.chatId) {
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM mcp_servers
+           WHERE scope = 'chat' AND owner_user_id = ? AND chat_id = ?
+           ORDER BY name ASC`
+        )
+        .all(adminUserId, filter.chatId) as Array<Record<string, unknown>>;
+      return rows.map((r) => this.mapMcpServerRow(r));
+    }
     const rows = this.db
       .prepare(
         `SELECT * FROM mcp_servers
@@ -1988,14 +2039,38 @@ export class AppDatabase {
     return rows.map((r) => this.mapMcpServerRow(r));
   }
 
-  listEffectiveMcpServersForUser(userId: string): StoredMcpServerRow[] {
+  listEffectiveMcpServersForUser(
+    userId: string,
+    context?: { projectId?: string | null; chatId?: string | null }
+  ): StoredMcpServerRow[] {
+    const projectId = context?.projectId ?? null;
+    const chatId = context?.chatId ?? null;
+    const clauses: string[] = [
+      `scope = 'shared'`,
+      `(scope = 'profile' AND owner_user_id = ?)`,
+    ];
+    const params: Array<string> = [userId];
+    if (projectId) {
+      clauses.push(`(scope = 'project' AND owner_user_id = ? AND project_id = ?)`);
+      params.push(userId, projectId);
+    }
+    if (chatId) {
+      clauses.push(`(scope = 'chat' AND owner_user_id = ? AND chat_id = ?)`);
+      params.push(userId, chatId);
+    }
     const rows = this.db
       .prepare(
         `SELECT * FROM mcp_servers
-         WHERE enabled = 1 AND (scope = 'shared' OR (scope = 'profile' AND owner_user_id = ?))
-         ORDER BY CASE WHEN scope = 'shared' THEN 0 ELSE 1 END, name ASC`
+         WHERE enabled = 1 AND (${clauses.join(' OR ')})
+         ORDER BY CASE scope
+           WHEN 'shared' THEN 0
+           WHEN 'profile' THEN 1
+           WHEN 'project' THEN 2
+           WHEN 'chat' THEN 3
+           ELSE 4
+         END, name ASC`
       )
-      .all(userId) as Array<Record<string, unknown>>;
+      .all(...params) as Array<Record<string, unknown>>;
     return rows.map((r) => this.mapMcpServerRow(r));
   }
 
@@ -2009,14 +2084,20 @@ export class AppDatabase {
   findMcpServerByScopeAndName(
     scope: McpScope,
     ownerUserId: string | null,
-    name: string
+    name: string,
+    projectId: string | null = null,
+    chatId: string | null = null
   ): StoredMcpServerRow | null {
     const row = this.db
       .prepare(
         `SELECT * FROM mcp_servers
-         WHERE scope = ? AND COALESCE(owner_user_id, '') = COALESCE(?, '') AND name = ?`
+         WHERE scope = ?
+           AND COALESCE(owner_user_id, '') = COALESCE(?, '')
+           AND COALESCE(project_id, '') = COALESCE(?, '')
+           AND COALESCE(chat_id, '') = COALESCE(?, '')
+           AND name = ?`
       )
-      .get(scope, ownerUserId ?? '', name) as Record<string, unknown> | undefined;
+      .get(scope, ownerUserId ?? '', projectId ?? '', chatId ?? '', name) as Record<string, unknown> | undefined;
     return row ? this.mapMcpServerRow(row) : null;
   }
 
@@ -2026,6 +2107,8 @@ export class AppDatabase {
     description: string;
     scope: McpScope;
     ownerUserId: string | null;
+    projectId?: string | null;
+    chatId?: string | null;
     transport: McpTransport;
     enabled: boolean;
     allowedToolsJson?: string;
@@ -2050,14 +2133,14 @@ export class AppDatabase {
     this.db
       .prepare(
         `INSERT INTO mcp_servers (
-          id, name, description, scope, owner_user_id, transport, enabled,
+          id, name, description, scope, owner_user_id, project_id, chat_id, transport, enabled,
           allowed_tools_json, disabled_tools_json, always_allow_tools_json, discovered_tools_json,
           command, args_json, encrypted_env_json,
           url, auth_type, encrypted_headers_json,
           oauth_config_json, encrypted_oauth_client_secret, encrypted_oauth_tokens_json,
           oauth_status, oauth_error, oauth_updated_at,
           created_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         input.id,
@@ -2065,6 +2148,8 @@ export class AppDatabase {
         input.description,
         input.scope,
         input.ownerUserId,
+        input.projectId ?? null,
+        input.chatId ?? null,
         input.transport,
         input.enabled ? 1 : 0,
         input.allowedToolsJson ?? '[]',
@@ -2097,6 +2182,8 @@ export class AppDatabase {
       description: string;
       scope: McpScope;
       ownerUserId: string | null;
+      projectId: string | null;
+      chatId: string | null;
       transport: McpTransport;
       enabled: boolean;
       allowedToolsJson: string;
@@ -2127,6 +2214,8 @@ export class AppDatabase {
           description = ?,
           scope = ?,
           owner_user_id = ?,
+          project_id = ?,
+          chat_id = ?,
           transport = ?,
           enabled = ?,
           allowed_tools_json = ?,
@@ -2153,6 +2242,8 @@ export class AppDatabase {
         patch.description !== undefined ? patch.description : existing.description,
         patch.scope !== undefined ? patch.scope : existing.scope,
         patch.ownerUserId !== undefined ? patch.ownerUserId : existing.ownerUserId,
+        patch.projectId !== undefined ? patch.projectId : existing.projectId,
+        patch.chatId !== undefined ? patch.chatId : existing.chatId,
         patch.transport !== undefined ? patch.transport : existing.transport,
         (patch.enabled !== undefined ? patch.enabled : existing.enabled) ? 1 : 0,
         patch.allowedToolsJson !== undefined ? patch.allowedToolsJson : existing.allowedToolsJson,

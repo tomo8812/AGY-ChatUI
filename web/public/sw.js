@@ -96,7 +96,6 @@ self.addEventListener('push', (event) => {
         badge: '/icon.svg',
         tag,
         renotify: true,
-        ...(Array.isArray(data.vibrate) ? { vibrate: data.vibrate } : {}),
         data: { chatId, url },
       })
       .catch(() =>

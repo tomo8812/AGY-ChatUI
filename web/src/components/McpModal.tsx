@@ -14,7 +14,11 @@ import { ModalDialog } from './ModalDialog';
 import { ToggleSwitch } from './ToggleSwitch';
 
 interface McpModalProps {
-  onClose: () => void;
+  mode?: 'global' | 'project' | 'chat';
+  projectId?: string | null;
+  chatId?: string | null;
+  embedded?: boolean;
+  onClose?: () => void;
 }
 
 interface EditableKeyValue {
@@ -30,6 +34,8 @@ type EditorViewMode = 'idle' | 'connect' | 'auth' | 'configure' | 'import';
 const SCOPE_LABELS: Record<McpScope, string> = {
   shared: '共有',
   profile: '個人',
+  project: 'プロジェクト',
+  chat: 'このチャット',
 };
 
 const TRANSPORT_LABELS: Record<McpTransport, string> = {
@@ -67,8 +73,19 @@ function formatServerStatusBadge(server: McpServerRecord): { label: string; tone
   return { label: '認証なし', tone: 'muted' };
 }
 
-export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
-  const [scopeTab, setScopeTab] = useState<McpScope>('shared');
+export const McpModal: React.FC<McpModalProps> = ({
+  mode = 'global',
+  projectId = null,
+  chatId = null,
+  embedded = false,
+  onClose,
+}) => {
+  const [globalScopeTab, setGlobalScopeTab] = useState<'shared' | 'profile'>('shared');
+  const scopeTab: McpScope = mode === 'project' ? 'project' : mode === 'chat' ? 'chat' : globalScopeTab;
+  const canUseCurrentScope =
+    mode === 'global' ||
+    (mode === 'project' && Boolean(projectId)) ||
+    (mode === 'chat' && Boolean(chatId));
   const [servers, setServers] = useState<McpServerRecord[]>([]);
   const [callbackUrl, setCallbackUrl] = useState<string>(
     `${window.location.origin}/api/mcp/oauth/callback`
@@ -136,10 +153,18 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
   const autoProbedServerIdRef = useRef<string | null>(null);
 
   const loadServers = useCallback(async () => {
+    if (!canUseCurrentScope) {
+      setServers([]);
+      setLoading(false);
+      setListError(null);
+      return [];
+    }
     setLoading(true);
     setListError(null);
     try {
-      const res = await api.listMcpServers();
+      const res = await api.listMcpServers(
+        mode === 'project' ? { projectId } : mode === 'chat' ? { chatId } : undefined
+      );
       setServers(res.servers);
       if (res.callbackUrl) setCallbackUrl(res.callbackUrl);
       return res.servers;
@@ -149,7 +174,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [canUseCurrentScope, mode, projectId, chatId]);
 
   useEffect(() => {
     void loadServers();
@@ -596,10 +621,14 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
       const res = await api.createMcpServer({
         ...payload,
         scope: scopeTab,
+        ...(scopeTab === 'project' ? { projectId } : {}),
+        ...(scopeTab === 'chat' ? { chatId } : {}),
         enabled: true,
       });
       const saved = res.server;
-      setScopeTab(saved.scope);
+      if (mode === 'global' && (saved.scope === 'shared' || saved.scope === 'profile')) {
+        setGlobalScopeTab(saved.scope);
+      }
       await loadServers();
 
       if (saved.transport !== 'stdio' && saved.authType === 'oauth') {
@@ -802,6 +831,8 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     try {
       const res = await api.importMcpJson({
         scope: scopeTab,
+        ...(scopeTab === 'project' ? { projectId } : {}),
+        ...(scopeTab === 'chat' ? { chatId } : {}),
         rawJson: importJsonText,
         overwrite: importOverwrite,
       });
@@ -1337,56 +1368,79 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     </>
   );
 
-  return (
-    <ModalDialog label="MCP サーバー" size="modal-xl" onClose={onClose}>
-      <div className="modal-head">
-        <div className="modal-head-title-wrap">
-          <h3>MCP サーバー</h3>
-          <p className="muted-xs" style={{ marginTop: 2 }}>
-            外部ツールやサービスをチャットに接続します
-          </p>
-        </div>
-        <button type="button" className="icon-btn" onClick={onClose} aria-label="閉じる">
-          <CloseIcon size={18} />
-        </button>
-      </div>
+  const modalTitle =
+    mode === 'project'
+      ? 'プロジェクト MCP'
+      : mode === 'chat'
+        ? 'このチャットの MCP'
+        : 'MCP サーバー（グローバル）';
 
-      <div className="skills-scope-tabs" role="tablist" aria-label="適用範囲">
-        {(['shared', 'profile'] as McpScope[]).map((sc) => {
-          const count = servers.filter((s) => s.scope === sc).length;
-          return (
-            <button
-              key={sc}
-              type="button"
-              role="tab"
-              aria-selected={scopeTab === sc}
-              className={`skills-scope-tab ${scopeTab === sc ? 'active' : ''}`}
-              onClick={() => {
-                setScopeTab(sc);
-                setSelectedId(null);
-                setViewMode('idle');
-                setIsSetupFlow(false);
-                setTestResult(null);
-                setOAuthPendingUrl(null);
-                setError(null);
-                setStatusNote(null);
-                setMobileShowEditor(false);
-              }}
-            >
-              <span>{SCOPE_LABELS[sc]}</span>
-              <span className="skills-tab-count">{count}</span>
+  const scopeHint =
+    scopeTab === 'shared'
+      ? '全ユーザーのチャットで利用できるサーバーを管理します。'
+      : scopeTab === 'profile'
+        ? '自分のアカウントのチャットでのみ利用できるサーバーを管理します。'
+        : scopeTab === 'project'
+          ? 'このプロジェクト内のチャットで利用できるサーバーを管理します。'
+          : 'このチャットのみで利用できるサーバーを管理します。';
+
+  const content = (
+    <>
+      {!embedded && (
+        <div className="modal-head">
+          <div className="modal-head-title-wrap">
+            <h3>{modalTitle}</h3>
+            <p className="muted-xs" style={{ marginTop: 2 }}>
+              外部ツールやサービスをチャットに接続します
+            </p>
+          </div>
+          {onClose && (
+            <button type="button" className="icon-btn" onClick={onClose} aria-label="閉じる">
+              <CloseIcon size={18} />
             </button>
-          );
-        })}
-      </div>
+          )}
+        </div>
+      )}
 
-      <div className={`skills-body ${mobileShowEditor ? 'mobile-editor' : ''}`}>
+      {mode === 'global' && (
+        <div className="skills-scope-tabs" role="tablist" aria-label="適用範囲">
+          {(['shared', 'profile'] as const).map((sc) => {
+            const count = servers.filter((s) => s.scope === sc).length;
+            return (
+              <button
+                key={sc}
+                type="button"
+                role="tab"
+                aria-selected={scopeTab === sc}
+                className={`skills-scope-tab ${scopeTab === sc ? 'active' : ''}`}
+                onClick={() => {
+                  setGlobalScopeTab(sc);
+                  setSelectedId(null);
+                  setViewMode('idle');
+                  setIsSetupFlow(false);
+                  setTestResult(null);
+                  setOAuthPendingUrl(null);
+                  setError(null);
+                  setStatusNote(null);
+                  setMobileShowEditor(false);
+                }}
+              >
+                <span>{SCOPE_LABELS[sc]}</span>
+                <span className="skills-tab-count">{count}</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      <div className={`skills-body ${embedded ? 'is-embedded' : ''} ${mobileShowEditor ? 'mobile-editor' : ''}`}>
         {/* Left pane: Server list */}
         <div className="skills-list-pane">
           <div className="skills-list-toolbar">
             <button
               type="button"
               className="btn btn-primary btn-xs"
+              disabled={!canUseCurrentScope}
               onClick={() => openConnectScreen('http')}
             >
               <PlusIcon size={13} /> サーバーを追加
@@ -1394,6 +1448,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
             <button
               type="button"
               className="btn btn-secondary btn-xs"
+              disabled={!canUseCurrentScope}
               onClick={openImportForm}
             >
               JSON 取込
@@ -1401,12 +1456,16 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
           </div>
 
           <div className="muted-xs" style={{ padding: '0 12px 8px' }}>
-            {scopeTab === 'shared'
-              ? '全ユーザーのチャットで利用できるサーバーを管理します。'
-              : '自分のアカウントのチャットでのみ利用できるサーバーを管理します。'}
+            {scopeHint}
           </div>
 
-          {loading ? (
+          {!canUseCurrentScope ? (
+            <div className="empty-box muted-sm" style={{ margin: '0 12px 12px' }}>
+              {mode === 'project'
+                ? '先にプロジェクトを作成してください。'
+                : 'このチャット用のMCPを設定するには、まずチャットを開くかメッセージを送信してください。'}
+            </div>
+          ) : loading ? (
             <div className="muted-xs" style={{ padding: 16 }}>読み込み中...</div>
           ) : listError ? (
             <div className="error-box" role="alert" style={{ margin: '0 12px 12px' }}>
@@ -2085,6 +2144,16 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
           )}
         </div>
       </div>
+    </>
+  );
+
+  if (embedded) {
+    return content;
+  }
+
+  return (
+    <ModalDialog label={modalTitle} size="modal-xl" onClose={onClose ?? (() => {})}>
+      {content}
     </ModalDialog>
   );
 };

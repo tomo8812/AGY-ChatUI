@@ -432,7 +432,7 @@ export interface SyncEventEnvelope {
   createdAt: number;
 }
 
-export type McpScope = 'shared' | 'profile';
+export type McpScope = 'shared' | 'profile' | 'project' | 'chat';
 export type McpTransport = 'stdio' | 'http' | 'sse';
 export type McpAuthType = 'none' | 'bearer' | 'api_key' | 'headers' | 'oauth';
 export type McpOAuthStatus = 'disconnected' | 'connected' | 'expired' | 'error';
@@ -480,6 +480,8 @@ export interface McpServerRecord {
   description: string;
   scope: McpScope;
   ownerUserId: string | null;
+  projectId: string | null;
+  chatId: string | null;
   transport: McpTransport;
   enabled: boolean;
   allowedTools: string[];

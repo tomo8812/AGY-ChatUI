@@ -500,13 +500,20 @@ export const api = {
     }>('/api/notifications/test', { method: 'POST', body: endpoint ? { endpoint } : {} }),
 
   // Admin MCP Server Management
-  listMcpServers: () =>
-    apiFetch<{ servers: McpServerRecord[]; callbackUrl: string }>('/api/mcp/servers'),
+  listMcpServers: (params?: { projectId?: string | null; chatId?: string | null }) => {
+    const qs = new URLSearchParams();
+    if (params?.projectId) qs.set('projectId', params.projectId);
+    if (params?.chatId) qs.set('chatId', params.chatId);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    return apiFetch<{ servers: McpServerRecord[]; callbackUrl: string }>(`/api/mcp/servers${suffix}`);
+  },
 
   createMcpServer: (payload: {
     name: string;
     description?: string;
     scope: McpScope;
+    projectId?: string | null;
+    chatId?: string | null;
     transport: McpTransport;
     enabled?: boolean;
     allowedTools?: string[];
@@ -541,6 +548,8 @@ export const api = {
       name?: string;
       description?: string;
       scope?: McpScope;
+      projectId?: string | null;
+      chatId?: string | null;
       transport?: McpTransport;
       enabled?: boolean;
       allowedTools?: string[];
@@ -575,7 +584,13 @@ export const api = {
       method: 'DELETE',
     }),
 
-  importMcpJson: (payload: { scope: McpScope; rawJson: string; overwrite?: boolean }) =>
+  importMcpJson: (payload: {
+    scope: McpScope;
+    projectId?: string | null;
+    chatId?: string | null;
+    rawJson: string;
+    overwrite?: boolean;
+  }) =>
     apiFetch<{ imported: McpServerRecord[]; skipped: string[] }>('/api/mcp/import', {
       method: 'POST',
       body: payload,

@@ -4,6 +4,7 @@ import {
   CloseIcon,
   ComposeIcon,
   FolderIcon,
+  PlugIcon,
   PlusIcon,
   SearchIcon,
   SettingsIcon,
@@ -187,7 +188,7 @@ export const Sidebar: React.FC<SidebarProps> = React.memo(({
                 }}
               >
                 <span className="sidebar-nav-left">
-                  <SparklesIcon size={15} />
+                  <PlugIcon size={15} />
                   <span>MCP 管理（管理者）</span>
                 </span>
               </button>
