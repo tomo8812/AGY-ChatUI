@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ArtifactRecord } from '../../web/src/types';
+import { computePdfAutoFitScale } from '../../web/src/utils/pdfFit';
 import {
   artifactTextCache,
   buildArtifactContentUrl,
@@ -207,5 +208,33 @@ describe('viewerCache client caching & LRU utilities', () => {
     });
     await inflight;
     expect(peekResolvedLink('chat-9', 'leak.png')).toBeNull();
+  });
+
+  it('auto-fits 16:9 landscape PDFs without horizontal clipping on iPhone 375px/430px and PC viewports', () => {
+    const slide16x9 = { width: 960, height: 540 };
+    const wideSlide = { width: 1280, height: 720 };
+
+    // iPhone 375px viewport (modal inner scroll container ~324px wide -> availW 300px)
+    const iphone375 = { width: 324, height: 600 };
+    const scale375 = computePdfAutoFitScale(slide16x9, iphone375);
+    expect(scale375).toBeLessThanOrEqual(300 / 960);
+    expect(slide16x9.width * scale375).toBeLessThanOrEqual(iphone375.width - 24);
+
+    const scale375Wide = computePdfAutoFitScale(wideSlide, iphone375);
+    expect(wideSlide.width * scale375Wide).toBeLessThanOrEqual(iphone375.width - 24);
+
+    // iPhone 430px viewport (modal inner scroll container ~398px wide -> availW 374px)
+    const iphone430 = { width: 398, height: 700 };
+    const scale430 = computePdfAutoFitScale(slide16x9, iphone430);
+    expect(slide16x9.width * scale430).toBeLessThanOrEqual(iphone430.width - 24);
+
+    const scale430Wide = computePdfAutoFitScale(wideSlide, iphone430);
+    expect(wideSlide.width * scale430Wide).toBeLessThanOrEqual(iphone430.width - 24);
+
+    // PC desktop modal (e.g. 1160x700 scroll container) fits both width and height
+    const pcModal = { width: 1160, height: 700 };
+    const scalePc = computePdfAutoFitScale(slide16x9, pcModal);
+    expect(slide16x9.width * scalePc).toBeLessThanOrEqual(pcModal.width - 24);
+    expect(slide16x9.height * scalePc).toBeLessThanOrEqual(pcModal.height - 24);
   });
 });

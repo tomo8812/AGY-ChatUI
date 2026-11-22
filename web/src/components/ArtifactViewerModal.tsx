@@ -7,6 +7,11 @@ import React, { useCallback, useDeferredValue, useEffect, useMemo, useRef, useSt
 import { ApiError, api } from '../api/client';
 import type { ArtifactRecord, ProjectRecord } from '../types';
 import {
+  computePdfAutoFitScale,
+  PDF_MANUAL_MAX_SCALE,
+  PDF_MANUAL_MIN_SCALE,
+} from '../utils/pdfFit';
+import {
   artifactTextCache,
   artifactVersionKey,
   buildArtifactContentUrl,
@@ -217,25 +222,13 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
     };
   }, [pdfDoc, pageNum]);
 
-  const autoScale = useMemo(() => {
-    if (!pageNaturalSize || containerSize.width <= 0) return 1.0;
-    const availW = Math.max(220, containerSize.width - 24);
-    const availH = Math.max(220, containerSize.height - 24);
-    const widthScale = availW / pageNaturalSize.width;
-    const isLandscape = pageNaturalSize.width > pageNaturalSize.height;
-    let computed: number;
-    if (isLandscape && containerSize.height > 0) {
-      const heightScale = availH / pageNaturalSize.height;
-      // Fit both width and height on PC; on portrait iPhone widthScale < heightScale so it fills width cleanly
-      computed = Math.min(widthScale, heightScale);
-    } else {
-      computed = Math.min(widthScale, 1.8);
-    }
-    const clamped = Math.max(0.35, Math.min(2.2, computed));
-    return Math.round(clamped * 100) / 100;
-  }, [pageNaturalSize, containerSize]);
+  const autoScale = useMemo(
+    () => computePdfAutoFitScale(pageNaturalSize, containerSize),
+    [pageNaturalSize, containerSize]
+  );
 
   const scale = fitMode === 'auto' ? autoScale : manualScale;
+  const manualMinScale = Math.min(PDF_MANUAL_MIN_SCALE, autoScale);
 
   useEffect(() => {
     if (!pdfDoc || !canvasRef.current) return;
@@ -349,7 +342,7 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
             aria-label="縮小"
             onClick={() => {
               setFitMode('manual');
-              setManualScale(Math.max(0.35, Math.round((scale - 0.2) * 100) / 100));
+              setManualScale(Math.max(manualMinScale, Math.round((scale - 0.2) * 100) / 100));
             }}
           >
             −
@@ -361,7 +354,7 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
             aria-label="拡大"
             onClick={() => {
               setFitMode('manual');
-              setManualScale(Math.min(3.0, Math.round((scale + 0.2) * 100) / 100));
+              setManualScale(Math.min(PDF_MANUAL_MAX_SCALE, Math.round((scale + 0.2) * 100) / 100));
             }}
           >
             ＋

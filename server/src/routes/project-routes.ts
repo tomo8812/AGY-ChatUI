@@ -10,7 +10,12 @@ import {
   resolveContainedWriteTarget,
   sanitizeFileName,
 } from '../files/workspace.js';
+import type { AcpClientManager } from '../acp/client-manager.js';
 import { requireAuth, type RouteDeps } from './auth-routes.js';
+
+export interface ProjectRouteDeps extends RouteDeps {
+  acp?: AcpClientManager;
+}
 
 const createProjectSchema = z.object({
   name: z.string().trim().min(1).max(80),
@@ -24,8 +29,8 @@ const patchProjectSchema = z.object({
   instructions: z.string().max(16000).optional(),
 });
 
-export async function registerProjectRoutes(app: FastifyInstance, deps: RouteDeps): Promise<void> {
-  const { config, db, hub } = deps;
+export async function registerProjectRoutes(app: FastifyInstance, deps: ProjectRouteDeps): Promise<void> {
+  const { config, db, hub, acp } = deps;
 
   app.get('/api/projects', async (req, reply) => {
     const session = requireAuth(req, reply, db);
@@ -115,8 +120,12 @@ export async function registerProjectRoutes(app: FastifyInstance, deps: RouteDep
     const { projectId } = req.params as { projectId: string };
     const existing = db.getProject(session.user.id, projectId);
     if (!existing) return reply.code(404).send({ error: 'NOT_FOUND', message: 'プロジェクトが見つかりません。' });
+    const affectedChatIds = db.listChatIdsForProject(session.user.id, projectId);
     db.deleteProject(session.user.id, projectId);
     fs.rmSync(path.dirname(existing.storageDir), { recursive: true, force: true });
+    if (affectedChatIds.length > 0) {
+      await acp?.stopIdleWorkersForChats(session.user.id, affectedChatIds);
+    }
     hub.emitDurable({
       userId: session.user.id,
       type: 'project.deleted',

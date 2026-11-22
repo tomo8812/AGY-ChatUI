@@ -1821,7 +1821,16 @@ export class McpService {
     return this.toPublicRecord(updated);
   }
 
-  deleteServer(adminUserId: string, serverId: string): { deleted: boolean; scope: McpScope; ownerUserId: string | null } {
+  deleteServer(
+    adminUserId: string,
+    serverId: string
+  ): {
+    deleted: boolean;
+    scope: McpScope;
+    ownerUserId: string | null;
+    projectId: string | null;
+    chatId: string | null;
+  } {
     const existing = this.db.getMcpServerById(serverId);
     if (!existing) {
       throw new McpValidationError('MCP_NOT_FOUND', '指定されたMCPサーバーが見つかりません。', 404);
@@ -1839,7 +1848,13 @@ export class McpService {
       });
       this.emitUpdated(existing.scope, existing.ownerUserId, existing.id);
     }
-    return { deleted, scope: existing.scope, ownerUserId: existing.ownerUserId };
+    return {
+      deleted,
+      scope: existing.scope,
+      ownerUserId: existing.ownerUserId,
+      projectId: existing.projectId,
+      chatId: existing.chatId,
+    };
   }
 
   /**

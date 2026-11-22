@@ -2193,6 +2193,95 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
     });
     expect(effectiveOther.map((s) => s.name)).toEqual(['shared-mcp']);
   });
+
+  it('reloads affected chat ACP workers after project deletion and keeps unrelated chat workers intact on chat/project MCP changes', async () => {
+    const srv = await createTestServer({ allowPrivateMcpUrls: true });
+    servers.push(srv);
+
+    const { client: admin, userId } = await registerAndBindAgy(
+      srv.baseUrl,
+      'projdeladmin',
+      'user:projdel-admin'
+    );
+    await admin.connectWs();
+
+    const projRes = await admin.request<{ project: { id: string } }>('POST', '/api/projects', {
+      name: 'Deletable MCP Project',
+    });
+    expect(projRes.status).toBe(201);
+    const projectId = projRes.data.project.id;
+
+    const projMcpRes = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'proj-del-mcp',
+      scope: 'project',
+      projectId,
+      transport: 'stdio',
+      command: 'node',
+      args: ['-e', 'process.exit(0)'],
+    });
+    expect(projMcpRes.status).toBe(201);
+
+    const projChatRes = await admin.request<{ chat: { id: string } }>('POST', '/api/chats', {
+      title: 'Project Chat',
+      projectId,
+    });
+    const projChatId = projChatRes.data.chat.id;
+
+    const unrelatedChatRes = await admin.request<{ chat: { id: string } }>('POST', '/api/chats', {
+      title: 'Unrelated Chat',
+    });
+    const unrelatedChatId = unrelatedChatRes.data.chat.id;
+
+    // Warm up both chats' ACP workers
+    const beforeProjServers = await runInspectPrompt(admin, projChatId);
+    expect(beforeProjServers.map((s) => s.name)).toContain('proj-del-mcp');
+
+    const beforeUnrelatedServers = await runInspectPrompt(admin, unrelatedChatId);
+    expect(beforeUnrelatedServers.map((s) => s.name)).not.toContain('proj-del-mcp');
+
+    // Capture unrelated worker reference before chat-scoped MCP change & project deletion
+    const workersMap = (srv.ctx.acp as unknown as {
+      workers: Map<string, { process: { pid?: number }; needsConfigReload: boolean }>;
+    }).workers;
+    const unrelatedWorkerBefore = workersMap.get(`${userId}:${unrelatedChatId}`);
+    expect(unrelatedWorkerBefore).toBeDefined();
+    const unrelatedPidBefore = unrelatedWorkerBefore!.process.pid;
+
+    // 1) Adding a chat-scoped MCP to projChatId must NOT stop or flag unrelatedChatId's worker
+    const chatMcpRes = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'single-chat-mcp',
+      scope: 'chat',
+      chatId: projChatId,
+      transport: 'stdio',
+      command: 'node',
+      args: ['-e', 'process.exit(0)'],
+    });
+    expect(chatMcpRes.status).toBe(201);
+
+    const unrelatedAfterChatMcp = workersMap.get(`${userId}:${unrelatedChatId}`);
+    expect(unrelatedAfterChatMcp).toBe(unrelatedWorkerBefore);
+    expect(unrelatedAfterChatMcp?.process.pid).toBe(unrelatedPidBefore);
+    expect(unrelatedAfterChatMcp?.needsConfigReload).toBe(false);
+
+    // projChatId reloads and now sees both proj-del-mcp and single-chat-mcp
+    const midProjServers = await runInspectPrompt(admin, projChatId);
+    expect(midProjServers.map((s) => s.name).sort()).toEqual(['proj-del-mcp', 'single-chat-mcp']);
+
+    // 2) Deleting the project must invalidate projChatId's worker without touching unrelatedChatId
+    const delRes = await admin.request('DELETE', `/api/projects/${projectId}`);
+    expect(delRes.status).toBe(200);
+
+    const unrelatedAfterProjDel = workersMap.get(`${userId}:${unrelatedChatId}`);
+    expect(unrelatedAfterProjDel).toBe(unrelatedWorkerBefore);
+    expect(unrelatedAfterProjDel?.process.pid).toBe(unrelatedPidBefore);
+    expect(unrelatedAfterProjDel?.needsConfigReload).toBe(false);
+
+    // Re-sending in the former project chat reloads ACP without proj-del-mcp (while keeping single-chat-mcp)
+    const afterDelServers = await runInspectPrompt(admin, projChatId);
+    expect(afterDelServers.map((s) => s.name)).toEqual(['single-chat-mcp']);
+
+    admin.closeWs();
+  });
 });
 
 

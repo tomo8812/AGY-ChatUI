@@ -121,7 +121,7 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
   });
 
   await registerAuthRoutes(app, { config, db, hub, agyAuth, skillService, mcpService, buildId, buildInfo });
-  await registerProjectRoutes(app, { config, db, hub, agyAuth });
+  await registerProjectRoutes(app, { config, db, hub, agyAuth, acp });
   await registerChatRoutes(app, { config, db, hub, agyAuth, acp, scheduler, skillService });
   await registerFileRoutes(app, { config, db, hub, agyAuth });
   await registerQuotaRoutes(app, { config, db, hub, agyAuth, quotaService });

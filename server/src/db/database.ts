@@ -852,6 +852,13 @@ export class AppDatabase {
     return this.getProject(userId, projectId);
   }
 
+  listChatIdsForProject(userId: string, projectId: string): string[] {
+    const rows = this.db
+      .prepare('SELECT id FROM chats WHERE user_id = ? AND project_id = ?')
+      .all(userId, projectId) as Array<{ id: string }>;
+    return rows.map((r) => String(r.id));
+  }
+
   deleteProject(userId: string, projectId: string): boolean {
     const info = this.db.prepare('DELETE FROM projects WHERE id = ? AND user_id = ?').run(projectId, userId);
     return Number(info.changes) > 0;

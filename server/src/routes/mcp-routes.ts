@@ -332,11 +332,29 @@ function renderOAuthCallbackHtml(payload: {
 export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps): Promise<void> {
   const { config, db, mcpService, acp } = deps;
 
-  const refreshWorkersForScope = async (scope: McpScope, ownerUserId: string | null) => {
-    if (scope === 'shared') {
+  const refreshWorkersForScope = async (target: {
+    scope: McpScope;
+    ownerUserId: string | null;
+    projectId?: string | null;
+    chatId?: string | null;
+  }) => {
+    if (target.scope === 'shared') {
       await acp.stopIdleWorkersForAllUsers();
-    } else if (ownerUserId) {
-      await acp.stopIdleWorkersForUser(ownerUserId);
+      return;
+    }
+    if (!target.ownerUserId) return;
+    if (target.scope === 'profile') {
+      await acp.stopIdleWorkersForUser(target.ownerUserId);
+      return;
+    }
+    if (target.scope === 'project') {
+      if (!target.projectId) return;
+      const chatIds = db.listChatIdsForProject(target.ownerUserId, target.projectId);
+      await acp.stopIdleWorkersForChats(target.ownerUserId, chatIds);
+      return;
+    }
+    if (target.scope === 'chat' && target.chatId) {
+      await acp.stopIdleWorkersForChats(target.ownerUserId, [target.chatId]);
     }
   };
 
@@ -370,7 +388,7 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
     }
     try {
       const server = mcpService.createServer(session.user.id, parsed.data);
-      await refreshWorkersForScope(server.scope, server.ownerUserId);
+      await refreshWorkersForScope(server);
       return reply.code(201).send({ server });
     } catch (err) {
       return handleMcpError(reply, err);
@@ -394,7 +412,14 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
       if (prev.scope === 'shared' || server.scope === 'shared') {
         await acp.stopIdleWorkersForAllUsers();
       } else {
-        await refreshWorkersForScope(server.scope, server.ownerUserId);
+        await refreshWorkersForScope(server);
+        if (
+          prev.scope !== server.scope ||
+          prev.projectId !== server.projectId ||
+          prev.chatId !== server.chatId
+        ) {
+          await refreshWorkersForScope(prev);
+        }
       }
       return { server };
     } catch (err) {
@@ -407,8 +432,8 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
     if (!session) return;
     const { id } = req.params as { id: string };
     try {
-      const { scope, ownerUserId } = mcpService.deleteServer(session.user.id, id);
-      await refreshWorkersForScope(scope, ownerUserId);
+      const deleted = mcpService.deleteServer(session.user.id, id);
+      await refreshWorkersForScope(deleted);
       return { ok: true };
     } catch (err) {
       return handleMcpError(reply, err);
@@ -427,10 +452,12 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
     }
     try {
       const result = mcpService.importFromJson(session.user.id, parsed.data);
-      await refreshWorkersForScope(
-        parsed.data.scope,
-        parsed.data.scope === 'shared' ? null : session.user.id
-      );
+      await refreshWorkersForScope({
+        scope: parsed.data.scope,
+        ownerUserId: parsed.data.scope === 'shared' ? null : session.user.id,
+        projectId: parsed.data.projectId ?? null,
+        chatId: parsed.data.chatId ?? null,
+      });
       return reply.code(201).send(result);
     } catch (err) {
       return handleMcpError(reply, err);
@@ -475,7 +502,7 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
     }
     try {
       const { server } = await mcpService.completeOAuthManualInput(session.user.id, id, parsed.data);
-      await refreshWorkersForScope(server.scope, server.ownerUserId);
+      await refreshWorkersForScope(server);
       return { server };
     } catch (err) {
       return handleMcpError(reply, err);
@@ -488,7 +515,7 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
     const { id } = req.params as { id: string };
     try {
       const server = mcpService.disconnectOAuth(session.user.id, id);
-      await refreshWorkersForScope(server.scope, server.ownerUserId);
+      await refreshWorkersForScope(server);
       return { server };
     } catch (err) {
       return handleMcpError(reply, err);
@@ -556,7 +583,7 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
         error: query.error,
         errorDescription: query.error_description,
       });
-      await refreshWorkersForScope(server.scope, server.ownerUserId);
+      await refreshWorkersForScope(server);
       return reply
         .code(200)
         .header('Cache-Control', 'no-store')
