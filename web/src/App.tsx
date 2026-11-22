@@ -538,8 +538,7 @@ export const App: React.FC = () => {
         document.documentElement.style.setProperty('--app-vv-top', `${effectiveVvTop}px`);
       }
       const heightDrop = Math.max(window.innerHeight - effectiveVh, baseHeight - effectiveVh);
-      const keyboardOpen =
-        window.innerWidth <= 860 && isTextFocused && (heightDrop > 120 || isTextFocused);
+      const keyboardOpen = window.innerWidth <= 860 && isTextFocused && heightDrop > 120;
       const keyboardStateChanged = lastAppliedKeyboardOpen !== keyboardOpen;
       if (keyboardStateChanged) {
         lastAppliedKeyboardOpen = keyboardOpen;
