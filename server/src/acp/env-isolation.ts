@@ -15,8 +15,8 @@ const require = createRequire(import.meta.url);
 
 export const SANDBOX_WORKSPACE_MOUNT = '/workspace';
 export const SANDBOX_HOME_MOUNT = '/home/sandbox';
-export const SANDBOX_DOC_RUNTIME_MOUNT = '/opt/agy-doc-runtime';
-export const SANDBOX_CHAT_RUNTIME_MOUNT = '/opt/agy-chat-runtime';
+export const SANDBOX_DOC_RUNTIME_MOUNT = '/usr/local/agy-doc-runtime';
+export const SANDBOX_CHAT_RUNTIME_MOUNT = '/home/sandbox/.cache/agy-chat-runtime';
 
 export function getChatBrainHostDir(profileDir: string, workspaceDir?: string | null): string {
   const profileAbs = path.resolve(profileDir);
@@ -788,20 +788,68 @@ export function buildAgyCommandSpec(params: {
       }
     }
 
-    ensureOptDir();
+    const realHostNode = resolveRealHostNodeBin();
+    const isSystemMountedNode = Boolean(
+      realHostNode && isInsideSystemMountTree(realHostNode, mountedSystemDirs)
+    );
+    const hasCustomNodeModules = Boolean(docRuntime?.nodeModulesRel);
+    const needsCustomNodeBind = Boolean(hasCustomNodeModules && realHostNode && !isSystemMountedNode);
+    const SANDBOX_CUSTOM_NODE_MOUNT = '/usr/local/agy-doc-node';
+    let sandboxNodeBin = isSystemMountedNode && realHostNode ? realHostNode : '/usr/bin/node';
+
     if (docRuntime) {
+      if (fs.existsSync('/usr/local')) {
+        bwrapArgs.push('--tmpfs', '/usr/local');
+        for (const entry of fs.readdirSync('/usr/local', { withFileTypes: true })) {
+          if (
+            entry.name === path.posix.basename(SANDBOX_DOC_RUNTIME_MOUNT) ||
+            entry.name === path.posix.basename(SANDBOX_CUSTOM_NODE_MOUNT)
+          ) {
+            continue;
+          }
+          const entryPath = path.posix.join('/usr/local', entry.name);
+          if (entry.isSymbolicLink()) {
+            bwrapArgs.push('--symlink', fs.readlinkSync(entryPath), entryPath);
+          } else if (entry.isDirectory() || entry.isFile()) {
+            bwrapArgs.push('--ro-bind', entryPath, entryPath);
+          }
+        }
+        if (needsCustomNodeBind && realHostNode) {
+          let resolvedHostNode = realHostNode;
+          try {
+            resolvedHostNode = fs.realpathSync(realHostNode);
+          } catch {
+            // keep realHostNode
+          }
+          if (fs.existsSync(resolvedHostNode)) {
+            bwrapArgs.push('--ro-bind', resolvedHostNode, SANDBOX_CUSTOM_NODE_MOUNT);
+            sandboxNodeBin = SANDBOX_CUSTOM_NODE_MOUNT;
+          }
+        }
+      } else if (needsCustomNodeBind && realHostNode) {
+        let resolvedHostNode = realHostNode;
+        try {
+          resolvedHostNode = fs.realpathSync(realHostNode);
+        } catch {
+          // keep realHostNode
+        }
+        if (fs.existsSync(resolvedHostNode)) {
+          ensureOptDir();
+          bwrapArgs.push('--dir', '/opt/agy-node', '--ro-bind', resolvedHostNode, '/opt/agy-node/node');
+          sandboxNodeBin = '/opt/agy-node/node';
+        }
+      }
       bwrapArgs.push('--ro-bind', docRuntime.hostDir, SANDBOX_DOC_RUNTIME_MOUNT);
     }
 
-    const chatRuntimeHostDir = ensurePerChatRuntimeDir(profileAbs, workspaceAbs, docRuntime);
-    bwrapArgs.push('--bind', chatRuntimeHostDir, SANDBOX_CHAT_RUNTIME_MOUNT);
-    if (docRuntime?.nodeModulesRel) {
-      bwrapArgs.push(
-        '--bind',
-        path.join(chatRuntimeHostDir, 'node', 'lib', 'node_modules'),
-        '/node_modules'
-      );
-    }
+    const chatRuntimeHostDir = ensurePerChatRuntimeDir(
+      profileAbs,
+      workspaceAbs,
+      docRuntime,
+      SANDBOX_DOC_RUNTIME_MOUNT,
+      SANDBOX_CHAT_RUNTIME_MOUNT,
+      sandboxNodeBin
+    );
     applySandboxLayeredRuntime(env, docRuntime, sandboxAgyBinDir);
 
     const wsKey = path.basename(workspaceAbs) || 'default';
@@ -817,6 +865,7 @@ export function buildAgyCommandSpec(params: {
       '.local/share',
       '.local/state',
       '.cache',
+      '.cache/agy-chat-runtime',
       '.gemini',
       '.gemini/antigravity',
       '.gemini/antigravity-cli',
@@ -850,7 +899,14 @@ export function buildAgyCommandSpec(params: {
       ensurePrivateDir(path.join(chatHomeHostDir, ...rel));
     }
 
-    bwrapArgs.push('--bind', chatHomeHostDir, SANDBOX_HOME_MOUNT);
+    bwrapArgs.push(
+      '--bind',
+      chatHomeHostDir,
+      SANDBOX_HOME_MOUNT,
+      '--bind',
+      chatRuntimeHostDir,
+      SANDBOX_CHAT_RUNTIME_MOUNT
+    );
 
     const pushSharedBindMount = (hostSource: string, relUnderHome: string, readonly = false) => {
       const target = resolveBindableHostPath(hostSource);
@@ -1176,6 +1232,8 @@ function ensureSymlinkTarget(targetPath: string, linkPath: string): void {
   fs.symlinkSync(targetPath, linkPath);
 }
 
+const LEGACY_SANDBOX_DOC_RUNTIME_MOUNTS = ['/opt/agy-doc-runtime'] as const;
+
 function reconcileBaseNodeModulesSymlinks(
   chatNodeModulesDir: string,
   docRuntime: DocRuntimeLayout | null,
@@ -1185,6 +1243,7 @@ function reconcileBaseNodeModulesSymlinks(
   const managedPrefixes = Array.from(
     new Set([
       `${toPosix(SANDBOX_DOC_RUNTIME_MOUNT).replace(/\/+$/, '')}/`,
+      ...LEGACY_SANDBOX_DOC_RUNTIME_MOUNTS.map((root) => `${toPosix(root).replace(/\/+$/, '')}/`),
       `${toPosix(docRuntimeMountRoot).replace(/\/+$/, '')}/`,
     ])
   );
@@ -1279,11 +1338,80 @@ function reconcileBaseNodeModulesSymlinks(
   }
 }
 
+function buildEsmHookScript(defaultLayerRoots: string[]): string {
+  return `import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const envRoots = (process.env.AGY_NODE_LAYER_PATHS || '')
+  .split(path.delimiter)
+  .map((p) => p.trim())
+  .filter(Boolean);
+const fallbackRoots = envRoots.length > 0 ? envRoots : ${JSON.stringify(defaultLayerRoots)};
+
+function isBareSpecifier(specifier) {
+  if (!specifier) return false;
+  if (
+    specifier.startsWith('./') ||
+    specifier.startsWith('../') ||
+    specifier.startsWith('/') ||
+    specifier.startsWith('#')
+  ) {
+    return false;
+  }
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(specifier)) return false;
+  return true;
+}
+
+export async function resolve(specifier, context, nextResolve) {
+  try {
+    return await nextResolve(specifier, context);
+  } catch (err) {
+    if (!err || err.code !== 'ERR_MODULE_NOT_FOUND' || !isBareSpecifier(specifier)) {
+      throw err;
+    }
+    for (const root of fallbackRoots) {
+      try {
+        const anchorUrl = pathToFileURL(path.join(root, '_agy_layer_anchor.mjs')).href;
+        return await nextResolve(specifier, { ...context, parentURL: anchorUrl });
+      } catch {
+        // Try next layer
+      }
+    }
+    throw err;
+  }
+}
+`;
+}
+
+const ESM_REGISTER_SCRIPT = `import * as nodeModule from 'node:module';
+if (typeof nodeModule.register === 'function') {
+  nodeModule.register(new URL('./esm-hook.mjs', import.meta.url));
+}
+`;
+
+function resolveRealHostNodeBin(excludePath?: string): string | null {
+  if (
+    process.execPath &&
+    process.execPath !== excludePath &&
+    path.basename(process.execPath).startsWith('node') &&
+    fs.existsSync(process.execPath)
+  ) {
+    return process.execPath;
+  }
+  const fromPath = resolveHostExecutable('node');
+  if (fromPath && fromPath !== excludePath && fs.existsSync(fromPath)) {
+    return fromPath;
+  }
+  return null;
+}
+
 export function ensurePerChatRuntimeDir(
   profileDir: string,
   workspaceDir: string,
   docRuntime: DocRuntimeLayout | null,
-  docRuntimeMountRoot = SANDBOX_DOC_RUNTIME_MOUNT
+  docRuntimeMountRoot = SANDBOX_DOC_RUNTIME_MOUNT,
+  chatRuntimeMountRoot = SANDBOX_CHAT_RUNTIME_MOUNT,
+  hostNodeBinOverride?: string
 ): string {
   const profileAbs = path.resolve(profileDir);
   const wsKey = path.basename(path.resolve(workspaceDir)) || 'default';
@@ -1344,6 +1472,61 @@ export function ensurePerChatRuntimeDir(
 
   reconcileBaseNodeModulesSymlinks(chatNodeModulesDir, docRuntime, docRuntimeMountRoot);
 
+  const hooksDir = path.join(chatRuntimeDir, 'hooks');
+  const nodeWrapperPath = path.join(chatRuntimeDir, 'bin', 'node');
+  if (docRuntime?.nodeModulesRel) {
+    const toPosix = (rel: string) => rel.split(path.sep).join(path.posix.sep);
+    const chatMountPosix = toPosix(chatRuntimeMountRoot).replace(/\/+$/, '');
+    const docNodeParent = path.posix.dirname(
+      path.posix.join(toPosix(docRuntimeMountRoot), toPosix(docRuntime.nodeModulesRel))
+    );
+    const defaultLayerRoots = [`${chatMountPosix}/node/lib`, `${chatMountPosix}/node`, docNodeParent];
+    fs.mkdirSync(hooksDir, { recursive: true, mode: 0o700 });
+    writeFileIfChanged(path.join(hooksDir, 'esm-register.mjs'), ESM_REGISTER_SCRIPT, 0o644);
+    writeFileIfChanged(path.join(hooksDir, 'esm-hook.mjs'), buildEsmHookScript(defaultLayerRoots), 0o644);
+
+    const isSandboxMountedBin = (binPath: string | null | undefined): binPath is string =>
+      Boolean(
+        binPath &&
+          binPath !== nodeWrapperPath &&
+          (binPath.startsWith('/usr/') || binPath.startsWith('/bin/')) &&
+          fs.existsSync(binPath)
+      );
+    const hostNodeBin = (() => {
+      if (hostNodeBinOverride && hostNodeBinOverride !== nodeWrapperPath) {
+        return hostNodeBinOverride;
+      }
+      const detected = resolveRealHostNodeBin(nodeWrapperPath);
+      if (chatRuntimeMountRoot !== SANDBOX_CHAT_RUNTIME_MOUNT && detected) {
+        return detected;
+      }
+      return isSandboxMountedBin(detected) ? detected : '/usr/bin/node';
+    })();
+    const shSingleQuote = (val: string) => `'${val.replace(/'/g, "'\\''")}'`;
+    const registerInSandbox = `${chatMountPosix}/hooks/esm-register.mjs`;
+    const wrapperScript = [
+      '#!/bin/sh',
+      'case "${1:-}" in',
+      '  -v|--version|-h|--help)',
+      `    exec ${shSingleQuote(hostNodeBin)} "$@"`,
+      '    ;;',
+      'esac',
+      'for arg in "$@"; do',
+      '  case "$arg" in',
+      '    */agy|/opt/agy/agy|--disable-telemetry)',
+      `      exec ${shSingleQuote(hostNodeBin)} "$@"`,
+      '      ;;',
+      '  esac',
+      'done',
+      `exec ${shSingleQuote(hostNodeBin)} --import=${shSingleQuote(registerInSandbox)} "$@"`,
+      '',
+    ].join('\n');
+    writeFileIfChanged(nodeWrapperPath, wrapperScript, 0o755);
+  } else {
+    fs.rmSync(nodeWrapperPath, { force: true });
+    fs.rmSync(hooksDir, { recursive: true, force: true });
+  }
+
   return chatRuntimeDir;
 }
 
@@ -1354,12 +1537,10 @@ export function applySandboxLayeredRuntime(
   mounts?: {
     chatRuntimeMount?: string;
     docRuntimeMount?: string;
-    nodeModulesMount?: string;
   }
 ): void {
   const chatMount = mounts?.chatRuntimeMount ?? SANDBOX_CHAT_RUNTIME_MOUNT;
   const docMount = mounts?.docRuntimeMount ?? SANDBOX_DOC_RUNTIME_MOUNT;
-  const nodeModulesMount = mounts?.nodeModulesMount ?? '/node_modules';
   const toPosix = (rel: string) => rel.split(path.sep).join(path.posix.sep);
 
   env.VIRTUAL_ENV = `${chatMount}/venv`;
@@ -1370,12 +1551,22 @@ export function applySandboxLayeredRuntime(
   env.NPM_CONFIG_USERCONFIG = `${chatMount}/npmrc`;
 
   delete env.NODE_OPTIONS;
-  delete env.AGY_NODE_LAYER_PATHS;
 
   if (docRuntime?.nodeModulesRel) {
-    env.NODE_PATH = nodeModulesMount;
+    const docNodeModules = path.posix.join(docMount, toPosix(docRuntime.nodeModulesRel));
+    env.NODE_PATH = [
+      `${chatMount}/node/lib/node_modules`,
+      `${chatMount}/node/node_modules`,
+      docNodeModules,
+    ].join(path.delimiter);
+    env.AGY_NODE_LAYER_PATHS = [
+      `${chatMount}/node/lib`,
+      `${chatMount}/node`,
+      path.posix.dirname(docNodeModules),
+    ].join(path.delimiter);
   } else {
     delete env.NODE_PATH;
+    delete env.AGY_NODE_LAYER_PATHS;
   }
 
   const pathEntries = [

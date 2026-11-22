@@ -608,7 +608,14 @@ describe('Anthropic doc skills and runtime isolation', () => {
       expect(argsStr).not.toContain(`--bind\n${profileDir}\n${SANDBOX_HOME_MOUNT}`);
       expect(argsStr).toContain(`--tmpfs\n${SANDBOX_HOME_MOUNT}/.gemini/config/skills`);
       expect(argsStr).not.toContain(`.chat-runtime\n${SANDBOX_HOME_MOUNT}`);
-      expect(argsStr).not.toContain('esm-hooks');
+      expect(argsStr).toContain('--tmpfs\n/usr/local');
+      expect(argsStr).toContain(`--ro-bind\n${fs.realpathSync(docRuntimeDir)}\n${SANDBOX_DOC_RUNTIME_MOUNT}`);
+      expect(argsStr).toContain(
+        `--bind\n${path.join(profileDir, '.chat-runtime', 'workspace-a')}\n${SANDBOX_CHAT_RUNTIME_MOUNT}`,
+      );
+      expect(argsStr.indexOf(`--bind\n${chatHomeA}\n${SANDBOX_HOME_MOUNT}`)).toBeLessThan(
+        argsStr.indexOf(`--bind\n${path.join(profileDir, '.chat-runtime', 'workspace-a')}\n${SANDBOX_CHAT_RUNTIME_MOUNT}`),
+      );
       expect(argsStr).toContain(
         `--bind\n${fs.realpathSync(path.join(profileDir, '.gemini', 'oauth_creds.json'))}\n${SANDBOX_HOME_MOUNT}/.gemini/oauth_creds.json`,
       );
@@ -624,27 +631,20 @@ describe('Anthropic doc skills and runtime isolation', () => {
       );
       expect(argsStr).not.toContain(`${SANDBOX_HOME_MOUNT}/.gemini/config/skills/pdf`);
       expect(argsStr).not.toContain(`--ro-bind\n${fs.realpathSync(path.join(builtinSkillsDir, 'xlsx'))}`);
-      expect(argsStr).toContain(`--ro-bind\n${fs.realpathSync(docRuntimeDir)}\n${SANDBOX_DOC_RUNTIME_MOUNT}`);
-      expect(argsStr).toContain(
-        `--bind\n${path.join(profileDir, '.chat-runtime', 'workspace-a')}\n${SANDBOX_CHAT_RUNTIME_MOUNT}`,
-      );
-      expect(argsStr).toContain(
-        `--bind\n${path.join(profileDir, '.chat-runtime', 'workspace-a', 'node', 'lib', 'node_modules')}\n/node_modules`,
-      );
 
-      // Inside sandbox, zero custom NODE_OPTIONS hooks; standard env resolves /node_modules + venv
+      // Inside sandbox, zero custom NODE_OPTIONS hooks; standard env resolves ~/.cache runtime -> /usr/local doc runtime
       expect(spec.env.VIRTUAL_ENV).toBe(`${SANDBOX_CHAT_RUNTIME_MOUNT}/venv`);
       expect(spec.env.PYTHONNOUSERSITE).toBe('1');
       expect(spec.env.NPM_CONFIG_PREFIX).toBe(`${SANDBOX_CHAT_RUNTIME_MOUNT}/node`);
       expect(spec.env.NODE_OPTIONS).toBeUndefined();
-      expect(spec.env.AGY_NODE_LAYER_PATHS).toBeUndefined();
-      expect(spec.env.PATH).toContain(`${SANDBOX_CHAT_RUNTIME_MOUNT}/venv/bin:${SANDBOX_CHAT_RUNTIME_MOUNT}/node/bin`);
+      expect(spec.env.PATH).toContain(`${SANDBOX_CHAT_RUNTIME_MOUNT}/venv/bin:${SANDBOX_CHAT_RUNTIME_MOUNT}/node/bin:${SANDBOX_CHAT_RUNTIME_MOUNT}/bin`);
       expect(
         spec.env.PATH!.indexOf(`${SANDBOX_CHAT_RUNTIME_MOUNT}/venv/bin`),
       ).toBeLessThan(spec.env.PATH!.indexOf(`${SANDBOX_DOC_RUNTIME_MOUNT}/venv/bin`));
-      expect(spec.env.NODE_PATH).toBe('/node_modules');
+      expect(spec.env.NODE_PATH).toContain(`${SANDBOX_CHAT_RUNTIME_MOUNT}/node/lib/node_modules`);
+      expect(spec.env.NODE_PATH).toContain(`${SANDBOX_DOC_RUNTIME_MOUNT}/node/node_modules`);
 
-      // When docRuntime is unavailable (null), inject NO doc mounts, NO /node_modules, and NO NODE_OPTIONS/NODE_PATH
+      // When docRuntime is unavailable (null), inject NO doc mounts, NO node wrapper/hooks, and NO NODE_OPTIONS/NODE_PATH
       const noDocSpec = buildAgyCommandSpec({
         config: { ...baseCfg, docRuntimeDir: null },
         subcommandArgs: ['acp'],
@@ -654,15 +654,16 @@ describe('Anthropic doc skills and runtime isolation', () => {
       });
       expect(noDocSpec.env.NODE_OPTIONS).toBeUndefined();
       expect(noDocSpec.env.NODE_PATH).toBeUndefined();
+      expect(noDocSpec.env.AGY_NODE_LAYER_PATHS).toBeUndefined();
       expect(noDocSpec.env.SAL_USE_VCLPLUGIN).toBeUndefined();
       const noDocArgsStr = noDocSpec.args.join('\n');
       expect(noDocArgsStr).not.toContain(SANDBOX_DOC_RUNTIME_MOUNT);
-      expect(noDocArgsStr).not.toContain('\n/node_modules');
+      expect(noDocArgsStr).not.toContain('--tmpfs\n/usr/local');
       // Normal agy acp launch and standard Node ESM execution stay unaffected without docRuntime
       const fakeEsmAgy = path.join(mockBinDir, 'agy-esm.mjs');
       fs.writeFileSync(
         fakeEsmAgy,
-        '#!/usr/bin/env node\nimport path from "node:path";\nconsole.log("AGY_ESM_OK", process.env.NODE_OPTIONS ?? "NO_HOOK", path.basename("/a/b"), process.argv.slice(2).join(","));\n',
+        '#!/usr/bin/env node\nimport path from "node:path";\nconst hasHook = Boolean(process.env.NODE_OPTIONS) || process.execArgv.some((a) => a.includes("esm-register"));\nconsole.log("AGY_ESM_OK", hasHook ? "HOOKED" : "NO_HOOK", path.basename("/a/b"), process.argv.slice(2).join(","));\n',
         { mode: 0o755 },
       );
       const cleanNodeRes = execFileSync(
@@ -728,19 +729,19 @@ describe('Anthropic doc skills and runtime isolation', () => {
       expect(homeIsolationCheck).toContain('PROFILE_UNTOUCHED');
 
       // Live execution acceptance test: Chat A & Chat B with real python, pip, node CJS & ESM, npm, and shell subshells
-      // Mirror bwrap root `/node_modules` + `/workspace` per chat with ZERO NODE_OPTIONS hooks
+      // Specifically verify workspaces with NO ancestor node_modules (matching agy CLI inner sandbox) and ZERO NODE_OPTIONS
       const layout = resolveDocRuntimeLayout(docRuntimeDir);
       expect(layout).toBeTruthy();
-      const chatRuntimeA = ensurePerChatRuntimeDir(profileDir, workspaceA, layout, docRuntimeDir);
-      const chatRuntimeB = ensurePerChatRuntimeDir(profileDir, workspaceB, layout, docRuntimeDir);
+      const expectedChatRuntimeA = path.join(profileDir, '.chat-runtime', 'workspace-a');
+      const expectedChatRuntimeB = path.join(profileDir, '.chat-runtime', 'workspace-b');
+      const chatRuntimeA = ensurePerChatRuntimeDir(profileDir, workspaceA, layout, docRuntimeDir, expectedChatRuntimeA);
+      const chatRuntimeB = ensurePerChatRuntimeDir(profileDir, workspaceB, layout, docRuntimeDir, expectedChatRuntimeB);
       const simRootA = path.join(tmpRoot, 'sim-root-a');
       const simRootB = path.join(tmpRoot, 'sim-root-b');
       const simWorkspaceA = path.join(simRootA, 'workspace');
       const simWorkspaceB = path.join(simRootB, 'workspace');
       fs.mkdirSync(simWorkspaceA, { recursive: true });
       fs.mkdirSync(simWorkspaceB, { recursive: true });
-      fs.symlinkSync(path.join(chatRuntimeA, 'node', 'lib', 'node_modules'), path.join(simRootA, 'node_modules'));
-      fs.symlinkSync(path.join(chatRuntimeB, 'node', 'lib', 'node_modules'), path.join(simRootB, 'node_modules'));
 
       const buildTestLayerEnv = (chatRuntime: string): NodeJS.ProcessEnv => {
         const env: NodeJS.ProcessEnv = { ...process.env };
@@ -750,7 +751,6 @@ describe('Anthropic doc skills and runtime isolation', () => {
         applySandboxLayeredRuntime(env, layout, null, {
           chatRuntimeMount: chatRuntime,
           docRuntimeMount: docRuntimeDir,
-          nodeModulesMount: path.join(chatRuntime, 'node', 'lib', 'node_modules'),
         });
         return env;
       };
@@ -758,6 +758,20 @@ describe('Anthropic doc skills and runtime isolation', () => {
       const envA = buildTestLayerEnv(chatRuntimeA);
       const envB = buildTestLayerEnv(chatRuntimeB);
       expect(envA.NODE_OPTIONS).toBeUndefined();
+
+      // Even when docRuntime IS present and #!/usr/bin/env node hits chatRuntime/bin/node, agy acp bypasses ESM hooks
+      const agyBypassCheck = execFileSync(
+        fakeEsmAgy,
+        ['acp', '--disable-telemetry'],
+        { cwd: simWorkspaceA, env: envA, encoding: 'utf8' },
+      );
+      expect(agyBypassCheck.trim()).toBe('AGY_ESM_OK NO_HOOK b acp,--disable-telemetry');
+      const regularNodeHookCheck = execFileSync(
+        'node',
+        ['-e', 'console.log(process.execArgv.some((a) => a.includes("esm-register")))'],
+        { cwd: simWorkspaceA, env: envA, encoding: 'utf8' },
+      );
+      expect(regularNodeHookCheck.trim()).toBe('true');
 
       fs.writeFileSync(
         path.join(simWorkspaceA, 'check-base.mjs'),
@@ -770,7 +784,7 @@ describe('Anthropic doc skills and runtime isolation', () => {
         ].join('\n'),
       );
 
-      // 1. Standard python import + Node CJS require() + Node ESM import (stdin & .mjs file + scoped) resolve base packages with ZERO NODE_OPTIONS
+      // 1. Standard python import + Node CJS require() + Node ESM import (stdin & .mjs file + scoped) resolve base packages with ZERO NODE_OPTIONS and ZERO ancestor node_modules
       const baseCheckA = execFileSync(
         'sh',
         [
@@ -873,7 +887,7 @@ describe('Anthropic doc skills and runtime isolation', () => {
       );
 
       // Simulate worker restart: re-run ensurePerChatRuntimeDir + fresh env
-      const chatRuntimeAAfterRestart = ensurePerChatRuntimeDir(profileDir, workspaceA, layout, docRuntimeDir);
+      const chatRuntimeAAfterRestart = ensurePerChatRuntimeDir(profileDir, workspaceA, layout, docRuntimeDir, expectedChatRuntimeA);
       const envAAfterRestart = buildTestLayerEnv(chatRuntimeAAfterRestart);
 
       // Chat A keeps its additions/overrides after restart across subshell python + node CJS/ESM
@@ -916,11 +930,56 @@ describe('Anthropic doc skills and runtime isolation', () => {
       expect(checkB).toContain('ISOLATED_CJS');
       expect(checkB).toContain('ISOLATED_ESM');
 
-      // Reconcile when docRuntime becomes null cleans base symlinks without deleting per-chat packages
-      ensurePerChatRuntimeDir(profileDir, workspaceA, null, docRuntimeDir);
+      // Reconcile when docRuntime becomes null cleans base symlinks, node wrapper, and hooks without deleting per-chat packages
+      ensurePerChatRuntimeDir(profileDir, workspaceA, null, docRuntimeDir, expectedChatRuntimeA);
+      expect(fs.existsSync(path.join(chatRuntimeA, 'bin', 'node'))).toBe(false);
+      expect(fs.existsSync(path.join(chatRuntimeA, 'hooks'))).toBe(false);
       expect(fs.existsSync(path.join(chatRuntimeA, 'node', 'lib', 'node_modules', 'docx'))).toBe(false);
       expect(fs.existsSync(path.join(chatRuntimeA, 'node', 'lib', 'node_modules', 'chat-only-node'))).toBe(true);
       expect(fs.existsSync(path.join(chatRuntimeA, 'node', 'lib', 'node_modules', 'pptxgenjs'))).toBe(true);
+
+      // Upgrade regression test: legacy /opt/agy-doc-runtime symlinks from PR #29 are migrated/cleaned
+      // while user-installed real packages and non-managed symlinks are preserved
+      const legacyChatWs = path.join(tmpRoot, 'workspace-legacy');
+      fs.mkdirSync(legacyChatWs, { recursive: true });
+      const legacyNodeModules = path.join(profileDir, '.chat-runtime', 'workspace-legacy', 'node', 'lib', 'node_modules');
+      fs.mkdirSync(path.join(legacyNodeModules, '@myscope'), { recursive: true });
+      fs.mkdirSync(path.join(legacyNodeModules, '@legacy-scope'), { recursive: true });
+      fs.symlinkSync('/opt/agy-doc-runtime/node/node_modules/docx', path.join(legacyNodeModules, 'docx'));
+      fs.symlinkSync('/opt/agy-doc-runtime/node/node_modules/removed-base', path.join(legacyNodeModules, 'removed-base'));
+      fs.symlinkSync('/opt/agy-doc-runtime/node/node_modules/@myscope/doc-scoped', path.join(legacyNodeModules, '@myscope', 'doc-scoped'));
+      fs.symlinkSync('/opt/agy-doc-runtime/node/node_modules/@legacy-scope/stale', path.join(legacyNodeModules, '@legacy-scope', 'stale'));
+
+      // User-installed custom real package & custom symlink must survive migration untouched
+      const userRealPkgDir = path.join(legacyNodeModules, 'pptxgenjs');
+      fs.mkdirSync(userRealPkgDir, { recursive: true });
+      fs.writeFileSync(path.join(userRealPkgDir, 'index.cjs'), 'module.exports = { source: "user-custom-pptx" };\n');
+      const userLinkTarget = path.join(tmpRoot, 'user-custom-link-target');
+      fs.mkdirSync(userLinkTarget, { recursive: true });
+      fs.symlinkSync(userLinkTarget, path.join(legacyNodeModules, 'user-custom-link'));
+      fs.symlinkSync(userLinkTarget, path.join(legacyNodeModules, '@myscope', 'user-scoped-link'));
+
+      ensurePerChatRuntimeDir(profileDir, legacyChatWs, layout);
+      expect(fs.readlinkSync(path.join(legacyNodeModules, 'docx'))).toBe(
+        `${SANDBOX_DOC_RUNTIME_MOUNT}/node/node_modules/docx`,
+      );
+      expect(fs.readlinkSync(path.join(legacyNodeModules, '@myscope', 'doc-scoped'))).toBe(
+        `${SANDBOX_DOC_RUNTIME_MOUNT}/node/node_modules/@myscope/doc-scoped`,
+      );
+      expect(fs.readdirSync(legacyNodeModules)).not.toContain('removed-base');
+      expect(fs.readdirSync(legacyNodeModules)).not.toContain('@legacy-scope');
+      expect(fs.lstatSync(userRealPkgDir).isDirectory()).toBe(true);
+      expect(fs.readFileSync(path.join(userRealPkgDir, 'index.cjs'), 'utf8')).toContain('user-custom-pptx');
+      expect(fs.readlinkSync(path.join(legacyNodeModules, 'user-custom-link'))).toBe(userLinkTarget);
+      expect(fs.readlinkSync(path.join(legacyNodeModules, '@myscope', 'user-scoped-link'))).toBe(userLinkTarget);
+
+      // Re-seeding a legacy symlink and reconciling with docRuntime=null also cleans it without touching user installs
+      fs.symlinkSync('/opt/agy-doc-runtime/node/node_modules/pdf-lib', path.join(legacyNodeModules, 'legacy-pdf-lib'));
+      ensurePerChatRuntimeDir(profileDir, legacyChatWs, null);
+      expect(fs.readdirSync(legacyNodeModules)).not.toContain('legacy-pdf-lib');
+      expect(fs.readdirSync(legacyNodeModules)).not.toContain('docx');
+      expect(fs.lstatSync(userRealPkgDir).isDirectory()).toBe(true);
+      expect(fs.readlinkSync(path.join(legacyNodeModules, 'user-custom-link'))).toBe(userLinkTarget);
 
       // 3. Non-isolated mode explicitly refuses equivalence guarantees
       const offSpec = buildAgyCommandSpec({
@@ -963,7 +1022,7 @@ describe('Anthropic doc skills and runtime isolation', () => {
       restoreWriteTree(docRuntimeDir);
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test('Deploy scripts unify under INSTALL_DOC_RUNTIME=auto|0|1 and auto-update swaps read-only builtin-skills safely without hiding failures', async () => {
     const repoRoot = path.resolve(import.meta.dirname, '..', '..');

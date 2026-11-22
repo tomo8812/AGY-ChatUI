@@ -118,6 +118,8 @@ if [[ -f "${STAMP_FILE}" ]] && [[ "$(cat "${STAMP_FILE}" 2>/dev/null || true)" =
   if [[ -x "${DOC_RUNTIME_DIR}/venv/bin/python3" ]] \
     && [[ -d "${DOC_RUNTIME_DIR}/node/node_modules/pptxgenjs" ]] \
     && [[ -d "${DOC_RUNTIME_DIR}/node/node_modules/docx" ]] \
+    && [[ -d "${DOC_RUNTIME_DIR}/node/node_modules/sharp" ]] \
+    && [[ -d "${DOC_RUNTIME_DIR}/node/node_modules/react-icons" ]] \
     && command -v pdftoppm >/dev/null 2>&1 \
     && command -v pandoc >/dev/null 2>&1 \
     && command -v qpdf >/dev/null 2>&1 \
