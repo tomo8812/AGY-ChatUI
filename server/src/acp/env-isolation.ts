@@ -788,11 +788,25 @@ export function buildAgyCommandSpec(params: {
       }
     }
 
+    const realHostNode = resolveRealHostNodeBin();
+    const isSystemMountedNode = Boolean(
+      realHostNode && isInsideSystemMountTree(realHostNode, mountedSystemDirs)
+    );
+    const hasCustomNodeModules = Boolean(docRuntime?.nodeModulesRel);
+    const needsCustomNodeBind = Boolean(hasCustomNodeModules && realHostNode && !isSystemMountedNode);
+    const SANDBOX_CUSTOM_NODE_MOUNT = '/usr/local/agy-doc-node';
+    let sandboxNodeBin = isSystemMountedNode && realHostNode ? realHostNode : '/usr/bin/node';
+
     if (docRuntime) {
       if (fs.existsSync('/usr/local')) {
         bwrapArgs.push('--tmpfs', '/usr/local');
         for (const entry of fs.readdirSync('/usr/local', { withFileTypes: true })) {
-          if (entry.name === path.posix.basename(SANDBOX_DOC_RUNTIME_MOUNT)) continue;
+          if (
+            entry.name === path.posix.basename(SANDBOX_DOC_RUNTIME_MOUNT) ||
+            entry.name === path.posix.basename(SANDBOX_CUSTOM_NODE_MOUNT)
+          ) {
+            continue;
+          }
           const entryPath = path.posix.join('/usr/local', entry.name);
           if (entry.isSymbolicLink()) {
             bwrapArgs.push('--symlink', fs.readlinkSync(entryPath), entryPath);
@@ -800,11 +814,42 @@ export function buildAgyCommandSpec(params: {
             bwrapArgs.push('--ro-bind', entryPath, entryPath);
           }
         }
+        if (needsCustomNodeBind && realHostNode) {
+          let resolvedHostNode = realHostNode;
+          try {
+            resolvedHostNode = fs.realpathSync(realHostNode);
+          } catch {
+            // keep realHostNode
+          }
+          if (fs.existsSync(resolvedHostNode)) {
+            bwrapArgs.push('--ro-bind', resolvedHostNode, SANDBOX_CUSTOM_NODE_MOUNT);
+            sandboxNodeBin = SANDBOX_CUSTOM_NODE_MOUNT;
+          }
+        }
+      } else if (needsCustomNodeBind && realHostNode) {
+        let resolvedHostNode = realHostNode;
+        try {
+          resolvedHostNode = fs.realpathSync(realHostNode);
+        } catch {
+          // keep realHostNode
+        }
+        if (fs.existsSync(resolvedHostNode)) {
+          ensureOptDir();
+          bwrapArgs.push('--dir', '/opt/agy-node', '--ro-bind', resolvedHostNode, '/opt/agy-node/node');
+          sandboxNodeBin = '/opt/agy-node/node';
+        }
       }
       bwrapArgs.push('--ro-bind', docRuntime.hostDir, SANDBOX_DOC_RUNTIME_MOUNT);
     }
 
-    const chatRuntimeHostDir = ensurePerChatRuntimeDir(profileAbs, workspaceAbs, docRuntime);
+    const chatRuntimeHostDir = ensurePerChatRuntimeDir(
+      profileAbs,
+      workspaceAbs,
+      docRuntime,
+      SANDBOX_DOC_RUNTIME_MOUNT,
+      SANDBOX_CHAT_RUNTIME_MOUNT,
+      sandboxNodeBin
+    );
     applySandboxLayeredRuntime(env, docRuntime, sandboxAgyBinDir);
 
     const wsKey = path.basename(workspaceAbs) || 'default';
@@ -1341,12 +1386,29 @@ if (typeof nodeModule.register === 'function') {
 }
 `;
 
+function resolveRealHostNodeBin(excludePath?: string): string | null {
+  if (
+    process.execPath &&
+    process.execPath !== excludePath &&
+    path.basename(process.execPath).startsWith('node') &&
+    fs.existsSync(process.execPath)
+  ) {
+    return process.execPath;
+  }
+  const fromPath = resolveHostExecutable('node');
+  if (fromPath && fromPath !== excludePath && fs.existsSync(fromPath)) {
+    return fromPath;
+  }
+  return null;
+}
+
 export function ensurePerChatRuntimeDir(
   profileDir: string,
   workspaceDir: string,
   docRuntime: DocRuntimeLayout | null,
   docRuntimeMountRoot = SANDBOX_DOC_RUNTIME_MOUNT,
-  chatRuntimeMountRoot = SANDBOX_CHAT_RUNTIME_MOUNT
+  chatRuntimeMountRoot = SANDBOX_CHAT_RUNTIME_MOUNT,
+  hostNodeBinOverride?: string
 ): string {
   const profileAbs = path.resolve(profileDir);
   const wsKey = path.basename(path.resolve(workspaceDir)) || 'default';
@@ -1427,12 +1489,16 @@ export function ensurePerChatRuntimeDir(
           (binPath.startsWith('/usr/') || binPath.startsWith('/bin/')) &&
           fs.existsSync(binPath)
       );
-    const hostNodeBin = isSandboxMountedBin(process.execPath)
-      ? process.execPath
-      : (() => {
-          const fromPath = resolveHostExecutable('node');
-          return isSandboxMountedBin(fromPath) ? fromPath : '/usr/bin/node';
-        })();
+    const hostNodeBin = (() => {
+      if (hostNodeBinOverride && hostNodeBinOverride !== nodeWrapperPath) {
+        return hostNodeBinOverride;
+      }
+      const detected = resolveRealHostNodeBin(nodeWrapperPath);
+      if (chatRuntimeMountRoot !== SANDBOX_CHAT_RUNTIME_MOUNT && detected) {
+        return detected;
+      }
+      return isSandboxMountedBin(detected) ? detected : '/usr/bin/node';
+    })();
     const shSingleQuote = (val: string) => `'${val.replace(/'/g, "'\\''")}'`;
     const registerInSandbox = `${chatMountPosix}/hooks/esm-register.mjs`;
     const wrapperScript = [
