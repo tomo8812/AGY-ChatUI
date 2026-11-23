@@ -171,9 +171,10 @@ export interface MockApiOptions {
 export async function installMockApi(page: Page, options: MockApiOptions = {}): Promise<void> {
   const authenticated = options.authenticated ?? true;
 
-  // Prevent real WebSocket connection noise in static preview mode
-  await page.route('**/api/ws*', (route) => route.abort());
-  await page.route('**/ws*', (route) => route.abort());
+  // Intercept WebSocket connections directly so static preview never hits the unconfigured backend WS proxy
+  await page.routeWebSocket('**/api/ws*', (ws) => {
+    ws.close({ code: 1006, reason: 'Mocked offline WS in UI layout test' });
+  });
 
   await page.route('**/api/**', async (route) => {
     const req = route.request();
