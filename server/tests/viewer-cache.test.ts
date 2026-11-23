@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ArtifactRecord } from '../../web/src/types';
-import { computePdfAutoFitScale } from '../../web/src/utils/pdfFit';
+import { computePdfAutoFitScale, findActivePdfPage } from '../../web/src/utils/pdfFit';
 import {
   artifactTextCache,
   buildArtifactContentUrl,
@@ -210,31 +210,65 @@ describe('viewerCache client caching & LRU utilities', () => {
     expect(peekResolvedLink('chat-9', 'leak.png')).toBeNull();
   });
 
-  it('auto-fits 16:9 landscape PDFs without horizontal clipping on iPhone 375px/430px and PC viewports', () => {
+  it('auto-fits both landscape and portrait PDFs/PPTX to the maximum contained scale across iPhone and PC viewports', () => {
     const slide16x9 = { width: 960, height: 540 };
     const wideSlide = { width: 1280, height: 720 };
+    const a4Portrait = { width: 595, height: 842 };
+    const a4Landscape = { width: 842, height: 595 };
 
-    // iPhone 375px viewport (modal inner scroll container ~324px wide -> availW 300px)
-    const iphone375 = { width: 324, height: 600 };
-    const scale375 = computePdfAutoFitScale(slide16x9, iphone375);
-    expect(scale375).toBeLessThanOrEqual(300 / 960);
-    expect(slide16x9.width * scale375).toBeLessThanOrEqual(iphone375.width - 24);
+    const viewports = [
+      // iPhone 375x812 (PDF & PPTX with info-banner)
+      { name: 'iphone375-pdf', width: 351, height: 560 },
+      { name: 'iphone375-pptx', width: 351, height: 490 },
+      // iPhone 430x932 (PDF & PPTX with info-banner)
+      { name: 'iphone430-pdf', width: 406, height: 680 },
+      { name: 'iphone430-pptx', width: 406, height: 610 },
+      // PC standard viewports (1280x720, 1366x768, 1440x900, 1920x1080, 2560x1440)
+      { name: 'pc-1280x720', width: 1196, height: 450 },
+      { name: 'pc-1366x768', width: 1204, height: 500 },
+      { name: 'pc-1440x900', width: 1204, height: 620 },
+      { name: 'pc-1920x1080', width: 1204, height: 760 },
+    ];
 
-    const scale375Wide = computePdfAutoFitScale(wideSlide, iphone375);
-    expect(wideSlide.width * scale375Wide).toBeLessThanOrEqual(iphone375.width - 24);
+    for (const vp of viewports) {
+      for (const page of [slide16x9, wideSlide, a4Portrait, a4Landscape]) {
+        const scale = computePdfAutoFitScale(page, vp);
+        const availW = vp.width - 24;
+        const availH = vp.height - 24;
+        // Must fit completely within both width and height without clipping
+        expect(page.width * scale, `${vp.name} width`).toBeLessThanOrEqual(availW);
+        expect(page.height * scale, `${vp.name} height`).toBeLessThanOrEqual(availH);
+        // Must be the maximum 0.01-step scale that fits (next step overflows either width or height)
+        const nextScale = Math.round((scale + 0.01) * 100) / 100;
+        expect(
+          page.width * nextScale > availW || page.height * nextScale > availH,
+          `${vp.name} maximizes fit`
+        ).toBe(true);
+      }
+    }
 
-    // iPhone 430px viewport (modal inner scroll container ~398px wide -> availW 374px)
-    const iphone430 = { width: 398, height: 700 };
-    const scale430 = computePdfAutoFitScale(slide16x9, iphone430);
-    expect(slide16x9.width * scale430).toBeLessThanOrEqual(iphone430.width - 24);
+    // Regression guard: iPhone PPTX slide must never shrink down to 5%
+    const iphonePptxScale = computePdfAutoFitScale(slide16x9, { width: 351, height: 490 });
+    expect(iphonePptxScale).toBeGreaterThanOrEqual(0.3);
+  });
 
-    const scale430Wide = computePdfAutoFitScale(wideSlide, iphone430);
-    expect(wideSlide.width * scale430Wide).toBeLessThanOrEqual(iphone430.width - 24);
+  it('tracks the active page accurately during continuous vertical scrolling', () => {
+    const rects = [
+      { pageNum: 1, top: -400, bottom: 20 },
+      { pageNum: 2, top: 32, bottom: 452 },
+      { pageNum: 3, top: 464, bottom: 884 },
+    ];
+    // Container top=0, height=500, paddingTop=12 -> anchorY = 12 + 80 = 92 -> inside page 2
+    expect(findActivePdfPage(0, 500, 12, rects)).toBe(2);
 
-    // PC desktop modal (e.g. 1160x700 scroll container) fits both width and height
-    const pcModal = { width: 1160, height: 700 };
-    const scalePc = computePdfAutoFitScale(slide16x9, pcModal);
-    expect(slide16x9.width * scalePc).toBeLessThanOrEqual(pcModal.width - 24);
-    expect(slide16x9.height * scalePc).toBeLessThanOrEqual(pcModal.height - 24);
+    // Anchor falls in the 12px gap between page 1 and page 2 -> picks closest page
+    const gapRects = [
+      { pageNum: 1, top: -300, bottom: 86 },
+      { pageNum: 2, top: 98, bottom: 518 },
+    ];
+    expect(findActivePdfPage(0, 500, 12, gapRects)).toBe(1);
+
+    // Empty page list defaults to page 1
+    expect(findActivePdfPage(0, 500, 12, [])).toBe(1);
   });
 });
