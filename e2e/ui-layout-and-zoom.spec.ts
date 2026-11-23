@@ -221,6 +221,53 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
         return p2.getBoundingClientRect().width <= sc.clientWidth + 2;
       });
       expect(page2Fits, `[${vpLabel}] Landscape page 2 must fit horizontally without clipping`).toBe(true);
+
+      // Long-PDF performance check: scroll far down (page 25) so previously visited page 1 is offscreen,
+      // then zoom continuously and verify only visible/nearby pages re-render (page 1 keeps its old renderedScale).
+      const page1ScaleBeforeScrollZoom = await page
+        .locator('.pdf-page-slot[data-page-number="1"]')
+        .getAttribute('data-rendered-scale');
+      expect(page1ScaleBeforeScrollZoom, `[${vpLabel}] Page 1 should have been painted initially`).toBeTruthy();
+
+      await page.locator('.pdf-page-slot[data-page-number="25"]').scrollIntoViewIfNeeded();
+      await expect
+        .poll(async () =>
+          page.locator('.pdf-page-slot[data-page-number="25"]').getAttribute('data-rendered-scale')
+        )
+        .toBeTruthy();
+
+      const page25InitialScale = await page
+        .locator('.pdf-page-slot[data-page-number="25"]')
+        .getAttribute('data-rendered-scale');
+
+      // Continuous zoom while viewing page 25
+      if (isIphoneProject) {
+        await dispatchTouchPinch(page, '.pdf-canvas-scroll', 45, 85);
+      } else {
+        await dispatchCtrlWheel(page, '.pdf-canvas-scroll', -120);
+        await dispatchCtrlWheel(page, '.pdf-canvas-scroll', -120);
+      }
+      await page.locator('.pdf-zoom-group button[aria-label="拡大"]').click();
+
+      // Page 25 (visible) MUST re-render at the new higher scale
+      await expect
+        .poll(async () => {
+          const cur = await page
+            .locator('.pdf-page-slot[data-page-number="25"]')
+            .getAttribute('data-rendered-scale');
+          return cur && page25InitialScale ? Number(cur) > Number(page25InitialScale) : false;
+        })
+        .toBe(true);
+
+      // Page 1 (far offscreen, previously visited) MUST NOT have re-rendered at the new scale
+      const page1ScaleAfterScrollZoom = await page
+        .locator('.pdf-page-slot[data-page-number="1"]')
+        .getAttribute('data-rendered-scale');
+      expect(
+        page1ScaleAfterScrollZoom,
+        `[${vpLabel}] Far-offscreen visited page 1 must not re-render when zooming at page 25`
+      ).toBe(page1ScaleBeforeScrollZoom);
+
       await closeActiveModal(page);
 
       // 5. PPTX 16:9 Landscape Viewer with long filename
@@ -317,13 +364,68 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
       });
       await closeActiveModal(page);
 
-      // 8. Long-filename artifact with all header action buttons (ソース / 差分 / コピー / DL / 閉じる)
+      // 8. Text-based viewers: Markdown + DiffPatchView + CodeViewer (Source) + TableViewer
+      const TEXT_VIEWER_CHROME = ['.modal-head', '.text-zoom-toolbar', '.viewer-footer'] as const;
+
+      const verifyTextViewerZoom = async (screenPrefix: string, contentSelector: string) => {
+        await page.locator(contentSelector).first().waitFor({ state: 'visible' });
+        await assertNoLayoutViolations(page, {
+          screen: `${screenPrefix}-initial`,
+          viewport: vpLabel,
+          expectModal: true,
+        });
+
+        const chromeBefore = await snapshotUiChrome(page, TEXT_VIEWER_CHROME);
+        const fontBefore = await page
+          .locator(contentSelector)
+          .first()
+          .evaluate((el) => parseFloat(window.getComputedStyle(el).fontSize));
+
+        if (isIphoneProject) {
+          await dispatchTouchPinch(page, '.text-zoom-scroll', 40, 72);
+        } else {
+          await dispatchCtrlWheel(page, '.text-zoom-scroll', -120);
+          await dispatchCtrlWheel(page, '.text-zoom-scroll', -120);
+        }
+
+        await expect
+          .poll(async () =>
+            page
+              .locator(contentSelector)
+              .first()
+              .evaluate((el) => parseFloat(window.getComputedStyle(el).fontSize))
+          )
+          .toBeGreaterThan(fontBefore * 1.15);
+
+        const chromeAfter = await snapshotUiChrome(page, TEXT_VIEWER_CHROME);
+        assertUiChromeStable(chromeBefore, chromeAfter, `${screenPrefix}-zoom ${vpLabel}`);
+        await assertNoLayoutViolations(page, {
+          screen: `${screenPrefix}-zoomed`,
+          viewport: vpLabel,
+          expectModal: true,
+        });
+
+        // Reset via "画面に合わせる"
+        await page.locator('.text-zoom-toolbar button', { hasText: '画面に合わせる' }).click();
+        await expect(page.locator('.text-zoom-scroll')).toHaveAttribute('data-text-zoom', '100');
+      };
+
+      // 8a. Markdown + Diff + Source (Code) with long filename and all header action buttons
       await openArtifactByFilename(page, FIXTURE_ARTIFACTS[4].filename);
-      await assertNoLayoutViolations(page, {
-        screen: 'markdown-diff-long-filename',
-        viewport: vpLabel,
-        expectModal: true,
-      });
+      await verifyTextViewerZoom('markdown-viewer', '.text-zoom-scroll .md-body');
+
+      // Switch to Diff (DiffPatchView)
+      await page.locator('.modal-head-actions button', { hasText: '差分 (Diff)' }).click();
+      await verifyTextViewerZoom('diff-viewer', '.text-zoom-scroll .diff-container');
+
+      // Switch to Source (CodeViewer)
+      await page.locator('.modal-head-actions button', { hasText: 'ソース' }).click();
+      await verifyTextViewerZoom('code-viewer', '.text-zoom-scroll .code-pre');
+      await closeActiveModal(page);
+
+      // 8b. CSV Table Viewer (TableViewer)
+      await openArtifactByFilename(page, FIXTURE_ARTIFACTS[5].filename);
+      await verifyTextViewerZoom('table-viewer', '.text-zoom-scroll .viewer-table-scroll table');
       await closeActiveModal(page);
 
       // 9. Quota popover, Skills modal, MCP modal, Settings modal (on representative tightest & widest viewports)

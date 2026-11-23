@@ -9,6 +9,10 @@ import { useContentZoomGestures } from '../hooks/useContentZoomGestures';
 import type { ArtifactRecord, ProjectRecord } from '../types';
 import {
   captureRelativeFocalPoint,
+  CHAT_TEXT_DEFAULT_SCALE,
+  CHAT_TEXT_MAX_SCALE,
+  CHAT_TEXT_MIN_SCALE,
+  CHAT_TEXT_STEP,
   clampZoomScale,
   computeFocalScrollDelta,
   computeMediaAutoFitScale,
@@ -146,6 +150,7 @@ const PdfPageCanvas: React.FC<PdfPageCanvasProps> = React.memo(
     const slotRef = useRef<HTMLDivElement | null>(null);
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const hasPaintedRef = useRef(false);
+    const paintedKeyRef = useRef<string | null>(null);
     const [isNearViewport, setIsNearViewport] = useState(pageNum <= 2);
 
     const setSlotRef = useCallback(
@@ -158,6 +163,10 @@ const PdfPageCanvas: React.FC<PdfPageCanvasProps> = React.memo(
 
     useEffect(() => {
       hasPaintedRef.current = false;
+      paintedKeyRef.current = null;
+      if (slotRef.current) {
+        delete slotRef.current.dataset.renderedScale;
+      }
     }, [url, pageNum]);
 
     useEffect(() => {
@@ -171,9 +180,7 @@ const PdfPageCanvas: React.FC<PdfPageCanvasProps> = React.memo(
       const io = new IntersectionObserver(
         (entries) => {
           for (const entry of entries) {
-            if (entry.isIntersecting) {
-              setIsNearViewport(true);
-            }
+            setIsNearViewport(entry.isIntersecting);
           }
         },
         { root: scrollEl, rootMargin: '400px 0px' }
@@ -184,10 +191,13 @@ const PdfPageCanvas: React.FC<PdfPageCanvasProps> = React.memo(
 
     useEffect(() => {
       if (!readyToRender || !isNearViewport || !canvasRef.current || scale <= 0) return;
-      let cancelled = false;
-      let activeTask: PdfJsTypes.RenderTask | null = null;
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const key = makePdfBitmapKey(url, pageNum, scale, dpr);
+      // Skip redundant draw when scrolling back to a page already painted at this exact scale
+      if (paintedKeyRef.current === key) return;
+
+      let cancelled = false;
+      let activeTask: PdfJsTypes.RenderTask | null = null;
       const cachedHit = pdfPageBitmapCache.get(key);
 
       const renderPage = async () => {
@@ -209,6 +219,10 @@ const PdfPageCanvas: React.FC<PdfPageCanvasProps> = React.memo(
           if (cancelled || !canvasRef.current) return;
           drawBitmapToCanvas(canvasRef.current, cached);
           hasPaintedRef.current = true;
+          paintedKeyRef.current = key;
+          if (slotRef.current) {
+            slotRef.current.dataset.renderedScale = String(Math.round(scale * 100));
+          }
         } catch {
           // ignore abort when zooming or closing quickly
         }
@@ -856,6 +870,128 @@ const MediaZoomViewer: React.FC<MediaZoomViewerProps> = React.memo(({ src, alt, 
     </div>
   );
 });
+
+const TextContentZoomShell: React.FC<{ resetKey: string; children: React.ReactNode }> = ({
+  resetKey,
+  children,
+}) => {
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
+  const [contentEl, setContentEl] = useState<HTMLDivElement | null>(null);
+  const pendingFocalRef = useRef<RelativeFocalPoint | null>(null);
+  const [scale, setScale] = useState<number>(CHAT_TEXT_DEFAULT_SCALE);
+
+  const setScrollContainerRef = useCallback((el: HTMLDivElement | null) => {
+    scrollRef.current = el;
+    setScrollEl(el);
+  }, []);
+
+  const setContentContainerRef = useCallback((el: HTMLDivElement | null) => {
+    contentRef.current = el;
+    setContentEl(el);
+  }, []);
+
+  useEffect(() => {
+    pendingFocalRef.current = null;
+    setScale(CHAT_TEXT_DEFAULT_SCALE);
+    scrollRef.current?.scrollTo({ top: 0, left: 0 });
+  }, [resetKey]);
+
+  const handleGestureScaleChange = useCallback((nextScale: number, focal: RelativeFocalPoint | null) => {
+    pendingFocalRef.current = focal;
+    setScale(nextScale);
+  }, []);
+
+  const applyStepZoom = useCallback((delta: number) => {
+    const scroll = scrollRef.current;
+    const content = contentRef.current;
+    if (scroll && content) {
+      const rect = scroll.getBoundingClientRect();
+      pendingFocalRef.current = captureRelativeFocalPoint(
+        content.getBoundingClientRect(),
+        rect.left + rect.width / 2,
+        rect.top + rect.height / 2
+      );
+    }
+    setScale((prev) =>
+      clampZoomScale(Math.round((prev + delta) * 100) / 100, CHAT_TEXT_MIN_SCALE, CHAT_TEXT_MAX_SCALE)
+    );
+  }, []);
+
+  const handleReset = useCallback(() => {
+    pendingFocalRef.current = null;
+    setScale(CHAT_TEXT_DEFAULT_SCALE);
+  }, []);
+
+  useLayoutEffect(() => {
+    const focal = pendingFocalRef.current;
+    const scroll = scrollRef.current;
+    const content = contentRef.current;
+    if (!focal || !scroll || !content) return;
+    pendingFocalRef.current = null;
+    const { deltaY } = computeFocalScrollDelta(content.getBoundingClientRect(), focal);
+    if (Math.abs(deltaY) > 0.5) {
+      scroll.scrollTop = Math.max(0, scroll.scrollTop + deltaY);
+    }
+  }, [scale]);
+
+  useContentZoomGestures({
+    scrollEl,
+    contentEl,
+    scale,
+    minScale: CHAT_TEXT_MIN_SCALE,
+    maxScale: CHAT_TEXT_MAX_SCALE,
+    enableDragPan: false,
+    onScaleChange: handleGestureScaleChange,
+  });
+
+  const isDefault = Math.abs(scale - CHAT_TEXT_DEFAULT_SCALE) < 0.005;
+
+  return (
+    <div className="text-zoom-wrap">
+      <div className="viewer-toolbar pdf-viewer-toolbar text-zoom-toolbar">
+        <div className="pdf-toolbar-group pdf-zoom-group">
+          <button
+            type="button"
+            className={`btn btn-secondary btn-xs ${isDefault ? 'active' : ''}`}
+            onClick={handleReset}
+            title="標準サイズ (100%) に戻す"
+          >
+            画面に合わせる
+          </button>
+          <button
+            type="button"
+            className="btn btn-secondary btn-xs pdf-zoom-step-btn"
+            aria-label="文字を縮小"
+            onClick={() => applyStepZoom(-CHAT_TEXT_STEP)}
+          >
+            −
+          </button>
+          <span className="muted-xs pdf-scale-indicator">{Math.round(scale * 100)}%</span>
+          <button
+            type="button"
+            className="btn btn-secondary btn-xs pdf-zoom-step-btn"
+            aria-label="文字を拡大"
+            onClick={() => applyStepZoom(CHAT_TEXT_STEP)}
+          >
+            ＋
+          </button>
+        </div>
+      </div>
+      <div
+        ref={setScrollContainerRef}
+        className="text-zoom-scroll"
+        data-text-zoom={Math.round(scale * 100)}
+        style={{ '--viewer-text-scale': String(scale) } as React.CSSProperties}
+      >
+        <div ref={setContentContainerRef} className="text-zoom-content">
+          {children}
+        </div>
+      </div>
+    </div>
+  );
+};
 
 const DiffPatchView: React.FC<{ versionKey: string; patch: string }> = React.memo(({ versionKey, patch }) => {
   const cacheKey = `${versionKey}:diff`;
@@ -1617,6 +1753,24 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
   };
 
   const supportsSourceToggle = ['markdown', 'html', 'mermaid', 'svg', 'diff'].includes(artifact.previewKind);
+  const isTextZoomableView =
+    !loading &&
+    !error &&
+    ((viewMode === 'diff' && Boolean(artifact.diffPatch ?? (artifact.previewKind === 'diff' ? textContent : null))) ||
+      (viewMode === 'source' && textContent !== null) ||
+      (viewMode === 'preview' &&
+        (artifact.previewKind === 'code' ||
+          artifact.previewKind === 'diff' ||
+          artifact.previewKind === 'table' ||
+          artifact.previewKind === 'docx' ||
+          artifact.previewKind === 'markdown')));
+
+  const usesManagedZoomLayout =
+    isTextZoomableView ||
+    (viewMode === 'preview' &&
+      (artifact.previewKind === 'pdf' ||
+        artifact.previewKind === 'pptx' ||
+        ((artifact.previewKind === 'image' || artifact.previewKind === 'svg') && !imageError)));
 
   return (
     <ModalDialog label={artifact.filename} size="modal-xl viewer-modal" onClose={onClose}>
@@ -1674,16 +1828,7 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
           </div>
         </div>
 
-        <div
-          className={`modal-body viewer-body${
-            viewMode === 'preview' &&
-            (artifact.previewKind === 'pdf' ||
-              artifact.previewKind === 'pptx' ||
-              ((artifact.previewKind === 'image' || artifact.previewKind === 'svg') && !imageError))
-              ? ' viewer-body-pdf'
-              : ''
-          }`}
-        >
+        <div className={`modal-body viewer-body${usesManagedZoomLayout ? ' viewer-body-pdf' : ''}`}>
           {linkError && (
             <div className="error-box viewer-link-error" role="alert" style={{ marginBottom: 12 }}>
               <span>{linkError}</span>
@@ -1697,7 +1842,13 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
               </button>
             </div>
           )}
-          {renderBody()}
+          {isTextZoomableView ? (
+            <TextContentZoomShell resetKey={`${versionKey}:${viewMode}`}>
+              {renderBody()}
+            </TextContentZoomShell>
+          ) : (
+            renderBody()
+          )}
         </div>
 
         {projects.length > 0 && (

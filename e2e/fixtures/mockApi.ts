@@ -11,6 +11,7 @@ export const FIXTURE_IDS = {
   imageId: 'art_img_1600x900',
   svgId: 'art_svg_1200x800',
   codeDiffId: 'art_code_long_diff',
+  tableCsvId: 'art_table_metrics_csv',
 } as const;
 
 // Pre-build synthetic binary assets once per worker for fast test execution
@@ -43,7 +44,7 @@ const SAMPLE_CODE = [
 const SAMPLE_DIFF = [
   '--- a/src/layoutMetrics.ts',
   '+++ b/src/layoutMetrics.ts',
-  '@@ -1,4 +1,5 @@',
+  '@@ -1,3 +1,4 @@',
   ' export function computeLayoutMetrics(width: number, height: number) {',
   '-  return width / height;',
   '+  const ratio = Number((width / Math.max(1, height)).toFixed(3));',
@@ -134,6 +135,23 @@ export const FIXTURE_ARTIFACTS = [
     source: 'generated' as const,
     previewKind: 'markdown' as const,
     diffPatch: SAMPLE_DIFF,
+    createdAt: NOW,
+    updatedAt: NOW,
+  },
+  {
+    id: FIXTURE_IDS.tableCsvId,
+    userId: 'user_1',
+    chatId: FIXTURE_IDS.chatId,
+    messageId: 'msg_assistant_1',
+    runId: 'run_1',
+    relPath: 'data/quarterly_layout_metrics_2026.csv',
+    filename: 'quarterly_layout_metrics_2026.csv',
+    mimeType: 'text/csv',
+    sizeBytes: 256,
+    sha256: 'f'.repeat(64),
+    source: 'generated' as const,
+    previewKind: 'table' as const,
+    diffPatch: null,
     createdAt: NOW,
     updatedAt: NOW,
   },
@@ -624,6 +642,20 @@ export async function installMockApi(page: Page, options: MockApiOptions = {}): 
         status: 200,
         contentType: 'text/markdown; charset=utf-8',
         body: LONG_MARKDOWN,
+      });
+    }
+
+    if (pathname === `/api/files/${FIXTURE_IDS.tableCsvId}/content`) {
+      return route.fulfill({
+        status: 200,
+        contentType: 'text/csv; charset=utf-8',
+        body: [
+          'Screen,Viewport,ZoomTarget,Status',
+          'Chat,1280x720,Text,PASS',
+          'PDF,375x812,Canvas,PASS',
+          'Table,1920x1080,Text,PASS',
+          'Diff,430x932,Text,PASS',
+        ].join('\n'),
       });
     }
 
