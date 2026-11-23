@@ -139,7 +139,7 @@ export function computeMediaAutoFitScale(
     return 1.0;
   }
   const availW = Math.max(1, containerSize.width - paddingPx);
-  const availH = containerSize.height > paddingPx ? Math.max(1, containerSize.height - paddingPx) : availW;
+  const availH = Math.max(1, containerSize.height - paddingPx);
   const rawFit = Math.min(availW / naturalSize.width, availH / naturalSize.height);
   const maxFit = allowUpscale ? MEDIA_AUTO_FIT_MAX_SCALE : 1.0;
   const capped = Math.min(maxFit, Math.max(MEDIA_AUTO_FIT_MIN_SCALE, rawFit));
