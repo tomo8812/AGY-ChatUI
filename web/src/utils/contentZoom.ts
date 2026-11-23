@@ -1,13 +1,16 @@
-export const CHAT_TEXT_MIN_SCALE = 0.75;
-export const CHAT_TEXT_MAX_SCALE = 2.2;
-export const CHAT_TEXT_DEFAULT_SCALE = 1.0;
-export const CHAT_TEXT_STEP = 0.15;
+export const VIEWER_MIN_SCALE = 0.25;
+export const VIEWER_MAX_SCALE = 4.0;
+export const VIEWER_DEFAULT_SCALE = 1.0;
+export const VIEWER_AUTO_FIT_MIN_SCALE = 0.05;
+export const VIEWER_AUTO_FIT_MAX_SCALE = 3.0;
+export const VIEWER_ZOOM_STEP_FACTOR = 1.25;
 
-export const MEDIA_MIN_SCALE = 0.2;
-export const MEDIA_MAX_SCALE = 5.0;
-export const MEDIA_AUTO_FIT_MIN_SCALE = 0.05;
-export const MEDIA_AUTO_FIT_MAX_SCALE = 3.0;
-export const MEDIA_ZOOM_STEP_FACTOR = 1.25;
+// Legacy aliases kept for minimal churn in helper imports
+export const MEDIA_MIN_SCALE = VIEWER_MIN_SCALE;
+export const MEDIA_MAX_SCALE = VIEWER_MAX_SCALE;
+export const MEDIA_AUTO_FIT_MIN_SCALE = VIEWER_AUTO_FIT_MIN_SCALE;
+export const MEDIA_AUTO_FIT_MAX_SCALE = VIEWER_AUTO_FIT_MAX_SCALE;
+export const MEDIA_ZOOM_STEP_FACTOR = VIEWER_ZOOM_STEP_FACTOR;
 
 export interface Point2D {
   x: number;
@@ -141,7 +144,7 @@ export function computeMediaAutoFitScale(
   const availW = Math.max(1, containerSize.width - paddingPx);
   const availH = Math.max(1, containerSize.height - paddingPx);
   const rawFit = Math.min(availW / naturalSize.width, availH / naturalSize.height);
-  const maxFit = allowUpscale ? MEDIA_AUTO_FIT_MAX_SCALE : 1.0;
-  const capped = Math.min(maxFit, Math.max(MEDIA_AUTO_FIT_MIN_SCALE, rawFit));
-  return Math.max(MEDIA_AUTO_FIT_MIN_SCALE, Math.floor(capped * 100) / 100);
+  const maxFit = allowUpscale ? VIEWER_AUTO_FIT_MAX_SCALE : 1.0;
+  const capped = Math.min(maxFit, Math.max(VIEWER_AUTO_FIT_MIN_SCALE, rawFit));
+  return Math.max(VIEWER_AUTO_FIT_MIN_SCALE, Math.floor(capped * 100) / 100);
 }

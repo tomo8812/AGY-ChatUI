@@ -68,69 +68,141 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
       await page.setViewportSize({ width: vp.width, height: vp.height });
       await openChatAndWaitReady(page, isIphoneProject);
 
-      // 1. Accessibility policy: browser standard zoom is NOT globally disabled
+      // 1. Platform-specific normal-screen zoom policy
       const viewportMeta = await page.locator('meta[name="viewport"]').getAttribute('content');
-      expect(viewportMeta, `[${vpLabel}] viewport meta must not forbid user zoom`).not.toContain(
-        'user-scalable=no'
-      );
-      expect(viewportMeta, `[${vpLabel}] viewport meta must not lock maximum-scale=1`).not.toMatch(
-        /maximum-scale=1(\.0)?(\b|,)/
-      );
+      if (isIphoneProject) {
+        // Mobile (iPhone Safari / PWA): normal screen locks page pinch zoom
+        expect(viewportMeta, `[${vpLabel}] mobile viewport meta must lock zoom`).toContain('user-scalable=no');
+        expect(viewportMeta, `[${vpLabel}] mobile viewport meta must lock maximum-scale=1.0`).toContain(
+          'maximum-scale=1.0'
+        );
+      } else {
+        // PC: browser standard zoom is NEVER restricted
+        expect(viewportMeta, `[${vpLabel}] PC viewport meta must not forbid user zoom`).not.toContain(
+          'user-scalable=no'
+        );
+        expect(viewportMeta, `[${vpLabel}] PC viewport meta must not lock maximum-scale=1`).not.toMatch(
+          /maximum-scale=1(\.0)?(\b|,)/
+        );
+      }
 
-      // Ctrl+Wheel outside content containers (e.g. on .header-bar) must NOT be preventDefault-blocked
-      const headerWheelPrevented = await page.evaluate(() => {
-        const header = document.querySelector('.header-bar');
-        if (!header) return false;
-        const ev = new WheelEvent('wheel', {
-          bubbles: true,
-          cancelable: true,
-          ctrlKey: true,
-          deltaY: -100,
-        });
-        header.dispatchEvent(ev);
-        return ev.defaultPrevented;
-      });
-      expect(headerWheelPrevented, `[${vpLabel}] Ctrl+Wheel on header must not be blocked`).toBe(false);
-
-      // 2. Chat screen initial layout audit
+      // 2. Chat screen initial layout audit & absence of obsolete custom chat text zoom
       await assertNoLayoutViolations(page, { screen: 'chat-initial', viewport: vpLabel });
+      await expect(page.locator('.chat-zoom-pill')).toHaveCount(0);
 
-      // 3. Chat body content-only text zoom
-      const chromeBeforeChatZoom = await snapshotUiChrome(page, APP_CHROME_SELECTORS);
+      // 3. Verify normal-screen zoom behavior (blocked on mobile, native pass-through on PC)
+      const chromeBeforeNormalZoom = await snapshotUiChrome(page, APP_CHROME_SELECTORS);
       const fontSizeBefore = await page
         .locator('.md-body')
         .first()
         .evaluate((el) => parseFloat(window.getComputedStyle(el).fontSize));
 
       if (isIphoneProject) {
-        await dispatchTouchPinch(page, '.messages-scroll', 40, 72);
+        // Two-finger pinch & Safari gesturestart on normal UI must be prevented
+        const normalPinchResults = await page.evaluate(() => {
+          const checkTarget = (selector: string) => {
+            const target = document.querySelector(selector);
+            if (!target) return { selector, found: false, pinchPrevented: false, gesturePrevented: false, singleTouchPrevented: false };
+            const r = target.getBoundingClientRect();
+            const cx = r.left + r.width / 2;
+            const cy = r.top + r.height / 2;
+
+            const makeTouch = (id: number, x: number, y: number) => {
+              try {
+                return new Touch({ identifier: id, target, clientX: x, clientY: y, pageX: x, pageY: y });
+              } catch {
+                return { identifier: id, target, clientX: x, clientY: y, pageX: x, pageY: y };
+              }
+            };
+
+            const dispatchTouch = (type: string, touches: unknown[]) => {
+              let ev: Event;
+              try {
+                ev = new TouchEvent(type, {
+                  bubbles: true,
+                  cancelable: true,
+                  touches: touches as Touch[],
+                  targetTouches: touches as Touch[],
+                  changedTouches: touches as Touch[],
+                });
+              } catch {
+                ev = new Event(type, { bubbles: true, cancelable: true });
+                Object.defineProperty(ev, 'touches', { value: touches });
+                Object.defineProperty(ev, 'targetTouches', { value: touches });
+                Object.defineProperty(ev, 'changedTouches', { value: touches });
+              }
+              target.dispatchEvent(ev);
+              return ev.defaultPrevented;
+            };
+
+            const pinchPrevented = dispatchTouch('touchmove', [
+              makeTouch(1, cx - 40, cy),
+              makeTouch(2, cx + 40, cy),
+            ]);
+            const singleTouchPrevented = dispatchTouch('touchmove', [makeTouch(1, cx, cy + 12)]);
+            const gestureEv = new Event('gesturestart', { bubbles: true, cancelable: true });
+            target.dispatchEvent(gestureEv);
+            return {
+              selector,
+              found: true,
+              pinchPrevented,
+              gesturePrevented: gestureEv.defaultPrevented,
+              singleTouchPrevented,
+            };
+          };
+          return [
+            checkTarget('.messages-scroll'),
+            checkTarget('.header-bar'),
+            checkTarget('.composer-dock'),
+          ];
+        });
+
+        for (const res of normalPinchResults) {
+          expect(res.found, `[${vpLabel}] ${res.selector} must exist`).toBe(true);
+          expect(res.pinchPrevented, `[${vpLabel}] 2-finger pinch on ${res.selector} must be prevented`).toBe(true);
+          expect(res.gesturePrevented, `[${vpLabel}] gesturestart on ${res.selector} must be prevented`).toBe(true);
+          expect(
+            res.singleTouchPrevented,
+            `[${vpLabel}] single-finger touch on ${res.selector} must NOT be prevented`
+          ).toBe(false);
+        }
+
+        // Composer input must still accept normal text typing
+        const composerInput = page.locator('.composer-box textarea').first();
+        await composerInput.fill('テスト入力');
+        await expect(composerInput).toHaveValue('テスト入力');
+        await composerInput.fill('');
       } else {
-        await dispatchCtrlWheel(page, '.messages-scroll', -120);
-        await dispatchCtrlWheel(page, '.messages-scroll', -120);
+        // PC: Ctrl+Wheel on BOTH header and chat messages must NOT be prevented (native browser zoom preserved)
+        const wheelChecks = await page.evaluate(() => {
+          return ['.header-bar', '.messages-scroll'].map((selector) => {
+            const el = document.querySelector(selector);
+            if (!el) return { selector, found: false, prevented: true };
+            const ev = new WheelEvent('wheel', {
+              bubbles: true,
+              cancelable: true,
+              ctrlKey: true,
+              deltaY: -100,
+            });
+            el.dispatchEvent(ev);
+            return { selector, found: true, prevented: ev.defaultPrevented };
+          });
+        });
+        for (const wc of wheelChecks) {
+          expect(wc.found, `[${vpLabel}] ${wc.selector} must exist`).toBe(true);
+          expect(wc.prevented, `[${vpLabel}] Ctrl+Wheel on ${wc.selector} must not be blocked`).toBe(false);
+        }
       }
 
-      await expect
-        .poll(async () =>
-          page
-            .locator('.md-body')
-            .first()
-            .evaluate((el) => parseFloat(window.getComputedStyle(el).fontSize))
-        )
-        .toBeGreaterThan(fontSizeBefore * 1.15);
-
-      await page.locator('.chat-zoom-pill').waitFor({ state: 'visible' });
-      const chromeAfterChatZoom = await snapshotUiChrome(page, APP_CHROME_SELECTORS);
-      assertUiChromeStable(chromeBeforeChatZoom, chromeAfterChatZoom, `chat-zoom ${vpLabel}`);
-      await assertNoLayoutViolations(page, { screen: 'chat-text-zoomed', viewport: vpLabel });
-
-      // Reset chat text zoom via "画面に合わせる"
-      await page.locator('.chat-zoom-pill button', { hasText: '画面に合わせる' }).click();
-      await expect(page.locator('.chat-zoom-pill')).toBeHidden();
-      const fontSizeReset = await page
+      // Neither mobile pinch nor PC Ctrl+Wheel should trigger any custom chat text zoom
+      const fontSizeAfter = await page
         .locator('.md-body')
         .first()
         .evaluate((el) => parseFloat(window.getComputedStyle(el).fontSize));
-      expect(Math.abs(fontSizeReset - fontSizeBefore)).toBeLessThanOrEqual(0.5);
+      expect(Math.abs(fontSizeAfter - fontSizeBefore)).toBeLessThanOrEqual(0.5);
+      await expect(page.locator('.chat-zoom-pill')).toHaveCount(0);
+      const chromeAfterNormalZoom = await snapshotUiChrome(page, APP_CHROME_SELECTORS);
+      assertUiChromeStable(chromeBeforeNormalZoom, chromeAfterNormalZoom, `normal-screen ${vpLabel}`);
 
       // 4. Multi-page Mixed Portrait/Landscape 120-page PDF Viewer
       await openArtifactByFilename(page, FIXTURE_ARTIFACTS[0].filename);
@@ -364,10 +436,14 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
       });
       await closeActiveModal(page);
 
-      // 8. Text-based viewers: Markdown + DiffPatchView + CodeViewer (Source) + TableViewer
-      const TEXT_VIEWER_CHROME = ['.modal-head', '.text-zoom-toolbar', '.viewer-footer'] as const;
+      // 8. Unified shell viewers: Markdown + Diff + Code (Source) + CSV Table + DOCX + HTML
+      const UNIFIED_VIEWER_CHROME = ['.modal-head', '.viewer-zoom-toolbar', '.viewer-footer'] as const;
 
-      const verifyTextViewerZoom = async (screenPrefix: string, contentSelector: string) => {
+      const verifyUnifiedShellViewerZoom = async (
+        screenPrefix: string,
+        contentSelector: string,
+        useToolbarOnly = false
+      ) => {
         await page.locator(contentSelector).first().waitFor({ state: 'visible' });
         await assertNoLayoutViolations(page, {
           screen: `${screenPrefix}-initial`,
@@ -375,29 +451,37 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
           expectModal: true,
         });
 
-        const chromeBefore = await snapshotUiChrome(page, TEXT_VIEWER_CHROME);
-        const fontBefore = await page
-          .locator(contentSelector)
+        const chromeBefore = await snapshotUiChrome(page, UNIFIED_VIEWER_CHROME);
+        const widthBefore = await page
+          .locator('.viewer-zoom-content-inner')
           .first()
-          .evaluate((el) => parseFloat(window.getComputedStyle(el).fontSize));
+          .evaluate((el) => el.getBoundingClientRect().width);
 
-        if (isIphoneProject) {
-          await dispatchTouchPinch(page, '.text-zoom-scroll', 40, 72);
+        if (useToolbarOnly) {
+          await page.locator('.viewer-zoom-toolbar button[aria-label="拡大"]').click();
+        } else if (isIphoneProject) {
+          await dispatchTouchPinch(page, '.viewer-zoom-scroll', 40, 72);
         } else {
-          await dispatchCtrlWheel(page, '.text-zoom-scroll', -120);
-          await dispatchCtrlWheel(page, '.text-zoom-scroll', -120);
+          await dispatchCtrlWheel(page, '.viewer-zoom-scroll', -120);
+          await dispatchCtrlWheel(page, '.viewer-zoom-scroll', -120);
         }
 
         await expect
           .poll(async () =>
-            page
-              .locator(contentSelector)
-              .first()
-              .evaluate((el) => parseFloat(window.getComputedStyle(el).fontSize))
+            Number(await page.locator('.viewer-zoom-scroll').getAttribute('data-zoom-scale'))
           )
-          .toBeGreaterThan(fontBefore * 1.15);
+          .toBeGreaterThan(115);
 
-        const chromeAfter = await snapshotUiChrome(page, TEXT_VIEWER_CHROME);
+        await expect
+          .poll(async () =>
+            page
+              .locator('.viewer-zoom-content-inner')
+              .first()
+              .evaluate((el) => el.getBoundingClientRect().width)
+          )
+          .toBeGreaterThan(widthBefore * 1.15);
+
+        const chromeAfter = await snapshotUiChrome(page, UNIFIED_VIEWER_CHROME);
         assertUiChromeStable(chromeBefore, chromeAfter, `${screenPrefix}-zoom ${vpLabel}`);
         await assertNoLayoutViolations(page, {
           screen: `${screenPrefix}-zoomed`,
@@ -406,37 +490,49 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
         });
 
         // Reset via "画面に合わせる"
-        await page.locator('.text-zoom-toolbar button', { hasText: '画面に合わせる' }).click();
-        await expect(page.locator('.text-zoom-scroll')).toHaveAttribute('data-text-zoom', '100');
+        await page.locator('.viewer-zoom-toolbar button', { hasText: '画面に合わせる' }).click();
+        await expect(page.locator('.viewer-zoom-scroll')).toHaveAttribute('data-zoom-scale', '100');
+        await expect(page.locator('.viewer-zoom-scroll')).toHaveAttribute('data-fit-mode', 'auto');
       };
 
       // 8a. Markdown + Diff + Source (Code) with long filename and all header action buttons
       await openArtifactByFilename(page, FIXTURE_ARTIFACTS[4].filename);
-      await verifyTextViewerZoom('markdown-viewer', '.text-zoom-scroll .md-body');
+      await verifyUnifiedShellViewerZoom('markdown-viewer', '.viewer-zoom-scroll .md-body');
 
       // Switch to Diff (DiffPatchView)
       await page.locator('.modal-head-actions button', { hasText: '差分 (Diff)' }).click();
-      await verifyTextViewerZoom('diff-viewer', '.text-zoom-scroll .diff-container');
+      await verifyUnifiedShellViewerZoom('diff-viewer', '.viewer-zoom-scroll .diff-container');
 
       // Switch to Source (CodeViewer)
       await page.locator('.modal-head-actions button', { hasText: 'ソース' }).click();
-      await verifyTextViewerZoom('code-viewer', '.text-zoom-scroll .code-pre');
+      await verifyUnifiedShellViewerZoom('code-viewer', '.viewer-zoom-scroll .code-pre');
       await closeActiveModal(page);
 
       // 8b. CSV Table Viewer (TableViewer)
       await openArtifactByFilename(page, FIXTURE_ARTIFACTS[5].filename);
-      await verifyTextViewerZoom('table-viewer', '.text-zoom-scroll .viewer-table-scroll table');
+      await verifyUnifiedShellViewerZoom('table-viewer', '.viewer-zoom-scroll .viewer-table-scroll table');
       await closeActiveModal(page);
 
-      // 8c. DOCX (real OOXML -> Mammoth HTML): scoped text zoom and stable viewer chrome
+      // 8c. DOCX (real OOXML -> Mammoth HTML)
       const docxFixture = FIXTURE_ARTIFACTS.find((item) => item.id === FIXTURE_IDS.docxId);
       expect(docxFixture, `[${vpLabel}] DOCX test artifact must exist`).toBeDefined();
       await openArtifactByFilename(page, docxFixture!.filename);
-      await expect(page.locator('.text-zoom-scroll .docx-preview p').first()).toContainText(
+      await expect(page.locator('.viewer-zoom-scroll .docx-preview p').first()).toContainText(
         'DOCX viewer zoom fixture'
       );
-      await verifyTextViewerZoom('docx-viewer', '.text-zoom-scroll .docx-preview p');
+      await verifyUnifiedShellViewerZoom('docx-viewer', '.viewer-zoom-scroll .docx-preview p');
       await closeActiveModal(page);
+
+      // 8d. HTML Sandbox Viewer
+      const htmlFixture = FIXTURE_ARTIFACTS.find((item) => item.id === FIXTURE_IDS.htmlId);
+      expect(htmlFixture, `[${vpLabel}] HTML test artifact must exist`).toBeDefined();
+      await openArtifactByFilename(page, htmlFixture!.filename);
+      await verifyUnifiedShellViewerZoom('html-viewer', '.viewer-zoom-scroll .html-sandbox-frame', true);
+      await closeActiveModal(page);
+
+      // Verify closing viewers left the normal screen completely unaffected
+      const chromeAfterViewersClosed = await snapshotUiChrome(page, APP_CHROME_SELECTORS);
+      assertUiChromeStable(chromeBeforeNormalZoom, chromeAfterViewersClosed, `post-viewer-close ${vpLabel}`);
 
       // 9. Quota popover, Skills modal, MCP modal, Settings modal (on representative tightest & widest viewports)
       if (vp.width === 375 || vp.width === 1280 || vp.width === 1920) {
@@ -506,5 +602,64 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
       screen: 'auth-screen',
       viewport: `${vp.name} (${testInfo.project.name})`,
     });
+  });
+
+  test('PC browser zoom keeps desktop UI stable while actual window resize remains responsive', async ({
+    page,
+  }, testInfo) => {
+    test.skip(testInfo.project.name !== 'pc-chromium', 'PC browser zoom test runs on pc-chromium');
+
+    await installMockApi(page, { authenticated: true });
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await openChatAndWaitReady(page, false);
+
+    const cdp = await page.context().newCDPSession(page);
+
+    // Baseline 100%: desktop mode with visible sidebar and hidden mobile hamburger
+    await expect(page.locator('html')).toHaveAttribute('data-layout-mode', 'desktop');
+    await expect(page.locator('.sidebar')).toBeVisible();
+    await expect(page.locator('button[aria-label="メニューを開く"]')).toBeHidden();
+
+    // Simulate PC browser zoom at 125%, 150%, 175%, 200% on a 1280x720 window
+    for (const zoom of [1.25, 1.5, 1.75, 2.0]) {
+      const zoomedW = Math.round(1280 / zoom);
+      const zoomedH = Math.round(720 / zoom);
+      await cdp.send('Emulation.setDeviceMetricsOverride', {
+        width: zoomedW,
+        height: zoomedH,
+        deviceScaleFactor: zoom,
+        mobile: false,
+      });
+      await page.evaluate(() => window.dispatchEvent(new Event('resize')));
+      await expect(page.locator('html')).toHaveAttribute('data-layout-mode', 'desktop');
+      await expect(page.locator('html')).toHaveAttribute('data-browser-zoomed', 'true');
+
+      // Sidebar must remain visible on the left; mobile hamburger must stay hidden
+      const sidebarBox = await page.locator('.sidebar').boundingBox();
+      expect(sidebarBox, `Sidebar must remain visible at ${zoom * 100}% PC browser zoom`).not.toBeNull();
+      expect(sidebarBox!.x).toBeGreaterThanOrEqual(0);
+      expect(sidebarBox!.width).toBeGreaterThanOrEqual(160);
+      await expect(page.locator('button[aria-label="メニューを開く"]')).toBeHidden();
+
+      // Zero layout violations (no button wrapping, overlap, clipping, or horizontal overflow)
+      await assertNoLayoutViolations(page, {
+        screen: `pc-browser-zoom-${Math.round(zoom * 100)}pct`,
+        viewport: `PC-1280x720@${Math.round(zoom * 100)}% (${zoomedW}x${zoomedH})`,
+      });
+    }
+
+    // Now simulate an ACTUAL window resize to narrow width (720x720 at 100% zoom, dpr=1)
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width: 720,
+      height: 720,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await page.evaluate(() => window.dispatchEvent(new Event('resize')));
+    await expect(page.locator('html')).toHaveAttribute('data-layout-mode', 'mobile');
+    await expect(page.locator('button[aria-label="メニューを開く"]')).toBeVisible();
+
+    await cdp.send('Emulation.clearDeviceMetricsOverride');
+    await cdp.detach();
   });
 });

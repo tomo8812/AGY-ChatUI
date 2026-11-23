@@ -13,6 +13,7 @@ export const FIXTURE_IDS = {
   codeDiffId: 'art_code_long_diff',
   tableCsvId: 'art_table_metrics_csv',
   docxId: 'art_docx_zoom_preview',
+  htmlId: 'art_html_report_preview',
 } as const;
 
 // Pre-build synthetic binary assets once per worker for fast test execution
@@ -170,6 +171,23 @@ export const FIXTURE_ARTIFACTS = [
     sha256: 'g'.repeat(64),
     source: 'generated' as const,
     previewKind: 'docx' as const,
+    diffPatch: null,
+    createdAt: NOW,
+    updatedAt: NOW,
+  },
+  {
+    id: FIXTURE_IDS.htmlId,
+    userId: 'user_1',
+    chatId: FIXTURE_IDS.chatId,
+    messageId: 'msg_assistant_1',
+    runId: 'run_1',
+    relPath: 'reports/interactive_dashboard_preview.html',
+    filename: 'interactive_dashboard_preview.html',
+    mimeType: 'text/html',
+    sizeBytes: 384,
+    sha256: 'h'.repeat(64),
+    source: 'generated' as const,
+    previewKind: 'html' as const,
     diffPatch: null,
     createdAt: NOW,
     updatedAt: NOW,
@@ -683,6 +701,17 @@ export async function installMockApi(page: Page, options: MockApiOptions = {}): 
         status: 200,
         contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         body: DOCX_FIXTURE,
+      });
+    }
+
+    if (
+      pathname === `/api/files/${FIXTURE_IDS.htmlId}/content` ||
+      pathname === `/api/files/${FIXTURE_IDS.htmlId}/sandbox`
+    ) {
+      return route.fulfill({
+        status: 200,
+        contentType: 'text/html; charset=utf-8',
+        body: '<!doctype html><html><body style="font-family:sans-serif;padding:20px;"><h1>HTML Preview Report</h1><p>Unified viewer zoom verification content.</p></body></html>',
       });
     }
 
