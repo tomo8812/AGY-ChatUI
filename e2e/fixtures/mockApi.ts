@@ -1,5 +1,5 @@
 import type { Page } from '@playwright/test';
-import { buildSyntheticPdf, buildSyntheticPng, buildSyntheticSvg } from './syntheticAssets';
+import { buildSyntheticDocx, buildSyntheticPdf, buildSyntheticPng, buildSyntheticSvg } from './syntheticAssets';
 
 const NOW = 1763865600000;
 
@@ -12,6 +12,7 @@ export const FIXTURE_IDS = {
   svgId: 'art_svg_1200x800',
   codeDiffId: 'art_code_long_diff',
   tableCsvId: 'art_table_metrics_csv',
+  docxId: 'art_docx_zoom_preview',
 } as const;
 
 // Pre-build synthetic binary assets once per worker for fast test execution
@@ -33,6 +34,7 @@ const PPTX_16X9_PDF = buildSyntheticPdf(
 
 const WIDE_PNG = buildSyntheticPng(1600, 900);
 const ARCH_SVG = buildSyntheticSvg(1200, 800);
+const DOCX_FIXTURE = buildSyntheticDocx();
 
 const SAMPLE_CODE = [
   'export function computeLayoutMetrics(width: number, height: number): { ratio: number; label: string } {',
@@ -151,6 +153,23 @@ export const FIXTURE_ARTIFACTS = [
     sha256: 'f'.repeat(64),
     source: 'generated' as const,
     previewKind: 'table' as const,
+    diffPatch: null,
+    createdAt: NOW,
+    updatedAt: NOW,
+  },
+  {
+    id: FIXTURE_IDS.docxId,
+    userId: 'user_1',
+    chatId: FIXTURE_IDS.chatId,
+    messageId: 'msg_assistant_1',
+    runId: 'run_1',
+    relPath: 'docs/2026_annual_document_layout_zoom_check.docx',
+    filename: '2026_annual_document_layout_zoom_check.docx',
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    sizeBytes: DOCX_FIXTURE.length,
+    sha256: 'g'.repeat(64),
+    source: 'generated' as const,
+    previewKind: 'docx' as const,
     diffPatch: null,
     createdAt: NOW,
     updatedAt: NOW,
@@ -656,6 +675,14 @@ export async function installMockApi(page: Page, options: MockApiOptions = {}): 
           'Table,1920x1080,Text,PASS',
           'Diff,430x932,Text,PASS',
         ].join('\n'),
+      });
+    }
+
+    if (pathname === `/api/files/${FIXTURE_IDS.docxId}/content`) {
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        body: DOCX_FIXTURE,
       });
     }
 
