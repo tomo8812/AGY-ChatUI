@@ -1,5 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ArtifactRecord } from '../../web/src/types';
+import {
+  captureRelativeFocalPoint,
+  clampZoomScale,
+  computeFocalScrollDelta,
+  computeMediaAutoFitScale,
+  computePinchScale,
+  computeTouchPinchGeometry,
+  computeWheelZoomScale,
+} from '../../web/src/utils/contentZoom';
 import { computePdfAutoFitScale, findActivePdfPage } from '../../web/src/utils/pdfFit';
 import {
   artifactTextCache,
@@ -270,5 +279,43 @@ describe('viewerCache client caching & LRU utilities', () => {
 
     // Empty page list defaults to page 1
     expect(findActivePdfPage(0, 500, 12, [])).toBe(1);
+  });
+
+  it('computes smooth wheel, pinch, focal-point scroll delta, and media auto-fit scales accurately', () => {
+    // Clamp boundaries
+    expect(clampZoomScale(0.1, 0.25, 3.0)).toBe(0.25);
+    expect(clampZoomScale(10, 0.25, 3.0)).toBe(3.0);
+    expect(clampZoomScale(Number.NaN, 0.25, 3.0)).toBe(0.25);
+
+    // Wheel zoom in (negative deltaY) and out (positive deltaY)
+    const zoomedIn = computeWheelZoomScale(1.0, -80, 0, 0.25, 3.0);
+    const zoomedOut = computeWheelZoomScale(1.0, 80, 0, 0.25, 3.0);
+    expect(zoomedIn).toBeGreaterThan(1.0);
+    expect(zoomedOut).toBeLessThan(1.0);
+
+    // Pinch geometry & scale
+    const geom = computeTouchPinchGeometry({ clientX: 100, clientY: 200 }, { clientX: 200, clientY: 200 });
+    expect(geom.distance).toBe(100);
+    expect(geom.centerX).toBe(150);
+    expect(geom.centerY).toBe(200);
+    expect(computePinchScale(1.0, 100, 180, 0.5, 3.0)).toBe(1.8);
+    expect(computePinchScale(1.0, 100, 500, 0.5, 3.0)).toBe(3.0);
+
+    // Focal-point scroll anchoring: content doubles in size around its center (relX=0.5, relY=0.5)
+    const focal = captureRelativeFocalPoint({ left: 100, top: 50, width: 400, height: 300 }, 300, 200);
+    expect(focal).not.toBeNull();
+    const delta = computeFocalScrollDelta({ left: 100, top: 50, width: 800, height: 600 }, focal!);
+    expect(delta.deltaX).toBeCloseTo(200, 4);
+    expect(delta.deltaY).toBeCloseTo(150, 4);
+
+    // Media auto-fit: large landscape image fits inside iPhone viewport without clipping
+    const fitLarge = computeMediaAutoFitScale({ width: 1600, height: 900 }, { width: 351, height: 500 }, 24, false);
+    expect(1600 * fitLarge).toBeLessThanOrEqual(351 - 24);
+    expect(900 * fitLarge).toBeLessThanOrEqual(500 - 24);
+    // Small raster image does not upscale past 100%, while vector SVG can scale up to fit
+    const fitSmallRaster = computeMediaAutoFitScale({ width: 200, height: 150 }, { width: 800, height: 600 }, 24, false);
+    const fitSmallSvg = computeMediaAutoFitScale({ width: 200, height: 150 }, { width: 800, height: 600 }, 24, true);
+    expect(fitSmallRaster).toBe(1.0);
+    expect(fitSmallSvg).toBeGreaterThan(1.0);
   });
 });

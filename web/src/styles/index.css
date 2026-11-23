@@ -3534,14 +3534,14 @@ details[open] > .activity-summary > .activity-chevron {
   max-width: 100%;
 }
 .pdf-page-indicator {
-  min-width: 5.5ch;
+  min-width: 7ch;
   text-align: center;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   flex-shrink: 0;
 }
 .pdf-scale-indicator {
-  min-width: 4.5ch;
+  min-width: 5ch;
   text-align: center;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -3579,6 +3579,8 @@ details[open] > .activity-summary > .activity-chevron {
 }
 .pdf-page-slot canvas {
   display: block;
+  width: 100%;
+  height: 100%;
 }
 
 .viewer-table-scroll {
@@ -5232,4 +5234,194 @@ details[open] > .activity-summary > .activity-chevron {
   color: var(--danger);
   line-height: 1.45;
 }
+
+/* ---- Content-Only Zoom (Chat Body, PDF/PPTX, Image/SVG) ---- */
+.chat-view {
+  position: relative;
+}
+
+.chat-zoom-pill {
+  position: absolute;
+  top: 10px;
+  right: 14px;
+  z-index: 15;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
+  white-space: nowrap;
+  max-width: calc(100% - 28px);
+}
+
+.chat-zoom-pill .btn {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.messages-scroll {
+  touch-action: pan-y;
+}
+
+.messages-scroll .user-text,
+.messages-scroll .md-body {
+  font-size: calc(15px * var(--chat-text-scale, 1));
+}
+
+.messages-scroll .code-pre {
+  font-size: calc(13px * var(--chat-text-scale, 1));
+}
+
+.messages-scroll .md-table-scroll table {
+  font-size: calc(13px * var(--chat-text-scale, 1));
+}
+
+.content-zoom-surface {
+  touch-action: pan-x pan-y;
+  overscroll-behavior: contain;
+}
+
+.content-zoom-surface.is-pannable {
+  cursor: grab;
+}
+
+.content-zoom-surface.is-panning {
+  cursor: grabbing;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.media-zoom-wrap {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: 8px;
+}
+
+.media-zoom-toolbar {
+  justify-content: flex-end;
+}
+
+.media-zoom-scroll {
+  overflow: auto;
+  flex: 1;
+  min-height: 0;
+  background: var(--bg-subtle);
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  -webkit-overflow-scrolling: touch;
+}
+
+.media-zoom-canvas {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: fit-content;
+  min-width: 100%;
+  min-height: 100%;
+  margin: 0 auto;
+}
+
+.media-zoom-img {
+  display: block;
+  border-radius: var(--radius-sm);
+  background: #ffffff;
+  box-shadow: var(--shadow-sm);
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: inherit;
+}
+
+.pdf-viewer-toolbar .btn,
+.media-zoom-toolbar .btn,
+.text-zoom-toolbar .btn {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.text-zoom-wrap {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: 8px;
+}
+
+.text-zoom-toolbar {
+  justify-content: flex-end;
+}
+
+.text-zoom-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  touch-action: pan-x pan-y;
+  -webkit-overflow-scrolling: touch;
+}
+
+.text-zoom-content {
+  min-width: 0;
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.text-zoom-scroll .code-pre {
+  font-size: calc(13px * var(--viewer-text-scale, 1));
+}
+
+.text-zoom-scroll .diff-container {
+  font-size: calc(12.5px * var(--viewer-text-scale, 1));
+}
+
+.text-zoom-scroll .viewer-table-scroll table {
+  font-size: calc(13px * var(--viewer-text-scale, 1));
+}
+
+.text-zoom-scroll .docx-preview,
+.text-zoom-scroll .md-body {
+  font-size: calc(15px * var(--viewer-text-scale, 1));
+}
+
+@media (max-width: 560px) {
+  .header-bar {
+    padding-left: 10px;
+    padding-right: 10px;
+    gap: 4px;
+  }
+  .header-center,
+  .header-right {
+    gap: 4px;
+  }
+  .sync-badge {
+    padding: 2px 6px;
+    font-size: 11px;
+  }
+  .header-center .pill-btn {
+    padding: 5px 8px;
+    gap: 5px;
+    font-size: 12px;
+  }
+  .header-center .pill-mini-bar {
+    width: 24px;
+  }
+  .chat-zoom-pill {
+    top: 8px;
+    right: 10px;
+    gap: 4px;
+    padding: 4px 6px;
+  }
+  .pdf-viewer-toolbar {
+    gap: 6px 8px;
+  }
+  .pdf-toolbar-group {
+    gap: 4px;
+  }
+}
+
+
 
