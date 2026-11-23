@@ -149,10 +149,11 @@ const PdfPageCanvas: React.FC<PdfPageCanvasProps> = React.memo(
     useEffect(() => {
       const el = slotRef.current;
       if (!el) return;
-      if (typeof IntersectionObserver === 'undefined' || !scrollEl) {
+      if (typeof IntersectionObserver === 'undefined') {
         setIsNearViewport(true);
         return;
       }
+      if (!scrollEl) return;
       const io = new IntersectionObserver(
         (entries) => {
           for (const entry of entries) {
