@@ -21,3 +21,5 @@ antigravity-chat-bundle.tar.gz*
 generated_notes.md
 release_notes.md
 builtin-skills/
+playwright-report/
+test-results/
