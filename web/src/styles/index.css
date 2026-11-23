@@ -3499,6 +3499,19 @@ details[open] > .activity-summary > .activity-chevron {
   max-width: min(1240px, calc(100vw - 48px));
   height: min(90dvh, 960px);
 }
+.viewer-body.viewer-body-pdf {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.pptx-viewer-wrap {
+  flex: 1;
+  min-height: 0;
+  gap: 10px;
+}
+.pptx-viewer-wrap > .info-banner {
+  flex-shrink: 0;
+}
 .pdf-viewer-wrap {
   display: flex;
   flex-direction: column;
@@ -3506,22 +3519,66 @@ details[open] > .activity-summary > .activity-chevron {
   min-height: 0;
   gap: 8px;
 }
+.pdf-viewer-toolbar {
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-bottom: 0;
+  flex-shrink: 0;
+}
+.pdf-toolbar-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: nowrap;
+  flex-shrink: 0;
+  max-width: 100%;
+}
+.pdf-page-indicator {
+  min-width: 5.5ch;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.pdf-scale-indicator {
+  min-width: 4.5ch;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.pdf-zoom-step-btn {
+  min-width: 28px;
+  justify-content: center;
+  padding-left: 6px;
+  padding-right: 6px;
+}
 .pdf-canvas-scroll {
   overflow: auto;
-  display: flex;
   flex: 1;
   min-height: 0;
-  justify-content: flex-start;
-  align-items: flex-start;
   background: var(--bg-subtle);
   padding: 12px;
   border-radius: var(--radius-sm);
+  -webkit-overflow-scrolling: touch;
 }
-.pdf-canvas-scroll canvas {
-  margin: auto;
+.pdf-pages-list {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  width: fit-content;
+  min-width: 100%;
+  margin: 0 auto;
+}
+.pdf-page-slot {
+  position: relative;
   flex-shrink: 0;
-  box-shadow: var(--shadow-sm);
   background: #ffffff;
+  box-shadow: var(--shadow-sm);
+}
+.pdf-page-slot canvas {
+  display: block;
 }
 
 .viewer-table-scroll {
@@ -3968,6 +4025,13 @@ details[open] > .activity-summary > .activity-chevron {
   .viewer-modal {
     max-width: 100%;
     height: min(92dvh, calc(var(--app-vh, 100dvh) - 12px));
+  }
+  .viewer-body.viewer-body-pdf {
+    padding: 12px;
+  }
+  .pptx-viewer-wrap > .info-banner {
+    padding: 8px 10px;
+    font-size: 12px;
   }
 }
 

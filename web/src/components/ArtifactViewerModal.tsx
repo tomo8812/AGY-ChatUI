@@ -8,6 +8,7 @@ import { ApiError, api } from '../api/client';
 import type { ArtifactRecord, ProjectRecord } from '../types';
 import {
   computePdfAutoFitScale,
+  findActivePdfPage,
   PDF_MANUAL_MAX_SCALE,
   PDF_MANUAL_MIN_SCALE,
 } from '../utils/pdfFit';
@@ -112,29 +113,148 @@ function drawBitmapToCanvas(
   ctx.drawImage(entry.bitmap, 0, 0);
 }
 
+interface PdfPageSize {
+  width: number;
+  height: number;
+}
+
+const DEFAULT_PDF_PAGE_SIZE: PdfPageSize = { width: 595, height: 842 };
+
+interface PdfPageCanvasProps {
+  url: string;
+  pdfDoc: PdfJsTypes.PDFDocumentProxy;
+  pageNum: number;
+  scale: number;
+  cssWidth: number;
+  cssHeight: number;
+  scrollEl: HTMLDivElement | null;
+  readyToRender: boolean;
+  registerPageEl: (pageNum: number, el: HTMLDivElement | null) => void;
+}
+
+const PdfPageCanvas: React.FC<PdfPageCanvasProps> = React.memo(
+  ({ url, pdfDoc, pageNum, scale, cssWidth, cssHeight, scrollEl, readyToRender, registerPageEl }) => {
+    const slotRef = useRef<HTMLDivElement | null>(null);
+    const canvasRef = useRef<HTMLCanvasElement | null>(null);
+    const [isNearViewport, setIsNearViewport] = useState(pageNum <= 2);
+
+    const setSlotRef = useCallback(
+      (el: HTMLDivElement | null) => {
+        slotRef.current = el;
+        registerPageEl(pageNum, el);
+      },
+      [pageNum, registerPageEl]
+    );
+
+    useEffect(() => {
+      const el = slotRef.current;
+      if (!el) return;
+      if (typeof IntersectionObserver === 'undefined' || !scrollEl) {
+        setIsNearViewport(true);
+        return;
+      }
+      const io = new IntersectionObserver(
+        (entries) => {
+          for (const entry of entries) {
+            if (entry.isIntersecting) {
+              setIsNearViewport(true);
+            }
+          }
+        },
+        { root: scrollEl, rootMargin: '400px 0px' }
+      );
+      io.observe(el);
+      return () => io.disconnect();
+    }, [scrollEl]);
+
+    useEffect(() => {
+      if (!readyToRender || !isNearViewport || !canvasRef.current || scale <= 0) return;
+      let cancelled = false;
+      let activeTask: PdfJsTypes.RenderTask | null = null;
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+      const renderPage = async () => {
+        try {
+          const key = makePdfBitmapKey(url, pageNum, scale, dpr);
+          let cached = pdfPageBitmapCache.get(key);
+          if (!cached) {
+            const rendered = await renderPdfPageToBitmap(pdfDoc, pageNum, scale, dpr, (t) => {
+              activeTask = t;
+            });
+            if (cancelled) {
+              if (typeof ImageBitmap !== 'undefined' && rendered.bitmap instanceof ImageBitmap) {
+                rendered.bitmap.close();
+              }
+              return;
+            }
+            pdfPageBitmapCache.set(key, rendered);
+            cached = rendered;
+          }
+          if (cancelled || !canvasRef.current) return;
+          drawBitmapToCanvas(canvasRef.current, cached);
+        } catch {
+          // ignore abort when zooming or closing quickly
+        }
+      };
+
+      void renderPage();
+      return () => {
+        cancelled = true;
+        activeTask?.cancel();
+      };
+    }, [pdfDoc, url, pageNum, scale, isNearViewport, readyToRender]);
+
+    return (
+      <div
+        ref={setSlotRef}
+        className="pdf-page-slot"
+        data-page-number={pageNum}
+        style={{ width: `${cssWidth}px`, height: `${cssHeight}px` }}
+      >
+        <canvas
+          ref={canvasRef}
+          style={{ width: `${cssWidth}px`, height: `${cssHeight}px` }}
+        />
+      </div>
+    );
+  }
+);
+
 const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
+  const pageElementsRef = useRef<Map<number, HTMLDivElement>>(new Map());
+  const programmaticScrollRef = useRef<{ targetPage: number; expiresAt: number } | null>(null);
+  const scrollRafRef = useRef<number | null>(null);
+
   const [pdfDoc, setPdfDoc] = useState<PdfJsTypes.PDFDocumentProxy | null>(null);
   const [pageNum, setPageNum] = useState(1);
   const [numPages, setNumPages] = useState(0);
   const [fitMode, setFitMode] = useState<'auto' | 'manual'>('auto');
-  const [manualScale, setManualScale] = useState(1.25);
-  const [pageNaturalSize, setPageNaturalSize] = useState<{ width: number; height: number } | null>(null);
+  const [manualScale, setManualScale] = useState(1.0);
+  const [pageSizes, setPageSizes] = useState<Array<PdfPageSize | null>>([]);
   const [containerSize, setContainerSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    scrollRef.current?.scrollTo({ top: 0, left: 0 });
-  }, [pageNum, url]);
+  const setScrollContainerRef = useCallback((el: HTMLDivElement | null) => {
+    scrollRef.current = el;
+    setScrollEl(el);
+  }, []);
+
+  const registerPageEl = useCallback((p: number, el: HTMLDivElement | null) => {
+    if (el) {
+      pageElementsRef.current.set(p, el);
+    } else {
+      pageElementsRef.current.delete(p);
+    }
+  }, []);
 
   useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
+    if (!scrollEl) return;
     const measure = () => {
-      const nextW = Math.round(el.clientWidth);
-      const nextH = Math.round(el.clientHeight);
+      const nextW = Math.round(scrollEl.clientWidth);
+      const nextH = Math.round(scrollEl.clientHeight);
       setContainerSize((prev) =>
         prev.width === nextW && prev.height === nextH ? prev : { width: nextW, height: nextH }
       );
@@ -142,12 +262,12 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
     measure();
     if (typeof ResizeObserver !== 'undefined') {
       const ro = new ResizeObserver(measure);
-      ro.observe(el);
+      ro.observe(scrollEl);
       return () => ro.disconnect();
     }
     window.addEventListener('resize', measure);
     return () => window.removeEventListener('resize', measure);
-  }, [loading, pdfDoc]);
+  }, [scrollEl]);
 
   useEffect(() => {
     let active = true;
@@ -158,7 +278,9 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
     setNumPages(0);
     setPageNum(1);
     setFitMode('auto');
-    setPageNaturalSize(null);
+    setPageSizes([]);
+    programmaticScrollRef.current = null;
+    pageElementsRef.current.clear();
 
     const load = async () => {
       try {
@@ -186,6 +308,7 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
         setPdfDoc(loadedDoc);
         setNumPages(loadedDoc.numPages);
         setPageNum(1);
+        setPageSizes(new Array<PdfPageSize | null>(loadedDoc.numPages).fill(null));
       } catch (err) {
         if (active) setError(err instanceof Error ? err.message : 'PDFの表示に失敗しました');
       } finally {
@@ -201,133 +324,171 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
   }, [url]);
 
   useEffect(() => {
-    if (!pdfDoc) return;
-    let active = true;
-    void pdfDoc
-      .getPage(pageNum)
-      .then((page) => {
-        if (!active) return;
-        const vp = page.getViewport({ scale: 1 });
-        setPageNaturalSize((prev) =>
-          prev && Math.abs(prev.width - vp.width) < 0.5 && Math.abs(prev.height - vp.height) < 0.5
-            ? prev
-            : { width: vp.width, height: vp.height }
-        );
-      })
-      .catch(() => {
-        // ignore page lookup error during teardown
-      });
-    return () => {
-      active = false;
-    };
-  }, [pdfDoc, pageNum]);
-
-  const autoScale = useMemo(
-    () => computePdfAutoFitScale(pageNaturalSize, containerSize),
-    [pageNaturalSize, containerSize]
-  );
-
-  const scale = fitMode === 'auto' ? autoScale : manualScale;
-  const manualMinScale = Math.min(PDF_MANUAL_MIN_SCALE, autoScale);
+    scrollRef.current?.scrollTo({ top: 0, left: 0 });
+  }, [url]);
 
   useEffect(() => {
-    if (!pdfDoc || !canvasRef.current) return;
-    if (fitMode === 'auto' && (!pageNaturalSize || containerSize.width <= 0)) return;
-    let cancelled = false;
-    let activeTask: PdfJsTypes.RenderTask | null = null;
-    let prefetchTimer: number | undefined;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    if (!pdfDoc || numPages <= 0) return;
+    let active = true;
 
-    const drawAndPrefetch = async () => {
+    const loadPageSizes = async () => {
       try {
-        const key = makePdfBitmapKey(url, pageNum, scale, dpr);
-        let cached = pdfPageBitmapCache.get(key);
-        if (!cached) {
-          const rendered = await renderPdfPageToBitmap(pdfDoc, pageNum, scale, dpr, (t) => {
-            activeTask = t;
-          });
-          if (cancelled) {
-            if (typeof ImageBitmap !== 'undefined' && rendered.bitmap instanceof ImageBitmap) {
-              rendered.bitmap.close();
-            }
-            return;
-          }
-          pdfPageBitmapCache.set(key, rendered);
-          cached = rendered;
-        }
-        if (cancelled || !canvasRef.current) return;
-        drawBitmapToCanvas(canvasRef.current, cached);
+        const firstPage = await pdfDoc.getPage(1);
+        if (!active) return;
+        const firstVp = firstPage.getViewport({ scale: 1 });
+        const firstSize: PdfPageSize = { width: firstVp.width, height: firstVp.height };
+        setPageSizes((prev) => {
+          const next = prev.length === numPages ? [...prev] : new Array<PdfPageSize | null>(numPages).fill(null);
+          next[0] = firstSize;
+          return next;
+        });
 
-        // Pre-render adjacent pages sequentially while idle for instant page flipping
-        const neighbors = [pageNum + 1, pageNum - 1].filter((p) => p >= 1 && p <= numPages);
-        if (neighbors.length > 0) {
-          prefetchTimer = window.setTimeout(() => {
-            const runPrefetch = async () => {
-              for (const nPage of neighbors) {
-                if (cancelled) break;
-                const nKey = makePdfBitmapKey(url, nPage, scale, dpr);
-                if (pdfPageBitmapCache.has(nKey)) continue;
-                try {
-                  const rendered = await renderPdfPageToBitmap(pdfDoc, nPage, scale, dpr, (t) => {
-                    activeTask = t;
-                  });
-                  if (cancelled) {
-                    if (typeof ImageBitmap !== 'undefined' && rendered.bitmap instanceof ImageBitmap) {
-                      rendered.bitmap.close();
-                    }
-                    break;
-                  }
-                  pdfPageBitmapCache.set(nKey, rendered);
-                } catch {
-                  // ignore cancelled pre-render
-                }
-              }
-            };
-            void runPrefetch();
-          }, 80);
+        if (numPages <= 1) return;
+        const allSizes: Array<PdfPageSize | null> = new Array<PdfPageSize | null>(numPages).fill(null);
+        allSizes[0] = firstSize;
+        for (let p = 2; p <= numPages; p += 1) {
+          if (!active) return;
+          const page = await pdfDoc.getPage(p);
+          if (!active) return;
+          const vp = page.getViewport({ scale: 1 });
+          allSizes[p - 1] = { width: vp.width, height: vp.height };
+        }
+        if (active) {
+          setPageSizes(allSizes);
         }
       } catch {
-        // ignore abort when flipping pages quickly
+        // ignore page lookup error during teardown
       }
     };
 
-    void drawAndPrefetch();
-
+    void loadPageSizes();
     return () => {
-      cancelled = true;
-      if (prefetchTimer !== undefined) window.clearTimeout(prefetchTimer);
-      activeTask?.cancel();
+      active = false;
     };
-  }, [pdfDoc, url, pageNum, numPages, scale, fitMode, pageNaturalSize, containerSize.width]);
+  }, [pdfDoc, numPages]);
+
+  const fallbackPageSize = pageSizes[0] ?? DEFAULT_PDF_PAGE_SIZE;
+
+  const pageLayouts = useMemo(() => {
+    return Array.from({ length: numPages }, (_, idx) => {
+      const p = idx + 1;
+      const natural = pageSizes[idx] ?? fallbackPageSize;
+      const pageAutoScale = computePdfAutoFitScale(natural, containerSize);
+      const pageScale = fitMode === 'auto' ? pageAutoScale : manualScale;
+      return {
+        pageNum: p,
+        scale: pageScale,
+        autoScale: pageAutoScale,
+        cssWidth: Math.max(1, Math.floor(natural.width * pageScale)),
+        cssHeight: Math.max(1, Math.floor(natural.height * pageScale)),
+      };
+    });
+  }, [numPages, pageSizes, fallbackPageSize, containerSize, fitMode, manualScale]);
+
+  const activeLayout = pageLayouts[Math.max(0, Math.min(pageLayouts.length - 1, pageNum - 1))];
+  const currentAutoScale = activeLayout?.autoScale ?? computePdfAutoFitScale(pageSizes[0] ?? null, containerSize);
+  const scale = fitMode === 'auto' ? currentAutoScale : manualScale;
+  const manualMinScale = Math.min(PDF_MANUAL_MIN_SCALE, currentAutoScale);
+  const readyToRender =
+    Boolean(pdfDoc) &&
+    (fitMode !== 'auto' || (pageSizes[0] !== null && containerSize.width > 0 && containerSize.height > 0));
+
+  const scrollToPage = useCallback(
+    (targetPage: number) => {
+      if (numPages <= 0) return;
+      const clamped = Math.max(1, Math.min(numPages, targetPage));
+      setPageNum(clamped);
+      programmaticScrollRef.current = { targetPage: clamped, expiresAt: performance.now() + 700 };
+      const container = scrollRef.current;
+      const targetEl = pageElementsRef.current.get(clamped);
+      if (container && targetEl) {
+        const containerRect = container.getBoundingClientRect();
+        const targetRect = targetEl.getBoundingClientRect();
+        const paddingTop = parseFloat(window.getComputedStyle(container).paddingTop) || 0;
+        const nextTop = container.scrollTop + (targetRect.top - containerRect.top) - paddingTop;
+        container.scrollTo({ top: Math.max(0, nextTop), behavior: 'smooth' });
+      }
+    },
+    [numPages]
+  );
+
+  const cancelProgrammaticScrollLock = useCallback(() => {
+    programmaticScrollRef.current = null;
+  }, []);
+
+  const handleScroll = useCallback(() => {
+    if (scrollRafRef.current !== null) return;
+    scrollRafRef.current = window.requestAnimationFrame(() => {
+      scrollRafRef.current = null;
+      const container = scrollRef.current;
+      if (!container || numPages <= 0) return;
+
+      const lock = programmaticScrollRef.current;
+      if (lock) {
+        const targetEl = pageElementsRef.current.get(lock.targetPage);
+        const containerRect = container.getBoundingClientRect();
+        const paddingTop = parseFloat(window.getComputedStyle(container).paddingTop) || 0;
+        const reached =
+          targetEl !== undefined &&
+          Math.abs(targetEl.getBoundingClientRect().top - (containerRect.top + paddingTop)) <= 4;
+        if (reached || performance.now() >= lock.expiresAt) {
+          programmaticScrollRef.current = null;
+        } else {
+          return;
+        }
+      }
+
+      const containerRect = container.getBoundingClientRect();
+      const paddingTop = parseFloat(window.getComputedStyle(container).paddingTop) || 0;
+      const rects: Array<{ pageNum: number; top: number; bottom: number }> = [];
+      for (let p = 1; p <= numPages; p += 1) {
+        const el = pageElementsRef.current.get(p);
+        if (!el) continue;
+        const r = el.getBoundingClientRect();
+        rects.push({ pageNum: p, top: r.top, bottom: r.bottom });
+      }
+      if (rects.length === 0) return;
+      const nextActive = findActivePdfPage(containerRect.top, container.clientHeight, paddingTop, rects);
+      setPageNum((prev) => (prev === nextActive ? prev : nextActive));
+    });
+  }, [numPages]);
+
+  useEffect(() => {
+    return () => {
+      if (scrollRafRef.current !== null) {
+        window.cancelAnimationFrame(scrollRafRef.current);
+      }
+    };
+  }, []);
 
   if (loading) return <div className="viewer-state muted-sm">PDFを読み込み中...</div>;
   if (error) return <div className="error-box" role="alert">{error}</div>;
 
   return (
     <div className="pdf-viewer-wrap">
-      <div className="viewer-toolbar">
-        <div className="row-actions">
+      <div className="viewer-toolbar pdf-viewer-toolbar">
+        <div className="pdf-toolbar-group pdf-nav-group">
           <button
             type="button"
             className="btn btn-secondary btn-xs"
             disabled={pageNum <= 1}
-            onClick={() => setPageNum((p) => Math.max(1, p - 1))}
+            onClick={() => scrollToPage(pageNum - 1)}
           >
             <ChevronIcon size={14} dir="left" /> 前
           </button>
-          <span className="muted-xs">
+          <span className="muted-xs pdf-page-indicator">
             {pageNum} / {numPages}
           </span>
           <button
             type="button"
             className="btn btn-secondary btn-xs"
             disabled={pageNum >= numPages}
-            onClick={() => setPageNum((p) => Math.min(numPages, p + 1))}
+            onClick={() => scrollToPage(pageNum + 1)}
           >
             次 <ChevronIcon size={14} dir="right" />
           </button>
         </div>
-        <div className="row-actions">
+        <div className="pdf-toolbar-group pdf-zoom-group">
           <button
             type="button"
             className={`btn btn-secondary btn-xs ${fitMode === 'auto' ? 'active' : ''}`}
@@ -338,7 +499,7 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
           </button>
           <button
             type="button"
-            className="btn btn-secondary btn-xs"
+            className="btn btn-secondary btn-xs pdf-zoom-step-btn"
             aria-label="縮小"
             onClick={() => {
               setFitMode('manual');
@@ -347,10 +508,10 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
           >
             −
           </button>
-          <span className="muted-xs">{Math.round(scale * 100)}%</span>
+          <span className="muted-xs pdf-scale-indicator">{Math.round(scale * 100)}%</span>
           <button
             type="button"
-            className="btn btn-secondary btn-xs"
+            className="btn btn-secondary btn-xs pdf-zoom-step-btn"
             aria-label="拡大"
             onClick={() => {
               setFitMode('manual');
@@ -361,8 +522,30 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
           </button>
         </div>
       </div>
-      <div ref={scrollRef} className="pdf-canvas-scroll">
-        <canvas ref={canvasRef} />
+      <div
+        ref={setScrollContainerRef}
+        className="pdf-canvas-scroll"
+        onScroll={handleScroll}
+        onWheel={cancelProgrammaticScrollLock}
+        onTouchStart={cancelProgrammaticScrollLock}
+      >
+        <div className="pdf-pages-list">
+          {pdfDoc &&
+            pageLayouts.map((layout) => (
+              <PdfPageCanvas
+                key={`${url}:${layout.pageNum}`}
+                url={url}
+                pdfDoc={pdfDoc}
+                pageNum={layout.pageNum}
+                scale={layout.scale}
+                cssWidth={layout.cssWidth}
+                cssHeight={layout.cssHeight}
+                scrollEl={scrollEl}
+                readyToRender={readyToRender}
+                registerPageEl={registerPageEl}
+              />
+            ))}
+        </div>
       </div>
     </div>
   );
@@ -1050,7 +1233,7 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
 
       case 'pptx':
         return (
-          <div className="stack-gap">
+          <div className="stack-gap pptx-viewer-wrap">
             <div className="info-banner">
               プレゼンファイル (.pptx) を確認するには、PDF変換表示または原本ダウンロードをご利用ください。
             </div>
@@ -1198,7 +1381,13 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
           </div>
         </div>
 
-        <div className="modal-body viewer-body">
+        <div
+          className={`modal-body viewer-body${
+            viewMode === 'preview' && (artifact.previewKind === 'pdf' || artifact.previewKind === 'pptx')
+              ? ' viewer-body-pdf'
+              : ''
+          }`}
+        >
           {linkError && (
             <div className="error-box viewer-link-error" role="alert" style={{ marginBottom: 12 }}>
               <span>{linkError}</span>
