@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
-import { FIXTURE_ARTIFACTS, installMockApi } from './fixtures/mockApi';
+import { FIXTURE_ARTIFACTS, FIXTURE_IDS, installMockApi } from './fixtures/mockApi';
 import {
   assertNoLayoutViolations,
   assertUiChromeStable,
@@ -426,6 +426,16 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
       // 8b. CSV Table Viewer (TableViewer)
       await openArtifactByFilename(page, FIXTURE_ARTIFACTS[5].filename);
       await verifyTextViewerZoom('table-viewer', '.text-zoom-scroll .viewer-table-scroll table');
+      await closeActiveModal(page);
+
+      // 8c. DOCX (real OOXML -> Mammoth HTML): scoped text zoom and stable viewer chrome
+      const docxFixture = FIXTURE_ARTIFACTS.find((item) => item.id === FIXTURE_IDS.docxId);
+      expect(docxFixture, `[${vpLabel}] DOCX test artifact must exist`).toBeDefined();
+      await openArtifactByFilename(page, docxFixture!.filename);
+      await expect(page.locator('.text-zoom-scroll .docx-preview p').first()).toContainText(
+        'DOCX viewer zoom fixture'
+      );
+      await verifyTextViewerZoom('docx-viewer', '.text-zoom-scroll .docx-preview p');
       await closeActiveModal(page);
 
       // 9. Quota popover, Skills modal, MCP modal, Settings modal (on representative tightest & widest viewports)
