@@ -1,5 +1,5 @@
-export const VIEWER_MIN_SCALE = 0.25;
-export const VIEWER_MAX_SCALE = 4.0;
+export const VIEWER_MIN_SCALE = 0.2;
+export const VIEWER_MAX_SCALE = 5.0;
 export const VIEWER_DEFAULT_SCALE = 1.0;
 export const VIEWER_AUTO_FIT_MIN_SCALE = 0.05;
 export const VIEWER_AUTO_FIT_MAX_SCALE = 3.0;
