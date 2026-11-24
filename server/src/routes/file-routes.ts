@@ -12,6 +12,19 @@ import {
 } from '../files/workspace.js';
 import { requireAuth, type RouteDeps } from './auth-routes.js';
 
+const SANDBOX_ZOOM_BRIDGE_SCRIPT =
+  '<script>(function(){if(window.__agySandboxZoomBridge)return;window.__agySandboxZoomBridge=1;var p=window.parent;if(!p||p===window)return;var post=function(m){try{p.postMessage(m,"*");}catch(e){}};var active=false;window.addEventListener("wheel",function(e){if(!e.ctrlKey&&!e.metaKey)return;e.preventDefault();post({type:"agy-sandbox-zoom",kind:"wheel",deltaY:e.deltaY,deltaMode:e.deltaMode,localX:e.clientX,localY:e.clientY});},{passive:false,capture:true});var geom=function(t1,t2){var dx=t2.clientX-t1.clientX,dy=t2.clientY-t1.clientY;return{d:Math.hypot(dx,dy),x:(t1.clientX+t2.clientX)/2,y:(t1.clientY+t2.clientY)/2};};window.addEventListener("touchstart",function(e){if(e.touches.length===2){e.preventDefault();active=true;var g=geom(e.touches[0],e.touches[1]);post({type:"agy-sandbox-zoom",kind:"pinch-start",distance:g.d,localX:g.x,localY:g.y});}},{passive:false,capture:true});window.addEventListener("touchmove",function(e){if(e.touches.length===2){e.preventDefault();var g=geom(e.touches[0],e.touches[1]);post({type:"agy-sandbox-zoom",kind:active?"pinch-move":"pinch-start",distance:g.d,localX:g.x,localY:g.y});active=true;}},{passive:false,capture:true});var end=function(e){if(active&&e.touches.length<2){active=false;post({type:"agy-sandbox-zoom",kind:"pinch-end"});}};window.addEventListener("touchend",end,{passive:true,capture:true});window.addEventListener("touchcancel",end,{passive:true,capture:true});var gs=function(e){e.preventDefault();};window.addEventListener("gesturestart",gs,{passive:false,capture:true});window.addEventListener("gesturechange",gs,{passive:false,capture:true});window.addEventListener("gestureend",gs,{passive:false,capture:true});})();</script>';
+
+export function injectSandboxZoomBridge(html: string): string {
+  if (/<\/body>/i.test(html)) {
+    return html.replace(/<\/body>/i, `${SANDBOX_ZOOM_BRIDGE_SCRIPT}</body>`);
+  }
+  if (/<\/html>/i.test(html)) {
+    return html.replace(/<\/html>/i, `${SANDBOX_ZOOM_BRIDGE_SCRIPT}</html>`);
+  }
+  return `${html}${SANDBOX_ZOOM_BRIDGE_SCRIPT}`;
+}
+
 export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps): Promise<void> {
   const { config, db, hub } = deps;
 
@@ -213,7 +226,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const hasMatchingVersion = Boolean(query.v && expectedV && query.v === expectedV && diskMatchesArtifact);
 
     const etag = computeStrongEtag([
-      'sandbox-v1',
+      'sandbox-v2',
       artifact.id,
       artifact.sha256,
       stat.size,
@@ -240,7 +253,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     }
 
     const html = await fs.promises.readFile(absPath, 'utf8');
-    return reply.send(html);
+    return reply.send(injectSandboxZoomBridge(html));
   });
 
   app.post('/api/files/:artifactId/copy-to-project', async (req, reply) => {

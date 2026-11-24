@@ -631,7 +631,7 @@ pre {
 
 /* Sidebar */
 .sidebar {
-  width: 272px;
+  width: clamp(190px, 21vw, 272px);
   flex-shrink: 0;
   background: var(--bg-sidebar);
   border-right: 1px solid var(--border);
@@ -950,7 +950,7 @@ pre {
   padding: calc(8px + env(safe-area-inset-top)) 14px 6px;
   background: var(--bg-canvas);
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) auto minmax(max-content, 1fr);
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
@@ -5246,46 +5246,6 @@ html[data-device-class='mobile-touch'] body {
 .messages-scroll .md-table-scroll,
 .messages-scroll .code-pre {
   touch-action: pan-x pan-y;
-}
-
-/* PC browser zoom stability: keep desktop layout intact without wrapping, clipping, or switching to mobile UI */
-html[data-layout-mode='desktop'][data-browser-zoomed='true'] .sidebar {
-  width: clamp(176px, 22vw, 260px);
-}
-
-html[data-layout-mode='desktop'][data-browser-zoomed='true'] .header-bar {
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  padding-left: 10px;
-  padding-right: 10px;
-  gap: 6px;
-}
-
-html[data-layout-mode='desktop'][data-browser-zoomed='true'] .header-center,
-html[data-layout-mode='desktop'][data-browser-zoomed='true'] .header-right {
-  gap: 5px;
-}
-
-html[data-layout-mode='desktop'][data-browser-zoomed='true'] .sync-badge {
-  padding: 2px 6px;
-  font-size: 11px;
-}
-
-html[data-layout-mode='desktop'][data-browser-zoomed='true'] .header-center .pill-btn {
-  padding: 5px 8px;
-  gap: 5px;
-  font-size: 12px;
-}
-
-html[data-layout-mode='desktop'][data-browser-zoomed='true'] .composer-dock {
-  --composer-inline-padding: 12px;
-}
-
-html[data-layout-mode='desktop'][data-browser-zoomed='true'] .composer-toolbar {
-  gap: 6px;
-}
-
-html[data-layout-mode='desktop'][data-browser-zoomed='true'] .composer-hint {
-  display: none;
 }
 
 /* Unified File Viewer Zoom Surface */

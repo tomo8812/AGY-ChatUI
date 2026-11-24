@@ -3,16 +3,16 @@ import type { StructuredPatch } from 'diff';
 import DOMPurify from 'dompurify';
 import hljs from 'highlight.js';
 import type * as PdfJsTypes from 'pdfjs-dist';
-import React, { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, api } from '../api/client';
 import { useUnifiedViewerZoom } from '../hooks/useUnifiedViewerZoom';
 import type { ArtifactRecord, ProjectRecord } from '../types';
 import {
   clampZoomScale,
   computeMediaAutoFitScale,
+  computeStepZoomScale,
   MEDIA_MAX_SCALE,
   MEDIA_MIN_SCALE,
-  MEDIA_ZOOM_STEP_FACTOR,
 } from '../utils/contentZoom';
 import {
   computePdfAutoFitScale,
@@ -379,6 +379,8 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
     scrollRef.current?.scrollTo({ top: 0, left: 0 });
   }, [url]);
 
+  const pendingSizeAnchorRef = useRef<{ pageNum: number; offsetTop: number } | null>(null);
+
   useEffect(() => {
     if (!pdfDoc || numPages <= 0) return;
     let active = true;
@@ -398,14 +400,43 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
         if (numPages <= 1) return;
         const allSizes: Array<PdfPageSize | null> = new Array<PdfPageSize | null>(numPages).fill(null);
         allSizes[0] = firstSize;
-        for (let p = 2; p <= numPages; p += 1) {
+
+        // Fetch remaining page dimensions in bounded non-blocking batches to keep UI responsive on long PDFs
+        const BATCH_SIZE = 12;
+        for (let start = 2; start <= numPages; start += BATCH_SIZE) {
           if (!active) return;
-          const page = await pdfDoc.getPage(p);
+          const end = Math.min(numPages, start + BATCH_SIZE - 1);
+          const batchNums: number[] = [];
+          for (let p = start; p <= end; p += 1) batchNums.push(p);
+
+          const batchResults = await Promise.all(
+            batchNums.map(async (p) => {
+              const page = await pdfDoc.getPage(p);
+              const vp = page.getViewport({ scale: 1 });
+              return { p, size: { width: vp.width, height: vp.height } as PdfPageSize };
+            })
+          );
           if (!active) return;
-          const vp = page.getViewport({ scale: 1 });
-          allSizes[p - 1] = { width: vp.width, height: vp.height };
+          for (const item of batchResults) {
+            allSizes[item.p - 1] = item.size;
+          }
+          if (end < numPages) {
+            await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+          }
         }
+
         if (active) {
+          // Capture the active page's viewport offset before applying real page sizes so
+          // downstream viewing position never jumps on mixed portrait/landscape PDFs.
+          const sc = scrollRef.current;
+          const anchorPage = pageNumRef.current;
+          const anchorSlot = pageElementsRef.current.get(anchorPage);
+          if (sc && anchorSlot && sc.scrollTop > 0) {
+            pendingSizeAnchorRef.current = {
+              pageNum: anchorPage,
+              offsetTop: anchorSlot.getBoundingClientRect().top - sc.getBoundingClientRect().top,
+            };
+          }
           setPageSizes(allSizes);
         }
       } catch {
@@ -418,6 +449,21 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
       active = false;
     };
   }, [pdfDoc, numPages]);
+
+  // Synchronously preserve scroll anchor when delayed page dimensions commit
+  useLayoutEffect(() => {
+    const anchor = pendingSizeAnchorRef.current;
+    if (!anchor) return;
+    pendingSizeAnchorRef.current = null;
+    const sc = scrollRef.current;
+    const slot = pageElementsRef.current.get(anchor.pageNum);
+    if (!sc || !slot) return;
+    const afterOffsetTop = slot.getBoundingClientRect().top - sc.getBoundingClientRect().top;
+    const delta = afterOffsetTop - anchor.offsetTop;
+    if (Math.abs(delta) > 0.5) {
+      sc.scrollTop = Math.max(0, sc.scrollTop + delta);
+    }
+  }, [pageSizes]);
 
   const fallbackPageSize = pageSizes[0] ?? DEFAULT_PDF_PAGE_SIZE;
 
@@ -725,10 +771,8 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
   });
 
   const applyStepZoom = useCallback(
-    (delta: number) => {
-      commitDiscreteScale((cur) =>
-        clampZoomScale(Math.round((cur + delta) * 100) / 100, manualMinScale, PDF_MANUAL_MAX_SCALE)
-      );
+    (direction: 'in' | 'out') => {
+      commitDiscreteScale((cur) => computeStepZoomScale(cur, direction, manualMinScale, PDF_MANUAL_MAX_SCALE));
     },
     [manualMinScale, commitDiscreteScale]
   );
@@ -791,7 +835,7 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
             type="button"
             className="btn btn-secondary btn-xs pdf-zoom-step-btn"
             aria-label="縮小"
-            onClick={() => applyStepZoom(-0.2)}
+            onClick={() => applyStepZoom('out')}
           >
             −
           </button>
@@ -802,7 +846,7 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
             type="button"
             className="btn btn-secondary btn-xs pdf-zoom-step-btn"
             aria-label="拡大"
-            onClick={() => applyStepZoom(0.2)}
+            onClick={() => applyStepZoom('in')}
           >
             ＋
           </button>
@@ -919,8 +963,8 @@ const MediaZoomViewer: React.FC<MediaZoomViewerProps> = React.memo(({ src, alt, 
   });
 
   const applyStepZoom = useCallback(
-    (factor: number) => {
-      commitDiscreteScale((cur) => clampZoomScale(cur * factor, minScale, MEDIA_MAX_SCALE));
+    (direction: 'in' | 'out') => {
+      commitDiscreteScale((cur) => computeStepZoomScale(cur, direction, minScale, MEDIA_MAX_SCALE));
     },
     [minScale, commitDiscreteScale]
   );
@@ -970,7 +1014,7 @@ const MediaZoomViewer: React.FC<MediaZoomViewerProps> = React.memo(({ src, alt, 
             type="button"
             className="btn btn-secondary btn-xs pdf-zoom-step-btn"
             aria-label="縮小"
-            onClick={() => applyStepZoom(1 / MEDIA_ZOOM_STEP_FACTOR)}
+            onClick={() => applyStepZoom('out')}
           >
             −
           </button>
@@ -981,7 +1025,7 @@ const MediaZoomViewer: React.FC<MediaZoomViewerProps> = React.memo(({ src, alt, 
             type="button"
             className="btn btn-secondary btn-xs pdf-zoom-step-btn"
             aria-label="拡大"
-            onClick={() => applyStepZoom(MEDIA_ZOOM_STEP_FACTOR)}
+            onClick={() => applyStepZoom('in')}
           >
             ＋
           </button>

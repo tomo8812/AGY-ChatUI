@@ -1,10 +1,10 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   clampZoomScale,
+  computeStepZoomScale,
   VIEWER_DEFAULT_SCALE,
   VIEWER_MAX_SCALE,
   VIEWER_MIN_SCALE,
-  VIEWER_ZOOM_STEP_FACTOR,
 } from '../utils/contentZoom';
 import { useUnifiedViewerZoom } from '../hooks/useUnifiedViewerZoom';
 
@@ -104,7 +104,13 @@ export const UnifiedViewerZoomShell: React.FC<UnifiedViewerZoomShellProps> = ({
   const isDefault = Math.abs(scale - VIEWER_DEFAULT_SCALE) < 0.005;
   const isZoomedIn = scale > VIEWER_DEFAULT_SCALE + 0.01;
 
-  const { isPanning, commitDiscreteScale, cancelActiveGesture } = useUnifiedViewerZoom({
+  const {
+    isPanning,
+    commitDiscreteScale,
+    cancelActiveGesture,
+    handleExternalWheel,
+    handleExternalPinch,
+  } = useUnifiedViewerZoom({
     scrollEl,
     stageEl,
     scaleBadgeEl,
@@ -116,9 +122,57 @@ export const UnifiedViewerZoomShell: React.FC<UnifiedViewerZoomShellProps> = ({
     resetKey,
   });
 
+  // Bridge zoom gestures from sandboxed HTML iframes (`sandbox="allow-scripts"`) into the same
+  // unified 3-phase zoom engine without weakening the opaque-origin sandbox boundary.
+  useEffect(() => {
+    if (!fillViewportHeight) return;
+
+    const onMessage = (event: MessageEvent) => {
+      const data = event.data;
+      if (!data || typeof data !== 'object' || data.type !== 'agy-sandbox-zoom') return;
+
+      const iframe = innerRef.current?.querySelector('iframe.html-sandbox-frame') as HTMLIFrameElement | null;
+      if (!iframe || !iframe.contentWindow || event.source !== iframe.contentWindow) return;
+
+      const iframeRect = iframe.getBoundingClientRect();
+      const scaleX = iframe.offsetWidth > 0 ? iframeRect.width / iframe.offsetWidth : 1;
+      const scaleY = iframe.offsetHeight > 0 ? iframeRect.height / iframe.offsetHeight : 1;
+
+      if (data.kind === 'wheel') {
+        const deltaY = Number(data.deltaY);
+        const deltaMode = Number(data.deltaMode) || 0;
+        const localX = Number(data.localX);
+        const localY = Number(data.localY);
+        if (!Number.isFinite(deltaY) || !Number.isFinite(localX) || !Number.isFinite(localY)) return;
+        const clientX = iframeRect.left + localX * scaleX;
+        const clientY = iframeRect.top + localY * scaleY;
+        handleExternalWheel(deltaY, deltaMode, clientX, clientY);
+        return;
+      }
+
+      if (data.kind === 'pinch-start' || data.kind === 'pinch-move') {
+        const distance = Number(data.distance);
+        const localX = Number(data.localX);
+        const localY = Number(data.localY);
+        if (!Number.isFinite(distance) || !Number.isFinite(localX) || !Number.isFinite(localY)) return;
+        const clientX = iframeRect.left + localX * scaleX;
+        const clientY = iframeRect.top + localY * scaleY;
+        handleExternalPinch(data.kind === 'pinch-start' ? 'start' : 'move', distance * scaleX, clientX, clientY);
+        return;
+      }
+
+      if (data.kind === 'pinch-end') {
+        handleExternalPinch('end');
+      }
+    };
+
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, [fillViewportHeight, handleExternalWheel, handleExternalPinch]);
+
   const applyStepZoom = useCallback(
-    (factor: number) => {
-      commitDiscreteScale((cur) => clampZoomScale(cur * factor, VIEWER_MIN_SCALE, VIEWER_MAX_SCALE));
+    (direction: 'in' | 'out') => {
+      commitDiscreteScale((cur) => computeStepZoomScale(cur, direction, VIEWER_MIN_SCALE, VIEWER_MAX_SCALE));
     },
     [commitDiscreteScale]
   );
@@ -176,7 +230,7 @@ export const UnifiedViewerZoomShell: React.FC<UnifiedViewerZoomShellProps> = ({
             type="button"
             className="btn btn-secondary btn-xs pdf-zoom-step-btn"
             aria-label="縮小"
-            onClick={() => applyStepZoom(1 / VIEWER_ZOOM_STEP_FACTOR)}
+            onClick={() => applyStepZoom('out')}
           >
             −
           </button>
@@ -187,7 +241,7 @@ export const UnifiedViewerZoomShell: React.FC<UnifiedViewerZoomShellProps> = ({
             type="button"
             className="btn btn-secondary btn-xs pdf-zoom-step-btn"
             aria-label="拡大"
-            onClick={() => applyStepZoom(VIEWER_ZOOM_STEP_FACTOR)}
+            onClick={() => applyStepZoom('in')}
           >
             ＋
           </button>

@@ -442,7 +442,7 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
       const verifyUnifiedShellViewerZoom = async (
         screenPrefix: string,
         contentSelector: string,
-        useToolbarOnly = false
+        insideIframe = false
       ) => {
         await page.locator(contentSelector).first().waitFor({ state: 'visible' });
         await assertNoLayoutViolations(page, {
@@ -457,8 +457,70 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
           .first()
           .evaluate((el) => el.getBoundingClientRect().width);
 
-        if (useToolbarOnly) {
-          await page.locator('.viewer-zoom-toolbar button[aria-label="拡大"]').click();
+        if (insideIframe) {
+          // Verify sandbox="allow-scripts" security boundary is preserved (no allow-same-origin)
+          const sandboxAttr = await page.locator('iframe.html-sandbox-frame').getAttribute('sandbox');
+          expect(sandboxAttr, `[${vpLabel}] HTML iframe must preserve sandbox="allow-scripts"`).toBe('allow-scripts');
+
+          const frame = page.frameLocator('iframe.html-sandbox-frame');
+          await frame.locator('h1').waitFor({ state: 'visible' });
+
+          if (isIphoneProject) {
+            await frame.locator('body').evaluate((body) => {
+              const r = body.getBoundingClientRect();
+              const cx = r.left + Math.max(80, r.width / 2);
+              const cy = r.top + Math.max(80, r.height / 2);
+              const makeTouch = (id: number, x: number, y: number) => {
+                try {
+                  return new Touch({ identifier: id, target: body, clientX: x, clientY: y, pageX: x, pageY: y });
+                } catch {
+                  return { identifier: id, target: body, clientX: x, clientY: y, pageX: x, pageY: y };
+                }
+              };
+              const send = (type: string, touches: unknown[]) => {
+                let ev: Event;
+                try {
+                  ev = new TouchEvent(type, {
+                    bubbles: true,
+                    cancelable: true,
+                    touches: touches as Touch[],
+                    targetTouches: touches as Touch[],
+                    changedTouches: touches as Touch[],
+                  });
+                } catch {
+                  ev = new Event(type, { bubbles: true, cancelable: true });
+                  Object.defineProperty(ev, 'touches', { value: touches });
+                  Object.defineProperty(ev, 'targetTouches', { value: touches });
+                  Object.defineProperty(ev, 'changedTouches', { value: touches });
+                }
+                body.dispatchEvent(ev);
+              };
+              send('touchstart', [makeTouch(1, cx - 40, cy), makeTouch(2, cx + 40, cy)]);
+              for (const span of [50, 60, 72]) {
+                send('touchmove', [makeTouch(1, cx - span, cy), makeTouch(2, cx + span, cy)]);
+              }
+              send('touchend', []);
+            });
+          } else {
+            await frame.locator('body').evaluate((body) => {
+              const r = body.getBoundingClientRect();
+              const cx = r.left + Math.max(80, r.width / 2);
+              const cy = r.top + Math.max(80, r.height / 2);
+              for (let i = 0; i < 2; i += 1) {
+                body.dispatchEvent(
+                  new WheelEvent('wheel', {
+                    bubbles: true,
+                    cancelable: true,
+                    ctrlKey: true,
+                    deltaY: -120,
+                    deltaMode: 0,
+                    clientX: cx,
+                    clientY: cy,
+                  })
+                );
+              }
+            });
+          }
         } else if (isIphoneProject) {
           await dispatchTouchPinch(page, '.viewer-zoom-scroll', 40, 72);
         } else {
@@ -523,7 +585,7 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
       await verifyUnifiedShellViewerZoom('docx-viewer', '.viewer-zoom-scroll .docx-preview p');
       await closeActiveModal(page);
 
-      // 8d. HTML Sandbox Viewer
+      // 8d. HTML Sandbox Viewer (real Ctrl+Wheel / 2-finger pinch dispatched INSIDE sandboxed iframe)
       const htmlFixture = FIXTURE_ARTIFACTS.find((item) => item.id === FIXTURE_IDS.htmlId);
       expect(htmlFixture, `[${vpLabel}] HTML test artifact must exist`).toBeDefined();
       await openArtifactByFilename(page, htmlFixture!.filename);
@@ -632,13 +694,14 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
       });
       await page.evaluate(() => window.dispatchEvent(new Event('resize')));
       await expect(page.locator('html')).toHaveAttribute('data-layout-mode', 'desktop');
-      await expect(page.locator('html')).toHaveAttribute('data-browser-zoomed', 'true');
+      // Must NOT apply custom zoom-triggered CSS attributes or hide normal UI elements
+      expect(await page.locator('html').getAttribute('data-browser-zoomed')).toBeNull();
 
       // Sidebar must remain visible on the left; mobile hamburger must stay hidden
       const sidebarBox = await page.locator('.sidebar').boundingBox();
       expect(sidebarBox, `Sidebar must remain visible at ${zoom * 100}% PC browser zoom`).not.toBeNull();
       expect(sidebarBox!.x).toBeGreaterThanOrEqual(0);
-      expect(sidebarBox!.width).toBeGreaterThanOrEqual(160);
+      expect(sidebarBox!.width).toBeGreaterThanOrEqual(180);
       await expect(page.locator('button[aria-label="メニューを開く"]')).toBeHidden();
 
       // Zero layout violations (no button wrapping, overlap, clipping, or horizontal overflow)

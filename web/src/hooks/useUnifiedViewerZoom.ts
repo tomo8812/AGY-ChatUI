@@ -46,6 +46,15 @@ export interface UseUnifiedViewerZoomResult {
   ) => void;
   /** Cancel any in-flight preview gesture and clear transforms immediately (e.g. before resetToFit) */
   cancelActiveGesture: () => void;
+  /** Feed a wheel zoom event forwarded from a sandboxed iframe into the same 3-phase zoom engine */
+  handleExternalWheel: (deltaY: number, deltaMode: number, clientX: number, clientY: number) => void;
+  /** Feed a pinch gesture event forwarded from a sandboxed iframe into the same 3-phase zoom engine */
+  handleExternalPinch: (
+    kind: 'start' | 'move' | 'end',
+    distance?: number,
+    clientX?: number,
+    clientY?: number
+  ) => void;
 }
 
 interface ActiveGestureState {
@@ -226,6 +235,14 @@ export function useUnifiedViewerZoom({
     [clearPreviewTransform]
   );
 
+  const externalHandlersRef = useRef<{
+    wheel: (deltaY: number, deltaMode: number, clientX: number, clientY: number) => void;
+    pinch: (kind: 'start' | 'move' | 'end', distance?: number, clientX?: number, clientY?: number) => void;
+  }>({
+    wheel: () => {},
+    pinch: () => {},
+  });
+
   // Gesture event listeners (Wheel Ctrl/Meta + Touch 2-finger pinch + Safari gesture*)
   useEffect(() => {
     if (!scrollEl) return;
@@ -328,24 +345,20 @@ export function useUnifiedViewerZoom({
       commit(finalScale);
     };
 
-    const handleWheel = (e: WheelEvent) => {
-      if (!e.ctrlKey && !e.metaKey) return;
-      e.preventDefault();
-      e.stopPropagation();
-
+    const processWheelZoom = (deltaY: number, deltaMode: number, clientX: number, clientY: number) => {
       const { minScale: minS, maxScale: maxS, wheelSensitivity: sens, wheelCommitDelayMs: delay } = latestRef.current;
 
       let g = gestureRef.current;
       if (!g) {
-        g = beginGesture(e.clientX, e.clientY);
+        g = beginGesture(clientX, clientY);
         if (!g) return;
       }
 
-      const nextScale = computeWheelZoomScale(g.liveScale, e.deltaY, e.deltaMode, minS, maxS, sens);
+      const nextScale = computeWheelZoomScale(g.liveScale, deltaY, deltaMode, minS, maxS, sens);
       if (Math.abs(nextScale - g.liveScale) >= 0.0002) {
         g.liveScale = nextScale;
-        g.curPointerX = e.clientX - g.scrollRectLeft;
-        g.curPointerY = e.clientY - g.scrollRectTop;
+        g.curPointerX = clientX - g.scrollRectLeft;
+        g.curPointerY = clientY - g.scrollRectTop;
         schedulePreviewFrame();
       }
 
@@ -355,17 +368,57 @@ export function useUnifiedViewerZoom({
       wheelCommitTimerRef.current = window.setTimeout(finishGesture, delay);
     };
 
+    const processPinch = (
+      kind: 'start' | 'move' | 'end',
+      distance = 0,
+      centerX = 0,
+      centerY = 0
+    ) => {
+      if (kind === 'end') {
+        if (pinchActive) {
+          pinchActive = false;
+          pinchStartDistance = 0;
+          finishGesture();
+        }
+        return;
+      }
+      if (kind === 'start' || !pinchActive || pinchStartDistance <= 4) {
+        if (distance <= 4) return;
+        pinchActive = true;
+        pinchStartDistance = distance;
+        const g = gestureRef.current ?? beginGesture(centerX, centerY);
+        pinchStartScale = g ? g.liveScale : latestRef.current.committedScale;
+        return;
+      }
+      const g = gestureRef.current;
+      if (!g || distance <= 0) return;
+
+      const { minScale: minS, maxScale: maxS } = latestRef.current;
+      const nextScale = computePinchScale(pinchStartScale, pinchStartDistance, distance, minS, maxS);
+      g.liveScale = nextScale;
+      g.curPointerX = centerX - g.scrollRectLeft;
+      g.curPointerY = centerY - g.scrollRectTop;
+      schedulePreviewFrame();
+    };
+
+    externalHandlersRef.current = {
+      wheel: processWheelZoom,
+      pinch: processPinch,
+    };
+
+    const handleWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      e.stopPropagation();
+      processWheelZoom(e.deltaY, e.deltaMode, e.clientX, e.clientY);
+    };
+
     const handleTouchStart = (e: TouchEvent) => {
       if (e.touches.length === 2) {
         e.preventDefault();
         e.stopPropagation();
         const geom = computeTouchPinchGeometry(e.touches[0], e.touches[1]);
-        if (geom.distance > 4) {
-          pinchActive = true;
-          pinchStartDistance = geom.distance;
-          const g = gestureRef.current ?? beginGesture(geom.centerX, geom.centerY);
-          pinchStartScale = g ? g.liveScale : latestRef.current.committedScale;
-        }
+        processPinch('start', geom.distance, geom.centerX, geom.centerY);
       }
     };
 
@@ -373,32 +426,13 @@ export function useUnifiedViewerZoom({
       if (e.touches.length !== 2) return;
       e.preventDefault();
       e.stopPropagation();
-
       const geom = computeTouchPinchGeometry(e.touches[0], e.touches[1]);
-      if (!pinchActive || pinchStartDistance <= 4) {
-        pinchActive = true;
-        pinchStartDistance = Math.max(geom.distance, 1);
-        const g = gestureRef.current ?? beginGesture(geom.centerX, geom.centerY);
-        pinchStartScale = g ? g.liveScale : latestRef.current.committedScale;
-        return;
-      }
-
-      const g = gestureRef.current;
-      if (!g) return;
-
-      const { minScale: minS, maxScale: maxS } = latestRef.current;
-      const nextScale = computePinchScale(pinchStartScale, pinchStartDistance, geom.distance, minS, maxS);
-      g.liveScale = nextScale;
-      g.curPointerX = geom.centerX - g.scrollRectLeft;
-      g.curPointerY = geom.centerY - g.scrollRectTop;
-      schedulePreviewFrame();
+      processPinch('move', geom.distance, geom.centerX, geom.centerY);
     };
 
     const endPinch = (e: TouchEvent) => {
-      if (pinchActive && e.touches.length < 2) {
-        pinchActive = false;
-        pinchStartDistance = 0;
-        finishGesture();
+      if (e.touches.length < 2) {
+        processPinch('end');
       }
     };
 
@@ -417,6 +451,7 @@ export function useUnifiedViewerZoom({
     scrollEl.addEventListener('gestureend', handleSafariGesture, { passive: false });
 
     return () => {
+      externalHandlersRef.current = { wheel: () => {}, pinch: () => {} };
       scrollEl.removeEventListener('wheel', handleWheel);
       scrollEl.removeEventListener('touchstart', handleTouchStart);
       scrollEl.removeEventListener('touchmove', handleTouchMove);
@@ -428,6 +463,20 @@ export function useUnifiedViewerZoom({
       cancelActiveGesture();
     };
   }, [scrollEl, clearPreviewTransform, cancelActiveGesture]);
+
+  const handleExternalWheel = useCallback(
+    (deltaY: number, deltaMode: number, clientX: number, clientY: number) => {
+      externalHandlersRef.current.wheel(deltaY, deltaMode, clientX, clientY);
+    },
+    []
+  );
+
+  const handleExternalPinch = useCallback(
+    (kind: 'start' | 'move' | 'end', distance?: number, clientX?: number, clientY?: number) => {
+      externalHandlersRef.current.pinch(kind, distance, clientX, clientY);
+    },
+    []
+  );
 
   // PC Mouse drag-to-pan when content overflows the scroll container
   useEffect(() => {
@@ -487,5 +536,7 @@ export function useUnifiedViewerZoom({
     isPanning,
     commitDiscreteScale,
     cancelActiveGesture,
+    handleExternalWheel,
+    handleExternalPinch,
   };
 }

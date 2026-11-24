@@ -38,6 +38,21 @@ export function clampZoomScale(scale: number, min: number, max: number): number 
 }
 
 /**
+ * Shared zoom-in / zoom-out step calculation used uniformly across ALL file viewers
+ * (PDF, PPTX, Image, SVG, DOCX, Markdown, Code, Diff, CSV/Excel, Mermaid, HTML).
+ */
+export function computeStepZoomScale(
+  currentScale: number,
+  direction: 'in' | 'out',
+  min: number,
+  max: number,
+  stepFactor = VIEWER_ZOOM_STEP_FACTOR
+): number {
+  const factor = direction === 'in' ? stepFactor : 1 / stepFactor;
+  return clampZoomScale(currentScale * factor, min, max);
+}
+
+/**
  * Computes the next zoom scale from a wheel event (PC Ctrl+Wheel or trackpad pinch).
  * Trackpad pinch gestures emit wheel events with `ctrlKey: true` and small deltaY values,
  * while discrete mouse wheels emit larger deltaY steps or line-mode deltas.
