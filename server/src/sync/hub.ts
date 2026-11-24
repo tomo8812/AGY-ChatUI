@@ -13,6 +13,7 @@ interface SocketRegistration {
   visible: boolean;
   pushEndpoint: string | null;
   lastVisibleHeartbeatAt: number;
+  lastSentUserSeq: number;
 }
 
 export class SyncHub {
@@ -30,6 +31,7 @@ export class SyncHub {
     clientId: string;
     ws: WebSocket;
     sinceSeq?: number;
+    sinceUserSeq?: number;
   }): () => void {
     const reg: SocketRegistration = {
       userId: params.userId,
@@ -39,6 +41,7 @@ export class SyncHub {
       visible: false,
       pushEndpoint: null,
       lastVisibleHeartbeatAt: 0,
+      lastSentUserSeq: 0,
     };
 
     let set = this.connections.get(params.userId);
@@ -49,7 +52,7 @@ export class SyncHub {
     set.add(reg);
 
     // Send catchup or full-resync instruction scoped strictly to this authenticated userId
-    this.sendReplayHello(reg, params.sinceSeq ?? 0);
+    this.sendReplayHello(reg, params.sinceSeq ?? 0, params.sinceUserSeq);
 
     return () => {
       const current = this.connections.get(params.userId);
@@ -60,6 +63,10 @@ export class SyncHub {
         }
       }
     };
+  }
+
+  getLatestUserSyncSeq(userId: string): number {
+    return this.db.getLatestUserSyncSeq(userId);
   }
 
   updatePresence(params: {
@@ -114,8 +121,17 @@ export class SyncHub {
     return result;
   }
 
-  private sendReplayHello(reg: SocketRegistration, sinceSeq: number): void {
-    const { events, truncated, latestSeq } = this.db.getSyncEventsSince(reg.userId, sinceSeq);
+  private sendReplayHello(reg: SocketRegistration, sinceSeq: number, sinceUserSeq?: number): void {
+    const replay =
+      sinceUserSeq !== undefined
+        ? this.db.getSyncEventsSinceUserSeq(reg.userId, sinceUserSeq)
+        : this.db.getSyncEventsSince(reg.userId, sinceSeq);
+    const { events, truncated, latestSeq, latestUserSeq } = replay;
+    reg.lastSentUserSeq = truncated
+      ? latestUserSeq
+      : events.length > 0
+        ? events[events.length - 1].userSeq
+        : latestUserSeq;
     this.safeSend(reg.ws, {
       kind: 'hello',
       userId: reg.userId,
@@ -123,9 +139,33 @@ export class SyncHub {
       buildId: this.buildId,
       version: this.appVersion,
       latestSeq,
+      latestUserSeq,
       resyncRequired: truncated,
       events: truncated ? [] : events,
     });
+  }
+
+  /** Broadcast an already-persisted outbox event (e.g., committed in ArtifactService Stage T6). */
+  broadcastPersistedEvent(envelope: SyncEventEnvelope): void {
+    const set = this.connections.get(envelope.userId);
+    if (!set || set.size === 0) return;
+    const json = JSON.stringify({
+      kind: 'event',
+      event: envelope,
+    });
+    for (const reg of set) {
+      if (reg.userId !== envelope.userId) continue;
+      if (reg.ws.readyState === 1) {
+        try {
+          reg.ws.send(json);
+          if (envelope.userSeq > reg.lastSentUserSeq) {
+            reg.lastSentUserSeq = envelope.userSeq;
+          }
+        } catch {
+          // cleaned up on close
+        }
+      }
+    }
   }
 
   emitDurable(params: {
@@ -146,10 +186,7 @@ export class SyncHub {
       payload: params.payload,
     });
 
-    this.broadcastToUser(params.userId, {
-      kind: 'event',
-      event: envelope,
-    });
+    this.broadcastPersistedEvent(envelope);
     return envelope;
   }
 

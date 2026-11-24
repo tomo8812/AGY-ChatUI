@@ -2,6 +2,8 @@ node_modules/
 dist/
 server/dist/
 web/dist/
+shared/dist/
+*.tsbuildinfo
 data/
 .env
 .env.*

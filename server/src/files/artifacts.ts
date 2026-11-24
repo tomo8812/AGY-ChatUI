@@ -1,14 +1,10 @@
-import { execFile } from 'node:child_process';
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import { createTwoFilesPatch } from 'diff';
+import type { ArtifactService } from '../artifacts/artifact-service.js';
 import type { AppDatabase } from '../db/database.js';
 import type { ArtifactRecord } from '../types.js';
-import { detectMimeAndPreviewKind, resolveContainedExistingPath, sha256File } from './workspace.js';
-
-const execFileAsync = promisify(execFile);
+import { resolveContainedExistingPath, sha256File } from './workspace.js';
 
 export interface FileSnapshotItem {
   sizeBytes: number;
@@ -71,7 +67,8 @@ export function captureWorkspaceSnapshot(workspaceDir: string): WorkspaceSnapsho
   return snapshot;
 }
 
-export function syncWorkspaceChangesAsArtifacts(params: {
+export async function syncWorkspaceChangesAsArtifacts(params: {
+  artifactService: ArtifactService;
   db: AppDatabase;
   userId: string;
   chatId: string;
@@ -81,7 +78,8 @@ export function syncWorkspaceChangesAsArtifacts(params: {
   before: WorkspaceSnapshot;
   hintPaths?: string[];
   skipIfAlreadyOwnedByOtherMessage?: boolean;
-}): ArtifactRecord[] {
+  onError?: (relPath: string, err: unknown) => void;
+}): Promise<ArtifactRecord[]> {
   const registered: ArtifactRecord[] = [];
   if (!fs.existsSync(params.workspaceDir)) return registered;
   const rootReal = fs.realpathSync(params.workspaceDir);
@@ -105,15 +103,15 @@ export function syncWorkspaceChangesAsArtifacts(params: {
     }
     const existing = params.db.findArtifactByRelPath(params.userId, params.chatId, relPath);
     if (
-      params.skipIfAlreadyOwnedByOtherMessage && !hintSet.has(relPath) &&
-      existing?.messageId && existing.messageId !== params.messageId &&
+      params.skipIfAlreadyOwnedByOtherMessage &&
+      !hintSet.has(relPath) &&
+      existing?.messageId &&
+      existing.messageId !== params.messageId &&
       existing.sha256 === after.sha256
     ) {
       continue;
     }
 
-    const filename = existing?.filename ?? path.basename(relPath);
-    const { mimeType, previewKind } = existing ?? detectMimeAndPreviewKind(filename);
     let diffPatch: string | null = null;
     if (changed && after.textSample !== null && (!prev || prev.textSample !== null)) {
       diffPatch = createTwoFilesPatch(
@@ -127,69 +125,45 @@ export function syncWorkspaceChangesAsArtifacts(params: {
       );
     }
 
-    const record = params.db.upsertArtifact({
-      id: existing?.id ?? crypto.randomUUID(),
-      userId: params.userId,
-      chatId: params.chatId,
-      messageId: params.messageId,
-      runId: params.runId,
-      relPath,
-      filename,
-      mimeType,
-      sizeBytes: after.sizeBytes,
-      sha256: after.sha256,
-      source: isInitialProjectCopy && !changed ? 'project_copy' : 'generated',
-      previewKind,
-      diffPatch,
-      minUpdatedAt: after.mtimeMs,
-    });
-    registered.push(record);
+    // Do NOT pass unlocked `filename`/`mimeType`/`previewKind` derived before acquiring ArtifactLockManager:
+    // `ingestWorkspaceFile` resolves them atomically inside the lock so concurrent inline generated assets
+    // (whose logical filename differs from the hashed relPath basename) are never overwritten.
+    // Isolate per-file ingestion failures so one file's error never aborts other files or corrupts ACP turn state.
+    try {
+      const { artifact } = await params.artifactService.ingestWorkspaceFile({
+        userId: params.userId,
+        chatId: params.chatId,
+        workspaceDir: rootReal,
+        relPath,
+        source: isInitialProjectCopy && !changed ? 'project_copy' : 'generated',
+        messageId: params.messageId,
+        runId: params.runId,
+        diffPatch,
+        emitEvent: false,
+      });
+      registered.push(artifact);
+    } catch (err) {
+      params.onError?.(relPath, err);
+    }
   }
   return registered;
 }
 
 export async function convertPresentationToPdfCached(params: {
-  libreOfficeBin: string;
-  cacheRoot: string;
+  artifactService: ArtifactService;
+  artifactId: string;
+  revision: number;
   sourceAbsPath: string;
+  sourceFilename?: string;
   sourceSha256: string;
+  dependencyManifestHash?: string | null;
 }): Promise<string | null> {
-  const outDir = path.join(params.cacheRoot, params.sourceSha256);
-  fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
-  const base = path.basename(params.sourceAbsPath, path.extname(params.sourceAbsPath));
-  const expectedPdf = path.join(outDir, `${base}.pdf`);
-  if (fs.existsSync(expectedPdf)) {
-    return expectedPdf;
-  }
-
-  const loProfileDir = path.join(outDir, `.lo-profile-${process.pid}-${Date.now()}`);
-  fs.mkdirSync(loProfileDir, { recursive: true, mode: 0o700 });
-  try {
-    await execFileAsync(
-      params.libreOfficeBin,
-      [
-        `-env:UserInstallation=file://${loProfileDir}`,
-        '--headless',
-        '--norestore',
-        '--convert-to',
-        'pdf',
-        '--outdir',
-        outDir,
-        params.sourceAbsPath,
-      ],
-      {
-        timeout: 30_000,
-        env: { ...process.env, SAL_USE_VCLPLUGIN: 'svp' },
-      }
-    );
-    if (fs.existsSync(expectedPdf)) {
-      return expectedPdf;
-    }
-    const found = fs.readdirSync(outDir).find((f) => f.toLowerCase().endsWith('.pdf'));
-    return found ? path.join(outDir, found) : null;
-  } catch {
-    return null;
-  } finally {
-    fs.rmSync(loProfileDir, { recursive: true, force: true });
-  }
+  return params.artifactService.renderCache.renderPresentationToPdf({
+    artifactId: params.artifactId,
+    revision: params.revision,
+    sourceAbsPath: params.sourceAbsPath,
+    sourceFilename: params.sourceFilename,
+    sourceSha256: params.sourceSha256,
+    dependencyManifestHash: params.dependencyManifestHash ?? null,
+  });
 }

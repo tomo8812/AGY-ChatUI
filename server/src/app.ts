@@ -10,21 +10,26 @@ import { AcpClientManager } from './acp/client-manager.js';
 import { ensureAgyProfileSettings } from './acp/profile-settings.js';
 import { QuotaService } from './acp/quota-service.js';
 import { ExecutionScheduler } from './acp/scheduler.js';
+import { ArtifactService } from './artifacts/artifact-service.js';
 import { AgyAuthManager } from './auth/agy-auth.js';
 import { authenticateRequest } from './auth/session.js';
 import { loadConfig, type AppConfig } from './config.js';
 import { AppDatabase } from './db/database.js';
-import { registerAuthRoutes } from './routes/auth-routes.js';
+import { EditRequestService } from './edit-requests/edit-request-service.js';
+import { McpService } from './mcp/mcp-service.js';
+import { PushNotificationService } from './notifications/web-push.js';
+import { RichContentService } from './rich/rich-content-service.js';
+import { registerAuthRoutes, requireAuth } from './routes/auth-routes.js';
 import { registerChatRoutes } from './routes/chat-routes.js';
+import { registerEditRequestRoutes } from './routes/edit-request-routes.js';
 import { registerFileRoutes } from './routes/file-routes.js';
+import { registerMcpRoutes } from './routes/mcp-routes.js';
 import { registerNotificationRoutes } from './routes/notification-routes.js';
 import { registerProjectRoutes } from './routes/project-routes.js';
 import { registerQuotaRoutes } from './routes/quota-routes.js';
+import { registerRichRoutes } from './routes/rich-routes.js';
 import { registerSkillRoutes } from './routes/skill-routes.js';
-import { registerMcpRoutes } from './routes/mcp-routes.js';
-import { McpService } from './mcp/mcp-service.js';
 import { SkillService } from './skills/skill-service.js';
-import { PushNotificationService } from './notifications/web-push.js';
 import { SyncHub } from './sync/hub.js';
 import { loadAppBuildInfo, type AppBuildInfo } from './version.js';
 
@@ -34,6 +39,9 @@ export interface AppContext {
   buildInfo: AppBuildInfo;
   db: AppDatabase;
   hub: SyncHub;
+  artifactService: ArtifactService;
+  richContentService: RichContentService;
+  editRequestService: EditRequestService;
   acp: AcpClientManager;
   agyAuth: AgyAuthManager;
   scheduler: ExecutionScheduler;
@@ -53,6 +61,7 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
     config.projectsRoot,
     config.uploadsRoot,
     config.artifactsCacheRoot,
+    config.artifactHistoryRoot,
   ]) {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
@@ -64,11 +73,16 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
   db.recoverInterruptedRuns();
 
   const hub = new SyncHub(db, buildId, buildInfo.version);
+  const artifactService = new ArtifactService(config, db, hub);
+  await artifactService.recoverOnStartup();
+  const richContentService = new RichContentService(config, db, hub, artifactService);
+  const editRequestService = new EditRequestService(db, hub, artifactService, richContentService);
+
   const pushService = new PushNotificationService(config, db, hub);
   const quotaService = new QuotaService(config, db, hub);
   const skillService = new SkillService(config, db, hub);
   const mcpService = new McpService(config, db, hub);
-  const acp = new AcpClientManager(config, db, hub, skillService, pushService, mcpService);
+  const acp = new AcpClientManager(config, db, hub, artifactService, skillService, pushService, mcpService);
   const agyAuth = new AgyAuthManager(config, db, hub, acp);
   const scheduler = new ExecutionScheduler(config, db, hub, acp, pushService, quotaService);
 
@@ -76,6 +90,7 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
     trustProxy: config.trustProxy,
     bodyLimit: 10 * 1024 * 1024,
     logger: config.nodeEnv === 'test' ? false : { level: 'info' },
+    forceCloseConnections: config.nodeEnv === 'test' ? true : 'idle',
   });
 
   for (const profileDir of db.listAgyProfileDirs()) {
@@ -120,14 +135,33 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
     };
   });
 
-  await registerAuthRoutes(app, { config, db, hub, agyAuth, skillService, mcpService, buildId, buildInfo });
-  await registerProjectRoutes(app, { config, db, hub, agyAuth, acp });
-  await registerChatRoutes(app, { config, db, hub, agyAuth, acp, scheduler, skillService });
-  await registerFileRoutes(app, { config, db, hub, agyAuth });
-  await registerQuotaRoutes(app, { config, db, hub, agyAuth, quotaService });
-  await registerNotificationRoutes(app, { config, db, hub, agyAuth, pushService });
-  await registerSkillRoutes(app, { config, db, hub, agyAuth, skillService, acp });
-  await registerMcpRoutes(app, { config, db, hub, agyAuth, mcpService, acp });
+  // Single-transaction full resync snapshot endpoint (`ARCH-09`)
+  app.get('/api/sync/snapshot', async (req, reply) => {
+    const session = requireAuth(req, reply, db);
+    if (!session) return;
+    return db.getSyncSnapshot(session.user.id);
+  });
+
+  const sharedRouteDeps = {
+    config,
+    db,
+    hub,
+    agyAuth,
+    artifactService,
+    richContentService,
+    editRequestService,
+  };
+
+  await registerAuthRoutes(app, { ...sharedRouteDeps, skillService, mcpService, buildId, buildInfo });
+  await registerProjectRoutes(app, { ...sharedRouteDeps, acp });
+  await registerChatRoutes(app, { ...sharedRouteDeps, acp, scheduler, skillService });
+  await registerFileRoutes(app, sharedRouteDeps);
+  await registerRichRoutes(app, { ...sharedRouteDeps, richContentService });
+  await registerEditRequestRoutes(app, { ...sharedRouteDeps, editRequestService });
+  await registerQuotaRoutes(app, { ...sharedRouteDeps, quotaService });
+  await registerNotificationRoutes(app, { ...sharedRouteDeps, pushService });
+  await registerSkillRoutes(app, { ...sharedRouteDeps, skillService, acp });
+  await registerMcpRoutes(app, { ...sharedRouteDeps, mcpService, acp });
 
   app.get('/api/ws', { websocket: true }, (socket, req) => {
     const session = authenticateRequest(req, db);
@@ -136,8 +170,10 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
       return;
     }
 
-    const query = req.query as { sinceSeq?: string; clientId?: string };
+    const query = req.query as { sinceSeq?: string; sinceUserSeq?: string; clientId?: string };
     const sinceSeq = query.sinceSeq ? Number.parseInt(query.sinceSeq, 10) : 0;
+    const sinceUserSeq =
+      query.sinceUserSeq !== undefined ? Number.parseInt(query.sinceUserSeq, 10) : undefined;
     const clientId = (query.clientId || crypto.randomUUID()).slice(0, 128);
 
     const unregister = hub.registerConnection({
@@ -146,6 +182,10 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
       clientId,
       ws: socket,
       sinceSeq: Number.isFinite(sinceSeq) && sinceSeq > 0 ? sinceSeq : 0,
+      sinceUserSeq:
+        sinceUserSeq !== undefined && Number.isFinite(sinceUserSeq) && sinceUserSeq >= 0
+          ? sinceUserSeq
+          : undefined,
     });
 
     const pingInterval = setInterval(() => {
@@ -169,7 +209,13 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
             socket,
             typeof msg.visible === 'boolean' ? msg.visible : undefined
           );
-          socket.send(JSON.stringify({ kind: 'pong', ts: Date.now() }));
+          socket.send(
+            JSON.stringify({
+              kind: 'pong',
+              ts: Date.now(),
+              latestUserSeq: hub.getLatestUserSyncSeq(session.user.id),
+            })
+          );
         } else if (msg.kind === 'presence') {
           const visible = typeof msg.visible === 'boolean' ? msg.visible : false;
           const pushEndpoint =
@@ -256,6 +302,9 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
     buildInfo,
     db,
     hub,
+    artifactService,
+    richContentService,
+    editRequestService,
     acp,
     agyAuth,
     scheduler,

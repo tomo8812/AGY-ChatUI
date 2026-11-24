@@ -1,9 +1,9 @@
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import mime from 'mime-types';
 import { getChatBrainHostDir, SANDBOX_HOME_MOUNT, SANDBOX_WORKSPACE_MOUNT } from '../acp/env-isolation.js';
+import type { ArtifactService } from '../artifacts/artifact-service.js';
 import type { AppDatabase } from '../db/database.js';
 import { resolveActiveBuiltinSkillsForProfile } from '../skills/builtin-skills.js';
 import type { ArtifactRecord, ChatRecord } from '../types.js';
@@ -297,68 +297,30 @@ function buildArtifactUrls(artifact: ArtifactRecord): { previewUrl: string; down
   };
 }
 
-export function resolveAuthorizedChatFileReference(params: {
+/** Read-only resolution of an authorized chat file path without DB/FS mutation. */
+export function resolveChatFileForReference(params: {
   db: AppDatabase;
   userId: string;
   chatId: string;
   reference: string;
-  label?: string;
-  mimeType?: string | null;
-  messageId?: string;
-  runId?: string;
   builtinSkillsDir?: string | null;
-}): ResolvedWorkspaceLink | null {
+}): ResolvedChatFile | null {
   const { db, userId, chatId } = params;
   const chat = db.getChat(userId, chatId);
   if (!chat) return null;
   const candidate = normalizeLinkCandidatePath(params.reference);
   if (!candidate || candidate === SANDBOX_WORKSPACE_MOUNT) return null;
 
-  const register = (file: ResolvedChatFile | null): ResolvedWorkspaceLink | null => {
-    if (!file) return null;
-    try {
-      const { absPath, relPath } = file;
-      const stat = fs.statSync(absPath);
-      const existing = db.findArtifactByRelPath(userId, chatId, relPath);
-      const filename = existing?.source === 'attachment'
-        ? existing.filename : params.label ?? existing?.filename ?? path.basename(relPath);
-      const { mimeType, previewKind } = params.mimeType && existing?.source !== 'attachment'
-        ? detectContentFileType(filename, params.mimeType)
-        : existing ?? detectMimeAndPreviewKind(path.basename(relPath));
-      const mtimeChanged = !existing || Math.floor(stat.mtimeMs) > existing.updatedAt;
-      const sha256 = path.isAbsolute(relPath) || mtimeChanged || stat.size !== existing?.sizeBytes || stat.size <= 512 * 1024
-        ? sha256File(absPath) : existing.sha256;
-      const artifact = existing && !mtimeChanged && existing.sha256 === sha256 &&
-        existing.sizeBytes === stat.size && existing.filename === filename &&
-        existing.mimeType === mimeType && existing.previewKind === previewKind &&
-        (!params.messageId || existing.messageId === params.messageId)
-        ? existing
-        : db.upsertArtifact({
-          id: existing?.id ?? crypto.randomUUID(),
-          userId, chatId,
-          messageId: params.messageId ?? existing?.messageId ?? null,
-          runId: params.runId ?? existing?.runId ?? null,
-          relPath, filename, mimeType,
-          sizeBytes: stat.size, sha256,
-          source: existing?.source ?? (relPath.startsWith('.project-context/') ? 'project_copy' : 'generated'),
-          previewKind, diffPatch: null, minUpdatedAt: stat.mtimeMs,
-        });
-      return { artifact, ...buildArtifactUrls(artifact) };
-    } catch {
-      return null;
-    }
-  };
-
   const byId = db.getArtifact(userId, candidate);
-  if (byId?.chatId === chatId) return register(resolveArtifactFile(db, chat, byId, params.builtinSkillsDir));
+  if (byId?.chatId === chatId) return resolveArtifactFile(db, chat, byId, params.builtinSkillsDir);
 
   const exact = resolveChatFile(db, chat, candidate, params.builtinSkillsDir);
-  if (exact) return register(exact);
+  if (exact) return exact;
 
   if (!/^file:\/\//i.test(params.reference.trim()) && /%[a-f0-9]{2}/i.test(candidate)) {
     try {
       const decoded = resolveChatFile(db, chat, decodeURIComponent(candidate), params.builtinSkillsDir);
-      if (decoded) return register(decoded);
+      if (decoded) return decoded;
     } catch {
       // A literal percent sign is valid in a raw path.
     }
@@ -371,7 +333,7 @@ export function resolveAuthorizedChatFileReference(params: {
   const legacy = /^generated\/\/brain\/[^/.][^/]*\/([^/]+)$/.exec(workspaceRelative);
   if (legacy && legacy[1] !== '.' && legacy[1] !== '..') {
     const native = resolveChatFile(db, chat, `${SANDBOX_HOME_MOUNT}/.gemini/brain/${legacy[0].slice('generated//brain/'.length)}`);
-    if (native) return register(native);
+    if (native) return native;
     const filename = legacy[1];
     const ext = path.extname(filename);
     const stem = filename.slice(0, filename.length - ext.length);
@@ -392,7 +354,7 @@ export function resolveAuthorizedChatFileReference(params: {
           originalHash ??= sha256File(original.absPath);
           return sha256File(copy.absPath) !== originalHash;
         });
-        if (!hasCollision) return register(resolveChatFile(db, chat, relPath));
+        if (!hasCollision) return resolveChatFile(db, chat, relPath);
       }
     } catch {
       // No legacy workspace file to recover.
@@ -400,4 +362,60 @@ export function resolveAuthorizedChatFileReference(params: {
   }
 
   return null;
+}
+
+export async function resolveAuthorizedChatFileReference(params: {
+  artifactService: ArtifactService;
+  db: AppDatabase;
+  userId: string;
+  chatId: string;
+  reference: string;
+  label?: string;
+  mimeType?: string | null;
+  messageId?: string;
+  runId?: string;
+  builtinSkillsDir?: string | null;
+}): Promise<ResolvedWorkspaceLink | null> {
+  const { artifactService, db, userId, chatId } = params;
+  const chat = db.getChat(userId, chatId);
+  if (!chat) return null;
+  const file = resolveChatFileForReference({
+    db,
+    userId,
+    chatId,
+    reference: params.reference,
+    builtinSkillsDir: params.builtinSkillsDir,
+  });
+  if (!file) return null;
+
+  try {
+    const { absPath, relPath } = file;
+    const existing = db.findArtifactByRelPath(userId, chatId, relPath);
+    const filename =
+      existing?.source === 'attachment'
+        ? existing.filename
+        : params.label ?? existing?.filename ?? path.basename(relPath);
+    const { mimeType, previewKind } =
+      params.mimeType && existing?.source !== 'attachment'
+        ? detectContentFileType(filename, params.mimeType)
+        : existing ?? detectMimeAndPreviewKind(path.basename(relPath));
+
+    const { artifact } = await artifactService.ingestWorkspaceFile({
+      userId,
+      chatId,
+      workspaceDir: chat.workspaceDir,
+      relPath,
+      absPath,
+      filename,
+      mimeType,
+      previewKind,
+      source: existing?.source ?? (relPath.startsWith('.project-context/') ? 'project_copy' : 'generated'),
+      messageId: params.messageId ?? existing?.messageId ?? null,
+      runId: params.runId ?? existing?.runId ?? null,
+      emitEvent: false,
+    });
+    return { artifact, ...buildArtifactUrls(artifact) };
+  } catch {
+    return null;
+  }
 }

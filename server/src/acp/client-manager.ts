@@ -29,6 +29,7 @@ import {
   type SessionUpdate,
   type ToolCall,
 } from '@agentclientprotocol/sdk';
+import type { ArtifactService } from '../artifacts/artifact-service.js';
 import type { AppConfig } from '../config.js';
 import type { AppDatabase } from '../db/database.js';
 import { decryptSmallSecret } from '../auth/password.js';
@@ -43,6 +44,7 @@ import {
   normalizeLinkCandidatePath,
   resolveArtifactFile,
   resolveAuthorizedChatFileReference,
+  resolveChatFileForReference,
 } from '../files/link-resolver.js';
 import {
   detectMimeAndPreviewKind,
@@ -60,6 +62,7 @@ import type { SyncHub } from '../sync/hub.js';
 import type {
   AcpConfigOption,
   AcpSelectOption,
+  ArtifactRecord,
   AttachmentRef,
   AvailableCommandItem,
   ChatRecord,
@@ -470,7 +473,9 @@ interface ActiveTurnBridge {
   pendingResolvers: Map<string, (outcome: RequestPermissionResponse) => void>;
   pendingElicitationResolvers: Map<string, (resp: CreateElicitationResponse) => void>;
   beforeWorkspaceSnap: WorkspaceSnapshot;
-  emittedArtifactIds: Set<string>;
+  emittedArtifactVersions: Map<string, string>;
+  pendingArtifactOps: Promise<void>[];
+  backgroundSyncChain: Promise<void>;
   lastActivityAt: number;
   subagents: Map<string, TrackedSubagentState>;
   asyncSubagentToolIds: Set<string>;
@@ -525,12 +530,51 @@ export class AcpClientManager {
     private readonly config: AppConfig,
     private readonly db: AppDatabase,
     private readonly hub: SyncHub,
+    private readonly artifactService: ArtifactService,
     private readonly skillService?: SkillService,
     private readonly pushService?: PushNotificationService,
     private readonly mcpService?: McpService
   ) {
     this.cleanupTimer = setInterval(() => this.evictIdleWorkers(), 30_000);
     this.cleanupTimer.unref();
+  }
+
+  /**
+   * Read-only query for 2-layer rich block binding (`ACP-01`).
+   * Returns active turn hints ONLY when a single unambiguous parent turn is running with zero
+   * concurrent background bridges or running subagents. Never alters ACP execution.
+   */
+  resolveUnambiguousTurnForMcp(workerKey: string): { assistantMessageId: string; runId: string } | null {
+    const worker = this.workers.get(workerKey);
+    if (!worker || !worker.activeTurn) return null;
+    if (worker.backgroundBridge && worker.backgroundBridge !== worker.activeTurn) return null;
+    if (worker.activeTurn.backgroundWorkCount > 0) return null;
+    for (const sub of worker.activeTurn.subagents.values()) {
+      if (sub.state === 'running' || sub.state === 'requires_action') return null;
+    }
+    return {
+      assistantMessageId: worker.activeTurn.assistantMessageId,
+      runId: worker.activeTurn.runId,
+    };
+  }
+
+  private emitArtifactVersionIfNeeded(
+    bridge: ActiveTurnBridge,
+    artifact: { id: string; revision: number; sha256: string; dependencyManifestHash?: string | null } & Record<string, unknown>,
+    runId: string | null
+  ): void {
+    const versionKey = `${artifact.revision}:${artifact.sha256}:${artifact.dependencyManifestHash ?? ''}`;
+    const prevKey = bridge.emittedArtifactVersions.get(artifact.id);
+    if (prevKey === versionKey) return;
+    bridge.emittedArtifactVersions.set(artifact.id, versionKey);
+    const eventType = prevKey === undefined && artifact.revision <= 1 ? 'artifact.created' : 'artifact.updated';
+    this.hub.emitDurable({
+      userId: bridge.userId,
+      type: eventType,
+      chatId: bridge.chatId,
+      runId,
+      payload: { artifact },
+    });
   }
 
   private getExpectedMcpConfigEpoch(userId: string, chatId: string): number {
@@ -1346,7 +1390,9 @@ export class AcpClientManager {
       pendingResolvers: new Map(),
       pendingElicitationResolvers: new Map(),
       beforeWorkspaceSnap: beforeSnap,
-      emittedArtifactIds: new Set(),
+      emittedArtifactVersions: new Map(),
+      pendingArtifactOps: [],
+      backgroundSyncChain: Promise.resolve(),
       lastActivityAt: nowInit,
       subagents: new Map(),
       asyncSubagentToolIds: new Set(),
@@ -1427,16 +1473,36 @@ export class AcpClientManager {
       const hintPaths = bridge.toolCalls.flatMap(tool => (tool.locations ?? [])
         .map(location => toHostWorkspacePath(worker.workspaceDir, worker.sandboxWorkspaceRoot, location.path)));
 
-      const newArtifacts = syncWorkspaceChangesAsArtifacts({
-        db: this.db,
-        userId: params.userId,
-        chatId: params.chatId,
-        workspaceDir: chat.workspaceDir,
-        messageId: params.assistantMessageId,
-        runId: params.runId,
-        before: beforeSnap,
-        hintPaths,
-      });
+      // ACP transparency (`AGENTS.md`): Antigravity's native prompt response is already complete.
+      // Any ChatUI-side Artifact ingestion/dependency-propagation error MUST be handled strictly as
+      // an Artifact-layer error and NEVER alter the assistant message's ACP completion status or stopReason.
+      let newArtifacts: ArtifactRecord[] = [];
+      const artifactErrors: Array<{ relPath: string | null; message: string }> = [];
+      try {
+        await this.drainPendingArtifactOps(bridge);
+        newArtifacts = await syncWorkspaceChangesAsArtifacts({
+          artifactService: this.artifactService,
+          db: this.db,
+          userId: params.userId,
+          chatId: params.chatId,
+          workspaceDir: chat.workspaceDir,
+          messageId: params.assistantMessageId,
+          runId: params.runId,
+          before: beforeSnap,
+          hintPaths,
+          onError: (relPath, err) => {
+            artifactErrors.push({
+              relPath,
+              message: err instanceof Error ? err.message : String(err),
+            });
+          },
+        });
+      } catch (err) {
+        artifactErrors.push({
+          relPath: null,
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
 
       if (bridge.activity.at(-1)?.kind === 'content') bridge.activity.push({ kind: 'answer_end' });
 
@@ -1447,20 +1513,12 @@ export class AcpClientManager {
         toolCalls: bridge.toolCalls,
         activity: bridge.activity,
         sessionMessages: bridge.sessionMessages,
-        artifactIds: [...new Set([...bridge.emittedArtifactIds, ...newArtifacts.map(a => a.id)])],
+        artifactIds: [...new Set([...bridge.emittedArtifactVersions.keys(), ...newArtifacts.map((a) => a.id)])],
         status: finalStatus,
       })!;
 
       for (const art of newArtifacts) {
-        if (bridge.emittedArtifactIds.has(art.id)) continue;
-        bridge.emittedArtifactIds.add(art.id);
-        this.hub.emitDurable({
-          userId: params.userId,
-          type: 'artifact.created',
-          chatId: params.chatId,
-          runId: params.runId,
-          payload: { artifact: art },
-        });
+        this.emitArtifactVersionIfNeeded(bridge, art as unknown as { id: string; revision: number; sha256: string; dependencyManifestHash?: string | null } & Record<string, unknown>, params.runId);
       }
 
       this.hub.emitDurable({
@@ -1471,33 +1529,51 @@ export class AcpClientManager {
         payload: { message: updatedMsg },
       });
 
-      const afterSkillsSig = captureWorkspaceSkillsSignature(chat.workspaceDir);
-      if (afterSkillsSig !== beforeSkillsSig && this.skillService) {
-        const refreshed = this.enrichParsedOptions(params.userId, worker.parsedOptions, {
-          projectId: chat.projectId,
-          chatId: params.chatId,
-        });
-        worker.parsedOptions = refreshed;
+      if (artifactErrors.length > 0) {
         this.hub.emitDurable({
           userId: params.userId,
-          type: 'skills.updated',
-          projectId: chat.projectId,
+          type: 'artifact.sync_error',
           chatId: params.chatId,
+          runId: params.runId,
           payload: {
-            scope: 'workspace',
+            chatId: params.chatId,
+            messageId: params.assistantMessageId,
+            errors: artifactErrors,
+          },
+        });
+      }
+
+      try {
+        const afterSkillsSig = captureWorkspaceSkillsSignature(chat.workspaceDir);
+        if (afterSkillsSig !== beforeSkillsSig && this.skillService) {
+          const refreshed = this.enrichParsedOptions(params.userId, worker.parsedOptions, {
             projectId: chat.projectId,
             chatId: params.chatId,
-          },
-        });
-        this.hub.emitDurable({
-          userId: params.userId,
-          type: 'chat.commands_updated',
-          chatId: params.chatId,
-          payload: {
-            availableCommands: refreshed.availableCommands ?? [],
-            sessionOptions: refreshed,
-          },
-        });
+          });
+          worker.parsedOptions = refreshed;
+          this.hub.emitDurable({
+            userId: params.userId,
+            type: 'skills.updated',
+            projectId: chat.projectId,
+            chatId: params.chatId,
+            payload: {
+              scope: 'workspace',
+              projectId: chat.projectId,
+              chatId: params.chatId,
+            },
+          });
+          this.hub.emitDurable({
+            userId: params.userId,
+            type: 'chat.commands_updated',
+            chatId: params.chatId,
+            payload: {
+              availableCommands: refreshed.availableCommands ?? [],
+              sessionOptions: refreshed,
+            },
+          });
+        }
+      } catch {
+        // Non-fatal post-turn skills refresh error must not alter completed ACP response
       }
 
       return { stopReason: response.stopReason };
@@ -2266,11 +2342,30 @@ export class AcpClientManager {
       const identity = crypto.createHash('sha256').update(JSON.stringify([filename, mimeType, hash])).digest('hex');
       const storageStem = [...stem].slice(0, 32).join('');
       const target = resolveContainedWriteTarget(worker.workspaceDir, `generated/${storageStem}-${identity}${suffix}`);
-      fs.mkdirSync(path.dirname(target.absPath), { recursive: true, mode: 0o700 });
-      if (!fs.existsSync(target.absPath) || sha256File(target.absPath) !== hash) {
-        fs.writeFileSync(target.absPath, data);
-      }
-      this.publishArtifactReference(turn, target.relPath, filename, mimeType);
+      // Synchronously kick off ArtifactService write so ArtifactLockManager reserves the path lock immediately
+      // before run.delta is emitted, while preserving exact ACP streaming chunk order.
+      const op = this.artifactService
+        .saveInlineGeneratedAsset({
+          userId: turn.userId,
+          chatId: turn.chatId,
+          relPath: target.relPath,
+          filename,
+          mimeType,
+          data,
+          messageId: turn.assistantMessageId,
+          runId: turn.runId,
+        })
+        .then(({ artifact }) => {
+          this.emitArtifactVersionIfNeeded(
+            turn,
+            artifact as unknown as { id: string; revision: number; sha256: string; dependencyManifestHash?: string | null } & Record<string, unknown>,
+            turn.runId
+          );
+        })
+        .catch(() => {
+          // Non-fatal during streaming; final workspace sync will reconcile if needed
+        });
+      turn.pendingArtifactOps.push(op);
       return target.relPath;
     } catch {
       return null;
@@ -2318,7 +2413,17 @@ export class AcpClientManager {
   }
 
   private publishArtifactReference(turn: ActiveTurnBridge, reference: string, label?: string, mimeType?: string | null): boolean {
-    const resolved = resolveAuthorizedChatFileReference({
+    const file = resolveChatFileForReference({
+      db: this.db,
+      userId: turn.userId,
+      chatId: turn.chatId,
+      reference,
+      builtinSkillsDir: this.config.builtinSkillsDir,
+    });
+    if (!file) return false;
+
+    const op = resolveAuthorizedChatFileReference({
+      artifactService: this.artifactService,
       db: this.db,
       userId: turn.userId,
       chatId: turn.chatId,
@@ -2328,19 +2433,20 @@ export class AcpClientManager {
       label,
       mimeType,
       builtinSkillsDir: this.config.builtinSkillsDir,
-    });
-    if (!resolved) return false;
-    const { artifact } = resolved;
-    if (!turn.emittedArtifactIds.has(artifact.id)) {
-      turn.emittedArtifactIds.add(artifact.id);
-      this.hub.emitDurable({
-        userId: turn.userId,
-        chatId: turn.chatId,
-        runId: turn.runId,
-        type: 'artifact.created',
-        payload: { artifact },
+    })
+      .then((resolved) => {
+        if (!resolved) return;
+        const { artifact } = resolved;
+        this.emitArtifactVersionIfNeeded(
+          turn,
+          artifact as unknown as { id: string; revision: number; sha256: string; dependencyManifestHash?: string | null } & Record<string, unknown>,
+          turn.runId
+        );
+      })
+      .catch(() => {
+        // Non-fatal during streaming
       });
-    }
+    turn.pendingArtifactOps.push(op);
     return true;
   }
 
@@ -2859,7 +2965,17 @@ export class AcpClientManager {
       pendingResolvers: new Map(),
       pendingElicitationResolvers: new Map(),
       beforeWorkspaceSnap,
-      emittedArtifactIds: new Set(latestAssistant.artifactIds),
+      emittedArtifactVersions: new Map(
+        latestAssistant.artifactIds.map((id) => {
+          const existing = this.db.getArtifact(worker.userId, id);
+          return [
+            id,
+            existing ? `${existing.revision}:${existing.sha256}:${existing.dependencyManifestHash ?? ''}` : '0::',
+          ];
+        })
+      ),
+      pendingArtifactOps: [],
+      backgroundSyncChain: Promise.resolve(),
       lastActivityAt: Date.now(),
       subagents: new Map(),
       asyncSubagentToolIds: new Set(),
@@ -2879,51 +2995,77 @@ export class AcpClientManager {
     return bridge;
   }
 
-  private syncBackgroundWorkspaceArtifacts(
+  private async drainPendingArtifactOps(bridge: ActiveTurnBridge): Promise<void> {
+    while (bridge.pendingArtifactOps.length > 0) {
+      const batch = bridge.pendingArtifactOps.splice(0, bridge.pendingArtifactOps.length);
+      await Promise.allSettled(batch);
+    }
+  }
+
+  private async syncBackgroundWorkspaceArtifacts(
     worker: WorkerInstance,
     bridge: ActiveTurnBridge
-  ): void {
+  ): Promise<void> {
     if (worker.activeTurn && worker.activeTurn !== bridge) {
       return;
     }
-    const newArtifacts = syncWorkspaceChangesAsArtifacts({
-      db: this.db,
-      userId: worker.userId,
-      chatId: worker.chatId,
-      workspaceDir: worker.workspaceDir,
-      messageId: bridge.assistantMessageId,
-      runId: bridge.runId || null,
-      before: bridge.beforeWorkspaceSnap,
-      skipIfAlreadyOwnedByOtherMessage: true,
-    });
+    const artifactErrors: Array<{ relPath: string | null; message: string }> = [];
+    let newArtifacts: ArtifactRecord[] = [];
+    try {
+      await this.drainPendingArtifactOps(bridge);
+      newArtifacts = await syncWorkspaceChangesAsArtifacts({
+        artifactService: this.artifactService,
+        db: this.db,
+        userId: worker.userId,
+        chatId: worker.chatId,
+        workspaceDir: worker.workspaceDir,
+        messageId: bridge.assistantMessageId,
+        runId: bridge.runId || null,
+        before: bridge.beforeWorkspaceSnap,
+        skipIfAlreadyOwnedByOtherMessage: true,
+        onError: (relPath, err) => {
+          artifactErrors.push({
+            relPath,
+            message: err instanceof Error ? err.message : String(err),
+          });
+        },
+      });
+    } catch (err) {
+      artifactErrors.push({
+        relPath: null,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
     for (const art of newArtifacts) {
-      if (bridge.emittedArtifactIds.has(art.id)) continue;
-      bridge.emittedArtifactIds.add(art.id);
+      this.emitArtifactVersionIfNeeded(
+        bridge,
+        art as unknown as { id: string; revision: number; sha256: string; dependencyManifestHash?: string | null } & Record<string, unknown>,
+        bridge.runId || null
+      );
+    }
+    if (artifactErrors.length > 0) {
       this.hub.emitDurable({
         userId: worker.userId,
-        type: 'artifact.created',
+        type: 'artifact.sync_error',
         chatId: worker.chatId,
         runId: bridge.runId || null,
-        payload: { artifact: art },
+        payload: {
+          chatId: worker.chatId,
+          messageId: bridge.assistantMessageId,
+          errors: artifactErrors,
+        },
       });
     }
   }
 
-  private flushBackgroundBridgeToMessage(
-    worker: WorkerInstance,
-    bridge: ActiveTurnBridge,
-    syncArtifacts = false
-  ): void {
-    if (syncArtifacts) {
-      this.syncBackgroundWorkspaceArtifacts(worker, bridge);
-    }
+  private persistAndBroadcastBackgroundMessage(worker: WorkerInstance, bridge: ActiveTurnBridge): void {
     const updated = this.db.updateMessage(worker.userId, bridge.assistantMessageId, {
       contentText: bridge.contentText,
       thoughtsText: bridge.thoughtsText,
       toolCalls: bridge.toolCalls,
       activity: bridge.activity,
       sessionMessages: bridge.sessionMessages,
-      artifactIds: [...bridge.emittedArtifactIds],
+      artifactIds: [...bridge.emittedArtifactVersions.keys()],
     });
     if (updated) {
       this.hub.emitDurable({
@@ -2934,6 +3076,25 @@ export class AcpClientManager {
         payload: { message: updated },
       });
     }
+  }
+
+  private flushBackgroundBridgeToMessage(
+    worker: WorkerInstance,
+    bridge: ActiveTurnBridge,
+    syncArtifacts = false
+  ): void {
+    if (!syncArtifacts) {
+      this.persistAndBroadcastBackgroundMessage(worker, bridge);
+      return;
+    }
+    bridge.backgroundSyncChain = bridge.backgroundSyncChain
+      .then(async () => {
+        await this.syncBackgroundWorkspaceArtifacts(worker, bridge);
+        this.persistAndBroadcastBackgroundMessage(worker, bridge);
+      })
+      .catch(() => {
+        this.persistAndBroadcastBackgroundMessage(worker, bridge);
+      });
   }
 
   private handleSessionNotification(worker: WorkerInstance, params: SessionNotification): void {

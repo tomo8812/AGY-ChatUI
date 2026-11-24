@@ -3,15 +3,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { isArtifactError } from '../artifacts/errors.js';
 import { computeStrongEtag, formatHttpDate, isFreshRequest } from '../files/http-cache.js';
-import {
-  detectMimeAndPreviewKind,
-  resolveContainedExistingPath,
-  resolveContainedWriteTarget,
-  sanitizeFileName,
-} from '../files/workspace.js';
+import { resolveContainedExistingPath, sanitizeFileName } from '../files/workspace.js';
 import type { AcpClientManager } from '../acp/client-manager.js';
-import { requireAuth, type RouteDeps } from './auth-routes.js';
+import { buildLiveSessionAuthVerifier, requireAuth, type RouteDeps } from './auth-routes.js';
 
 export interface ProjectRouteDeps extends RouteDeps {
   acp?: AcpClientManager;
@@ -30,7 +26,7 @@ const patchProjectSchema = z.object({
 });
 
 export async function registerProjectRoutes(app: FastifyInstance, deps: ProjectRouteDeps): Promise<void> {
-  const { config, db, hub, acp } = deps;
+  const { config, db, hub, acp, artifactService } = deps;
 
   app.get('/api/projects', async (req, reply) => {
     const session = requireAuth(req, reply, db);
@@ -118,21 +114,22 @@ export async function registerProjectRoutes(app: FastifyInstance, deps: ProjectR
     const session = requireAuth(req, reply, db);
     if (!session) return;
     const { projectId } = req.params as { projectId: string };
-    const existing = db.getProject(session.user.id, projectId);
-    if (!existing) return reply.code(404).send({ error: 'NOT_FOUND', message: 'プロジェクトが見つかりません。' });
-    const affectedChatIds = db.listChatIdsForProject(session.user.id, projectId);
-    db.deleteProject(session.user.id, projectId);
-    fs.rmSync(path.dirname(existing.storageDir), { recursive: true, force: true });
-    if (affectedChatIds.length > 0) {
-      await acp?.stopIdleWorkersForChats(session.user.id, affectedChatIds);
+    try {
+      const { affectedChatIds } = await artifactService.deleteProject({
+        userId: session.user.id,
+        projectId,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
+      });
+      if (affectedChatIds.length > 0) {
+        await acp?.stopIdleWorkersForChats(session.user.id, affectedChatIds);
+      }
+      return { ok: true };
+    } catch (err) {
+      if (isArtifactError(err)) {
+        return reply.code(err.statusCode).send({ error: err.code, message: err.message, details: err.details });
+      }
+      throw err;
     }
-    hub.emitDurable({
-      userId: session.user.id,
-      type: 'project.deleted',
-      projectId,
-      payload: { projectId },
-    });
-    return { ok: true };
   });
 
   app.post('/api/projects/:projectId/files', async (req, reply) => {
@@ -141,31 +138,29 @@ export async function registerProjectRoutes(app: FastifyInstance, deps: ProjectR
     const { projectId } = req.params as { projectId: string };
     const project = db.getProject(session.user.id, projectId);
     if (!project) return reply.code(404).send({ error: 'NOT_FOUND', message: 'プロジェクトが見つかりません。' });
+    const assertAuthorized = buildLiveSessionAuthVerifier(req, db, session.user.id);
 
-    fs.mkdirSync(project.storageDir, { recursive: true, mode: 0o700 });
     const uploaded: unknown[] = [];
-
-    for await (const part of req.parts()) {
-      if (part.type !== 'file') continue;
-      const filename = sanitizeFileName(part.filename || 'file.bin');
-      const target = resolveContainedWriteTarget(project.storageDir, filename);
-      const buf = await part.toBuffer();
-      await fs.promises.writeFile(target.absPath, buf);
-      const { mimeType } = detectMimeAndPreviewKind(filename, part.mimetype);
-      const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
-
-      const { file } = db.upsertProjectFile({
-        id: crypto.randomUUID(),
-        projectId: project.id,
-        userId: session.user.id,
-        relPath: target.relPath,
-        filename,
-        mimeType,
-        sizeBytes: buf.length,
-        sha256,
-        createdAt: Date.now(),
-      });
-      uploaded.push(file);
+    try {
+      for await (const part of req.parts()) {
+        if (part.type !== 'file') continue;
+        const filename = sanitizeFileName(part.filename || 'file.bin');
+        const buf = await part.toBuffer();
+        const { file } = await artifactService.uploadProjectFile({
+          userId: session.user.id,
+          projectId: project.id,
+          filename,
+          mimeType: part.mimetype,
+          buffer: buf,
+          assertAuthorized,
+        });
+        uploaded.push(file);
+      }
+    } catch (err) {
+      if (isArtifactError(err)) {
+        return reply.code(err.statusCode).send({ error: err.code, message: err.message, details: err.details });
+      }
+      throw err;
     }
 
     if (uploaded.length === 0) {
@@ -174,12 +169,6 @@ export async function registerProjectRoutes(app: FastifyInstance, deps: ProjectR
 
     const latestProject = db.getProject(session.user.id, projectId)!;
     const full = { ...latestProject, files: db.listProjectFiles(session.user.id, projectId) };
-    hub.emitDurable({
-      userId: session.user.id,
-      type: 'project.updated',
-      projectId,
-      payload: { project: full },
-    });
     return reply.code(201).send({ project: full, uploaded });
   });
 
@@ -187,28 +176,50 @@ export async function registerProjectRoutes(app: FastifyInstance, deps: ProjectR
     const session = requireAuth(req, reply, db);
     if (!session) return;
     const { projectId, fileId } = req.params as { projectId: string; fileId: string };
-    const project = db.getProject(session.user.id, projectId);
-    if (!project) return reply.code(404).send({ error: 'NOT_FOUND', message: 'プロジェクトが見つかりません。' });
-
-    const { deleted } = db.deleteProjectFile(session.user.id, projectId, fileId);
-    if (!deleted) return reply.code(404).send({ error: 'NOT_FOUND', message: 'ファイルが見つかりません。' });
-
     try {
-      const { absPath } = resolveContainedExistingPath(project.storageDir, deleted.relPath);
-      fs.rmSync(absPath, { force: true });
-    } catch {
-      // ignore if already absent
+      const { project: full } = await artifactService.deleteProjectFile({
+        userId: session.user.id,
+        projectId,
+        fileId,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
+      });
+      return { project: full };
+    } catch (err) {
+      if (isArtifactError(err)) {
+        return reply.code(err.statusCode).send({ error: err.code, message: err.message });
+      }
+      throw err;
+    }
+  });
+
+  app.post('/api/projects/:projectId/files/:fileId/working-copy', async (req, reply) => {
+    const session = requireAuth(req, reply, db);
+    if (!session) return;
+    const { projectId, fileId } = req.params as { projectId: string; fileId: string };
+    const parsed = z.object({ chatId: z.string().min(1) }).safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'INVALID_INPUT' });
+
+    const pf = db.getProjectFileById(session.user.id, projectId, fileId);
+    const projArtId = pf?.artifactId ?? db.findProjectArtifactByRelPath(session.user.id, projectId, pf?.relPath ?? '')?.id;
+    if (!projArtId) {
+      return reply.code(404).send({ error: 'NOT_FOUND', message: 'プロジェクト原本ファイルが見つかりません。' });
     }
 
-    const updated = db.getProject(session.user.id, projectId)!;
-    const full = { ...updated, files: db.listProjectFiles(session.user.id, projectId) };
-    hub.emitDurable({
-      userId: session.user.id,
-      type: 'project.updated',
-      projectId,
-      payload: { project: full },
-    });
-    return { project: full };
+    try {
+      const result = await artifactService.createProjectWorkingCopyInChat({
+        userId: session.user.id,
+        projectId,
+        projectArtifactId: projArtId,
+        chatId: parsed.data.chatId,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
+      });
+      return reply.code(201).send(result);
+    } catch (err) {
+      if (isArtifactError(err)) {
+        return reply.code(err.statusCode).send({ error: err.code, message: err.message, details: err.details });
+      }
+      throw err;
+    }
   });
 
   app.get('/api/projects/:projectId/files/:fileId/content', async (req, reply) => {
