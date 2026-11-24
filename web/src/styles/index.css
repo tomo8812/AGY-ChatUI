@@ -4248,22 +4248,22 @@ html[data-layout-mode='mobile'] .header-bar {
   margin-bottom: 0;
 }
 
-html[data-layout-mode='mobile'] .skills-body {
-    display: flex;
-    flex-direction: column;
-  }
-  html[data-layout-mode='mobile'] .skills-body:not(.mobile-editor) .skills-editor-pane {
-    display: none;
-  }
-  html[data-layout-mode='mobile'] .skills-body.mobile-editor .skills-list-pane {
-    display: none;
-  }
-  html[data-layout-mode='mobile'] .mobile-back-btn {
-    display: inline-flex;
-  }
-  html[data-layout-mode='mobile'] .mcp-grid-2 {
-    grid-template-columns: 1fr;
-  }
+html[data-layout-narrow='true'] .skills-body {
+  display: flex;
+  flex-direction: column;
+}
+html[data-layout-narrow='true'] .skills-body:not(.mobile-editor) .skills-editor-pane {
+  display: none;
+}
+html[data-layout-narrow='true'] .skills-body.mobile-editor .skills-list-pane {
+  display: none;
+}
+html[data-layout-narrow='true'] .mobile-back-btn {
+  display: inline-flex;
+}
+html[data-layout-narrow='true'] .mcp-grid-2 {
+  grid-template-columns: 1fr;
+}
 
 /* ---- UI/UX & Accessibility Containment Fixes ---- */
 

@@ -42,6 +42,7 @@ export interface LayoutModeTrackerState {
 
 export interface LayoutModeSnapshot {
   mode: LayoutMode;
+  narrow: boolean;
   compact: boolean;
   short: boolean;
   browserZoomFactor: number;
@@ -119,6 +120,7 @@ export function resolveLayoutMode(
   if (input.isTouchMobile) {
     return {
       mode: 'mobile',
+      narrow: iw <= 760,
       compact: iw <= 560,
       short: ih <= 560 || iw <= 480,
       browserZoomFactor: 1,
@@ -181,6 +183,7 @@ export function resolveLayoutMode(
 
   return {
     mode: effectiveWidth <= 860 ? 'mobile' : 'desktop',
+    narrow: effectiveWidth <= 760,
     compact: effectiveWidth <= 560,
     short: effectiveHeight <= 560 || effectiveWidth <= 480,
     browserZoomFactor: Math.round(clampedZoom * 100) / 100,
@@ -219,6 +222,12 @@ export function applyLayoutModeToDocument(snapshot?: LayoutModeSnapshot): Layout
   const root = document.documentElement;
   root.dataset.layoutMode = next.mode;
   root.dataset.deviceClass = next.isTouchMobile ? 'mobile-touch' : 'desktop';
+
+  if (next.narrow) {
+    root.dataset.layoutNarrow = 'true';
+  } else {
+    delete root.dataset.layoutNarrow;
+  }
 
   if (next.compact) {
     root.dataset.layoutCompact = 'true';
