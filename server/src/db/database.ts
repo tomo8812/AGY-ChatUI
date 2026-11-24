@@ -397,6 +397,8 @@ export class AppDatabase {
         operation_summary TEXT NOT NULL,
         operation_payload_json TEXT,
         batch_id TEXT,
+        batch_seq INTEGER,
+        staging_isolation_mode TEXT,
         idempotency_scope_key TEXT,
         idempotency_key TEXT,
         request_fingerprint TEXT,
@@ -851,6 +853,14 @@ export class AppDatabase {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_events_user_user_seq
         ON sync_events(user_id, user_seq) WHERE user_seq > 0;
     `);
+
+    const journalCols = this.db.prepare('PRAGMA table_info(artifact_commit_journal)').all() as Array<{ name: string }>;
+    if (!journalCols.some((col) => col.name === 'batch_seq')) {
+      this.db.exec('ALTER TABLE artifact_commit_journal ADD COLUMN batch_seq INTEGER;');
+    }
+    if (!journalCols.some((col) => col.name === 'staging_isolation_mode')) {
+      this.db.exec('ALTER TABLE artifact_commit_journal ADD COLUMN staging_isolation_mode TEXT;');
+    }
   }
 
   recoverInterruptedRuns(): void {

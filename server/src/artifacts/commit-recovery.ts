@@ -22,7 +22,6 @@ export interface CommitRecoveryHost {
   db: AppDatabase;
   hub: SyncHub;
   blobManager: PerUserBlobManager;
-  getStagingIsolation(): StagingIsolationKind;
   resolveScopeRootDir(userId: string, scopeKind: ArtifactScopeKind, chatId: string | null, projectId: string | null): string | null;
   finalizeStageT6InTx(journal: ArtifactCommitJournalRow, opts?: { suppressDependencyPropagation?: boolean }): {
     artifact: ArtifactRecord;
@@ -41,6 +40,13 @@ export interface RecoveryReport {
   aborted: number;
   quarantined: number;
   completedOutbox: number;
+}
+
+function parseStagingIsolationMode(raw: unknown): StagingIsolationKind | null {
+  if (raw === 'bwrap_mount_isolated' || raw === 'non_isolated_same_uid') {
+    return raw;
+  }
+  return null;
 }
 
 function mapJournalRow(r: Record<string, unknown>): ArtifactCommitJournalRow {
@@ -71,6 +77,8 @@ function mapJournalRow(r: Record<string, unknown>): ArtifactCommitJournalRow {
     operationSummary: String(r.operation_summary ?? ''),
     operationPayloadJson: r.operation_payload_json ? String(r.operation_payload_json) : null,
     batchId: r.batch_id ? String(r.batch_id) : null,
+    batchSeq: r.batch_seq !== null && r.batch_seq !== undefined ? Number(r.batch_seq) : null,
+    stagingIsolationMode: parseStagingIsolationMode(r.staging_isolation_mode),
     idempotencyScopeKey: r.idempotency_scope_key ? String(r.idempotency_scope_key) : null,
     idempotencyKey: r.idempotency_key ? String(r.idempotency_key) : null,
     requestFingerprint: r.request_fingerprint ? String(r.request_fingerprint) : null,
@@ -159,9 +167,6 @@ export function recoverPendingCommits(host: CommitRecoveryHost): RecoveryReport 
        ORDER BY created_at ASC`
     )
     .all() as Array<Record<string, unknown>>;
-
-  const stagingIsolation = host.getStagingIsolation();
-  const isMountIsolated = stagingIsolation === 'bwrap_mount_isolated';
 
   const markAborted = (j: ArtifactCommitJournalRow, note: string) => {
     removeStageAndSync(j.privateStagePath);
@@ -260,6 +265,9 @@ export function recoverPendingCommits(host: CommitRecoveryHost): RecoveryReport 
 
   for (const raw of rows) {
     const j = mapJournalRow(raw);
+    // ARCH-05 & SEC-10: Use ONLY the isolation mode recorded at commit time (T1).
+    // If unknown/null or non_isolated_same_uid, NEVER assume mount isolation.
+    const isMountIsolated = j.stagingIsolationMode === 'bwrap_mount_isolated';
     const rootDir = host.resolveScopeRootDir(j.userId, j.scopeKind, j.chatId, j.projectId);
     const stage = inspectStageFile(j.privateStagePath);
     const target = inspectTargetFile(rootDir, j.relPath);

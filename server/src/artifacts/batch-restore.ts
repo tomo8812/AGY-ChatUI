@@ -21,6 +21,7 @@ export interface BatchRestoreHost {
     actorKind: ActorKind;
     actorId: string | null;
     batchId: string;
+    batchSeq: number;
     suppressDependencyPropagation: boolean;
     alreadyLocked: boolean;
   }): Promise<{ artifact: ArtifactRecord }>;
@@ -227,22 +228,30 @@ export async function executeRestoreBundle(
             actorKind: params.actorKind,
             actorId: params.actorId,
             batchId,
+            batchSeq: seq,
             suppressDependencyPropagation: true,
             alreadyLocked: true,
           });
+          // artifact_restore_batch_items(committed) was already updated atomically inside Stage T6.
           committedItems.push({
             artifactId: item.artifactId,
             relPath: item.relPath,
             committedRevision: res.artifact.revision,
           });
-          host.db.db
-            .prepare(
-              `UPDATE artifact_restore_batch_items
-               SET status = 'committed', committed_revision = ?
-               WHERE batch_id = ? AND seq = ?`
-            )
-            .run(res.artifact.revision, batchId, seq);
         } catch (err) {
+          // If Stage T4/T5 already started replacing or replaced the file on disk (journal state IN ('replacing', 'file_replaced')),
+          // do NOT falsely mark the item failed or close the batch: leave the batch running
+          // so startup recovery resolves/rolls forward Stage T6 atomically and propagates dependencies.
+          const pendingInFlight = host.db.db
+            .prepare(
+              `SELECT commit_id FROM artifact_commit_journal
+               WHERE batch_id = ? AND batch_seq = ? AND state IN ('replacing', 'file_replaced')
+               LIMIT 1`
+            )
+            .get(batchId, seq) as { commit_id: string } | undefined;
+          if (pendingInFlight) {
+            throw err;
+          }
           failed = true;
           const errorCode = err instanceof ArtifactError ? err.code : 'RESTORE_FAILED';
           host.db.db

@@ -7,7 +7,7 @@ import { isArtifactError } from '../artifacts/errors.js';
 import { computeStrongEtag, formatHttpDate, isFreshRequest } from '../files/http-cache.js';
 import { resolveContainedExistingPath, sanitizeFileName } from '../files/workspace.js';
 import type { AcpClientManager } from '../acp/client-manager.js';
-import { requireAuth, type RouteDeps } from './auth-routes.js';
+import { buildLiveSessionAuthVerifier, requireAuth, type RouteDeps } from './auth-routes.js';
 
 export interface ProjectRouteDeps extends RouteDeps {
   acp?: AcpClientManager;
@@ -114,21 +114,22 @@ export async function registerProjectRoutes(app: FastifyInstance, deps: ProjectR
     const session = requireAuth(req, reply, db);
     if (!session) return;
     const { projectId } = req.params as { projectId: string };
-    const existing = db.getProject(session.user.id, projectId);
-    if (!existing) return reply.code(404).send({ error: 'NOT_FOUND', message: 'プロジェクトが見つかりません。' });
-    const affectedChatIds = db.listChatIdsForProject(session.user.id, projectId);
-    db.deleteProject(session.user.id, projectId);
-    fs.rmSync(path.dirname(existing.storageDir), { recursive: true, force: true });
-    if (affectedChatIds.length > 0) {
-      await acp?.stopIdleWorkersForChats(session.user.id, affectedChatIds);
+    try {
+      const { affectedChatIds } = await artifactService.deleteProject({
+        userId: session.user.id,
+        projectId,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
+      });
+      if (affectedChatIds.length > 0) {
+        await acp?.stopIdleWorkersForChats(session.user.id, affectedChatIds);
+      }
+      return { ok: true };
+    } catch (err) {
+      if (isArtifactError(err)) {
+        return reply.code(err.statusCode).send({ error: err.code, message: err.message, details: err.details });
+      }
+      throw err;
     }
-    hub.emitDurable({
-      userId: session.user.id,
-      type: 'project.deleted',
-      projectId,
-      payload: { projectId },
-    });
-    return { ok: true };
   });
 
   app.post('/api/projects/:projectId/files', async (req, reply) => {
@@ -137,6 +138,7 @@ export async function registerProjectRoutes(app: FastifyInstance, deps: ProjectR
     const { projectId } = req.params as { projectId: string };
     const project = db.getProject(session.user.id, projectId);
     if (!project) return reply.code(404).send({ error: 'NOT_FOUND', message: 'プロジェクトが見つかりません。' });
+    const assertAuthorized = buildLiveSessionAuthVerifier(req, db, session.user.id);
 
     const uploaded: unknown[] = [];
     try {
@@ -150,6 +152,7 @@ export async function registerProjectRoutes(app: FastifyInstance, deps: ProjectR
           filename,
           mimeType: part.mimetype,
           buffer: buf,
+          assertAuthorized,
         });
         uploaded.push(file);
       }
@@ -178,6 +181,7 @@ export async function registerProjectRoutes(app: FastifyInstance, deps: ProjectR
         userId: session.user.id,
         projectId,
         fileId,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
       });
       return { project: full };
     } catch (err) {
@@ -207,6 +211,7 @@ export async function registerProjectRoutes(app: FastifyInstance, deps: ProjectR
         projectId,
         projectArtifactId: projArtId,
         chatId: parsed.data.chatId,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
       });
       return reply.code(201).send(result);
     } catch (err) {

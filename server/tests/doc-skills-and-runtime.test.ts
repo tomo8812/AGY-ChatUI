@@ -437,7 +437,7 @@ describe('Anthropic doc skills and runtime isolation', () => {
         projectId: projRes.data.project.id,
       });
 
-      const activeBuiltinLink = resolveAuthorizedChatFileReference({
+      const activeBuiltinLink = await resolveAuthorizedChatFileReference({
         artifactService: srv.ctx.artifactService,
         db: srv.ctx.db,
         userId: alice.userId,
@@ -447,7 +447,7 @@ describe('Anthropic doc skills and runtime isolation', () => {
       });
       expect(activeBuiltinLink).toBeTruthy();
 
-      const disabledBuiltinLink = resolveAuthorizedChatFileReference({
+      const disabledBuiltinLink = await resolveAuthorizedChatFileReference({
         artifactService: srv.ctx.artifactService,
         db: srv.ctx.db,
         userId: alice.userId,

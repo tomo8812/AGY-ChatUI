@@ -28,7 +28,7 @@ describe('native and legacy file links', () => {
     }
   });
 
-  it('resolves the current chat scratch and playground aliases and keeps their files isolated', () => {
+  it('resolves the current chat scratch and playground aliases and keeps their files isolated', async () => {
     const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-native-links-'));
     const db = new AppDatabase(':memory:');
     cleanups.push(() => {
@@ -59,17 +59,17 @@ describe('native and legacy file links', () => {
       fs.writeFileSync(file, kind);
       const sandboxPath = `/home/sandbox/.gemini/antigravity/${kind}/`;
       const encoded = filename.split('/').map(encodeURIComponent).join('/');
-      const first = resolve(chat.id, `file://${sandboxPath}${encoded}`)!.artifact;
+      const first = (await resolve(chat.id, `file://${sandboxPath}${encoded}`))!.artifact;
       expect(first.relPath).toBe(`/home/sandbox/.gemini/${kind}/${filename}`);
       for (const reference of [file, `${sandboxPath}${encoded}`, `~/.gemini/jetski/${kind}/${filename}`]) {
-        expect(resolve(chat.id, reference)?.artifact.id).toBe(first.id);
-        expect(resolve(other.id, reference)).toBeNull();
+        expect((await resolve(chat.id, reference))?.artifact.id).toBe(first.id);
+        expect(await resolve(other.id, reference)).toBeNull();
       }
       const otherRoot = path.join(profile, `.chat-${kind}`, path.basename(other.workspaceDir));
       fs.symlinkSync(root, otherRoot);
-      expect(resolve(other.id, `${sandboxPath}${encoded}`)).toBeNull();
+      expect(await resolve(other.id, `${sandboxPath}${encoded}`)).toBeNull();
       fs.symlinkSync(file, path.join(chat.workspaceDir, 'outside.md'));
-      expect(resolve(chat.id, '/workspace/outside.md')).toBeNull();
+      expect(await resolve(chat.id, '/workspace/outside.md')).toBeNull();
       fs.unlinkSync(path.join(chat.workspaceDir, 'outside.md'));
       expect(resolveArtifactFile(db, chat, first)?.absPath).toBe(file);
     }

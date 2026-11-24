@@ -44,6 +44,7 @@ import {
   normalizeLinkCandidatePath,
   resolveArtifactFile,
   resolveAuthorizedChatFileReference,
+  resolveChatFileForReference,
 } from '../files/link-resolver.js';
 import {
   detectMimeAndPreviewKind,
@@ -472,6 +473,8 @@ interface ActiveTurnBridge {
   pendingElicitationResolvers: Map<string, (resp: CreateElicitationResponse) => void>;
   beforeWorkspaceSnap: WorkspaceSnapshot;
   emittedArtifactVersions: Map<string, string>;
+  pendingArtifactOps: Promise<void>[];
+  backgroundSyncChain: Promise<void>;
   lastActivityAt: number;
   subagents: Map<string, TrackedSubagentState>;
   asyncSubagentToolIds: Set<string>;
@@ -1387,6 +1390,8 @@ export class AcpClientManager {
       pendingElicitationResolvers: new Map(),
       beforeWorkspaceSnap: beforeSnap,
       emittedArtifactVersions: new Map(),
+      pendingArtifactOps: [],
+      backgroundSyncChain: Promise.resolve(),
       lastActivityAt: nowInit,
       subagents: new Map(),
       asyncSubagentToolIds: new Set(),
@@ -1467,7 +1472,8 @@ export class AcpClientManager {
       const hintPaths = bridge.toolCalls.flatMap(tool => (tool.locations ?? [])
         .map(location => toHostWorkspacePath(worker.workspaceDir, worker.sandboxWorkspaceRoot, location.path)));
 
-      const newArtifacts = syncWorkspaceChangesAsArtifacts({
+      await Promise.allSettled(bridge.pendingArtifactOps);
+      const newArtifacts = await syncWorkspaceChangesAsArtifacts({
         artifactService: this.artifactService,
         db: this.db,
         userId: params.userId,
@@ -2299,11 +2305,30 @@ export class AcpClientManager {
       const identity = crypto.createHash('sha256').update(JSON.stringify([filename, mimeType, hash])).digest('hex');
       const storageStem = [...stem].slice(0, 32).join('');
       const target = resolveContainedWriteTarget(worker.workspaceDir, `generated/${storageStem}-${identity}${suffix}`);
-      fs.mkdirSync(path.dirname(target.absPath), { recursive: true, mode: 0o700 });
-      if (!fs.existsSync(target.absPath) || sha256File(target.absPath) !== hash) {
-        fs.writeFileSync(target.absPath, data);
-      }
-      this.publishArtifactReference(turn, target.relPath, filename, mimeType);
+      // Synchronously kick off ArtifactService write so ArtifactLockManager reserves the path lock immediately
+      // before run.delta is emitted, while preserving exact ACP streaming chunk order.
+      const op = this.artifactService
+        .saveInlineGeneratedAsset({
+          userId: turn.userId,
+          chatId: turn.chatId,
+          relPath: target.relPath,
+          filename,
+          mimeType,
+          data,
+          messageId: turn.assistantMessageId,
+          runId: turn.runId,
+        })
+        .then(({ artifact }) => {
+          this.emitArtifactVersionIfNeeded(
+            turn,
+            artifact as unknown as { id: string; revision: number; sha256: string; dependencyManifestHash?: string | null } & Record<string, unknown>,
+            turn.runId
+          );
+        })
+        .catch(() => {
+          // Non-fatal during streaming; final workspace sync will reconcile if needed
+        });
+      turn.pendingArtifactOps.push(op);
       return target.relPath;
     } catch {
       return null;
@@ -2351,7 +2376,16 @@ export class AcpClientManager {
   }
 
   private publishArtifactReference(turn: ActiveTurnBridge, reference: string, label?: string, mimeType?: string | null): boolean {
-    const resolved = resolveAuthorizedChatFileReference({
+    const file = resolveChatFileForReference({
+      db: this.db,
+      userId: turn.userId,
+      chatId: turn.chatId,
+      reference,
+      builtinSkillsDir: this.config.builtinSkillsDir,
+    });
+    if (!file) return false;
+
+    const op = resolveAuthorizedChatFileReference({
       artifactService: this.artifactService,
       db: this.db,
       userId: turn.userId,
@@ -2362,14 +2396,20 @@ export class AcpClientManager {
       label,
       mimeType,
       builtinSkillsDir: this.config.builtinSkillsDir,
-    });
-    if (!resolved) return false;
-    const { artifact } = resolved;
-    this.emitArtifactVersionIfNeeded(
-      turn,
-      artifact as unknown as { id: string; revision: number; sha256: string; dependencyManifestHash?: string | null } & Record<string, unknown>,
-      turn.runId
-    );
+    })
+      .then((resolved) => {
+        if (!resolved) return;
+        const { artifact } = resolved;
+        this.emitArtifactVersionIfNeeded(
+          turn,
+          artifact as unknown as { id: string; revision: number; sha256: string; dependencyManifestHash?: string | null } & Record<string, unknown>,
+          turn.runId
+        );
+      })
+      .catch(() => {
+        // Non-fatal during streaming
+      });
+    turn.pendingArtifactOps.push(op);
     return true;
   }
 
@@ -2897,6 +2937,8 @@ export class AcpClientManager {
           ];
         })
       ),
+      pendingArtifactOps: [],
+      backgroundSyncChain: Promise.resolve(),
       lastActivityAt: Date.now(),
       subagents: new Map(),
       asyncSubagentToolIds: new Set(),
@@ -2916,14 +2958,15 @@ export class AcpClientManager {
     return bridge;
   }
 
-  private syncBackgroundWorkspaceArtifacts(
+  private async syncBackgroundWorkspaceArtifacts(
     worker: WorkerInstance,
     bridge: ActiveTurnBridge
-  ): void {
+  ): Promise<void> {
     if (worker.activeTurn && worker.activeTurn !== bridge) {
       return;
     }
-    const newArtifacts = syncWorkspaceChangesAsArtifacts({
+    await Promise.allSettled(bridge.pendingArtifactOps);
+    const newArtifacts = await syncWorkspaceChangesAsArtifacts({
       artifactService: this.artifactService,
       db: this.db,
       userId: worker.userId,
@@ -2943,14 +2986,7 @@ export class AcpClientManager {
     }
   }
 
-  private flushBackgroundBridgeToMessage(
-    worker: WorkerInstance,
-    bridge: ActiveTurnBridge,
-    syncArtifacts = false
-  ): void {
-    if (syncArtifacts) {
-      this.syncBackgroundWorkspaceArtifacts(worker, bridge);
-    }
+  private persistAndBroadcastBackgroundMessage(worker: WorkerInstance, bridge: ActiveTurnBridge): void {
     const updated = this.db.updateMessage(worker.userId, bridge.assistantMessageId, {
       contentText: bridge.contentText,
       thoughtsText: bridge.thoughtsText,
@@ -2968,6 +3004,25 @@ export class AcpClientManager {
         payload: { message: updated },
       });
     }
+  }
+
+  private flushBackgroundBridgeToMessage(
+    worker: WorkerInstance,
+    bridge: ActiveTurnBridge,
+    syncArtifacts = false
+  ): void {
+    if (!syncArtifacts) {
+      this.persistAndBroadcastBackgroundMessage(worker, bridge);
+      return;
+    }
+    bridge.backgroundSyncChain = bridge.backgroundSyncChain
+      .then(async () => {
+        await this.syncBackgroundWorkspaceArtifacts(worker, bridge);
+        this.persistAndBroadcastBackgroundMessage(worker, bridge);
+      })
+      .catch(() => {
+        this.persistAndBroadcastBackgroundMessage(worker, bridge);
+      });
   }
 
   private handleSessionNotification(worker: WorkerInstance, params: SessionNotification): void {

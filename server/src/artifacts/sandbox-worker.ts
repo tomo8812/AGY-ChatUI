@@ -20,6 +20,25 @@ export const WORKER_RSS_LIMIT_MB: Record<DocWorkerKind, number> = {
 
 export const WORKER_MAX_OUTPUT_BYTES = 100 * 1024 * 1024; // 100MB
 
+export interface DocWorkerRlimits {
+  /** RLIMIT_CPU in seconds (soft=hard). */
+  cpuSeconds: number;
+  /** RLIMIT_FSIZE in bytes (soft=hard). */
+  fsizeBytes: number;
+  /** RLIMIT_NOFILE open file descriptor cap (soft=hard). */
+  nofile: number;
+  /** RLIMIT_NPROC per-UID process/thread cap (soft=hard). */
+  nproc: number;
+}
+
+export const WORKER_DEFAULT_RLIMITS: Record<DocWorkerKind, Omit<DocWorkerRlimits, 'cpuSeconds'>> = {
+  libreoffice: { fsizeBytes: 128 * 1024 * 1024, nofile: 512, nproc: 1024 },
+  chromium: { fsizeBytes: 128 * 1024 * 1024, nofile: 512, nproc: 1024 },
+  python: { fsizeBytes: 128 * 1024 * 1024, nofile: 512, nproc: 512 },
+  ffmpeg: { fsizeBytes: 128 * 1024 * 1024, nofile: 512, nproc: 512 },
+  resvg: { fsizeBytes: 128 * 1024 * 1024, nofile: 512, nproc: 512 },
+};
+
 export interface SandboxWorkerRequest {
   kind: DocWorkerKind;
   command: string;
@@ -28,15 +47,64 @@ export interface SandboxWorkerRequest {
   expectedOutputRelPath?: string;
   timeoutMs?: number;
   rssLimitMb?: number;
+  rlimits?: Partial<DocWorkerRlimits>;
   env?: Record<string, string>;
 }
 
 export interface SandboxWorkerResult {
   exitCode: number;
+  signal: NodeJS.Signals | null;
   stdout: string;
   stderr: string;
   outputBuffer?: Buffer;
   isolation: SandboxIsolationKind;
+  appliedRlimits: DocWorkerRlimits;
+}
+
+function resolvePrlimitBinary(): string | null {
+  for (const candidate of ['/usr/bin/prlimit', '/bin/prlimit']) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function wrapCommandWithRlimits(
+  command: string,
+  args: string[],
+  rlimits: DocWorkerRlimits
+): { command: string; args: string[] } {
+  const prlimitBin = resolvePrlimitBinary();
+  if (prlimitBin) {
+    return {
+      command: prlimitBin,
+      args: [
+        `--cpu=${rlimits.cpuSeconds}`,
+        `--fsize=${rlimits.fsizeBytes}`,
+        `--nofile=${rlimits.nofile}`,
+        `--nproc=${rlimits.nproc}`,
+        '--',
+        command,
+        ...args,
+      ],
+    };
+  }
+  // Fallback when prlimit binary is unavailable: bash ulimit (-f is in 512-byte blocks)
+  const fsizeBlocks512 = Math.max(1, Math.ceil(rlimits.fsizeBytes / 512));
+  const shellBin = fs.existsSync('/bin/bash') ? '/bin/bash' : '/bin/sh';
+  return {
+    command: shellBin,
+    args: [
+      '-c',
+      'ulimit -H -t "$1" -f "$2" -n "$3" -u "$4" 2>/dev/null; ulimit -S -t "$1" -f "$2" -n "$3" -u "$4" && shift 4 && exec "$@"',
+      '--',
+      String(rlimits.cpuSeconds),
+      String(fsizeBlocks512),
+      String(rlimits.nofile),
+      String(rlimits.nproc),
+      command,
+      ...args,
+    ],
+  };
 }
 
 function readProcessTreeRssMb(rootPid: number): number {
@@ -74,9 +142,10 @@ function readProcessTreeRssMb(rootPid: number): number {
 /**
  * Isolated external document/media worker runner (`SEC-04`, `PERF-02`, `ARCH-13`).
  * - Applies `bwrap --unshare-net --unshare-pid --die-with-parent`, manifest-limited `--ro-bind`, private out dir.
+ * - Enforces kernel `RLIMIT_CPU`, `RLIMIT_FSIZE`, `RLIMIT_NOFILE`, and `RLIMIT_NPROC` strictly on this worker process.
  * - Enforces timeout and 250ms RSS watchdog with SIGKILL cleanup.
  * - Validates output via `openContainedRegularFileNoFollow` (full intermediate O_NOFOLLOW) and 100MB cap.
- * - Never affects Pure-JS operations or legacy read-only PPTX->PDF viewing fallback.
+ * - Never affects normal ACP processes, Pure-JS operations, or legacy read-only PPTX->PDF viewing fallback.
  */
 export class DocWorkerSandbox {
   constructor(
@@ -93,6 +162,16 @@ export class DocWorkerSandbox {
       return 'unsandboxed_explicit';
     }
     return 'sandbox_required_blocked';
+  }
+
+  resolveRlimits(kind: DocWorkerKind, timeoutMs: number, overrides?: Partial<DocWorkerRlimits>): DocWorkerRlimits {
+    const defaults = WORKER_DEFAULT_RLIMITS[kind];
+    return {
+      cpuSeconds: Math.max(1, Math.floor(overrides?.cpuSeconds ?? Math.ceil(timeoutMs / 1000))),
+      fsizeBytes: Math.max(1024, Math.floor(overrides?.fsizeBytes ?? defaults.fsizeBytes)),
+      nofile: Math.max(32, Math.floor(overrides?.nofile ?? defaults.nofile)),
+      nproc: Math.max(32, Math.floor(overrides?.nproc ?? defaults.nproc)),
+    };
   }
 
   async run(req: SandboxWorkerRequest): Promise<SandboxWorkerResult> {
@@ -117,9 +196,11 @@ export class DocWorkerSandbox {
       try {
         const timeoutMs = req.timeoutMs ?? this.config.docWorkerTimeoutMs;
         const rssLimitMb = req.rssLimitMb ?? WORKER_RSS_LIMIT_MB[req.kind];
+        const appliedRlimits = this.resolveRlimits(req.kind, timeoutMs, req.rlimits);
+        const rlimited = wrapCommandWithRlimits(req.command, req.args, appliedRlimits);
 
-        let spawnCmd = req.command;
-        let spawnArgs = [...req.args];
+        let spawnCmd = rlimited.command;
+        let spawnArgs = rlimited.args;
         const env: Record<string, string> = {
           PATH: '/usr/local/bin:/usr/bin:/bin',
           HOME: tmpDir,
@@ -153,7 +234,7 @@ export class DocWorkerSandbox {
             const safeName = path.basename(inp.sandboxName);
             bwrapArgs.push('--ro-bind', inp.hostPath, `/work/in/${safeName}`);
           }
-          bwrapArgs.push('--chdir', '/work/tmp', '--', req.command, ...req.args);
+          bwrapArgs.push('--chdir', '/work/tmp', '--', rlimited.command, ...rlimited.args);
           spawnCmd = this.config.bwrapBin;
           spawnArgs = bwrapArgs;
           env.HOME = '/work/tmp';
@@ -166,79 +247,81 @@ export class DocWorkerSandbox {
           }
         }
 
-        const result = await new Promise<{ exitCode: number; stdout: string; stderr: string }>((resolve, reject) => {
-          const child = spawn(spawnCmd, spawnArgs, {
-            cwd: tmpDir,
-            env,
-            stdio: ['ignore', 'pipe', 'pipe'],
-          });
+        const result = await new Promise<{ exitCode: number; signal: NodeJS.Signals | null; stdout: string; stderr: string }>(
+          (resolve, reject) => {
+            const child = spawn(spawnCmd, spawnArgs, {
+              cwd: tmpDir,
+              env,
+              stdio: ['ignore', 'pipe', 'pipe'],
+            });
 
-          let stdout = '';
-          let stderr = '';
-          let killedReason: ArtifactError | null = null;
-          let settled = false;
+            let stdout = '';
+            let stderr = '';
+            let killedReason: ArtifactError | null = null;
+            let settled = false;
 
-          child.stdout?.on('data', (chunk: Buffer) => {
-            if (stdout.length < 256 * 1024) stdout += chunk.toString('utf8');
-          });
-          child.stderr?.on('data', (chunk: Buffer) => {
-            if (stderr.length < 256 * 1024) stderr += chunk.toString('utf8');
-          });
+            child.stdout?.on('data', (chunk: Buffer) => {
+              if (stdout.length < 256 * 1024) stdout += chunk.toString('utf8');
+            });
+            child.stderr?.on('data', (chunk: Buffer) => {
+              if (stderr.length < 256 * 1024) stderr += chunk.toString('utf8');
+            });
 
-          const timer = setTimeout(() => {
-            killedReason = new ArtifactError(
-              'DOC_WORKER_TIMEOUT',
-              `ドキュメント処理が制限時間（${timeoutMs}ms）を超過しました。`,
-              504
-            );
-            try {
-              child.kill('SIGKILL');
-            } catch {
-              // ignore
-            }
-          }, timeoutMs);
-
-          const rssWatchdog = setInterval(() => {
-            if (!child.pid) return;
-            const rssMb = readProcessTreeRssMb(child.pid);
-            if (rssMb > rssLimitMb) {
+            const timer = setTimeout(() => {
               killedReason = new ArtifactError(
-                'DOC_WORKER_RSS_EXCEEDED',
-                `ドキュメント処理がメモリ上限（${rssLimitMb}MB）を超過しました（${rssMb}MB）。`,
-                503
+                'DOC_WORKER_TIMEOUT',
+                `ドキュメント処理が制限時間（${timeoutMs}ms）を超過しました。`,
+                504
               );
               try {
                 child.kill('SIGKILL');
               } catch {
                 // ignore
               }
-            }
-          }, 250);
-          rssWatchdog.unref();
+            }, timeoutMs);
 
-          const finish = () => {
-            clearTimeout(timer);
-            clearInterval(rssWatchdog);
-          };
+            const rssWatchdog = setInterval(() => {
+              if (!child.pid) return;
+              const rssMb = readProcessTreeRssMb(child.pid);
+              if (rssMb > rssLimitMb) {
+                killedReason = new ArtifactError(
+                  'DOC_WORKER_RSS_EXCEEDED',
+                  `ドキュメント処理がメモリ上限（${rssLimitMb}MB）を超過しました（${rssMb}MB）。`,
+                  503
+                );
+                try {
+                  child.kill('SIGKILL');
+                } catch {
+                  // ignore
+                }
+              }
+            }, 250);
+            rssWatchdog.unref();
 
-          child.on('error', (err) => {
-            if (settled) return;
-            settled = true;
-            finish();
-            reject(new ArtifactError('DOC_WORKER_SPAWN_FAILED', err.message, 500));
-          });
+            const finish = () => {
+              clearTimeout(timer);
+              clearInterval(rssWatchdog);
+            };
 
-          child.on('close', (code) => {
-            if (settled) return;
-            settled = true;
-            finish();
-            if (killedReason) {
-              reject(killedReason);
-              return;
-            }
-            resolve({ exitCode: code ?? 1, stdout, stderr });
-          });
-        });
+            child.on('error', (err) => {
+              if (settled) return;
+              settled = true;
+              finish();
+              reject(new ArtifactError('DOC_WORKER_SPAWN_FAILED', err.message, 500));
+            });
+
+            child.on('close', (code, signal) => {
+              if (settled) return;
+              settled = true;
+              finish();
+              if (killedReason) {
+                reject(killedReason);
+                return;
+              }
+              resolve({ exitCode: code ?? (signal ? 128 : 1), signal, stdout, stderr });
+            });
+          }
+        );
 
         let outputBuffer: Buffer | undefined;
         if (req.expectedOutputRelPath && result.exitCode === 0) {
@@ -255,10 +338,12 @@ export class DocWorkerSandbox {
 
         return {
           exitCode: result.exitCode,
+          signal: result.signal,
           stdout: result.stdout,
           stderr: result.stderr,
           outputBuffer,
           isolation,
+          appliedRlimits,
         };
       } finally {
         fs.rmSync(workRoot, { recursive: true, force: true });

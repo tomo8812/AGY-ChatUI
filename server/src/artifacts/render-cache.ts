@@ -25,15 +25,35 @@ export interface RenderCacheKeyInput {
   renderOptions?: Record<string, unknown>;
 }
 
+export type PptxPdfConverterFn = (params: {
+  stagedInputPath: string;
+  sourceAbsPath: string;
+  sourceFilename: string;
+  revision: number;
+  sourceSha256: string;
+  dependencyManifestHash: string | null;
+  cacheKey: string;
+  tmpTargetPath: string;
+}) => Promise<boolean>;
+
 /**
  * Single-flight, atomic-rename, LRU-bounded render cache manager (`ARCH-08`, `ARCH-13`).
  * Also preserves existing read-only PPTX->PDF viewing conversion even when `bwrap` is absent in `auto`/`off` mode.
  */
 export class RenderCacheManager {
   private readonly inFlight = new Map<string, Promise<string | null>>();
+  private pptxConverterOverride: PptxPdfConverterFn | null = null;
 
   constructor(private readonly config: AppConfig) {
     fs.mkdirSync(config.artifactsCacheRoot, { recursive: true, mode: 0o700 });
+  }
+
+  /**
+   * Test-only hook to deterministically inspect PPTX->PDF render cache inputs & cache keys
+   * without requiring LibreOffice in CI/unit tests.
+   */
+  setPptxConverterOverrideForTest(fn: PptxPdfConverterFn | null): void {
+    this.pptxConverterOverride = fn;
   }
 
   computeCacheKey(input: RenderCacheKeyInput): string {
@@ -115,30 +135,56 @@ export class RenderCacheManager {
   }
 
   /**
-   * Read-only PPTX->PDF viewing conversion preserving existing compatibility on hosts without bwrap (`ARCH-13`).
+   * Read-only PPTX->PDF viewing conversion preserving existing compatibility on hosts without bwrap (`ARCH-08`, `ARCH-13`).
+   * When `sourceAbsPath` is a revision-pinned immutable `.blob` file, stages a copy with the original `.pptx` extension
+   * inside the temporary conversion directory so LibreOffice reliably identifies the presentation format.
    */
   async renderPresentationToPdf(params: {
     artifactId: string;
     revision: number;
     sourceAbsPath: string;
+    sourceFilename?: string;
     sourceSha256: string;
     dependencyManifestHash?: string | null;
   }): Promise<string | null> {
+    const keyInput: RenderCacheKeyInput = {
+      artifactId: params.artifactId,
+      revision: params.revision,
+      sha256: params.sourceSha256,
+      dependencyManifestHash: params.dependencyManifestHash ?? null,
+      variant: 'pptx_view_pdf',
+      engineVersion: 'libreoffice-view-v1',
+    };
+    const cacheKey = this.computeCacheKey(keyInput);
+    const rawName = path.basename(params.sourceFilename || params.sourceAbsPath).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const stagedName = /\.(pptx|ppt|odp)$/i.test(rawName) ? rawName : `${rawName || 'presentation'}.pptx`;
+
     return this.getOrRender({
-      keyInput: {
-        artifactId: params.artifactId,
-        revision: params.revision,
-        sha256: params.sourceSha256,
-        dependencyManifestHash: params.dependencyManifestHash ?? null,
-        variant: 'pptx_view_pdf',
-        engineVersion: 'libreoffice-view-v1',
-      },
+      keyInput,
       ext: '.pdf',
       produce: async (tmpTargetPath) => {
         const workDir = fs.mkdtempSync(path.join(this.config.artifactsCacheRoot, '.lo-view-'));
         const loProfileDir = path.join(workDir, 'profile');
         fs.mkdirSync(loProfileDir, { recursive: true, mode: 0o700 });
         try {
+          const inputDir = path.join(workDir, 'input');
+          fs.mkdirSync(inputDir, { recursive: true, mode: 0o700 });
+          const stagedInputPath = path.join(inputDir, stagedName);
+          fs.copyFileSync(params.sourceAbsPath, stagedInputPath);
+
+          if (this.pptxConverterOverride) {
+            return await this.pptxConverterOverride({
+              stagedInputPath,
+              sourceAbsPath: params.sourceAbsPath,
+              sourceFilename: stagedName,
+              revision: params.revision,
+              sourceSha256: params.sourceSha256,
+              dependencyManifestHash: params.dependencyManifestHash ?? null,
+              cacheKey,
+              tmpTargetPath,
+            });
+          }
+
           await execFileAsync(
             this.config.libreOfficeBin,
             [
@@ -149,14 +195,14 @@ export class RenderCacheManager {
               'pdf',
               '--outdir',
               workDir,
-              params.sourceAbsPath,
+              stagedInputPath,
             ],
             {
               timeout: 30_000,
               env: { ...process.env, SAL_USE_VCLPLUGIN: 'svp' },
             }
           );
-          const base = path.basename(params.sourceAbsPath, path.extname(params.sourceAbsPath));
+          const base = path.basename(stagedInputPath, path.extname(stagedInputPath));
           const expected = path.join(workDir, `${base}.pdf`);
           const found = fs.existsSync(expected)
             ? expected

@@ -428,5 +428,72 @@ describe('Lightweight Rich UI Core Security & Negative Self-Tests (NEG-06..NEG-0
     expect(savedArt.status).toBe(201);
     expect(savedArt.data.artifact.relPath).toBe('simulation.json');
     expect(savedArt.data.artifact.revision).toBe(1);
+  }, 15_000);
+
+  it('Finding #9 (PERF-05): enforces per-user rich storage quota across BOTH rich_blocks and accumulated rich_block_revisions', async () => {
+    // Tight 10KB per-user rich storage quota
+    const srv = await createTestServer({ sandboxMode: 'off', richContentMaxMb: 10 / 1024 });
+    cleanups.push(srv.cleanup);
+
+    const { client: alice, userId: aliceId } = await registerAndBindAgy(srv.baseUrl, 'rich_quota_alice', 'quota-code');
+    const chatId = (await alice.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Quota Chat' })).data.chat.id;
+
+    // Create a ~2KB rich document (persisted in both rich_blocks and rich_block_revisions -> ~4KB total)
+    const makePaddedDoc = (tag: string) => ({
+      ...makeValidDoc(),
+      title: `Quota Block ${tag}`,
+      root: {
+        id: 'root',
+        type: 'card' as const,
+        children: [
+          {
+            id: 't1',
+            type: 'text' as const,
+            text: `${tag}:${'A'.repeat(1800)}`,
+          },
+        ],
+      },
+    });
+
+    const created = srv.ctx.richContentService.createBlock({
+      userId: aliceId,
+      chatId,
+      document: makePaddedDoc('v1'),
+      actorKind: 'ai',
+    });
+    const blockId = created.block.id;
+    const afterRev1Bytes = srv.ctx.richContentService.getUserRichStorageBytes(aliceId);
+    expect(afterRev1Bytes).toBeGreaterThanOrEqual(created.block.sizeBytes * 2);
+
+    // Update repeatedly with same-sized ~2KB payload: rich_blocks stays ~2KB, but rich_block_revisions grows by ~2KB each time!
+    let rev = 1;
+    let quotaHit = false;
+    for (let i = 2; i <= 10; i++) {
+      try {
+        const res = srv.ctx.richContentService.updateBlock({
+          userId: aliceId,
+          chatId,
+          blockId,
+          expectedRevision: rev,
+          document: makePaddedDoc(`v${i}`),
+          actorKind: 'user',
+        });
+        rev = res.block.revision;
+      } catch (err) {
+        expect(err).toMatchObject({ code: 'RICH_QUOTA_EXCEEDED', statusCode: 413 });
+        quotaHit = true;
+        break;
+      }
+    }
+
+    expect(quotaHit).toBe(true);
+    // Current block stayed small (~2KB), proving quota triggered because of accumulated rich_block_revisions!
+    const currentBlock = srv.ctx.richContentService.getBlock(aliceId, chatId, blockId)!;
+    expect(currentBlock.sizeBytes).toBeLessThan(3000);
+    // Revision history was NOT silently pruned
+    const revisions = srv.ctx.richContentService.listRevisions(aliceId, chatId, blockId);
+    expect(revisions.length).toBe(rev);
+    expect(revisions.length).toBeGreaterThanOrEqual(2);
+    expect(srv.ctx.richContentService.getUserRichStorageBytes(aliceId)).toBeLessThanOrEqual(10 * 1024);
   });
 });

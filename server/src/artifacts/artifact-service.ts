@@ -12,11 +12,14 @@ import {
   ExternalConcurrentWriteError,
   fingerprintsMatch,
   fsyncDir,
+  listContainedFilesNoFollow,
   normalizeRelPath,
   openContainedRegularFileNoFollow,
   readContainedRegularFileNoFollowStable,
+  removeContainedSubtreeNoFollow,
   sanitizeFileName,
   sha256Fd,
+  unlinkContainedRegularFileNoFollow,
   type FileFingerprint,
 } from '../files/workspace.js';
 import type { SyncHub } from '../sync/hub.js';
@@ -191,7 +194,6 @@ export class ArtifactService {
       db: this.db,
       hub: this.hub,
       blobManager: this.blobManager,
-      getStagingIsolation: () => this.getStagingIsolation(),
       resolveScopeRootDir: (u, sk, cid, pid) => this.resolveScopeRootDir(u, sk, cid, pid),
       finalizeStageT6InTx: (j, opts) => this.finalizeStageT6InTx(j, opts),
       recordExternalSyncOnRecovery: (p) => this.recordExternalSyncOnRecovery(p),
@@ -701,6 +703,27 @@ export class ArtifactService {
         );
     }
 
+    // Atomically mark batch restore item committed inside the exact same Stage T6 transaction (ARCH-04 / ARCH-07)
+    if (journal.batchId) {
+      if (journal.batchSeq !== null) {
+        this.db.db
+          .prepare(
+            `UPDATE artifact_restore_batch_items
+             SET status = 'committed', committed_revision = ?
+             WHERE batch_id = ? AND seq = ?`
+          )
+          .run(artifact.revision, journal.batchId, journal.batchSeq);
+      } else {
+        this.db.db
+          .prepare(
+            `UPDATE artifact_restore_batch_items
+             SET status = 'committed', committed_revision = ?
+             WHERE batch_id = ? AND artifact_id = ?`
+          )
+          .run(artifact.revision, journal.batchId, journal.artifactId);
+      }
+    }
+
     // Mark journal db_committed with outbox seq
     this.db.db
       .prepare(
@@ -742,6 +765,7 @@ export class ArtifactService {
     operationSummary: string;
     operationPayload?: Record<string, unknown> | null;
     batchId?: string | null;
+    batchSeq?: number | null;
     idempotencyScopeKey?: string | null;
     idempotencyKey?: string | null;
     requestFingerprint?: string | null;
@@ -756,6 +780,7 @@ export class ArtifactService {
     const normalizedRel = normalizeRelPath(params.relPath);
     const stagingDir = this.blobManager.getUserStagingDir(params.userId);
     this.assertSameFilesystem(stagingDir, params.rootDir);
+    const stagingIsolation = this.getStagingIsolation();
 
     const newSha256 = crypto.createHash('sha256').update(params.newBuffer).digest('hex');
     const depScan = scanArtifactDependencies({
@@ -773,6 +798,32 @@ export class ArtifactService {
       depScan.manifestHash === params.prevDepHash
     ) {
       const current = this.db.getArtifact(params.userId, params.artifactId)!;
+      if (params.batchId) {
+        this.db.db.exec('BEGIN IMMEDIATE;');
+        try {
+          if (params.batchSeq !== undefined && params.batchSeq !== null) {
+            this.db.db
+              .prepare(
+                `UPDATE artifact_restore_batch_items
+                 SET status = 'committed', committed_revision = ?
+                 WHERE batch_id = ? AND seq = ?`
+              )
+              .run(current.revision, params.batchId, params.batchSeq);
+          } else {
+            this.db.db
+              .prepare(
+                `UPDATE artifact_restore_batch_items
+                 SET status = 'committed', committed_revision = ?
+                 WHERE batch_id = ? AND artifact_id = ?`
+              )
+              .run(current.revision, params.batchId, current.id);
+          }
+          this.db.db.exec('COMMIT;');
+        } catch (err) {
+          this.db.db.exec('ROLLBACK;');
+          throw err;
+        }
+      }
       return { artifact: current, noOp: true };
     }
 
@@ -808,7 +859,7 @@ export class ArtifactService {
 
       await this.commitFaultHook?.('before_T1', faultCtx);
 
-      // ---- T1: Persist artifact_commit_journal(state='prepared', stage_ino=NULL) (+ pending_create if create) ----
+      // ---- T1: Persist artifact_commit_journal(state='prepared', stage_ino=NULL, staging_isolation_mode) (+ pending_create if create) ----
       const t1Now = Date.now();
       this.db.db.exec('BEGIN IMMEDIATE;');
       try {
@@ -854,9 +905,10 @@ export class ArtifactService {
                new_sha256, new_dependency_manifest_hash, new_deps_json, new_size_bytes,
                prev_blob_sha256, new_blob_sha256, private_stage_path, stage_ino,
                actor_kind, actor_id, operation_type, operation_summary, operation_payload_json,
-               batch_id, idempotency_scope_key, idempotency_key, request_fingerprint, diff_patch,
+               batch_id, batch_seq, staging_isolation_mode,
+               idempotency_scope_key, idempotency_key, request_fingerprint, diff_patch,
                state, audit_note, sync_event_seq, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', NULL, NULL, ?, ?)`
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', NULL, NULL, ?, ?)`
           )
           .run(
             commitId,
@@ -884,6 +936,8 @@ export class ArtifactService {
             params.operationSummary,
             params.operationPayload ? JSON.stringify(params.operationPayload) : null,
             params.batchId ?? null,
+            params.batchSeq ?? null,
+            stagingIsolation,
             params.idempotencyScopeKey ?? null,
             params.idempotencyKey ?? null,
             params.requestFingerprint ?? null,
@@ -991,7 +1045,7 @@ export class ArtifactService {
           }
           fs.fsyncSync(dirFd);
           // Non-isolated post-placement check (SEC-10)
-          if (this.getStagingIsolation() === 'non_isolated_same_uid') {
+          if (stagingIsolation === 'non_isolated_same_uid') {
             this.verifyPostPlacementOrQuarantine(
               commitId,
               params.artifactId,
@@ -1013,7 +1067,7 @@ export class ArtifactService {
           stageFileCreated = false;
           fs.fsyncSync(dirFd);
           fsyncDir(stagingDir);
-          if (this.getStagingIsolation() === 'non_isolated_same_uid') {
+          if (stagingIsolation === 'non_isolated_same_uid') {
             this.verifyPostPlacementOrQuarantine(
               commitId,
               params.artifactId,
@@ -1044,7 +1098,7 @@ export class ArtifactService {
       await this.commitFaultHook?.('after_T5', faultCtx);
       await this.commitFaultHook?.('before_T6', faultCtx);
 
-      // ---- T6: Single BEGIN IMMEDIATE transaction committing DB + revisions + deps + idempotency + outbox ----
+      // ---- T6: Single BEGIN IMMEDIATE transaction committing DB + revisions + deps + idempotency + outbox + batch item ----
       const journalObj: ArtifactCommitJournalRow = {
         commitId,
         artifactId: params.artifactId,
@@ -1072,6 +1126,8 @@ export class ArtifactService {
         operationSummary: params.operationSummary,
         operationPayloadJson: params.operationPayload ? JSON.stringify(params.operationPayload) : null,
         batchId: params.batchId ?? null,
+        batchSeq: params.batchSeq ?? null,
+        stagingIsolationMode: stagingIsolation,
         idempotencyScopeKey: params.idempotencyScopeKey ?? null,
         idempotencyKey: params.idempotencyKey ?? null,
         requestFingerprint: params.requestFingerprint ?? null,
@@ -1382,9 +1438,9 @@ export class ArtifactService {
 
   /**
    * Unified ingestion for files already created/updated on disk inside a chat workspace (ACP / link-resolver / inline assets).
-   * Records content blobs, dependency manifests, and revisions inside `ArtifactService`.
+   * Serialized per-artifact/path via ArtifactLockManager (`ARCH-03` & Section 3.2) without ever restricting external ACP writes.
    */
-  ingestWorkspaceFile(params: {
+  async ingestWorkspaceFile(params: {
     userId: string;
     chatId: string;
     workspaceDir: string;
@@ -1400,200 +1456,303 @@ export class ArtifactService {
     sourceArtifactId?: string | null;
     sourceBaseRevision?: number | null;
     emitEvent?: boolean;
-  }): { artifact: ArtifactRecord; created: boolean; changed: boolean } {
-    const existing = this.db.findArtifactByRelPath(params.userId, params.chatId, params.relPath);
-    const filename =
-      existing?.source === 'attachment'
-        ? existing.filename
-        : params.filename ?? existing?.filename ?? path.basename(params.relPath);
-    const detected = params.mimeType
-      ? detectMimeAndPreviewKind(filename, params.mimeType)
-      : existing
-        ? { mimeType: existing.mimeType, previewKind: existing.previewKind }
-        : detectMimeAndPreviewKind(filename);
-    const mimeType = params.mimeType && existing?.source !== 'attachment' ? params.mimeType : detected.mimeType;
-    const previewKind = params.previewKind ?? detected.previewKind;
+  }): Promise<{ artifact: ArtifactRecord; created: boolean; changed: boolean }> {
+    const pathLockKey = `path:${params.userId}:chat:${params.chatId}:${params.relPath}`;
 
-    let buf: Buffer;
-    let sha256: string;
-    let sizeBytes: number;
-    let mtimeMs = Date.now();
-    if (params.absPath) {
-      const st = fs.statSync(params.absPath);
-      buf = fs.readFileSync(params.absPath);
-      sha256 = crypto.createHash('sha256').update(buf).digest('hex');
-      sizeBytes = st.size;
-      mtimeMs = st.mtimeMs;
-    } else {
-      const read = readContainedRegularFileNoFollowStable(params.workspaceDir, params.relPath);
-      buf = read.buffer;
-      sha256 = read.sha256;
-      sizeBytes = read.sizeBytes;
-      mtimeMs = Number(read.fingerprint.mtimeNs / 1_000_000n);
-    }
-
-    const depScan = !path.isAbsolute(params.relPath)
-      ? scanArtifactDependencies({
-          rootDir: params.workspaceDir,
-          relPath: params.relPath,
-          previewKind,
-          contentBuffer: buf,
-        })
-      : { deps: [], depBuffers: new Map<string, Buffer>(), manifestHash: null };
-
-    const contentChanged =
-      !existing ||
-      existing.sha256 !== sha256 ||
-      existing.dependencyManifestHash !== depScan.manifestHash ||
-      existing.sizeBytes !== sizeBytes;
-    const metaChanged =
-      !existing ||
-      existing.filename !== filename ||
-      existing.mimeType !== mimeType ||
-      existing.previewKind !== previewKind ||
-      (params.messageId && existing.messageId !== params.messageId);
-
-    if (existing && !contentChanged && !metaChanged) {
-      return { artifact: existing, created: false, changed: false };
-    }
-
-    const leases: BlobLease[] = [];
-    try {
-      const mainLease = this.blobManager.putBlobWithLease(params.userId, buf);
-      leases.push(mainLease);
-      for (const depBuf of depScan.depBuffers.values()) {
-        leases.push(this.blobManager.putBlobWithLease(params.userId, depBuf));
+    const runIngestLocked = async (
+      lockedArtifactId: string | null
+    ): Promise<{ artifact: ArtifactRecord; created: boolean; changed: boolean } | { retryWithArtifactId: string }> => {
+      const existing = this.db.findArtifactByRelPath(params.userId, params.chatId, params.relPath);
+      if (existing && lockedArtifactId !== existing.id) {
+        return { retryWithArtifactId: existing.id };
       }
 
-      const now = Math.max(Date.now(), Math.ceil(mtimeMs));
-      const nextRev = existing ? (contentChanged ? existing.revision + 1 : existing.revision) : 1;
-      const artifactId = existing?.id ?? crypto.randomUUID();
-      let envelope: SyncEventEnvelope | null = null;
+      const filename =
+        existing?.source === 'attachment'
+          ? existing.filename
+          : params.filename ?? existing?.filename ?? path.basename(params.relPath);
+      const detected = params.mimeType
+        ? detectMimeAndPreviewKind(filename, params.mimeType)
+        : existing
+          ? { mimeType: existing.mimeType, previewKind: existing.previewKind }
+          : detectMimeAndPreviewKind(filename);
+      const mimeType = params.mimeType && existing?.source !== 'attachment' ? params.mimeType : detected.mimeType;
+      const previewKind = params.previewKind ?? detected.previewKind;
 
-      this.db.db.exec('BEGIN IMMEDIATE;');
+      let buf: Buffer;
+      let sha256: string;
+      let sizeBytes: number;
+      let mtimeMs = Date.now();
+      if (params.absPath) {
+        const st = fs.statSync(params.absPath);
+        buf = fs.readFileSync(params.absPath);
+        sha256 = crypto.createHash('sha256').update(buf).digest('hex');
+        sizeBytes = st.size;
+        mtimeMs = st.mtimeMs;
+      } else {
+        const read = readContainedRegularFileNoFollowStable(params.workspaceDir, params.relPath);
+        buf = read.buffer;
+        sha256 = read.sha256;
+        sizeBytes = read.sizeBytes;
+        mtimeMs = Number(read.fingerprint.mtimeNs / 1_000_000n);
+      }
+
+      const depScan = !path.isAbsolute(params.relPath)
+        ? scanArtifactDependencies({
+            rootDir: params.workspaceDir,
+            relPath: params.relPath,
+            previewKind,
+            contentBuffer: buf,
+          })
+        : { deps: [], depBuffers: new Map<string, Buffer>(), manifestHash: null };
+
+      const contentChanged =
+        !existing ||
+        existing.sha256 !== sha256 ||
+        existing.dependencyManifestHash !== depScan.manifestHash ||
+        existing.sizeBytes !== sizeBytes;
+      const metaChanged =
+        !existing ||
+        existing.filename !== filename ||
+        existing.mimeType !== mimeType ||
+        existing.previewKind !== previewKind ||
+        (params.messageId && existing.messageId !== params.messageId);
+
+      if (existing && !contentChanged && !metaChanged) {
+        return { artifact: existing, created: false, changed: false };
+      }
+
+      const leases: BlobLease[] = [];
       try {
-        const saved = this.db.upsertArtifact({
-          id: artifactId,
-          userId: params.userId,
-          scopeKind: 'chat',
-          chatId: params.chatId,
-          projectId: null,
-          messageId: params.messageId ?? existing?.messageId ?? null,
-          runId: params.runId ?? existing?.runId ?? null,
-          relPath: params.relPath,
-          filename,
-          mimeType,
-          sizeBytes,
-          sha256,
-          source:
-            params.source ??
-            existing?.source ??
-            (params.relPath.startsWith('.project-context/') ? 'project_copy' : 'generated'),
-          previewKind,
-          diffPatch: params.diffPatch ?? null,
-          revision: nextRev,
-          dependencyManifestHash: depScan.manifestHash,
-          sourceArtifactId: params.sourceArtifactId ?? existing?.sourceArtifactId ?? null,
-          sourceBaseRevision: params.sourceBaseRevision ?? existing?.sourceBaseRevision ?? null,
-          minUpdatedAt: now,
-        });
+        const mainLease = this.blobManager.putBlobWithLease(params.userId, buf);
+        leases.push(mainLease);
+        for (const depBuf of depScan.depBuffers.values()) {
+          leases.push(this.blobManager.putBlobWithLease(params.userId, depBuf));
+        }
 
-        if (!existing || contentChanged) {
-          this.db.db
-            .prepare(
-              `INSERT OR IGNORE INTO artifact_revisions (
-                 id, artifact_id, user_id, chat_id, project_id, revision, parent_revision,
-                 sha256, dependency_manifest_hash, size_bytes, blob_sha256, blob_available,
-                 actor_kind, actor_id, operation_type, operation_summary, diff_patch, created_at
-               ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 1, 'ai', NULL, ?, ?, ?, ?)`
-            )
-            .run(
-              crypto.randomUUID(),
-              saved.id,
-              params.userId,
-              params.chatId,
-              nextRev,
-              existing ? existing.revision : null,
-              sha256,
-              depScan.manifestHash,
-              sizeBytes,
-              mainLease.sha256,
-              existing ? 'workspace_sync' : 'create',
-              existing ? `Workspace updated ${filename}` : `Generated ${filename}`,
-              params.diffPatch ?? null,
-              now
-            );
+        const now = Math.max(Date.now(), Math.ceil(mtimeMs));
+        const nextRev = existing ? (contentChanged ? existing.revision + 1 : existing.revision) : 1;
+        const artifactId = existing?.id ?? crypto.randomUUID();
+        let envelope: SyncEventEnvelope | null = null;
 
-          for (const dep of depScan.deps) {
+        this.db.db.exec('BEGIN IMMEDIATE;');
+        try {
+          const saved = this.db.upsertArtifact({
+            id: artifactId,
+            userId: params.userId,
+            scopeKind: 'chat',
+            chatId: params.chatId,
+            projectId: null,
+            messageId: params.messageId ?? existing?.messageId ?? null,
+            runId: params.runId ?? existing?.runId ?? null,
+            relPath: params.relPath,
+            filename,
+            mimeType,
+            sizeBytes,
+            sha256,
+            source:
+              params.source ??
+              existing?.source ??
+              (params.relPath.startsWith('.project-context/') ? 'project_copy' : 'generated'),
+            previewKind,
+            diffPatch: params.diffPatch ?? null,
+            revision: nextRev,
+            dependencyManifestHash: depScan.manifestHash,
+            sourceArtifactId: params.sourceArtifactId ?? existing?.sourceArtifactId ?? null,
+            sourceBaseRevision: params.sourceBaseRevision ?? existing?.sourceBaseRevision ?? null,
+            minUpdatedAt: now,
+          });
+
+          if (!existing || contentChanged) {
             this.db.db
               .prepare(
-                `INSERT OR REPLACE INTO artifact_revision_deps (
-                   artifact_id, revision, user_id, scope_kind, chat_id, project_id,
-                   rel_path, status, sha256, blob_sha256, size_bytes, mime_type
-                 ) VALUES (?, ?, ?, 'chat', ?, NULL, ?, ?, ?, ?, ?, ?)`
-              )
-              .run(
-                saved.id,
-                nextRev,
-                params.userId,
-                params.chatId,
-                dep.relPath,
-                dep.status,
-                dep.sha256,
-                dep.blobSha256,
-                dep.sizeBytes,
-                dep.mimeType
-              );
-          }
-
-          if (!path.isAbsolute(params.relPath)) {
-            this.db.db
-              .prepare(
-                `INSERT INTO artifact_dep_propagation_queue (
-                   id, user_id, scope_kind, chat_id, project_id, changed_rel_path,
-                   source_artifact_id, source_revision, batch_id, exclude_artifact_ids_json, state, created_at, updated_at
-                 ) VALUES (?, ?, 'chat', ?, NULL, ?, ?, ?, NULL, '[]', 'pending', ?, ?)`
+                `INSERT OR IGNORE INTO artifact_revisions (
+                   id, artifact_id, user_id, chat_id, project_id, revision, parent_revision,
+                   sha256, dependency_manifest_hash, size_bytes, blob_sha256, blob_available,
+                   actor_kind, actor_id, operation_type, operation_summary, diff_patch, created_at
+                 ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 1, 'ai', NULL, ?, ?, ?, ?)`
               )
               .run(
                 crypto.randomUUID(),
+                saved.id,
                 params.userId,
                 params.chatId,
-                params.relPath,
-                saved.id,
                 nextRev,
-                now,
+                existing ? existing.revision : null,
+                sha256,
+                depScan.manifestHash,
+                sizeBytes,
+                mainLease.sha256,
+                existing ? 'workspace_sync' : 'create',
+                existing ? `Workspace updated ${filename}` : `Generated ${filename}`,
+                params.diffPatch ?? null,
                 now
               );
+
+            for (const dep of depScan.deps) {
+              this.db.db
+                .prepare(
+                  `INSERT OR REPLACE INTO artifact_revision_deps (
+                     artifact_id, revision, user_id, scope_kind, chat_id, project_id,
+                     rel_path, status, sha256, blob_sha256, size_bytes, mime_type
+                   ) VALUES (?, ?, ?, 'chat', ?, NULL, ?, ?, ?, ?, ?, ?)`
+                )
+                .run(
+                  saved.id,
+                  nextRev,
+                  params.userId,
+                  params.chatId,
+                  dep.relPath,
+                  dep.status,
+                  dep.sha256,
+                  dep.blobSha256,
+                  dep.sizeBytes,
+                  dep.mimeType
+                );
+            }
+
+            if (!path.isAbsolute(params.relPath)) {
+              this.db.db
+                .prepare(
+                  `INSERT INTO artifact_dep_propagation_queue (
+                     id, user_id, scope_kind, chat_id, project_id, changed_rel_path,
+                     source_artifact_id, source_revision, batch_id, exclude_artifact_ids_json, state, created_at, updated_at
+                   ) VALUES (?, ?, 'chat', ?, NULL, ?, ?, ?, NULL, '[]', 'pending', ?, ?)`
+                )
+                .run(
+                  crypto.randomUUID(),
+                  params.userId,
+                  params.chatId,
+                  params.relPath,
+                  saved.id,
+                  nextRev,
+                  now,
+                  now
+                );
+            }
           }
+
+          if (params.emitEvent) {
+            envelope = this.db.insertSyncEventInTx({
+              userId: params.userId,
+              eventId: crypto.randomUUID(),
+              type: existing ? 'artifact.updated' : 'artifact.created',
+              chatId: params.chatId,
+              runId: params.runId ?? null,
+              payload: { artifact: saved },
+              createdAt: now,
+            });
+          }
+
+          this.db.db.exec('COMMIT;');
+        } catch (err) {
+          this.db.db.exec('ROLLBACK;');
+          throw err;
         }
 
-        if (params.emitEvent) {
-          envelope = this.db.insertSyncEventInTx({
+        const finalArt = this.db.getArtifact(params.userId, artifactId)!;
+        if (envelope) this.hub.broadcastPersistedEvent(envelope);
+        if (contentChanged) {
+          this.notifyUpdateListeners(finalArt);
+        }
+        return { artifact: finalArt, created: !existing, changed: contentChanged };
+      } finally {
+        for (const l of leases) l.release();
+      }
+    };
+
+    const initialExisting = this.db.findArtifactByRelPath(params.userId, params.chatId, params.relPath);
+    let targetArtifactId = initialExisting?.id ?? null;
+    let outcome: { artifact: ArtifactRecord; created: boolean; changed: boolean } | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const lockKeys = targetArtifactId ? [`artifact:${targetArtifactId}`, pathLockKey] : [pathLockKey];
+      const res = await this.lockManager.withLocks(lockKeys, () => runIngestLocked(targetArtifactId));
+      if ('retryWithArtifactId' in res) {
+        targetArtifactId = res.retryWithArtifactId;
+        continue;
+      }
+      outcome = res;
+      break;
+    }
+    if (!outcome) {
+      throw new ArtifactError('ARTIFACT_LOCK_CONTENTION', 'ファイル取り込みの排他取得に失敗しました。', 409);
+    }
+    if (outcome.changed) {
+      await this.drainDepPropagationQueue();
+    }
+    return outcome;
+  }
+
+  /**
+   * Persist an inline ACP-generated binary/text asset into chat workspace strictly via ArtifactService + ArtifactLockManager.
+   */
+  async saveInlineGeneratedAsset(params: {
+    userId: string;
+    chatId: string;
+    relPath: string;
+    filename: string;
+    mimeType: string;
+    data: Buffer;
+    messageId?: string | null;
+    runId?: string | null;
+  }): Promise<{ artifact: ArtifactRecord }> {
+    const normalizedRel = normalizeRelPath(params.relPath);
+    const existing = this.db.findArtifactByRelPath(params.userId, params.chatId, normalizedRel);
+    const hash = crypto.createHash('sha256').update(params.data).digest('hex');
+    if (existing && existing.sha256 === hash) {
+      return { artifact: existing };
+    }
+    if (existing) {
+      const updated = await this.replaceArtifactBytes({
+        userId: params.userId,
+        artifactId: existing.id,
+        expectedRevision: existing.revision,
+        newBuffer: params.data,
+        actorKind: 'ai',
+        actorId: null,
+        operationType: 'workspace_sync',
+        operationSummary: `Updated generated asset ${params.filename}`,
+      });
+      return { artifact: updated.artifact };
+    }
+    try {
+      const created = await this.createArtifact({
+        userId: params.userId,
+        scopeKind: 'chat',
+        chatId: params.chatId,
+        relPath: normalizedRel,
+        filename: params.filename,
+        mimeType: params.mimeType,
+        content: params.data,
+        source: 'generated',
+        actorKind: 'ai',
+        actorId: null,
+        messageId: params.messageId ?? null,
+        runId: params.runId ?? null,
+        operationSummary: `Generated ${params.filename}`,
+      });
+      return { artifact: created.artifact };
+    } catch (err) {
+      // If file already exists on disk (e.g. concurrent same-hash write), ingest it cleanly under ArtifactLockManager
+      if (err instanceof ArtifactError && err.statusCode === 409) {
+        const chat = this.db.getChat(params.userId, params.chatId);
+        if (chat) {
+          const ingested = await this.ingestWorkspaceFile({
             userId: params.userId,
-            eventId: crypto.randomUUID(),
-            type: existing ? 'artifact.updated' : 'artifact.created',
             chatId: params.chatId,
+            workspaceDir: chat.workspaceDir,
+            relPath: normalizedRel,
+            filename: params.filename,
+            mimeType: params.mimeType,
+            source: 'generated',
+            messageId: params.messageId ?? null,
             runId: params.runId ?? null,
-            payload: { artifact: saved },
-            createdAt: now,
+            emitEvent: false,
           });
+          return { artifact: ingested.artifact };
         }
-
-        this.db.db.exec('COMMIT;');
-      } catch (err) {
-        this.db.db.exec('ROLLBACK;');
-        throw err;
       }
-
-      const finalArt = this.db.getArtifact(params.userId, artifactId)!;
-      if (envelope) this.hub.broadcastPersistedEvent(envelope);
-      if (contentChanged) {
-        this.notifyUpdateListeners(finalArt);
-        void this.drainDepPropagationQueue();
-      }
-      return { artifact: finalArt, created: !existing, changed: contentChanged };
-    } finally {
-      for (const l of leases) l.release();
+      throw err;
     }
   }
 
@@ -1608,7 +1767,9 @@ export class ArtifactService {
     filename: string;
     mimeType?: string | null;
     buffer: Buffer;
+    assertAuthorized?: () => void | Promise<void>;
   }): Promise<ArtifactRecord> {
+    await params.assertAuthorized?.();
     const safeName = sanitizeFileName(params.filename || 'attachment.bin');
     const ts = Math.max(Date.now(), this.lastAttachmentTs + 1);
     this.lastAttachmentTs = ts;
@@ -1625,6 +1786,7 @@ export class ArtifactService {
       actorKind: 'user',
       actorId: params.userId,
       operationSummary: `Uploaded attachment ${safeName}`,
+      assertAuthorized: params.assertAuthorized,
     });
     return res.artifact;
   }
@@ -1639,7 +1801,9 @@ export class ArtifactService {
     mimeType?: string | null;
     buffer: Buffer;
     idempotencyKey?: string;
+    assertAuthorized?: () => void | Promise<void>;
   }): Promise<{ artifact: ArtifactRecord; file: ProjectFileRecord }> {
+    await params.assertAuthorized?.();
     const project = this.db.getProject(params.userId, params.projectId);
     if (!project) {
       throw new ArtifactError('NOT_FOUND', 'プロジェクトが見つかりません。', 404);
@@ -1664,6 +1828,7 @@ export class ArtifactService {
         actorId: params.userId,
         idempotencyKey: params.idempotencyKey,
         operationSummary: `Uploaded project file ${safeName}`,
+        assertAuthorized: params.assertAuthorized,
       });
       artifact = created.artifact;
     } else {
@@ -1677,6 +1842,7 @@ export class ArtifactService {
         operationType: 'project_upload_overwrite',
         operationSummary: `Updated project file ${safeName}`,
         idempotencyKey: params.idempotencyKey,
+        assertAuthorized: params.assertAuthorized,
       });
       artifact = updated.artifact;
     }
@@ -1691,7 +1857,9 @@ export class ArtifactService {
     userId: string;
     projectId: string;
     fileId: string;
+    assertAuthorized?: () => void | Promise<void>;
   }): Promise<{ deleted: ProjectFileRecord; project: ReturnType<AppDatabase['getProject']> & { files: ProjectFileRecord[] } }> {
+    await params.assertAuthorized?.();
     const project = this.db.getProject(params.userId, params.projectId);
     if (!project) {
       throw new ArtifactError('NOT_FOUND', 'プロジェクトが見つかりません。', 404);
@@ -1701,39 +1869,31 @@ export class ArtifactService {
       throw new ArtifactError('NOT_FOUND', 'ファイルが見つかりません。', 404);
     }
 
-    const lockKey = existingPf.artifactId
-      ? `artifact:${existingPf.artifactId}`
-      : `path:${params.userId}:project:${params.projectId}:${existingPf.relPath}`;
+    const pathLockKey = `path:${params.userId}:project:${params.projectId}:${existingPf.relPath}`;
+    const lockKeys = existingPf.artifactId ? [`artifact:${existingPf.artifactId}`, pathLockKey] : [pathLockKey];
 
     let envelopes: SyncEventEnvelope[] = [];
-    await this.lockManager.withLock(lockKey, async () => {
-      // Remove disk file safely via O_NOFOLLOW parent dir
-      try {
-        const segments = normalizeRelPath(existingPf.relPath).split('/');
-        const leaf = segments.pop()!;
-        const { dirFd } = ensureContainedDirectoryNoFollow(project.storageDir, segments.join('/'), {
-          createMissing: false,
-        });
-        try {
-          fs.unlinkSync(`/proc/self/fd/${dirFd}/${leaf}`);
-          fs.fsyncSync(dirFd);
-        } finally {
-          fs.closeSync(dirFd);
-        }
-      } catch {
-        // ignore if already absent on disk
+    await this.lockManager.withLocks(lockKeys, async () => {
+      await params.assertAuthorized?.();
+      const liveProj = this.db.getProject(params.userId, params.projectId);
+      const livePf = this.db.getProjectFileById(params.userId, params.projectId, params.fileId);
+      if (!liveProj || !livePf) {
+        throw new ArtifactError('NOT_FOUND', 'ファイルが見つかりません。', 404);
       }
+
+      // SEC-02 & ARCH-03: Strict O_NOFOLLOW unlink; tolerate ONLY ENOENT, rethrow all other errors before DB deletion
+      unlinkContainedRegularFileNoFollow(liveProj.storageDir, livePf.relPath);
 
       const now = Date.now();
       this.db.db.exec('BEGIN IMMEDIATE;');
       try {
         this.db.db
           .prepare('DELETE FROM project_files WHERE id = ? AND user_id = ?')
-          .run(existingPf.id, params.userId);
-        if (existingPf.artifactId) {
+          .run(livePf.id, params.userId);
+        if (livePf.artifactId) {
           this.db.db
             .prepare("UPDATE artifacts SET lifecycle_state = 'deleted', deleted_on_disk = 1, updated_at = ? WHERE id = ? AND user_id = ?")
-            .run(now, existingPf.artifactId, params.userId);
+            .run(now, livePf.artifactId, params.userId);
           this.db.db
             .prepare(
               `INSERT INTO artifact_dep_propagation_queue (
@@ -1745,11 +1905,21 @@ export class ArtifactService {
               crypto.randomUUID(),
               params.userId,
               params.projectId,
-              existingPf.relPath,
-              existingPf.artifactId,
+              livePf.relPath,
+              livePf.artifactId,
               now,
               now
             );
+          envelopes.push(
+            this.db.insertSyncEventInTx({
+              userId: params.userId,
+              eventId: crypto.randomUUID(),
+              type: 'artifact.deleted',
+              projectId: params.projectId,
+              payload: { artifactId: livePf.artifactId, relPath: livePf.relPath, scopeKind: 'project' },
+              createdAt: now,
+            })
+          );
         }
         this.db.db
           .prepare('UPDATE projects SET context_version = context_version + 1, updated_at = ? WHERE id = ? AND user_id = ?')
@@ -1788,13 +1958,194 @@ export class ArtifactService {
     };
   }
 
+  /**
+   * Unified gateway for deleting an entire project, its project artifacts, storage subtree, and durable notifications (`ARCH-01`, `ARCH-03`, `SEC-02`).
+   */
+  async deleteProject(params: {
+    userId: string;
+    projectId: string;
+    assertAuthorized?: () => void | Promise<void>;
+  }): Promise<{ affectedChatIds: string[] }> {
+    await params.assertAuthorized?.();
+    const existing = this.db.getProject(params.userId, params.projectId);
+    if (!existing) {
+      throw new ArtifactError('NOT_FOUND', 'プロジェクトが見つかりません。', 404);
+    }
+
+    const projectArtifacts = this.db.listArtifactsForProject(params.userId, params.projectId);
+    const projectFiles = this.db.listProjectFiles(params.userId, params.projectId);
+    const lockKeys = [
+      `project:${params.projectId}`,
+      ...projectArtifacts.map((a) => `artifact:${a.id}`),
+      ...projectFiles.map((f) => `path:${params.userId}:project:${params.projectId}:${f.relPath}`),
+    ];
+
+    let affectedChatIds: string[] = [];
+    const envelopes: SyncEventEnvelope[] = [];
+
+    await this.lockManager.withLocks(lockKeys, async () => {
+      await params.assertAuthorized?.();
+      const liveProj = this.db.getProject(params.userId, params.projectId);
+      if (!liveProj) {
+        throw new ArtifactError('NOT_FOUND', 'プロジェクトが見つかりません。', 404);
+      }
+      affectedChatIds = this.db.listChatIdsForProject(params.userId, params.projectId);
+      const liveArtifacts = this.db.listArtifactsForProject(params.userId, params.projectId);
+      const liveFiles = this.db.listProjectFiles(params.userId, params.projectId);
+
+      // Unlink each project file via O_NOFOLLOW (tolerate ONLY ENOENT)
+      for (const pf of liveFiles) {
+        unlinkContainedRegularFileNoFollow(liveProj.storageDir, pf.relPath);
+      }
+
+      // Safely remove the project directory subtree strictly inside config.projectsRoot without following symlinks
+      const projDir = path.dirname(liveProj.storageDir);
+      const relProjSubtree = path.relative(this.config.projectsRoot, projDir);
+      if (relProjSubtree && !relProjSubtree.startsWith('..') && !path.isAbsolute(relProjSubtree)) {
+        removeContainedSubtreeNoFollow(this.config.projectsRoot, relProjSubtree);
+      }
+
+      const now = Date.now();
+      this.db.db.exec('BEGIN IMMEDIATE;');
+      try {
+        for (const art of liveArtifacts) {
+          this.db.db
+            .prepare("UPDATE artifacts SET lifecycle_state = 'deleted', deleted_on_disk = 1, updated_at = ? WHERE id = ? AND user_id = ?")
+            .run(now, art.id, params.userId);
+          envelopes.push(
+            this.db.insertSyncEventInTx({
+              userId: params.userId,
+              eventId: crypto.randomUUID(),
+              type: 'artifact.deleted',
+              projectId: params.projectId,
+              payload: { artifactId: art.id, relPath: art.relPath, scopeKind: 'project' },
+              createdAt: now,
+            })
+          );
+        }
+        // Detach source_artifact_id & source_base_revision on any chat copies before ON DELETE CASCADE
+        // removes project artifacts, preserving CHECK(source_base_revision IS NULL OR source_artifact_id IS NOT NULL).
+        this.db.db
+          .prepare(
+            `UPDATE artifacts
+             SET source_artifact_id = NULL, source_base_revision = NULL, updated_at = ?
+             WHERE user_id = ?
+               AND source_artifact_id IN (
+                 SELECT id FROM artifacts WHERE project_id = ? AND user_id = ?
+               )`
+          )
+          .run(now, params.userId, params.projectId, params.userId);
+        this.db.deleteProject(params.userId, params.projectId);
+        envelopes.push(
+          this.db.insertSyncEventInTx({
+            userId: params.userId,
+            eventId: crypto.randomUUID(),
+            type: 'project.deleted',
+            projectId: params.projectId,
+            payload: { projectId: params.projectId },
+            createdAt: now,
+          })
+        );
+        this.db.db.exec('COMMIT;');
+      } catch (err) {
+        this.db.db.exec('ROLLBACK;');
+        throw err;
+      }
+    });
+
+    for (const env of envelopes) this.hub.broadcastPersistedEvent(env);
+    return { affectedChatIds };
+  }
+
+  /**
+   * Unified gateway for deleting a chat, its artifacts, workspace subtree, and durable notifications (`ARCH-01`, `SEC-02`).
+   */
+  async deleteChat(params: {
+    userId: string;
+    chatId: string;
+    assertAuthorized?: () => void | Promise<void>;
+  }): Promise<void> {
+    await params.assertAuthorized?.();
+    const existing = this.db.getChat(params.userId, params.chatId);
+    if (!existing) {
+      throw new ArtifactError('NOT_FOUND', 'チャットが見つかりません。', 404);
+    }
+
+    const chatArtifacts = this.db.listArtifactsForChat(params.userId, params.chatId);
+    const lockKeys = [
+      `chat:${params.chatId}`,
+      ...chatArtifacts.map((a) => `artifact:${a.id}`),
+    ];
+
+    const envelopes: SyncEventEnvelope[] = [];
+    await this.lockManager.withLocks(lockKeys, async () => {
+      await params.assertAuthorized?.();
+      const liveChat = this.db.getChat(params.userId, params.chatId);
+      if (!liveChat) {
+        throw new ArtifactError('NOT_FOUND', 'チャットが見つかりません。', 404);
+      }
+      const liveArtifacts = this.db.listArtifactsForChat(params.userId, params.chatId);
+
+      const relChatSubtree = path.relative(this.config.workspacesRoot, liveChat.workspaceDir);
+      if (relChatSubtree && !relChatSubtree.startsWith('..') && !path.isAbsolute(relChatSubtree)) {
+        removeContainedSubtreeNoFollow(this.config.workspacesRoot, relChatSubtree);
+      }
+
+      const now = Date.now();
+      this.db.db.exec('BEGIN IMMEDIATE;');
+      try {
+        for (const art of liveArtifacts) {
+          envelopes.push(
+            this.db.insertSyncEventInTx({
+              userId: params.userId,
+              eventId: crypto.randomUUID(),
+              type: 'artifact.deleted',
+              chatId: params.chatId,
+              payload: { artifactId: art.id, relPath: art.relPath, scopeKind: 'chat' },
+              createdAt: now,
+            })
+          );
+        }
+        this.db.db
+          .prepare(
+            `UPDATE artifacts
+             SET source_artifact_id = NULL, source_base_revision = NULL, updated_at = ?
+             WHERE user_id = ?
+               AND source_artifact_id IN (
+                 SELECT id FROM artifacts WHERE chat_id = ? AND user_id = ?
+               )`
+          )
+          .run(now, params.userId, params.chatId, params.userId);
+        this.db.deleteChat(params.userId, params.chatId);
+        envelopes.push(
+          this.db.insertSyncEventInTx({
+            userId: params.userId,
+            eventId: crypto.randomUUID(),
+            type: 'chat.deleted',
+            chatId: params.chatId,
+            payload: { chatId: params.chatId },
+            createdAt: now,
+          })
+        );
+        this.db.db.exec('COMMIT;');
+      } catch (err) {
+        this.db.db.exec('ROLLBACK;');
+        throw err;
+      }
+    });
+
+    for (const env of envelopes) this.hub.broadcastPersistedEvent(env);
+  }
+
   async copyArtifactToProject(params: {
     userId: string;
     artifactId: string;
     projectId: string;
     targetFilename?: string;
     srcAbsPathOverride?: string;
+    assertAuthorized?: () => void | Promise<void>;
   }): Promise<{ artifact: ArtifactRecord; file: ProjectFileRecord }> {
+    await params.assertAuthorized?.();
     const srcArtifact = this.db.getArtifact(params.userId, params.artifactId);
     if (!srcArtifact) {
       throw new ArtifactError('ARTIFACT_NOT_FOUND', 'コピー元の成果物が見つかりません。', 404);
@@ -1811,6 +2162,7 @@ export class ArtifactService {
       filename: params.targetFilename ?? srcArtifact.filename,
       mimeType: srcArtifact.mimeType,
       buffer: buf,
+      assertAuthorized: params.assertAuthorized,
     });
   }
 
@@ -1823,7 +2175,9 @@ export class ArtifactService {
     projectId: string;
     projectArtifactId: string;
     chatId: string;
+    assertAuthorized?: () => void | Promise<void>;
   }): Promise<{ artifact: ArtifactRecord }> {
+    await params.assertAuthorized?.();
     const project = this.db.getProject(params.userId, params.projectId);
     const chat = this.db.getChat(params.userId, params.chatId);
     if (!project || !chat) {
@@ -1852,6 +2206,7 @@ export class ArtifactService {
         actorKind: 'user',
         actorId: params.userId,
         operationSummary: `Created chat working copy of project file ${projArt.relPath}`,
+        assertAuthorized: params.assertAuthorized,
       });
       return { artifact: created.artifact };
     }
@@ -1867,6 +2222,7 @@ export class ArtifactService {
       operationSummary: `Refreshed working copy from project rev ${projArt.revision}`,
       sourceArtifactId: projArt.id,
       sourceBaseRevision: projArt.revision,
+      assertAuthorized: params.assertAuthorized,
     });
     return { artifact: updated.artifact };
   }
@@ -1878,7 +2234,9 @@ export class ArtifactService {
     userId: string;
     projectId: string;
     chatId: string;
+    assertAuthorized?: () => void | Promise<void>;
   }): Promise<string[]> {
+    await params.assertAuthorized?.();
     const project = this.db.getProject(params.userId, params.projectId);
     const chat = this.db.getChat(params.userId, params.chatId);
     if (!project || !chat) {
@@ -1888,30 +2246,82 @@ export class ArtifactService {
     const projectFiles = this.db.listProjectFiles(params.userId, params.projectId);
     const expectedRels = new Set(projectFiles.map((f) => normalizeRelPath(`.project-context/${f.relPath}`)));
 
-    // Clean removed files inside .project-context
-    const contextDir = path.join(chat.workspaceDir, '.project-context');
-    if (fs.existsSync(contextDir)) {
-      const walkRemove = (dir: string, prefix = '') => {
-        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-          const full = path.join(dir, entry.name);
-          const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
-          if (entry.isDirectory()) {
-            walkRemove(full, rel);
-          } else if (entry.isFile()) {
-            const wsRel = `.project-context/${rel}`;
-            if (!expectedRels.has(wsRel)) {
-              fs.rmSync(full, { force: true });
-              const oldArt = this.db.findArtifactByRelPath(params.userId, params.chatId, wsRel);
-              if (oldArt) {
-                this.db.db
-                  .prepare("UPDATE artifacts SET lifecycle_state = 'deleted', deleted_on_disk = 1, updated_at = ? WHERE id = ?")
-                  .run(Date.now(), oldArt.id);
-              }
-            }
+    // Clean removed files inside .project-context using O_NOFOLLOW enumeration + unlink, ArtifactLockManager, dep propagation, and SyncHub events
+    const diskContextFiles = listContainedFilesNoFollow(chat.workspaceDir, '.project-context');
+    const dbContextArtifacts = this.db
+      .listArtifactsForChat(params.userId, params.chatId)
+      .filter((a) => a.relPath.startsWith('.project-context/'));
+
+    const obsoleteRels = new Set<string>();
+    for (const rel of diskContextFiles) {
+      const normalized = normalizeRelPath(rel);
+      if (!expectedRels.has(normalized)) obsoleteRels.add(normalized);
+    }
+    for (const art of dbContextArtifacts) {
+      const normalized = normalizeRelPath(art.relPath);
+      if (!expectedRels.has(normalized)) obsoleteRels.add(normalized);
+    }
+
+    let deletedAny = false;
+    for (const wsRel of obsoleteRels) {
+      const oldArt = this.db.findArtifactByRelPath(params.userId, params.chatId, wsRel);
+      const pathLockKey = `path:${params.userId}:chat:${params.chatId}:${wsRel}`;
+      const lockKeys = oldArt ? [`artifact:${oldArt.id}`, pathLockKey] : [pathLockKey];
+      const envelopes: SyncEventEnvelope[] = [];
+
+      await this.lockManager.withLocks(lockKeys, async () => {
+        await params.assertAuthorized?.();
+        // SEC-02 & ARCH-03: Walk every intermediate dir with O_NOFOLLOW; tolerate ONLY ENOENT
+        unlinkContainedRegularFileNoFollow(chat.workspaceDir, wsRel);
+
+        const liveArt = this.db.findArtifactByRelPath(params.userId, params.chatId, wsRel);
+        if (liveArt) {
+          const now = Date.now();
+          this.db.db.exec('BEGIN IMMEDIATE;');
+          try {
+            this.db.db
+              .prepare("UPDATE artifacts SET lifecycle_state = 'deleted', deleted_on_disk = 1, updated_at = ? WHERE id = ? AND user_id = ?")
+              .run(now, liveArt.id, params.userId);
+            this.db.db
+              .prepare(
+                `INSERT INTO artifact_dep_propagation_queue (
+                   id, user_id, scope_kind, chat_id, project_id, changed_rel_path,
+                   source_artifact_id, source_revision, batch_id, exclude_artifact_ids_json, state, created_at, updated_at
+                 ) VALUES (?, ?, 'chat', ?, NULL, ?, ?, 0, NULL, '[]', 'pending', ?, ?)`
+              )
+              .run(
+                crypto.randomUUID(),
+                params.userId,
+                params.chatId,
+                wsRel,
+                liveArt.id,
+                now,
+                now
+              );
+            envelopes.push(
+              this.db.insertSyncEventInTx({
+                userId: params.userId,
+                eventId: crypto.randomUUID(),
+                type: 'artifact.deleted',
+                chatId: params.chatId,
+                payload: { artifactId: liveArt.id, relPath: wsRel, scopeKind: 'chat' },
+                createdAt: now,
+              })
+            );
+            this.db.db.exec('COMMIT;');
+            deletedAny = true;
+          } catch (err) {
+            this.db.db.exec('ROLLBACK;');
+            throw err;
           }
         }
-      };
-      walkRemove(contextDir);
+      });
+
+      for (const env of envelopes) this.hub.broadcastPersistedEvent(env);
+    }
+
+    if (deletedAny) {
+      await this.drainDepPropagationQueue();
     }
 
     const syncedPaths: string[] = [];
@@ -1978,7 +2388,9 @@ export class ArtifactService {
     actorKind: ActorKind;
     actorId?: string | null;
     idempotencyKey?: string;
+    assertAuthorized?: () => void | Promise<void>;
   }): Promise<{ projectArtifact: ArtifactRecord; workingCopy: ArtifactRecord }> {
+    await params.assertAuthorized?.();
     if (params.actorKind === 'ai') {
       throw new ArtifactError('FORBIDDEN', '内蔵MCPまたはAIからプロジェクト原本へ直接反映することは禁止されています。', 403);
     }
@@ -2032,6 +2444,7 @@ export class ArtifactService {
       operationSummary: `Reflected changes from chat working copy ${workingCopy.id}`,
       idempotencyKey: params.idempotencyKey,
       updateWorkingCopyId: workingCopy.id,
+      assertAuthorized: params.assertAuthorized,
     });
 
     const updatedWorkingCopy = this.db.getArtifact(params.userId, workingCopy.id)!;
@@ -2055,6 +2468,7 @@ export class ArtifactService {
     operationSummary: string;
     operationPayload?: Record<string, unknown> | null;
     batchId?: string | null;
+    batchSeq?: number | null;
     suppressDependencyPropagation?: boolean;
     idempotencyKey?: string;
     sourceArtifactId?: string | null;
@@ -2065,12 +2479,18 @@ export class ArtifactService {
   }): Promise<{ artifact: ArtifactRecord; noOp: boolean }> {
     const scopeKey = `artifact:${params.artifactId}`;
     const reverifyAuth = async () => {
+      await params.assertAuthorized?.();
       const art = this.db.getArtifact(params.userId, params.artifactId);
       if (!art) throw new ArtifactError('NOT_FOUND', '対象の成果物が見つからないか権限がありません。', 404);
+      if (art.scopeKind === 'chat' && (!art.chatId || !this.db.getChat(params.userId, art.chatId))) {
+        throw new ArtifactError('NOT_FOUND', '対象チャットが見つからないか権限がありません。', 404);
+      }
+      if (art.scopeKind === 'project' && (!art.projectId || !this.db.getProject(params.userId, art.projectId))) {
+        throw new ArtifactError('NOT_FOUND', '対象プロジェクトが見つからないか権限がありません。', 404);
+      }
       if (params.actorKind === 'ai' && art.scopeKind === 'project') {
         throw new ArtifactError('FORBIDDEN', 'AI/内蔵MCPからプロジェクト原本への書き込みは禁止されています。', 403);
       }
-      await params.assertAuthorized?.();
     };
 
     const fingerprint = computeRequestFingerprint({
@@ -2151,6 +2571,7 @@ export class ArtifactService {
         operationSummary: params.operationSummary,
         operationPayload: params.operationPayload,
         batchId: params.batchId,
+        batchSeq: params.batchSeq,
         idempotencyScopeKey: params.idempotencyKey ? scopeKey : null,
         idempotencyKey: params.idempotencyKey ?? null,
         requestFingerprint: fingerprint,
@@ -2206,12 +2627,18 @@ export class ArtifactService {
   }): Promise<{ artifact: ArtifactRecord; noOp: boolean; summary: string }> {
     const scopeKey = `artifact:${params.artifactId}`;
     const reverifyAuth = async () => {
+      await params.assertAuthorized?.();
       const art = this.db.getArtifact(params.userId, params.artifactId);
       if (!art) throw new ArtifactError('NOT_FOUND', '成果物が見つからないか権限がありません。', 404);
+      if (art.scopeKind === 'chat' && (!art.chatId || !this.db.getChat(params.userId, art.chatId))) {
+        throw new ArtifactError('NOT_FOUND', '対象チャットが見つからないか権限がありません。', 404);
+      }
+      if (art.scopeKind === 'project' && (!art.projectId || !this.db.getProject(params.userId, art.projectId))) {
+        throw new ArtifactError('NOT_FOUND', '対象プロジェクトが見つからないか権限がありません。', 404);
+      }
       if (params.actorKind === 'ai' && art.scopeKind === 'project') {
         throw new ArtifactError('FORBIDDEN', 'AI/内蔵MCPからプロジェクト原本への書き込みは禁止されています。', 403);
       }
-      await params.assertAuthorized?.();
     };
 
     const fingerprint = computeRequestFingerprint({
@@ -2397,7 +2824,9 @@ export class ArtifactService {
     actorKind: ActorKind;
     actorId?: string | null;
     idempotencyKey?: string;
+    assertAuthorized?: () => void | Promise<void>;
   }): Promise<{ artifact: ArtifactRecord; exported: AdapterExportResult }> {
+    await params.assertAuthorized?.();
     const src = this.db.getArtifact(params.userId, params.artifactId);
     if (!src) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
     if (params.actorKind === 'ai' && src.scopeKind === 'project') {
@@ -2432,6 +2861,7 @@ export class ArtifactService {
       actorId: params.actorId ?? null,
       idempotencyKey: params.idempotencyKey,
       operationSummary: `Exported ${src.filename} to ${params.targetFormat}`,
+      assertAuthorized: params.assertAuthorized,
     });
     return { artifact: created.artifact, exported };
   }
@@ -2502,9 +2932,12 @@ export class ArtifactService {
     actorId?: string | null;
     idempotencyKey?: string;
     batchId?: string | null;
+    batchSeq?: number | null;
     suppressDependencyPropagation?: boolean;
     alreadyLocked?: boolean;
+    assertAuthorized?: () => void | Promise<void>;
   }): Promise<{ artifact: ArtifactRecord; dependencyDiff: Array<{ relPath: string; targetSha256: string | null; currentSha256: string | null }> }> {
+    await params.assertAuthorized?.();
     let artifact = this.db.getArtifact(params.userId, params.artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
     if (params.actorKind === 'ai' && artifact.scopeKind === 'project') {
@@ -2569,9 +3002,11 @@ export class ArtifactService {
       operationSummary: `Restored from revision ${params.targetRevision}`,
       operationPayload: { restoredFromRevision: params.targetRevision },
       batchId: params.batchId ?? null,
+      batchSeq: params.batchSeq ?? null,
       suppressDependencyPropagation: params.suppressDependencyPropagation,
       idempotencyKey: params.idempotencyKey,
       alreadyLocked: params.alreadyLocked,
+      assertAuthorized: params.assertAuthorized,
     });
 
     return { artifact: res.artifact, dependencyDiff };
@@ -2585,7 +3020,9 @@ export class ArtifactService {
     actorKind: ActorKind;
     actorId?: string | null;
     failAfterCommittedCountForTest?: number;
+    assertAuthorized?: () => void | Promise<void>;
   }): Promise<ArtifactRestoreBatchRecord> {
+    await params.assertAuthorized?.();
     const parent = this.db.getArtifact(params.userId, params.parentArtifactId);
     if (!parent) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
     if (params.actorKind === 'ai' && parent.scopeKind === 'project') {
@@ -2597,7 +3034,8 @@ export class ArtifactService {
         db: this.db,
         blobManager: this.blobManager,
         lockManager: this.lockManager,
-        restoreSingleArtifactLocked: (p) => this.restoreRevision(p),
+        restoreSingleArtifactLocked: (p) =>
+          this.restoreRevision({ ...p, assertAuthorized: params.assertAuthorized }),
         drainDepPropagationQueue: () => this.drainDepPropagationQueue(),
       },
       {
@@ -2630,7 +3068,9 @@ export class ArtifactService {
     actorKind: ActorKind;
     actorId: string | null;
     idempotencyKey?: string;
+    assertAuthorized?: () => void | Promise<void>;
   }): Promise<{ artifact: ArtifactRecord; undoState: UndoStateSummary }> {
+    await params.assertAuthorized?.();
     let artifact = this.db.getArtifact(params.userId, params.artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
     artifact = this.ensureLegacyHistoryMigrated(artifact);
@@ -2659,6 +3099,7 @@ export class ArtifactService {
       operationSummary: `Undo revision ${plan.undoneRevision} (to rev ${plan.restoreFromRevision})`,
       operationPayload: { undoOfRevision: plan.undoneRevision, restoredFromRevision: plan.restoreFromRevision },
       idempotencyKey: params.idempotencyKey,
+      assertAuthorized: params.assertAuthorized,
     });
     return {
       artifact: res.artifact,
@@ -2672,7 +3113,9 @@ export class ArtifactService {
     actorKind: ActorKind;
     actorId: string | null;
     idempotencyKey?: string;
+    assertAuthorized?: () => void | Promise<void>;
   }): Promise<{ artifact: ArtifactRecord; undoState: UndoStateSummary }> {
+    await params.assertAuthorized?.();
     let artifact = this.db.getArtifact(params.userId, params.artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
     artifact = this.ensureLegacyHistoryMigrated(artifact);
@@ -2701,6 +3144,7 @@ export class ArtifactService {
       operationSummary: `Redo revision ${plan.restoreFromRevision}`,
       operationPayload: { redoOfRevision: plan.restoreFromRevision },
       idempotencyKey: params.idempotencyKey,
+      assertAuthorized: params.assertAuthorized,
     });
     return {
       artifact: res.artifact,

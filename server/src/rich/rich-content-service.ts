@@ -142,21 +142,42 @@ export class RichContentService {
     }
   }
 
-  private assertUserQuota(userId: string, additionalBytes: number, replaceBlockId?: string): void {
+  /**
+   * Computes total persisted UTF-8 bytes across BOTH current `rich_blocks`
+   * (`document_json` + `ui_state_snapshot_json`) AND all historical `rich_block_revisions` (`document_json`)
+   * for the specified user (`PERF-05`).
+   */
+  getUserRichStorageBytes(userId: string): number {
+    const blocksRow = this.db.db
+      .prepare(
+        `SELECT COALESCE(SUM(LENGTH(CAST(document_json AS BLOB)) + COALESCE(LENGTH(CAST(ui_state_snapshot_json AS BLOB)), 0)), 0) AS total
+         FROM rich_blocks
+         WHERE user_id = ?`
+      )
+      .get(userId) as { total: number };
+    const revisionsRow = this.db.db
+      .prepare(
+        `SELECT COALESCE(SUM(LENGTH(CAST(document_json AS BLOB))), 0) AS total
+         FROM rich_block_revisions
+         WHERE user_id = ?`
+      )
+      .get(userId) as { total: number };
+    return Number(blocksRow.total ?? 0) + Number(revisionsRow.total ?? 0);
+  }
+
+  private assertUserQuotaDelta(userId: string, deltaBytes: number): void {
     const maxBytes = this.config.richContentMaxMb * 1024 * 1024;
-    const row = replaceBlockId
-      ? (this.db.db
-          .prepare('SELECT COALESCE(SUM(size_bytes), 0) AS total FROM rich_blocks WHERE user_id = ? AND id != ?')
-          .get(userId, replaceBlockId) as { total: number })
-      : (this.db.db
-          .prepare('SELECT COALESCE(SUM(size_bytes), 0) AS total FROM rich_blocks WHERE user_id = ?')
-          .get(userId) as { total: number });
-    const currentTotal = Number(row.total ?? 0);
-    if (currentTotal + additionalBytes > maxBytes) {
+    const currentTotal = this.getUserRichStorageBytes(userId);
+    if (currentTotal + Math.max(0, deltaBytes) > maxBytes) {
       throw new RichContentError(
         'RICH_QUOTA_EXCEEDED',
         `リッチコンテンツの保存容量上限（${this.config.richContentMaxMb}MB）を超過します。`,
-        413
+        413,
+        {
+          currentBytes: currentTotal,
+          deltaBytes: Math.max(0, deltaBytes),
+          maxBytes,
+        }
       );
     }
   }
@@ -196,7 +217,6 @@ export class RichContentService {
     const doc = params.document as RichDocumentV1;
     const docJson = JSON.stringify(doc);
     const sizeBytes = Buffer.byteLength(docJson, 'utf8');
-    this.assertUserQuota(params.userId, sizeBytes);
 
     const id = crypto.randomUUID();
     const now = Date.now();
@@ -220,6 +240,9 @@ export class RichContentService {
     let envelope;
     this.db.db.exec('BEGIN IMMEDIATE;');
     try {
+      // Creating a block persists both rich_blocks.document_json and revision 1 in rich_block_revisions.document_json.
+      this.assertUserQuotaDelta(params.userId, sizeBytes * 2);
+
       const seqRow = this.db.db
         .prepare('SELECT COALESCE(MAX(created_seq), 0) AS max_seq FROM rich_blocks WHERE chat_id = ?')
         .get(params.chatId) as { max_seq: number };
@@ -498,7 +521,6 @@ export class RichContentService {
     const doc = candidateDoc as RichDocumentV1;
     const docJson = JSON.stringify(doc);
     const sizeBytes = Buffer.byteLength(docJson, 'utf8');
-    this.assertUserQuota(params.userId, sizeBytes, current.id);
 
     const nextRevision = current.revision + 1;
     const now = Date.now();
@@ -512,6 +534,24 @@ export class RichContentService {
     let envelope;
     this.db.db.exec('BEGIN IMMEDIATE;');
     try {
+      const liveRow = this.db.db
+        .prepare(
+          `SELECT revision, LENGTH(CAST(document_json AS BLOB)) AS doc_bytes
+           FROM rich_blocks
+           WHERE id = ? AND user_id = ? AND chat_id = ?`
+        )
+        .get(current.id, params.userId, params.chatId) as { revision: number; doc_bytes: number } | undefined;
+      if (!liveRow) {
+        throw new RichContentError('NOT_FOUND', 'リッチブロックが見つからないか権限がありません。', 404);
+      }
+      if (Number(liveRow.revision) !== params.expectedRevision) {
+        throw new RichContentError('RICH_BLOCK_CONFLICT', 'Concurrent update conflict.', 409);
+      }
+      // Updating replaces rich_blocks.document_json (delta = sizeBytes - prevDocBytes)
+      // AND appends a new immutable revision row in rich_block_revisions (+sizeBytes).
+      const prevDocBytes = Number(liveRow.doc_bytes ?? 0);
+      this.assertUserQuotaDelta(params.userId, sizeBytes - prevDocBytes + sizeBytes);
+
       const info = this.db.db
         .prepare(
           `UPDATE rich_blocks
@@ -591,18 +631,33 @@ export class RichContentService {
     blockId: string,
     uiState: Record<string, RichStateValue>
   ): RichBlockRecord {
-    const current = this.getBlock(userId, chatId, blockId);
-    if (!current) {
-      throw new RichContentError('NOT_FOUND', 'リッチブロックが見つかりません。', 404);
-    }
     const serialized = JSON.stringify(uiState);
-    if (Buffer.byteLength(serialized, 'utf8') > RICH_LIMITS.maxStateBytes) {
+    const newUiBytes = Buffer.byteLength(serialized, 'utf8');
+    if (newUiBytes > RICH_LIMITS.maxStateBytes) {
       throw new RichContentError('RICH_STATE_TOO_LARGE', 'UI状態スナップショットが128KB上限を超えています。', 422);
     }
     const now = Date.now();
-    this.db.db
-      .prepare('UPDATE rich_blocks SET ui_state_snapshot_json = ?, updated_at = ? WHERE id = ? AND user_id = ? AND chat_id = ?')
-      .run(serialized, now, blockId, userId, chatId);
+    this.db.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const row = this.db.db
+        .prepare(
+          `SELECT COALESCE(LENGTH(CAST(ui_state_snapshot_json AS BLOB)), 0) AS prev_ui_bytes
+           FROM rich_blocks
+           WHERE id = ? AND user_id = ? AND chat_id = ?`
+        )
+        .get(blockId, userId, chatId) as { prev_ui_bytes: number } | undefined;
+      if (!row) {
+        throw new RichContentError('NOT_FOUND', 'リッチブロックが見つかりません。', 404);
+      }
+      this.assertUserQuotaDelta(userId, newUiBytes - Number(row.prev_ui_bytes ?? 0));
+      this.db.db
+        .prepare('UPDATE rich_blocks SET ui_state_snapshot_json = ?, updated_at = ? WHERE id = ? AND user_id = ? AND chat_id = ?')
+        .run(serialized, now, blockId, userId, chatId);
+      this.db.db.exec('COMMIT;');
+    } catch (err) {
+      this.db.db.exec('ROLLBACK;');
+      throw err;
+    }
     return this.getBlock(userId, chatId, blockId)!;
   }
 

@@ -67,7 +67,7 @@ export function captureWorkspaceSnapshot(workspaceDir: string): WorkspaceSnapsho
   return snapshot;
 }
 
-export function syncWorkspaceChangesAsArtifacts(params: {
+export async function syncWorkspaceChangesAsArtifacts(params: {
   artifactService: ArtifactService;
   db: AppDatabase;
   userId: string;
@@ -78,7 +78,7 @@ export function syncWorkspaceChangesAsArtifacts(params: {
   before: WorkspaceSnapshot;
   hintPaths?: string[];
   skipIfAlreadyOwnedByOtherMessage?: boolean;
-}): ArtifactRecord[] {
+}): Promise<ArtifactRecord[]> {
   const registered: ArtifactRecord[] = [];
   if (!fs.existsSync(params.workspaceDir)) return registered;
   const rootReal = fs.realpathSync(params.workspaceDir);
@@ -126,7 +126,7 @@ export function syncWorkspaceChangesAsArtifacts(params: {
       );
     }
 
-    const { artifact } = params.artifactService.ingestWorkspaceFile({
+    const { artifact } = await params.artifactService.ingestWorkspaceFile({
       userId: params.userId,
       chatId: params.chatId,
       workspaceDir: rootReal,
@@ -150,6 +150,7 @@ export async function convertPresentationToPdfCached(params: {
   artifactId: string;
   revision: number;
   sourceAbsPath: string;
+  sourceFilename?: string;
   sourceSha256: string;
   dependencyManifestHash?: string | null;
 }): Promise<string | null> {
@@ -157,6 +158,7 @@ export async function convertPresentationToPdfCached(params: {
     artifactId: params.artifactId,
     revision: params.revision,
     sourceAbsPath: params.sourceAbsPath,
+    sourceFilename: params.sourceFilename,
     sourceSha256: params.sourceSha256,
     dependencyManifestHash: params.dependencyManifestHash ?? null,
   });

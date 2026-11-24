@@ -116,6 +116,8 @@ export interface ArtifactCommitJournalRow {
   operationSummary: string;
   operationPayloadJson: string | null;
   batchId: string | null;
+  batchSeq: number | null;
+  stagingIsolationMode: StagingIsolationKind | null;
   idempotencyScopeKey: string | null;
   idempotencyKey: string | null;
   requestFingerprint: string | null;

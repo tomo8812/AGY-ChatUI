@@ -8,7 +8,7 @@ import { resolveArtifactFile, resolveAuthorizedChatFileReference } from '../file
 import { listWorkspaceFiles, resolveContainedExistingPath } from '../files/workspace.js';
 import { injectSandboxZoomBridge } from '../files/sandbox-bridge.js';
 import type { ArtifactRecord } from '../types.js';
-import { requireAuth, type RouteDeps } from './auth-routes.js';
+import { buildLiveSessionAuthVerifier, requireAuth, type RouteDeps } from './auth-routes.js';
 
 export { injectSandboxZoomBridge };
 
@@ -58,8 +58,9 @@ function sendByteRangeOrFull(params: {
   const rangeHeader = typeof req.headers.range === 'string' ? req.headers.range : undefined;
   const ifRange = typeof req.headers['if-range'] === 'string' ? req.headers['if-range'].trim() : undefined;
 
-  // Strict If-Range validation: only serve 206 if If-Range matches ETag (otherwise serve full 200)
-  const ifRangeSatisfied = !ifRange || ifRange === etag || ifRange === `W/${etag}`;
+  // Strict RFC 9110 §13.1.5 If-Range strong comparison (`ARCH-08`):
+  // Weak ETags (`W/"..."`) NEVER satisfy If-Range; fall back to full 200 OK representation.
+  const ifRangeSatisfied = !ifRange || (!ifRange.startsWith('W/') && !etag.startsWith('W/') && ifRange === etag);
 
   if (rangeHeader && !forceDownload && ifRangeSatisfied) {
     const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader);
@@ -140,7 +141,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const body = z.object({ reference: z.string().min(1) }).safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: 'INVALID_INPUT' });
 
-    const resolved = resolveAuthorizedChatFileReference({
+    const resolved = await resolveAuthorizedChatFileReference({
       artifactService,
       db,
       userId: session.user.id,
@@ -190,6 +191,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
         actorId: session.user.id,
         idempotencyKey: parsed.data.idempotencyKey,
         operationSummary: parsed.data.operationSummary,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
       });
       return reply.code(201).send(result);
     } catch (err) {
@@ -209,55 +211,117 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     return { artifact };
   });
 
-  // Immutable revision-pinned content endpoint
+  const servePinnedRevisionContent = async (params: {
+    req: { headers: Record<string, string | string[] | undefined> };
+    reply: FastifyReply;
+    userId: string;
+    artifactId: string;
+    revNum: number;
+    query: { download?: string; converted?: string; v?: string; d?: string };
+    immutableByPath: boolean;
+  }) => {
+    const { req, reply, userId, artifactId, revNum, query, immutableByPath } = params;
+    const { artifact, revision, blobPath, sizeBytes } = artifactService.getRevisionContentBlob(userId, artifactId, revNum);
+    const forceDownload = query.download === '1' || query.download === 'true';
+    const isConvertedPdf = query.converted === 'pdf' && artifact.previewKind === 'pptx';
+
+    let serveAbsPath = blobPath;
+    let serveSize = sizeBytes;
+    let serveMime = artifact.mimeType;
+    let serveFilename = artifact.filename;
+
+    if (isConvertedPdf) {
+      const convertedPath = await convertPresentationToPdfCached({
+        artifactService,
+        artifactId: artifact.id,
+        revision: revision.revision,
+        sourceAbsPath: blobPath,
+        sourceFilename: artifact.filename,
+        sourceSha256: revision.sha256,
+        dependencyManifestHash: revision.dependencyManifestHash,
+      });
+      if (!convertedPath) {
+        return reply.code(422).send({
+          error: 'CONVERSION_UNAVAILABLE',
+          message: 'この環境にはプレゼン変換用のLibreOfficeが導入されていないため、原本ダウンロードをご利用ください。',
+        });
+      }
+      const stat = await fs.promises.stat(convertedPath);
+      serveAbsPath = convertedPath;
+      serveSize = stat.size;
+      serveMime = 'application/pdf';
+      serveFilename = `${artifact.filename}.pdf`;
+    }
+
+    const expectedV = revision.sha256.slice(0, 12);
+    const expectedD = revision.dependencyManifestHash ? revision.dependencyManifestHash.slice(0, 8) : null;
+    const depMatches = !expectedD || query.d === expectedD;
+    const isImmutable = !forceDownload && (immutableByPath ? depMatches : Boolean(query.v && query.v === expectedV && depMatches));
+    const variant = isConvertedPdf ? 'pdf' : forceDownload ? 'dl' : 'inline';
+    const etag = computeStrongEtag([
+      artifact.id,
+      'rev',
+      revision.revision,
+      revision.sha256,
+      revision.dependencyManifestHash ?? '',
+      variant,
+    ]);
+
+    reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('X-Artifact-Revision', String(revision.revision));
+    reply.header(
+      'Content-Location',
+      isConvertedPdf
+        ? `/api/files/${artifact.id}/revisions/${revision.revision}/content?converted=pdf`
+        : `/api/files/${artifact.id}/revisions/${revision.revision}/content`
+    );
+    reply.header('Vary', 'Cookie');
+    reply.header('ETag', etag);
+    reply.header('Last-Modified', formatHttpDate(revision.createdAt));
+    reply.header(
+      'Cache-Control',
+      isImmutable ? 'private, max-age=31536000, immutable' : 'private, max-age=0, must-revalidate'
+    );
+    reply.header('Accept-Ranges', 'bytes');
+
+    if (!forceDownload && (serveMime === 'text/html' || serveMime === 'image/svg+xml')) {
+      reply.header('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline';");
+    }
+    if (forceDownload) {
+      reply.header('Content-Type', 'application/octet-stream');
+      reply.header('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(serveFilename)}`);
+    } else {
+      reply.header('Content-Type', serveMime);
+      reply.header('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(serveFilename)}`);
+    }
+
+    if (isFreshRequest(req.headers, etag, revision.createdAt)) {
+      return reply.code(304).send();
+    }
+    return sendByteRangeOrFull({ req, reply, absPath: serveAbsPath, totalSize: serveSize, etag, forceDownload });
+  };
+
+  // Immutable revision-pinned content endpoint (supports raw & `?converted=pdf` from immutable blob)
   app.get('/api/files/:artifactId/revisions/:rev/content', async (req, reply) => {
     const session = requireAuth(req, reply, db);
     if (!session) return;
     const { artifactId, rev: revParam } = req.params as { artifactId: string; rev: string };
-    const query = req.query as { download?: string; v?: string; d?: string };
+    const query = req.query as { download?: string; converted?: string; v?: string; d?: string };
     const revNum = Number.parseInt(revParam, 10);
     if (!Number.isInteger(revNum) || revNum < 1) {
       return reply.code(400).send({ error: 'INVALID_REVISION' });
     }
 
     try {
-      const { artifact, revision, blobPath, sizeBytes } = artifactService.getRevisionContentBlob(
-        session.user.id,
+      return await servePinnedRevisionContent({
+        req,
+        reply,
+        userId: session.user.id,
         artifactId,
-        revNum
-      );
-      const forceDownload = query.download === '1' || query.download === 'true';
-      const serveMime = artifact.mimeType;
-      const etag = computeStrongEtag([artifact.id, 'rev', revision.revision, revision.sha256, forceDownload ? 'dl' : 'inline']);
-
-      reply.header('X-Content-Type-Options', 'nosniff');
-      reply.header('X-Artifact-Revision', String(revision.revision));
-      reply.header('Content-Location', `/api/files/${artifact.id}/revisions/${revision.revision}/content`);
-      reply.header('Vary', 'Cookie');
-      reply.header('ETag', etag);
-      reply.header('Last-Modified', formatHttpDate(revision.createdAt));
-      reply.header(
-        'Cache-Control',
-        forceDownload ? 'private, max-age=0, must-revalidate' : 'private, max-age=31536000, immutable'
-      );
-      reply.header('Accept-Ranges', 'bytes');
-
-      if (!forceDownload && (serveMime === 'text/html' || serveMime === 'image/svg+xml')) {
-        reply.header('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline';");
-      }
-      if (forceDownload) {
-        reply.header('Content-Type', 'application/octet-stream');
-        reply.header('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(artifact.filename)}`);
-      } else {
-        reply.header('Content-Type', serveMime);
-        reply.header('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(artifact.filename)}`);
-      }
-
-      if (isFreshRequest(req.headers, etag, revision.createdAt)) {
-        return reply.code(304).send();
-      }
-
-      return sendByteRangeOrFull({ req, reply, absPath: blobPath, totalSize: sizeBytes, etag, forceDownload });
+        revNum,
+        query,
+        immutableByPath: true,
+      });
     } catch (err) {
       return sendArtifactError(reply, err);
     }
@@ -277,52 +341,22 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const forceDownload = query.download === '1' || query.download === 'true';
     const isConvertedPdf = query.converted === 'pdf' && artifact.previewKind === 'pptx';
 
-    // Revision-pinned immutable blob serving (`?rev=<rev>&v=<sha12>[&d=<dep8>]`)
-    if (query.rev && !isConvertedPdf) {
+    // Revision-pinned immutable blob serving (`?rev=<rev>&v=<sha12>[&d=<dep8>][&converted=pdf]`)
+    if (query.rev) {
       const revNum = Number.parseInt(query.rev, 10);
       if (!Number.isInteger(revNum) || revNum < 1) {
         return reply.code(400).send({ error: 'INVALID_REVISION' });
       }
       try {
-        const { revision, blobPath, sizeBytes } = artifactService.getRevisionContentBlob(
-          session.user.id,
+        return await servePinnedRevisionContent({
+          req,
+          reply,
+          userId: session.user.id,
           artifactId,
-          revNum
-        );
-        const expectedV = revision.sha256.slice(0, 12);
-        const expectedD = revision.dependencyManifestHash ? revision.dependencyManifestHash.slice(0, 8) : null;
-        const hashMatches = Boolean(query.v && query.v === expectedV);
-        const depMatches = !expectedD || query.d === expectedD;
-        const isImmutable = hashMatches && depMatches && !forceDownload;
-
-        const etag = computeStrongEtag([artifact.id, 'rev', revision.revision, revision.sha256, forceDownload ? 'dl' : 'inline']);
-        reply.header('X-Content-Type-Options', 'nosniff');
-        reply.header('X-Artifact-Revision', String(revision.revision));
-        reply.header('Content-Location', `/api/files/${artifact.id}/revisions/${revision.revision}/content`);
-        reply.header('Vary', 'Cookie');
-        reply.header('ETag', etag);
-        reply.header('Last-Modified', formatHttpDate(revision.createdAt));
-        reply.header(
-          'Cache-Control',
-          isImmutable ? 'private, max-age=31536000, immutable' : 'private, max-age=0, must-revalidate'
-        );
-        reply.header('Accept-Ranges', 'bytes');
-
-        if (!forceDownload && (artifact.mimeType === 'text/html' || artifact.mimeType === 'image/svg+xml')) {
-          reply.header('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline';");
-        }
-        if (forceDownload) {
-          reply.header('Content-Type', 'application/octet-stream');
-          reply.header('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(artifact.filename)}`);
-        } else {
-          reply.header('Content-Type', artifact.mimeType);
-          reply.header('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(artifact.filename)}`);
-        }
-
-        if (isFreshRequest(req.headers, etag, revision.createdAt)) {
-          return reply.code(304).send();
-        }
-        return sendByteRangeOrFull({ req, reply, absPath: blobPath, totalSize: sizeBytes, etag, forceDownload });
+          revNum,
+          query,
+          immutableByPath: false,
+        });
       } catch (err) {
         return sendArtifactError(reply, err);
       }
@@ -341,6 +375,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
         artifactId: artifact.id,
         revision: artifact.revision,
         sourceAbsPath: absPath,
+        sourceFilename: artifact.filename,
         sourceSha256: artifact.sha256,
         dependencyManifestHash: artifact.dependencyManifestHash,
       });
@@ -484,6 +519,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
         projectId: project.id,
         targetFilename: parsed.data.filename,
         srcAbsPathOverride: fileSource.absPath,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
       });
       const latestProject = db.getProject(session.user.id, project.id)!;
       const full = { ...latestProject, files: db.listProjectFiles(session.user.id, project.id) };
@@ -551,6 +587,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
         actorId: session.user.id,
         idempotencyKey: parsed.data.idempotencyKey,
         operationSummary: parsed.data.operationSummary,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
       });
     } catch (err) {
       return sendArtifactError(reply, err);
@@ -574,6 +611,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
         actorId: session.user.id,
         idempotencyKey: parsed.data.idempotencyKey,
         operationSummary: parsed.data.operationSummary,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
       });
     } catch (err) {
       return sendArtifactError(reply, err);
@@ -613,6 +651,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
         actorKind: 'user',
         actorId: session.user.id,
         idempotencyKey: parsed.data.idempotencyKey,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
       });
       return reply.code(201).send({ artifact });
     } catch (err) {
@@ -653,6 +692,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
         actorKind: 'user',
         actorId: session.user.id,
         idempotencyKey: parsed.data.idempotencyKey,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
       });
     } catch (err) {
       return sendArtifactError(reply, err);
@@ -679,6 +719,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
         sharedPolicy: parsed.data.sharedPolicy,
         actorKind: 'user',
         actorId: session.user.id,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
       });
       return { batch };
     } catch (err) {
@@ -698,6 +739,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
         actorKind: 'user',
         actorId: session.user.id,
         idempotencyKey: typeof body.idempotencyKey === 'string' ? body.idempotencyKey : undefined,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
       });
     } catch (err) {
       return sendArtifactError(reply, err);
@@ -716,6 +758,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
         actorKind: 'user',
         actorId: session.user.id,
         idempotencyKey: typeof body.idempotencyKey === 'string' ? body.idempotencyKey : undefined,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
       });
     } catch (err) {
       return sendArtifactError(reply, err);
@@ -742,6 +785,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
         actorKind: 'user',
         actorId: session.user.id,
         idempotencyKey: parsed.data.idempotencyKey,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
       });
     } catch (err) {
       return sendArtifactError(reply, err);

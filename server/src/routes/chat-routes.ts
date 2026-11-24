@@ -9,7 +9,7 @@ import type { SkillService } from '../skills/skill-service.js';
 import { isArtifactError } from '../artifacts/errors.js';
 import { sanitizeFileName } from '../files/workspace.js';
 import type { AttachmentRef } from '../types.js';
-import { requireAuth, type RouteDeps } from './auth-routes.js';
+import { buildLiveSessionAuthVerifier, requireAuth, type RouteDeps } from './auth-routes.js';
 
 export interface ChatRouteDeps extends RouteDeps {
   acp: AcpClientManager;
@@ -143,6 +143,7 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
         userId: session.user.id,
         projectId: project.id,
         chatId: chat.id,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
       });
       skillService?.syncProjectSkillsToChat(session.user.id, project.id, workspaceDir);
     }
@@ -255,16 +256,19 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
       await scheduler.cancelRun(session.user.id, chatId, active.id);
     }
     await acp.stopChatWorker(session.user.id, chatId);
-    db.deleteChat(session.user.id, chatId);
-    fs.rmSync(chat.workspaceDir, { recursive: true, force: true });
-
-    hub.emitDurable({
-      userId: session.user.id,
-      type: 'chat.deleted',
-      chatId,
-      payload: { chatId },
-    });
-    return { ok: true };
+    try {
+      await artifactService.deleteChat({
+        userId: session.user.id,
+        chatId,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
+      });
+      return { ok: true };
+    } catch (err) {
+      if (isArtifactError(err)) {
+        return reply.code(err.statusCode).send({ error: err.code, message: err.message, details: err.details });
+      }
+      throw err;
+    }
   });
 
   app.post('/api/chats/:chatId/sync-project', async (req, reply) => {
@@ -280,11 +284,20 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
       return reply.code(404).send({ error: 'PROJECT_NOT_FOUND', message: 'プロジェクトが存在しません。' });
     }
 
-    const syncedPaths = await artifactService.syncProjectFilesToChat({
-      userId: session.user.id,
-      projectId: project.id,
-      chatId,
-    });
+    let syncedPaths: string[];
+    try {
+      syncedPaths = await artifactService.syncProjectFilesToChat({
+        userId: session.user.id,
+        projectId: project.id,
+        chatId,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
+      });
+    } catch (err) {
+      if (isArtifactError(err)) {
+        return reply.code(err.statusCode).send({ error: err.code, message: err.message, details: err.details });
+      }
+      throw err;
+    }
     skillService?.syncProjectSkillsToChat(session.user.id, project.id, chat.workspaceDir);
 
     // Reset ACP worker so next turn loads refreshed project instructions & skills if changed
@@ -311,6 +324,7 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
     const { chatId } = req.params as { chatId: string };
     const chat = db.getChat(session.user.id, chatId);
     if (!chat) return reply.code(404).send({ error: 'NOT_FOUND', message: 'チャットが見つかりません。' });
+    const assertAuthorized = buildLiveSessionAuthVerifier(req, db, session.user.id);
 
     const attachments: AttachmentRef[] = [];
     try {
@@ -324,6 +338,7 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
           filename,
           mimeType: part.mimetype,
           buffer: buf,
+          assertAuthorized,
         });
         attachments.push({
           artifactId: artifact.id,

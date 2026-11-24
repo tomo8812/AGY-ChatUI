@@ -14,6 +14,7 @@ import {
   verifyCsrfIfMutating,
 } from '../auth/session.js';
 import { ensureUserDirs } from '../files/workspace.js';
+import { ArtifactError } from '../artifacts/errors.js';
 import type { ArtifactService } from '../artifacts/artifact-service.js';
 import type { EditRequestService } from '../edit-requests/edit-request-service.js';
 import type { McpService } from '../mcp/mcp-service.js';
@@ -68,6 +69,28 @@ export function requireAuth(req: FastifyRequest, reply: FastifyReply, db: AppDat
     return null;
   }
   return session;
+}
+
+/**
+ * Live DB session re-verifier (`ARCH-06` / Sec 3.3).
+ * Passed as `assertAuthorized` into ArtifactService mutating operations so session validity
+ * and user ownership are re-checked against live DB state right before T3 commit and before
+ * returning any idempotent replay / coalesced result.
+ */
+export function buildLiveSessionAuthVerifier(
+  req: FastifyRequest,
+  db: AppDatabase,
+  expectedUserId: string
+): () => void {
+  return () => {
+    const liveSession = authenticateRequest(req, db);
+    if (!liveSession || liveSession.user.id !== expectedUserId) {
+      throw new ArtifactError('UNAUTHENTICATED', 'セッションが無効化されました。再ログインしてください。', 401);
+    }
+    if (!verifyCsrfIfMutating(req)) {
+      throw new ArtifactError('CSRF_INVALID', 'CSRFトークンが無効です。ページを再読込してください。', 403);
+    }
+  };
 }
 
 export async function registerAuthRoutes(app: FastifyInstance, deps: RouteDeps): Promise<void> {

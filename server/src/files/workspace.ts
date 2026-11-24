@@ -222,6 +222,228 @@ export function ensureContainedDirectoryNoFollow(
   }
 }
 
+/**
+ * Unlink a regular file strictly contained inside `rootDir` by walking EVERY intermediate directory
+ * with O_DIRECTORY | O_NOFOLLOW and rejecting symlinks or non-regular files on the leaf.
+ * Tolerates ONLY `ENOENT` (returning `{ deleted: false }`); all other FS or containment errors are rethrown.
+ */
+export function unlinkContainedRegularFileNoFollow(
+  rootDir: string,
+  relPathRaw: string
+): { deleted: boolean; relPath: string } {
+  if (!supportsWorkspaceTextWrites) {
+    throw new PathContainmentError('この実行環境では O_NOFOLLOW による安全なファイル削除を利用できません。');
+  }
+  const relPath = normalizeRelPath(relPathRaw);
+  const segments = relPath.split('/');
+  const leaf = segments.pop()!;
+  const parentRel = segments.join('/');
+
+  let dirFd: number;
+  try {
+    ({ dirFd } = ensureContainedDirectoryNoFollow(rootDir, parentRel, { createMissing: false }));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { deleted: false, relPath };
+    }
+    throw err;
+  }
+
+  try {
+    const leafPath = `/proc/self/fd/${dirFd}/${leaf}`;
+    let lst: fs.Stats;
+    try {
+      lst = fs.lstatSync(leafPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return { deleted: false, relPath };
+      }
+      throw err;
+    }
+    if (lst.isSymbolicLink() || !lst.isFile()) {
+      throw new PathContainmentError('削除対象が通常ファイルでないか、シンボリックリンクです。');
+    }
+    try {
+      fs.unlinkSync(leafPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return { deleted: false, relPath };
+      }
+      throw err;
+    }
+    fs.fsyncSync(dirFd);
+    return { deleted: true, relPath };
+  } finally {
+    try {
+      fs.closeSync(dirFd);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/**
+ * Enumerate regular files strictly contained under `rootDir/subRelDir` without ever following symlinks.
+ * Rejects symlinked intermediate directories in `subRelDir`; skips any symlinked child entries during traversal.
+ */
+export function listContainedFilesNoFollow(rootDir: string, subRelDir: string): string[] {
+  if (!supportsWorkspaceTextWrites) {
+    throw new PathContainmentError('この実行環境では O_NOFOLLOW による安全なディレクトリ列挙を利用できません。');
+  }
+  const normalizedSub = normalizeRelPath(subRelDir);
+  let rootSubFd: number;
+  try {
+    ({ dirFd: rootSubFd } = ensureContainedDirectoryNoFollow(rootDir, normalizedSub, { createMissing: false }));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return [];
+    }
+    throw err;
+  }
+
+  const results: string[] = [];
+  const { O_RDONLY, O_DIRECTORY, O_NOFOLLOW } = fs.constants;
+  const walkFd = (dirFd: number, relPrefix: string) => {
+    const dirProcPath = `/proc/self/fd/${dirFd}`;
+    const entries = fs.readdirSync(dirProcPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const childPath = `${dirProcPath}/${entry.name}`;
+      let lst: fs.Stats;
+      try {
+        lst = fs.lstatSync(childPath);
+      } catch {
+        continue;
+      }
+      if (lst.isSymbolicLink()) continue;
+      const childRel = `${relPrefix}/${entry.name}`;
+      if (lst.isDirectory()) {
+        let childFd: number;
+        try {
+          childFd = fs.openSync(childPath, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        } catch {
+          continue;
+        }
+        try {
+          walkFd(childFd, childRel);
+        } finally {
+          try {
+            fs.closeSync(childFd);
+          } catch {
+            // ignore
+          }
+        }
+      } else if (lst.isFile()) {
+        results.push(childRel);
+      }
+    }
+  };
+
+  try {
+    walkFd(rootSubFd, normalizedSub);
+  } finally {
+    try {
+      fs.closeSync(rootSubFd);
+    } catch {
+      // ignore
+    }
+  }
+  return results;
+}
+
+/**
+ * Safely remove a directory subtree contained strictly inside `rootDir` without following symlinks.
+ * Tolerates ONLY `ENOENT` if the subtree is already absent; rethrows containment or permission errors.
+ */
+export function removeContainedSubtreeNoFollow(rootDir: string, relSubtreePath: string): { deleted: boolean } {
+  if (!supportsWorkspaceTextWrites) {
+    throw new PathContainmentError('この実行環境では O_NOFOLLOW による安全なディレクトリ削除を利用できません。');
+  }
+  const normalized = normalizeRelPath(relSubtreePath);
+  const segments = normalized.split('/');
+  const targetName = segments.pop()!;
+  const parentRel = segments.join('/');
+
+  let parentFd: number;
+  try {
+    ({ dirFd: parentFd } = ensureContainedDirectoryNoFollow(rootDir, parentRel, { createMissing: false }));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { deleted: false };
+    }
+    throw err;
+  }
+
+  const { O_RDONLY, O_DIRECTORY, O_NOFOLLOW } = fs.constants;
+  const removeContentsNoFollow = (dirFd: number) => {
+    const dirProc = `/proc/self/fd/${dirFd}`;
+    for (const entry of fs.readdirSync(dirProc, { withFileTypes: true })) {
+      const childPath = `${dirProc}/${entry.name}`;
+      let lst: fs.Stats;
+      try {
+        lst = fs.lstatSync(childPath);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw err;
+      }
+      if (lst.isDirectory() && !lst.isSymbolicLink()) {
+        const childFd = fs.openSync(childPath, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        try {
+          removeContentsNoFollow(childFd);
+        } finally {
+          fs.closeSync(childFd);
+        }
+        try {
+          fs.rmdirSync(childPath);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+        }
+      } else {
+        try {
+          fs.unlinkSync(childPath);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+        }
+      }
+    }
+    fs.fsyncSync(dirFd);
+  };
+
+  try {
+    const targetPath = `/proc/self/fd/${parentFd}/${targetName}`;
+    let lst: fs.Stats;
+    try {
+      lst = fs.lstatSync(targetPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return { deleted: false };
+      }
+      throw err;
+    }
+    if (lst.isSymbolicLink() || !lst.isDirectory()) {
+      throw new PathContainmentError('削除対象が通常ディレクトリでないか、シンボリックリンクです。');
+    }
+    const targetFd = fs.openSync(targetPath, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    try {
+      removeContentsNoFollow(targetFd);
+    } finally {
+      fs.closeSync(targetFd);
+    }
+    try {
+      fs.rmdirSync(targetPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    }
+    fs.fsyncSync(parentFd);
+    return { deleted: true };
+  } finally {
+    try {
+      fs.closeSync(parentFd);
+    } catch {
+      // ignore
+    }
+  }
+}
+
 export interface OpenedContainedFile {
   fd: number;
   stat: fs.BigIntStats;

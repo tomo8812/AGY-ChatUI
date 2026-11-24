@@ -994,4 +994,615 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
     expect(peakActive).toBeLessThanOrEqual(2);
     expect(budgetGov.getUsedWeight()).toBe(0);
   });
+
+  it('Finding #2 (ARCH-03 / Sec 3.2): serializes concurrent ingestWorkspaceFile and editArtifact through ArtifactLockManager', async () => {
+    const srv = await createTestServer({ sandboxMode: 'off' });
+    cleanups.push(srv.cleanup);
+
+    const { client: alice, userId } = await registerAndBindAgy(srv.baseUrl, 'lock_alice', 'lock-code');
+    const chatRes = await alice.request<{ chat: { id: string; workspaceDir: string } }>('POST', '/api/chats', { title: 'Lock Chat' });
+    const chatId = chatRes.data.chat.id;
+    const workspaceDir = chatRes.data.chat.workspaceDir;
+
+    const created = await alice.request<{ artifact: { id: string; revision: number } }>(
+      'POST',
+      `/api/chats/${chatId}/artifacts`,
+      { relPath: 'shared.md', content: '# initial\n' }
+    );
+    const artifactId = created.data.artifact.id;
+
+    // Spy on ArtifactLockManager to prove ingestWorkspaceFile acquires artifact & path locks
+    const acquiredKeys: string[][] = [];
+    const origWithLocks = srv.ctx.artifactService.lockManager.withLocks.bind(srv.ctx.artifactService.lockManager);
+    srv.ctx.artifactService.lockManager.withLocks = (async (keys, fn) => {
+      acquiredKeys.push([...keys]);
+      return origWithLocks(keys, fn);
+    }) as typeof srv.ctx.artifactService.lockManager.withLocks;
+
+    // Simulate external ACP write + concurrent ingestWorkspaceFile vs editArtifact on the same artifact
+    const filePath = path.join(workspaceDir, 'shared.md');
+    fs.writeFileSync(filePath, '# external-acp-v2\n', 'utf8');
+
+    const [ingestOut, editOut] = await Promise.all([
+      srv.ctx.artifactService.ingestWorkspaceFile({
+        userId,
+        chatId,
+        workspaceDir,
+        relPath: 'shared.md',
+        absPath: filePath,
+      }),
+      srv.ctx.artifactService.editArtifact({
+        userId,
+        artifactId,
+        expectedRevision: 1,
+        operations: [{ op: 'replace_source', content: '# user-edit\n' }],
+        actorKind: 'user',
+        actorId: userId,
+      }).catch((err: unknown) => ({ conflictErr: err })),
+    ]);
+
+    expect(ingestOut.artifact.id).toBe(artifactId);
+    expect(acquiredKeys.some((ks) => ks.includes(`artifact:${artifactId}`))).toBe(true);
+    // Either ingest ran first (causing edit to see 409 CONFLICT on stale rev 1) OR edit ran first and ingest saw updated bytes;
+    // in BOTH serialized orders, final DB artifact revision, sha256, and disk content must stay 100% consistent.
+    const latest = srv.ctx.db.getArtifact(userId, artifactId)!;
+    const diskBytes = fs.readFileSync(filePath);
+    const diskSha = crypto.createHash('sha256').update(diskBytes).digest('hex');
+    expect(latest.sha256).toBe(diskSha);
+    expect(latest.revision).toBeGreaterThanOrEqual(2);
+    expect(editOut).toBeDefined();
+  });
+
+  it('Finding #3 (ARCH-04 / ARCH-07): atomically marks artifact_restore_batch_items committed inside Stage T6 on both normal commit and crash recovery', async () => {
+    const srv = await createTestServer({ sandboxMode: 'off' });
+    cleanups.push(srv.cleanup);
+
+    const { client: alice, userId } = await registerAndBindAgy(srv.baseUrl, 'batch_t6_alice', 't6-code');
+    const chatRes = await alice.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Batch T6 Chat' });
+    const chatId = chatRes.data.chat.id;
+
+    // Create shared CSS + parent HTML + external sibling HTML
+    const cssRes = await alice.request<{ artifact: { id: string } }>('POST', `/api/chats/${chatId}/artifacts`, {
+      relPath: 'theme.css',
+      content: 'body { color: navy; }',
+    });
+    const cssId = cssRes.data.artifact.id;
+
+    const parentRes = await alice.request<{ artifact: { id: string; revision: number } }>(
+      'POST',
+      `/api/chats/${chatId}/artifacts`,
+      { relPath: 'parent.html', content: '<link rel="stylesheet" href="theme.css"><h1>Parent v1</h1>' }
+    );
+    const parentId = parentRes.data.artifact.id;
+
+    const siblingRes = await alice.request<{ artifact: { id: string; revision: number } }>(
+      'POST',
+      `/api/chats/${chatId}/artifacts`,
+      { relPath: 'sibling.html', content: '<link rel="stylesheet" href="theme.css"><h1>Sibling v1</h1>' }
+    );
+    const siblingId = siblingRes.data.artifact.id;
+
+    // Mutate theme.css to rev 2 (auto-propagating dependency_sync to parent & sibling -> rev 2)
+    const editCss = await alice.request('POST', `/api/files/${cssId}/edit`, {
+      expectedRevision: 1,
+      operations: [{ op: 'replace_source', content: 'body { color: crimson; }' }],
+    });
+    expect(editCss.status).toBe(200);
+    const parentBeforeRestore = srv.ctx.db.getArtifact(userId, parentId)!;
+    const siblingBeforeRestore = srv.ctx.db.getArtifact(userId, siblingId)!;
+    expect(parentBeforeRestore.revision).toBe(2);
+    expect(siblingBeforeRestore.revision).toBe(2);
+
+    // Inject crash at after_T5 on the FIRST item (theme.css) during restoreBundle(parent, rev 1)
+    let injectedOnce = false;
+    srv.ctx.artifactService.commitFaultHook = (stage) => {
+      if (stage === 'after_T5' && !injectedOnce) {
+        injectedOnce = true;
+        throw new Error('SIMULATED_CRASH_AFTER_T5_IN_BATCH');
+      }
+    };
+
+    await expect(
+      srv.ctx.artifactService.restoreBundle({
+        userId,
+        parentArtifactId: parentId,
+        targetRevision: 1,
+        sharedPolicy: 'overwrite_shared',
+        actorKind: 'user',
+        actorId: userId,
+      })
+    ).rejects.toThrow('SIMULATED_CRASH_AFTER_T5_IN_BATCH');
+    srv.ctx.artifactService.commitFaultHook = undefined;
+
+    // Before recovery: T6 did NOT run yet, so journal has batch_seq = 1 and batch item is still pending
+    const journalBefore = srv.ctx.db.db
+      .prepare('SELECT state, batch_id, batch_seq FROM artifact_commit_journal WHERE artifact_id = ? ORDER BY created_at DESC LIMIT 1')
+      .get(cssId) as { state: string; batch_id: string; batch_seq: number };
+    expect(journalBefore.state).toBe('file_replaced');
+    expect(journalBefore.batch_id).toBeTruthy();
+    expect(journalBefore.batch_seq).toBe(1);
+
+    const itemBefore = srv.ctx.db.db
+      .prepare('SELECT status, committed_revision FROM artifact_restore_batch_items WHERE batch_id = ? AND seq = 1')
+      .get(journalBefore.batch_id) as { status: string; committed_revision: number | null };
+    expect(itemBefore.status).toBe('pending');
+    expect(itemBefore.committed_revision).toBeNull();
+
+    // Run startup crash recovery -> rolls forward T6 atomically marking batch item committed,
+    // finalizes interrupted batch as failed_partial, and propagates dependency_sync to BOTH
+    // the un-restored parent in T AND the external sibling S!
+    await srv.ctx.artifactService.recoverOnStartup();
+
+    const itemAfter = srv.ctx.db.db
+      .prepare('SELECT status, committed_revision FROM artifact_restore_batch_items WHERE batch_id = ? AND seq = 1')
+      .get(journalBefore.batch_id) as { status: string; committed_revision: number | null };
+    expect(itemAfter.status).toBe('committed');
+    expect(itemAfter.committed_revision).toBe(3);
+
+    const batchRow = srv.ctx.db.db
+      .prepare('SELECT state FROM artifact_restore_batches WHERE batch_id = ?')
+      .get(journalBefore.batch_id) as { state: string };
+    expect(batchRow.state).toBe('failed_partial');
+
+    const parentAfter = srv.ctx.db.getArtifact(userId, parentId)!;
+    const siblingAfter = srv.ctx.db.getArtifact(userId, siblingId)!;
+    expect(parentAfter.revision).toBeGreaterThan(parentBeforeRestore.revision);
+    expect(siblingAfter.revision).toBeGreaterThan(siblingBeforeRestore.revision);
+  });
+
+  it('Finding #4 (ARCH-03 / ARCH-07 / SEC-02): enforces ENOENT-only deletion, O_NOFOLLOW .project-context sync deletion with dep propagation, and gateway-routed project deletion', async () => {
+    const srv = await createTestServer({ sandboxMode: 'off' });
+    cleanups.push(srv.cleanup);
+
+    const { client: alice, userId } = await registerAndBindAgy(srv.baseUrl, 'proj_del_alice', 'projdel-code');
+
+    // 1. Create project & upload ref.css
+    const projRes = await alice.request<{ project: { id: string; storageDir: string } }>('POST', '/api/projects', {
+      name: 'Strict Delete Project',
+    });
+    const projectId = projRes.data.project.id;
+    const storageDir = projRes.data.project.storageDir;
+
+    const up = await srv.ctx.artifactService.uploadProjectFile({
+      userId,
+      projectId,
+      filename: 'ref.css',
+      mimeType: 'text/css',
+      buffer: Buffer.from('h1 { color: teal; }', 'utf8'),
+    });
+
+    // 2. Make storageDir read-only (0500) -> unlink fails with EACCES -> deleteProjectFile MUST throw and preserve DB row!
+    fs.chmodSync(storageDir, 0o500);
+    try {
+      const failDel = await alice.request('DELETE', `/api/projects/${projectId}/files/${up.file.id}`);
+      expect(failDel.status).toBeGreaterThanOrEqual(400);
+      expect(srv.ctx.db.getProjectFileById(userId, projectId, up.file.id)).not.toBeNull();
+      expect(srv.ctx.db.getArtifact(userId, up.artifact.id)).not.toBeNull();
+    } finally {
+      fs.chmodSync(storageDir, 0o700);
+    }
+
+    // 3. Create chat under project (copies ref.css into .project-context/ref.css) and create dependent HTML
+    const chatRes = await alice.request<{ chat: { id: string; workspaceDir: string } }>('POST', '/api/chats', {
+      title: 'Sync Dep Chat',
+      projectId,
+    });
+    const chatId = chatRes.data.chat.id;
+    const workspaceDir = chatRes.data.chat.workspaceDir;
+    const docRes = await alice.request<{ artifact: { id: string; revision: number } }>(
+      'POST',
+      `/api/chats/${chatId}/artifacts`,
+      { relPath: 'page.html', content: '<link rel="stylesheet" href=".project-context/ref.css"><p>Hi</p>' }
+    );
+    const pageId = docRes.data.artifact.id;
+    const pageBeforeSync = srv.ctx.db.getArtifact(userId, pageId)!;
+    expect(pageBeforeSync.dependencyManifestHash).toBeTruthy();
+
+    // 4. Delete ref.css from project (simulate ENOENT first by manually removing file -> ENOENT IS tolerated)
+    fs.unlinkSync(path.join(storageDir, up.file.relPath));
+    const okDel = await alice.request('DELETE', `/api/projects/${projectId}/files/${up.file.id}`);
+    expect(okDel.status).toBe(200);
+    expect(srv.ctx.db.getProjectFileById(userId, projectId, up.file.id)).toBeNull();
+    expect(srv.ctx.db.getArtifact(userId, up.artifact.id)).toBeNull();
+
+    // Verify artifact.deleted durable event was persisted
+    const delEvents = srv.ctx.db.db
+      .prepare("SELECT event_type, payload_json FROM sync_events WHERE user_id = ? AND event_type = 'artifact.deleted'")
+      .all(userId) as Array<{ event_type: string; payload_json: string }>;
+    expect(delEvents.some((e) => e.payload_json.includes(up.artifact.id))).toBe(true);
+
+    // 5. Sync project to chat -> deletes .project-context/ref.css with O_NOFOLLOW, emits artifact.deleted, and propagates dep update to page.html
+    const syncRes = await alice.request('POST', `/api/chats/${chatId}/sync-project`, {});
+    expect(syncRes.status).toBe(200);
+    expect(fs.existsSync(path.join(workspaceDir, '.project-context', 'ref.css'))).toBe(false);
+    const pageAfterSync = srv.ctx.db.getArtifact(userId, pageId)!;
+    expect(pageAfterSync.revision).toBeGreaterThan(pageBeforeSync.revision);
+
+    // 6. Replace .project-context with a symlink -> syncProjectFilesToChat MUST reject via O_NOFOLLOW!
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-outside-'));
+    cleanups.push(async () => fs.rmSync(outsideDir, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(outsideDir, 'secret.txt'), 'secret');
+    const ctxDir = path.join(workspaceDir, '.project-context');
+    fs.rmSync(ctxDir, { recursive: true, force: true });
+    fs.symlinkSync(outsideDir, ctxDir);
+
+    await expect(
+      srv.ctx.artifactService.syncProjectFilesToChat({ userId, projectId, chatId })
+    ).rejects.toThrow();
+    // Outside file must remain untouched
+    expect(fs.existsSync(path.join(outsideDir, 'secret.txt'))).toBe(true);
+
+    // Restore normal dir and upload another project file to test DELETE /api/projects/:projectId via ArtifactService
+    fs.unlinkSync(ctxDir);
+    const up2 = await srv.ctx.artifactService.uploadProjectFile({
+      userId,
+      projectId,
+      filename: 'guide.md',
+      mimeType: 'text/markdown',
+      buffer: Buffer.from('# Guide', 'utf8'),
+    });
+    const delProjRes = await alice.request('DELETE', `/api/projects/${projectId}`);
+    expect(delProjRes.status, JSON.stringify(delProjRes.data)).toBe(200);
+    expect(srv.ctx.db.getProject(userId, projectId)).toBeNull();
+    expect(srv.ctx.db.getArtifact(userId, up2.artifact.id)).toBeNull();
+    expect(fs.existsSync(path.dirname(storageDir))).toBe(false);
+    const projEvents = srv.ctx.db.db
+      .prepare("SELECT event_type, payload_json FROM sync_events WHERE user_id = ? AND event_type IN ('artifact.deleted', 'project.deleted')")
+      .all(userId) as Array<{ event_type: string; payload_json: string }>;
+    expect(projEvents.some((e) => e.event_type === 'artifact.deleted' && e.payload_json.includes(up2.artifact.id))).toBe(true);
+    expect(projEvents.some((e) => e.event_type === 'project.deleted' && e.payload_json.includes(projectId))).toBe(true);
+  });
+
+  it('Finding #5 (ARCH-05 / SEC-10): evaluates crash recovery strictly from commit-time persisted staging_isolation_mode (never current host bwrap state)', async () => {
+    const srv = await createTestServer({ sandboxMode: 'off' });
+    cleanups.push(srv.cleanup);
+
+    const { client: alice, userId } = await registerAndBindAgy(srv.baseUrl, 'iso_alice', 'iso-code');
+    const chatRes = await alice.request<{ chat: { id: string; workspaceDir: string } }>('POST', '/api/chats', { title: 'Iso Chat' });
+    const chatId = chatRes.data.chat.id;
+    const workspaceDir = chatRes.data.chat.workspaceDir;
+
+    // 1. Create artifact, then inject crash at after_T3 while host has non_isolated_same_uid
+    const created = await alice.request<{ artifact: { id: string } }>('POST', `/api/chats/${chatId}/artifacts`, {
+      relPath: 'iso.txt',
+      content: 'rev1',
+    });
+    const artifactId = created.data.artifact.id;
+
+    srv.ctx.artifactService.stagingIsolationOverride = 'non_isolated_same_uid';
+    srv.ctx.artifactService.commitFaultHook = (stage) => {
+      if (stage === 'after_T3') throw new Error('CRASH_AT_REPLACING_NON_ISOLATED');
+    };
+    await expect(
+      srv.ctx.artifactService.editArtifact({
+        userId,
+        artifactId,
+        expectedRevision: 1,
+        operations: [{ op: 'replace_source', content: 'rev2-ambiguous' }],
+        actorKind: 'user',
+        actorId: userId,
+      })
+    ).rejects.toThrow('CRASH_AT_REPLACING_NON_ISOLATED');
+    srv.ctx.artifactService.commitFaultHook = undefined;
+
+    // Simulate ambiguous disk state AND flip host isolation to bwrap_mount_isolated before recovery!
+    const jRow = srv.ctx.db.db
+      .prepare('SELECT commit_id, state, staging_isolation_mode, new_sha256 FROM artifact_commit_journal WHERE artifact_id = ? ORDER BY created_at DESC LIMIT 1')
+      .get(artifactId) as { commit_id: string; state: string; staging_isolation_mode: string | null; new_sha256: string };
+    expect(jRow.state).toBe('replacing');
+    expect(jRow.staging_isolation_mode).toBe('non_isolated_same_uid');
+    fs.writeFileSync(path.join(workspaceDir, 'iso.txt'), 'rev2-ambiguous', 'utf8');
+
+    // Host switches to bwrap_mount_isolated at boot time — recovery MUST ignore host state and use persisted non_isolated_same_uid!
+    srv.ctx.artifactService.stagingIsolationOverride = 'bwrap_mount_isolated';
+    const report1 = await srv.ctx.artifactService.recoverOnStartup();
+    expect(report1.commits.quarantined).toBeGreaterThanOrEqual(1);
+    const jAfter1 = srv.ctx.db.db
+      .prepare('SELECT state FROM artifact_commit_journal WHERE commit_id = ?')
+      .get(jRow.commit_id) as { state: string };
+    expect(jAfter1.state).toBe('ambiguous_quarantined');
+
+    // 2. Test NULL/unknown staging_isolation_mode on a replacing journal row while host IS bwrap_mount_isolated -> MUST ALSO quarantine!
+    const art2 = await alice.request<{ artifact: { id: string } }>('POST', `/api/chats/${chatId}/artifacts`, {
+      relPath: 'unknown-iso.txt',
+      content: 'v1',
+    });
+    srv.ctx.artifactService.commitFaultHook = (stage) => {
+      if (stage === 'after_T3') throw new Error('CRASH_UNKNOWN_ISO');
+    };
+    await expect(
+      srv.ctx.artifactService.editArtifact({
+        userId,
+        artifactId: art2.data.artifact.id,
+        expectedRevision: 1,
+        operations: [{ op: 'replace_source', content: 'v2-unknown' }],
+        actorKind: 'user',
+        actorId: userId,
+      })
+    ).rejects.toThrow('CRASH_UNKNOWN_ISO');
+    srv.ctx.artifactService.commitFaultHook = undefined;
+
+    const j2 = srv.ctx.db.db
+      .prepare('SELECT commit_id FROM artifact_commit_journal WHERE artifact_id = ? ORDER BY created_at DESC LIMIT 1')
+      .get(art2.data.artifact.id) as { commit_id: string };
+    srv.ctx.db.db.prepare('UPDATE artifact_commit_journal SET staging_isolation_mode = NULL WHERE commit_id = ?').run(j2.commit_id);
+    fs.writeFileSync(path.join(workspaceDir, 'unknown-iso.txt'), 'v2-unknown', 'utf8');
+
+    const report2 = await srv.ctx.artifactService.recoverOnStartup();
+    expect(report2.commits.quarantined).toBeGreaterThanOrEqual(1);
+    const j2After = srv.ctx.db.db
+      .prepare('SELECT state FROM artifact_commit_journal WHERE commit_id = ?')
+      .get(j2.commit_id) as { state: string };
+    expect(j2After.state).toBe('ambiguous_quarantined');
+  });
+
+  it('Finding #6 (ARCH-06): re-verifies live DB session & resource validity on REST edit idempotency replay and pre-commit', async () => {
+    const srv = await createTestServer({ sandboxMode: 'off' });
+    cleanups.push(srv.cleanup);
+
+    const { client: alice, userId } = await registerAndBindAgy(srv.baseUrl, 'auth_reverify_alice', 'auth-code');
+    const chatRes = await alice.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Auth Chat' });
+    const chatId = chatRes.data.chat.id;
+    const created = await alice.request<{ artifact: { id: string } }>('POST', `/api/chats/${chatId}/artifacts`, {
+      relPath: 'doc.md',
+      content: '# v1\n',
+    });
+    const artifactId = created.data.artifact.id;
+
+    // 1. Initial idempotent edit succeeds
+    const edit1 = await alice.request<{ artifact: { revision: number } }>('POST', `/api/files/${artifactId}/edit`, {
+      expectedRevision: 1,
+      operations: [{ op: 'replace_source', content: '# v2\n' }],
+      idempotencyKey: 'idem-live-auth-check',
+    });
+    expect(edit1.status).toBe(200);
+    expect(edit1.data.artifact.revision).toBe(2);
+
+    // 2. Replay while session is still valid -> returns cached idempotent result (rev 2)
+    const replayOk = await alice.request<{ artifact: { revision: number } }>('POST', `/api/files/${artifactId}/edit`, {
+      expectedRevision: 1,
+      operations: [{ op: 'replace_source', content: '# v2\n' }],
+      idempotencyKey: 'idem-live-auth-check',
+    });
+    expect(replayOk.status).toBe(200);
+    expect(replayOk.data.artifact.revision).toBe(2);
+
+    // 3. Verify live session revocation rejects idempotent replay over REST (401)
+    const savedCookie = alice.cookieHeader;
+    const savedCsrf = decodeURIComponent(alice.csrfToken);
+    await alice.request('POST', '/api/auth/logout', {});
+    const replayAfterLogout = await fetch(`${srv.baseUrl}/api/files/${artifactId}/edit`, {
+      method: 'POST',
+      headers: {
+        cookie: savedCookie,
+        'x-csrf-token': savedCsrf,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        expectedRevision: 1,
+        operations: [{ op: 'replace_source', content: '# v2\n' }],
+        idempotencyKey: 'idem-live-auth-check',
+      }),
+    });
+    expect(replayAfterLogout.status).toBe(401);
+
+    // 4. Verify live re-check inside ArtifactService rejects replay when session is revoked right after entry
+    let sessionAlive = true;
+    const assertLive = () => {
+      if (!sessionAlive) throw Object.assign(new Error('REVOKED'), { code: 'UNAUTHENTICATED', statusCode: 401 });
+    };
+    const directReplayOk = await srv.ctx.artifactService.editArtifact({
+      userId,
+      artifactId,
+      expectedRevision: 1,
+      operations: [{ op: 'replace_source', content: '# v2\n' }],
+      actorKind: 'user',
+      actorId: userId,
+      idempotencyKey: 'idem-live-auth-check',
+      assertAuthorized: assertLive,
+    });
+    expect(directReplayOk.artifact.revision).toBe(2);
+
+    sessionAlive = false;
+    await expect(
+      srv.ctx.artifactService.editArtifact({
+        userId,
+        artifactId,
+        expectedRevision: 1,
+        operations: [{ op: 'replace_source', content: '# v2\n' }],
+        actorKind: 'user',
+        actorId: userId,
+        idempotencyKey: 'idem-live-auth-check',
+        assertAuthorized: assertLive,
+      })
+    ).rejects.toMatchObject({ statusCode: 401 });
+
+    // 5. Log back in, delete the chat, and verify idempotent replay returns 404 (not stale cached result!)
+    const loginRes = await alice.request('POST', '/api/auth/login', {
+      username: 'auth_reverify_alice',
+      password: 'password123',
+    });
+    expect(loginRes.status).toBe(200);
+    await alice.request('DELETE', `/api/chats/${chatId}`);
+    const replayAfterDelete = await alice.request('POST', `/api/files/${artifactId}/edit`, {
+      expectedRevision: 1,
+      operations: [{ op: 'replace_source', content: '# v2\n' }],
+      idempotencyKey: 'idem-live-auth-check',
+    });
+    expect(replayAfterDelete.status).toBe(404);
+  });
+
+  it('Finding #7 (ARCH-08): serves revision-pinned PPTX->PDF from immutable blob with exact cache key and enforces strict strong If-Range comparison', async () => {
+    const srv = await createTestServer({ sandboxMode: 'off' });
+    cleanups.push(srv.cleanup);
+
+    const { client: alice, userId } = await registerAndBindAgy(srv.baseUrl, 'pptx_pin_alice', 'pptx-code');
+    const chatRes = await alice.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'PPTX Chat' });
+    const chatId = chatRes.data.chat.id;
+
+    // Create rev 1 PPTX and update to rev 2 PPTX
+    const rev1Bytes = Buffer.from('PK-PPTX-REV-1-CONTENT', 'utf8');
+    const rev2Bytes = Buffer.from('PK-PPTX-REV-2-UPDATED', 'utf8');
+    const created = await srv.ctx.artifactService.createArtifact({
+      userId,
+      scopeKind: 'chat',
+      chatId,
+      relPath: 'deck.pptx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      content: rev1Bytes,
+      actorKind: 'user',
+      actorId: userId,
+    });
+    const artifactId = created.artifact.id;
+    const rev1Sha = created.artifact.sha256;
+
+    const updated = await srv.ctx.artifactService.replaceArtifactBytes({
+      userId,
+      artifactId,
+      expectedRevision: 1,
+      newBuffer: rev2Bytes,
+      actorKind: 'user',
+      actorId: userId,
+      operationType: 'edit',
+      operationSummary: 'Update PPTX rev 2',
+    });
+    const rev2Sha = updated.artifact.sha256;
+
+    // Intercept PPTX->PDF converter to inspect exact input bytes, staged filename, revision, sha256, and cache key
+    const converterCalls: Array<{
+      revision: number;
+      sourceSha256: string;
+      sourceFilename: string;
+      sourceAbsPath: string;
+      stagedContent: string;
+      cacheKey: string;
+    }> = [];
+    srv.ctx.artifactService.renderCache.setPptxConverterOverrideForTest(async (p) => {
+      const stagedContent = fs.readFileSync(p.stagedInputPath, 'utf8');
+      converterCalls.push({
+        revision: p.revision,
+        sourceSha256: p.sourceSha256,
+        sourceFilename: p.sourceFilename,
+        sourceAbsPath: p.sourceAbsPath,
+        stagedContent,
+        cacheKey: p.cacheKey,
+      });
+      fs.writeFileSync(p.tmpTargetPath, `%PDF-1.4\n%rev=${p.revision}:${stagedContent}\n`, 'utf8');
+      return true;
+    });
+
+    // 1. Revision-pinned `?rev=1&v=<sha12>&converted=pdf` MUST convert rev 1 immutable blob (NOT workspace rev 2)
+    const pinPdf1 = await fetch(
+      `${srv.baseUrl}/api/files/${artifactId}/content?rev=1&v=${rev1Sha.slice(0, 12)}&converted=pdf`,
+      { headers: { cookie: alice.cookieHeader } }
+    );
+    expect(pinPdf1.status).toBe(200);
+    expect(pinPdf1.headers.get('content-type')).toBe('application/pdf');
+    expect(pinPdf1.headers.get('x-artifact-revision')).toBe('1');
+    expect(pinPdf1.headers.get('cache-control')).toContain('immutable');
+    const pinPdf1Body = await pinPdf1.text();
+    expect(pinPdf1Body).toContain('%rev=1:PK-PPTX-REV-1-CONTENT');
+    expect(converterCalls).toHaveLength(1);
+    expect(converterCalls[0].revision).toBe(1);
+    expect(converterCalls[0].sourceSha256).toBe(rev1Sha);
+    expect(converterCalls[0].sourceFilename).toBe('deck.pptx');
+    expect(converterCalls[0].sourceAbsPath).toContain(srv.ctx.config.artifactHistoryRoot);
+
+    // 2. `/revisions/1/content?converted=pdf` MUST hit the exact same render cache entry without re-running converter
+    const pinPdf1Direct = await fetch(
+      `${srv.baseUrl}/api/files/${artifactId}/revisions/1/content?converted=pdf`,
+      { headers: { cookie: alice.cookieHeader } }
+    );
+    expect(pinPdf1Direct.status).toBe(200);
+    expect(await pinPdf1Direct.text()).toBe(pinPdf1Body);
+    expect(converterCalls).toHaveLength(1);
+
+    // 3. Unpinned legacy `?converted=pdf` still converts current workspace rev 2 (even without bwrap!)
+    const legacyPdf = await fetch(
+      `${srv.baseUrl}/api/files/${artifactId}/content?converted=pdf`,
+      { headers: { cookie: alice.cookieHeader } }
+    );
+    expect(legacyPdf.status).toBe(200);
+    expect(await legacyPdf.text()).toContain('%rev=2:PK-PPTX-REV-2-UPDATED');
+    expect(converterCalls).toHaveLength(2);
+    expect(converterCalls[1].revision).toBe(2);
+    expect(converterCalls[1].sourceSha256).toBe(rev2Sha);
+
+    // 4. Strict RFC 9110 If-Range comparison: strong ETag -> 206; weak ETag `W/...` -> 200 full body!
+    const rawRev1 = await fetch(`${srv.baseUrl}/api/files/${artifactId}/revisions/1/content`, {
+      headers: { cookie: alice.cookieHeader },
+    });
+    const strongEtag = rawRev1.headers.get('etag')!;
+    expect(strongEtag.startsWith('"')).toBe(true);
+
+    const strongRange = await fetch(`${srv.baseUrl}/api/files/${artifactId}/revisions/1/content`, {
+      headers: { cookie: alice.cookieHeader, range: 'bytes=0-4', 'if-range': strongEtag },
+    });
+    expect(strongRange.status).toBe(206);
+    expect(await strongRange.text()).toBe('PK-PP');
+
+    const weakRange = await fetch(`${srv.baseUrl}/api/files/${artifactId}/revisions/1/content`, {
+      headers: { cookie: alice.cookieHeader, range: 'bytes=0-4', 'if-range': `W/${strongEtag}` },
+    });
+    expect(weakRange.status).toBe(200);
+    expect(await weakRange.text()).toBe('PK-PPTX-REV-1-CONTENT');
+  });
+
+  it('Finding #8 (SEC-04 / PERF-02): DocWorkerSandbox enforces real kernel RLIMIT_CPU, RLIMIT_FSIZE, RLIMIT_NOFILE, and RLIMIT_NPROC', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-rlimit-'));
+    cleanups.push(async () => fs.rmSync(tmp, { recursive: true, force: true }));
+
+    const cfg = loadConfig({
+      dataRoot: tmp,
+      sandboxMode: 'off',
+      allowUnsandboxedDocWorkers: true,
+    });
+    const gov = new ResourceGovernor(cfg, () => 2048);
+    const sandbox = new DocWorkerSandbox(cfg, gov);
+
+    // 1. Inspect actual kernel resource.getrlimit() inside the spawned worker process
+    const res = await sandbox.run({
+      kind: 'python',
+      command: 'python3',
+      args: [
+        '-c',
+        "import json, resource; print(json.dumps({k: list(resource.getrlimit(getattr(resource, k))) for k in ['RLIMIT_CPU','RLIMIT_FSIZE','RLIMIT_NOFILE','RLIMIT_NPROC']}))",
+      ],
+      rlimits: {
+        cpuSeconds: 9,
+        fsizeBytes: 2 * 1024 * 1024,
+        nofile: 128,
+        nproc: 256,
+      },
+    });
+    expect(res.exitCode).toBe(0);
+    const observed = JSON.parse(res.stdout.trim()) as Record<string, [number, number]>;
+    expect(observed.RLIMIT_CPU).toEqual([9, 9]);
+    expect(observed.RLIMIT_FSIZE).toEqual([2 * 1024 * 1024, 2 * 1024 * 1024]);
+    expect(observed.RLIMIT_NOFILE).toEqual([128, 128]);
+    expect(observed.RLIMIT_NPROC).toEqual([256, 256]);
+    expect(res.appliedRlimits).toEqual({
+      cpuSeconds: 9,
+      fsizeBytes: 2 * 1024 * 1024,
+      nofile: 128,
+      nproc: 256,
+    });
+
+    // 2. Prove kernel enforces RLIMIT_FSIZE by rejecting a 256KB file write under a 64KB cap
+    const fsizeRes = await sandbox.run({
+      kind: 'python',
+      command: 'python3',
+      args: [
+        '-c',
+        "import os; p = os.path.join(os.environ['AGY_WORKER_OUT_DIR'], 'big.bin'); f = open(p, 'wb'); f.write(b'x' * (256 * 1024)); f.close()",
+      ],
+      rlimits: {
+        cpuSeconds: 5,
+        fsizeBytes: 64 * 1024,
+        nofile: 128,
+        nproc: 256,
+      },
+    });
+    expect(fsizeRes.exitCode !== 0 || fsizeRes.signal === 'SIGXFSZ').toBe(true);
+  });
 });
