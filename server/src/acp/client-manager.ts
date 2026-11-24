@@ -526,10 +526,10 @@ export class AcpClientManager {
     private readonly config: AppConfig,
     private readonly db: AppDatabase,
     private readonly hub: SyncHub,
+    private readonly artifactService: ArtifactService,
     private readonly skillService?: SkillService,
     private readonly pushService?: PushNotificationService,
-    private readonly mcpService?: McpService,
-    private readonly artifactService?: ArtifactService
+    private readonly mcpService?: McpService
   ) {
     this.cleanupTimer = setInterval(() => this.evictIdleWorkers(), 30_000);
     this.cleanupTimer.unref();
@@ -1467,19 +1467,17 @@ export class AcpClientManager {
       const hintPaths = bridge.toolCalls.flatMap(tool => (tool.locations ?? [])
         .map(location => toHostWorkspacePath(worker.workspaceDir, worker.sandboxWorkspaceRoot, location.path)));
 
-      const newArtifacts = this.artifactService
-        ? syncWorkspaceChangesAsArtifacts({
-            artifactService: this.artifactService,
-            db: this.db,
-            userId: params.userId,
-            chatId: params.chatId,
-            workspaceDir: chat.workspaceDir,
-            messageId: params.assistantMessageId,
-            runId: params.runId,
-            before: beforeSnap,
-            hintPaths,
-          })
-        : [];
+      const newArtifacts = syncWorkspaceChangesAsArtifacts({
+        artifactService: this.artifactService,
+        db: this.db,
+        userId: params.userId,
+        chatId: params.chatId,
+        workspaceDir: chat.workspaceDir,
+        messageId: params.assistantMessageId,
+        runId: params.runId,
+        before: beforeSnap,
+        hintPaths,
+      });
 
       if (bridge.activity.at(-1)?.kind === 'content') bridge.activity.push({ kind: 'answer_end' });
 
@@ -2925,7 +2923,6 @@ export class AcpClientManager {
     if (worker.activeTurn && worker.activeTurn !== bridge) {
       return;
     }
-    if (!this.artifactService) return;
     const newArtifacts = syncWorkspaceChangesAsArtifacts({
       artifactService: this.artifactService,
       db: this.db,

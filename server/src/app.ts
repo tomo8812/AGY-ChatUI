@@ -82,7 +82,7 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
   const quotaService = new QuotaService(config, db, hub);
   const skillService = new SkillService(config, db, hub);
   const mcpService = new McpService(config, db, hub);
-  const acp = new AcpClientManager(config, db, hub, skillService, pushService, mcpService, artifactService);
+  const acp = new AcpClientManager(config, db, hub, artifactService, skillService, pushService, mcpService);
   const agyAuth = new AgyAuthManager(config, db, hub, acp);
   const scheduler = new ExecutionScheduler(config, db, hub, acp, pushService, quotaService);
 

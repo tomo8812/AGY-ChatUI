@@ -5,8 +5,11 @@ import { pathToFileURL } from 'node:url';
 import { normalizeClientLinkReference } from '../../web/src/utils/viewerCache';
 import { afterEach, describe, expect, it } from 'vitest';
 import { getChatBrainHostDir } from '../src/acp/env-isolation.js';
+import { ArtifactService } from '../src/artifacts/artifact-service.js';
+import { loadConfig } from '../src/config.js';
 import { AppDatabase } from '../src/db/database.js';
 import { normalizeLinkCandidatePath, resolveArtifactFile, resolveAuthorizedChatFileReference } from '../src/files/link-resolver.js';
+import { SyncHub } from '../src/sync/hub.js';
 import type { ArtifactRecord } from '../src/types.js';
 import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
 
@@ -44,7 +47,9 @@ describe('native and legacy file links', () => {
     };
     const chat = createChat('chat');
     const other = createChat('other');
-    const resolve = (chatId: string, reference: string) => resolveAuthorizedChatFileReference({ db, userId, chatId, reference });
+    const artifactService = new ArtifactService(loadConfig({ dataRoot: temp }), db, new SyncHub(db));
+    const resolve = (chatId: string, reference: string) =>
+      resolveAuthorizedChatFileReference({ artifactService, db, userId, chatId, reference });
 
     for (const kind of ['scratch', 'playground']) {
       const root = path.join(profile, `.chat-${kind}`, path.basename(chat.workspaceDir));

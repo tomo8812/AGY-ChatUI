@@ -95,10 +95,14 @@ export async function registerEditRequestRoutes(app: FastifyInstance, deps: Edit
     const session = requireAuth(req, reply, db);
     if (!session) return;
     const { chatId, requestId } = req.params as { chatId: string; requestId: string };
-    const request = editRequestService.getRequest(session.user.id, chatId, requestId);
-    if (!request) return reply.code(404).send({ error: 'NOT_FOUND' });
-    const reResolution = editRequestService.resolveRequestTarget(request);
-    return { request, reResolution };
+    try {
+      const request = editRequestService.getRequest(session.user.id, chatId, requestId);
+      if (!request) return reply.code(404).send({ error: 'NOT_FOUND' });
+      const reResolution = editRequestService.resolveRequestTarget(request);
+      return { request, reResolution };
+    } catch (err) {
+      return sendEditRequestError(reply, err);
+    }
   });
 
   app.patch('/api/chats/:chatId/edit-requests/:requestId', async (req, reply) => {

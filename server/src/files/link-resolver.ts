@@ -1,14 +1,11 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import mime from 'mime-types';
 import { getChatBrainHostDir, SANDBOX_HOME_MOUNT, SANDBOX_WORKSPACE_MOUNT } from '../acp/env-isolation.js';
-import { ArtifactService } from '../artifacts/artifact-service.js';
-import { loadConfig } from '../config.js';
+import type { ArtifactService } from '../artifacts/artifact-service.js';
 import type { AppDatabase } from '../db/database.js';
 import { resolveActiveBuiltinSkillsForProfile } from '../skills/builtin-skills.js';
-import { SyncHub } from '../sync/hub.js';
 import type { ArtifactRecord, ChatRecord } from '../types.js';
 import { detectMimeAndPreviewKind, normalizeRelPath, resolveContainedExistingPath, sha256File } from './workspace.js';
 
@@ -300,21 +297,8 @@ function buildArtifactUrls(artifact: ArtifactRecord): { previewUrl: string; down
   };
 }
 
-const fallbackArtifactServices = new WeakMap<AppDatabase, ArtifactService>();
-
-function getOrCreateFallbackArtifactService(db: AppDatabase): ArtifactService {
-  let svc = fallbackArtifactServices.get(db);
-  if (!svc) {
-    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-link-resolver-'));
-    const cfg = loadConfig({ dataRoot: tmpRoot });
-    svc = new ArtifactService(cfg, db, new SyncHub(db));
-    fallbackArtifactServices.set(db, svc);
-  }
-  return svc;
-}
-
 export function resolveAuthorizedChatFileReference(params: {
-  artifactService?: ArtifactService;
+  artifactService: ArtifactService;
   db: AppDatabase;
   userId: string;
   chatId: string;
@@ -325,8 +309,7 @@ export function resolveAuthorizedChatFileReference(params: {
   runId?: string;
   builtinSkillsDir?: string | null;
 }): ResolvedWorkspaceLink | null {
-  const { db, userId, chatId } = params;
-  const artifactService = params.artifactService ?? getOrCreateFallbackArtifactService(db);
+  const { artifactService, db, userId, chatId } = params;
   const chat = db.getChat(userId, chatId);
   if (!chat) return null;
   const candidate = normalizeLinkCandidatePath(params.reference);

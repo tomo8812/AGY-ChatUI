@@ -438,6 +438,7 @@ describe('Anthropic doc skills and runtime isolation', () => {
       });
 
       const activeBuiltinLink = resolveAuthorizedChatFileReference({
+        artifactService: srv.ctx.artifactService,
         db: srv.ctx.db,
         userId: alice.userId,
         chatId: chatRes.data.chat.id,
@@ -447,6 +448,7 @@ describe('Anthropic doc skills and runtime isolation', () => {
       expect(activeBuiltinLink).toBeTruthy();
 
       const disabledBuiltinLink = resolveAuthorizedChatFileReference({
+        artifactService: srv.ctx.artifactService,
         db: srv.ctx.db,
         userId: alice.userId,
         chatId: chatRes.data.chat.id,
