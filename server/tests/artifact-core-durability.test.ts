@@ -929,5 +929,26 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       statusCode: 503,
       code: 'SANDBOX_REQUIRED',
     });
+
+    // 3. Concurrent waiters never exceed maxWeightBudget on wakeup
+    const budgetCfg = loadConfig({ dataRoot: tmp, docWorkerBudget: 2 });
+    const budgetGov = new ResourceGovernor(budgetCfg, () => 2048);
+    let peakUsedWeight = 0;
+    let activeCount = 0;
+    let peakActive = 0;
+    await Promise.all(
+      Array.from({ length: 5 }, () =>
+        budgetGov.runWithBudget('python', async () => {
+          activeCount += 1;
+          peakActive = Math.max(peakActive, activeCount);
+          peakUsedWeight = Math.max(peakUsedWeight, budgetGov.getUsedWeight());
+          await new Promise((r) => setTimeout(r, 25));
+          activeCount -= 1;
+        })
+      )
+    );
+    expect(peakUsedWeight).toBeLessThanOrEqual(2);
+    expect(peakActive).toBeLessThanOrEqual(2);
+    expect(budgetGov.getUsedWeight()).toBe(0);
   });
 });

@@ -1264,10 +1264,13 @@ export function validateRichDocument(
           evalNodePost(anyNode.children[i] as RichNode, `${p}.children[${i}]`, ctx);
         }
       }
-      if (node.type === 'tabs') {
+      if (node.type === 'tabs' && Array.isArray(node.items)) {
         for (let i = 0; i < node.items.length; i++) {
-          for (let j = 0; j < node.items[i].content.length; j++) {
-            evalNodePost(node.items[i].content[j], `${p}.items[${i}].content[${j}]`, ctx);
+          const tabContent = node.items[i]?.content;
+          if (Array.isArray(tabContent)) {
+            for (let j = 0; j < tabContent.length; j++) {
+              evalNodePost(tabContent[j], `${p}.items[${i}].content[${j}]`, ctx);
+            }
           }
         }
       }
@@ -1276,7 +1279,7 @@ export function validateRichDocument(
         if (node.footer) evalNodePost(node.footer, `${p}.footer`, ctx);
       }
       if (node.type === 'popover' || node.type === 'tooltip') {
-        evalNodePost(node.trigger, `${p}.trigger`, ctx);
+        if (node.trigger) evalNodePost(node.trigger, `${p}.trigger`, ctx);
         if (Array.isArray(node.content)) {
           for (let i = 0; i < node.content.length; i++) {
             evalNodePost(node.content[i], `${p}.content[${i}]`, ctx);

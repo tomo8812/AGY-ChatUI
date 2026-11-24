@@ -310,6 +310,17 @@ describe('Lightweight Rich UI Core Security & Negative Self-Tests (NEG-06..NEG-0
     const stepRes = validateRichDocument(stepBomb);
     expect(stepRes.valid).toBe(false);
     expect(stepRes.primaryErrorCode).toBe('RICH_STEP_LIMIT_EXCEEDED');
+
+    // 4. Popover/tooltip without trigger is handled cleanly without crashing evalNodePost
+    const popoverMissingTrigger = makeValidDoc({
+      root: {
+        id: 'pop-1',
+        type: 'popover',
+        content: [{ id: 'pop-txt', type: 'text', content: 'details' }],
+      } as unknown as RichDocumentV1['root'],
+    });
+    const popRes = validateRichDocument(popoverMissingTrigger);
+    expect(popRes.primaryErrorCode).not.toBe('RICH_EVAL_ERROR');
   });
 
   it('NEG-09 & ACP-01: enforces strict cross-chat/cross-user scope isolation, 2-layer binding invariant, and explicit ArtifactService save in Base ChatUI', async () => {

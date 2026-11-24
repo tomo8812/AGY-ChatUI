@@ -106,12 +106,14 @@ export class ResourceGovernor {
     const weight = Math.min(WORKER_WEIGHTS[kind], this.maxWeightBudget);
     await this.ensureMemAvailableForHeavyWorker(kind);
 
-    if (this.usedWeight + weight > this.maxWeightBudget) {
+    if (this.usedWeight + weight <= this.maxWeightBudget) {
+      this.usedWeight += weight;
+    } else {
       await new Promise<void>((resolve) => {
         this.waiters.push({ weight, resolve });
       });
+      // Weight was reserved atomically by drainWaiters() before resolving this waiter.
     }
-    this.usedWeight += weight;
 
     try {
       return await fn();
@@ -126,6 +128,7 @@ export class ResourceGovernor {
       const w = this.waiters[i];
       if (this.usedWeight + w.weight <= this.maxWeightBudget) {
         this.waiters.splice(i, 1);
+        this.usedWeight += w.weight;
         w.resolve();
       } else {
         i += 1;
