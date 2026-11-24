@@ -113,6 +113,14 @@ describe('Lightweight Rich UI Core Security & Negative Self-Tests (NEG-06..NEG-0
     expect(() =>
       evaluateRichExpr('eval("1+1")', { state: {}, computed: {} })
     ).toThrow(/not permitted/i);
+
+    // Locale-aware formatting respects ctx.locale instead of hard-coding en-US
+    expect(
+      evaluateRichExpr('formatNumber(1234.5, 2)', { state: {}, computed: {}, locale: 'de-DE' })
+    ).toBe(new Intl.NumberFormat('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(1234.5));
+    expect(
+      evaluateRichExpr('formatCurrency(1500, "EUR")', { state: {}, computed: {}, locale: 'de-DE' })
+    ).toBe(new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR' }).format(1500));
   });
 
   it('NEG-06: rejects static and post-evaluation dangerous SVG, markdown/mermaid/media external images, and side-effect actions in onChange', () => {

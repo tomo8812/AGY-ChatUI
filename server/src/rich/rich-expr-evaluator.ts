@@ -27,6 +27,7 @@ export interface RichEvalContext {
   item?: unknown;
   index?: number;
   theme?: 'light' | 'dark';
+  locale?: string;
   aliases?: Record<string, unknown>;
 }
 
@@ -574,7 +575,7 @@ function toNumList(args: unknown[], budget: RichEvalBudget): number[] {
   return out;
 }
 
-function invokePureFn(name: string, args: unknown[], budget: RichEvalBudget): unknown {
+function invokePureFn(name: string, args: unknown[], budget: RichEvalBudget, ctx: RichEvalContext): unknown {
   tick(budget);
   switch (name) {
     case 'abs':
@@ -725,16 +726,27 @@ function invokePureFn(name: string, args: unknown[], budget: RichEvalBudget): un
       const val = args[0];
       if (val === null || val === undefined || typeof val !== 'number' || !Number.isFinite(val)) return '—';
       const digits = args[1] !== undefined ? Math.max(0, Math.min(8, Math.trunc(toNum(args[1])))) : undefined;
-      return new Intl.NumberFormat('en-US', digits !== undefined ? { minimumFractionDigits: digits, maximumFractionDigits: digits } : undefined).format(val);
+      const fmtOpts = digits !== undefined ? { minimumFractionDigits: digits, maximumFractionDigits: digits } : undefined;
+      const locale = typeof ctx.locale === 'string' && ctx.locale.trim().length > 0 ? ctx.locale.trim() : undefined;
+      try {
+        return new Intl.NumberFormat(locale, fmtOpts).format(val);
+      } catch {
+        return new Intl.NumberFormat(undefined, fmtOpts).format(val);
+      }
     }
     case 'formatCurrency': {
       const val = args[0];
       if (val === null || val === undefined || typeof val !== 'number' || !Number.isFinite(val)) return '—';
       const currency = typeof args[1] === 'string' && /^[A-Z]{3}$/.test(args[1]) ? args[1] : 'JPY';
+      const locale = typeof ctx.locale === 'string' && ctx.locale.trim().length > 0 ? ctx.locale.trim() : undefined;
       try {
-        return new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(val);
+        return new Intl.NumberFormat(locale, { style: 'currency', currency }).format(val);
       } catch {
-        return `${currency} ${val}`;
+        try {
+          return new Intl.NumberFormat(undefined, { style: 'currency', currency }).format(val);
+        } catch {
+          return `${currency} ${val}`;
+        }
       }
     }
     case 'formatPercent': {
@@ -847,7 +859,7 @@ export function evaluateRichAst(ast: ExprAst, ctx: RichEvalContext, budget: Rich
     }
     case 'call': {
       const args = ast.args.map((a) => evaluateRichAst(a, ctx, budget));
-      return invokePureFn(ast.callee, args, budget);
+      return invokePureFn(ast.callee, args, budget, ctx);
     }
   }
 }

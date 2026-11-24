@@ -379,6 +379,7 @@ export function topologicalSortComputed(
 
 export interface ValidateRichDocumentOptions {
   authorizedArtifactIds?: Set<string>;
+  locale?: string;
 }
 
 export function validateRichDocument(
@@ -1059,7 +1060,12 @@ export function validateRichDocument(
 
   // Stage 2 & 3: Dynamic expansion + Post-Evaluation validation
   const computedValues: Record<string, unknown> = {};
-  const rootCtx: RichEvalContext = { state: initialState, computed: computedValues, theme: 'light' };
+  const rootCtx: RichEvalContext = {
+    state: initialState,
+    computed: computedValues,
+    theme: 'light',
+    locale: opts.locale,
+  };
 
   try {
     for (const key of computedOrder) {
