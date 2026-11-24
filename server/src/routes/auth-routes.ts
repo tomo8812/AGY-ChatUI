@@ -14,7 +14,10 @@ import {
   verifyCsrfIfMutating,
 } from '../auth/session.js';
 import { ensureUserDirs } from '../files/workspace.js';
+import type { ArtifactService } from '../artifacts/artifact-service.js';
+import type { EditRequestService } from '../edit-requests/edit-request-service.js';
 import type { McpService } from '../mcp/mcp-service.js';
+import type { RichContentService } from '../rich/rich-content-service.js';
 import type { SkillService } from '../skills/skill-service.js';
 import type { SyncHub } from '../sync/hub.js';
 import type { AppBuildInfo } from '../version.js';
@@ -24,6 +27,9 @@ export interface RouteDeps {
   db: AppDatabase;
   hub: SyncHub;
   agyAuth: AgyAuthManager;
+  artifactService: ArtifactService;
+  richContentService?: RichContentService;
+  editRequestService?: EditRequestService;
   skillService?: SkillService;
   mcpService?: McpService;
   buildId?: string;

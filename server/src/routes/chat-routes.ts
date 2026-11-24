@@ -6,12 +6,8 @@ import { z } from 'zod';
 import type { AcpClientManager } from '../acp/client-manager.js';
 import type { ExecutionScheduler } from '../acp/scheduler.js';
 import type { SkillService } from '../skills/skill-service.js';
-import {
-  detectMimeAndPreviewKind,
-  resolveContainedWriteTarget,
-  sanitizeFileName,
-  syncProjectFilesToWorkspace,
-} from '../files/workspace.js';
+import { isArtifactError } from '../artifacts/errors.js';
+import { sanitizeFileName } from '../files/workspace.js';
 import type { AttachmentRef } from '../types.js';
 import { requireAuth, type RouteDeps } from './auth-routes.js';
 
@@ -61,7 +57,7 @@ const elicitationActionSchema = z.object({
 });
 
 export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDeps): Promise<void> {
-  const { config, db, hub, acp, scheduler, skillService } = deps;
+  const { config, db, hub, acp, scheduler, skillService, artifactService } = deps;
 
   const ensureAgyAuthenticated = (userId: string) => {
     const prof = db.getAgyProfile(userId);
@@ -130,18 +126,6 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
     const workspaceDir = path.join(config.workspacesRoot, session.user.id, chatId);
     fs.mkdirSync(workspaceDir, { recursive: true, mode: 0o700 });
 
-    if (project) {
-      const files = db.listProjectFiles(session.user.id, project.id);
-      if (files.length > 0) {
-        syncProjectFilesToWorkspace({
-          projectStorageDir: project.storageDir,
-          workspaceDir,
-          relPaths: files.map((f) => f.relPath),
-        });
-      }
-      skillService?.syncProjectSkillsToChat(session.user.id, project.id, workspaceDir);
-    }
-
     const prefs = db.getPreferences(session.user.id);
     const chat = db.createChat({
       id: chatId,
@@ -153,6 +137,15 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
       effortValue: parsed.data.effortValue ?? prefs.defaultEffortValue,
       projectContextVersion,
     });
+
+    if (project) {
+      await artifactService.syncProjectFilesToChat({
+        userId: session.user.id,
+        projectId: project.id,
+        chatId: chat.id,
+      });
+      skillService?.syncProjectSkillsToChat(session.user.id, project.id, workspaceDir);
+    }
 
     let sessionOptions = null;
     try {
@@ -287,11 +280,10 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
       return reply.code(404).send({ error: 'PROJECT_NOT_FOUND', message: 'プロジェクトが存在しません。' });
     }
 
-    const files = db.listProjectFiles(session.user.id, project.id);
-    const syncedPaths = syncProjectFilesToWorkspace({
-      projectStorageDir: project.storageDir,
-      workspaceDir: chat.workspaceDir,
-      relPaths: files.map((f) => f.relPath),
+    const syncedPaths = await artifactService.syncProjectFilesToChat({
+      userId: session.user.id,
+      projectId: project.id,
+      chatId,
     });
     skillService?.syncProjectSkillsToChat(session.user.id, project.id, chat.workspaceDir);
 
@@ -320,52 +312,33 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
     const chat = db.getChat(session.user.id, chatId);
     if (!chat) return reply.code(404).send({ error: 'NOT_FOUND', message: 'チャットが見つかりません。' });
 
-    fs.mkdirSync(chat.workspaceDir, { recursive: true, mode: 0o700 });
     const attachments: AttachmentRef[] = [];
-
-    for await (const part of req.parts()) {
-      if (part.type !== 'file') continue;
-      const filename = sanitizeFileName(part.filename || 'attachment.bin');
-      const relInput = `attachments/${Date.now()}-${filename}`;
-      const target = resolveContainedWriteTarget(chat.workspaceDir, relInput);
-      fs.mkdirSync(path.dirname(target.absPath), { recursive: true, mode: 0o700 });
-
-      const buf = await part.toBuffer();
-      await fs.promises.writeFile(target.absPath, buf);
-      const { mimeType, previewKind } = detectMimeAndPreviewKind(filename, part.mimetype);
-      const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
-
-      const artifact = db.upsertArtifact({
-        id: crypto.randomUUID(),
-        userId: session.user.id,
-        chatId,
-        messageId: null,
-        runId: null,
-        relPath: target.relPath,
-        filename,
-        mimeType,
-        sizeBytes: buf.length,
-        sha256,
-        source: 'attachment',
-        previewKind,
-        diffPatch: null,
-      });
-
-      attachments.push({
-        artifactId: artifact.id,
-        filename: artifact.filename,
-        mimeType: artifact.mimeType,
-        sizeBytes: artifact.sizeBytes,
-        relPath: artifact.relPath,
-        previewKind: artifact.previewKind,
-      });
-
-      hub.emitDurable({
-        userId: session.user.id,
-        type: 'artifact.created',
-        chatId,
-        payload: { artifact },
-      });
+    try {
+      for await (const part of req.parts()) {
+        if (part.type !== 'file') continue;
+        const filename = sanitizeFileName(part.filename || 'attachment.bin');
+        const buf = await part.toBuffer();
+        const artifact = await artifactService.uploadChatAttachment({
+          userId: session.user.id,
+          chatId,
+          filename,
+          mimeType: part.mimetype,
+          buffer: buf,
+        });
+        attachments.push({
+          artifactId: artifact.id,
+          filename: artifact.filename,
+          mimeType: artifact.mimeType,
+          sizeBytes: artifact.sizeBytes,
+          relPath: artifact.relPath,
+          previewKind: artifact.previewKind,
+        });
+      }
+    } catch (err) {
+      if (isArtifactError(err)) {
+        return reply.code(err.statusCode).send({ error: err.code, message: err.message, details: err.details });
+      }
+      throw err;
     }
 
     if (attachments.length === 0) {

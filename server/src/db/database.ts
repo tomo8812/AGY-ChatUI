@@ -1,11 +1,15 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { detectMimeAndPreviewKind } from '../files/workspace.js';
 import type {
   AgyAuthMethod,
   AgyAuthStatus,
   AgyProfile,
+  ArtifactLifecycleState,
   ArtifactRecord,
+  ArtifactScopeKind,
   AttachmentRef,
   ChatRecord,
   ElicitationContentValue,
@@ -76,7 +80,7 @@ export class AppDatabase {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(dbPath);
     this.db.exec('PRAGMA journal_mode = WAL;');
-    this.db.exec('PRAGMA synchronous = NORMAL;');
+    this.db.exec('PRAGMA synchronous = FULL;');
     this.db.exec('PRAGMA foreign_keys = ON;');
     this.db.exec('PRAGMA busy_timeout = 5000;');
     this.migrate();
@@ -274,7 +278,9 @@ export class AppDatabase {
       CREATE TABLE IF NOT EXISTS artifacts (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        scope_kind TEXT NOT NULL DEFAULT 'chat',
+        chat_id TEXT REFERENCES chats(id) ON DELETE CASCADE,
+        project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
         message_id TEXT,
         run_id TEXT,
         rel_path TEXT NOT NULL,
@@ -285,11 +291,237 @@ export class AppDatabase {
         source TEXT NOT NULL,
         preview_kind TEXT NOT NULL,
         diff_patch TEXT,
+        lifecycle_state TEXT NOT NULL DEFAULT 'active',
+        deleted_on_disk INTEGER NOT NULL DEFAULT 0,
+        revision INTEGER NOT NULL DEFAULT 1,
+        dependency_manifest_hash TEXT,
+        source_artifact_id TEXT REFERENCES artifacts(id) ON DELETE SET NULL,
+        source_base_revision INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
-        UNIQUE (chat_id, rel_path)
+        CHECK (
+          (scope_kind = 'chat' AND chat_id IS NOT NULL AND project_id IS NULL)
+          OR (scope_kind = 'project' AND project_id IS NOT NULL AND chat_id IS NULL)
+        ),
+        CHECK (source_base_revision IS NULL OR source_artifact_id IS NOT NULL)
       );
       CREATE INDEX IF NOT EXISTS idx_artifacts_chat ON artifacts(chat_id, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS artifact_revisions (
+        id TEXT PRIMARY KEY,
+        artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        chat_id TEXT REFERENCES chats(id) ON DELETE CASCADE,
+        project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+        revision INTEGER NOT NULL,
+        parent_revision INTEGER,
+        sha256 TEXT NOT NULL,
+        dependency_manifest_hash TEXT,
+        size_bytes INTEGER NOT NULL,
+        blob_sha256 TEXT,
+        blob_available INTEGER NOT NULL DEFAULT 1,
+        actor_kind TEXT NOT NULL,
+        actor_id TEXT,
+        operation_type TEXT NOT NULL,
+        operation_summary TEXT NOT NULL DEFAULT '',
+        operation_payload_json TEXT,
+        batch_id TEXT,
+        diff_patch TEXT,
+        created_at INTEGER NOT NULL,
+        UNIQUE (artifact_id, revision)
+      );
+
+      CREATE TABLE IF NOT EXISTS artifact_revision_deps (
+        artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+        revision INTEGER NOT NULL,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        scope_kind TEXT NOT NULL,
+        chat_id TEXT,
+        project_id TEXT,
+        rel_path TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'present',
+        sha256 TEXT,
+        blob_sha256 TEXT,
+        size_bytes INTEGER NOT NULL DEFAULT 0,
+        mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+        PRIMARY KEY (artifact_id, revision, rel_path)
+      );
+      CREATE INDEX IF NOT EXISTS idx_artifact_rev_deps_scope_path
+        ON artifact_revision_deps(user_id, scope_kind, COALESCE(chat_id, ''), COALESCE(project_id, ''), rel_path);
+
+      CREATE TABLE IF NOT EXISTS artifact_idempotency (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        scope_key TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        status TEXT NOT NULL,
+        server_boot_id TEXT NOT NULL,
+        commit_id TEXT,
+        actor_kind TEXT NOT NULL,
+        actor_id TEXT,
+        request_fingerprint TEXT NOT NULL,
+        artifact_id TEXT,
+        committed_revision INTEGER,
+        no_op INTEGER NOT NULL DEFAULT 0,
+        response_json TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        PRIMARY KEY (user_id, scope_key, idempotency_key)
+      );
+
+      -- Intentionally NO foreign key CASCADE on artifact_id so audit/recovery survives pending_create cleanup
+      CREATE TABLE IF NOT EXISTS artifact_commit_journal (
+        commit_id TEXT PRIMARY KEY,
+        artifact_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        chat_id TEXT,
+        project_id TEXT,
+        scope_kind TEXT NOT NULL,
+        rel_path TEXT NOT NULL,
+        is_create INTEGER NOT NULL DEFAULT 0,
+        target_revision INTEGER NOT NULL,
+        parent_revision INTEGER,
+        expected_prev_sha256 TEXT,
+        expected_prev_ino TEXT,
+        new_sha256 TEXT NOT NULL,
+        new_dependency_manifest_hash TEXT,
+        new_deps_json TEXT,
+        new_size_bytes INTEGER NOT NULL,
+        prev_blob_sha256 TEXT,
+        new_blob_sha256 TEXT NOT NULL,
+        private_stage_path TEXT NOT NULL,
+        stage_ino TEXT,
+        actor_kind TEXT NOT NULL,
+        actor_id TEXT,
+        operation_type TEXT NOT NULL,
+        operation_summary TEXT NOT NULL,
+        operation_payload_json TEXT,
+        batch_id TEXT,
+        idempotency_scope_key TEXT,
+        idempotency_key TEXT,
+        request_fingerprint TEXT,
+        diff_patch TEXT,
+        state TEXT NOT NULL,
+        audit_note TEXT,
+        sync_event_seq INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS artifact_dep_propagation_queue (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        scope_kind TEXT NOT NULL,
+        chat_id TEXT,
+        project_id TEXT,
+        changed_rel_path TEXT NOT NULL,
+        source_artifact_id TEXT NOT NULL,
+        source_revision INTEGER NOT NULL,
+        batch_id TEXT,
+        exclude_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+        state TEXT NOT NULL DEFAULT 'pending',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS artifact_restore_batches (
+        batch_id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        scope_kind TEXT NOT NULL,
+        chat_id TEXT,
+        project_id TEXT,
+        parent_artifact_id TEXT NOT NULL,
+        shared_policy TEXT NOT NULL,
+        state TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS artifact_restore_batch_items (
+        batch_id TEXT NOT NULL REFERENCES artifact_restore_batches(batch_id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        artifact_id TEXT NOT NULL,
+        target_revision INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        committed_revision INTEGER,
+        error_code TEXT,
+        PRIMARY KEY (batch_id, seq)
+      );
+
+      CREATE TABLE IF NOT EXISTS ai_edit_request_batches (
+        batch_id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        sent_message_id TEXT,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS ai_edit_requests (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        target_kind TEXT NOT NULL,
+        artifact_id TEXT REFERENCES artifacts(id) ON DELETE CASCADE,
+        rich_block_id TEXT,
+        base_revision INTEGER NOT NULL,
+        format TEXT NOT NULL,
+        container_ref_json TEXT NOT NULL DEFAULT '{}',
+        selector_json TEXT NOT NULL,
+        range_json TEXT,
+        content_coords_json TEXT,
+        selected_content_snapshot TEXT NOT NULL DEFAULT '',
+        surrounding_context TEXT,
+        region_image_blob_sha256 TEXT,
+        instruction TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'draft',
+        view_state_snapshot_json TEXT,
+        batch_id TEXT REFERENCES ai_edit_request_batches(batch_id) ON DELETE SET NULL,
+        sent_message_id TEXT,
+        applied_revision INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS rich_blocks (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        confirmed_message_id TEXT REFERENCES messages(id) ON DELETE CASCADE,
+        tentative_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+        run_id TEXT,
+        tool_call_id TEXT,
+        binding_state TEXT NOT NULL DEFAULT 'unattached',
+        created_seq INTEGER NOT NULL DEFAULT 0,
+        schema_version INTEGER NOT NULL DEFAULT 1,
+        revision INTEGER NOT NULL DEFAULT 1,
+        title TEXT NOT NULL DEFAULT '',
+        document_json TEXT NOT NULL,
+        ui_state_snapshot_json TEXT,
+        referenced_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+        size_bytes INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        CHECK (
+          (binding_state = 'confirmed_by_tool_call' AND confirmed_message_id IS NOT NULL AND tool_call_id IS NOT NULL)
+          OR (binding_state != 'confirmed_by_tool_call' AND confirmed_message_id IS NULL)
+        )
+      );
+      CREATE INDEX IF NOT EXISTS idx_rich_blocks_chat_confirmed_msg ON rich_blocks(chat_id, confirmed_message_id, created_seq);
+
+      CREATE TABLE IF NOT EXISTS rich_block_revisions (
+        id TEXT PRIMARY KEY,
+        rich_block_id TEXT NOT NULL REFERENCES rich_blocks(id) ON DELETE CASCADE,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        revision INTEGER NOT NULL,
+        schema_version INTEGER NOT NULL,
+        document_json TEXT NOT NULL,
+        actor_kind TEXT NOT NULL,
+        actor_id TEXT,
+        operation_summary TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        UNIQUE (rich_block_id, revision)
+      );
 
       CREATE TABLE IF NOT EXISTS quota_snapshots (
         user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -303,6 +535,7 @@ export class AppDatabase {
       CREATE TABLE IF NOT EXISTS sync_events (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        user_seq INTEGER NOT NULL DEFAULT 0,
         event_id TEXT NOT NULL,
         event_type TEXT NOT NULL,
         chat_id TEXT,
@@ -443,6 +676,181 @@ export class AppDatabase {
         PRAGMA foreign_keys = ON;
       `);
     }
+
+    // Add messages.rich_block_ids_json if absent
+    const msgColsPost = this.db.prepare('PRAGMA table_info(messages)').all() as Array<{ name: string }>;
+    if (!msgColsPost.some((col) => col.name === 'rich_block_ids_json')) {
+      this.db.exec("ALTER TABLE messages ADD COLUMN rich_block_ids_json TEXT NOT NULL DEFAULT '[]';");
+    }
+
+    // Migrate legacy artifacts table (which had chat_id NOT NULL and lacked scope_kind/lifecycle_state/revision)
+    const artCols = this.db.prepare('PRAGMA table_info(artifacts)').all() as Array<{ name: string }>;
+    if (!artCols.some((col) => col.name === 'scope_kind')) {
+      this.db.exec(`
+        PRAGMA foreign_keys = OFF;
+        BEGIN;
+        CREATE TABLE artifacts_new (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          scope_kind TEXT NOT NULL DEFAULT 'chat',
+          chat_id TEXT REFERENCES chats(id) ON DELETE CASCADE,
+          project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+          message_id TEXT,
+          run_id TEXT,
+          rel_path TEXT NOT NULL,
+          filename TEXT NOT NULL,
+          mime_type TEXT NOT NULL,
+          size_bytes INTEGER NOT NULL,
+          sha256 TEXT NOT NULL,
+          source TEXT NOT NULL,
+          preview_kind TEXT NOT NULL,
+          diff_patch TEXT,
+          lifecycle_state TEXT NOT NULL DEFAULT 'active',
+          deleted_on_disk INTEGER NOT NULL DEFAULT 0,
+          revision INTEGER NOT NULL DEFAULT 1,
+          dependency_manifest_hash TEXT,
+          source_artifact_id TEXT REFERENCES artifacts(id) ON DELETE SET NULL,
+          source_base_revision INTEGER,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          CHECK (
+            (scope_kind = 'chat' AND chat_id IS NOT NULL AND project_id IS NULL)
+            OR (scope_kind = 'project' AND project_id IS NOT NULL AND chat_id IS NULL)
+          ),
+          CHECK (source_base_revision IS NULL OR source_artifact_id IS NOT NULL)
+        );
+        INSERT INTO artifacts_new (
+          id, user_id, scope_kind, chat_id, project_id, message_id, run_id, rel_path, filename,
+          mime_type, size_bytes, sha256, source, preview_kind, diff_patch,
+          lifecycle_state, deleted_on_disk, revision, dependency_manifest_hash,
+          source_artifact_id, source_base_revision, created_at, updated_at
+        )
+        SELECT
+          id, user_id, 'chat', chat_id, NULL, message_id, run_id, rel_path, filename,
+          mime_type, size_bytes, sha256, source, preview_kind, diff_patch,
+          'active', 0, 1, NULL,
+          NULL, NULL, created_at, updated_at
+        FROM artifacts;
+        DROP TABLE artifacts;
+        ALTER TABLE artifacts_new RENAME TO artifacts;
+        COMMIT;
+        PRAGMA foreign_keys = ON;
+      `);
+    }
+
+    // Ensure partial unique indexes and lookup indexes on unified artifacts table
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_artifacts_chat ON artifacts(chat_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_artifacts_project ON artifacts(project_id, updated_at DESC);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_chat_rel_active
+        ON artifacts(chat_id, rel_path) WHERE scope_kind = 'chat' AND lifecycle_state != 'deleted';
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_project_rel_active
+        ON artifacts(project_id, rel_path) WHERE scope_kind = 'project' AND lifecycle_state != 'deleted';
+    `);
+
+    // Add project_files.artifact_id and backfill 1:1 unified project artifacts
+    const pfCols = this.db.prepare('PRAGMA table_info(project_files)').all() as Array<{ name: string }>;
+    if (!pfCols.some((col) => col.name === 'artifact_id')) {
+      this.db.exec('ALTER TABLE project_files ADD COLUMN artifact_id TEXT REFERENCES artifacts(id) ON DELETE CASCADE;');
+    }
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_project_files_artifact_id
+        ON project_files(artifact_id) WHERE artifact_id IS NOT NULL;
+    `);
+    const unlinkedProjectFiles = this.db
+      .prepare('SELECT * FROM project_files WHERE artifact_id IS NULL')
+      .all() as Array<Record<string, unknown>>;
+    if (unlinkedProjectFiles.length > 0) {
+      this.db.exec('BEGIN IMMEDIATE;');
+      try {
+        for (const pf of unlinkedProjectFiles) {
+          const projectId = String(pf.project_id);
+          const userId = String(pf.user_id);
+          const relPath = String(pf.rel_path);
+          const filename = String(pf.filename);
+          const mimeType = String(pf.mime_type);
+          const sizeBytes = Number(pf.size_bytes);
+          const sha256 = String(pf.sha256);
+          const createdAt = Number(pf.created_at);
+          const existingArt = this.db
+            .prepare(
+              `SELECT id FROM artifacts
+               WHERE scope_kind = 'project' AND project_id = ? AND rel_path = ? AND lifecycle_state != 'deleted'`
+            )
+            .get(projectId, relPath) as { id: string } | undefined;
+          let artifactId = existingArt?.id;
+          if (!artifactId) {
+            artifactId = crypto.randomUUID();
+            const { previewKind } = detectMimeAndPreviewKind(filename, mimeType);
+            this.db
+              .prepare(
+                `INSERT INTO artifacts (
+                   id, user_id, scope_kind, chat_id, project_id, message_id, run_id,
+                   rel_path, filename, mime_type, size_bytes, sha256, source, preview_kind,
+                   diff_patch, lifecycle_state, deleted_on_disk, revision, dependency_manifest_hash,
+                   source_artifact_id, source_base_revision, created_at, updated_at
+                 ) VALUES (?, ?, 'project', NULL, ?, NULL, NULL, ?, ?, ?, ?, ?, 'project_upload', ?, NULL, 'active', 0, 1, NULL, NULL, NULL, ?, ?)`
+              )
+              .run(
+                artifactId,
+                userId,
+                projectId,
+                relPath,
+                filename,
+                mimeType,
+                sizeBytes,
+                sha256,
+                previewKind,
+                createdAt,
+                createdAt
+              );
+          }
+          this.db
+            .prepare('UPDATE project_files SET artifact_id = ? WHERE id = ?')
+            .run(artifactId, String(pf.id));
+        }
+        this.db.exec('COMMIT;');
+      } catch (err) {
+        this.db.exec('ROLLBACK;');
+        throw err;
+      }
+    }
+
+    // Add sync_events.user_seq if absent and backfill monotonically per user
+    const syncCols = this.db.prepare('PRAGMA table_info(sync_events)').all() as Array<{ name: string }>;
+    if (!syncCols.some((col) => col.name === 'user_seq')) {
+      this.db.exec('ALTER TABLE sync_events ADD COLUMN user_seq INTEGER NOT NULL DEFAULT 0;');
+    }
+    const needsBackfill = this.db
+      .prepare('SELECT 1 FROM sync_events WHERE user_seq = 0 LIMIT 1')
+      .get() as Record<string, unknown> | undefined;
+    if (needsBackfill) {
+      this.db.exec('BEGIN IMMEDIATE;');
+      try {
+        const users = this.db
+          .prepare('SELECT DISTINCT user_id FROM sync_events WHERE user_seq = 0')
+          .all() as Array<{ user_id: string }>;
+        for (const { user_id: uid } of users) {
+          const rows = this.db
+            .prepare('SELECT seq FROM sync_events WHERE user_id = ? ORDER BY seq ASC')
+            .all(uid) as Array<{ seq: number }>;
+          let counter = 0;
+          const upd = this.db.prepare('UPDATE sync_events SET user_seq = ? WHERE seq = ?');
+          for (const row of rows) {
+            counter += 1;
+            upd.run(counter, row.seq);
+          }
+        }
+        this.db.exec('COMMIT;');
+      } catch (err) {
+        this.db.exec('ROLLBACK;');
+        throw err;
+      }
+    }
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_events_user_user_seq
+        ON sync_events(user_id, user_seq) WHERE user_seq > 0;
+    `);
   }
 
   recoverInterruptedRuns(): void {
@@ -867,7 +1275,7 @@ export class AppDatabase {
   listProjectFiles(userId: string, projectId: string): ProjectFileRecord[] {
     const rows = this.db
       .prepare(
-        `SELECT id, project_id, user_id, rel_path, filename, mime_type, size_bytes, sha256, created_at
+        `SELECT id, project_id, user_id, artifact_id, rel_path, filename, mime_type, size_bytes, sha256, created_at
          FROM project_files WHERE project_id = ? AND user_id = ? ORDER BY created_at ASC`
       )
       .all(projectId, userId) as Array<Record<string, unknown>>;
@@ -875,6 +1283,7 @@ export class AppDatabase {
       id: String(r.id),
       projectId: String(r.project_id),
       userId: String(r.user_id),
+      artifactId: r.artifact_id ? String(r.artifact_id) : null,
       relPath: String(r.rel_path),
       filename: String(r.filename),
       mimeType: String(r.mime_type),
@@ -884,34 +1293,63 @@ export class AppDatabase {
     }));
   }
 
+  getProjectFileById(userId: string, projectId: string, fileId: string): ProjectFileRecord | null {
+    const r = this.db
+      .prepare(
+        `SELECT id, project_id, user_id, artifact_id, rel_path, filename, mime_type, size_bytes, sha256, created_at
+         FROM project_files WHERE id = ? AND project_id = ? AND user_id = ?`
+      )
+      .get(fileId, projectId, userId) as Record<string, unknown> | undefined;
+    if (!r) return null;
+    return {
+      id: String(r.id),
+      projectId: String(r.project_id),
+      userId: String(r.user_id),
+      artifactId: r.artifact_id ? String(r.artifact_id) : null,
+      relPath: String(r.rel_path),
+      filename: String(r.filename),
+      mimeType: String(r.mime_type),
+      sizeBytes: Number(r.size_bytes),
+      sha256: String(r.sha256),
+      createdAt: Number(r.created_at),
+    };
+  }
+
+  upsertProjectFileInTx(file: ProjectFileRecord, now: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO project_files (id, project_id, user_id, artifact_id, rel_path, filename, mime_type, size_bytes, sha256, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(project_id, rel_path) DO UPDATE SET
+           artifact_id = COALESCE(excluded.artifact_id, project_files.artifact_id),
+           filename = excluded.filename,
+           mime_type = excluded.mime_type,
+           size_bytes = excluded.size_bytes,
+           sha256 = excluded.sha256,
+           created_at = excluded.created_at`
+      )
+      .run(
+        file.id,
+        file.projectId,
+        file.userId,
+        file.artifactId ?? null,
+        file.relPath,
+        file.filename,
+        file.mimeType,
+        file.sizeBytes,
+        file.sha256,
+        file.createdAt
+      );
+    this.db
+      .prepare('UPDATE projects SET context_version = context_version + 1, updated_at = ? WHERE id = ? AND user_id = ?')
+      .run(now, file.projectId, file.userId);
+  }
+
   upsertProjectFile(file: ProjectFileRecord): { file: ProjectFileRecord; contextVersion: number } {
     const now = Date.now();
-    this.db.exec('BEGIN;');
+    this.db.exec('BEGIN IMMEDIATE;');
     try {
-      this.db
-        .prepare(
-          `INSERT INTO project_files (id, project_id, user_id, rel_path, filename, mime_type, size_bytes, sha256, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(project_id, rel_path) DO UPDATE SET
-             mime_type = excluded.mime_type,
-             size_bytes = excluded.size_bytes,
-             sha256 = excluded.sha256,
-             created_at = excluded.created_at`
-        )
-        .run(
-          file.id,
-          file.projectId,
-          file.userId,
-          file.relPath,
-          file.filename,
-          file.mimeType,
-          file.sizeBytes,
-          file.sha256,
-          file.createdAt
-        );
-      this.db
-        .prepare('UPDATE projects SET context_version = context_version + 1, updated_at = ? WHERE id = ? AND user_id = ?')
-        .run(now, file.projectId, file.userId);
+      this.upsertProjectFileInTx(file, now);
       this.db.exec('COMMIT;');
     } catch (err) {
       this.db.exec('ROLLBACK;');
@@ -924,17 +1362,17 @@ export class AppDatabase {
   }
 
   deleteProjectFile(userId: string, projectId: string, fileId: string): { deleted: ProjectFileRecord | null; contextVersion: number | null } {
-    const row = this.db
-      .prepare(
-        `SELECT id, project_id, user_id, rel_path, filename, mime_type, size_bytes, sha256, created_at
-         FROM project_files WHERE id = ? AND project_id = ? AND user_id = ?`
-      )
-      .get(fileId, projectId, userId) as Record<string, unknown> | undefined;
-    if (!row) return { deleted: null, contextVersion: null };
+    const existing = this.getProjectFileById(userId, projectId, fileId);
+    if (!existing) return { deleted: null, contextVersion: null };
     const now = Date.now();
-    this.db.exec('BEGIN;');
+    this.db.exec('BEGIN IMMEDIATE;');
     try {
       this.db.prepare('DELETE FROM project_files WHERE id = ? AND user_id = ?').run(fileId, userId);
+      if (existing.artifactId) {
+        this.db
+          .prepare("UPDATE artifacts SET lifecycle_state = 'deleted', deleted_on_disk = 1, updated_at = ? WHERE id = ? AND user_id = ?")
+          .run(now, existing.artifactId, userId);
+      }
       this.db
         .prepare('UPDATE projects SET context_version = context_version + 1, updated_at = ? WHERE id = ? AND user_id = ?')
         .run(now, projectId, userId);
@@ -945,17 +1383,7 @@ export class AppDatabase {
     }
     const proj = this.getProject(userId, projectId);
     return {
-      deleted: {
-        id: String(row.id),
-        projectId: String(row.project_id),
-        userId: String(row.user_id),
-        relPath: String(row.rel_path),
-        filename: String(row.filename),
-        mimeType: String(row.mime_type),
-        sizeBytes: Number(row.size_bytes),
-        sha256: String(row.sha256),
-        createdAt: Number(row.created_at),
-      },
+      deleted: existing,
       contextVersion: proj?.contextVersion ?? null,
     };
   }
@@ -1238,6 +1666,7 @@ export class AppDatabase {
 
   private mapMessage(r: Record<string, unknown>): MessageRecord {
     const rawSessionMessages = r.session_messages_json ? String(r.session_messages_json) : '[]';
+    const rawRichBlockIds = r.rich_block_ids_json ? String(r.rich_block_ids_json) : '[]';
     return {
       id: String(r.id),
       chatId: String(r.chat_id),
@@ -1251,12 +1680,28 @@ export class AppDatabase {
       sessionMessages: JSON.parse(rawSessionMessages) as SessionMessageItem[],
       attachments: JSON.parse(String(r.attachments_json)) as AttachmentRef[],
       artifactIds: JSON.parse(String(r.artifact_refs_json)) as string[],
+      richBlockIds: JSON.parse(rawRichBlockIds) as string[],
       status: r.status as MessageRecord['status'],
       runId: r.run_id ? String(r.run_id) : null,
       errorMessage: r.error_message ? String(r.error_message) : null,
       createdAt: Number(r.created_at),
       updatedAt: Number(r.updated_at),
     };
+  }
+
+  appendConfirmedRichBlockToMessageInTx(userId: string, messageId: string, blockId: string, now: number): string[] {
+    const row = this.db
+      .prepare('SELECT rich_block_ids_json FROM messages WHERE id = ? AND user_id = ?')
+      .get(messageId, userId) as { rich_block_ids_json?: string } | undefined;
+    if (!row) return [];
+    const current = JSON.parse(row.rich_block_ids_json ? String(row.rich_block_ids_json) : '[]') as string[];
+    if (!current.includes(blockId)) {
+      current.push(blockId);
+      this.db
+        .prepare('UPDATE messages SET rich_block_ids_json = ?, updated_at = ? WHERE id = ? AND user_id = ?')
+        .run(JSON.stringify(current), now, messageId, userId);
+    }
+    return current;
   }
 
   // ---- Runs & Permissions ----
@@ -1590,7 +2035,9 @@ export class AppDatabase {
   upsertArtifact(params: {
     id: string;
     userId: string;
-    chatId: string;
+    scopeKind?: ArtifactScopeKind;
+    chatId: string | null;
+    projectId?: string | null;
     messageId: string | null;
     runId: string | null;
     relPath: string;
@@ -1598,34 +2045,85 @@ export class AppDatabase {
     mimeType: string;
     sizeBytes: number;
     sha256: string;
-    source: 'attachment' | 'generated' | 'project_copy';
+    source: ArtifactRecord['source'];
     previewKind: PreviewKind;
     diffPatch: string | null;
+    revision?: number;
+    dependencyManifestHash?: string | null;
+    sourceArtifactId?: string | null;
+    sourceBaseRevision?: number | null;
     minUpdatedAt?: number;
   }): ArtifactRecord {
+    const scopeKind: ArtifactScopeKind = params.scopeKind ?? (params.projectId ? 'project' : 'chat');
+    const chatId = scopeKind === 'chat' ? params.chatId : null;
+    const projectId = scopeKind === 'project' ? (params.projectId ?? null) : null;
     const now = Math.max(Date.now(), Math.ceil(params.minUpdatedAt ?? 0));
+
+    const existing =
+      scopeKind === 'chat' && chatId
+        ? this.findArtifactByRelPath(params.userId, chatId, params.relPath)
+        : scopeKind === 'project' && projectId
+          ? this.findProjectArtifactByRelPath(params.userId, projectId, params.relPath)
+          : null;
+
+    if (existing) {
+      this.db
+        .prepare(
+          `UPDATE artifacts
+           SET message_id = COALESCE(?, message_id),
+               run_id = COALESCE(?, run_id),
+               filename = ?,
+               mime_type = ?,
+               size_bytes = ?,
+               sha256 = ?,
+               source = ?,
+               preview_kind = ?,
+               diff_patch = COALESCE(?, diff_patch),
+               lifecycle_state = 'active',
+               deleted_on_disk = 0,
+               revision = COALESCE(?, revision),
+               dependency_manifest_hash = COALESCE(?, dependency_manifest_hash),
+               source_artifact_id = COALESCE(?, source_artifact_id),
+               source_base_revision = COALESCE(?, source_base_revision),
+               updated_at = ?
+           WHERE id = ? AND user_id = ?`
+        )
+        .run(
+          params.messageId,
+          params.runId,
+          params.filename,
+          params.mimeType,
+          params.sizeBytes,
+          params.sha256,
+          params.source,
+          params.previewKind,
+          params.diffPatch,
+          params.revision ?? null,
+          params.dependencyManifestHash ?? null,
+          params.sourceArtifactId ?? null,
+          params.sourceBaseRevision ?? null,
+          now,
+          existing.id,
+          params.userId
+        );
+      return this.getArtifact(params.userId, existing.id)!;
+    }
+
     this.db
       .prepare(
         `INSERT INTO artifacts (
-           id, user_id, chat_id, message_id, run_id, rel_path, filename, mime_type,
-           size_bytes, sha256, source, preview_kind, diff_patch, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(chat_id, rel_path) DO UPDATE SET
-           message_id = COALESCE(excluded.message_id, artifacts.message_id),
-           run_id = COALESCE(excluded.run_id, artifacts.run_id),
-           filename = excluded.filename,
-           mime_type = excluded.mime_type,
-           size_bytes = excluded.size_bytes,
-           sha256 = excluded.sha256,
-           source = excluded.source,
-           preview_kind = excluded.preview_kind,
-           diff_patch = COALESCE(excluded.diff_patch, artifacts.diff_patch),
-           updated_at = excluded.updated_at`
+           id, user_id, scope_kind, chat_id, project_id, message_id, run_id,
+           rel_path, filename, mime_type, size_bytes, sha256, source, preview_kind,
+           diff_patch, lifecycle_state, deleted_on_disk, revision, dependency_manifest_hash,
+           source_artifact_id, source_base_revision, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         params.id,
         params.userId,
-        params.chatId,
+        scopeKind,
+        chatId,
+        projectId,
         params.messageId,
         params.runId,
         params.relPath,
@@ -1636,41 +2134,79 @@ export class AppDatabase {
         params.source,
         params.previewKind,
         params.diffPatch,
+        params.revision ?? 1,
+        params.dependencyManifestHash ?? null,
+        params.sourceArtifactId ?? null,
+        params.sourceBaseRevision ?? null,
         now,
         now
       );
-    const row = this.db
-      .prepare('SELECT * FROM artifacts WHERE chat_id = ? AND rel_path = ? AND user_id = ?')
-      .get(params.chatId, params.relPath, params.userId) as Record<string, unknown>;
-    return this.mapArtifact(row);
+    return this.getArtifact(params.userId, params.id)!;
   }
 
+  /** Public lookup: strictly returns lifecycle_state = 'active' artifacts only. */
   getArtifact(userId: string, artifactId: string): ArtifactRecord | null {
     const row = this.db
-      .prepare('SELECT * FROM artifacts WHERE id = ? AND user_id = ?')
+      .prepare("SELECT * FROM artifacts WHERE id = ? AND user_id = ? AND lifecycle_state = 'active'")
       .get(artifactId, userId) as Record<string, unknown> | undefined;
+    return row ? this.mapArtifact(row) : null;
+  }
+
+  /** Internal lookup for commit/recovery paths that need to inspect pending_create or deleted rows. */
+  getArtifactInternal(artifactId: string): ArtifactRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM artifacts WHERE id = ?')
+      .get(artifactId) as Record<string, unknown> | undefined;
     return row ? this.mapArtifact(row) : null;
   }
 
   findArtifactByRelPath(userId: string, chatId: string, relPath: string): ArtifactRecord | null {
     const row = this.db
-      .prepare('SELECT * FROM artifacts WHERE chat_id = ? AND user_id = ? AND rel_path = ?')
+      .prepare(
+        "SELECT * FROM artifacts WHERE scope_kind = 'chat' AND chat_id = ? AND user_id = ? AND rel_path = ? AND lifecycle_state = 'active'"
+      )
       .get(chatId, userId, relPath) as Record<string, unknown> | undefined;
+    return row ? this.mapArtifact(row) : null;
+  }
+
+  findProjectArtifactByRelPath(userId: string, projectId: string, relPath: string): ArtifactRecord | null {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM artifacts WHERE scope_kind = 'project' AND project_id = ? AND user_id = ? AND rel_path = ? AND lifecycle_state = 'active'"
+      )
+      .get(projectId, userId, relPath) as Record<string, unknown> | undefined;
     return row ? this.mapArtifact(row) : null;
   }
 
   listArtifactsForChat(userId: string, chatId: string): ArtifactRecord[] {
     const rows = this.db
-      .prepare('SELECT * FROM artifacts WHERE chat_id = ? AND user_id = ? ORDER BY updated_at DESC, created_at DESC')
+      .prepare(
+        "SELECT * FROM artifacts WHERE scope_kind = 'chat' AND chat_id = ? AND user_id = ? AND lifecycle_state = 'active' ORDER BY updated_at DESC, created_at DESC"
+      )
       .all(chatId, userId) as Array<Record<string, unknown>>;
     return rows.map((r) => this.mapArtifact(r));
+  }
+
+  listArtifactsForProject(userId: string, projectId: string): ArtifactRecord[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM artifacts WHERE scope_kind = 'project' AND project_id = ? AND user_id = ? AND lifecycle_state = 'active' ORDER BY updated_at DESC, created_at DESC"
+      )
+      .all(projectId, userId) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapArtifact(r));
+  }
+
+  mapArtifactRow(r: Record<string, unknown>): ArtifactRecord {
+    return this.mapArtifact(r);
   }
 
   private mapArtifact(r: Record<string, unknown>): ArtifactRecord {
     return {
       id: String(r.id),
       userId: String(r.user_id),
-      chatId: String(r.chat_id),
+      scopeKind: (r.scope_kind === 'project' ? 'project' : 'chat') as ArtifactScopeKind,
+      chatId: r.chat_id ? String(r.chat_id) : null,
+      projectId: r.project_id ? String(r.project_id) : null,
       messageId: r.message_id ? String(r.message_id) : null,
       runId: r.run_id ? String(r.run_id) : null,
       relPath: String(r.rel_path),
@@ -1681,6 +2217,14 @@ export class AppDatabase {
       source: r.source as ArtifactRecord['source'],
       previewKind: r.preview_kind as PreviewKind,
       diffPatch: r.diff_patch ? String(r.diff_patch) : null,
+      lifecycleState: (r.lifecycle_state ? String(r.lifecycle_state) : 'active') as ArtifactLifecycleState,
+      deletedOnDisk: Boolean(r.deleted_on_disk),
+      revision: r.revision !== undefined && r.revision !== null ? Number(r.revision) : 1,
+      dependencyManifestHash: r.dependency_manifest_hash ? String(r.dependency_manifest_hash) : null,
+      sourceArtifactId: r.source_artifact_id ? String(r.source_artifact_id) : null,
+      sourceBaseRevision: r.source_base_revision !== undefined && r.source_base_revision !== null
+        ? Number(r.source_base_revision)
+        : null,
       createdAt: Number(r.created_at),
       updatedAt: Number(r.updated_at),
     };
@@ -1841,7 +2385,7 @@ export class AppDatabase {
 
   // ---- Sync Events ----
 
-  appendSyncEvent(params: {
+  insertSyncEventInTx(params: {
     userId: string;
     eventId: string;
     type: string;
@@ -1849,15 +2393,22 @@ export class AppDatabase {
     projectId?: string | null;
     runId?: string | null;
     payload: unknown;
+    createdAt?: number;
   }): SyncEventEnvelope {
-    const now = Date.now();
+    const now = params.createdAt ?? Date.now();
+    const maxRow = this.db
+      .prepare('SELECT COALESCE(MAX(user_seq), 0) AS max_user_seq FROM sync_events WHERE user_id = ?')
+      .get(params.userId) as { max_user_seq: number };
+    const userSeq = Number(maxRow.max_user_seq) + 1;
+
     const res = this.db
       .prepare(
-        `INSERT INTO sync_events (user_id, event_id, event_type, chat_id, project_id, run_id, payload_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO sync_events (user_id, user_seq, event_id, event_type, chat_id, project_id, run_id, payload_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         params.userId,
+        userSeq,
         params.eventId,
         params.type,
         params.chatId ?? null,
@@ -1869,12 +2420,12 @@ export class AppDatabase {
 
     // Prune older events for this user beyond the most recent 2000 rows to bound disk usage
     const seq = Number(res.lastInsertRowid);
-    if (seq % 100 === 0) {
+    if (userSeq % 100 === 0) {
       this.db
         .prepare(
           `DELETE FROM sync_events
-           WHERE user_id = ? AND seq < COALESCE(
-             (SELECT seq FROM sync_events WHERE user_id = ? ORDER BY seq DESC LIMIT 1 OFFSET 2000),
+           WHERE user_id = ? AND user_seq < COALESCE(
+             (SELECT user_seq FROM sync_events WHERE user_id = ? ORDER BY user_seq DESC LIMIT 1 OFFSET 2000),
              0
            )`
         )
@@ -1883,6 +2434,7 @@ export class AppDatabase {
 
     return {
       seq,
+      userSeq,
       eventId: params.eventId,
       userId: params.userId,
       type: params.type,
@@ -1894,6 +2446,29 @@ export class AppDatabase {
     };
   }
 
+  appendSyncEvent(params: {
+    userId: string;
+    eventId: string;
+    type: string;
+    chatId?: string | null;
+    projectId?: string | null;
+    runId?: string | null;
+    payload: unknown;
+  }): SyncEventEnvelope {
+    if (this.db.isTransaction) {
+      return this.insertSyncEventInTx(params);
+    }
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const envelope = this.insertSyncEventInTx(params);
+      this.db.exec('COMMIT;');
+      return envelope;
+    } catch (err) {
+      this.db.exec('ROLLBACK;');
+      throw err;
+    }
+  }
+
   getLatestSyncSeq(userId: string): number {
     const row = this.db
       .prepare('SELECT COALESCE(MAX(seq), 0) AS max_seq FROM sync_events WHERE user_id = ?')
@@ -1901,19 +2476,43 @@ export class AppDatabase {
     return Number(row.max_seq);
   }
 
+  getLatestUserSyncSeq(userId: string): number {
+    const row = this.db
+      .prepare('SELECT COALESCE(MAX(user_seq), 0) AS max_user_seq FROM sync_events WHERE user_id = ?')
+      .get(userId) as { max_user_seq: number };
+    return Number(row.max_user_seq);
+  }
+
+  private mapSyncEventRow(r: Record<string, unknown>): SyncEventEnvelope {
+    return {
+      seq: Number(r.seq),
+      userSeq: Number(r.user_seq ?? 0),
+      eventId: String(r.event_id),
+      userId: String(r.user_id),
+      type: String(r.event_type),
+      chatId: r.chat_id ? String(r.chat_id) : null,
+      projectId: r.project_id ? String(r.project_id) : null,
+      runId: r.run_id ? String(r.run_id) : null,
+      payload: JSON.parse(String(r.payload_json)),
+      createdAt: Number(r.created_at),
+    };
+  }
+
   getSyncEventsSince(userId: string, sinceSeq: number, limit = 500): {
     events: SyncEventEnvelope[];
     truncated: boolean;
     latestSeq: number;
+    latestUserSeq: number;
   } {
     const latestSeq = this.getLatestSyncSeq(userId);
+    const latestUserSeq = this.getLatestUserSyncSeq(userId);
     const minAvailableRow = this.db
       .prepare('SELECT MIN(seq) AS min_seq FROM sync_events WHERE user_id = ?')
       .get(userId) as { min_seq: number | null };
     const minSeq = minAvailableRow.min_seq !== null ? Number(minAvailableRow.min_seq) : 0;
 
     if (sinceSeq > 0 && minSeq > 0 && sinceSeq + 1 < minSeq) {
-      return { events: [], truncated: true, latestSeq };
+      return { events: [], truncated: true, latestSeq, latestUserSeq };
     }
 
     const rows = this.db
@@ -1923,20 +2522,73 @@ export class AppDatabase {
     const truncated = rows.length > limit;
     const slice = rows.slice(0, limit);
     return {
-      events: slice.map((r) => ({
-        seq: Number(r.seq),
-        eventId: String(r.event_id),
-        userId: String(r.user_id),
-        type: String(r.event_type),
-        chatId: r.chat_id ? String(r.chat_id) : null,
-        projectId: r.project_id ? String(r.project_id) : null,
-        runId: r.run_id ? String(r.run_id) : null,
-        payload: JSON.parse(String(r.payload_json)),
-        createdAt: Number(r.created_at),
-      })),
+      events: slice.map((r) => this.mapSyncEventRow(r)),
       truncated,
       latestSeq,
+      latestUserSeq,
     };
+  }
+
+  getSyncEventsSinceUserSeq(userId: string, sinceUserSeq: number, limit = 500): {
+    events: SyncEventEnvelope[];
+    truncated: boolean;
+    latestSeq: number;
+    latestUserSeq: number;
+  } {
+    const latestSeq = this.getLatestSyncSeq(userId);
+    const latestUserSeq = this.getLatestUserSyncSeq(userId);
+    const minAvailableRow = this.db
+      .prepare('SELECT MIN(user_seq) AS min_user_seq FROM sync_events WHERE user_id = ? AND user_seq > 0')
+      .get(userId) as { min_user_seq: number | null };
+    const minUserSeq = minAvailableRow.min_user_seq !== null ? Number(minAvailableRow.min_user_seq) : 0;
+
+    if (sinceUserSeq > 0 && minUserSeq > 0 && sinceUserSeq + 1 < minUserSeq) {
+      return { events: [], truncated: true, latestSeq, latestUserSeq };
+    }
+
+    const rows = this.db
+      .prepare('SELECT * FROM sync_events WHERE user_id = ? AND user_seq > ? ORDER BY user_seq ASC LIMIT ?')
+      .all(userId, sinceUserSeq, limit + 1) as Array<Record<string, unknown>>;
+
+    const truncated = rows.length > limit;
+    const slice = rows.slice(0, limit);
+    return {
+      events: slice.map((r) => this.mapSyncEventRow(r)),
+      truncated,
+      latestSeq,
+      latestUserSeq,
+    };
+  }
+
+  /**
+   * Single read transaction returning consistent snapshotUserSeq and entity state for full WS resync.
+   */
+  getSyncSnapshot(userId: string): {
+    snapshotUserSeq: number;
+    latestSeq: number;
+    projects: Array<ProjectRecord & { files: ProjectFileRecord[] }>;
+    chats: ChatRecord[];
+    artifacts: ArtifactRecord[];
+  } {
+    this.db.exec('BEGIN;');
+    try {
+      const snapshotUserSeq = this.getLatestUserSyncSeq(userId);
+      const latestSeq = this.getLatestSyncSeq(userId);
+      const projects = this.listProjects(userId).map((p) => ({
+        ...p,
+        files: this.listProjectFiles(userId, p.id),
+      }));
+      const chats = this.listChats(userId);
+      const artRows = this.db
+        .prepare("SELECT * FROM artifacts WHERE user_id = ? AND lifecycle_state = 'active' ORDER BY updated_at DESC")
+        .all(userId) as Array<Record<string, unknown>>;
+      const artifacts = artRows.map((r) => this.mapArtifact(r));
+      this.db.exec('COMMIT;');
+      return { snapshotUserSeq, latestSeq, projects, chats, artifacts };
+    } catch (err) {
+      this.db.exec('ROLLBACK;');
+      throw err;
+    }
   }
 
   // ---- MCP Servers ----

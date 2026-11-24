@@ -92,7 +92,330 @@ export function resolveContainedWriteTarget(rootDir: string, relPathRaw: string)
 
 export const supportsWorkspaceTextWrites = process.platform === 'linux' && fs.existsSync('/proc/self/fd');
 
-export function writeWorkspaceTextFile(rootDir: string, relativePath: string, content: string): void {
+export class ExternalConcurrentWriteError extends Error {
+  public readonly statusCode = 409;
+  public readonly code = 'EXTERNAL_CONCURRENT_WRITE';
+  constructor(message = 'ファイルの読取中に外部からの同時変更を検出しました。') {
+    super(message);
+    this.name = 'ExternalConcurrentWriteError';
+  }
+}
+
+export interface FileFingerprint {
+  dev: bigint;
+  ino: bigint;
+  size: number;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+}
+
+export function extractFileFingerprint(stat: fs.BigIntStats): FileFingerprint {
+  return {
+    dev: stat.dev,
+    ino: stat.ino,
+    size: Number(stat.size),
+    mtimeNs: stat.mtimeNs,
+    ctimeNs: stat.ctimeNs,
+  };
+}
+
+export function fingerprintsMatch(a: FileFingerprint, b: FileFingerprint): boolean {
+  return (
+    a.dev === b.dev &&
+    a.ino === b.ino &&
+    a.size === b.size &&
+    a.mtimeNs === b.mtimeNs &&
+    a.ctimeNs === b.ctimeNs
+  );
+}
+
+export function fsyncDir(dirPath: string): void {
+  const { O_RDONLY, O_DIRECTORY } = fs.constants;
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(dirPath, O_RDONLY | O_DIRECTORY);
+    fs.fsyncSync(fd);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== 'EINVAL' && code !== 'EBADF' && code !== 'EROFS') {
+      throw err;
+    }
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+export function checkSameFilesystem(pathA: string, pathB: string): boolean {
+  const statA = fs.statSync(pathA, { bigint: true });
+  const statB = fs.statSync(pathB, { bigint: true });
+  return statA.dev === statB.dev;
+}
+
+function openRootDirectoryNoFollow(rootDir: string): { rootReal: string; dirFd: number } {
+  const { O_RDONLY, O_DIRECTORY, O_NOFOLLOW } = fs.constants;
+  let rootReal: string;
+  try {
+    rootReal = fs.realpathSync(rootDir);
+  } catch {
+    throw new PathContainmentError('ルートディレクトリが存在しないかアクセスできません。');
+  }
+  const dirFd = fs.openSync(rootReal, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+  return { rootReal, dirFd };
+}
+
+/**
+ * Walk every intermediate parent directory with O_DIRECTORY | O_NOFOLLOW and optionally create missing directories.
+ * Caller MUST close the returned `dirFd`.
+ */
+export function ensureContainedDirectoryNoFollow(
+  rootDir: string,
+  relDirPath: string,
+  opts: { createMissing?: boolean } = {}
+): { dirFd: number; rootReal: string; absDirPath: string } {
+  if (!supportsWorkspaceTextWrites) {
+    throw new PathContainmentError('この実行環境では O_NOFOLLOW による安全なディレクトリ走査を利用できません。');
+  }
+  const { O_RDONLY, O_DIRECTORY, O_NOFOLLOW } = fs.constants;
+  const directoryFlags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
+  const { rootReal, dirFd: initialFd } = openRootDirectoryNoFollow(rootDir);
+  let dirFd = initialFd;
+  try {
+    const trimmed = relDirPath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    const segments = trimmed ? normalizeRelPath(trimmed).split('/') : [];
+    for (const segment of segments) {
+      const child = `/proc/self/fd/${dirFd}/${segment}`;
+      if (opts.createMissing) {
+        try {
+          fs.mkdirSync(child, { mode: 0o700 });
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+        }
+      }
+      let nextFd: number;
+      try {
+        nextFd = fs.openSync(child, directoryFlags);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === 'ELOOP' || code === 'ENOTDIR') {
+          throw new PathContainmentError('中間ディレクトリにシンボリックリンクまたは不正なエントリが含まれています。');
+        }
+        throw err;
+      }
+      fs.closeSync(dirFd);
+      dirFd = nextFd;
+    }
+    const absDirPath = segments.length > 0 ? path.join(rootReal, ...segments) : rootReal;
+    return { dirFd, rootReal, absDirPath };
+  } catch (err) {
+    try {
+      fs.closeSync(dirFd);
+    } catch {
+      // ignore
+    }
+    throw err;
+  }
+}
+
+export interface OpenedContainedFile {
+  fd: number;
+  stat: fs.BigIntStats;
+  fingerprint: FileFingerprint;
+  relPath: string;
+  absPath: string;
+}
+
+/**
+ * Open a regular file strictly contained inside `rootDir` by walking EVERY intermediate directory
+ * with O_DIRECTORY | O_NOFOLLOW and opening the leaf with O_NOFOLLOW | O_NONBLOCK.
+ * Rejects symlinks (intermediate or leaf), path traversal, non-regular files, and hardlinks (by default).
+ * Caller MUST close `fd`.
+ */
+export function openContainedRegularFileNoFollow(
+  rootDir: string,
+  relPathRaw: string,
+  opts: { allowHardlinks?: boolean; maxBytes?: number } = {}
+): OpenedContainedFile {
+  if (!supportsWorkspaceTextWrites) {
+    throw new PathContainmentError('この実行環境では O_NOFOLLOW による安全なファイル参照を利用できません。');
+  }
+  const relPath = normalizeRelPath(relPathRaw);
+  const segments = relPath.split('/');
+  const filename = segments.pop()!;
+  const parentRel = segments.join('/');
+  const { O_RDONLY, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
+
+  const { dirFd, rootReal } = ensureContainedDirectoryNoFollow(rootDir, parentRel, { createMissing: false });
+  let fileFd: number | null = null;
+  try {
+    const leafPath = `/proc/self/fd/${dirFd}/${filename}`;
+    try {
+      fileFd = fs.openSync(leafPath, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ELOOP') {
+        throw new PathContainmentError('シンボリックリンクの参照は許可されていません。');
+      }
+      throw err;
+    }
+
+    const stat = fs.fstatSync(fileFd, { bigint: true });
+    if (!stat.isFile()) {
+      throw new PathContainmentError('通常のファイルのみアクセスできます。');
+    }
+    if (!opts.allowHardlinks && stat.nlink !== 1n) {
+      throw new PathContainmentError('ハードリンクされたファイルへのアクセスは拒否されました。');
+    }
+    if (opts.maxBytes !== undefined && Number(stat.size) > opts.maxBytes) {
+      throw new PathContainmentError(`ファイルサイズが上限（${opts.maxBytes} bytes）を超えています。`);
+    }
+
+    const absPath = path.join(rootReal, ...segments, filename);
+    const result: OpenedContainedFile = {
+      fd: fileFd,
+      stat,
+      fingerprint: extractFileFingerprint(stat),
+      relPath,
+      absPath,
+    };
+    fileFd = null; // transferred to caller
+    return result;
+  } finally {
+    fs.closeSync(dirFd);
+    if (fileFd !== null) {
+      try {
+        fs.closeSync(fileFd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+export interface StableFileReadResult {
+  buffer: Buffer;
+  sha256: string;
+  sizeBytes: number;
+  fingerprint: FileFingerprint;
+  relPath: string;
+  absPath: string;
+}
+
+/**
+ * Read a contained regular file from a single O_NOFOLLOW FD while checking fstat before/after
+ * and parent-entry lstat consistency. Retries up to `maxRetries` times on concurrent external writes.
+ */
+export function readContainedRegularFileNoFollowStable(
+  rootDir: string,
+  relPathRaw: string,
+  opts: { allowHardlinks?: boolean; maxBytes?: number; maxRetries?: number } = {}
+): StableFileReadResult {
+  const maxRetries = opts.maxRetries ?? 2;
+  const relPath = normalizeRelPath(relPathRaw);
+  const segments = relPath.split('/');
+  const filename = segments.pop()!;
+  const parentRel = segments.join('/');
+  const { O_RDONLY, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const { dirFd, rootReal } = ensureContainedDirectoryNoFollow(rootDir, parentRel, { createMissing: false });
+    let fileFd: number | null = null;
+    try {
+      const leafPath = `/proc/self/fd/${dirFd}/${filename}`;
+      try {
+        fileFd = fs.openSync(leafPath, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === 'ELOOP') {
+          throw new PathContainmentError('シンボリックリンクの参照は許可されていません。');
+        }
+        throw err;
+      }
+
+      const statBefore = fs.fstatSync(fileFd, { bigint: true });
+      if (!statBefore.isFile()) {
+        throw new PathContainmentError('通常のファイルのみアクセスできます。');
+      }
+      if (!opts.allowHardlinks && statBefore.nlink !== 1n) {
+        throw new PathContainmentError('ハードリンクされたファイルへのアクセスは拒否されました。');
+      }
+      if (opts.maxBytes !== undefined && Number(statBefore.size) > opts.maxBytes) {
+        throw new PathContainmentError(`ファイルサイズが上限（${opts.maxBytes} bytes）を超えています。`);
+      }
+
+      const fpBefore = extractFileFingerprint(statBefore);
+      const hash = crypto.createHash('sha256');
+      const chunks: Buffer[] = [];
+      let totalRead = 0;
+      const buf = Buffer.allocUnsafe(64 * 1024);
+      let bytesRead = 0;
+      while ((bytesRead = fs.readSync(fileFd, buf, 0, buf.length, null)) > 0) {
+        totalRead += bytesRead;
+        if (opts.maxBytes !== undefined && totalRead > opts.maxBytes) {
+          throw new PathContainmentError(`ファイルサイズが上限（${opts.maxBytes} bytes）を超えています。`);
+        }
+        const slice = Buffer.from(buf.subarray(0, bytesRead));
+        chunks.push(slice);
+        hash.update(slice);
+      }
+
+      const statAfter = fs.fstatSync(fileFd, { bigint: true });
+      const fpAfter = extractFileFingerprint(statAfter);
+      const lstatTarget = fs.lstatSync(leafPath, { bigint: true, throwIfNoEntry: false });
+      const fpLstat = lstatTarget ? extractFileFingerprint(lstatTarget) : null;
+
+      if (
+        !fingerprintsMatch(fpBefore, fpAfter) ||
+        !fpLstat ||
+        !fingerprintsMatch(fpBefore, fpLstat) ||
+        totalRead !== fpBefore.size
+      ) {
+        if (attempt < maxRetries) {
+          continue;
+        }
+        throw new ExternalConcurrentWriteError();
+      }
+
+      return {
+        buffer: Buffer.concat(chunks, totalRead),
+        sha256: hash.digest('hex'),
+        sizeBytes: totalRead,
+        fingerprint: fpAfter,
+        relPath,
+        absPath: path.join(rootReal, ...segments, filename),
+      };
+    } finally {
+      if (fileFd !== null) {
+        try {
+          fs.closeSync(fileFd);
+        } catch {
+          // ignore
+        }
+      }
+      fs.closeSync(dirFd);
+    }
+  }
+  throw new ExternalConcurrentWriteError();
+}
+
+export function sha256Fd(fd: number): { sha256: string; sizeBytes: number } {
+  const hash = crypto.createHash('sha256');
+  const chunk = Buffer.allocUnsafe(64 * 1024);
+  let offset = 0;
+  let bytesRead = 0;
+  while ((bytesRead = fs.readSync(fd, chunk, 0, chunk.length, offset)) > 0) {
+    hash.update(chunk.subarray(0, bytesRead));
+    offset += bytesRead;
+  }
+  return { sha256: hash.digest('hex'), sizeBytes: offset };
+}
+
+export function writeWorkspaceBinaryFile(rootDir: string, relativePath: string, content: Buffer): void {
   if (!supportsWorkspaceTextWrites) {
     throw new PathContainmentError('この実行環境では ACP の作業ファイル書き込みを利用できません。');
   }
@@ -136,7 +459,8 @@ export function writeWorkspaceTextFile(rootDir: string, relativePath: string, co
     const fd = fs.openSync(temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, stat ? stat.mode & 0o777 : 0o666);
     let replaced = false;
     try {
-      fs.writeFileSync(fd, content, 'utf8');
+      fs.writeFileSync(fd, content);
+      fs.fsyncSync(fd);
       if (stat) fs.fchmodSync(fd, stat.mode & 0o777);
       // Rename replaces the directory entry without following a concurrently introduced link.
       fs.renameSync(temporary, target);
@@ -148,6 +472,10 @@ export function writeWorkspaceTextFile(rootDir: string, relativePath: string, co
   } finally {
     fs.closeSync(directory);
   }
+}
+
+export function writeWorkspaceTextFile(rootDir: string, relativePath: string, content: string): void {
+  writeWorkspaceBinaryFile(rootDir, relativePath, Buffer.from(content, 'utf8'));
 }
 
 export function ensureUserDirs(baseRoots: {
@@ -239,16 +567,24 @@ export function detectMimeAndPreviewKind(filename: string, providedMime?: string
   if (ext === '.mmd' || ext === '.mermaid') return { mimeType: 'text/plain', previewKind: 'mermaid' };
   if (ext === '.diff' || ext === '.patch') return { mimeType: 'text/x-diff', previewKind: 'diff' };
   if (ext === '.md' || ext === '.markdown' || ext === '.mdx') return { mimeType: 'text/markdown', previewKind: 'markdown' };
-  if (mimeType.startsWith('audio/')) return { mimeType, previewKind: 'audio' };
-  if (mimeType.startsWith('video/')) return { mimeType, previewKind: 'video' };
-
   const codeOrTextExts = new Set([
     '.txt', '.log', '.json', '.jsonc', '.yaml', '.yml', '.toml', '.xml', '.ini', '.env', '.conf',
     '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.sh', '.bash', '.zsh', '.sql', '.css',
     '.scss', '.less', '.rs', '.go', '.java', '.kt', '.c', '.cpp', '.h', '.hpp', '.rb', '.php',
     '.swift', '.dockerfile', '.gitignore',
   ]);
-  if (codeOrTextExts.has(ext) || mimeType.startsWith('text/') || mimeType === 'application/json' || mimeType === 'application/xml') {
+  if (codeOrTextExts.has(ext)) {
+    const resolvedMime =
+      ext === '.ts' || ext === '.tsx'
+        ? 'text/typescript'
+        : mimeType === 'application/octet-stream'
+          ? 'text/plain'
+          : mimeType;
+    return { mimeType: resolvedMime, previewKind: 'code' };
+  }
+  if (mimeType.startsWith('audio/')) return { mimeType, previewKind: 'audio' };
+  if (mimeType.startsWith('video/')) return { mimeType, previewKind: 'video' };
+  if (mimeType.startsWith('text/') || mimeType === 'application/json' || mimeType === 'application/xml') {
     return { mimeType, previewKind: 'code' };
   }
   return { mimeType, previewKind: 'binary' };

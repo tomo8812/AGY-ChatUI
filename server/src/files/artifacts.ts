@@ -1,14 +1,10 @@
-import { execFile } from 'node:child_process';
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import { createTwoFilesPatch } from 'diff';
+import type { ArtifactService } from '../artifacts/artifact-service.js';
 import type { AppDatabase } from '../db/database.js';
 import type { ArtifactRecord } from '../types.js';
 import { detectMimeAndPreviewKind, resolveContainedExistingPath, sha256File } from './workspace.js';
-
-const execFileAsync = promisify(execFile);
 
 export interface FileSnapshotItem {
   sizeBytes: number;
@@ -72,6 +68,7 @@ export function captureWorkspaceSnapshot(workspaceDir: string): WorkspaceSnapsho
 }
 
 export function syncWorkspaceChangesAsArtifacts(params: {
+  artifactService: ArtifactService;
   db: AppDatabase;
   userId: string;
   chatId: string;
@@ -105,8 +102,10 @@ export function syncWorkspaceChangesAsArtifacts(params: {
     }
     const existing = params.db.findArtifactByRelPath(params.userId, params.chatId, relPath);
     if (
-      params.skipIfAlreadyOwnedByOtherMessage && !hintSet.has(relPath) &&
-      existing?.messageId && existing.messageId !== params.messageId &&
+      params.skipIfAlreadyOwnedByOtherMessage &&
+      !hintSet.has(relPath) &&
+      existing?.messageId &&
+      existing.messageId !== params.messageId &&
       existing.sha256 === after.sha256
     ) {
       continue;
@@ -127,69 +126,38 @@ export function syncWorkspaceChangesAsArtifacts(params: {
       );
     }
 
-    const record = params.db.upsertArtifact({
-      id: existing?.id ?? crypto.randomUUID(),
+    const { artifact } = params.artifactService.ingestWorkspaceFile({
       userId: params.userId,
       chatId: params.chatId,
-      messageId: params.messageId,
-      runId: params.runId,
+      workspaceDir: rootReal,
       relPath,
       filename,
       mimeType,
-      sizeBytes: after.sizeBytes,
-      sha256: after.sha256,
-      source: isInitialProjectCopy && !changed ? 'project_copy' : 'generated',
       previewKind,
+      source: isInitialProjectCopy && !changed ? 'project_copy' : 'generated',
+      messageId: params.messageId,
+      runId: params.runId,
       diffPatch,
-      minUpdatedAt: after.mtimeMs,
+      emitEvent: false,
     });
-    registered.push(record);
+    registered.push(artifact);
   }
   return registered;
 }
 
 export async function convertPresentationToPdfCached(params: {
-  libreOfficeBin: string;
-  cacheRoot: string;
+  artifactService: ArtifactService;
+  artifactId: string;
+  revision: number;
   sourceAbsPath: string;
   sourceSha256: string;
+  dependencyManifestHash?: string | null;
 }): Promise<string | null> {
-  const outDir = path.join(params.cacheRoot, params.sourceSha256);
-  fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
-  const base = path.basename(params.sourceAbsPath, path.extname(params.sourceAbsPath));
-  const expectedPdf = path.join(outDir, `${base}.pdf`);
-  if (fs.existsSync(expectedPdf)) {
-    return expectedPdf;
-  }
-
-  const loProfileDir = path.join(outDir, `.lo-profile-${process.pid}-${Date.now()}`);
-  fs.mkdirSync(loProfileDir, { recursive: true, mode: 0o700 });
-  try {
-    await execFileAsync(
-      params.libreOfficeBin,
-      [
-        `-env:UserInstallation=file://${loProfileDir}`,
-        '--headless',
-        '--norestore',
-        '--convert-to',
-        'pdf',
-        '--outdir',
-        outDir,
-        params.sourceAbsPath,
-      ],
-      {
-        timeout: 30_000,
-        env: { ...process.env, SAL_USE_VCLPLUGIN: 'svp' },
-      }
-    );
-    if (fs.existsSync(expectedPdf)) {
-      return expectedPdf;
-    }
-    const found = fs.readdirSync(outDir).find((f) => f.toLowerCase().endsWith('.pdf'));
-    return found ? path.join(outDir, found) : null;
-  } catch {
-    return null;
-  } finally {
-    fs.rmSync(loProfileDir, { recursive: true, force: true });
-  }
+  return params.artifactService.renderCache.renderPresentationToPdf({
+    artifactId: params.artifactId,
+    revision: params.revision,
+    sourceAbsPath: params.sourceAbsPath,
+    sourceSha256: params.sourceSha256,
+    dependencyManifestHash: params.dependencyManifestHash ?? null,
+  });
 }

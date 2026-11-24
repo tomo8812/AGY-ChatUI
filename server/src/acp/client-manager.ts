@@ -29,6 +29,7 @@ import {
   type SessionUpdate,
   type ToolCall,
 } from '@agentclientprotocol/sdk';
+import type { ArtifactService } from '../artifacts/artifact-service.js';
 import type { AppConfig } from '../config.js';
 import type { AppDatabase } from '../db/database.js';
 import { decryptSmallSecret } from '../auth/password.js';
@@ -470,7 +471,7 @@ interface ActiveTurnBridge {
   pendingResolvers: Map<string, (outcome: RequestPermissionResponse) => void>;
   pendingElicitationResolvers: Map<string, (resp: CreateElicitationResponse) => void>;
   beforeWorkspaceSnap: WorkspaceSnapshot;
-  emittedArtifactIds: Set<string>;
+  emittedArtifactVersions: Map<string, string>;
   lastActivityAt: number;
   subagents: Map<string, TrackedSubagentState>;
   asyncSubagentToolIds: Set<string>;
@@ -527,10 +528,49 @@ export class AcpClientManager {
     private readonly hub: SyncHub,
     private readonly skillService?: SkillService,
     private readonly pushService?: PushNotificationService,
-    private readonly mcpService?: McpService
+    private readonly mcpService?: McpService,
+    private readonly artifactService?: ArtifactService
   ) {
     this.cleanupTimer = setInterval(() => this.evictIdleWorkers(), 30_000);
     this.cleanupTimer.unref();
+  }
+
+  /**
+   * Read-only query for 2-layer rich block binding (`ACP-01`).
+   * Returns active turn hints ONLY when a single unambiguous parent turn is running with zero
+   * concurrent background bridges or running subagents. Never alters ACP execution.
+   */
+  resolveUnambiguousTurnForMcp(workerKey: string): { assistantMessageId: string; runId: string } | null {
+    const worker = this.workers.get(workerKey);
+    if (!worker || !worker.activeTurn) return null;
+    if (worker.backgroundBridge && worker.backgroundBridge !== worker.activeTurn) return null;
+    if (worker.activeTurn.backgroundWorkCount > 0) return null;
+    for (const sub of worker.activeTurn.subagents.values()) {
+      if (sub.state === 'running' || sub.state === 'requires_action') return null;
+    }
+    return {
+      assistantMessageId: worker.activeTurn.assistantMessageId,
+      runId: worker.activeTurn.runId,
+    };
+  }
+
+  private emitArtifactVersionIfNeeded(
+    bridge: ActiveTurnBridge,
+    artifact: { id: string; revision: number; sha256: string; dependencyManifestHash?: string | null } & Record<string, unknown>,
+    runId: string | null
+  ): void {
+    const versionKey = `${artifact.revision}:${artifact.sha256}:${artifact.dependencyManifestHash ?? ''}`;
+    const prevKey = bridge.emittedArtifactVersions.get(artifact.id);
+    if (prevKey === versionKey) return;
+    bridge.emittedArtifactVersions.set(artifact.id, versionKey);
+    const eventType = prevKey === undefined && artifact.revision <= 1 ? 'artifact.created' : 'artifact.updated';
+    this.hub.emitDurable({
+      userId: bridge.userId,
+      type: eventType,
+      chatId: bridge.chatId,
+      runId,
+      payload: { artifact },
+    });
   }
 
   private getExpectedMcpConfigEpoch(userId: string, chatId: string): number {
@@ -1346,7 +1386,7 @@ export class AcpClientManager {
       pendingResolvers: new Map(),
       pendingElicitationResolvers: new Map(),
       beforeWorkspaceSnap: beforeSnap,
-      emittedArtifactIds: new Set(),
+      emittedArtifactVersions: new Map(),
       lastActivityAt: nowInit,
       subagents: new Map(),
       asyncSubagentToolIds: new Set(),
@@ -1427,16 +1467,19 @@ export class AcpClientManager {
       const hintPaths = bridge.toolCalls.flatMap(tool => (tool.locations ?? [])
         .map(location => toHostWorkspacePath(worker.workspaceDir, worker.sandboxWorkspaceRoot, location.path)));
 
-      const newArtifacts = syncWorkspaceChangesAsArtifacts({
-        db: this.db,
-        userId: params.userId,
-        chatId: params.chatId,
-        workspaceDir: chat.workspaceDir,
-        messageId: params.assistantMessageId,
-        runId: params.runId,
-        before: beforeSnap,
-        hintPaths,
-      });
+      const newArtifacts = this.artifactService
+        ? syncWorkspaceChangesAsArtifacts({
+            artifactService: this.artifactService,
+            db: this.db,
+            userId: params.userId,
+            chatId: params.chatId,
+            workspaceDir: chat.workspaceDir,
+            messageId: params.assistantMessageId,
+            runId: params.runId,
+            before: beforeSnap,
+            hintPaths,
+          })
+        : [];
 
       if (bridge.activity.at(-1)?.kind === 'content') bridge.activity.push({ kind: 'answer_end' });
 
@@ -1447,20 +1490,12 @@ export class AcpClientManager {
         toolCalls: bridge.toolCalls,
         activity: bridge.activity,
         sessionMessages: bridge.sessionMessages,
-        artifactIds: [...new Set([...bridge.emittedArtifactIds, ...newArtifacts.map(a => a.id)])],
+        artifactIds: [...new Set([...bridge.emittedArtifactVersions.keys(), ...newArtifacts.map((a) => a.id)])],
         status: finalStatus,
       })!;
 
       for (const art of newArtifacts) {
-        if (bridge.emittedArtifactIds.has(art.id)) continue;
-        bridge.emittedArtifactIds.add(art.id);
-        this.hub.emitDurable({
-          userId: params.userId,
-          type: 'artifact.created',
-          chatId: params.chatId,
-          runId: params.runId,
-          payload: { artifact: art },
-        });
+        this.emitArtifactVersionIfNeeded(bridge, art as unknown as { id: string; revision: number; sha256: string; dependencyManifestHash?: string | null } & Record<string, unknown>, params.runId);
       }
 
       this.hub.emitDurable({
@@ -2319,6 +2354,7 @@ export class AcpClientManager {
 
   private publishArtifactReference(turn: ActiveTurnBridge, reference: string, label?: string, mimeType?: string | null): boolean {
     const resolved = resolveAuthorizedChatFileReference({
+      artifactService: this.artifactService,
       db: this.db,
       userId: turn.userId,
       chatId: turn.chatId,
@@ -2331,16 +2367,11 @@ export class AcpClientManager {
     });
     if (!resolved) return false;
     const { artifact } = resolved;
-    if (!turn.emittedArtifactIds.has(artifact.id)) {
-      turn.emittedArtifactIds.add(artifact.id);
-      this.hub.emitDurable({
-        userId: turn.userId,
-        chatId: turn.chatId,
-        runId: turn.runId,
-        type: 'artifact.created',
-        payload: { artifact },
-      });
-    }
+    this.emitArtifactVersionIfNeeded(
+      turn,
+      artifact as unknown as { id: string; revision: number; sha256: string; dependencyManifestHash?: string | null } & Record<string, unknown>,
+      turn.runId
+    );
     return true;
   }
 
@@ -2859,7 +2890,15 @@ export class AcpClientManager {
       pendingResolvers: new Map(),
       pendingElicitationResolvers: new Map(),
       beforeWorkspaceSnap,
-      emittedArtifactIds: new Set(latestAssistant.artifactIds),
+      emittedArtifactVersions: new Map(
+        latestAssistant.artifactIds.map((id) => {
+          const existing = this.db.getArtifact(worker.userId, id);
+          return [
+            id,
+            existing ? `${existing.revision}:${existing.sha256}:${existing.dependencyManifestHash ?? ''}` : '0::',
+          ];
+        })
+      ),
       lastActivityAt: Date.now(),
       subagents: new Map(),
       asyncSubagentToolIds: new Set(),
@@ -2886,7 +2925,9 @@ export class AcpClientManager {
     if (worker.activeTurn && worker.activeTurn !== bridge) {
       return;
     }
+    if (!this.artifactService) return;
     const newArtifacts = syncWorkspaceChangesAsArtifacts({
+      artifactService: this.artifactService,
       db: this.db,
       userId: worker.userId,
       chatId: worker.chatId,
@@ -2897,15 +2938,11 @@ export class AcpClientManager {
       skipIfAlreadyOwnedByOtherMessage: true,
     });
     for (const art of newArtifacts) {
-      if (bridge.emittedArtifactIds.has(art.id)) continue;
-      bridge.emittedArtifactIds.add(art.id);
-      this.hub.emitDurable({
-        userId: worker.userId,
-        type: 'artifact.created',
-        chatId: worker.chatId,
-        runId: bridge.runId || null,
-        payload: { artifact: art },
-      });
+      this.emitArtifactVersionIfNeeded(
+        bridge,
+        art as unknown as { id: string; revision: number; sha256: string; dependencyManifestHash?: string | null } & Record<string, unknown>,
+        bridge.runId || null
+      );
     }
   }
 
@@ -2923,7 +2960,7 @@ export class AcpClientManager {
       toolCalls: bridge.toolCalls,
       activity: bridge.activity,
       sessionMessages: bridge.sessionMessages,
-      artifactIds: [...bridge.emittedArtifactIds],
+      artifactIds: [...bridge.emittedArtifactVersions.keys()],
     });
     if (updated) {
       this.hub.emitDurable({

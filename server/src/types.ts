@@ -63,6 +63,7 @@ export interface ProjectFileRecord {
   id: string;
   projectId: string;
   userId: string;
+  artifactId?: string | null;
   relPath: string;
   filename: string;
   mimeType: string;
@@ -176,6 +177,7 @@ export interface MessageRecord {
   sessionMessages?: SessionMessageItem[];
   attachments: AttachmentRef[];
   artifactIds: string[];
+  richBlockIds?: string[];
   status: 'queued' | 'streaming' | 'completed' | 'cancelled' | 'error';
   runId: string | null;
   errorMessage: string | null;
@@ -305,10 +307,15 @@ export interface PendingElicitationRecord {
   resolvedAt: number | null;
 }
 
+export type ArtifactScopeKind = 'chat' | 'project';
+export type ArtifactLifecycleState = 'pending_create' | 'active' | 'deleted';
+
 export interface ArtifactRecord {
   id: string;
   userId: string;
-  chatId: string;
+  scopeKind: ArtifactScopeKind;
+  chatId: string | null;
+  projectId: string | null;
   messageId: string | null;
   runId: string | null;
   relPath: string;
@@ -316,9 +323,15 @@ export interface ArtifactRecord {
   mimeType: string;
   sizeBytes: number;
   sha256: string;
-  source: 'attachment' | 'generated' | 'project_copy';
+  source: 'attachment' | 'generated' | 'project_copy' | 'project_upload' | 'user_edit' | 'mcp';
   previewKind: PreviewKind;
   diffPatch: string | null;
+  lifecycleState: ArtifactLifecycleState;
+  deletedOnDisk: boolean;
+  revision: number;
+  dependencyManifestHash: string | null;
+  sourceArtifactId: string | null;
+  sourceBaseRevision: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -422,6 +435,7 @@ export interface SandboxStatus {
 
 export interface SyncEventEnvelope {
   seq: number;
+  userSeq: number;
   eventId: string;
   userId: string;
   type: string;

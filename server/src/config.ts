@@ -16,6 +16,16 @@ export interface AppConfig {
   projectsRoot: string;
   uploadsRoot: string;
   artifactsCacheRoot: string;
+  artifactHistoryRoot: string;
+  artifactHistoryMaxMb: number;
+  artifactCacheMaxMb: number;
+  richContentMaxMb: number;
+  allowUnsandboxedDocWorkers: boolean;
+  installDocRuntime: string;
+  docWorkerBudget: number | null;
+  docWorkerTimeoutMs: number;
+  docWorkerExportTimeoutMs: number;
+  minMemAvailableMb: number;
   builtinSkillsDir: string;
   docRuntimeDir: string;
   dbPath: string;
@@ -92,6 +102,18 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     projectsRoot: path.join(dataRoot, 'projects'),
     uploadsRoot: path.join(dataRoot, 'uploads'),
     artifactsCacheRoot: path.join(dataRoot, 'artifacts-cache'),
+    artifactHistoryRoot: path.join(dataRoot, 'artifact-history'),
+    artifactHistoryMaxMb: parsePositiveInt(process.env.ARTIFACT_HISTORY_MAX_MB, 512),
+    artifactCacheMaxMb: parsePositiveInt(process.env.ARTIFACT_CACHE_MAX_MB, 512),
+    richContentMaxMb: parsePositiveInt(process.env.RICH_CONTENT_MAX_MB, 256),
+    allowUnsandboxedDocWorkers: parseBool(process.env.ALLOW_UNSANDBOXED_DOC_WORKERS, false),
+    installDocRuntime: (process.env.INSTALL_DOC_RUNTIME ?? 'auto').trim().toLowerCase(),
+    docWorkerBudget: process.env.ARTIFACT_WORKER_BUDGET
+      ? parsePositiveInt(process.env.ARTIFACT_WORKER_BUDGET, 2)
+      : null,
+    docWorkerTimeoutMs: parsePositiveInt(process.env.ARTIFACT_WORKER_TIMEOUT_MS, 30_000),
+    docWorkerExportTimeoutMs: parsePositiveInt(process.env.ARTIFACT_WORKER_EXPORT_TIMEOUT_MS, 60_000),
+    minMemAvailableMb: parsePositiveInt(process.env.ARTIFACT_MIN_MEM_AVAILABLE_MB, 400),
     builtinSkillsDir: path.resolve(process.env.BUILTIN_SKILLS_DIR ?? path.join(repoRoot, 'builtin-skills')),
     docRuntimeDir: path.resolve(process.env.DOC_RUNTIME_DIR ?? '/opt/agy-doc-runtime'),
     dbPath: path.resolve(process.env.DB_PATH ?? path.join(dataRoot, 'antigravity-chat.db')),
@@ -144,6 +166,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   if (!overrides.projectsRoot) merged.projectsRoot = path.join(merged.dataRoot, 'projects');
   if (!overrides.uploadsRoot) merged.uploadsRoot = path.join(merged.dataRoot, 'uploads');
   if (!overrides.artifactsCacheRoot) merged.artifactsCacheRoot = path.join(merged.dataRoot, 'artifacts-cache');
+  if (!overrides.artifactHistoryRoot) merged.artifactHistoryRoot = path.join(merged.dataRoot, 'artifact-history');
   if (!overrides.dbPath && overrides.dataRoot) {
     merged.dbPath = path.join(merged.dataRoot, 'antigravity-chat.db');
   }
