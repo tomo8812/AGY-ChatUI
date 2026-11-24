@@ -885,6 +885,32 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
     });
     expect((await alice.request<{ ok: boolean }>('POST', `/api/files/${diffRes.data.artifact.id}/verify`)).data.ok).toBe(true);
 
+    // SVG set_attr rejects on* handlers and invalid regex attribute names while safely updating valid attributes
+    const svgRes = await alice.request<{ artifact: { id: string } }>('POST', `/api/chats/${chatId}/artifacts`, {
+      relPath: 'icon.svg',
+      content: '<svg viewBox="0 0 100 100"><rect id="box" fill="red" width="10" height="10"/></svg>',
+    });
+    const badHandler = await alice.request<{ error: string }>('POST', `/api/files/${svgRes.data.artifact.id}/edit`, {
+      expectedRevision: 1,
+      operations: [{ op: 'set_attr', elementId: 'box', attr: 'onload', value: 'alert(1)' }],
+    });
+    expect(badHandler.status).toBe(400);
+    expect(badHandler.data.error).toBe('INVALID_SVG_ATTRIBUTE');
+
+    const badRegexAttr = await alice.request<{ error: string }>('POST', `/api/files/${svgRes.data.artifact.id}/edit`, {
+      expectedRevision: 1,
+      operations: [{ op: 'set_attr', elementId: 'box', attr: '[invalid(regex', value: 'x' }],
+    });
+    expect(badRegexAttr.status).toBe(400);
+    expect(badRegexAttr.data.error).toBe('INVALID_SVG_ATTRIBUTE');
+
+    const goodAttr = await alice.request<{ artifact: { revision: number } }>('POST', `/api/files/${svgRes.data.artifact.id}/edit`, {
+      expectedRevision: 1,
+      operations: [{ op: 'set_attr', elementId: 'box', attr: 'fill', value: 'blue' }],
+    });
+    expect(goodAttr.status).toBe(200);
+    expect(goodAttr.data.artifact.revision).toBe(2);
+
     // WS ping -> pong includes latestUserSeq, and GET /api/sync/snapshot returns consistent snapshotUserSeq (ARCH-09)
     alice.ws!.send(JSON.stringify({ kind: 'ping', visible: true }));
     const pong = await alice.waitForFrame((f) => f.kind === 'pong');

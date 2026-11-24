@@ -115,17 +115,29 @@ export class SvgAdapter implements FormatAdapter {
         }
         text = text.replace(op.search, op.replace);
       } else if (op.op === 'set_attr' && typeof op.elementId === 'string' && typeof op.attr === 'string') {
+        const attrName = op.attr.trim();
+        if (!/^[a-zA-Z_:][a-zA-Z0-9:._-]*$/.test(attrName) || /^on/i.test(attrName)) {
+          throw new ArtifactError('INVALID_SVG_ATTRIBUTE', `Invalid or forbidden SVG attribute '${op.attr}'.`, 400);
+        }
+        const rawVal = String(op.value ?? '');
+        if (/^(?:href|xlink:href)$/i.test(attrName) && /^\s*(?:javascript|vbscript):/i.test(rawVal)) {
+          throw new ArtifactError('INVALID_SVG_ATTRIBUTE', `Forbidden URI scheme for SVG attribute '${attrName}'.`, 400);
+        }
         const escapedId = op.elementId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const re = new RegExp(`(<[a-zA-Z][^>]*\\bid=["']${escapedId}["'][^>]*?)(\\/?>)`);
         if (!re.test(text)) {
           throw new ArtifactError('ELEMENT_NOT_FOUND', `SVG element '${op.elementId}' not found.`, 404);
         }
-        const attrName = op.attr;
-        const attrVal = String(op.value ?? '').replace(/"/g, '&quot;');
+        const escapedAttr = attrName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const attrVal = rawVal
+          .replace(/&/g, '&amp;')
+          .replace(/"/g, '&quot;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;');
         text = text.replace(re, (_full, openTag: string, close: string) => {
-          const attrRe = new RegExp(`\\b${attrName}\\s*=\\s*["'][^"']*["']`);
+          const attrRe = new RegExp(`(\\s)${escapedAttr}\\s*=\\s*["'][^"']*["']`);
           if (attrRe.test(openTag)) {
-            return `${openTag.replace(attrRe, `${attrName}="${attrVal}"`)}${close}`;
+            return `${openTag.replace(attrRe, (_m, ws: string) => `${ws}${attrName}="${attrVal}"`)}${close}`;
           }
           return `${openTag} ${attrName}="${attrVal}"${close}`;
         });
