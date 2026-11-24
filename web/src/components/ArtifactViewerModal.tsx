@@ -91,7 +91,8 @@ function computeBoundedPdfDpr(cssWidth: number, cssHeight: number, rawDpr: numbe
   if (pixelArea * effectiveDpr * effectiveDpr > MAX_PDF_CANVAS_PIXELS) {
     effectiveDpr = Math.min(effectiveDpr, Math.sqrt(MAX_PDF_CANVAS_PIXELS / pixelArea));
   }
-  return Math.max(0.5, Math.round(effectiveDpr * 100) / 100);
+  const floored = Math.floor(effectiveDpr * 1000) / 1000;
+  return floored > 0 ? floored : Math.max(0.001, effectiveDpr);
 }
 
 function makePdfBitmapKey(url: string, pageNum: number, scale: number, dpr: number): string {
