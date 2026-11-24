@@ -118,7 +118,9 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
 
     const keyField = repeatNode.repeat.keyField;
     const itemKey = selector.itemKey !== undefined && selector.itemKey !== null ? String(selector.itemKey) : null;
-    const itemIndex = Number(selector.itemIndex ?? -1);
+    const hasItemIndex =
+      selector.itemIndex !== undefined && selector.itemIndex !== null && Number.isInteger(Number(selector.itemIndex));
+    const itemIndex = hasItemIndex ? Number(selector.itemIndex) : -1;
     const expectedItemHash = selector.expectedItemHash ? String(selector.expectedItemHash) : null;
     const expectedListOrderHash = selector.expectedListOrderHash ? String(selector.expectedListOrderHash) : null;
 
@@ -168,7 +170,7 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
     if (expectedItemHash && foundHash !== expectedItemHash) {
       return { status: 'needs_review', reason: 'repeat_item_content_changed', orderChanged };
     }
-    if (orderChanged || foundIdx !== itemIndex) {
+    if (orderChanged || (hasItemIndex && foundIdx !== itemIndex)) {
       // Per 5.2: even when unique itemKey + expectedItemHash match, notify/require review on position change
       return {
         status: 'needs_review',

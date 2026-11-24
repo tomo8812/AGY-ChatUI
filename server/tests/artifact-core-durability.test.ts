@@ -781,6 +781,23 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       },
       instruction: 'Highlight first item',
     });
+    // Key-based selector without itemIndex resolves cleanly when key + hash match and order is unchanged
+    const reqRichKeyOnly = srv.ctx.editRequestService.createRequest({
+      userId,
+      chatId,
+      targetKind: 'rich_block',
+      richBlockId: richCreated.block.id,
+      selector: {
+        kind: 'rich_repeat_item',
+        repeatNodeId: 'rep-row',
+        itemKey: 'r1',
+        expectedItemHash: sha256(JSON.stringify({ id: 'r1', name: 'First' })),
+        expectedListOrderHash: sha256(JSON.stringify(['r1', 'r2'])),
+      },
+      instruction: 'Check key-only item',
+    });
+    expect(srv.ctx.editRequestService.resolveRequestTarget(reqRichKeyOnly).status).toBe('resolved');
+
     // Swap array order r2, r1
     srv.ctx.richContentService.updateBlock({
       userId,
