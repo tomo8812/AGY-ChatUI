@@ -4,7 +4,7 @@ import { createTwoFilesPatch } from 'diff';
 import type { ArtifactService } from '../artifacts/artifact-service.js';
 import type { AppDatabase } from '../db/database.js';
 import type { ArtifactRecord } from '../types.js';
-import { detectMimeAndPreviewKind, resolveContainedExistingPath, sha256File } from './workspace.js';
+import { resolveContainedExistingPath, sha256File } from './workspace.js';
 
 export interface FileSnapshotItem {
   sizeBytes: number;
@@ -111,8 +111,6 @@ export async function syncWorkspaceChangesAsArtifacts(params: {
       continue;
     }
 
-    const filename = existing?.filename ?? path.basename(relPath);
-    const { mimeType, previewKind } = existing ?? detectMimeAndPreviewKind(filename);
     let diffPatch: string | null = null;
     if (changed && after.textSample !== null && (!prev || prev.textSample !== null)) {
       diffPatch = createTwoFilesPatch(
@@ -126,14 +124,14 @@ export async function syncWorkspaceChangesAsArtifacts(params: {
       );
     }
 
+    // Do NOT pass unlocked `filename`/`mimeType`/`previewKind` derived before acquiring ArtifactLockManager:
+    // `ingestWorkspaceFile` resolves them atomically inside the lock so concurrent inline generated assets
+    // (whose logical filename differs from the hashed relPath basename) are never overwritten.
     const { artifact } = await params.artifactService.ingestWorkspaceFile({
       userId: params.userId,
       chatId: params.chatId,
       workspaceDir: rootReal,
       relPath,
-      filename,
-      mimeType,
-      previewKind,
       source: isInitialProjectCopy && !changed ? 'project_copy' : 'generated',
       messageId: params.messageId,
       runId: params.runId,

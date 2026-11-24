@@ -1472,7 +1472,7 @@ export class AcpClientManager {
       const hintPaths = bridge.toolCalls.flatMap(tool => (tool.locations ?? [])
         .map(location => toHostWorkspacePath(worker.workspaceDir, worker.sandboxWorkspaceRoot, location.path)));
 
-      await Promise.allSettled(bridge.pendingArtifactOps);
+      await this.drainPendingArtifactOps(bridge);
       const newArtifacts = await syncWorkspaceChangesAsArtifacts({
         artifactService: this.artifactService,
         db: this.db,
@@ -2958,6 +2958,13 @@ export class AcpClientManager {
     return bridge;
   }
 
+  private async drainPendingArtifactOps(bridge: ActiveTurnBridge): Promise<void> {
+    while (bridge.pendingArtifactOps.length > 0) {
+      const batch = bridge.pendingArtifactOps.splice(0, bridge.pendingArtifactOps.length);
+      await Promise.allSettled(batch);
+    }
+  }
+
   private async syncBackgroundWorkspaceArtifacts(
     worker: WorkerInstance,
     bridge: ActiveTurnBridge
@@ -2965,7 +2972,7 @@ export class AcpClientManager {
     if (worker.activeTurn && worker.activeTurn !== bridge) {
       return;
     }
-    await Promise.allSettled(bridge.pendingArtifactOps);
+    await this.drainPendingArtifactOps(bridge);
     const newArtifacts = await syncWorkspaceChangesAsArtifacts({
       artifactService: this.artifactService,
       db: this.db,
