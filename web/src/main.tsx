@@ -16,6 +16,9 @@ import './styles/index.css';
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { App } from './App';
+import { initLayoutModeAndMobileZoomGuard } from './utils/layoutMode';
+
+initLayoutModeAndMobileZoomGuard();
 
 if ('serviceWorker' in navigator && import.meta.env.PROD) {
   window.addEventListener('load', () => {

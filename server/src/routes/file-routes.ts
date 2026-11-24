@@ -10,7 +10,10 @@ import {
   resolveContainedWriteTarget,
   sha256FileAsync,
 } from '../files/workspace.js';
+import { injectSandboxZoomBridge } from '../files/sandbox-bridge.js';
 import { requireAuth, type RouteDeps } from './auth-routes.js';
+
+export { injectSandboxZoomBridge };
 
 export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps): Promise<void> {
   const { config, db, hub } = deps;
@@ -213,7 +216,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const hasMatchingVersion = Boolean(query.v && expectedV && query.v === expectedV && diskMatchesArtifact);
 
     const etag = computeStrongEtag([
-      'sandbox-v1',
+      'sandbox-v2',
       artifact.id,
       artifact.sha256,
       stat.size,
@@ -240,7 +243,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     }
 
     const html = await fs.promises.readFile(absPath, 'utf8');
-    return reply.send(html);
+    return reply.send(injectSandboxZoomBridge(html));
   });
 
   app.post('/api/files/:artifactId/copy-to-project', async (req, reply) => {

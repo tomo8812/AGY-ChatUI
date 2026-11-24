@@ -17,17 +17,6 @@ import type {
   RunRecord,
   ToolCallItem,
 } from '../types';
-import { useContentZoomGestures } from '../hooks/useContentZoomGestures';
-import {
-  captureRelativeFocalPoint,
-  CHAT_TEXT_DEFAULT_SCALE,
-  CHAT_TEXT_MAX_SCALE,
-  CHAT_TEXT_MIN_SCALE,
-  CHAT_TEXT_STEP,
-  clampZoomScale,
-  computeFocalScrollDelta,
-  type RelativeFocalPoint,
-} from '../utils/contentZoom';
 import { getMessageActivity } from '../utils/messageActivity';
 import { isAppleTouchHapticsFallback, triggerHaptic } from '../utils/haptics';
 import { EffortBar } from './EffortBar';
@@ -2205,72 +2194,7 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
   const chatViewRef = useRef<HTMLDivElement>(null);
   const messagesScrollRef = useRef<HTMLDivElement | null>(null);
   const messagesRailRef = useRef<HTMLDivElement | null>(null);
-  const [messagesScrollEl, setMessagesScrollEl] = useState<HTMLDivElement | null>(null);
-  const [messagesRailEl, setMessagesRailEl] = useState<HTMLDivElement | null>(null);
-  const [chatTextScale, setChatTextScale] = useState<number>(CHAT_TEXT_DEFAULT_SCALE);
-  const pendingTextZoomFocalRef = useRef<RelativeFocalPoint | null>(null);
   const composerRef = useRef<ChatComposerHandle>(null);
-
-  const setMessagesScrollContainerRef = useCallback((el: HTMLDivElement | null) => {
-    messagesScrollRef.current = el;
-    setMessagesScrollEl(el);
-  }, []);
-
-  const setMessagesRailContainerRef = useCallback((el: HTMLDivElement | null) => {
-    messagesRailRef.current = el;
-    setMessagesRailEl(el);
-  }, []);
-
-  const handleChatTextScaleChange = useCallback((nextScale: number, focal: RelativeFocalPoint | null) => {
-    pendingTextZoomFocalRef.current = focal;
-    setChatTextScale(nextScale);
-  }, []);
-
-  const applyChatTextStep = useCallback(
-    (delta: number) => {
-      const scroll = messagesScrollRef.current;
-      const rail = messagesRailRef.current;
-      if (scroll && rail) {
-        const rect = scroll.getBoundingClientRect();
-        pendingTextZoomFocalRef.current = captureRelativeFocalPoint(
-          rail.getBoundingClientRect(),
-          rect.left + rect.width / 2,
-          rect.top + rect.height / 2
-        );
-      }
-      setChatTextScale((prev) =>
-        clampZoomScale(Math.round((prev + delta) * 100) / 100, CHAT_TEXT_MIN_SCALE, CHAT_TEXT_MAX_SCALE)
-      );
-    },
-    []
-  );
-
-  const handleResetChatTextScale = useCallback(() => {
-    pendingTextZoomFocalRef.current = null;
-    setChatTextScale(CHAT_TEXT_DEFAULT_SCALE);
-  }, []);
-
-  useLayoutEffect(() => {
-    const focal = pendingTextZoomFocalRef.current;
-    const scroll = messagesScrollRef.current;
-    const rail = messagesRailRef.current;
-    if (!focal || !scroll || !rail) return;
-    pendingTextZoomFocalRef.current = null;
-    const { deltaY } = computeFocalScrollDelta(rail.getBoundingClientRect(), focal);
-    if (Math.abs(deltaY) > 0.5) {
-      scroll.scrollTop = Math.max(0, scroll.scrollTop + deltaY);
-    }
-  }, [chatTextScale]);
-
-  useContentZoomGestures({
-    scrollEl: messagesScrollEl,
-    contentEl: messagesRailEl,
-    scale: chatTextScale,
-    minScale: CHAT_TEXT_MIN_SCALE,
-    maxScale: CHAT_TEXT_MAX_SCALE,
-    enableDragPan: false,
-    onScaleChange: handleChatTextScaleChange,
-  });
 
   const isNearBottomRef = useRef(true);
   const scrollRafRef = useRef<number | null>(null);
@@ -2669,44 +2593,12 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
         </div>
       )}
 
-      {Math.abs(chatTextScale - CHAT_TEXT_DEFAULT_SCALE) >= 0.005 && (
-        <div className="chat-zoom-pill" role="region" aria-label="本文の文字サイズ操作">
-          <button
-            type="button"
-            className="btn btn-secondary btn-xs pdf-zoom-step-btn"
-            aria-label="文字を縮小"
-            onClick={() => applyChatTextStep(-CHAT_TEXT_STEP)}
-          >
-            −
-          </button>
-          <span className="muted-xs pdf-scale-indicator">{Math.round(chatTextScale * 100)}%</span>
-          <button
-            type="button"
-            className="btn btn-secondary btn-xs pdf-zoom-step-btn"
-            aria-label="文字を拡大"
-            onClick={() => applyChatTextStep(CHAT_TEXT_STEP)}
-          >
-            ＋
-          </button>
-          <button
-            type="button"
-            className="btn btn-secondary btn-xs"
-            onClick={handleResetChatTextScale}
-            title="標準サイズ (100%) に戻す"
-          >
-            画面に合わせる
-          </button>
-        </div>
-      )}
-
       <div
-        ref={setMessagesScrollContainerRef}
+        ref={messagesScrollRef}
         className="messages-scroll"
-        data-text-zoom={Math.round(chatTextScale * 100)}
-        style={{ '--chat-text-scale': String(chatTextScale) } as React.CSSProperties}
         onScroll={handleMessagesScroll}
       >
-        <div ref={setMessagesRailContainerRef} className="messages-rail">
+        <div ref={messagesRailRef} className="messages-rail">
           {chatLoadError && (
             <div className="error-box chat-load-error" role="alert">
               <span>{chatLoadError}</span>
