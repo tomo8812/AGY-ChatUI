@@ -196,6 +196,9 @@ export class ArtifactService {
       blobManager: this.blobManager,
       resolveScopeRootDir: (u, sk, cid, pid) => this.resolveScopeRootDir(u, sk, cid, pid),
       finalizeStageT6InTx: (j, opts) => this.finalizeStageT6InTx(j, opts),
+      inspectDeleteTargetIntact: (j) => this.inspectDeleteTargetIntact(j),
+      performDeleteFsCleanup: (j) => this.performDeleteFsCleanup(j),
+      finalizeDeleteStageT6InTx: (j) => this.finalizeDeleteStageT6InTx(j),
       recordExternalSyncOnRecovery: (p) => this.recordExternalSyncOnRecovery(p),
     });
     const staleIdempotencyDeleted = this.idempotency.recoverStaleIdempotency();
@@ -217,6 +220,7 @@ export class ArtifactService {
       lockManager: this.lockManager,
       resolveScopeRootDir: (u, sk, cid, pid) => this.resolveScopeRootDir(u, sk, cid, pid),
       readActiveArtifactBytes: (a) => this.readActiveArtifactBytes(a),
+      syncExternalChangeLocked: (p) => this.recordExternalSyncOnRecovery(p),
     });
   }
 
@@ -354,16 +358,38 @@ export class ArtifactService {
     artifactId: string;
     rootDir: string;
     relPath: string;
-  }): void {
+  }): boolean {
     const artifact = this.db.getArtifact(params.userId, params.artifactId);
-    if (!artifact) return;
+    if (!artifact) return false;
 
     const now = Date.now();
     try {
       const read = readContainedRegularFileNoFollowStable(params.rootDir, params.relPath);
-      if (read.sha256 === artifact.sha256) return;
-      const lease = this.blobManager.putBlobWithLease(params.userId, read.buffer);
+      const depScan = !path.isAbsolute(params.relPath)
+        ? scanArtifactDependencies({
+            rootDir: params.rootDir,
+            relPath: params.relPath,
+            previewKind: artifact.previewKind,
+            contentBuffer: read.buffer,
+          })
+        : { deps: [], depBuffers: new Map<string, Buffer>(), manifestHash: null };
+
+      if (
+        read.sha256 === artifact.sha256 &&
+        read.sizeBytes === artifact.sizeBytes &&
+        depScan.manifestHash === artifact.dependencyManifestHash
+      ) {
+        return false;
+      }
+
+      const leases: BlobLease[] = [];
       try {
+        const lease = this.blobManager.putBlobWithLease(params.userId, read.buffer);
+        leases.push(lease);
+        for (const depBuf of depScan.depBuffers.values()) {
+          leases.push(this.blobManager.putBlobWithLease(params.userId, depBuf));
+        }
+
         const nextRev = artifact.revision + 1;
         let env: SyncEventEnvelope;
         this.db.db.exec('BEGIN IMMEDIATE;');
@@ -371,17 +397,17 @@ export class ArtifactService {
           this.db.db
             .prepare(
               `UPDATE artifacts
-               SET sha256 = ?, size_bytes = ?, revision = ?, deleted_on_disk = 0, updated_at = ?
+               SET sha256 = ?, size_bytes = ?, revision = ?, dependency_manifest_hash = ?, deleted_on_disk = 0, updated_at = ?
                WHERE id = ? AND user_id = ?`
             )
-            .run(read.sha256, read.sizeBytes, nextRev, now, artifact.id, params.userId);
+            .run(read.sha256, read.sizeBytes, nextRev, depScan.manifestHash, now, artifact.id, params.userId);
           this.db.db
             .prepare(
               `INSERT INTO artifact_revisions (
                  id, artifact_id, user_id, chat_id, project_id, revision, parent_revision,
                  sha256, dependency_manifest_hash, size_bytes, blob_sha256, blob_available,
                  actor_kind, actor_id, operation_type, operation_summary, created_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 1, 'system', NULL, 'external_sync', 'External file change detected during recovery', ?)`
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'system', NULL, 'external_sync', 'External file change synchronized', ?)`
             )
             .run(
               crypto.randomUUID(),
@@ -392,10 +418,34 @@ export class ArtifactService {
               nextRev,
               artifact.revision,
               read.sha256,
+              depScan.manifestHash,
               read.sizeBytes,
               lease.sha256,
               now
             );
+          for (const dep of depScan.deps) {
+            this.db.db
+              .prepare(
+                `INSERT OR REPLACE INTO artifact_revision_deps (
+                   artifact_id, revision, user_id, scope_kind, chat_id, project_id,
+                   rel_path, status, sha256, blob_sha256, size_bytes, mime_type
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              )
+              .run(
+                artifact.id,
+                nextRev,
+                params.userId,
+                artifact.scopeKind,
+                artifact.chatId,
+                artifact.projectId,
+                dep.relPath,
+                dep.status,
+                dep.sha256,
+                dep.blobSha256,
+                dep.sizeBytes,
+                dep.mimeType
+              );
+          }
           const updated = this.db.getArtifact(params.userId, artifact.id)!;
           env = this.db.insertSyncEventInTx({
             userId: params.userId,
@@ -412,14 +462,18 @@ export class ArtifactService {
           throw err;
         }
         this.hub.broadcastPersistedEvent(env);
+        return true;
       } finally {
-        lease.release();
+        for (const l of leases) l.release();
       }
-    } catch {
-      // File disappeared on disk -> mark deleted_on_disk = 1
-      this.db.db
-        .prepare('UPDATE artifacts SET deleted_on_disk = 1, updated_at = ? WHERE id = ? AND user_id = ?')
-        .run(now, artifact.id, params.userId);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        // File disappeared on disk -> mark deleted_on_disk = 1
+        this.db.db
+          .prepare('UPDATE artifacts SET deleted_on_disk = 1, updated_at = ? WHERE id = ? AND user_id = ?')
+          .run(now, artifact.id, params.userId);
+      }
+      return false;
     }
   }
 
@@ -1853,6 +1907,456 @@ export class ArtifactService {
     return { artifact, file };
   }
 
+  private parseDeleteJournalPayload(journal: ArtifactCommitJournalRow):
+    | { kind: 'delete_project_file'; fileId: string; storageDir: string; relPath: string; artifactId: string | null }
+    | {
+        kind: 'delete_project';
+        projectId: string;
+        storageDir: string;
+        projectSubtreeRel: string | null;
+        fileRelPaths: string[];
+        artifacts: Array<{ id: string; relPath: string }>;
+      }
+    | { kind: 'delete_sync_file'; chatId: string; workspaceDir: string; relPath: string; artifactId: string | null }
+    | {
+        kind: 'delete_chat';
+        chatId: string;
+        workspaceDir: string;
+        chatSubtreeRel: string | null;
+        artifacts: Array<{ id: string; relPath: string }>;
+      }
+    | null {
+    if (!journal.operationPayloadJson) return null;
+    try {
+      const parsed = JSON.parse(journal.operationPayloadJson) as Record<string, unknown>;
+      if (
+        parsed.kind === 'delete_project_file' ||
+        parsed.kind === 'delete_project' ||
+        parsed.kind === 'delete_sync_file' ||
+        parsed.kind === 'delete_chat'
+      ) {
+        return parsed as ReturnType<ArtifactService['parseDeleteJournalPayload']>;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  private inspectDeleteTargetIntact(journal: ArtifactCommitJournalRow): boolean {
+    const payload = this.parseDeleteJournalPayload(journal);
+    if (!payload) return false;
+    if (payload.kind === 'delete_project_file') {
+      if (!fs.existsSync(payload.storageDir)) return false;
+      try {
+        const opened = openContainedRegularFileNoFollow(payload.storageDir, payload.relPath, { allowHardlinks: true });
+        fs.closeSync(opened.fd);
+        return true;
+      } catch (err) {
+        return (err as NodeJS.ErrnoException).code !== 'ENOENT';
+      }
+    }
+    if (payload.kind === 'delete_sync_file') {
+      if (!fs.existsSync(payload.workspaceDir)) return false;
+      try {
+        const opened = openContainedRegularFileNoFollow(payload.workspaceDir, payload.relPath, { allowHardlinks: true });
+        fs.closeSync(opened.fd);
+        return true;
+      } catch (err) {
+        return (err as NodeJS.ErrnoException).code !== 'ENOENT';
+      }
+    }
+    if (payload.kind === 'delete_project') {
+      if (!fs.existsSync(path.dirname(payload.storageDir))) return false;
+      if (payload.fileRelPaths.length > 0 && !fs.existsSync(payload.storageDir)) return false;
+      for (const rel of payload.fileRelPaths) {
+        try {
+          const opened = openContainedRegularFileNoFollow(payload.storageDir, rel, { allowHardlinks: true });
+          fs.closeSync(opened.fd);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+        }
+      }
+      return true;
+    }
+    if (payload.kind === 'delete_chat') {
+      return fs.existsSync(payload.workspaceDir);
+    }
+    return false;
+  }
+
+  private performDeleteFsCleanup(journal: ArtifactCommitJournalRow): void {
+    const payload = this.parseDeleteJournalPayload(journal);
+    if (!payload) return;
+    if (payload.kind === 'delete_project_file') {
+      unlinkContainedRegularFileNoFollow(payload.storageDir, payload.relPath);
+      return;
+    }
+    if (payload.kind === 'delete_sync_file') {
+      unlinkContainedRegularFileNoFollow(payload.workspaceDir, payload.relPath);
+      return;
+    }
+    if (payload.kind === 'delete_project') {
+      if (fs.existsSync(payload.storageDir)) {
+        for (const rel of payload.fileRelPaths) {
+          unlinkContainedRegularFileNoFollow(payload.storageDir, rel);
+        }
+      }
+      if (
+        payload.projectSubtreeRel &&
+        !payload.projectSubtreeRel.startsWith('..') &&
+        !path.isAbsolute(payload.projectSubtreeRel)
+      ) {
+        removeContainedSubtreeNoFollow(this.config.projectsRoot, payload.projectSubtreeRel);
+      }
+      return;
+    }
+    if (payload.kind === 'delete_chat') {
+      if (
+        payload.chatSubtreeRel &&
+        !payload.chatSubtreeRel.startsWith('..') &&
+        !path.isAbsolute(payload.chatSubtreeRel)
+      ) {
+        removeContainedSubtreeNoFollow(this.config.workspacesRoot, payload.chatSubtreeRel);
+      }
+    }
+  }
+
+  /**
+   * Shared Stage T6 transactional finalization for journaled deletions (normal commit & crash recovery roll-forward).
+   */
+  private finalizeDeleteStageT6InTx(journal: ArtifactCommitJournalRow): { envelopes: SyncEventEnvelope[] } {
+    const payload = this.parseDeleteJournalPayload(journal);
+    const now = Date.now();
+    const envelopes: SyncEventEnvelope[] = [];
+
+    if (payload?.kind === 'delete_project_file' && journal.projectId) {
+      this.db.db
+        .prepare('DELETE FROM project_files WHERE id = ? AND user_id = ?')
+        .run(payload.fileId, journal.userId);
+      const artId = payload.artifactId;
+      if (artId) {
+        this.db.db
+          .prepare("UPDATE artifacts SET lifecycle_state = 'deleted', deleted_on_disk = 1, updated_at = ? WHERE id = ? AND user_id = ?")
+          .run(now, artId, journal.userId);
+        this.db.db
+          .prepare(
+            `INSERT INTO artifact_dep_propagation_queue (
+               id, user_id, scope_kind, chat_id, project_id, changed_rel_path,
+               source_artifact_id, source_revision, batch_id, exclude_artifact_ids_json, state, created_at, updated_at
+             ) VALUES (?, ?, 'project', NULL, ?, ?, ?, 0, NULL, '[]', 'pending', ?, ?)`
+          )
+          .run(crypto.randomUUID(), journal.userId, journal.projectId, payload.relPath, artId, now, now);
+        envelopes.push(
+          this.db.insertSyncEventInTx({
+            userId: journal.userId,
+            eventId: crypto.randomUUID(),
+            type: 'artifact.deleted',
+            projectId: journal.projectId,
+            payload: { artifactId: artId, relPath: payload.relPath, scopeKind: 'project' },
+            createdAt: now,
+          })
+        );
+      }
+      const liveProj = this.db.getProject(journal.userId, journal.projectId);
+      if (liveProj) {
+        this.db.db
+          .prepare('UPDATE projects SET context_version = context_version + 1, updated_at = ? WHERE id = ? AND user_id = ?')
+          .run(now, journal.projectId, journal.userId);
+        const latestProj = this.db.getProject(journal.userId, journal.projectId)!;
+        envelopes.push(
+          this.db.insertSyncEventInTx({
+            userId: journal.userId,
+            eventId: crypto.randomUUID(),
+            type: 'project.updated',
+            projectId: journal.projectId,
+            payload: {
+              project: {
+                ...latestProj,
+                files: this.db.listProjectFiles(journal.userId, journal.projectId),
+              },
+            },
+            createdAt: now,
+          })
+        );
+      }
+    } else if (payload?.kind === 'delete_project') {
+      for (const art of payload.artifacts) {
+        this.db.db
+          .prepare("UPDATE artifacts SET lifecycle_state = 'deleted', deleted_on_disk = 1, updated_at = ? WHERE id = ? AND user_id = ?")
+          .run(now, art.id, journal.userId);
+        envelopes.push(
+          this.db.insertSyncEventInTx({
+            userId: journal.userId,
+            eventId: crypto.randomUUID(),
+            type: 'artifact.deleted',
+            projectId: payload.projectId,
+            payload: { artifactId: art.id, relPath: art.relPath, scopeKind: 'project' },
+            createdAt: now,
+          })
+        );
+      }
+      // Detach source_artifact_id & source_base_revision on any chat copies before ON DELETE CASCADE
+      // removes project artifacts, preserving CHECK(source_base_revision IS NULL OR source_artifact_id IS NOT NULL).
+      this.db.db
+        .prepare(
+          `UPDATE artifacts
+           SET source_artifact_id = NULL, source_base_revision = NULL, updated_at = ?
+           WHERE user_id = ?
+             AND source_artifact_id IN (
+               SELECT id FROM artifacts WHERE project_id = ? AND user_id = ?
+             )`
+        )
+        .run(now, journal.userId, payload.projectId, journal.userId);
+      this.db.deleteProject(journal.userId, payload.projectId);
+      envelopes.push(
+        this.db.insertSyncEventInTx({
+          userId: journal.userId,
+          eventId: crypto.randomUUID(),
+          type: 'project.deleted',
+          projectId: payload.projectId,
+          payload: { projectId: payload.projectId },
+          createdAt: now,
+        })
+      );
+    } else if (payload?.kind === 'delete_sync_file') {
+      const liveArt =
+        (payload.artifactId ? this.db.getArtifact(journal.userId, payload.artifactId) : null) ??
+        this.db.findArtifactByRelPath(journal.userId, payload.chatId, payload.relPath);
+      if (liveArt) {
+        this.db.db
+          .prepare("UPDATE artifacts SET lifecycle_state = 'deleted', deleted_on_disk = 1, updated_at = ? WHERE id = ? AND user_id = ?")
+          .run(now, liveArt.id, journal.userId);
+        this.db.db
+          .prepare(
+            `INSERT INTO artifact_dep_propagation_queue (
+               id, user_id, scope_kind, chat_id, project_id, changed_rel_path,
+               source_artifact_id, source_revision, batch_id, exclude_artifact_ids_json, state, created_at, updated_at
+             ) VALUES (?, ?, 'chat', ?, NULL, ?, ?, 0, NULL, '[]', 'pending', ?, ?)`
+          )
+          .run(crypto.randomUUID(), journal.userId, payload.chatId, payload.relPath, liveArt.id, now, now);
+        envelopes.push(
+          this.db.insertSyncEventInTx({
+            userId: journal.userId,
+            eventId: crypto.randomUUID(),
+            type: 'artifact.deleted',
+            chatId: payload.chatId,
+            payload: { artifactId: liveArt.id, relPath: payload.relPath, scopeKind: 'chat' },
+            createdAt: now,
+          })
+        );
+      }
+    } else if (payload?.kind === 'delete_chat') {
+      for (const art of payload.artifacts) {
+        envelopes.push(
+          this.db.insertSyncEventInTx({
+            userId: journal.userId,
+            eventId: crypto.randomUUID(),
+            type: 'artifact.deleted',
+            chatId: payload.chatId,
+            payload: { artifactId: art.id, relPath: art.relPath, scopeKind: 'chat' },
+            createdAt: now,
+          })
+        );
+      }
+      this.db.db
+        .prepare(
+          `UPDATE artifacts
+           SET source_artifact_id = NULL, source_base_revision = NULL, updated_at = ?
+           WHERE user_id = ?
+             AND source_artifact_id IN (
+               SELECT id FROM artifacts WHERE chat_id = ? AND user_id = ?
+             )`
+        )
+        .run(now, journal.userId, payload.chatId, journal.userId);
+      this.db.deleteChat(journal.userId, payload.chatId);
+      envelopes.push(
+        this.db.insertSyncEventInTx({
+          userId: journal.userId,
+          eventId: crypto.randomUUID(),
+          type: 'chat.deleted',
+          chatId: payload.chatId,
+          payload: { chatId: payload.chatId },
+          createdAt: now,
+        })
+      );
+    }
+
+    const firstSeq = envelopes.length > 0 ? envelopes[0].seq : null;
+    const seqAudit = JSON.stringify({ syncEventSeqs: envelopes.map((e) => e.seq) });
+    this.db.db
+      .prepare(
+        `UPDATE artifact_commit_journal
+         SET state = 'db_committed', sync_event_seq = ?, audit_note = ?, updated_at = ?
+         WHERE commit_id = ?`
+      )
+      .run(firstSeq, seqAudit, now, journal.commitId);
+
+    return { envelopes };
+  }
+
+  /**
+   * Executes a crash-recoverable deletion through the existing `artifact_commit_journal` T1 -> T3 -> T4 -> T5 -> T6 -> T7 pipeline.
+   */
+  private async executeJournaledDelete(params: {
+    userId: string;
+    scopeKind: ArtifactScopeKind;
+    chatId: string | null;
+    projectId: string | null;
+    artifactId: string;
+    relPath: string;
+    operationSummary: string;
+    payload: NonNullable<ReturnType<ArtifactService['parseDeleteJournalPayload']>>;
+  }): Promise<{ envelopes: SyncEventEnvelope[] }> {
+    const commitId = crypto.randomUUID();
+    const now = Date.now();
+    const stagingIsolation = this.getStagingIsolation();
+    const payloadJson = JSON.stringify(params.payload);
+    const faultCtx = {
+      commitId,
+      artifactId: params.artifactId,
+      isCreate: false,
+      privateStagePath: '',
+      finalTargetPath: params.relPath,
+    };
+
+    const journalObj: ArtifactCommitJournalRow = {
+      commitId,
+      artifactId: params.artifactId,
+      userId: params.userId,
+      chatId: params.chatId,
+      projectId: params.projectId,
+      scopeKind: params.scopeKind,
+      relPath: params.relPath,
+      isCreate: false,
+      targetRevision: 0,
+      parentRevision: null,
+      expectedPrevSha256: null,
+      expectedPrevIno: null,
+      newSha256: '',
+      newDependencyManifestHash: null,
+      newDeps: [],
+      newSizeBytes: 0,
+      prevBlobSha256: null,
+      newBlobSha256: '',
+      privateStagePath: '',
+      stageIno: null,
+      actorKind: 'user',
+      actorId: params.userId,
+      operationType: params.payload.kind,
+      operationSummary: params.operationSummary,
+      operationPayloadJson: payloadJson,
+      batchId: null,
+      batchSeq: null,
+      stagingIsolationMode: stagingIsolation,
+      idempotencyScopeKey: null,
+      idempotencyKey: null,
+      requestFingerprint: null,
+      diffPatch: null,
+      state: 'prepared',
+      auditNote: null,
+      syncEventSeq: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    let journalInserted = false;
+    try {
+      await this.commitFaultHook?.('before_T1', faultCtx);
+      // T1: Persist delete intent in artifact_commit_journal BEFORE any filesystem unlink
+      this.db.db
+        .prepare(
+          `INSERT INTO artifact_commit_journal (
+             commit_id, artifact_id, user_id, chat_id, project_id, scope_kind, rel_path,
+             is_create, target_revision, parent_revision, expected_prev_sha256, expected_prev_ino,
+             new_sha256, new_dependency_manifest_hash, new_deps_json, new_size_bytes,
+             prev_blob_sha256, new_blob_sha256, private_stage_path, stage_ino,
+             actor_kind, actor_id, operation_type, operation_summary, operation_payload_json,
+             batch_id, batch_seq, staging_isolation_mode, idempotency_scope_key, idempotency_key,
+             request_fingerprint, diff_patch, state, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, NULL, NULL, '', NULL, '[]', 0, NULL, '', '', NULL,
+                     'user', ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL, NULL, 'prepared', ?, ?)`
+        )
+        .run(
+          commitId,
+          params.artifactId,
+          params.userId,
+          params.chatId,
+          params.projectId,
+          params.scopeKind,
+          params.relPath,
+          params.userId,
+          params.payload.kind,
+          params.operationSummary,
+          payloadJson,
+          stagingIsolation,
+          now,
+          now
+        );
+      journalInserted = true;
+      await this.commitFaultHook?.('after_T1', faultCtx);
+
+      await this.commitFaultHook?.('before_T3', faultCtx);
+      // T3: Transition to 'replacing' immediately before FS deletion
+      this.db.db
+        .prepare("UPDATE artifact_commit_journal SET state = 'replacing', updated_at = ? WHERE commit_id = ?")
+        .run(Date.now(), commitId);
+      journalObj.state = 'replacing';
+      await this.commitFaultHook?.('after_T3', faultCtx);
+
+      await this.commitFaultHook?.('before_T4', faultCtx);
+      // T4: Strict O_NOFOLLOW filesystem unlink / subtree removal (tolerate ONLY ENOENT)
+      this.performDeleteFsCleanup(journalObj);
+      await this.commitFaultHook?.('after_T4', faultCtx);
+
+      await this.commitFaultHook?.('before_T5', faultCtx);
+      // T5: Persist state = 'file_replaced' confirming FS removal succeeded
+      this.db.db
+        .prepare("UPDATE artifact_commit_journal SET state = 'file_replaced', updated_at = ? WHERE commit_id = ?")
+        .run(Date.now(), commitId);
+      journalObj.state = 'file_replaced';
+      await this.commitFaultHook?.('after_T5', faultCtx);
+
+      await this.commitFaultHook?.('before_T6', faultCtx);
+      // T6: Single BEGIN IMMEDIATE transaction committing DB deletion + dep queue + durable outbox events
+      let envelopes: SyncEventEnvelope[] = [];
+      this.db.db.exec('BEGIN IMMEDIATE;');
+      try {
+        const res = this.finalizeDeleteStageT6InTx(journalObj);
+        envelopes = res.envelopes;
+        this.db.db.exec('COMMIT;');
+      } catch (err) {
+        this.db.db.exec('ROLLBACK;');
+        throw err;
+      }
+      await this.commitFaultHook?.('after_T6', faultCtx);
+
+      await this.commitFaultHook?.('before_T7', faultCtx);
+      // T7: Broadcast persisted outbox events and remove completed journal row
+      for (const env of envelopes) {
+        this.hub.broadcastPersistedEvent(env);
+      }
+      this.db.db.prepare('DELETE FROM artifact_commit_journal WHERE commit_id = ?').run(commitId);
+      await this.commitFaultHook?.('after_T7', faultCtx);
+
+      return { envelopes };
+    } catch (err) {
+      // If a real non-fault-injected FS error (e.g. EACCES / PathContainmentError) failed BEFORE target removal,
+      // abort the journal cleanly so DB and FS remain consistent and startup recovery does not delete untouched data.
+      if (journalInserted && !this.commitFaultHook) {
+        const row = this.db.db
+          .prepare('SELECT state FROM artifact_commit_journal WHERE commit_id = ?')
+          .get(commitId) as { state: string } | undefined;
+        if (row && (row.state === 'prepared' || (row.state === 'replacing' && this.inspectDeleteTargetIntact(journalObj)))) {
+          this.db.db
+            .prepare("UPDATE artifact_commit_journal SET state = 'aborted', audit_note = ?, updated_at = ? WHERE commit_id = ?")
+            .run(`delete_fs_error:${err instanceof Error ? err.message.slice(0, 120) : 'error'}`, Date.now(), commitId);
+        }
+      }
+      throw err;
+    }
+  }
+
   async deleteProjectFile(params: {
     userId: string;
     projectId: string;
@@ -1872,7 +2376,6 @@ export class ArtifactService {
     const pathLockKey = `path:${params.userId}:project:${params.projectId}:${existingPf.relPath}`;
     const lockKeys = existingPf.artifactId ? [`artifact:${existingPf.artifactId}`, pathLockKey] : [pathLockKey];
 
-    let envelopes: SyncEventEnvelope[] = [];
     await this.lockManager.withLocks(lockKeys, async () => {
       await params.assertAuthorized?.();
       const liveProj = this.db.getProject(params.userId, params.projectId);
@@ -1881,74 +2384,24 @@ export class ArtifactService {
         throw new ArtifactError('NOT_FOUND', 'ファイルが見つかりません。', 404);
       }
 
-      // SEC-02 & ARCH-03: Strict O_NOFOLLOW unlink; tolerate ONLY ENOENT, rethrow all other errors before DB deletion
-      unlinkContainedRegularFileNoFollow(liveProj.storageDir, livePf.relPath);
-
-      const now = Date.now();
-      this.db.db.exec('BEGIN IMMEDIATE;');
-      try {
-        this.db.db
-          .prepare('DELETE FROM project_files WHERE id = ? AND user_id = ?')
-          .run(livePf.id, params.userId);
-        if (livePf.artifactId) {
-          this.db.db
-            .prepare("UPDATE artifacts SET lifecycle_state = 'deleted', deleted_on_disk = 1, updated_at = ? WHERE id = ? AND user_id = ?")
-            .run(now, livePf.artifactId, params.userId);
-          this.db.db
-            .prepare(
-              `INSERT INTO artifact_dep_propagation_queue (
-                 id, user_id, scope_kind, chat_id, project_id, changed_rel_path,
-                 source_artifact_id, source_revision, batch_id, exclude_artifact_ids_json, state, created_at, updated_at
-               ) VALUES (?, ?, 'project', NULL, ?, ?, ?, 0, NULL, '[]', 'pending', ?, ?)`
-            )
-            .run(
-              crypto.randomUUID(),
-              params.userId,
-              params.projectId,
-              livePf.relPath,
-              livePf.artifactId,
-              now,
-              now
-            );
-          envelopes.push(
-            this.db.insertSyncEventInTx({
-              userId: params.userId,
-              eventId: crypto.randomUUID(),
-              type: 'artifact.deleted',
-              projectId: params.projectId,
-              payload: { artifactId: livePf.artifactId, relPath: livePf.relPath, scopeKind: 'project' },
-              createdAt: now,
-            })
-          );
-        }
-        this.db.db
-          .prepare('UPDATE projects SET context_version = context_version + 1, updated_at = ? WHERE id = ? AND user_id = ?')
-          .run(now, params.projectId, params.userId);
-
-        const latestProj = this.db.getProject(params.userId, params.projectId)!;
-        envelopes.push(
-          this.db.insertSyncEventInTx({
-            userId: params.userId,
-            eventId: crypto.randomUUID(),
-            type: 'project.updated',
-            projectId: params.projectId,
-            payload: {
-              project: {
-                ...latestProj,
-                files: this.db.listProjectFiles(params.userId, params.projectId),
-              },
-            },
-            createdAt: now,
-          })
-        );
-        this.db.db.exec('COMMIT;');
-      } catch (err) {
-        this.db.db.exec('ROLLBACK;');
-        throw err;
-      }
+      await this.executeJournaledDelete({
+        userId: params.userId,
+        scopeKind: 'project',
+        chatId: null,
+        projectId: params.projectId,
+        artifactId: livePf.artifactId ?? livePf.id,
+        relPath: livePf.relPath,
+        operationSummary: `Delete project file ${livePf.relPath}`,
+        payload: {
+          kind: 'delete_project_file',
+          fileId: livePf.id,
+          storageDir: liveProj.storageDir,
+          relPath: livePf.relPath,
+          artifactId: livePf.artifactId ?? null,
+        },
+      });
     });
 
-    for (const env of envelopes) this.hub.broadcastPersistedEvent(env);
     await this.drainDepPropagationQueue();
 
     const latest = this.db.getProject(params.userId, params.projectId)!;
@@ -1981,7 +2434,6 @@ export class ArtifactService {
     ];
 
     let affectedChatIds: string[] = [];
-    const envelopes: SyncEventEnvelope[] = [];
 
     await this.lockManager.withLocks(lockKeys, async () => {
       await params.assertAuthorized?.();
@@ -1993,67 +2445,32 @@ export class ArtifactService {
       const liveArtifacts = this.db.listArtifactsForProject(params.userId, params.projectId);
       const liveFiles = this.db.listProjectFiles(params.userId, params.projectId);
 
-      // Unlink each project file via O_NOFOLLOW (tolerate ONLY ENOENT)
-      for (const pf of liveFiles) {
-        unlinkContainedRegularFileNoFollow(liveProj.storageDir, pf.relPath);
-      }
-
-      // Safely remove the project directory subtree strictly inside config.projectsRoot without following symlinks
       const projDir = path.dirname(liveProj.storageDir);
       const relProjSubtree = path.relative(this.config.projectsRoot, projDir);
-      if (relProjSubtree && !relProjSubtree.startsWith('..') && !path.isAbsolute(relProjSubtree)) {
-        removeContainedSubtreeNoFollow(this.config.projectsRoot, relProjSubtree);
-      }
+      const safeSubtreeRel =
+        relProjSubtree && !relProjSubtree.startsWith('..') && !path.isAbsolute(relProjSubtree)
+          ? relProjSubtree
+          : null;
 
-      const now = Date.now();
-      this.db.db.exec('BEGIN IMMEDIATE;');
-      try {
-        for (const art of liveArtifacts) {
-          this.db.db
-            .prepare("UPDATE artifacts SET lifecycle_state = 'deleted', deleted_on_disk = 1, updated_at = ? WHERE id = ? AND user_id = ?")
-            .run(now, art.id, params.userId);
-          envelopes.push(
-            this.db.insertSyncEventInTx({
-              userId: params.userId,
-              eventId: crypto.randomUUID(),
-              type: 'artifact.deleted',
-              projectId: params.projectId,
-              payload: { artifactId: art.id, relPath: art.relPath, scopeKind: 'project' },
-              createdAt: now,
-            })
-          );
-        }
-        // Detach source_artifact_id & source_base_revision on any chat copies before ON DELETE CASCADE
-        // removes project artifacts, preserving CHECK(source_base_revision IS NULL OR source_artifact_id IS NOT NULL).
-        this.db.db
-          .prepare(
-            `UPDATE artifacts
-             SET source_artifact_id = NULL, source_base_revision = NULL, updated_at = ?
-             WHERE user_id = ?
-               AND source_artifact_id IN (
-                 SELECT id FROM artifacts WHERE project_id = ? AND user_id = ?
-               )`
-          )
-          .run(now, params.userId, params.projectId, params.userId);
-        this.db.deleteProject(params.userId, params.projectId);
-        envelopes.push(
-          this.db.insertSyncEventInTx({
-            userId: params.userId,
-            eventId: crypto.randomUUID(),
-            type: 'project.deleted',
-            projectId: params.projectId,
-            payload: { projectId: params.projectId },
-            createdAt: now,
-          })
-        );
-        this.db.db.exec('COMMIT;');
-      } catch (err) {
-        this.db.db.exec('ROLLBACK;');
-        throw err;
-      }
+      await this.executeJournaledDelete({
+        userId: params.userId,
+        scopeKind: 'project',
+        chatId: null,
+        projectId: params.projectId,
+        artifactId: `project:${params.projectId}`,
+        relPath: safeSubtreeRel ?? params.projectId,
+        operationSummary: `Delete project ${params.projectId}`,
+        payload: {
+          kind: 'delete_project',
+          projectId: params.projectId,
+          storageDir: liveProj.storageDir,
+          projectSubtreeRel: safeSubtreeRel,
+          fileRelPaths: liveFiles.map((f) => f.relPath),
+          artifacts: liveArtifacts.map((a) => ({ id: a.id, relPath: a.relPath })),
+        },
+      });
     });
 
-    for (const env of envelopes) this.hub.broadcastPersistedEvent(env);
     return { affectedChatIds };
   }
 
@@ -2077,7 +2494,6 @@ export class ArtifactService {
       ...chatArtifacts.map((a) => `artifact:${a.id}`),
     ];
 
-    const envelopes: SyncEventEnvelope[] = [];
     await this.lockManager.withLocks(lockKeys, async () => {
       await params.assertAuthorized?.();
       const liveChat = this.db.getChat(params.userId, params.chatId);
@@ -2085,56 +2501,29 @@ export class ArtifactService {
         throw new ArtifactError('NOT_FOUND', 'チャットが見つかりません。', 404);
       }
       const liveArtifacts = this.db.listArtifactsForChat(params.userId, params.chatId);
-
       const relChatSubtree = path.relative(this.config.workspacesRoot, liveChat.workspaceDir);
-      if (relChatSubtree && !relChatSubtree.startsWith('..') && !path.isAbsolute(relChatSubtree)) {
-        removeContainedSubtreeNoFollow(this.config.workspacesRoot, relChatSubtree);
-      }
+      const safeSubtreeRel =
+        relChatSubtree && !relChatSubtree.startsWith('..') && !path.isAbsolute(relChatSubtree)
+          ? relChatSubtree
+          : null;
 
-      const now = Date.now();
-      this.db.db.exec('BEGIN IMMEDIATE;');
-      try {
-        for (const art of liveArtifacts) {
-          envelopes.push(
-            this.db.insertSyncEventInTx({
-              userId: params.userId,
-              eventId: crypto.randomUUID(),
-              type: 'artifact.deleted',
-              chatId: params.chatId,
-              payload: { artifactId: art.id, relPath: art.relPath, scopeKind: 'chat' },
-              createdAt: now,
-            })
-          );
-        }
-        this.db.db
-          .prepare(
-            `UPDATE artifacts
-             SET source_artifact_id = NULL, source_base_revision = NULL, updated_at = ?
-             WHERE user_id = ?
-               AND source_artifact_id IN (
-                 SELECT id FROM artifacts WHERE chat_id = ? AND user_id = ?
-               )`
-          )
-          .run(now, params.userId, params.chatId, params.userId);
-        this.db.deleteChat(params.userId, params.chatId);
-        envelopes.push(
-          this.db.insertSyncEventInTx({
-            userId: params.userId,
-            eventId: crypto.randomUUID(),
-            type: 'chat.deleted',
-            chatId: params.chatId,
-            payload: { chatId: params.chatId },
-            createdAt: now,
-          })
-        );
-        this.db.db.exec('COMMIT;');
-      } catch (err) {
-        this.db.db.exec('ROLLBACK;');
-        throw err;
-      }
+      await this.executeJournaledDelete({
+        userId: params.userId,
+        scopeKind: 'chat',
+        chatId: params.chatId,
+        projectId: null,
+        artifactId: `chat:${params.chatId}`,
+        relPath: safeSubtreeRel ?? params.chatId,
+        operationSummary: `Delete chat ${params.chatId}`,
+        payload: {
+          kind: 'delete_chat',
+          chatId: params.chatId,
+          workspaceDir: liveChat.workspaceDir,
+          chatSubtreeRel: safeSubtreeRel,
+          artifacts: liveArtifacts.map((a) => ({ id: a.id, relPath: a.relPath })),
+        },
+      });
     });
-
-    for (const env of envelopes) this.hub.broadcastPersistedEvent(env);
   }
 
   async copyArtifactToProject(params: {
@@ -2267,57 +2656,28 @@ export class ArtifactService {
       const oldArt = this.db.findArtifactByRelPath(params.userId, params.chatId, wsRel);
       const pathLockKey = `path:${params.userId}:chat:${params.chatId}:${wsRel}`;
       const lockKeys = oldArt ? [`artifact:${oldArt.id}`, pathLockKey] : [pathLockKey];
-      const envelopes: SyncEventEnvelope[] = [];
 
       await this.lockManager.withLocks(lockKeys, async () => {
         await params.assertAuthorized?.();
-        // SEC-02 & ARCH-03: Walk every intermediate dir with O_NOFOLLOW; tolerate ONLY ENOENT
-        unlinkContainedRegularFileNoFollow(chat.workspaceDir, wsRel);
-
         const liveArt = this.db.findArtifactByRelPath(params.userId, params.chatId, wsRel);
-        if (liveArt) {
-          const now = Date.now();
-          this.db.db.exec('BEGIN IMMEDIATE;');
-          try {
-            this.db.db
-              .prepare("UPDATE artifacts SET lifecycle_state = 'deleted', deleted_on_disk = 1, updated_at = ? WHERE id = ? AND user_id = ?")
-              .run(now, liveArt.id, params.userId);
-            this.db.db
-              .prepare(
-                `INSERT INTO artifact_dep_propagation_queue (
-                   id, user_id, scope_kind, chat_id, project_id, changed_rel_path,
-                   source_artifact_id, source_revision, batch_id, exclude_artifact_ids_json, state, created_at, updated_at
-                 ) VALUES (?, ?, 'chat', ?, NULL, ?, ?, 0, NULL, '[]', 'pending', ?, ?)`
-              )
-              .run(
-                crypto.randomUUID(),
-                params.userId,
-                params.chatId,
-                wsRel,
-                liveArt.id,
-                now,
-                now
-              );
-            envelopes.push(
-              this.db.insertSyncEventInTx({
-                userId: params.userId,
-                eventId: crypto.randomUUID(),
-                type: 'artifact.deleted',
-                chatId: params.chatId,
-                payload: { artifactId: liveArt.id, relPath: wsRel, scopeKind: 'chat' },
-                createdAt: now,
-              })
-            );
-            this.db.db.exec('COMMIT;');
-            deletedAny = true;
-          } catch (err) {
-            this.db.db.exec('ROLLBACK;');
-            throw err;
-          }
-        }
+        const { envelopes } = await this.executeJournaledDelete({
+          userId: params.userId,
+          scopeKind: 'chat',
+          chatId: params.chatId,
+          projectId: null,
+          artifactId: liveArt?.id ?? `sync:${params.chatId}:${wsRel}`,
+          relPath: wsRel,
+          operationSummary: `Remove obsolete synced project file ${wsRel}`,
+          payload: {
+            kind: 'delete_sync_file',
+            chatId: params.chatId,
+            workspaceDir: chat.workspaceDir,
+            relPath: wsRel,
+            artifactId: liveArt?.id ?? null,
+          },
+        });
+        if (envelopes.length > 0) deletedAny = true;
       });
-
-      for (const env of envelopes) this.hub.broadcastPersistedEvent(env);
     }
 
     if (deletedAny) {

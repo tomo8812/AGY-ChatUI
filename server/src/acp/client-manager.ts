@@ -62,6 +62,7 @@ import type { SyncHub } from '../sync/hub.js';
 import type {
   AcpConfigOption,
   AcpSelectOption,
+  ArtifactRecord,
   AttachmentRef,
   AvailableCommandItem,
   ChatRecord,
@@ -1472,18 +1473,36 @@ export class AcpClientManager {
       const hintPaths = bridge.toolCalls.flatMap(tool => (tool.locations ?? [])
         .map(location => toHostWorkspacePath(worker.workspaceDir, worker.sandboxWorkspaceRoot, location.path)));
 
-      await this.drainPendingArtifactOps(bridge);
-      const newArtifacts = await syncWorkspaceChangesAsArtifacts({
-        artifactService: this.artifactService,
-        db: this.db,
-        userId: params.userId,
-        chatId: params.chatId,
-        workspaceDir: chat.workspaceDir,
-        messageId: params.assistantMessageId,
-        runId: params.runId,
-        before: beforeSnap,
-        hintPaths,
-      });
+      // ACP transparency (`AGENTS.md`): Antigravity's native prompt response is already complete.
+      // Any ChatUI-side Artifact ingestion/dependency-propagation error MUST be handled strictly as
+      // an Artifact-layer error and NEVER alter the assistant message's ACP completion status or stopReason.
+      let newArtifacts: ArtifactRecord[] = [];
+      const artifactErrors: Array<{ relPath: string | null; message: string }> = [];
+      try {
+        await this.drainPendingArtifactOps(bridge);
+        newArtifacts = await syncWorkspaceChangesAsArtifacts({
+          artifactService: this.artifactService,
+          db: this.db,
+          userId: params.userId,
+          chatId: params.chatId,
+          workspaceDir: chat.workspaceDir,
+          messageId: params.assistantMessageId,
+          runId: params.runId,
+          before: beforeSnap,
+          hintPaths,
+          onError: (relPath, err) => {
+            artifactErrors.push({
+              relPath,
+              message: err instanceof Error ? err.message : String(err),
+            });
+          },
+        });
+      } catch (err) {
+        artifactErrors.push({
+          relPath: null,
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
 
       if (bridge.activity.at(-1)?.kind === 'content') bridge.activity.push({ kind: 'answer_end' });
 
@@ -1510,33 +1529,51 @@ export class AcpClientManager {
         payload: { message: updatedMsg },
       });
 
-      const afterSkillsSig = captureWorkspaceSkillsSignature(chat.workspaceDir);
-      if (afterSkillsSig !== beforeSkillsSig && this.skillService) {
-        const refreshed = this.enrichParsedOptions(params.userId, worker.parsedOptions, {
-          projectId: chat.projectId,
-          chatId: params.chatId,
-        });
-        worker.parsedOptions = refreshed;
+      if (artifactErrors.length > 0) {
         this.hub.emitDurable({
           userId: params.userId,
-          type: 'skills.updated',
-          projectId: chat.projectId,
+          type: 'artifact.sync_error',
           chatId: params.chatId,
+          runId: params.runId,
           payload: {
-            scope: 'workspace',
+            chatId: params.chatId,
+            messageId: params.assistantMessageId,
+            errors: artifactErrors,
+          },
+        });
+      }
+
+      try {
+        const afterSkillsSig = captureWorkspaceSkillsSignature(chat.workspaceDir);
+        if (afterSkillsSig !== beforeSkillsSig && this.skillService) {
+          const refreshed = this.enrichParsedOptions(params.userId, worker.parsedOptions, {
             projectId: chat.projectId,
             chatId: params.chatId,
-          },
-        });
-        this.hub.emitDurable({
-          userId: params.userId,
-          type: 'chat.commands_updated',
-          chatId: params.chatId,
-          payload: {
-            availableCommands: refreshed.availableCommands ?? [],
-            sessionOptions: refreshed,
-          },
-        });
+          });
+          worker.parsedOptions = refreshed;
+          this.hub.emitDurable({
+            userId: params.userId,
+            type: 'skills.updated',
+            projectId: chat.projectId,
+            chatId: params.chatId,
+            payload: {
+              scope: 'workspace',
+              projectId: chat.projectId,
+              chatId: params.chatId,
+            },
+          });
+          this.hub.emitDurable({
+            userId: params.userId,
+            type: 'chat.commands_updated',
+            chatId: params.chatId,
+            payload: {
+              availableCommands: refreshed.availableCommands ?? [],
+              sessionOptions: refreshed,
+            },
+          });
+        }
+      } catch {
+        // Non-fatal post-turn skills refresh error must not alter completed ACP response
       }
 
       return { stopReason: response.stopReason };
@@ -2972,24 +3009,52 @@ export class AcpClientManager {
     if (worker.activeTurn && worker.activeTurn !== bridge) {
       return;
     }
-    await this.drainPendingArtifactOps(bridge);
-    const newArtifacts = await syncWorkspaceChangesAsArtifacts({
-      artifactService: this.artifactService,
-      db: this.db,
-      userId: worker.userId,
-      chatId: worker.chatId,
-      workspaceDir: worker.workspaceDir,
-      messageId: bridge.assistantMessageId,
-      runId: bridge.runId || null,
-      before: bridge.beforeWorkspaceSnap,
-      skipIfAlreadyOwnedByOtherMessage: true,
-    });
+    const artifactErrors: Array<{ relPath: string | null; message: string }> = [];
+    let newArtifacts: ArtifactRecord[] = [];
+    try {
+      await this.drainPendingArtifactOps(bridge);
+      newArtifacts = await syncWorkspaceChangesAsArtifacts({
+        artifactService: this.artifactService,
+        db: this.db,
+        userId: worker.userId,
+        chatId: worker.chatId,
+        workspaceDir: worker.workspaceDir,
+        messageId: bridge.assistantMessageId,
+        runId: bridge.runId || null,
+        before: bridge.beforeWorkspaceSnap,
+        skipIfAlreadyOwnedByOtherMessage: true,
+        onError: (relPath, err) => {
+          artifactErrors.push({
+            relPath,
+            message: err instanceof Error ? err.message : String(err),
+          });
+        },
+      });
+    } catch (err) {
+      artifactErrors.push({
+        relPath: null,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
     for (const art of newArtifacts) {
       this.emitArtifactVersionIfNeeded(
         bridge,
         art as unknown as { id: string; revision: number; sha256: string; dependencyManifestHash?: string | null } & Record<string, unknown>,
         bridge.runId || null
       );
+    }
+    if (artifactErrors.length > 0) {
+      this.hub.emitDurable({
+        userId: worker.userId,
+        type: 'artifact.sync_error',
+        chatId: worker.chatId,
+        runId: bridge.runId || null,
+        payload: {
+          chatId: worker.chatId,
+          messageId: bridge.assistantMessageId,
+          errors: artifactErrors,
+        },
+      });
     }
   }
 

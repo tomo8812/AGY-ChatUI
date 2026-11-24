@@ -78,6 +78,7 @@ export async function syncWorkspaceChangesAsArtifacts(params: {
   before: WorkspaceSnapshot;
   hintPaths?: string[];
   skipIfAlreadyOwnedByOtherMessage?: boolean;
+  onError?: (relPath: string, err: unknown) => void;
 }): Promise<ArtifactRecord[]> {
   const registered: ArtifactRecord[] = [];
   if (!fs.existsSync(params.workspaceDir)) return registered;
@@ -127,18 +128,23 @@ export async function syncWorkspaceChangesAsArtifacts(params: {
     // Do NOT pass unlocked `filename`/`mimeType`/`previewKind` derived before acquiring ArtifactLockManager:
     // `ingestWorkspaceFile` resolves them atomically inside the lock so concurrent inline generated assets
     // (whose logical filename differs from the hashed relPath basename) are never overwritten.
-    const { artifact } = await params.artifactService.ingestWorkspaceFile({
-      userId: params.userId,
-      chatId: params.chatId,
-      workspaceDir: rootReal,
-      relPath,
-      source: isInitialProjectCopy && !changed ? 'project_copy' : 'generated',
-      messageId: params.messageId,
-      runId: params.runId,
-      diffPatch,
-      emitEvent: false,
-    });
-    registered.push(artifact);
+    // Isolate per-file ingestion failures so one file's error never aborts other files or corrupts ACP turn state.
+    try {
+      const { artifact } = await params.artifactService.ingestWorkspaceFile({
+        userId: params.userId,
+        chatId: params.chatId,
+        workspaceDir: rootReal,
+        relPath,
+        source: isInitialProjectCopy && !changed ? 'project_copy' : 'generated',
+        messageId: params.messageId,
+        runId: params.runId,
+        diffPatch,
+        emitEvent: false,
+      });
+      registered.push(artifact);
+    } catch (err) {
+      params.onError?.(relPath, err);
+    }
   }
   return registered;
 }

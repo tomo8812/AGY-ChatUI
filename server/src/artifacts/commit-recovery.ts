@@ -27,12 +27,17 @@ export interface CommitRecoveryHost {
     artifact: ArtifactRecord;
     envelopes: ReturnType<AppDatabase['insertSyncEventInTx']>[];
   };
+  inspectDeleteTargetIntact?(journal: ArtifactCommitJournalRow): boolean;
+  performDeleteFsCleanup?(journal: ArtifactCommitJournalRow): void;
+  finalizeDeleteStageT6InTx?(journal: ArtifactCommitJournalRow): {
+    envelopes: ReturnType<AppDatabase['insertSyncEventInTx']>[];
+  };
   recordExternalSyncOnRecovery(params: {
     userId: string;
     artifactId: string;
     rootDir: string;
     relPath: string;
-  }): void;
+  }): boolean;
 }
 
 export interface RecoveryReport {
@@ -263,40 +268,100 @@ export function recoverPendingCommits(host: CommitRecoveryHost): RecoveryReport 
     report.rolledForward += 1;
   };
 
+  const broadcastPersistedSeqs = (userId: string, seqs: number[]) => {
+    for (const seq of seqs) {
+      const evRow = host.db.db
+        .prepare('SELECT * FROM sync_events WHERE seq = ? AND user_id = ?')
+        .get(seq, userId) as Record<string, unknown> | undefined;
+      if (evRow) {
+        host.hub.broadcastPersistedEvent({
+          seq: Number(evRow.seq),
+          userSeq: Number(evRow.user_seq ?? 0),
+          eventId: String(evRow.event_id),
+          userId: String(evRow.user_id),
+          type: String(evRow.event_type),
+          chatId: evRow.chat_id ? String(evRow.chat_id) : null,
+          projectId: evRow.project_id ? String(evRow.project_id) : null,
+          runId: evRow.run_id ? String(evRow.run_id) : null,
+          payload: JSON.parse(String(evRow.payload_json)),
+          createdAt: Number(evRow.created_at),
+        });
+      }
+    }
+  };
+
+  const extractDbCommittedSeqs = (j: ArtifactCommitJournalRow): number[] => {
+    if (j.auditNote) {
+      try {
+        const parsed = JSON.parse(j.auditNote) as { syncEventSeqs?: unknown };
+        if (Array.isArray(parsed.syncEventSeqs)) {
+          const valid = parsed.syncEventSeqs.filter((n): n is number => typeof n === 'number' && Number.isFinite(n));
+          if (valid.length > 0) return valid;
+        }
+      } catch {
+        // non-JSON audit note
+      }
+    }
+    return j.syncEventSeq !== null ? [j.syncEventSeq] : [];
+  };
+
+  const rollForwardDeleteToT6 = (j: ArtifactCommitJournalRow) => {
+    host.performDeleteFsCleanup?.(j);
+    let envelopes: ReturnType<AppDatabase['insertSyncEventInTx']>[] = [];
+    host.db.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const finalized = host.finalizeDeleteStageT6InTx!(j);
+      envelopes = finalized.envelopes;
+      host.db.db.exec('COMMIT;');
+    } catch (err) {
+      host.db.db.exec('ROLLBACK;');
+      throw err;
+    }
+    for (const env of envelopes) {
+      host.hub.broadcastPersistedEvent(env);
+    }
+    host.db.db.prepare('DELETE FROM artifact_commit_journal WHERE commit_id = ?').run(j.commitId);
+    report.rolledForward += 1;
+  };
+
   for (const raw of rows) {
     const j = mapJournalRow(raw);
+
+    // 1. db_committed: verify outbox sync_event(s) exist, broadcast if needed, delete completed journal
+    if (j.state === 'db_committed') {
+      broadcastPersistedSeqs(j.userId, extractDbCommittedSeqs(j));
+      host.db.db.prepare('DELETE FROM artifact_commit_journal WHERE commit_id = ?').run(j.commitId);
+      report.completedOutbox += 1;
+      continue;
+    }
+
+    // 1b. Journaled delete operations (delete_project_file, delete_project, delete_sync_file, delete_chat)
+    if (j.operationType.startsWith('delete_') && host.finalizeDeleteStageT6InTx) {
+      if (j.state === 'prepared') {
+        markAborted(j, 'delete_aborted_before_unlink');
+        continue;
+      }
+      if (j.state === 'file_replaced') {
+        rollForwardDeleteToT6(j);
+        continue;
+      }
+      if (j.state === 'replacing') {
+        const intact = host.inspectDeleteTargetIntact ? host.inspectDeleteTargetIntact(j) : false;
+        if (intact) {
+          markAborted(j, 'delete_aborted_target_still_intact');
+        } else {
+          rollForwardDeleteToT6(j);
+        }
+        continue;
+      }
+    }
+
     // ARCH-05 & SEC-10: Use ONLY the isolation mode recorded at commit time (T1).
     // If unknown/null or non_isolated_same_uid, NEVER assume mount isolation.
     const isMountIsolated = j.stagingIsolationMode === 'bwrap_mount_isolated';
     const rootDir = host.resolveScopeRootDir(j.userId, j.scopeKind, j.chatId, j.projectId);
     const stage = inspectStageFile(j.privateStagePath);
     const target = inspectTargetFile(rootDir, j.relPath);
-
-    // 1. db_committed: verify outbox sync_event exists, broadcast if needed, delete completed journal
-    if (j.state === 'db_committed') {
-      if (j.syncEventSeq !== null) {
-        const evRow = host.db.db
-          .prepare('SELECT * FROM sync_events WHERE seq = ? AND user_id = ?')
-          .get(j.syncEventSeq, j.userId) as Record<string, unknown> | undefined;
-        if (evRow) {
-          host.hub.broadcastPersistedEvent({
-            seq: Number(evRow.seq),
-            userSeq: Number(evRow.user_seq ?? 0),
-            eventId: String(evRow.event_id),
-            userId: String(evRow.user_id),
-            type: String(evRow.event_type),
-            chatId: evRow.chat_id ? String(evRow.chat_id) : null,
-            projectId: evRow.project_id ? String(evRow.project_id) : null,
-            runId: evRow.run_id ? String(evRow.run_id) : null,
-            payload: JSON.parse(String(evRow.payload_json)),
-            createdAt: Number(evRow.created_at),
-          });
-        }
-      }
-      host.db.db.prepare('DELETE FROM artifact_commit_journal WHERE commit_id = ?').run(j.commitId);
-      report.completedOutbox += 1;
-      continue;
-    }
 
     // 2. file_replaced: placement succeeded -> roll forward to Stage T6 (+ external_sync if subsequently changed)
     if (j.state === 'file_replaced') {

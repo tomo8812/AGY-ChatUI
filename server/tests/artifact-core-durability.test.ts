@@ -1605,4 +1605,276 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
     });
     expect(fsizeRes.exitCode !== 0 || fsizeRes.signal === 'SIGXFSZ').toBe(true);
   });
+
+  it('Remaining #1: recovers deleteProjectFile, syncProjectFilesToChat obsolete removal, and deleteProject consistently after mid-delete crashes (fault injection)', async () => {
+    const srv = await createTestServer({ sandboxMode: 'off' });
+    cleanups.push(srv.cleanup);
+
+    const { client: alice, userId } = await registerAndBindAgy(srv.baseUrl, 'del_rec_alice', 'delrec-code');
+    const projRes = await alice.request<{ project: { id: string; storageDir: string } }>('POST', '/api/projects', {
+      name: 'Delete Recovery Project',
+    });
+    const projectId = projRes.data.project.id;
+    const storageDir = projRes.data.project.storageDir;
+
+    // --- 1A. deleteProjectFile fault injection at after_T1 (before unlink) -> aborts cleanly, keeps file & DB ---
+    const f1 = await srv.ctx.artifactService.uploadProjectFile({
+      userId,
+      projectId,
+      filename: 'keep-on-t1.md',
+      mimeType: 'text/markdown',
+      buffer: Buffer.from('# Keep me', 'utf8'),
+    });
+    srv.ctx.artifactService.commitFaultHook = (stage) => {
+      if (stage === 'after_T1') throw new Error('CRASH_DEL_AFTER_T1');
+    };
+    await expect(
+      srv.ctx.artifactService.deleteProjectFile({ userId, projectId, fileId: f1.file.id })
+    ).rejects.toThrow('CRASH_DEL_AFTER_T1');
+    srv.ctx.artifactService.commitFaultHook = undefined;
+
+    const rT1 = await srv.ctx.artifactService.recoverOnStartup();
+    expect(rT1.commits.aborted).toBeGreaterThanOrEqual(1);
+    expect(fs.existsSync(path.join(storageDir, f1.file.relPath))).toBe(true);
+    expect(srv.ctx.db.getProjectFileById(userId, projectId, f1.file.id)).not.toBeNull();
+    expect(srv.ctx.db.getArtifact(userId, f1.artifact.id)).not.toBeNull();
+
+    // --- 1B. deleteProjectFile fault injection at after_T4 (after unlink, before T5/T6 DB tx) -> rolls forward cleanly ---
+    srv.ctx.artifactService.commitFaultHook = (stage) => {
+      if (stage === 'after_T4') throw new Error('CRASH_DEL_AFTER_T4');
+    };
+    await expect(
+      srv.ctx.artifactService.deleteProjectFile({ userId, projectId, fileId: f1.file.id })
+    ).rejects.toThrow('CRASH_DEL_AFTER_T4');
+    srv.ctx.artifactService.commitFaultHook = undefined;
+
+    // Immediately after crash: file is already gone on disk, DB still has project_file & active artifact
+    expect(fs.existsSync(path.join(storageDir, f1.file.relPath))).toBe(false);
+    expect(srv.ctx.db.getProjectFileById(userId, projectId, f1.file.id)).not.toBeNull();
+    expect(srv.ctx.db.getArtifact(userId, f1.artifact.id)).not.toBeNull();
+
+    const rT4 = await srv.ctx.artifactService.recoverOnStartup();
+    expect(rT4.commits.rolledForward).toBeGreaterThanOrEqual(1);
+    expect(srv.ctx.db.getProjectFileById(userId, projectId, f1.file.id)).toBeNull();
+    expect(srv.ctx.db.getArtifact(userId, f1.artifact.id)).toBeNull();
+    const delFileEvents = srv.ctx.db.db
+      .prepare("SELECT event_type, payload_json FROM sync_events WHERE user_id = ? AND event_type = 'artifact.deleted'")
+      .all(userId) as Array<{ event_type: string; payload_json: string }>;
+    expect(delFileEvents.some((e) => e.payload_json.includes(f1.artifact.id))).toBe(true);
+
+    // --- 1C. syncProjectFilesToChat obsolete removal crash at after_T4 -> rolls forward + propagates dep update ---
+    const f2 = await srv.ctx.artifactService.uploadProjectFile({
+      userId,
+      projectId,
+      filename: 'sync-ref.css',
+      mimeType: 'text/css',
+      buffer: Buffer.from('body { color: green; }', 'utf8'),
+    });
+    const chatRes = await alice.request<{ chat: { id: string; workspaceDir: string } }>('POST', '/api/chats', {
+      title: 'Sync Crash Chat',
+      projectId,
+    });
+    const chatId = chatRes.data.chat.id;
+    const workspaceDir = chatRes.data.chat.workspaceDir;
+
+    const parentRes = await alice.request<{ artifact: { id: string; revision: number } }>(
+      'POST',
+      `/api/chats/${chatId}/artifacts`,
+      { relPath: 'view.html', content: '<link rel="stylesheet" href=".project-context/sync-ref.css"><p>v1</p>' }
+    );
+    const parentId = parentRes.data.artifact.id;
+    const parentBefore = srv.ctx.db.getArtifact(userId, parentId)!;
+    expect(parentBefore.dependencyManifestHash).toBeTruthy();
+
+    // Delete from project normally, then crash mid-sync deletion at after_T4
+    await srv.ctx.artifactService.deleteProjectFile({ userId, projectId, fileId: f2.file.id });
+    srv.ctx.artifactService.commitFaultHook = (stage) => {
+      if (stage === 'after_T4') throw new Error('CRASH_SYNC_DEL_AFTER_T4');
+    };
+    await expect(
+      srv.ctx.artifactService.syncProjectFilesToChat({ userId, projectId, chatId })
+    ).rejects.toThrow('CRASH_SYNC_DEL_AFTER_T4');
+    srv.ctx.artifactService.commitFaultHook = undefined;
+
+    const ctxArtBefore = srv.ctx.db.findArtifactByRelPath(userId, chatId, '.project-context/sync-ref.css');
+    expect(fs.existsSync(path.join(workspaceDir, '.project-context', 'sync-ref.css'))).toBe(false);
+    expect(ctxArtBefore).not.toBeNull();
+
+    const rSync = await srv.ctx.artifactService.recoverOnStartup();
+    expect(rSync.commits.rolledForward).toBeGreaterThanOrEqual(1);
+    expect(srv.ctx.db.findArtifactByRelPath(userId, chatId, '.project-context/sync-ref.css')).toBeNull();
+    const parentAfter = srv.ctx.db.getArtifact(userId, parentId)!;
+    expect(parentAfter.revision).toBeGreaterThan(parentBefore.revision);
+
+    // --- 1D. deleteProject crash at after_T4 (after subtree removal, before DB deletion) -> rolls forward cleanly ---
+    const f3 = await srv.ctx.artifactService.uploadProjectFile({
+      userId,
+      projectId,
+      filename: 'final.md',
+      mimeType: 'text/markdown',
+      buffer: Buffer.from('# Final', 'utf8'),
+    });
+    srv.ctx.artifactService.commitFaultHook = (stage) => {
+      if (stage === 'after_T4') throw new Error('CRASH_PROJ_DEL_AFTER_T4');
+    };
+    await expect(
+      srv.ctx.artifactService.deleteProject({ userId, projectId })
+    ).rejects.toThrow('CRASH_PROJ_DEL_AFTER_T4');
+    srv.ctx.artifactService.commitFaultHook = undefined;
+
+    expect(fs.existsSync(path.dirname(storageDir))).toBe(false);
+    expect(srv.ctx.db.getProject(userId, projectId)).not.toBeNull();
+
+    const rProj = await srv.ctx.artifactService.recoverOnStartup();
+    expect(rProj.commits.rolledForward).toBeGreaterThanOrEqual(1);
+    expect(srv.ctx.db.getProject(userId, projectId)).toBeNull();
+    expect(srv.ctx.db.getArtifact(userId, f3.artifact.id)).toBeNull();
+    const projEvents = srv.ctx.db.db
+      .prepare("SELECT event_type, payload_json FROM sync_events WHERE user_id = ? AND event_type IN ('artifact.deleted', 'project.deleted')")
+      .all(userId) as Array<{ event_type: string; payload_json: string }>;
+    expect(projEvents.some((e) => e.event_type === 'artifact.deleted' && e.payload_json.includes(f3.artifact.id))).toBe(true);
+    expect(projEvents.some((e) => e.event_type === 'project.deleted' && e.payload_json.includes(projectId))).toBe(true);
+  });
+
+  it('Remaining #2: keeps Revision sha256, size_bytes, blob, and dependency_manifest_hash consistent when normal ACP externally modifies parent during dependency propagation', async () => {
+    const srv = await createTestServer({ sandboxMode: 'off' });
+    cleanups.push(srv.cleanup);
+
+    const { client: alice, userId } = await registerAndBindAgy(srv.baseUrl, 'dep_cons_alice', 'depcons-code');
+    const chatRes = await alice.request<{ chat: { id: string; workspaceDir: string } }>('POST', '/api/chats', {
+      title: 'Dep Consistency Chat',
+    });
+    const chatId = chatRes.data.chat.id;
+    const workspaceDir = chatRes.data.chat.workspaceDir;
+
+    const cssRes = await alice.request<{ artifact: { id: string } }>('POST', `/api/chats/${chatId}/artifacts`, {
+      relPath: 'style.css',
+      content: 'h1 { color: black; }',
+    });
+    const cssId = cssRes.data.artifact.id;
+
+    const htmlRes = await alice.request<{ artifact: { id: string } }>('POST', `/api/chats/${chatId}/artifacts`, {
+      relPath: 'index.html',
+      content: '<link rel="stylesheet" href="style.css"><h1>Original</h1>',
+    });
+    const htmlId = htmlRes.data.artifact.id;
+
+    // Simulate unrestricted normal ACP external write directly modifying parent index.html on disk
+    const externalParentHtml = '<link rel="stylesheet" href="style.css"><h1>Modified Externally By ACP with Extra Text</h1>';
+    const externalParentBuf = Buffer.from(externalParentHtml, 'utf8');
+    const externalParentSha = sha256(externalParentBuf);
+    fs.writeFileSync(path.join(workspaceDir, 'index.html'), externalParentBuf);
+
+    // Now edit child style.css via ArtifactService -> triggers drainDepPropagationQueue for index.html
+    const editCss = await alice.request<{ artifact: { sha256: string } }>('POST', `/api/files/${cssId}/edit`, {
+      expectedRevision: 1,
+      operations: [{ op: 'replace_source', content: 'h1 { color: rebeccapurple; }' }],
+    });
+    expect(editCss.status).toBe(200);
+    const newCssSha = editCss.data.artifact.sha256;
+
+    // Verify artifacts row, latest artifact_revisions row, stored blob bytes, and artifact_revision_deps are 100% mutually consistent
+    const parentAfter = srv.ctx.db.getArtifact(userId, htmlId)!;
+    expect(parentAfter.revision).toBeGreaterThanOrEqual(2);
+    expect(parentAfter.sha256).toBe(externalParentSha);
+    expect(parentAfter.sizeBytes).toBe(externalParentBuf.length);
+    expect(parentAfter.dependencyManifestHash).toBeTruthy();
+
+    const revRows = srv.ctx.db.db
+      .prepare('SELECT revision, sha256, size_bytes, blob_sha256, dependency_manifest_hash, operation_type FROM artifact_revisions WHERE artifact_id = ? ORDER BY revision ASC')
+      .all(htmlId) as Array<{
+        revision: number;
+        sha256: string;
+        size_bytes: number;
+        blob_sha256: string;
+        dependency_manifest_hash: string | null;
+        operation_type: string;
+      }>;
+    expect(revRows.length).toBeGreaterThanOrEqual(2);
+
+    // Every single revision's metadata MUST exactly match its stored immutable blob bytes!
+    for (const r of revRows) {
+      const blobPath = srv.ctx.artifactService.blobManager.getBlobPath(userId, r.blob_sha256);
+      const blobBytes = fs.readFileSync(blobPath);
+      expect(r.sha256).toBe(r.blob_sha256);
+      expect(sha256(blobBytes)).toBe(r.sha256);
+      expect(blobBytes.length).toBe(r.size_bytes);
+    }
+
+    const latestRev = revRows[revRows.length - 1];
+    expect(latestRev.revision).toBe(parentAfter.revision);
+    expect(latestRev.sha256).toBe(externalParentSha);
+    expect(latestRev.size_bytes).toBe(externalParentBuf.length);
+    expect(latestRev.dependency_manifest_hash).toBe(parentAfter.dependencyManifestHash);
+
+    const depRow = srv.ctx.db.db
+      .prepare('SELECT sha256 FROM artifact_revision_deps WHERE artifact_id = ? AND revision = ? AND rel_path = ?')
+      .get(htmlId, latestRev.revision, 'style.css') as { sha256: string } | undefined;
+    expect(depRow?.sha256).toBe(newCssSha);
+
+    // Serving the pinned latest revision returns the exact external bytes
+    const pinnedRes = await fetch(`${srv.baseUrl}/api/files/${htmlId}/revisions/${latestRev.revision}/content`, {
+      headers: { cookie: alice.cookieHeader },
+    });
+    expect(pinnedRes.status).toBe(200);
+    expect(await pinnedRes.text()).toBe(externalParentHtml);
+  });
+
+  it('Remaining #3: preserves native ACP response content and completed status when Artifact ingestion intentionally fails', async () => {
+    const srv = await createTestServer({ sandboxMode: 'off' });
+    cleanups.push(srv.cleanup);
+
+    const { client: alice, userId } = await registerAndBindAgy(srv.baseUrl, 'acp_trans_alice', 'acptrans-code');
+    await alice.connectWs();
+    cleanups.push(async () => alice.closeWs());
+
+    const chatRes = await alice.request<{ chat: { id: string; workspaceDir: string } }>('POST', '/api/chats', {
+      title: 'ACP Transparency Chat',
+    });
+    const chatId = chatRes.data.chat.id;
+
+    // Intentionally fail ArtifactService.ingestWorkspaceFile to simulate lock contention / FS / dep errors
+    const origIngest = srv.ctx.artifactService.ingestWorkspaceFile.bind(srv.ctx.artifactService);
+    let ingestAttempts = 0;
+    srv.ctx.artifactService.ingestWorkspaceFile = (async () => {
+      ingestAttempts += 1;
+      throw new Error('INJECTED_ARTIFACT_INGEST_FAILURE');
+    }) as typeof srv.ctx.artifactService.ingestWorkspaceFile;
+
+    try {
+      // Trigger a normal mock ACP turn that creates a workspace file and returns end_turn
+      const sendRes = await alice.request('POST', `/api/chats/${chatId}/messages`, {
+        text: '[ARTIFACT] Please write output and reply normally.',
+      });
+      expect(sendRes.status).toBe(202);
+
+      const finishedFrame = await alice.waitForFrame(
+        (frame) => frame.kind === 'event' && (frame.event as { type?: string })?.type === 'run.finished',
+        15_000
+      );
+      const finishedPayload = (finishedFrame.event as { payload?: { status?: string; stopReason?: string } }).payload;
+      expect(finishedPayload?.status).not.toBe('error');
+
+      // Inspect persisted assistant message: MUST stay completed with native ACP content & no errorMessage
+      const detail = await alice.request<{
+        messages: Array<{ role: string; status: string; contentText: string; errorMessage: string | null }>;
+      }>('GET', `/api/chats/${chatId}`);
+      expect(detail.status).toBe(200);
+      const assistant = detail.data.messages.find((m) => m.role === 'assistant');
+      expect(assistant).toBeDefined();
+      expect(assistant!.status).toBe('completed');
+      expect(assistant!.errorMessage).toBeNull();
+      expect(assistant!.contentText.length).toBeGreaterThan(0);
+
+      // Verify Artifact ingestion WAS attempted, failed, and was recorded separately as artifact.sync_error
+      expect(ingestAttempts).toBeGreaterThan(0);
+      const syncErrEvents = srv.ctx.db.db
+        .prepare("SELECT event_type, payload_json FROM sync_events WHERE user_id = ? AND chat_id = ? AND event_type = 'artifact.sync_error'")
+        .all(userId, chatId) as Array<{ event_type: string; payload_json: string }>;
+      expect(syncErrEvents.length).toBeGreaterThanOrEqual(1);
+      expect(syncErrEvents[0].payload_json).toContain('INJECTED_ARTIFACT_INGEST_FAILURE');
+    } finally {
+      srv.ctx.artifactService.ingestWorkspaceFile = origIngest;
+    }
+  });
 });

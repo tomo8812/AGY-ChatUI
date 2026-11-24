@@ -13,6 +13,12 @@ export interface DepPropagationHost {
   lockManager: ArtifactLockManager;
   resolveScopeRootDir(userId: string, scopeKind: ArtifactScopeKind, chatId: string | null, projectId: string | null): string | null;
   readActiveArtifactBytes(artifact: ArtifactRecord): Buffer | null;
+  syncExternalChangeLocked(params: {
+    userId: string;
+    artifactId: string;
+    rootDir: string;
+    relPath: string;
+  }): boolean;
 }
 
 /**
@@ -73,10 +79,35 @@ export async function drainDepPropagationQueue(host: DepPropagationHost): Promis
           visitedArtifactIds.add(parentId);
 
           await host.lockManager.withLock(`artifact:${parentId}`, async () => {
-            const parent = host.db.getArtifact(userId, parentId);
+            let parent = host.db.getArtifact(userId, parentId);
             if (!parent) return;
-            const buf = host.readActiveArtifactBytes(parent);
+            let buf = host.readActiveArtifactBytes(parent);
             if (!buf) return;
+
+            let liveSha256 = crypto.createHash('sha256').update(buf).digest('hex');
+            let liveSizeBytes = buf.length;
+
+            // If normal ACP or another external actor modified the parent file on disk,
+            // first ingest that external change through the unified revision/blob/deps foundation
+            // so revision metadata (sha256, size_bytes, blob_sha256, dependency_manifest_hash) stays strictly consistent.
+            if (liveSha256 !== parent.sha256 || liveSizeBytes !== parent.sizeBytes) {
+              const syncedExternal = host.syncExternalChangeLocked({
+                userId,
+                artifactId: parent.id,
+                rootDir,
+                relPath: parent.relPath,
+              });
+              parent = host.db.getArtifact(userId, parentId);
+              if (!parent) return;
+              if (syncedExternal && !visitedPaths.has(parent.relPath)) {
+                visitedPaths.add(parent.relPath);
+                bfsQueue.push(parent.relPath);
+              }
+              buf = host.readActiveArtifactBytes(parent);
+              if (!buf) return;
+              liveSha256 = crypto.createHash('sha256').update(buf).digest('hex');
+              liveSizeBytes = buf.length;
+            }
 
             const scan = scanArtifactDependencies({
               rootDir,
@@ -85,11 +116,16 @@ export async function drainDepPropagationQueue(host: DepPropagationHost): Promis
               contentBuffer: buf,
             });
 
-            if (scan.manifestHash === parent.dependencyManifestHash) {
+            if (
+              scan.manifestHash === parent.dependencyManifestHash &&
+              liveSha256 === parent.sha256 &&
+              liveSizeBytes === parent.sizeBytes
+            ) {
               return;
             }
 
-            // Store any new dependency blobs under lease before DB commit
+            // Store parent & dependency blobs under lease before DB commit;
+            // always record liveSha256/liveSizeBytes matching the actual stored blob.
             const leases = [];
             try {
               const parentLease = host.blobManager.putBlobWithLease(userId, buf);
@@ -106,10 +142,10 @@ export async function drainDepPropagationQueue(host: DepPropagationHost): Promis
                 host.db.db
                   .prepare(
                     `UPDATE artifacts
-                     SET revision = ?, dependency_manifest_hash = ?, updated_at = ?
+                     SET revision = ?, sha256 = ?, size_bytes = ?, dependency_manifest_hash = ?, updated_at = ?
                      WHERE id = ? AND user_id = ?`
                   )
-                  .run(nextRev, scan.manifestHash, now, parent.id, userId);
+                  .run(nextRev, liveSha256, liveSizeBytes, scan.manifestHash, now, parent.id, userId);
 
                 host.db.db
                   .prepare(
@@ -128,9 +164,9 @@ export async function drainDepPropagationQueue(host: DepPropagationHost): Promis
                     parent.projectId,
                     nextRev,
                     parent.revision,
-                    parent.sha256,
+                    liveSha256,
                     scan.manifestHash,
-                    parent.sizeBytes,
+                    liveSizeBytes,
                     parentLease.sha256,
                     `Dependency updated: ${changedRelPath}`,
                     batchId,
