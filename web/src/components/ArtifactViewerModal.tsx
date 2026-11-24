@@ -125,11 +125,14 @@ async function renderPdfPageToBitmap(
     onTask?.(renderTask);
     if (isCancelled()) {
       renderTask.cancel();
-      onTask?.(null);
-      return null;
     }
     try {
       await renderTask.promise;
+    } catch (err) {
+      if (isCancelled() || isPdfRenderCancelledError(err)) {
+        return null;
+      }
+      throw err;
     } finally {
       onTask?.(null);
     }
