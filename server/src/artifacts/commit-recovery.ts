@@ -18,6 +18,20 @@ import type {
   StagingIsolationKind,
 } from './types.js';
 
+export type DeleteTargetStatus =
+  | 'deleted'
+  | 'intact'
+  | 'partially_deleted'
+  | 'externally_recreated'
+  | 'indeterminate';
+
+export interface DeleteTargetInspection {
+  status: DeleteTargetStatus;
+  detail: string;
+  /** True when the journal proves the target was already absent before T1 began. */
+  absentAtT1?: boolean;
+}
+
 export interface CommitRecoveryHost {
   db: AppDatabase;
   hub: SyncHub;
@@ -27,8 +41,8 @@ export interface CommitRecoveryHost {
     artifact: ArtifactRecord;
     envelopes: ReturnType<AppDatabase['insertSyncEventInTx']>[];
   };
-  inspectDeleteTargetIntact?(journal: ArtifactCommitJournalRow): boolean;
-  performDeleteFsCleanup?(journal: ArtifactCommitJournalRow): void;
+  inspectDeleteTarget?(journal: ArtifactCommitJournalRow): DeleteTargetInspection;
+  performVerifiedPartialDeleteCleanup?(journal: ArtifactCommitJournalRow): { ok: true } | { ok: false; reason: string };
   finalizeDeleteStageT6InTx?(journal: ArtifactCommitJournalRow): {
     envelopes: ReturnType<AppDatabase['insertSyncEventInTx']>[];
   };
@@ -305,8 +319,18 @@ export function recoverPendingCommits(host: CommitRecoveryHost): RecoveryReport 
     return j.syncEventSeq !== null ? [j.syncEventSeq] : [];
   };
 
-  const rollForwardDeleteToT6 = (j: ArtifactCommitJournalRow) => {
-    host.performDeleteFsCleanup?.(j);
+  const rollForwardDeleteToT6 = (j: ArtifactCommitJournalRow, performPartialCleanup: boolean) => {
+    if (performPartialCleanup) {
+      if (!host.performVerifiedPartialDeleteCleanup) {
+        markQuarantined(j, 'delete_partial_cleanup_unavailable', false, null);
+        return;
+      }
+      const cleaned = host.performVerifiedPartialDeleteCleanup(j);
+      if (!cleaned.ok) {
+        markQuarantined(j, `delete_partial_cleanup_aborted:${cleaned.reason}`, false, null);
+        return;
+      }
+    }
     let envelopes: ReturnType<AppDatabase['insertSyncEventInTx']>[] = [];
     host.db.db.exec('BEGIN IMMEDIATE;');
     try {
@@ -337,20 +361,51 @@ export function recoverPendingCommits(host: CommitRecoveryHost): RecoveryReport 
 
     // 1b. Journaled delete operations (delete_project_file, delete_project, delete_sync_file, delete_chat)
     if (j.operationType.startsWith('delete_') && host.finalizeDeleteStageT6InTx) {
+      const inspection: DeleteTargetInspection = host.inspectDeleteTarget
+        ? host.inspectDeleteTarget(j)
+        : { status: 'indeterminate', detail: 'no_delete_inspector' };
+
       if (j.state === 'prepared') {
-        markAborted(j, 'delete_aborted_before_unlink');
-        continue;
-      }
-      if (j.state === 'file_replaced') {
-        rollForwardDeleteToT6(j);
-        continue;
-      }
-      if (j.state === 'replacing') {
-        const intact = host.inspectDeleteTargetIntact ? host.inspectDeleteTargetIntact(j) : false;
-        if (intact) {
-          markAborted(j, 'delete_aborted_target_still_intact');
+        if (inspection.status === 'intact' || (inspection.absentAtT1 && inspection.status === 'deleted')) {
+          markAborted(j, 'delete_aborted_before_unlink');
         } else {
-          rollForwardDeleteToT6(j);
+          markQuarantined(j, `delete_prepared_${inspection.status}:${inspection.detail}`, false, null);
+        }
+        continue;
+      }
+
+      if (j.state === 'file_replaced') {
+        if (inspection.status === 'deleted') {
+          // FS deletion already completed before T5; finalize DB only without touching FS.
+          rollForwardDeleteToT6(j, false);
+        } else if (inspection.status === 'externally_recreated') {
+          // Original target was already deleted before T5, and a new external file/dir now occupies the path.
+          // Finalize DB deletion of the old record WITHOUT touching the externally recreated FS target.
+          rollForwardDeleteToT6(j, false);
+        } else {
+          // Target still intact, partially deleted, or indeterminate despite T5 -> quarantine, NEVER blindly re-delete.
+          markQuarantined(j, `delete_file_replaced_${inspection.status}:${inspection.detail}`, false, null);
+        }
+        continue;
+      }
+
+      if (j.state === 'replacing') {
+        if (inspection.status === 'intact') {
+          markAborted(j, 'delete_aborted_target_still_intact');
+        } else if (inspection.status === 'deleted') {
+          // T4 already finished deleting the target before crashing prior to T5; finalize DB without FS re-delete.
+          rollForwardDeleteToT6(j, false);
+        } else if (inspection.status === 'partially_deleted') {
+          // Subtree deletion crashed mid-way and every remaining entry matches the T1 snapshot:
+          // complete identity-verified cleanup of remaining T1 entries only, then finalize T6.
+          rollForwardDeleteToT6(j, true);
+        } else if (inspection.status === 'externally_recreated' && inspection.absentAtT1) {
+          // Target was already absent before T1, so any current entry is provably a brand-new external creation:
+          // finalize old DB record deletion without touching the new FS target.
+          rollForwardDeleteToT6(j, false);
+        } else {
+          // externally_recreated (with existedAtT1=true) or indeterminate -> quarantine, NEVER unconditionally re-delete.
+          markQuarantined(j, `delete_replacing_${inspection.status}:${inspection.detail}`, false, null);
         }
         continue;
       }

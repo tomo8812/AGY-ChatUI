@@ -1877,4 +1877,256 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       srv.ctx.artifactService.ingestWorkspaceFile = origIngest;
     }
   });
+
+  it('Delete Recovery Identity & Partial Deletion: distinguishes deleted, intact, partially_deleted, externally_recreated, and indeterminate without ever deleting recreated or indeterminate targets', async () => {
+    const srv = await createTestServer({ sandboxMode: 'off' });
+    cleanups.push(srv.cleanup);
+
+    const { client: alice, userId } = await registerAndBindAgy(srv.baseUrl, 'del_id_alice', 'delid-code');
+
+    // Helper: create a project with files
+    const projRes = await alice.request<{ project: { id: string; storageDir: string } }>('POST', '/api/projects', {
+      name: 'Delete Identity Project',
+    });
+    expect(projRes.status).toBe(201);
+    const projectId = projRes.data.project.id;
+    const storageDir = projRes.data.project.storageDir;
+
+    // 1. External recreation AFTER file deletion (crash at after_T5 / state='file_replaced')
+    const up1 = await srv.ctx.artifactService.uploadProjectFile({
+      userId,
+      projectId,
+      filename: 'recreate-t5.txt',
+      mimeType: 'text/plain',
+      buffer: Buffer.from('original-v1-before-t5', 'utf8'),
+    });
+    const f1Path = path.join(storageDir, up1.file.relPath);
+    srv.ctx.artifactService.commitFaultHook = async (stage) => {
+      if (stage === 'after_T5') throw new Error('CRASH_AFTER_T5_FILE');
+    };
+    await expect(
+      srv.ctx.artifactService.deleteProjectFile({ userId, projectId, fileId: up1.file.id })
+    ).rejects.toThrow('CRASH_AFTER_T5_FILE');
+    srv.ctx.artifactService.commitFaultHook = undefined;
+    expect(fs.existsSync(f1Path)).toBe(false);
+
+    // External actor creates a brand-new file at the exact same path before recovery runs
+    fs.writeFileSync(f1Path, 'BRAND_NEW_EXTERNAL_FILE_AFTER_T5', 'utf8');
+
+    const rec1 = await srv.ctx.artifactService.recoverOnStartup();
+    expect(rec1.commits.rolledForward).toBe(1);
+    expect(rec1.commits.quarantined).toBe(0);
+    // Old DB record finalized deleted, yet externally recreated file on disk MUST be preserved intact!
+    expect(srv.ctx.db.getProjectFileById(userId, projectId, up1.file.id)).toBeNull();
+    expect(srv.ctx.db.getArtifact(userId, up1.artifact.id)).toBeNull();
+    const art1Row = srv.ctx.db.db
+      .prepare('SELECT lifecycle_state FROM artifacts WHERE id = ?')
+      .get(up1.artifact.id) as { lifecycle_state: string } | undefined;
+    expect(art1Row?.lifecycle_state).toBe('deleted');
+    expect(fs.existsSync(f1Path)).toBe(true);
+    expect(fs.readFileSync(f1Path, 'utf8')).toBe('BRAND_NEW_EXTERNAL_FILE_AFTER_T5');
+    fs.unlinkSync(f1Path);
+
+    // 2. External recreation during 'replacing' (crash at after_T4) -> MUST quarantine and preserve new file
+    const up2 = await srv.ctx.artifactService.uploadProjectFile({
+      userId,
+      projectId,
+      filename: 'recreate-t4.txt',
+      mimeType: 'text/plain',
+      buffer: Buffer.from('original-v1-before-t4', 'utf8'),
+    });
+    const f2Path = path.join(storageDir, up2.file.relPath);
+    srv.ctx.artifactService.commitFaultHook = async (stage) => {
+      if (stage === 'after_T4') throw new Error('CRASH_AFTER_T4_FILE');
+    };
+    await expect(
+      srv.ctx.artifactService.deleteProjectFile({ userId, projectId, fileId: up2.file.id })
+    ).rejects.toThrow('CRASH_AFTER_T4_FILE');
+    srv.ctx.artifactService.commitFaultHook = undefined;
+    expect(fs.existsSync(f2Path)).toBe(false);
+
+    // External actor writes a brand-new file at the same path
+    fs.writeFileSync(f2Path, 'RECREATED_DURING_REPLACING', 'utf8');
+
+    const rec2 = await srv.ctx.artifactService.recoverOnStartup();
+    expect(rec2.commits.quarantined).toBe(1);
+    expect(rec2.commits.rolledForward).toBe(0);
+    expect(fs.existsSync(f2Path)).toBe(true);
+    expect(fs.readFileSync(f2Path, 'utf8')).toBe('RECREATED_DURING_REPLACING');
+    const qRow2 = srv.ctx.db.db
+      .prepare("SELECT state, audit_note FROM artifact_commit_journal WHERE artifact_id = ? AND state = 'ambiguous_quarantined'")
+      .get(up2.artifact.id) as { state: string; audit_note: string } | undefined;
+    expect(qRow2?.state).toBe('ambiguous_quarantined');
+    expect(qRow2?.audit_note).toMatch(/^delete_replacing_(externally_recreated|indeterminate):/);
+
+    // 3. Indeterminate target (missing T1 identity snapshot while file exists) -> MUST quarantine, NEVER delete
+    const up3 = await srv.ctx.artifactService.uploadProjectFile({
+      userId,
+      projectId,
+      filename: 'indeterminate-file.txt',
+      mimeType: 'text/plain',
+      buffer: Buffer.from('must-not-be-blindly-deleted', 'utf8'),
+    });
+    const f3Path = path.join(storageDir, up3.file.relPath);
+    srv.ctx.artifactService.commitFaultHook = async (stage) => {
+      if (stage === 'after_T3') throw new Error('CRASH_AFTER_T3_INDET');
+    };
+    await expect(
+      srv.ctx.artifactService.deleteProjectFile({ userId, projectId, fileId: up3.file.id })
+    ).rejects.toThrow('CRASH_AFTER_T3_INDET');
+    srv.ctx.artifactService.commitFaultHook = undefined;
+
+    // Strip targetIdentity from the journal payload to simulate an indeterminate/legacy journal entry
+    const j3 = srv.ctx.db.db
+      .prepare("SELECT commit_id, operation_payload_json FROM artifact_commit_journal WHERE artifact_id = ? AND state = 'replacing'")
+      .get(up3.artifact.id) as { commit_id: string; operation_payload_json: string };
+    const strippedPayload = JSON.parse(j3.operation_payload_json) as Record<string, unknown>;
+    delete strippedPayload.targetIdentity;
+    srv.ctx.db.db
+      .prepare('UPDATE artifact_commit_journal SET operation_payload_json = ? WHERE commit_id = ?')
+      .run(JSON.stringify(strippedPayload), j3.commit_id);
+
+    const rec3 = await srv.ctx.artifactService.recoverOnStartup();
+    expect(rec3.commits.quarantined).toBe(1);
+    expect(rec3.commits.rolledForward).toBe(0);
+    expect(fs.existsSync(f3Path)).toBe(true);
+    expect(fs.readFileSync(f3Path, 'utf8')).toBe('must-not-be-blindly-deleted');
+
+    // 4. Directory partial deletion (deleteChat): some files removed, directory + other files remain
+    const chatPartRes = await alice.request<{ chat: { id: string; workspaceDir: string } }>('POST', '/api/chats', {
+      title: 'Partial Delete Chat',
+    });
+    const chatPartId = chatPartRes.data.chat.id;
+    const chatPartWs = chatPartRes.data.chat.workspaceDir;
+    fs.writeFileSync(path.join(chatPartWs, 'first.txt'), 'first-file', 'utf8');
+    fs.mkdirSync(path.join(chatPartWs, 'nested'), { recursive: true });
+    fs.writeFileSync(path.join(chatPartWs, 'nested', 'second.txt'), 'second-file', 'utf8');
+
+    // First verify untouched intact directory at after_T3 aborts cleanly without deleting anything
+    srv.ctx.artifactService.commitFaultHook = async (stage) => {
+      if (stage === 'after_T3') throw new Error('CRASH_CHAT_INTACT_T3');
+    };
+    await expect(srv.ctx.artifactService.deleteChat({ userId, chatId: chatPartId })).rejects.toThrow('CRASH_CHAT_INTACT_T3');
+    srv.ctx.artifactService.commitFaultHook = undefined;
+    const recIntact = await srv.ctx.artifactService.recoverOnStartup();
+    expect(recIntact.commits.aborted).toBe(1);
+    expect(recIntact.commits.rolledForward).toBe(0);
+    expect(fs.existsSync(path.join(chatPartWs, 'first.txt'))).toBe(true);
+    expect(fs.existsSync(path.join(chatPartWs, 'nested', 'second.txt'))).toBe(true);
+    expect(srv.ctx.db.getChat(userId, chatPartId)).not.toBeNull();
+
+    // Now simulate mid-way partial directory deletion (first.txt removed, nested/second.txt & workspaceDir remain)
+    srv.ctx.artifactService.commitFaultHook = async (stage) => {
+      if (stage === 'before_T4') {
+        fs.unlinkSync(path.join(chatPartWs, 'first.txt'));
+        throw new Error('CRASH_MID_DIR_DELETE');
+      }
+    };
+    await expect(srv.ctx.artifactService.deleteChat({ userId, chatId: chatPartId })).rejects.toThrow('CRASH_MID_DIR_DELETE');
+    srv.ctx.artifactService.commitFaultHook = undefined;
+    // Directory still exists on disk, so existence alone would have misclassified this as intact!
+    expect(fs.existsSync(chatPartWs)).toBe(true);
+    expect(fs.existsSync(path.join(chatPartWs, 'nested', 'second.txt'))).toBe(true);
+
+    const recPartial = await srv.ctx.artifactService.recoverOnStartup();
+    expect(recPartial.commits.rolledForward).toBe(1);
+    expect(recPartial.commits.aborted).toBe(0);
+    expect(recPartial.commits.quarantined).toBe(0);
+    expect(fs.existsSync(chatPartWs)).toBe(false);
+    expect(srv.ctx.db.getChat(userId, chatPartId)).toBeNull();
+
+    // 5. Directory partial deletion + external new file creation -> MUST classify indeterminate, quarantine & preserve new file
+    const chatMixRes = await alice.request<{ chat: { id: string; workspaceDir: string } }>('POST', '/api/chats', {
+      title: 'Partial Plus External Chat',
+    });
+    const chatMixId = chatMixRes.data.chat.id;
+    const chatMixWs = chatMixRes.data.chat.workspaceDir;
+    fs.writeFileSync(path.join(chatMixWs, 'old-a.txt'), 'old-a', 'utf8');
+    fs.writeFileSync(path.join(chatMixWs, 'old-b.txt'), 'old-b', 'utf8');
+
+    srv.ctx.artifactService.commitFaultHook = async (stage) => {
+      if (stage === 'before_T4') {
+        fs.unlinkSync(path.join(chatMixWs, 'old-a.txt'));
+        throw new Error('CRASH_MID_DIR_BEFORE_EXTERNAL');
+      }
+    };
+    await expect(srv.ctx.artifactService.deleteChat({ userId, chatId: chatMixId })).rejects.toThrow('CRASH_MID_DIR_BEFORE_EXTERNAL');
+    srv.ctx.artifactService.commitFaultHook = undefined;
+
+    // External actor creates a brand-new file inside the partially deleted directory
+    fs.writeFileSync(path.join(chatMixWs, 'external-new.txt'), 'DO_NOT_DELETE_ME', 'utf8');
+
+    const recMix = await srv.ctx.artifactService.recoverOnStartup();
+    expect(recMix.commits.quarantined).toBe(1);
+    expect(recMix.commits.rolledForward).toBe(0);
+    expect(fs.existsSync(path.join(chatMixWs, 'external-new.txt'))).toBe(true);
+    expect(fs.readFileSync(path.join(chatMixWs, 'external-new.txt'), 'utf8')).toBe('DO_NOT_DELETE_ME');
+    expect(fs.existsSync(path.join(chatMixWs, 'old-b.txt'))).toBe(true);
+
+    // 6. External recreation of a deleted directory AFTER T5 (deleteChat at after_T5 / file_replaced)
+    const chatRecRes = await alice.request<{ chat: { id: string; workspaceDir: string } }>('POST', '/api/chats', {
+      title: 'Recreated Dir Chat',
+    });
+    const chatRecId = chatRecRes.data.chat.id;
+    const chatRecWs = chatRecRes.data.chat.workspaceDir;
+    fs.writeFileSync(path.join(chatRecWs, 'legacy.txt'), 'legacy', 'utf8');
+
+    srv.ctx.artifactService.commitFaultHook = async (stage) => {
+      if (stage === 'after_T5') throw new Error('CRASH_CHAT_AFTER_T5');
+    };
+    await expect(srv.ctx.artifactService.deleteChat({ userId, chatId: chatRecId })).rejects.toThrow('CRASH_CHAT_AFTER_T5');
+    srv.ctx.artifactService.commitFaultHook = undefined;
+    expect(fs.existsSync(chatRecWs)).toBe(false);
+
+    // External actor recreates the directory with brand-new content
+    fs.mkdirSync(chatRecWs, { recursive: true });
+    fs.writeFileSync(path.join(chatRecWs, 'fresh-after-delete.txt'), 'FRESH_DIR_CONTENT', 'utf8');
+
+    const recDirRecreate = await srv.ctx.artifactService.recoverOnStartup();
+    expect(recDirRecreate.commits.rolledForward).toBe(1);
+    expect(recDirRecreate.commits.quarantined).toBe(0);
+    expect(srv.ctx.db.getChat(userId, chatRecId)).toBeNull();
+    expect(fs.existsSync(path.join(chatRecWs, 'fresh-after-delete.txt'))).toBe(true);
+    expect(fs.readFileSync(path.join(chatRecWs, 'fresh-after-delete.txt'), 'utf8')).toBe('FRESH_DIR_CONTENT');
+
+    // 7. Directory partial deletion for deleteProject
+    const projPartRes = await alice.request<{ project: { id: string; storageDir: string } }>('POST', '/api/projects', {
+      name: 'Partial Delete Project',
+    });
+    const projPartId = projPartRes.data.project.id;
+    const projPartStorage = projPartRes.data.project.storageDir;
+    const projPartDir = path.dirname(projPartStorage);
+    const pA = await srv.ctx.artifactService.uploadProjectFile({
+      userId,
+      projectId: projPartId,
+      filename: 'part-a.txt',
+      mimeType: 'text/plain',
+      buffer: Buffer.from('proj-part-a', 'utf8'),
+    });
+    await srv.ctx.artifactService.uploadProjectFile({
+      userId,
+      projectId: projPartId,
+      filename: 'part-b.txt',
+      mimeType: 'text/plain',
+      buffer: Buffer.from('proj-part-b', 'utf8'),
+    });
+
+    srv.ctx.artifactService.commitFaultHook = async (stage) => {
+      if (stage === 'before_T4') {
+        fs.unlinkSync(path.join(projPartStorage, pA.file.relPath));
+        throw new Error('CRASH_MID_PROJECT_DELETE');
+      }
+    };
+    await expect(srv.ctx.artifactService.deleteProject({ userId, projectId: projPartId })).rejects.toThrow('CRASH_MID_PROJECT_DELETE');
+    srv.ctx.artifactService.commitFaultHook = undefined;
+    expect(fs.existsSync(projPartDir)).toBe(true);
+
+    const recProjPartial = await srv.ctx.artifactService.recoverOnStartup();
+    expect(recProjPartial.commits.rolledForward).toBe(1);
+    expect(recProjPartial.commits.aborted).toBe(0);
+    expect(recProjPartial.commits.quarantined).toBe(0);
+    expect(fs.existsSync(projPartDir)).toBe(false);
+    expect(srv.ctx.db.getProject(userId, projPartId)).toBeNull();
+  });
 });
+

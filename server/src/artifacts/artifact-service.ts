@@ -32,7 +32,7 @@ import type {
 import { detectArtifactFormat, FormatAdapterRegistry } from './adapters/registry.js';
 import { executeRestoreBundle, getRestoreBatchRecord, recoverPendingRestoreBatches } from './batch-restore.js';
 import { PerUserBlobManager, type BlobLease } from './blob-store.js';
-import { recoverPendingCommits, type RecoveryReport } from './commit-recovery.js';
+import { recoverPendingCommits, type DeleteTargetInspection, type RecoveryReport } from './commit-recovery.js';
 import { scanArtifactDependencies } from './dependency-manifest.js';
 import { drainDepPropagationQueue } from './dep-propagation.js';
 import { artifactConflictError, ArtifactError, unsupportedOperationError } from './errors.js';
@@ -65,6 +65,75 @@ export interface ArtifactServiceOptions {
 }
 
 const MAX_TEXT_DIFF_BYTES = 256 * 1024;
+const MAX_SUBTREE_SNAPSHOT_ENTRIES = 20_000;
+const MAX_SUBTREE_HASH_FILE_BYTES = 16 * 1024 * 1024;
+const MAX_SUBTREE_HASH_TOTAL_BYTES = 64 * 1024 * 1024;
+
+interface DeleteFileTargetIdentity {
+  existedAtT1: boolean;
+  dev: string | null;
+  ino: string | null;
+  sizeBytes: number | null;
+  sha256: string | null;
+  mtimeNs: string | null;
+  ctimeNs: string | null;
+}
+
+interface DeleteSubtreeEntryIdentity {
+  relPath: string;
+  kind: 'file' | 'dir' | 'other';
+  dev: string;
+  ino: string;
+  sizeBytes?: number | null;
+  sha256?: string | null;
+  mtimeNs?: string | null;
+  ctimeNs?: string | null;
+}
+
+interface DeleteSubtreeSnapshot {
+  existedAtT1: boolean;
+  rootDev: string | null;
+  rootIno: string | null;
+  rootMtimeNs: string | null;
+  rootCtimeNs: string | null;
+  captureComplete: boolean;
+  entries: DeleteSubtreeEntryIdentity[];
+}
+
+type DeleteJournalPayload =
+  | {
+      kind: 'delete_project_file';
+      fileId: string;
+      storageDir: string;
+      relPath: string;
+      artifactId: string | null;
+      targetIdentity?: DeleteFileTargetIdentity;
+    }
+  | {
+      kind: 'delete_project';
+      projectId: string;
+      storageDir: string;
+      projectSubtreeRel: string | null;
+      fileRelPaths: string[];
+      artifacts: Array<{ id: string; relPath: string }>;
+      subtreeSnapshot?: DeleteSubtreeSnapshot;
+    }
+  | {
+      kind: 'delete_sync_file';
+      chatId: string;
+      workspaceDir: string;
+      relPath: string;
+      artifactId: string | null;
+      targetIdentity?: DeleteFileTargetIdentity;
+    }
+  | {
+      kind: 'delete_chat';
+      chatId: string;
+      workspaceDir: string;
+      chatSubtreeRel: string | null;
+      artifacts: Array<{ id: string; relPath: string }>;
+      subtreeSnapshot?: DeleteSubtreeSnapshot;
+    };
 
 function maybeTextDiff(relPath: string, prevBuf: Buffer | null, nextBuf: Buffer): string | null {
   if (nextBuf.length > MAX_TEXT_DIFF_BYTES) return null;
@@ -196,8 +265,8 @@ export class ArtifactService {
       blobManager: this.blobManager,
       resolveScopeRootDir: (u, sk, cid, pid) => this.resolveScopeRootDir(u, sk, cid, pid),
       finalizeStageT6InTx: (j, opts) => this.finalizeStageT6InTx(j, opts),
-      inspectDeleteTargetIntact: (j) => this.inspectDeleteTargetIntact(j),
-      performDeleteFsCleanup: (j) => this.performDeleteFsCleanup(j),
+      inspectDeleteTarget: (j) => this.inspectDeleteTarget(j),
+      performVerifiedPartialDeleteCleanup: (j) => this.performVerifiedPartialDeleteCleanup(j),
       finalizeDeleteStageT6InTx: (j) => this.finalizeDeleteStageT6InTx(j),
       recordExternalSyncOnRecovery: (p) => this.recordExternalSyncOnRecovery(p),
     });
@@ -1907,25 +1976,7 @@ export class ArtifactService {
     return { artifact, file };
   }
 
-  private parseDeleteJournalPayload(journal: ArtifactCommitJournalRow):
-    | { kind: 'delete_project_file'; fileId: string; storageDir: string; relPath: string; artifactId: string | null }
-    | {
-        kind: 'delete_project';
-        projectId: string;
-        storageDir: string;
-        projectSubtreeRel: string | null;
-        fileRelPaths: string[];
-        artifacts: Array<{ id: string; relPath: string }>;
-      }
-    | { kind: 'delete_sync_file'; chatId: string; workspaceDir: string; relPath: string; artifactId: string | null }
-    | {
-        kind: 'delete_chat';
-        chatId: string;
-        workspaceDir: string;
-        chatSubtreeRel: string | null;
-        artifacts: Array<{ id: string; relPath: string }>;
-      }
-    | null {
+  private parseDeleteJournalPayload(journal: ArtifactCommitJournalRow): DeleteJournalPayload | null {
     if (!journal.operationPayloadJson) return null;
     try {
       const parsed = JSON.parse(journal.operationPayloadJson) as Record<string, unknown>;
@@ -1935,7 +1986,7 @@ export class ArtifactService {
         parsed.kind === 'delete_sync_file' ||
         parsed.kind === 'delete_chat'
       ) {
-        return parsed as ReturnType<ArtifactService['parseDeleteJournalPayload']>;
+        return parsed as DeleteJournalPayload;
       }
       return null;
     } catch {
@@ -1943,60 +1994,789 @@ export class ArtifactService {
     }
   }
 
-  private inspectDeleteTargetIntact(journal: ArtifactCommitJournalRow): boolean {
-    const payload = this.parseDeleteJournalPayload(journal);
-    if (!payload) return false;
-    if (payload.kind === 'delete_project_file') {
-      if (!fs.existsSync(payload.storageDir)) return false;
-      try {
-        const opened = openContainedRegularFileNoFollow(payload.storageDir, payload.relPath, { allowHardlinks: true });
-        fs.closeSync(opened.fd);
-        return true;
-      } catch (err) {
-        return (err as NodeJS.ErrnoException).code !== 'ENOENT';
-      }
+  private captureFileTargetIdentityNoFollow(rootDir: string, relPath: string): DeleteFileTargetIdentity {
+    if (!fs.existsSync(rootDir)) {
+      return {
+        existedAtT1: false,
+        dev: null,
+        ino: null,
+        sizeBytes: null,
+        sha256: null,
+        mtimeNs: null,
+        ctimeNs: null,
+      };
     }
-    if (payload.kind === 'delete_sync_file') {
-      if (!fs.existsSync(payload.workspaceDir)) return false;
-      try {
-        const opened = openContainedRegularFileNoFollow(payload.workspaceDir, payload.relPath, { allowHardlinks: true });
-        fs.closeSync(opened.fd);
-        return true;
-      } catch (err) {
-        return (err as NodeJS.ErrnoException).code !== 'ENOENT';
+    let opened: ReturnType<typeof openContainedRegularFileNoFollow>;
+    try {
+      opened = openContainedRegularFileNoFollow(rootDir, relPath, { allowHardlinks: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return {
+          existedAtT1: false,
+          dev: null,
+          ino: null,
+          sizeBytes: null,
+          sha256: null,
+          mtimeNs: null,
+          ctimeNs: null,
+        };
       }
+      throw err;
     }
-    if (payload.kind === 'delete_project') {
-      if (!fs.existsSync(path.dirname(payload.storageDir))) return false;
-      if (payload.fileRelPaths.length > 0 && !fs.existsSync(payload.storageDir)) return false;
-      for (const rel of payload.fileRelPaths) {
+    try {
+      const { sha256 } = sha256Fd(opened.fd);
+      return {
+        existedAtT1: true,
+        dev: opened.stat.dev.toString(),
+        ino: opened.stat.ino.toString(),
+        sizeBytes: Number(opened.stat.size),
+        sha256,
+        mtimeNs: opened.stat.mtimeNs.toString(),
+        ctimeNs: opened.stat.ctimeNs.toString(),
+      };
+    } finally {
+      fs.closeSync(opened.fd);
+    }
+  }
+
+  private captureSubtreeSnapshotNoFollow(parentRootDir: string, relSubtreePath: string | null): DeleteSubtreeSnapshot {
+    if (!relSubtreePath || relSubtreePath.startsWith('..') || path.isAbsolute(relSubtreePath)) {
+      return {
+        existedAtT1: false,
+        rootDev: null,
+        rootIno: null,
+        rootMtimeNs: null,
+        rootCtimeNs: null,
+        captureComplete: false,
+        entries: [],
+      };
+    }
+    if (!fs.existsSync(parentRootDir)) {
+      return {
+        existedAtT1: false,
+        rootDev: null,
+        rootIno: null,
+        rootMtimeNs: null,
+        rootCtimeNs: null,
+        captureComplete: true,
+        entries: [],
+      };
+    }
+
+    const normalized = normalizeRelPath(relSubtreePath);
+    const segments = normalized.split('/');
+    const targetName = segments.pop()!;
+    const parentRel = segments.join('/');
+
+    let parentFd: number;
+    try {
+      ({ dirFd: parentFd } = ensureContainedDirectoryNoFollow(parentRootDir, parentRel, { createMissing: false }));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return {
+          existedAtT1: false,
+          rootDev: null,
+          rootIno: null,
+          rootMtimeNs: null,
+          rootCtimeNs: null,
+          captureComplete: true,
+          entries: [],
+        };
+      }
+      return {
+        existedAtT1: true,
+        rootDev: null,
+        rootIno: null,
+        rootMtimeNs: null,
+        rootCtimeNs: null,
+        captureComplete: false,
+        entries: [],
+      };
+    }
+
+    const { O_RDONLY, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
+    try {
+      const targetPath = `/proc/self/fd/${parentFd}/${targetName}`;
+      let rootLst: fs.BigIntStats;
+      try {
+        rootLst = fs.lstatSync(targetPath, { bigint: true });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          return {
+            existedAtT1: false,
+            rootDev: null,
+            rootIno: null,
+            rootMtimeNs: null,
+            rootCtimeNs: null,
+            captureComplete: true,
+            entries: [],
+          };
+        }
+        return {
+          existedAtT1: true,
+          rootDev: null,
+          rootIno: null,
+          rootMtimeNs: null,
+          rootCtimeNs: null,
+          captureComplete: false,
+          entries: [],
+        };
+      }
+
+      if (rootLst.isSymbolicLink() || !rootLst.isDirectory()) {
+        return {
+          existedAtT1: true,
+          rootDev: null,
+          rootIno: null,
+          rootMtimeNs: null,
+          rootCtimeNs: null,
+          captureComplete: false,
+          entries: [],
+        };
+      }
+
+      let rootDirFd: number;
+      try {
+        rootDirFd = fs.openSync(targetPath, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+      } catch {
+        return {
+          existedAtT1: true,
+          rootDev: null,
+          rootIno: null,
+          rootMtimeNs: null,
+          rootCtimeNs: null,
+          captureComplete: false,
+          entries: [],
+        };
+      }
+
+      const entries: DeleteSubtreeEntryIdentity[] = [];
+      let captureComplete = true;
+      let totalHashedBytes = 0;
+
+      try {
+        const rootSt = fs.fstatSync(rootDirFd, { bigint: true });
+        const walkDir = (dirFd: number, relPrefix: string) => {
+          if (!captureComplete) return;
+          const dirProc = `/proc/self/fd/${dirFd}`;
+          let dirents: fs.Dirent[];
+          try {
+            dirents = fs.readdirSync(dirProc, { withFileTypes: true });
+          } catch {
+            captureComplete = false;
+            return;
+          }
+          for (const entry of dirents) {
+            if (entries.length >= MAX_SUBTREE_SNAPSHOT_ENTRIES) {
+              captureComplete = false;
+              return;
+            }
+            const childPath = `${dirProc}/${entry.name}`;
+            const childRel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
+            let lst: fs.BigIntStats;
+            try {
+              lst = fs.lstatSync(childPath, { bigint: true });
+            } catch (err) {
+              if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+              captureComplete = false;
+              return;
+            }
+            if (lst.isSymbolicLink() || (!lst.isDirectory() && !lst.isFile())) {
+              entries.push({
+                relPath: childRel,
+                kind: 'other',
+                dev: lst.dev.toString(),
+                ino: lst.ino.toString(),
+                mtimeNs: lst.mtimeNs.toString(),
+                ctimeNs: lst.ctimeNs.toString(),
+              });
+              continue;
+            }
+            if (lst.isDirectory()) {
+              let childFd: number;
+              try {
+                childFd = fs.openSync(childPath, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+              } catch (err) {
+                if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+                captureComplete = false;
+                return;
+              }
+              try {
+                const st = fs.fstatSync(childFd, { bigint: true });
+                entries.push({
+                  relPath: childRel,
+                  kind: 'dir',
+                  dev: st.dev.toString(),
+                  ino: st.ino.toString(),
+                });
+                walkDir(childFd, childRel);
+              } finally {
+                try {
+                  fs.closeSync(childFd);
+                } catch {
+                  // ignore
+                }
+              }
+              continue;
+            }
+            // Regular file
+            let fileFd: number;
+            try {
+              fileFd = fs.openSync(childPath, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+            } catch (err) {
+              if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+              captureComplete = false;
+              return;
+            }
+            try {
+              const st = fs.fstatSync(fileFd, { bigint: true });
+              if (!st.isFile()) {
+                captureComplete = false;
+                return;
+              }
+              const sizeBytes = Number(st.size);
+              let sha256: string | null = null;
+              if (sizeBytes <= MAX_SUBTREE_HASH_FILE_BYTES && totalHashedBytes + sizeBytes <= MAX_SUBTREE_HASH_TOTAL_BYTES) {
+                sha256 = sha256Fd(fileFd).sha256;
+                totalHashedBytes += sizeBytes;
+              }
+              entries.push({
+                relPath: childRel,
+                kind: 'file',
+                dev: st.dev.toString(),
+                ino: st.ino.toString(),
+                sizeBytes,
+                sha256,
+                mtimeNs: st.mtimeNs.toString(),
+                ctimeNs: st.ctimeNs.toString(),
+              });
+            } finally {
+              try {
+                fs.closeSync(fileFd);
+              } catch {
+                // ignore
+              }
+            }
+          }
+        };
+
+        walkDir(rootDirFd, '');
+        return {
+          existedAtT1: true,
+          rootDev: rootSt.dev.toString(),
+          rootIno: rootSt.ino.toString(),
+          rootMtimeNs: rootSt.mtimeNs.toString(),
+          rootCtimeNs: rootSt.ctimeNs.toString(),
+          captureComplete,
+          entries,
+        };
+      } finally {
         try {
-          const opened = openContainedRegularFileNoFollow(payload.storageDir, rel, { allowHardlinks: true });
-          fs.closeSync(opened.fd);
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+          fs.closeSync(rootDirFd);
+        } catch {
+          // ignore
         }
       }
-      return true;
+    } finally {
+      try {
+        fs.closeSync(parentFd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  private inspectSingleFileDeleteTarget(
+    rootDir: string,
+    relPath: string,
+    targetIdentity: DeleteFileTargetIdentity | undefined,
+    journalState: ArtifactCommitJournalRow['state']
+  ): DeleteTargetInspection {
+    const absentAtT1 = targetIdentity ? !targetIdentity.existedAtT1 : undefined;
+    if (!fs.existsSync(rootDir)) {
+      return { status: 'deleted', detail: 'root_dir_absent', absentAtT1 };
+    }
+
+    let opened: ReturnType<typeof openContainedRegularFileNoFollow>;
+    try {
+      opened = openContainedRegularFileNoFollow(rootDir, relPath, { allowHardlinks: true });
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') {
+        return { status: 'deleted', detail: 'target_absent', absentAtT1 };
+      }
+      return { status: 'indeterminate', detail: `target_unreadable_or_non_regular:${code ?? 'containment'}`, absentAtT1 };
+    }
+
+    let liveDev: string;
+    let liveIno: string;
+    let liveSize: number;
+    let liveSha256: string;
+    let liveMtimeNs: string;
+    let liveCtimeNs: string;
+    try {
+      const { sha256 } = sha256Fd(opened.fd);
+      liveDev = opened.stat.dev.toString();
+      liveIno = opened.stat.ino.toString();
+      liveSize = Number(opened.stat.size);
+      liveSha256 = sha256;
+      liveMtimeNs = opened.stat.mtimeNs.toString();
+      liveCtimeNs = opened.stat.ctimeNs.toString();
+    } catch (err) {
+      return { status: 'indeterminate', detail: `target_read_error:${(err as NodeJS.ErrnoException).code ?? 'error'}`, absentAtT1 };
+    } finally {
+      fs.closeSync(opened.fd);
+    }
+
+    if (!targetIdentity) {
+      return { status: 'indeterminate', detail: 'missing_t1_file_identity' };
+    }
+    if (!targetIdentity.existedAtT1) {
+      return { status: 'externally_recreated', detail: 'absent_at_t1_now_exists', absentAtT1: true };
+    }
+
+    const exactMatch =
+      liveDev === targetIdentity.dev &&
+      liveIno === targetIdentity.ino &&
+      liveSize === targetIdentity.sizeBytes &&
+      liveSha256 === targetIdentity.sha256 &&
+      liveMtimeNs === targetIdentity.mtimeNs &&
+      liveCtimeNs === targetIdentity.ctimeNs;
+
+    if (exactMatch) {
+      return { status: 'intact', detail: 'exact_t1_file_identity_match', absentAtT1: false };
+    }
+
+    if (liveDev !== targetIdentity.dev || liveIno !== targetIdentity.ino) {
+      return { status: 'externally_recreated', detail: 'file_dev_ino_changed', absentAtT1: false };
+    }
+
+    // Same dev+ino, but content/size/timestamps changed:
+    // If T5 ('file_replaced') already confirmed T4 unlinked the original, this reused-inode file is provably a recreation.
+    // Otherwise ('replacing'/'prepared'), it is ambiguous between an in-place edit before unlink vs unlink + inode-reused recreate.
+    if (journalState === 'file_replaced') {
+      return { status: 'externally_recreated', detail: 'post_t5_reused_ino_changed', absentAtT1: false };
+    }
+    return { status: 'indeterminate', detail: 'same_ino_content_or_timestamp_changed', absentAtT1: false };
+  }
+
+  private inspectSubtreeDeleteTarget(
+    parentRootDir: string,
+    relSubtreePath: string | null,
+    snapshot: DeleteSubtreeSnapshot | undefined,
+    journalState: ArtifactCommitJournalRow['state']
+  ): DeleteTargetInspection {
+    const absentAtT1 = snapshot ? !snapshot.existedAtT1 : undefined;
+    if (!relSubtreePath || relSubtreePath.startsWith('..') || path.isAbsolute(relSubtreePath)) {
+      return { status: 'indeterminate', detail: 'invalid_subtree_rel', absentAtT1 };
+    }
+    if (!fs.existsSync(parentRootDir)) {
+      return { status: 'deleted', detail: 'parent_root_absent', absentAtT1 };
+    }
+
+    const normalized = normalizeRelPath(relSubtreePath);
+    const segments = normalized.split('/');
+    const targetName = segments.pop()!;
+    const parentRel = segments.join('/');
+
+    let parentFd: number;
+    try {
+      ({ dirFd: parentFd } = ensureContainedDirectoryNoFollow(parentRootDir, parentRel, { createMissing: false }));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return { status: 'deleted', detail: 'parent_dir_absent', absentAtT1 };
+      }
+      return { status: 'indeterminate', detail: 'parent_dir_inaccessible', absentAtT1 };
+    }
+
+    try {
+      const targetPath = `/proc/self/fd/${parentFd}/${targetName}`;
+      let rootLst: fs.BigIntStats;
+      try {
+        rootLst = fs.lstatSync(targetPath, { bigint: true });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          return { status: 'deleted', detail: 'subtree_root_absent', absentAtT1 };
+        }
+        return { status: 'indeterminate', detail: 'subtree_root_stat_error', absentAtT1 };
+      }
+      if (rootLst.isSymbolicLink() || !rootLst.isDirectory()) {
+        return { status: 'indeterminate', detail: 'subtree_root_not_directory', absentAtT1 };
+      }
+    } finally {
+      try {
+        fs.closeSync(parentFd);
+      } catch {
+        // ignore
+      }
+    }
+
+    if (!snapshot || !snapshot.captureComplete) {
+      return { status: 'indeterminate', detail: 'missing_or_incomplete_t1_subtree_snapshot', absentAtT1 };
+    }
+    if (!snapshot.existedAtT1) {
+      return { status: 'externally_recreated', detail: 'subtree_absent_at_t1_now_exists', absentAtT1: true };
+    }
+
+    const live = this.captureSubtreeSnapshotNoFollow(parentRootDir, relSubtreePath);
+    if (!live.existedAtT1) {
+      return { status: 'deleted', detail: 'subtree_removed_during_scan', absentAtT1: false };
+    }
+    if (!live.captureComplete) {
+      return { status: 'indeterminate', detail: 'live_subtree_scan_incomplete', absentAtT1: false };
+    }
+
+    if (live.rootDev !== snapshot.rootDev || live.rootIno !== snapshot.rootIno) {
+      return { status: 'externally_recreated', detail: 'subtree_root_dev_ino_changed', absentAtT1: false };
+    }
+
+    const t1Map = new Map<string, DeleteSubtreeEntryIdentity>();
+    for (const e of snapshot.entries) t1Map.set(e.relPath, e);
+    const liveMap = new Map<string, DeleteSubtreeEntryIdentity>();
+    for (const e of live.entries) liveMap.set(e.relPath, e);
+
+    let matchedT1 = 0;
+    let mismatchedT1 = 0;
+    let unexpectedLive = 0;
+
+    for (const [rel, liveE] of liveMap.entries()) {
+      const t1E = t1Map.get(rel);
+      if (!t1E) {
+        unexpectedLive += 1;
+        continue;
+      }
+      if (liveE.kind !== t1E.kind || liveE.dev !== t1E.dev || liveE.ino !== t1E.ino) {
+        mismatchedT1 += 1;
+        continue;
+      }
+      if (t1E.kind === 'file') {
+        const hashMatches = t1E.sha256 == null || liveE.sha256 === t1E.sha256;
+        if (
+          liveE.sizeBytes !== t1E.sizeBytes ||
+          liveE.mtimeNs !== t1E.mtimeNs ||
+          liveE.ctimeNs !== t1E.ctimeNs ||
+          !hashMatches
+        ) {
+          mismatchedT1 += 1;
+          continue;
+        }
+      } else if (t1E.kind === 'other') {
+        if (liveE.mtimeNs !== t1E.mtimeNs || liveE.ctimeNs !== t1E.ctimeNs) {
+          mismatchedT1 += 1;
+          continue;
+        }
+      }
+      matchedT1 += 1;
+    }
+
+    const missingT1 = t1Map.size - (matchedT1 + mismatchedT1);
+
+    if (unexpectedLive > 0 || mismatchedT1 > 0) {
+      if (matchedT1 === 0) {
+        return {
+          status: 'externally_recreated',
+          detail: `subtree_external_entries(unexpected=${unexpectedLive},mismatched=${mismatchedT1})`,
+          absentAtT1: false,
+        };
+      }
+      return {
+        status: 'indeterminate',
+        detail: `subtree_mixed_entries(matched=${matchedT1},missing=${missingT1},unexpected=${unexpectedLive},mismatched=${mismatchedT1})`,
+        absentAtT1: false,
+      };
+    }
+
+    // Zero unexpected entries and zero mismatched entries
+    if (t1Map.size === 0) {
+      if (live.rootMtimeNs === snapshot.rootMtimeNs && live.rootCtimeNs === snapshot.rootCtimeNs) {
+        return { status: 'intact', detail: 'empty_subtree_root_untouched', absentAtT1: false };
+      }
+      if (journalState === 'file_replaced') {
+        return { status: 'externally_recreated', detail: 'post_t5_empty_subtree_recreated_reused_ino', absentAtT1: false };
+      }
+      return { status: 'indeterminate', detail: 'empty_subtree_timestamps_changed', absentAtT1: false };
+    }
+
+    if (missingT1 === 0) {
+      return { status: 'intact', detail: `all_t1_entries_intact(${matchedT1})`, absentAtT1: false };
+    }
+
+    if (journalState === 'file_replaced') {
+      if (liveMap.size === 0) {
+        return { status: 'externally_recreated', detail: 'post_t5_empty_dir_recreated_reused_ino', absentAtT1: false };
+      }
+      return { status: 'indeterminate', detail: `post_t5_t1_entries_still_present(${matchedT1})`, absentAtT1: false };
+    }
+
+    return {
+      status: 'partially_deleted',
+      detail: `subtree_partial_delete(missing=${missingT1},remaining=${matchedT1})`,
+      absentAtT1: false,
+    };
+  }
+
+  private inspectDeleteTarget(journal: ArtifactCommitJournalRow): DeleteTargetInspection {
+    const payload = this.parseDeleteJournalPayload(journal);
+    if (!payload) {
+      return { status: 'indeterminate', detail: 'missing_or_invalid_delete_payload' };
+    }
+    if (payload.kind === 'delete_project_file') {
+      return this.inspectSingleFileDeleteTarget(payload.storageDir, payload.relPath, payload.targetIdentity, journal.state);
+    }
+    if (payload.kind === 'delete_sync_file') {
+      return this.inspectSingleFileDeleteTarget(payload.workspaceDir, payload.relPath, payload.targetIdentity, journal.state);
+    }
+    if (payload.kind === 'delete_project') {
+      return this.inspectSubtreeDeleteTarget(
+        this.config.projectsRoot,
+        payload.projectSubtreeRel,
+        payload.subtreeSnapshot,
+        journal.state
+      );
     }
     if (payload.kind === 'delete_chat') {
-      return fs.existsSync(payload.workspaceDir);
+      return this.inspectSubtreeDeleteTarget(
+        this.config.workspacesRoot,
+        payload.chatSubtreeRel,
+        payload.subtreeSnapshot,
+        journal.state
+      );
     }
-    return false;
+    return { status: 'indeterminate', detail: 'unknown_delete_kind' };
+  }
+
+  /**
+   * Completes a verified mid-way subtree deletion during crash recovery.
+   * NEVER uses recursive deletion: every remaining file/entry/directory is individually verified
+   * against its T1 snapshot identity (`dev`, `ino`, `sizeBytes`, `sha256`, `mtimeNs`, `ctimeNs`)
+   * before unlinking or non-recursive `rmdirSync`. Any mismatch or unexpected entry aborts immediately.
+   */
+  private performVerifiedPartialDeleteCleanup(journal: ArtifactCommitJournalRow): { ok: true } | { ok: false; reason: string } {
+    const payload = this.parseDeleteJournalPayload(journal);
+    if (!payload || (payload.kind !== 'delete_project' && payload.kind !== 'delete_chat')) {
+      return { ok: false, reason: 'not_subtree_delete' };
+    }
+    const parentRootDir = payload.kind === 'delete_project' ? this.config.projectsRoot : this.config.workspacesRoot;
+    const relSubtreePath = payload.kind === 'delete_project' ? payload.projectSubtreeRel : payload.chatSubtreeRel;
+    const snapshot = payload.subtreeSnapshot;
+
+    if (!relSubtreePath || relSubtreePath.startsWith('..') || path.isAbsolute(relSubtreePath)) {
+      return { ok: false, reason: 'invalid_subtree_rel' };
+    }
+    if (!snapshot || !snapshot.captureComplete || !snapshot.existedAtT1 || !snapshot.rootDev || !snapshot.rootIno) {
+      return { ok: false, reason: 'incomplete_t1_snapshot' };
+    }
+
+    const normalized = normalizeRelPath(relSubtreePath);
+    const segments = normalized.split('/');
+    const targetName = segments.pop()!;
+    const parentRel = segments.join('/');
+
+    let parentFd: number;
+    let parentRootReal: string;
+    try {
+      const opened = ensureContainedDirectoryNoFollow(parentRootDir, parentRel, { createMissing: false });
+      parentFd = opened.dirFd;
+      parentRootReal = opened.rootReal;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { ok: true };
+      return { ok: false, reason: 'parent_dir_inaccessible' };
+    }
+
+    try {
+      const rootTargetPath = `/proc/self/fd/${parentFd}/${targetName}`;
+      let rootLst: fs.BigIntStats;
+      try {
+        rootLst = fs.lstatSync(rootTargetPath, { bigint: true });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { ok: true };
+        return { ok: false, reason: 'subtree_root_stat_error' };
+      }
+      if (
+        rootLst.isSymbolicLink() ||
+        !rootLst.isDirectory() ||
+        rootLst.dev.toString() !== snapshot.rootDev ||
+        rootLst.ino.toString() !== snapshot.rootIno
+      ) {
+        return { ok: false, reason: 'subtree_root_identity_mismatch' };
+      }
+
+      const subtreeRootAbs = path.join(parentRootReal, ...segments, targetName);
+      const depthOf = (rel: string) => rel.split('/').length;
+
+      // 1. Verify and unlink remaining T1 non-directory entries (deepest first)
+      const nonDirs = snapshot.entries
+        .filter((e) => e.kind !== 'dir')
+        .sort((a, b) => depthOf(b.relPath) - depthOf(a.relPath));
+
+      for (const entry of nonDirs) {
+        if (entry.kind === 'file') {
+          let openedFile: ReturnType<typeof openContainedRegularFileNoFollow>;
+          try {
+            openedFile = openContainedRegularFileNoFollow(subtreeRootAbs, entry.relPath, { allowHardlinks: true });
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+            return { ok: false, reason: `file_open_failed:${entry.relPath}` };
+          }
+          let matches = false;
+          try {
+            const st = openedFile.stat;
+            const hashMatches = entry.sha256 == null || sha256Fd(openedFile.fd).sha256 === entry.sha256;
+            matches =
+              st.dev.toString() === entry.dev &&
+              st.ino.toString() === entry.ino &&
+              Number(st.size) === entry.sizeBytes &&
+              st.mtimeNs.toString() === entry.mtimeNs &&
+              st.ctimeNs.toString() === entry.ctimeNs &&
+              hashMatches;
+          } finally {
+            fs.closeSync(openedFile.fd);
+          }
+          if (!matches) {
+            return { ok: false, reason: `file_identity_mismatch:${entry.relPath}` };
+          }
+          unlinkContainedRegularFileNoFollow(subtreeRootAbs, entry.relPath);
+        } else {
+          const entrySegs = normalizeRelPath(entry.relPath).split('/');
+          const leaf = entrySegs.pop()!;
+          const entryParentRel = entrySegs.join('/');
+          let entryParentFd: number;
+          try {
+            ({ dirFd: entryParentFd } = ensureContainedDirectoryNoFollow(subtreeRootAbs, entryParentRel, { createMissing: false }));
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+            return { ok: false, reason: `entry_parent_inaccessible:${entry.relPath}` };
+          }
+          try {
+            const leafPath = `/proc/self/fd/${entryParentFd}/${leaf}`;
+            let lst: fs.BigIntStats;
+            try {
+              lst = fs.lstatSync(leafPath, { bigint: true });
+            } catch (err) {
+              if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+              return { ok: false, reason: `entry_stat_failed:${entry.relPath}` };
+            }
+            if (
+              lst.isDirectory() ||
+              lst.dev.toString() !== entry.dev ||
+              lst.ino.toString() !== entry.ino ||
+              lst.mtimeNs.toString() !== entry.mtimeNs ||
+              lst.ctimeNs.toString() !== entry.ctimeNs
+            ) {
+              return { ok: false, reason: `entry_identity_mismatch:${entry.relPath}` };
+            }
+            try {
+              fs.unlinkSync(leafPath);
+              fs.fsyncSync(entryParentFd);
+            } catch (err) {
+              if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+                return { ok: false, reason: `entry_unlink_failed:${entry.relPath}` };
+              }
+            }
+          } finally {
+            try {
+              fs.closeSync(entryParentFd);
+            } catch {
+              // ignore
+            }
+          }
+        }
+      }
+
+      // 2. Verify and rmdir (non-recursive!) remaining T1 subdirectories (deepest first)
+      const dirs = snapshot.entries
+        .filter((e) => e.kind === 'dir')
+        .sort((a, b) => depthOf(b.relPath) - depthOf(a.relPath));
+
+      for (const entry of dirs) {
+        const entrySegs = normalizeRelPath(entry.relPath).split('/');
+        const leaf = entrySegs.pop()!;
+        const entryParentRel = entrySegs.join('/');
+        let entryParentFd: number;
+        try {
+          ({ dirFd: entryParentFd } = ensureContainedDirectoryNoFollow(subtreeRootAbs, entryParentRel, { createMissing: false }));
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+          return { ok: false, reason: `dir_parent_inaccessible:${entry.relPath}` };
+        }
+        try {
+          const dirPath = `/proc/self/fd/${entryParentFd}/${leaf}`;
+          let lst: fs.BigIntStats;
+          try {
+            lst = fs.lstatSync(dirPath, { bigint: true });
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+            return { ok: false, reason: `dir_stat_failed:${entry.relPath}` };
+          }
+          if (
+            lst.isSymbolicLink() ||
+            !lst.isDirectory() ||
+            lst.dev.toString() !== entry.dev ||
+            lst.ino.toString() !== entry.ino
+          ) {
+            return { ok: false, reason: `dir_identity_mismatch:${entry.relPath}` };
+          }
+          try {
+            fs.rmdirSync(dirPath);
+            fs.fsyncSync(entryParentFd);
+          } catch (err) {
+            const code = (err as NodeJS.ErrnoException).code;
+            if (code === 'ENOENT') continue;
+            return { ok: false, reason: `dir_rmdir_failed:${code ?? 'error'}:${entry.relPath}` };
+          }
+        } finally {
+          try {
+            fs.closeSync(entryParentFd);
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      // 3. Re-verify subtree root identity and non-recursively rmdir it (fails if any unexpected file exists)
+      try {
+        const finalLst = fs.lstatSync(rootTargetPath, { bigint: true });
+        if (
+          finalLst.isSymbolicLink() ||
+          !finalLst.isDirectory() ||
+          finalLst.dev.toString() !== snapshot.rootDev ||
+          finalLst.ino.toString() !== snapshot.rootIno
+        ) {
+          return { ok: false, reason: 'subtree_root_changed_before_rmdir' };
+        }
+        fs.rmdirSync(rootTargetPath);
+        fs.fsyncSync(parentFd);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT') {
+          return { ok: false, reason: `subtree_root_rmdir_failed:${code ?? 'error'}` };
+        }
+      }
+      return { ok: true };
+    } finally {
+      try {
+        fs.closeSync(parentFd);
+      } catch {
+        // ignore
+      }
+    }
   }
 
   private performDeleteFsCleanup(journal: ArtifactCommitJournalRow): void {
     const payload = this.parseDeleteJournalPayload(journal);
     if (!payload) return;
     if (payload.kind === 'delete_project_file') {
+      if (payload.targetIdentity && !payload.targetIdentity.existedAtT1) return;
       unlinkContainedRegularFileNoFollow(payload.storageDir, payload.relPath);
       return;
     }
     if (payload.kind === 'delete_sync_file') {
+      if (payload.targetIdentity && !payload.targetIdentity.existedAtT1) return;
       unlinkContainedRegularFileNoFollow(payload.workspaceDir, payload.relPath);
       return;
     }
     if (payload.kind === 'delete_project') {
+      if (payload.subtreeSnapshot && !payload.subtreeSnapshot.existedAtT1) return;
       if (fs.existsSync(payload.storageDir)) {
         for (const rel of payload.fileRelPaths) {
           unlinkContainedRegularFileNoFollow(payload.storageDir, rel);
@@ -2012,6 +2792,7 @@ export class ArtifactService {
       return;
     }
     if (payload.kind === 'delete_chat') {
+      if (payload.subtreeSnapshot && !payload.subtreeSnapshot.existedAtT1) return;
       if (
         payload.chatSubtreeRel &&
         !payload.chatSubtreeRel.startsWith('..') &&
@@ -2220,6 +3001,15 @@ export class ArtifactService {
       finalTargetPath: params.relPath,
     };
 
+    const expectedPrevSha256 =
+      params.payload.kind === 'delete_project_file' || params.payload.kind === 'delete_sync_file'
+        ? params.payload.targetIdentity?.sha256 ?? null
+        : null;
+    const expectedPrevIno =
+      params.payload.kind === 'delete_project_file' || params.payload.kind === 'delete_sync_file'
+        ? params.payload.targetIdentity?.ino ?? null
+        : params.payload.subtreeSnapshot?.rootIno ?? null;
+
     const journalObj: ArtifactCommitJournalRow = {
       commitId,
       artifactId: params.artifactId,
@@ -2231,8 +3021,8 @@ export class ArtifactService {
       isCreate: false,
       targetRevision: 0,
       parentRevision: null,
-      expectedPrevSha256: null,
-      expectedPrevIno: null,
+      expectedPrevSha256,
+      expectedPrevIno,
       newSha256: '',
       newDependencyManifestHash: null,
       newDeps: [],
@@ -2263,7 +3053,7 @@ export class ArtifactService {
     let journalInserted = false;
     try {
       await this.commitFaultHook?.('before_T1', faultCtx);
-      // T1: Persist delete intent in artifact_commit_journal BEFORE any filesystem unlink
+      // T1: Persist delete intent + target identity snapshot in artifact_commit_journal BEFORE any filesystem unlink
       this.db.db
         .prepare(
           `INSERT INTO artifact_commit_journal (
@@ -2274,7 +3064,7 @@ export class ArtifactService {
              actor_kind, actor_id, operation_type, operation_summary, operation_payload_json,
              batch_id, batch_seq, staging_isolation_mode, idempotency_scope_key, idempotency_key,
              request_fingerprint, diff_patch, state, created_at, updated_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, NULL, NULL, '', NULL, '[]', 0, NULL, '', '', NULL,
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, ?, ?, '', NULL, '[]', 0, NULL, '', '', NULL,
                      'user', ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL, NULL, 'prepared', ?, ?)`
         )
         .run(
@@ -2285,6 +3075,8 @@ export class ArtifactService {
           params.projectId,
           params.scopeKind,
           params.relPath,
+          expectedPrevSha256,
+          expectedPrevIno,
           params.userId,
           params.payload.kind,
           params.operationSummary,
@@ -2347,7 +3139,11 @@ export class ArtifactService {
         const row = this.db.db
           .prepare('SELECT state FROM artifact_commit_journal WHERE commit_id = ?')
           .get(commitId) as { state: string } | undefined;
-        if (row && (row.state === 'prepared' || (row.state === 'replacing' && this.inspectDeleteTargetIntact(journalObj)))) {
+        if (
+          row &&
+          (row.state === 'prepared' ||
+            (row.state === 'replacing' && this.inspectDeleteTarget(journalObj).status === 'intact'))
+        ) {
           this.db.db
             .prepare("UPDATE artifact_commit_journal SET state = 'aborted', audit_note = ?, updated_at = ? WHERE commit_id = ?")
             .run(`delete_fs_error:${err instanceof Error ? err.message.slice(0, 120) : 'error'}`, Date.now(), commitId);
@@ -2384,6 +3180,7 @@ export class ArtifactService {
         throw new ArtifactError('NOT_FOUND', 'ファイルが見つかりません。', 404);
       }
 
+      const targetIdentity = this.captureFileTargetIdentityNoFollow(liveProj.storageDir, livePf.relPath);
       await this.executeJournaledDelete({
         userId: params.userId,
         scopeKind: 'project',
@@ -2398,6 +3195,7 @@ export class ArtifactService {
           storageDir: liveProj.storageDir,
           relPath: livePf.relPath,
           artifactId: livePf.artifactId ?? null,
+          targetIdentity,
         },
       });
     });
@@ -2452,6 +3250,7 @@ export class ArtifactService {
           ? relProjSubtree
           : null;
 
+      const subtreeSnapshot = this.captureSubtreeSnapshotNoFollow(this.config.projectsRoot, safeSubtreeRel);
       await this.executeJournaledDelete({
         userId: params.userId,
         scopeKind: 'project',
@@ -2467,6 +3266,7 @@ export class ArtifactService {
           projectSubtreeRel: safeSubtreeRel,
           fileRelPaths: liveFiles.map((f) => f.relPath),
           artifacts: liveArtifacts.map((a) => ({ id: a.id, relPath: a.relPath })),
+          subtreeSnapshot,
         },
       });
     });
@@ -2507,6 +3307,7 @@ export class ArtifactService {
           ? relChatSubtree
           : null;
 
+      const subtreeSnapshot = this.captureSubtreeSnapshotNoFollow(this.config.workspacesRoot, safeSubtreeRel);
       await this.executeJournaledDelete({
         userId: params.userId,
         scopeKind: 'chat',
@@ -2521,6 +3322,7 @@ export class ArtifactService {
           workspaceDir: liveChat.workspaceDir,
           chatSubtreeRel: safeSubtreeRel,
           artifacts: liveArtifacts.map((a) => ({ id: a.id, relPath: a.relPath })),
+          subtreeSnapshot,
         },
       });
     });
@@ -2660,6 +3462,7 @@ export class ArtifactService {
       await this.lockManager.withLocks(lockKeys, async () => {
         await params.assertAuthorized?.();
         const liveArt = this.db.findArtifactByRelPath(params.userId, params.chatId, wsRel);
+        const targetIdentity = this.captureFileTargetIdentityNoFollow(chat.workspaceDir, wsRel);
         const { envelopes } = await this.executeJournaledDelete({
           userId: params.userId,
           scopeKind: 'chat',
@@ -2674,6 +3477,7 @@ export class ArtifactService {
             workspaceDir: chat.workspaceDir,
             relPath: wsRel,
             artifactId: liveArt?.id ?? null,
+            targetIdentity,
           },
         });
         if (envelopes.length > 0) deletedAny = true;
