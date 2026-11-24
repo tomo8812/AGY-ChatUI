@@ -11,7 +11,8 @@ function sha256(val: unknown): string {
   return crypto.createHash('sha256').update(s, 'utf8').digest('hex');
 }
 
-function findRichNodeById(root: RichNode, targetId: string): RichNode | null {
+function findRichNodeById(root: RichNode | null | undefined, targetId: string): RichNode | null {
+  if (!root) return null;
   if (root.id === targetId) return root;
   const anyNode = root as unknown as Record<string, unknown>;
   if (Array.isArray(anyNode.children)) {
@@ -39,8 +40,10 @@ function findRichNodeById(root: RichNode, targetId: string): RichNode | null {
     }
   }
   if (root.type === 'popover' || root.type === 'tooltip') {
-    const t = findRichNodeById(root.trigger, targetId);
-    if (t) return t;
+    if (root.trigger) {
+      const t = findRichNodeById(root.trigger, targetId);
+      if (t) return t;
+    }
     if (Array.isArray(root.content)) {
       for (const c of root.content) {
         const f = findRichNodeById(c, targetId);
@@ -220,7 +223,9 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
     const rowsVal = Array.isArray(tableNode.rows) ? tableNode.rows : [];
     const rowIdx = Number(selector.row ?? -1);
     const colKey = String(selector.col ?? '');
-    if (rowIdx < 0 || rowIdx >= rowsVal.length) return { status: 'stale', reason: 'table_row_out_of_bounds' };
+    if (!Number.isInteger(rowIdx) || rowIdx < 0 || rowIdx >= rowsVal.length) {
+      return { status: 'stale', reason: 'table_row_out_of_bounds' };
+    }
     const cell = rowsVal[rowIdx]?.[colKey];
     const expectedCellHash = selector.expectedCellHash ? String(selector.expectedCellHash) : null;
     if (expectedCellHash && sha256(cell ?? null) !== expectedCellHash) {
