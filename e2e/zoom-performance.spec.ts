@@ -286,5 +286,127 @@ test.describe('PDF & Viewer Zoom Performance Verification', () => {
     // Reset via "画面に合わせる"
     await page.locator('.pdf-zoom-group button', { hasText: '画面に合わせる' }).click();
     await expect(page.locator('.pdf-canvas-scroll')).toHaveAttribute('data-fit-mode', 'auto');
+
+    // 5. Mixed Portrait/Landscape page-level focal accuracy on middle (p.60 landscape) & near-end (p.115 portrait)
+    for (const targetPage of [60, 115]) {
+      await page.locator('.pdf-zoom-group button', { hasText: '画面に合わせる' }).click();
+      await expect(page.locator('.pdf-canvas-scroll')).toHaveAttribute('data-fit-mode', 'auto');
+
+      const slot = page.locator(`.pdf-page-slot[data-page-number="${targetPage}"]`);
+      await slot.scrollIntoViewIfNeeded();
+      await expect.poll(async () => slot.getAttribute('data-rendered-scale')).toBeTruthy();
+
+      // Record exact focal point (relY = 0.45 inside targetPage) BEFORE transitioning auto -> manual zoom-in
+      const focalBefore = await page.evaluate((pNum) => {
+        const el = document.querySelector(`.pdf-page-slot[data-page-number="${pNum}"]`) as HTMLElement;
+        const r = el.getBoundingClientRect();
+        const clientX = r.left + r.width * 0.5;
+        const clientY = r.top + r.height * 0.45;
+        return { clientX, clientY, relY: 0.45 };
+      }, targetPage);
+
+      // Dispatch Ctrl+Wheel zoom-in directly on that focal point
+      await page.evaluate(({ clientX, clientY }) => {
+        const scroll = document.querySelector('.pdf-canvas-scroll');
+        if (!scroll) return;
+        for (let i = 0; i < 6; i += 1) {
+          scroll.dispatchEvent(
+            new WheelEvent('wheel', {
+              bubbles: true,
+              cancelable: true,
+              ctrlKey: true,
+              deltaY: -40,
+              deltaMode: 0,
+              clientX,
+              clientY,
+            })
+          );
+        }
+      }, focalBefore);
+
+      // Wait for gesture commit
+      await expect
+        .poll(async () => page.locator('.pdf-canvas-scroll').getAttribute('data-fit-mode'))
+        .toBe('manual');
+      await expect
+        .poll(async () => page.locator('.pdf-canvas-scroll').getAttribute('data-zoom-interacting'))
+        .toBeNull();
+
+      // Verify targetPage is STILL pinned right under focalBefore.clientY (never jumped to another page!)
+      const focalAfterZoomIn = await page.evaluate(
+        ({ pNum, expectedClientY, relY }) => {
+          const el = document.querySelector(`.pdf-page-slot[data-page-number="${pNum}"]`) as HTMLElement;
+          const r = el.getBoundingClientRect();
+          const actualPointY = r.top + r.height * relY;
+          return {
+            errorY: Math.abs(actualPointY - expectedClientY),
+            indicator: document.querySelector('.pdf-page-indicator')?.textContent?.trim() ?? '',
+          };
+        },
+        { pNum: targetPage, expectedClientY: focalBefore.clientY, relY: focalBefore.relY }
+      );
+      expect(
+        focalAfterZoomIn.errorY,
+        `Page ${targetPage} auto->manual zoom-in focal Y drift must stay < 24px`
+      ).toBeLessThan(24);
+      expect(focalAfterZoomIn.indicator).toContain(`${targetPage} / 120`);
+
+      // Also verify zoom-out focal stability from the zoomed state
+      await page.evaluate(({ clientX, clientY }) => {
+        const scroll = document.querySelector('.pdf-canvas-scroll');
+        if (!scroll) return;
+        for (let i = 0; i < 4; i += 1) {
+          scroll.dispatchEvent(
+            new WheelEvent('wheel', {
+              bubbles: true,
+              cancelable: true,
+              ctrlKey: true,
+              deltaY: 40,
+              deltaMode: 0,
+              clientX,
+              clientY,
+            })
+          );
+        }
+      }, focalBefore);
+
+      await page.waitForTimeout(240);
+      const focalAfterZoomOut = await page.evaluate(
+        ({ pNum, expectedClientY, relY }) => {
+          const el = document.querySelector(`.pdf-page-slot[data-page-number="${pNum}"]`) as HTMLElement;
+          const r = el.getBoundingClientRect();
+          return Math.abs(r.top + r.height * relY - expectedClientY);
+        },
+        { pNum: targetPage, expectedClientY: focalBefore.clientY, relY: focalBefore.relY }
+      );
+      expect(
+        focalAfterZoomOut,
+        `Page ${targetPage} manual zoom-out focal Y drift must stay < 24px`
+      ).toBeLessThan(24);
+    }
+
+    // 6. Verify total live PDF canvas backing pixels stay within budget and released canvases clear data-rendered-scale
+    const canvasBudgetCheck = await page.evaluate(() => {
+      const slots = Array.from(document.querySelectorAll('.pdf-page-slot')) as HTMLElement[];
+      let totalPixels = 0;
+      let staleRenderedAttrCount = 0;
+      for (const slot of slots) {
+        const canvas = slot.querySelector('canvas');
+        const pixels = canvas ? canvas.width * canvas.height : 0;
+        totalPixels += pixels;
+        if (pixels === 0 && slot.dataset.renderedScale) {
+          staleRenderedAttrCount += 1;
+        }
+      }
+      return { totalPixels, staleRenderedAttrCount };
+    });
+    expect(
+      canvasBudgetCheck.totalPixels,
+      'Total live PDF canvas backing pixels must stay within 24M px memory budget'
+    ).toBeLessThanOrEqual(24_000_000);
+    expect(
+      canvasBudgetCheck.staleRenderedAttrCount,
+      'Released canvases must clear data-rendered-scale'
+    ).toBe(0);
   });
 });

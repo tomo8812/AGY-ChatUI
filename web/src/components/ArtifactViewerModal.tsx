@@ -5,7 +5,7 @@ import hljs from 'highlight.js';
 import type * as PdfJsTypes from 'pdfjs-dist';
 import React, { useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, api } from '../api/client';
-import { useUnifiedViewerZoom } from '../hooks/useUnifiedViewerZoom';
+import { useUnifiedViewerZoom, type ZoomAnchorAdapter } from '../hooks/useUnifiedViewerZoom';
 import type { ArtifactRecord, ProjectRecord } from '../types';
 import {
   clampZoomScale,
@@ -20,6 +20,16 @@ import {
   PDF_MANUAL_MAX_SCALE,
   PDF_MANUAL_MIN_SCALE,
 } from '../utils/pdfFit';
+import {
+  closeBitmapIfOwned,
+  commitPdfBitmapToCanvas,
+  computeBoundedPdfDpr,
+  isPdfRenderCancelledError,
+  MAX_PDF_CONCURRENT_RENDERS,
+  MAX_TOTAL_PDF_CANVAS_PIXELS,
+  PdfRenderJobTracker,
+  selectPdfCanvasesToRelease,
+} from '../utils/pdfRenderBudget';
 import { UnifiedViewerZoomShell } from './UnifiedViewerZoomShell';
 import {
   artifactTextCache,
@@ -64,11 +74,6 @@ interface ArtifactViewerModalProps {
   onOpenArtifact?: (artifact: ArtifactRecord) => void;
 }
 
-const MAX_PDF_CONCURRENT_RENDERS = 2;
-const MAX_PDF_CANVAS_DIM = 3072;
-const MAX_PDF_CANVAS_PIXELS = 6_000_000;
-const PDF_OFFSCREEN_RELEASE_DISTANCE = 14;
-
 const pdfScratchCanvasPool: HTMLCanvasElement[] = [];
 
 function acquirePdfScratchCanvas(): HTMLCanvasElement {
@@ -81,20 +86,6 @@ function releasePdfScratchCanvas(canvas: HTMLCanvasElement): void {
   }
 }
 
-function computeBoundedPdfDpr(cssWidth: number, cssHeight: number, rawDpr: number): number {
-  let effectiveDpr = Math.min(rawDpr || 1, 2);
-  const maxDim = Math.max(1, cssWidth, cssHeight);
-  if (maxDim * effectiveDpr > MAX_PDF_CANVAS_DIM) {
-    effectiveDpr = Math.min(effectiveDpr, MAX_PDF_CANVAS_DIM / maxDim);
-  }
-  const pixelArea = Math.max(1, cssWidth * cssHeight);
-  if (pixelArea * effectiveDpr * effectiveDpr > MAX_PDF_CANVAS_PIXELS) {
-    effectiveDpr = Math.min(effectiveDpr, Math.sqrt(MAX_PDF_CANVAS_PIXELS / pixelArea));
-  }
-  const floored = Math.floor(effectiveDpr * 1000) / 1000;
-  return floored > 0 ? floored : Math.max(0.001, effectiveDpr);
-}
-
 function makePdfBitmapKey(url: string, pageNum: number, scale: number, dpr: number): string {
   return `${url}@p${pageNum}@s${Math.round(scale * 100)}@d${Math.round(dpr * 100)}`;
 }
@@ -104,9 +95,13 @@ async function renderPdfPageToBitmap(
   pageNum: number,
   scale: number,
   rawDpr: number,
+  isCancelled: () => boolean,
   onTask?: (task: PdfJsTypes.RenderTask | null) => void
-): Promise<{ bitmap: ImageBitmap | HTMLCanvasElement; cssWidth: number; cssHeight: number }> {
+): Promise<{ bitmap: ImageBitmap | HTMLCanvasElement; cssWidth: number; cssHeight: number } | null> {
+  if (isCancelled()) return null;
   const page = await doc.getPage(pageNum);
+  if (isCancelled()) return null;
+
   const viewport = page.getViewport({ scale });
   const cssWidth = Math.max(1, Math.floor(viewport.width));
   const cssHeight = Math.max(1, Math.floor(viewport.height));
@@ -117,6 +112,7 @@ async function renderPdfPageToBitmap(
   const scratch = acquirePdfScratchCanvas();
   let reusedScratch = true;
   try {
+    if (isCancelled()) return null;
     if (scratch.width !== backingWidth) scratch.width = backingWidth;
     if (scratch.height !== backingHeight) scratch.height = backingHeight;
     const ctx = scratch.getContext('2d');
@@ -127,20 +123,33 @@ async function renderPdfPageToBitmap(
     ctx.clearRect(0, 0, cssWidth, cssHeight);
     const renderTask = page.render({ canvasContext: ctx, viewport, canvas: scratch });
     onTask?.(renderTask);
+    if (isCancelled()) {
+      renderTask.cancel();
+      onTask?.(null);
+      return null;
+    }
     try {
       await renderTask.promise;
     } finally {
       onTask?.(null);
     }
 
+    if (isCancelled()) return null;
+
     if (typeof createImageBitmap === 'function') {
       try {
         const bitmap = await createImageBitmap(scratch);
+        if (isCancelled()) {
+          closeBitmapIfOwned(bitmap);
+          return null;
+        }
         return { bitmap, cssWidth, cssHeight };
       } catch {
         // Fallback to dedicated canvas copy if ImageBitmap creation fails
       }
     }
+
+    if (isCancelled()) return null;
 
     // Fallback when ImageBitmap is unavailable: hand off a dedicated canvas so scratch stays reusable
     const copy = document.createElement('canvas');
@@ -158,19 +167,6 @@ async function renderPdfPageToBitmap(
       releasePdfScratchCanvas(scratch);
     }
   }
-}
-
-function drawBitmapToCanvas(
-  canvas: HTMLCanvasElement,
-  entry: { bitmap: ImageBitmap | HTMLCanvasElement; cssWidth: number; cssHeight: number }
-): void {
-  if (canvas.width !== entry.bitmap.width) canvas.width = entry.bitmap.width;
-  if (canvas.height !== entry.bitmap.height) canvas.height = entry.bitmap.height;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return;
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(entry.bitmap, 0, 0);
 }
 
 interface PdfPageSize {
@@ -238,6 +234,12 @@ const PdfPageSlot: React.FC<PdfPageSlotProps> = React.memo(
   }
 );
 
+interface PdfPageFocalAnchor {
+  pageNum: number;
+  relX: number;
+  relY: number;
+}
+
 const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
@@ -249,7 +251,8 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
   const canvasElementsRef = useRef<Map<number, HTMLCanvasElement>>(new Map());
   const visiblePagesRef = useRef<Set<number>>(new Set([1, 2]));
   const renderedKeyByPageRef = useRef<Map<number, string>>(new Map());
-  const activeTasksRef = useRef<Map<number, { key: string; cancel: () => void }>>(new Map());
+  const jobTrackerRef = useRef<PdfRenderJobTracker>(new PdfRenderJobTracker());
+  const isZoomInteractingRef = useRef(false);
   const programmaticScrollRef = useRef<{ targetPage: number; expiresAt: number } | null>(null);
   const scrollRafRef = useRef<number | null>(null);
   const scheduleRenderRef = useRef<() => void>(() => {});
@@ -263,6 +266,7 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
   const [pageSizes, setPageSizes] = useState<Array<PdfPageSize | null>>([]);
   const [containerSize, setContainerSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
   const [error, setError] = useState<string | null>(null);
+  const [pageRenderErrorCount, setPageRenderErrorCount] = useState(0);
   const [loading, setLoading] = useState(true);
 
   pageNumRef.current = pageNum;
@@ -317,20 +321,20 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
     let loadedDoc: PdfJsTypes.PDFDocumentProxy | null = null;
     setLoading(true);
     setError(null);
+    setPageRenderErrorCount(0);
     setPdfDoc(null);
     setNumPages(0);
     setPageNum(1);
     setFitMode('auto');
     setPageSizes([]);
+    isZoomInteractingRef.current = false;
     programmaticScrollRef.current = null;
     pageElementsRef.current.clear();
     canvasElementsRef.current.clear();
     visiblePagesRef.current = new Set([1, 2]);
     renderedKeyByPageRef.current.clear();
-    for (const task of activeTasksRef.current.values()) {
-      task.cancel();
-    }
-    activeTasksRef.current.clear();
+    jobTrackerRef.current.cancelAll();
+    jobTrackerRef.current.clearAllFailures();
 
     const load = async () => {
       try {
@@ -368,10 +372,7 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
 
     return () => {
       active = false;
-      for (const task of activeTasksRef.current.values()) {
-        task.cancel();
-      }
-      activeTasksRef.current.clear();
+      jobTrackerRef.current.cancelAll();
       if (loadedDoc) void loadedDoc.destroy();
     };
   }, [url]);
@@ -498,7 +499,9 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
       const all = new Set<number>();
       for (let p = 1; p <= numPages; p += 1) all.add(p);
       visiblePagesRef.current = all;
-      scheduleRenderRef.current();
+      if (!isZoomInteractingRef.current) {
+        scheduleRenderRef.current();
+      }
       return;
     }
 
@@ -518,7 +521,8 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
             changed = true;
           }
         }
-        if (changed) {
+        // Suppress renders/evictions while a GPU preview zoom gesture is actively running
+        if (changed && !isZoomInteractingRef.current) {
           scheduleRenderRef.current();
         }
       },
@@ -535,62 +539,79 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
     };
   }, [scrollEl, numPages]);
 
-  // Prioritized PDF render scheduler:
-  // - Only renders visible + immediate neighbor pages
-  // - Prioritizes activePageNum, then nearest neighbors
-  // - Cancels any stale or offscreen in-flight RenderTasks immediately
-  // - Releases far-offscreen canvas GPU buffers on long PDFs
+  // Prioritized PDF render scheduler with:
+  // - Pause during active zoom preview gestures
+  // - Strict total backing-pixel memory budget across ALL PDFs (including <= 20 pages)
+  // - Single-owner bitmap cleanup when LRU cache declines an oversized entry
+  // - Verified canvas 2D draw success before recording renderedScale
+  // - Bounded failure retry (no infinite retry loop on corrupt pages / context failures)
+  // - Job-identity-safe cancellation & concurrency accounting
   useEffect(() => {
     if (!readyToRender || !pdfDoc || numPages <= 0) return;
 
     let disposed = false;
+    const tracker = jobTrackerRef.current;
 
     const getTargetScaleForPage = (p: number): number => {
       if (fitMode === 'manual') return manualScale;
       return pageBaseSpecs[p - 1]?.autoScale ?? currentAutoScale;
     };
 
-    const releaseFarOffscreenCanvases = () => {
-      if (numPages <= 20) return;
-      const anchor = pageNumRef.current;
+    const enforceCanvasMemoryBudget = () => {
+      const live: Array<{ pageNum: number; pixels: number }> = [];
       for (const [p, canvas] of canvasElementsRef.current.entries()) {
-        if (visiblePagesRef.current.has(p)) continue;
-        if (Math.abs(p - anchor) <= PDF_OFFSCREEN_RELEASE_DISTANCE) continue;
-        if (canvas.width > 0 || canvas.height > 0) {
+        const pixels = canvas.width * canvas.height;
+        if (pixels > 0) {
+          live.push({ pageNum: p, pixels });
+        }
+      }
+      const releaseList = selectPdfCanvasesToRelease(
+        live,
+        visiblePagesRef.current,
+        pageNumRef.current,
+        numPages,
+        MAX_TOTAL_PDF_CANVAS_PIXELS
+      );
+      for (const p of releaseList) {
+        const canvas = canvasElementsRef.current.get(p);
+        if (canvas && (canvas.width > 0 || canvas.height > 0)) {
           canvas.width = 0;
           canvas.height = 0;
-          renderedKeyByPageRef.current.delete(p);
+        }
+        renderedKeyByPageRef.current.delete(p);
+        const slot = pageElementsRef.current.get(p);
+        if (slot) {
+          delete slot.dataset.renderedScale;
         }
       }
     };
 
     const pumpQueue = () => {
-      if (disposed) return;
+      if (disposed || isZoomInteractingRef.current) return;
 
       const rawDpr = window.devicePixelRatio || 1;
       const anchor = pageNumRef.current;
 
-      // Always include activePageNum and immediate neighbors if valid
       const candidatePages = new Set<number>(visiblePagesRef.current);
       if (anchor >= 1 && anchor <= numPages) {
         candidatePages.add(anchor);
       }
 
-      // 1. Cancel any active render tasks that are now offscreen or at an outdated scale
-      for (const [p, task] of Array.from(activeTasksRef.current.entries())) {
+      // 1. Cancel any active render jobs that are now offscreen or at an outdated scale
+      for (const activeJob of tracker.listActive()) {
+        const p = activeJob.pageNum;
         const targetScale = getTargetScaleForPage(p);
         const spec = pageBaseSpecs[p - 1];
         const cssW = Math.max(1, Math.floor((spec?.naturalWidth ?? DEFAULT_PDF_PAGE_SIZE.width) * targetScale));
         const cssH = Math.max(1, Math.floor((spec?.naturalHeight ?? DEFAULT_PDF_PAGE_SIZE.height) * targetScale));
         const boundedDpr = computeBoundedPdfDpr(cssW, cssH, rawDpr);
         const desiredKey = makePdfBitmapKey(url, p, targetScale, boundedDpr);
-        if (!candidatePages.has(p) || task.key !== desiredKey) {
-          task.cancel();
-          activeTasksRef.current.delete(p);
+        if (!candidatePages.has(p) || activeJob.key !== desiredKey) {
+          activeJob.cancel();
         }
       }
 
-      // 2. Collect pages needing paint, sorted by distance from activePageNum
+      // 2. Collect candidate pages needing render, sorted by distance from anchor
       const pending: Array<{ pageNum: number; scale: number; key: string; priority: number }> = [];
       for (const p of candidatePages) {
         const canvas = canvasElementsRef.current.get(p);
@@ -604,18 +625,32 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
         const key = makePdfBitmapKey(url, p, targetScale, boundedDpr);
 
         if (renderedKeyByPageRef.current.get(p) === key && canvas.width > 0) continue;
+        if (tracker.hasExceededFailures(key)) continue;
 
-        // Instant cache hit: blit synchronously without occupying a PDF.js worker slot
+        // Instant cache hit: blit synchronously and verify draw success
         const cached = pdfPageBitmapCache.get(key);
         if (cached) {
-          drawBitmapToCanvas(canvas, cached);
-          renderedKeyByPageRef.current.set(p, key);
+          const { drew } = commitPdfBitmapToCanvas(canvas, cached, true);
           const slot = pageElementsRef.current.get(p);
-          if (slot) slot.dataset.renderedScale = String(Math.round(targetScale * 100));
+          if (drew) {
+            renderedKeyByPageRef.current.set(p, key);
+            tracker.clearFailure(key);
+            if (slot) {
+              slot.dataset.renderedScale = String(Math.round(targetScale * 100));
+              delete slot.dataset.renderError;
+            }
+          } else {
+            tracker.recordFailure(key);
+            if (slot) {
+              delete slot.dataset.renderedScale;
+              slot.dataset.renderError = 'true';
+            }
+            setPageRenderErrorCount(tracker.failedKeyCount);
+          }
           continue;
         }
 
-        if (activeTasksRef.current.has(p)) continue;
+        if (tracker.hasActive(p)) continue;
 
         pending.push({
           pageNum: p,
@@ -627,71 +662,120 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
 
       pending.sort((a, b) => a.priority - b.priority || a.pageNum - b.pageNum);
 
-      // 3. Launch up to MAX_PDF_CONCURRENT_RENDERS PDF.js tasks
-      for (const job of pending) {
-        if (activeTasksRef.current.size >= MAX_PDF_CONCURRENT_RENDERS) break;
-        let cancelled = false;
-        let pdfTask: PdfJsTypes.RenderTask | null = null;
-        const cancel = () => {
-          cancelled = true;
-          pdfTask?.cancel();
-        };
-        activeTasksRef.current.set(job.pageNum, { key: job.key, cancel });
+      // 3. Launch up to MAX_PDF_CONCURRENT_RENDERS PDF.js tasks (counting winding-down cancelled jobs too)
+      for (const jobSpec of pending) {
+        if (tracker.runningCount >= MAX_PDF_CONCURRENT_RENDERS) break;
 
-        void renderPdfPageToBitmap(pdfDoc, job.pageNum, job.scale, rawDpr, (t) => {
-          pdfTask = t;
-        })
+        let pdfTask: PdfJsTypes.RenderTask | null = null;
+        const job = tracker.startJob(jobSpec.pageNum, jobSpec.key, () => {
+          pdfTask?.cancel();
+        });
+
+        const isCancelled = () => disposed || job.cancelled || isZoomInteractingRef.current;
+
+        void renderPdfPageToBitmap(
+          pdfDoc,
+          jobSpec.pageNum,
+          jobSpec.scale,
+          rawDpr,
+          isCancelled,
+          (t) => {
+            pdfTask = t;
+            if (t && isCancelled()) {
+              t.cancel();
+            }
+          }
+        )
           .then((rendered) => {
-            if (cancelled || disposed) {
-              if (typeof ImageBitmap !== 'undefined' && rendered.bitmap instanceof ImageBitmap) {
-                rendered.bitmap.close();
-              }
+            if (!rendered) return;
+            if (isCancelled()) {
+              closeBitmapIfOwned(rendered.bitmap);
               return;
             }
-            pdfPageBitmapCache.set(job.key, rendered);
-            const canvas = canvasElementsRef.current.get(job.pageNum);
-            const slot = pageElementsRef.current.get(job.pageNum);
-            if (canvas) {
-              drawBitmapToCanvas(canvas, rendered);
-              renderedKeyByPageRef.current.set(job.pageNum, job.key);
-            }
-            if (slot) {
-              slot.dataset.renderedScale = String(Math.round(job.scale * 100));
+
+            pdfPageBitmapCache.set(jobSpec.key, rendered);
+            const adoptedByCache = pdfPageBitmapCache.peek(jobSpec.key) === rendered;
+
+            const canvas = canvasElementsRef.current.get(jobSpec.pageNum) ?? null;
+            const slot = pageElementsRef.current.get(jobSpec.pageNum);
+            const { drew } = commitPdfBitmapToCanvas(canvas, rendered, adoptedByCache);
+
+            if (drew) {
+              renderedKeyByPageRef.current.set(jobSpec.pageNum, jobSpec.key);
+              tracker.clearFailure(jobSpec.key);
+              if (slot) {
+                slot.dataset.renderedScale = String(Math.round(jobSpec.scale * 100));
+                delete slot.dataset.renderError;
+              }
+              setPageRenderErrorCount(tracker.failedKeyCount);
+            } else {
+              tracker.recordFailure(jobSpec.key);
+              if (slot) {
+                delete slot.dataset.renderedScale;
+                slot.dataset.renderError = 'true';
+              }
+              setPageRenderErrorCount(tracker.failedKeyCount);
             }
           })
-          .catch(() => {
-            // ignore cancelled render tasks
+          .catch((err) => {
+            if (isCancelled() || isPdfRenderCancelledError(err)) {
+              return;
+            }
+            tracker.recordFailure(jobSpec.key);
+            const slot = pageElementsRef.current.get(jobSpec.pageNum);
+            if (slot) {
+              delete slot.dataset.renderedScale;
+              slot.dataset.renderError = 'true';
+            }
+            setPageRenderErrorCount(tracker.failedKeyCount);
           })
           .finally(() => {
-            const current = activeTasksRef.current.get(job.pageNum);
-            if (current && current.key === job.key) {
-              activeTasksRef.current.delete(job.pageNum);
-            }
-            if (!disposed) {
-              pumpQueue();
+            tracker.finishJob(job);
+            if (!isZoomInteractingRef.current) {
+              if (!disposed) {
+                enforceCanvasMemoryBudget();
+              }
+              // Always wake the LATEST scheduler when a concurrency slot frees up,
+              // even if this cancelled job came from an earlier effect closure.
+              scheduleRenderRef.current();
             }
           });
       }
 
-      releaseFarOffscreenCanvases();
+      enforceCanvasMemoryBudget();
     };
 
     scheduleRenderRef.current = pumpQueue;
-    pumpQueue();
+    if (!isZoomInteractingRef.current) {
+      pumpQueue();
+    }
 
     return () => {
       disposed = true;
-      for (const task of activeTasksRef.current.values()) {
-        task.cancel();
-      }
-      activeTasksRef.current.clear();
+      tracker.cancelAll();
     };
-  }, [readyToRender, pdfDoc, url, numPages, fitMode, manualScale, pageBaseSpecs, currentAutoScale]);
+  }, [readyToRender, pdfDoc, url, numPages, fitMode, manualScale, pageBaseSpecs]);
+
+  useEffect(() => {
+    return () => {
+      scheduleRenderRef.current = () => {};
+    };
+  }, []);
+
+  const handleRetryFailedPages = useCallback(() => {
+    jobTrackerRef.current.clearAllFailures();
+    setPageRenderErrorCount(0);
+    for (const slot of pageElementsRef.current.values()) {
+      delete slot.dataset.renderError;
+    }
+    scheduleRenderRef.current();
+  }, []);
 
   const scrollToPage = useCallback(
     (targetPage: number) => {
       if (numPages <= 0) return;
       const clamped = Math.max(1, Math.min(numPages, targetPage));
+      pageNumRef.current = clamped;
       setPageNum(clamped);
       programmaticScrollRef.current = { targetPage: clamped, expiresAt: performance.now() + 700 };
       const container = scrollRef.current;
@@ -703,6 +787,9 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
         const nextTop = container.scrollTop + (targetRect.top - containerRect.top) - paddingTop;
         container.scrollTo({ top: Math.max(0, nextTop), behavior: 'smooth' });
       }
+      if (!isZoomInteractingRef.current) {
+        scheduleRenderRef.current();
+      }
     },
     [numPages]
   );
@@ -711,10 +798,57 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
     programmaticScrollRef.current = null;
   }, []);
 
+  const handleGestureStart = useCallback(() => {
+    programmaticScrollRef.current = null;
+    isZoomInteractingRef.current = true;
+    jobTrackerRef.current.cancelAll();
+  }, []);
+
+  const handleGestureEnd = useCallback(() => {
+    isZoomInteractingRef.current = false;
+    scheduleRenderRef.current();
+  }, []);
+
+  // O(visible) active page resolver (avoids scanning all N slots on long PDFs)
+  const findNearestCandidatePages = useCallback(
+    (container: HTMLDivElement): number[] => {
+      const set = new Set<number>(visiblePagesRef.current);
+      const cur = pageNumRef.current;
+      for (let d = -2; d <= 2; d += 1) {
+        const p = cur + d;
+        if (p >= 1 && p <= numPages) set.add(p);
+      }
+
+      // Binary-search by offsetTop if scroll jumped rapidly past IO observations
+      if (numPages > 0) {
+        const targetOffset = container.scrollTop + Math.min(80, Math.max(0, container.clientHeight * 0.2));
+        let lo = 1;
+        let hi = numPages;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          const el = pageElementsRef.current.get(mid);
+          if (!el || el.offsetTop + el.offsetHeight < targetOffset) {
+            lo = mid + 1;
+          } else {
+            hi = mid;
+          }
+        }
+        for (let d = -1; d <= 1; d += 1) {
+          const p = lo + d;
+          if (p >= 1 && p <= numPages) set.add(p);
+        }
+      }
+      return Array.from(set).sort((a, b) => a - b);
+    },
+    [numPages]
+  );
+
   const handleScroll = useCallback(() => {
+    if (isZoomInteractingRef.current) return;
     if (scrollRafRef.current !== null) return;
     scrollRafRef.current = window.requestAnimationFrame(() => {
       scrollRafRef.current = null;
+      if (isZoomInteractingRef.current) return;
       const container = scrollRef.current;
       if (!container || numPages <= 0) return;
 
@@ -735,8 +869,9 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
 
       const containerRect = container.getBoundingClientRect();
       const paddingTop = parseFloat(window.getComputedStyle(container).paddingTop) || 0;
+      const candidateNums = findNearestCandidatePages(container);
       const rects: Array<{ pageNum: number; top: number; bottom: number }> = [];
-      for (let p = 1; p <= numPages; p += 1) {
+      for (const p of candidateNums) {
         const el = pageElementsRef.current.get(p);
         if (!el) continue;
         const r = el.getBoundingClientRect();
@@ -744,14 +879,76 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
       }
       if (rects.length === 0) return;
       const nextActive = findActivePdfPage(containerRect.top, container.clientHeight, paddingTop, rects);
-      setPageNum((prev) => {
-        if (prev === nextActive) return prev;
+      if (nextActive !== pageNumRef.current) {
         pageNumRef.current = nextActive;
+        setPageNum(nextActive);
         scheduleRenderRef.current();
-        return nextActive;
-      });
+      }
     });
-  }, [numPages]);
+  }, [numPages, findNearestCandidatePages]);
+
+  // Page-level focal anchor adapter: pins zoom center to exact normalized (relX, relY) inside
+  // the actual target PDF page so mixed portrait/landscape auto-fit -> manual transitions never jump pages.
+  const pdfAnchorAdapter = useMemo<ZoomAnchorAdapter<PdfPageFocalAnchor>>(
+    () => ({
+      capture: (clientX, clientY) => {
+        const container = scrollRef.current;
+        if (!container || numPages <= 0) return null;
+        const candidates = findNearestCandidatePages(container);
+        let bestPage = pageNumRef.current;
+        let bestRect: DOMRect | null = null;
+        let bestDist = Infinity;
+
+        for (const p of candidates) {
+          const el = pageElementsRef.current.get(p);
+          if (!el) continue;
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) continue;
+          if (clientY >= r.top && clientY <= r.bottom) {
+            bestPage = p;
+            bestRect = r;
+            bestDist = 0;
+            break;
+          }
+          const dist = clientY < r.top ? r.top - clientY : clientY - r.bottom;
+          if (dist < bestDist) {
+            bestDist = dist;
+            bestPage = p;
+            bestRect = r;
+          }
+        }
+
+        if (!bestRect) return null;
+        return {
+          pageNum: bestPage,
+          relX: (clientX - bestRect.left) / Math.max(1, bestRect.width),
+          relY: (clientY - bestRect.top) / Math.max(1, bestRect.height),
+        };
+      },
+      restore: (anchor, clientX, clientY) => {
+        const container = scrollRef.current;
+        const slot = pageElementsRef.current.get(anchor.pageNum);
+        if (!container || !slot) return;
+        const afterRect = slot.getBoundingClientRect();
+        if (afterRect.width <= 0 || afterRect.height <= 0) return;
+        const targetClientX = afterRect.left + anchor.relX * afterRect.width;
+        const targetClientY = afterRect.top + anchor.relY * afterRect.height;
+        const deltaX = targetClientX - clientX;
+        const deltaY = targetClientY - clientY;
+        if (Math.abs(deltaX) > 0.5) {
+          container.scrollLeft = Math.max(0, container.scrollLeft + deltaX);
+        }
+        if (Math.abs(deltaY) > 0.5) {
+          container.scrollTop = Math.max(0, container.scrollTop + deltaY);
+        }
+        if (anchor.pageNum !== pageNumRef.current) {
+          pageNumRef.current = anchor.pageNum;
+          setPageNum(anchor.pageNum);
+        }
+      },
+    }),
+    [numPages, findNearestCandidatePages]
+  );
 
   const handleCommitScale = useCallback((nextScale: number) => {
     setFitMode('manual');
@@ -761,13 +958,17 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
   const { isPanning, commitDiscreteScale, cancelActiveGesture } = useUnifiedViewerZoom({
     scrollEl,
     stageEl: pagesListEl,
+    anchorAdapter: pdfAnchorAdapter,
     scaleBadgeEl,
     committedScale,
     minScale: manualMinScale,
     maxScale: PDF_MANUAL_MAX_SCALE,
     enableDragPan: true,
+    dragPanMode: 'direct',
     onCommitScale: handleCommitScale,
-    onGestureStart: cancelProgrammaticScrollLock,
+    onGestureStart: handleGestureStart,
+    onGestureEnd: handleGestureEnd,
+    onPanStart: cancelProgrammaticScrollLock,
     resetKey: url,
   });
 
@@ -853,6 +1054,14 @@ const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
           </button>
         </div>
       </div>
+      {pageRenderErrorCount > 0 && (
+        <div className="warn-banner pdf-render-error-banner" role="status">
+          <span>一部ページの描画に失敗しました（他のページは閲覧を継続できます）。</span>
+          <button type="button" className="btn btn-secondary btn-xs" onClick={handleRetryFailedPages}>
+            再試行
+          </button>
+        </div>
+      )}
       <div
         ref={setScrollContainerRef}
         className={`pdf-canvas-scroll content-zoom-surface${isManuallyZoomed ? ' is-pannable' : ''}${isPanning ? ' is-panning' : ''}`}
@@ -1162,9 +1371,10 @@ function inferHasHeaderRow(rows: string[][]): boolean {
 
 const CodeViewer: React.FC<{
   versionKey: string;
+  resetKey: string;
   filename: string;
   source: string;
-}> = React.memo(({ versionKey, filename, source }) => {
+}> = React.memo(({ versionKey, resetKey, filename, source }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [showAllLines, setShowAllLines] = useState(false);
   const deferredSearch = useDeferredValue(searchTerm);
@@ -1243,8 +1453,8 @@ const CodeViewer: React.FC<{
     };
   }, [filteredLines, allLines, source, unfilteredHtml, showAllLines, language]);
 
-  return (
-    <div className="code-viewer-wrap">
+  const controlsTop = (
+    <div className="code-viewer-controls">
       <div className="viewer-search-row">
         <SearchIcon size={14} />
         <input
@@ -1270,6 +1480,11 @@ const CodeViewer: React.FC<{
           </button>
         </div>
       )}
+    </div>
+  );
+
+  return (
+    <UnifiedViewerZoomShell resetKey={resetKey} controlsTop={controlsTop}>
       {query && filteredLines && filteredLines.length === 0 ? (
         <div className="empty-box muted-sm" role="status">
           「{deferredSearch.trim()}」に一致する行が見つかりませんでした。
@@ -1279,14 +1494,15 @@ const CodeViewer: React.FC<{
           {displayHtml ? <code dangerouslySetInnerHTML={{ __html: displayHtml }} /> : <code>{displayText}</code>}
         </pre>
       )}
-    </div>
+    </UnifiedViewerZoomShell>
   );
 });
 
 const TableViewer: React.FC<{
   versionKey: string;
+  resetKey: string;
   sheets: ParsedSheetData[];
-}> = React.memo(({ versionKey, sheets }) => {
+}> = React.memo(({ versionKey, resetKey, sheets }) => {
   const tableScrollRef = useRef<HTMLDivElement>(null);
   const [activeSheetIdx, setActiveSheetIdx] = useState(0);
   const [page, setPage] = useState(0);
@@ -1348,42 +1564,80 @@ const TableViewer: React.FC<{
   const pageStart = safePage * TABLE_PAGE_SIZE;
   const pageRows = dataRows.slice(pageStart, pageStart + TABLE_PAGE_SIZE);
 
-  return (
-    <div className="stack-gap viewer-table">
-      <div className="viewer-toolbar">
-        <div className="row-actions">
-          {sheets.length > 1 &&
-            sheets.map((s, idx) => (
-              <button
-                key={idx}
-                type="button"
-                className={idx === activeSheetIdx ? 'chip-btn active' : 'chip-btn'}
-                onClick={() => {
-                  setActiveSheetIdx(idx);
-                  setPage(0);
-                  setHeaderOverride(null);
-                }}
-              >
-                {s.name}
-              </button>
-            ))}
-          <button
-            type="button"
-            className={`chip-btn ${hasHeader ? 'active' : ''}`}
-            aria-pressed={hasHeader}
-            onClick={() => {
-              setHeaderOverride(!hasHeader);
-              setPage(0);
-            }}
-          >
-            先頭行を見出しにする: {hasHeader ? 'ON' : 'OFF'}
-          </button>
-        </div>
-        <button type="button" className="btn btn-secondary btn-xs" onClick={handleCopyCsv}>
-          {copied ? <CheckIcon size={13} /> : <CopyIcon size={13} />}
-          <span>{copied ? 'コピー済' : 'CSVコピー'}</span>
+  const controlsTop = (
+    <div className="viewer-toolbar table-viewer-controls">
+      <div className="row-actions">
+        {sheets.length > 1 &&
+          sheets.map((s, idx) => (
+            <button
+              key={idx}
+              type="button"
+              className={idx === activeSheetIdx ? 'chip-btn active' : 'chip-btn'}
+              onClick={() => {
+                setActiveSheetIdx(idx);
+                setPage(0);
+                setHeaderOverride(null);
+              }}
+            >
+              {s.name}
+            </button>
+          ))}
+        <button
+          type="button"
+          className={`chip-btn ${hasHeader ? 'active' : ''}`}
+          aria-pressed={hasHeader}
+          onClick={() => {
+            setHeaderOverride(!hasHeader);
+            setPage(0);
+          }}
+        >
+          先頭行を見出しにする: {hasHeader ? 'ON' : 'OFF'}
         </button>
       </div>
+      <button type="button" className="btn btn-secondary btn-xs" onClick={handleCopyCsv}>
+        {copied ? <CheckIcon size={13} /> : <CopyIcon size={13} />}
+        <span>{copied ? 'コピー済' : 'CSVコピー'}</span>
+      </button>
+    </div>
+  );
+
+  const controlsBottom =
+    totalPages > 1 ? (
+      <div className="viewer-pagination">
+        <span className="muted-xs">
+          {pageStart + 1}〜{Math.min(pageStart + pageRows.length, dataRows.length)} 行 / 全{' '}
+          {dataRows.length} データ行
+        </span>
+        <div className="row-actions">
+          <button
+            type="button"
+            className="btn btn-secondary btn-xs"
+            disabled={safePage <= 0}
+            onClick={() => setPage((p) => Math.max(0, p - 1))}
+          >
+            <ChevronIcon size={13} dir="left" /> 前
+          </button>
+          <span className="muted-xs">
+            {safePage + 1} / {totalPages}
+          </span>
+          <button
+            type="button"
+            className="btn btn-secondary btn-xs"
+            disabled={safePage >= totalPages - 1}
+            onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
+          >
+            次 <ChevronIcon size={13} dir="right" />
+          </button>
+        </div>
+      </div>
+    ) : undefined;
+
+  return (
+    <UnifiedViewerZoomShell
+      resetKey={`${resetKey}:s${activeSheetIdx}:p${safePage}`}
+      controlsTop={controlsTop}
+      controlsBottom={controlsBottom}
+    >
       <div ref={tableScrollRef} className="md-table-scroll viewer-table-scroll">
         <table>
           <thead>
@@ -1404,36 +1658,7 @@ const TableViewer: React.FC<{
           </tbody>
         </table>
       </div>
-      {totalPages > 1 && (
-        <div className="viewer-pagination">
-          <span className="muted-xs">
-            {pageStart + 1}〜{Math.min(pageStart + pageRows.length, dataRows.length)} 行 / 全{' '}
-            {dataRows.length} データ行
-          </span>
-          <div className="row-actions">
-            <button
-              type="button"
-              className="btn btn-secondary btn-xs"
-              disabled={safePage <= 0}
-              onClick={() => setPage((p) => Math.max(0, p - 1))}
-            >
-              <ChevronIcon size={13} dir="left" /> 前
-            </button>
-            <span className="muted-xs">
-              {safePage + 1} / {totalPages}
-            </span>
-            <button
-              type="button"
-              className="btn btn-secondary btn-xs"
-              disabled={safePage >= totalPages - 1}
-              onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
-            >
-              次 <ChevronIcon size={13} dir="right" />
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
+    </UnifiedViewerZoomShell>
   );
 });
 
@@ -1690,7 +1915,14 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
     }
 
     if (viewMode === 'source' && textContent !== null) {
-      return <CodeViewer versionKey={versionKey} filename={artifact.filename} source={textContent} />;
+      return (
+        <CodeViewer
+          versionKey={versionKey}
+          resetKey={`${versionKey}:source`}
+          filename={artifact.filename}
+          source={textContent}
+        />
+      );
     }
 
     switch (artifact.previewKind) {
@@ -1740,19 +1972,23 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
         );
 
       case 'table':
-        return <TableViewer versionKey={versionKey} sheets={sheets} />;
+        return <TableViewer versionKey={versionKey} resetKey={`${versionKey}:table`} sheets={sheets} />;
 
       case 'docx':
         return (
-          <div className="stack-gap">
-            <div className="warn-banner">
-              簡易HTML変換プレビューのため、段組や複雑なレイアウトは元のWord文書と異なる場合があります。
-            </div>
+          <UnifiedViewerZoomShell
+            resetKey={`${versionKey}:docx`}
+            controlsTop={
+              <div className="warn-banner">
+                簡易HTML変換プレビューのため、段組や複雑なレイアウトは元のWord文書と異なる場合があります。
+              </div>
+            }
+          >
             <div
               className="docx-preview"
               dangerouslySetInnerHTML={{ __html: sanitizedHtml ?? '' }}
             />
-          </div>
+          </UnifiedViewerZoomShell>
         );
 
       case 'html':
@@ -1799,6 +2035,7 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
         return (
           <CodeViewer
             versionKey={versionKey}
+            resetKey={`${versionKey}:code`}
             filename={artifact.filename}
             source={textContent ?? ''}
           />
@@ -1822,22 +2059,29 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
   };
 
   const supportsSourceToggle = ['markdown', 'html', 'mermaid', 'svg', 'diff'].includes(artifact.previewKind);
-  const isUnifiedShellView =
+  const isSelfShelledView =
     !loading &&
     !error &&
-    ((viewMode === 'diff' && Boolean(artifact.diffPatch ?? (artifact.previewKind === 'diff' ? textContent : null))) ||
-      (viewMode === 'source' && textContent !== null) ||
+    ((viewMode === 'source' && textContent !== null) ||
       (viewMode === 'preview' &&
         (artifact.previewKind === 'code' ||
-          artifact.previewKind === 'diff' ||
           artifact.previewKind === 'table' ||
-          artifact.previewKind === 'docx' ||
+          artifact.previewKind === 'docx')));
+
+  const isOuterUnifiedShellView =
+    !loading &&
+    !error &&
+    !isSelfShelledView &&
+    ((viewMode === 'diff' && Boolean(artifact.diffPatch ?? (artifact.previewKind === 'diff' ? textContent : null))) ||
+      (viewMode === 'preview' &&
+        (artifact.previewKind === 'diff' ||
           artifact.previewKind === 'markdown' ||
           artifact.previewKind === 'mermaid' ||
           artifact.previewKind === 'html')));
 
   const usesManagedZoomLayout =
-    isUnifiedShellView ||
+    isSelfShelledView ||
+    isOuterUnifiedShellView ||
     (viewMode === 'preview' &&
       (artifact.previewKind === 'pdf' ||
         artifact.previewKind === 'pptx' ||
@@ -1913,7 +2157,7 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
               </button>
             </div>
           )}
-          {isUnifiedShellView ? (
+          {isOuterUnifiedShellView ? (
             <UnifiedViewerZoomShell
               resetKey={`${versionKey}:${viewMode}`}
               fillViewportHeight={viewMode === 'preview' && artifact.previewKind === 'html'}

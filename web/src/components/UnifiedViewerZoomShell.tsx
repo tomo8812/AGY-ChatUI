@@ -6,7 +6,7 @@ import {
   VIEWER_MAX_SCALE,
   VIEWER_MIN_SCALE,
 } from '../utils/contentZoom';
-import { useUnifiedViewerZoom } from '../hooks/useUnifiedViewerZoom';
+import { useUnifiedViewerZoom, type DragPanMode } from '../hooks/useUnifiedViewerZoom';
 
 export interface UnifiedViewerZoomShellProps {
   resetKey: string;
@@ -14,32 +14,51 @@ export interface UnifiedViewerZoomShellProps {
   scrollClassName?: string;
   /** Whether the child fills the viewport height (e.g. HTML sandbox iframe) */
   fillViewportHeight?: boolean;
-  /** Optional left-side toolbar controls */
+  /** Optional left-side toolbar controls rendered inside the zoom toolbar (never zoomed) */
   toolbarLeft?: React.ReactNode;
+  /** Optional app controls/banners rendered ABOVE the zoomable content surface (never zoomed) */
+  controlsTop?: React.ReactNode;
+  /** Optional app controls/pagination rendered BELOW the zoomable content surface (never zoomed) */
+  controlsBottom?: React.ReactNode;
+  /** Drag-pan interaction mode (default: 'modifier-or-surface' to preserve text selection) */
+  dragPanMode?: DragPanMode;
   children: React.ReactNode;
+}
+
+interface IframeGestureBasis {
+  left: number;
+  top: number;
+  scale: number;
 }
 
 /**
  * Unified zoom shell for all document, code, diff, table, markdown, docx, mermaid,
- * and HTML viewers. Uses the exact same 3-phase GPU-preview zoom engine as PDF/Image
- * viewers so every file format has identical gesture feel, focal-point anchoring,
- * pan support, and "画面に合わせる" reset.
+ * and HTML viewers. Keeps all viewer controls (toolbar, search, sheet tabs, pagination,
+ * banners) strictly outside the zoomable content surface so only the file content scales.
  */
 export const UnifiedViewerZoomShell: React.FC<UnifiedViewerZoomShellProps> = ({
   resetKey,
   scrollClassName,
   fillViewportHeight = false,
   toolbarLeft,
+  controlsTop,
+  controlsBottom,
+  dragPanMode = 'modifier-or-surface',
   children,
 }) => {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const innerRef = useRef<HTMLDivElement | null>(null);
+  const iframeGestureBasisRef = useRef<IframeGestureBasis | null>(null);
+
   const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
   const [stageEl, setStageEl] = useState<HTMLDivElement | null>(null);
   const [scaleBadgeEl, setScaleBadgeEl] = useState<HTMLSpanElement | null>(null);
 
   const [scale, setScale] = useState<number>(VIEWER_DEFAULT_SCALE);
+  const scaleRef = useRef(scale);
+  scaleRef.current = scale;
+
   const [containerSize, setContainerSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
   const [contentSize, setContentSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
 
@@ -54,6 +73,7 @@ export const UnifiedViewerZoomShell: React.FC<UnifiedViewerZoomShellProps> = ({
   }, []);
 
   useEffect(() => {
+    iframeGestureBasisRef.current = null;
     setScale(VIEWER_DEFAULT_SCALE);
     scrollRef.current?.scrollTo({ top: 0, left: 0 });
   }, [resetKey]);
@@ -98,7 +118,12 @@ export const UnifiedViewerZoomShell: React.FC<UnifiedViewerZoomShellProps> = ({
   }, [resetKey]);
 
   const handleCommitScale = useCallback((nextScale: number) => {
+    iframeGestureBasisRef.current = null;
     setScale(clampZoomScale(nextScale, VIEWER_MIN_SCALE, VIEWER_MAX_SCALE));
+  }, []);
+
+  const handleGestureEnd = useCallback(() => {
+    iframeGestureBasisRef.current = null;
   }, []);
 
   const isDefault = Math.abs(scale - VIEWER_DEFAULT_SCALE) < 0.005;
@@ -106,6 +131,7 @@ export const UnifiedViewerZoomShell: React.FC<UnifiedViewerZoomShellProps> = ({
 
   const {
     isPanning,
+    isSpacePanReady,
     commitDiscreteScale,
     cancelActiveGesture,
     handleExternalWheel,
@@ -113,19 +139,39 @@ export const UnifiedViewerZoomShell: React.FC<UnifiedViewerZoomShellProps> = ({
   } = useUnifiedViewerZoom({
     scrollEl,
     stageEl,
+    anchorEl: stageEl,
     scaleBadgeEl,
     committedScale: scale,
     minScale: VIEWER_MIN_SCALE,
     maxScale: VIEWER_MAX_SCALE,
     enableDragPan: isZoomedIn,
+    dragPanMode,
     onCommitScale: handleCommitScale,
+    onGestureEnd: handleGestureEnd,
     resetKey,
   });
 
   // Bridge zoom gestures from sandboxed HTML iframes (`sandbox="allow-scripts"`) into the same
   // unified 3-phase zoom engine without weakening the opaque-origin sandbox boundary.
+  // Crucially, the iframe->viewport coordinate basis is frozen at gesture start using the
+  // committed scale (excluding any live GPU preview transform) so multi-frame pinches never
+  // feed the preview scale back into distance or focal-point calculations.
   useEffect(() => {
     if (!fillViewportHeight) return;
+
+    const getOrFreezeBasis = (iframe: HTMLIFrameElement, forceCapture: boolean): IframeGestureBasis => {
+      if (!forceCapture && iframeGestureBasisRef.current) {
+        return iframeGestureBasisRef.current;
+      }
+      const rect = iframe.getBoundingClientRect();
+      const basis: IframeGestureBasis = {
+        left: rect.left,
+        top: rect.top,
+        scale: scaleRef.current,
+      };
+      iframeGestureBasisRef.current = basis;
+      return basis;
+    };
 
     const onMessage = (event: MessageEvent) => {
       const data = event.data;
@@ -134,18 +180,16 @@ export const UnifiedViewerZoomShell: React.FC<UnifiedViewerZoomShellProps> = ({
       const iframe = innerRef.current?.querySelector('iframe.html-sandbox-frame') as HTMLIFrameElement | null;
       if (!iframe || !iframe.contentWindow || event.source !== iframe.contentWindow) return;
 
-      const iframeRect = iframe.getBoundingClientRect();
-      const scaleX = iframe.offsetWidth > 0 ? iframeRect.width / iframe.offsetWidth : 1;
-      const scaleY = iframe.offsetHeight > 0 ? iframeRect.height / iframe.offsetHeight : 1;
-
       if (data.kind === 'wheel') {
         const deltaY = Number(data.deltaY);
         const deltaMode = Number(data.deltaMode) || 0;
         const localX = Number(data.localX);
         const localY = Number(data.localY);
         if (!Number.isFinite(deltaY) || !Number.isFinite(localX) || !Number.isFinite(localY)) return;
-        const clientX = iframeRect.left + localX * scaleX;
-        const clientY = iframeRect.top + localY * scaleY;
+        const isFreshGesture = scrollRef.current?.dataset.zoomInteracting !== 'true';
+        const basis = getOrFreezeBasis(iframe, isFreshGesture);
+        const clientX = basis.left + localX * basis.scale;
+        const clientY = basis.top + localY * basis.scale;
         handleExternalWheel(deltaY, deltaMode, clientX, clientY);
         return;
       }
@@ -155,19 +199,25 @@ export const UnifiedViewerZoomShell: React.FC<UnifiedViewerZoomShellProps> = ({
         const localX = Number(data.localX);
         const localY = Number(data.localY);
         if (!Number.isFinite(distance) || !Number.isFinite(localX) || !Number.isFinite(localY)) return;
-        const clientX = iframeRect.left + localX * scaleX;
-        const clientY = iframeRect.top + localY * scaleY;
-        handleExternalPinch(data.kind === 'pinch-start' ? 'start' : 'move', distance * scaleX, clientX, clientY);
+        const isStart = data.kind === 'pinch-start';
+        const basis = getOrFreezeBasis(iframe, isStart);
+        const clientX = basis.left + localX * basis.scale;
+        const clientY = basis.top + localY * basis.scale;
+        handleExternalPinch(isStart ? 'start' : 'move', distance * basis.scale, clientX, clientY);
         return;
       }
 
       if (data.kind === 'pinch-end') {
         handleExternalPinch('end');
+        iframeGestureBasisRef.current = null;
       }
     };
 
     window.addEventListener('message', onMessage);
-    return () => window.removeEventListener('message', onMessage);
+    return () => {
+      window.removeEventListener('message', onMessage);
+      iframeGestureBasisRef.current = null;
+    };
   }, [fillViewportHeight, handleExternalWheel, handleExternalPinch]);
 
   const applyStepZoom = useCallback(
@@ -178,12 +228,13 @@ export const UnifiedViewerZoomShell: React.FC<UnifiedViewerZoomShellProps> = ({
   );
 
   const handleResetFit = useCallback(() => {
+    iframeGestureBasisRef.current = null;
     cancelActiveGesture();
     setScale(VIEWER_DEFAULT_SCALE);
     scrollRef.current?.scrollTo({ top: 0, left: 0 });
   }, [cancelActiveGesture]);
 
-  const baseW = contentSize.width > 0 ? contentSize.width : Math.max(0, containerSize.width);
+  const baseW = containerSize.width > 0 ? containerSize.width : Math.max(0, contentSize.width);
   const baseH =
     contentSize.height > 0
       ? contentSize.height
@@ -191,13 +242,17 @@ export const UnifiedViewerZoomShell: React.FC<UnifiedViewerZoomShellProps> = ({
         ? Math.max(320, containerSize.height)
         : 0;
 
+  // When scaled (especially scale < 1), give the stage exact scaled pixel dimensions with
+  // overflow: hidden and NO minWidth: 100%, so:
+  // 1. Untransformed inner layout boxes never leave phantom scroll range when shrunk.
+  // 2. stage.getBoundingClientRect() matches the exact visual content rect for focal anchoring.
   const sizerStyle: React.CSSProperties =
     !isDefault && baseW > 0 && baseH > 0
       ? {
-          width: `${Math.ceil(baseW * scale)}px`,
-          height: `${Math.ceil(baseH * scale)}px`,
-          minWidth: '100%',
-          minHeight: fillViewportHeight ? '100%' : undefined,
+          width: `${Math.max(1, Math.ceil(baseW * scale))}px`,
+          height: `${Math.max(1, Math.ceil(baseH * scale))}px`,
+          overflow: 'hidden',
+          margin: scale < 1 ? '0 auto' : undefined,
         }
       : {
           width: '100%',
@@ -206,12 +261,15 @@ export const UnifiedViewerZoomShell: React.FC<UnifiedViewerZoomShellProps> = ({
         };
 
   const innerStyle: React.CSSProperties = {
-    width: !isDefault && containerSize.width > 0 ? `${containerSize.width}px` : '100%',
+    width: !isDefault && baseW > 0 ? `${baseW}px` : '100%',
     height: fillViewportHeight ? (containerSize.height > 0 ? `${containerSize.height}px` : '100%') : undefined,
     minHeight: fillViewportHeight ? '100%' : undefined,
     transform: isDefault ? undefined : `scale(${scale})`,
     transformOrigin: '0 0',
   };
+
+  const showGrabCursor =
+    isZoomedIn && (dragPanMode === 'direct' || isSpacePanReady);
 
   return (
     <div className="viewer-zoom-wrap">
@@ -247,9 +305,10 @@ export const UnifiedViewerZoomShell: React.FC<UnifiedViewerZoomShellProps> = ({
           </button>
         </div>
       </div>
+      {controlsTop && <div className="viewer-controls-top">{controlsTop}</div>}
       <div
         ref={setScrollContainerRef}
-        className={`viewer-zoom-scroll content-zoom-surface${scrollClassName ? ` ${scrollClassName}` : ''}${isZoomedIn ? ' is-pannable' : ''}${isPanning ? ' is-panning' : ''}`}
+        className={`viewer-zoom-scroll content-zoom-surface${scrollClassName ? ` ${scrollClassName}` : ''}${showGrabCursor ? ' is-pannable' : ''}${isPanning ? ' is-panning' : ''}`}
         data-viewer-zoom-surface="true"
         data-zoom-scale={Math.round(scale * 100)}
         data-fit-mode={isDefault ? 'auto' : 'manual'}
@@ -260,6 +319,7 @@ export const UnifiedViewerZoomShell: React.FC<UnifiedViewerZoomShellProps> = ({
           </div>
         </div>
       </div>
+      {controlsBottom && <div className="viewer-controls-bottom">{controlsBottom}</div>}
     </div>
   );
 };

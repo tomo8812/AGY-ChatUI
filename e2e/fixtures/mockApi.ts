@@ -1,4 +1,5 @@
 import type { Page } from '@playwright/test';
+import { injectSandboxZoomBridge } from '../../server/src/files/sandbox-bridge';
 import { buildSyntheticDocx, buildSyntheticPdf, buildSyntheticPng, buildSyntheticSvg } from './syntheticAssets';
 
 const NOW = 1763865600000;
@@ -704,21 +705,29 @@ export async function installMockApi(page: Page, options: MockApiOptions = {}): 
       });
     }
 
+    const SAMPLE_HTML = [
+      '<!doctype html><html><body style="font-family:sans-serif;padding:20px;">',
+      '<!-- comment containing </body> and </html> -->',
+      '<h1>HTML Preview Report</h1>',
+      '<p id="status">Unified viewer zoom verification content.</p>',
+      '<textarea readonly>literal </body> inside textarea</textarea>',
+      '<script>const fragment = "</body></html>"; document.getElementById("status").dataset.jsOk = String(fragment.length);</script>',
+      '</body></html>',
+    ].join('');
+
     if (pathname === `/api/files/${FIXTURE_IDS.htmlId}/content`) {
       return route.fulfill({
         status: 200,
         contentType: 'text/html; charset=utf-8',
-        body: '<!doctype html><html><body style="font-family:sans-serif;padding:20px;"><h1>HTML Preview Report</h1><p>Unified viewer zoom verification content.</p></body></html>',
+        body: SAMPLE_HTML,
       });
     }
 
     if (pathname === `/api/files/${FIXTURE_IDS.htmlId}/sandbox`) {
-      const bridge =
-        '<script>(function(){if(window.__agySandboxZoomBridge)return;window.__agySandboxZoomBridge=1;var p=window.parent;if(!p||p===window)return;var post=function(m){try{p.postMessage(m,"*");}catch(e){}};var active=false;window.addEventListener("wheel",function(e){if(!e.ctrlKey&&!e.metaKey)return;e.preventDefault();post({type:"agy-sandbox-zoom",kind:"wheel",deltaY:e.deltaY,deltaMode:e.deltaMode,localX:e.clientX,localY:e.clientY});},{passive:false,capture:true});var geom=function(t1,t2){var dx=t2.clientX-t1.clientX,dy=t2.clientY-t1.clientY;return{d:Math.hypot(dx,dy),x:(t1.clientX+t2.clientX)/2,y:(t1.clientY+t2.clientY)/2};};window.addEventListener("touchstart",function(e){if(e.touches.length===2){e.preventDefault();active=true;var g=geom(e.touches[0],e.touches[1]);post({type:"agy-sandbox-zoom",kind:"pinch-start",distance:g.d,localX:g.x,localY:g.y});}},{passive:false,capture:true});window.addEventListener("touchmove",function(e){if(e.touches.length===2){e.preventDefault();var g=geom(e.touches[0],e.touches[1]);post({type:"agy-sandbox-zoom",kind:active?"pinch-move":"pinch-start",distance:g.d,localX:g.x,localY:g.y});active=true;}},{passive:false,capture:true});var end=function(e){if(active&&e.touches.length<2){active=false;post({type:"agy-sandbox-zoom",kind:"pinch-end"});}};window.addEventListener("touchend",end,{passive:true,capture:true});window.addEventListener("touchcancel",end,{passive:true,capture:true});var gs=function(e){e.preventDefault();};window.addEventListener("gesturestart",gs,{passive:false,capture:true});window.addEventListener("gesturechange",gs,{passive:false,capture:true});window.addEventListener("gestureend",gs,{passive:false,capture:true});})();</script>';
       return route.fulfill({
         status: 200,
         contentType: 'text/html; charset=utf-8',
-        body: `<!doctype html><html><body style="font-family:sans-serif;padding:20px;"><h1>HTML Preview Report</h1><p>Unified viewer zoom verification content.</p>${bridge}</body></html>`,
+        body: injectSandboxZoomBridge(SAMPLE_HTML),
       });
     }
 

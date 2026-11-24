@@ -9,11 +9,24 @@ import {
   type RelativeFocalPoint,
 } from '../utils/contentZoom';
 
-export interface UseUnifiedViewerZoomOptions {
-  /** Scroll container element (.viewer-zoom-scroll) */
+export interface ZoomAnchorAdapter<TAnchor = unknown> {
+  /** Capture a viewer-specific focal anchor (e.g. PDF pageNum + page-local normalized coords) */
+  capture: (clientX: number, clientY: number) => TAnchor | null;
+  /** Synchronously adjust scroll offsets after layout commit so the captured anchor stays at (clientX, clientY) */
+  restore: (anchor: TAnchor, clientX: number, clientY: number) => void;
+}
+
+export type DragPanMode = 'direct' | 'modifier-or-surface';
+
+export interface UseUnifiedViewerZoomOptions<TAnchor = unknown> {
+  /** Scroll container element */
   scrollEl: HTMLElement | null;
-  /** Visual stage element (.viewer-zoom-stage) that receives GPU preview transforms */
+  /** Visual stage element that receives GPU preview transforms during gestures */
   stageEl: HTMLElement | null;
+  /** Optional element whose rect represents the true scaled content bounds for focal anchoring (defaults to stageEl) */
+  anchorEl?: HTMLElement | null;
+  /** Optional viewer-specific anchor adapter (e.g. PDF page-level focal anchoring) */
+  anchorAdapter?: ZoomAnchorAdapter<TAnchor>;
   /** Optional scale readout element updated directly via DOM during gestures (0 React renders) */
   scaleBadgeEl?: HTMLElement | null;
   /** Committed scale currently rendered in React */
@@ -24,20 +37,31 @@ export interface UseUnifiedViewerZoomOptions {
   maxScale: number;
   /** Whether PC mouse drag-to-pan is enabled when overflowing */
   enableDragPan?: boolean;
+  /**
+   * 'direct': left-click drag pans immediately on non-interactive targets (PDF, Image, SVG).
+   * 'modifier-or-surface': preserves native text selection on text elements while allowing
+   * drag-pan via Space+drag, Alt+drag, middle-click drag, or dragging non-text surfaces.
+   */
+  dragPanMode?: DragPanMode;
   /** Wheel sensitivity multiplier (default 0.0025) */
   wheelSensitivity?: number;
   /** Delay (ms) after the last wheel event before committing high-res layout/render */
   wheelCommitDelayMs?: number;
-  /** Called ONCE when a gesture ends (or on discrete step/reset) to commit the final scale */
+  /** Called ONCE when a gesture ends (or on discrete step) to commit the final scale */
   onCommitScale: (nextScale: number) => void;
-  /** Optional callback when a gesture starts (e.g. cancel smooth scroll locks) */
+  /** Optional callback when a zoom gesture starts */
   onGestureStart?: () => void;
+  /** Optional callback when a zoom gesture finishes or is cancelled */
+  onGestureEnd?: () => void;
+  /** Optional callback when a mouse drag-to-pan starts (does not pause rendering) */
+  onPanStart?: () => void;
   /** Optional key that resets any in-flight gesture state (e.g. file/artifact change) */
   resetKey?: string;
 }
 
 export interface UseUnifiedViewerZoomResult {
   isPanning: boolean;
+  isSpacePanReady: boolean;
   /** Capture a focal point and commit a discrete scale change immediately (e.g. +/- buttons or double-click) */
   commitDiscreteScale: (
     nextScaleOrUpdater: number | ((currentScale: number) => number),
@@ -57,65 +81,93 @@ export interface UseUnifiedViewerZoomResult {
   ) => void;
 }
 
-interface ActiveGestureState {
+interface ActiveGestureState<TAnchor = unknown> {
   baseScale: number;
   liveScale: number;
   scrollRectLeft: number;
   scrollRectTop: number;
-  startStageWidth: number;
-  startStageHeight: number;
+  startAnchorWidth: number;
+  startAnchorHeight: number;
   startPointerX: number;
   startPointerY: number;
   curPointerX: number;
   curPointerY: number;
+  /** Focal point relative to stageEl's un-transformed top-left (for GPU translate3d+scale preview) */
   focalStageX: number;
   focalStageY: number;
+  /** Focal point relative to anchorEl's un-transformed top-left (for fallback relative anchoring) */
+  focalAnchorX: number;
+  focalAnchorY: number;
+  /** Optional custom anchor captured at gesture start (e.g. PDF pageNum + page-local normalized coords) */
+  customAnchor: TAnchor | null;
 }
+
+type PendingFocalAnchor<TAnchor = unknown> =
+  | { kind: 'custom'; anchor: TAnchor; clientX: number; clientY: number }
+  | { kind: 'relative'; focal: RelativeFocalPoint };
 
 function isInteractiveTarget(target: EventTarget | null): boolean {
   if (!(target instanceof Element)) return false;
   return Boolean(target.closest('button, a, input, select, textarea, label, [role="button"]'));
 }
 
+function isEditableFocusedElement(): boolean {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement)) return false;
+  const tag = active.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || active.isContentEditable;
+}
+
+function isNonTextPanSurface(
+  target: EventTarget | null,
+  scrollEl: HTMLElement,
+  stageEl: HTMLElement | null
+): boolean {
+  if (!(target instanceof Element)) return false;
+  if (target === scrollEl || target === stageEl) return true;
+  if (target.closest('img, canvas, svg')) return true;
+  return false;
+}
+
 /**
  * Unified, 3-phase (start -> GPU preview update -> commit) zoom & pan engine
  * shared by all file viewers (PDF, PPTX, Image, SVG, DOCX, Markdown, Code, Diff,
  * CSV/Excel, Mermaid, HTML).
- *
- * During continuous pinch or Ctrl+Wheel gestures:
- * - Zero React state updates / zero component re-renders
- * - Zero layout recalculations / zero DOM style mutations on child items
- * - Pure GPU `translate3d + scale` anchored cleanly at the pointer/pinch midpoint
- *
- * When the gesture ends:
- * - Commits the final scale once to React
- * - Clears the GPU preview transform and applies exact focal-point scroll correction
- *   synchronously in `useLayoutEffect` before paint (zero jump / zero flicker).
  */
-export function useUnifiedViewerZoom({
+export function useUnifiedViewerZoom<TAnchor = unknown>({
   scrollEl,
   stageEl,
+  anchorEl = null,
+  anchorAdapter,
   scaleBadgeEl = null,
   committedScale,
   minScale,
   maxScale,
   enableDragPan = true,
+  dragPanMode = 'direct',
   wheelSensitivity = 0.0025,
   wheelCommitDelayMs = 140,
   onCommitScale,
   onGestureStart,
+  onGestureEnd,
+  onPanStart,
   resetKey,
-}: UseUnifiedViewerZoomOptions): UseUnifiedViewerZoomResult {
+}: UseUnifiedViewerZoomOptions<TAnchor>): UseUnifiedViewerZoomResult {
   const [isPanning, setIsPanning] = useState(false);
+  const [isSpacePanReady, setIsSpacePanReady] = useState(false);
 
-  const pendingFocalRef = useRef<RelativeFocalPoint | null>(null);
-  const gestureRef = useRef<ActiveGestureState | null>(null);
+  const pendingAnchorRef = useRef<PendingFocalAnchor<TAnchor> | null>(null);
+  const gestureRef = useRef<ActiveGestureState<TAnchor> | null>(null);
+  const gestureActiveFlagRef = useRef(false);
   const rafIdRef = useRef<number | null>(null);
   const wheelCommitTimerRef = useRef<number | null>(null);
+  const spacePressedRef = useRef(false);
 
   const latestRef = useRef({
     scrollEl,
     stageEl,
+    anchorEl,
+    anchorAdapter,
     scaleBadgeEl,
     committedScale,
     minScale,
@@ -124,10 +176,14 @@ export function useUnifiedViewerZoom({
     wheelCommitDelayMs,
     onCommitScale,
     onGestureStart,
+    onGestureEnd,
+    onPanStart,
   });
   latestRef.current = {
     scrollEl,
     stageEl,
+    anchorEl,
+    anchorAdapter,
     scaleBadgeEl,
     committedScale,
     minScale,
@@ -136,9 +192,11 @@ export function useUnifiedViewerZoom({
     wheelCommitDelayMs,
     onCommitScale,
     onGestureStart,
+    onGestureEnd,
+    onPanStart,
   };
 
-  const clearPreviewTransform = useCallback(() => {
+  const clearTimersAndPreview = useCallback(() => {
     const { scrollEl: sc, stageEl: st, scaleBadgeEl: badge, committedScale: curScale } = latestRef.current;
     if (rafIdRef.current !== null) {
       window.cancelAnimationFrame(rafIdRef.current);
@@ -161,20 +219,60 @@ export function useUnifiedViewerZoom({
     }
   }, []);
 
+  const notifyGestureEndedIfActive = useCallback(() => {
+    if (gestureActiveFlagRef.current) {
+      gestureActiveFlagRef.current = false;
+      latestRef.current.onGestureEnd?.();
+    }
+  }, []);
+
   const cancelActiveGesture = useCallback(() => {
     gestureRef.current = null;
-    pendingFocalRef.current = null;
-    clearPreviewTransform();
-  }, [clearPreviewTransform]);
+    pendingAnchorRef.current = null;
+    clearTimersAndPreview();
+    notifyGestureEndedIfActive();
+  }, [clearTimersAndPreview, notifyGestureEndedIfActive]);
 
   // Reset gesture state cleanly when switching files/views
   useEffect(() => {
     cancelActiveGesture();
   }, [resetKey, cancelActiveGesture]);
 
-  // After React commits the new `committedScale`, clear the preview transform and
-  // restore the exact focal-point scroll position synchronously before browser paint.
+  // Cancel any in-flight gesture if the scroll container resizes mid-gesture
+  useEffect(() => {
+    if (!scrollEl || typeof ResizeObserver === 'undefined') return;
+    let lastW = Math.round(scrollEl.clientWidth);
+    let lastH = Math.round(scrollEl.clientHeight);
+    const ro = new ResizeObserver(() => {
+      const nextW = Math.round(scrollEl.clientWidth);
+      const nextH = Math.round(scrollEl.clientHeight);
+      if (Math.abs(nextW - lastW) > 1 || Math.abs(nextH - lastH) > 1) {
+        lastW = nextW;
+        lastH = nextH;
+        if (gestureRef.current) {
+          cancelActiveGesture();
+        }
+      }
+    });
+    ro.observe(scrollEl);
+    return () => ro.disconnect();
+  }, [scrollEl, cancelActiveGesture]);
+
+  // After React commits `committedScale`, clear preview transform, abort any stale
+  // in-flight gesture (e.g. external scale change), and synchronously restore the exact focal anchor.
   useLayoutEffect(() => {
+    if (gestureRef.current) {
+      gestureRef.current = null;
+      if (rafIdRef.current !== null) {
+        window.cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
+      if (wheelCommitTimerRef.current !== null) {
+        window.clearTimeout(wheelCommitTimerRef.current);
+        wheelCommitTimerRef.current = null;
+      }
+    }
+
     const st = stageEl;
     const sc = scrollEl;
     if (st) {
@@ -189,18 +287,27 @@ export function useUnifiedViewerZoom({
       scaleBadgeEl.textContent = `${Math.round(committedScale * 100)}%`;
     }
 
-    const focal = pendingFocalRef.current;
-    if (!focal || !sc || !st) return;
-    pendingFocalRef.current = null;
+    const pending = pendingAnchorRef.current;
+    if (pending && sc) {
+      pendingAnchorRef.current = null;
+      if (pending.kind === 'custom') {
+        latestRef.current.anchorAdapter?.restore(pending.anchor, pending.clientX, pending.clientY);
+      } else {
+        const targetEl = anchorEl ?? st;
+        if (targetEl) {
+          const { deltaX, deltaY } = computeFocalScrollDelta(targetEl.getBoundingClientRect(), pending.focal);
+          if (Math.abs(deltaX) > 0.5) {
+            sc.scrollLeft = Math.max(0, sc.scrollLeft + deltaX);
+          }
+          if (Math.abs(deltaY) > 0.5) {
+            sc.scrollTop = Math.max(0, sc.scrollTop + deltaY);
+          }
+        }
+      }
+    }
 
-    const { deltaX, deltaY } = computeFocalScrollDelta(st.getBoundingClientRect(), focal);
-    if (Math.abs(deltaX) > 0.5) {
-      sc.scrollLeft = Math.max(0, sc.scrollLeft + deltaX);
-    }
-    if (Math.abs(deltaY) > 0.5) {
-      sc.scrollTop = Math.max(0, sc.scrollTop + deltaY);
-    }
-  }, [committedScale, scrollEl, stageEl, scaleBadgeEl]);
+    notifyGestureEndedIfActive();
+  }, [committedScale, scrollEl, stageEl, anchorEl, scaleBadgeEl, notifyGestureEndedIfActive]);
 
   const commitDiscreteScale = useCallback(
     (
@@ -211,28 +318,53 @@ export function useUnifiedViewerZoom({
       const {
         scrollEl: sc,
         stageEl: st,
+        anchorEl: aEl,
+        anchorAdapter: adapter,
         committedScale: curCommitted,
         minScale: minS,
         maxScale: maxS,
         onCommitScale: commit,
       } = latestRef.current;
+
+      const hadGesture = gestureRef.current !== null;
       const baseScale = gestureRef.current?.liveScale ?? curCommitted;
-      if (gestureRef.current) {
+      if (hadGesture) {
         gestureRef.current = null;
-        clearPreviewTransform();
+        clearTimersAndPreview();
       }
+
       const rawNext =
         typeof nextScaleOrUpdater === 'function' ? nextScaleOrUpdater(baseScale) : nextScaleOrUpdater;
       const nextScale = clampZoomScale(rawNext, minS, maxS);
+
+      // No-op guard: never leave a stale pendingAnchorRef when React will skip re-render
+      if (Math.abs(nextScale - curCommitted) < 0.0005) {
+        pendingAnchorRef.current = null;
+        if (hadGesture) {
+          notifyGestureEndedIfActive();
+        }
+        return;
+      }
+
       if (sc && st) {
         const scRect = sc.getBoundingClientRect();
         const cx = clientX ?? scRect.left + scRect.width / 2;
         const cy = clientY ?? scRect.top + scRect.height / 2;
-        pendingFocalRef.current = captureRelativeFocalPoint(st.getBoundingClientRect(), cx, cy);
+        if (adapter) {
+          const captured = adapter.capture(cx, cy);
+          pendingAnchorRef.current = captured !== null ? { kind: 'custom', anchor: captured, clientX: cx, clientY: cy } : null;
+        } else {
+          const targetEl = aEl ?? st;
+          const focal = captureRelativeFocalPoint(targetEl.getBoundingClientRect(), cx, cy);
+          pendingAnchorRef.current = focal ? { kind: 'relative', focal } : null;
+        }
+      } else {
+        pendingAnchorRef.current = null;
       }
+
       commit(nextScale);
     },
-    [clearPreviewTransform]
+    [clearTimersAndPreview, notifyGestureEndedIfActive]
   );
 
   const externalHandlersRef = useRef<{
@@ -251,40 +383,64 @@ export function useUnifiedViewerZoom({
     let pinchStartScale = 1;
     let pinchActive = false;
 
-    const beginGesture = (clientX: number, clientY: number): ActiveGestureState | null => {
-      const { scrollEl: sc, stageEl: st, committedScale: curScale, onGestureStart: notifyStart } = latestRef.current;
+    const beginGesture = (clientX: number, clientY: number): ActiveGestureState<TAnchor> | null => {
+      const {
+        scrollEl: sc,
+        stageEl: st,
+        anchorEl: aEl,
+        anchorAdapter: adapter,
+        committedScale: curScale,
+        onGestureStart: notifyStart,
+      } = latestRef.current;
       if (!sc || !st) return null;
 
-      notifyStart?.();
+      if (!gestureActiveFlagRef.current) {
+        gestureActiveFlagRef.current = true;
+        notifyStart?.();
+      }
 
       const scRect = sc.getBoundingClientRect();
       const stRect = st.getBoundingClientRect();
-      const startStageWidth = Math.max(1, stRect.width);
-      const startStageHeight = Math.max(1, stRect.height);
+      const targetAnchorEl = aEl ?? st;
+      const anchorRect = targetAnchorEl === st ? stRect : targetAnchorEl.getBoundingClientRect();
+
+      const startAnchorWidth = Math.max(1, anchorRect.width);
+      const startAnchorHeight = Math.max(1, anchorRect.height);
       const startPointerX = clientX - scRect.left;
       const startPointerY = clientY - scRect.top;
+
       const stageOriginX = stRect.left - scRect.left + sc.scrollLeft;
       const stageOriginY = stRect.top - scRect.top + sc.scrollTop;
       const focalStageX = sc.scrollLeft + startPointerX - stageOriginX;
       const focalStageY = sc.scrollTop + startPointerY - stageOriginY;
 
+      const anchorOriginX = anchorRect.left - scRect.left + sc.scrollLeft;
+      const anchorOriginY = anchorRect.top - scRect.top + sc.scrollTop;
+      const focalAnchorX = sc.scrollLeft + startPointerX - anchorOriginX;
+      const focalAnchorY = sc.scrollTop + startPointerY - anchorOriginY;
+
+      const customAnchor = adapter ? adapter.capture(clientX, clientY) : null;
+
       sc.dataset.zoomInteracting = 'true';
       st.style.transformOrigin = '0 0';
       st.style.willChange = 'transform';
 
-      const g: ActiveGestureState = {
+      const g: ActiveGestureState<TAnchor> = {
         baseScale: curScale,
         liveScale: curScale,
         scrollRectLeft: scRect.left,
         scrollRectTop: scRect.top,
-        startStageWidth,
-        startStageHeight,
+        startAnchorWidth,
+        startAnchorHeight,
         startPointerX,
         startPointerY,
         curPointerX: startPointerX,
         curPointerY: startPointerY,
         focalStageX,
         focalStageY,
+        focalAnchorX,
+        focalAnchorY,
+        customAnchor,
       };
       gestureRef.current = g;
       return g;
@@ -324,24 +480,45 @@ export function useUnifiedViewerZoom({
 
       const g = gestureRef.current;
       gestureRef.current = null;
-      if (!g) return;
+      if (!g) {
+        notifyGestureEndedIfActive();
+        return;
+      }
 
       const { committedScale: curCommitted, onCommitScale: commit } = latestRef.current;
       const finalScale = g.liveScale;
 
       if (Math.abs(finalScale - curCommitted) < 0.0005) {
-        clearPreviewTransform();
+        pendingAnchorRef.current = null;
+        clearTimersAndPreview();
+        notifyGestureEndedIfActive();
         return;
       }
 
-      pendingFocalRef.current = {
-        relX: g.focalStageX / g.startStageWidth,
-        relY: g.focalStageY / g.startStageHeight,
-        clientX: g.scrollRectLeft + g.curPointerX,
-        clientY: g.scrollRectTop + g.curPointerY,
-      };
+      const finalClientX = g.scrollRectLeft + g.curPointerX;
+      const finalClientY = g.scrollRectTop + g.curPointerY;
 
-      // Single React state commit at gesture end
+      if (g.customAnchor !== null) {
+        pendingAnchorRef.current = {
+          kind: 'custom',
+          anchor: g.customAnchor,
+          clientX: finalClientX,
+          clientY: finalClientY,
+        };
+      } else {
+        pendingAnchorRef.current = {
+          kind: 'relative',
+          focal: {
+            relX: g.focalAnchorX / g.startAnchorWidth,
+            relY: g.focalAnchorY / g.startAnchorHeight,
+            clientX: finalClientX,
+            clientY: finalClientY,
+          },
+        };
+      }
+
+      // Single React state commit at gesture end (useLayoutEffect will clear preview,
+      // restore focal scroll position, and call onGestureEnd)
       commit(finalScale);
     };
 
@@ -462,7 +639,7 @@ export function useUnifiedViewerZoom({
       scrollEl.removeEventListener('gestureend', handleSafariGesture);
       cancelActiveGesture();
     };
-  }, [scrollEl, clearPreviewTransform, cancelActiveGesture]);
+  }, [scrollEl, clearTimersAndPreview, cancelActiveGesture, notifyGestureEndedIfActive]);
 
   const handleExternalWheel = useCallback(
     (deltaY: number, deltaMode: number, clientX: number, clientY: number) => {
@@ -478,6 +655,43 @@ export function useUnifiedViewerZoom({
     []
   );
 
+  // Track Space key for grab-to-pan in text-selectable document viewers
+  useEffect(() => {
+    if (!scrollEl || !enableDragPan || dragPanMode !== 'modifier-or-surface') {
+      spacePressedRef.current = false;
+      setIsSpacePanReady(false);
+      return;
+    }
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code === 'Space' && !e.repeat && !isEditableFocusedElement()) {
+        spacePressedRef.current = true;
+        setIsSpacePanReady(true);
+      }
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code === 'Space') {
+        spacePressedRef.current = false;
+        setIsSpacePanReady(false);
+      }
+    };
+    const onBlur = () => {
+      spacePressedRef.current = false;
+      setIsSpacePanReady(false);
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onBlur);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onBlur);
+      spacePressedRef.current = false;
+      setIsSpacePanReady(false);
+    };
+  }, [scrollEl, enableDragPan, dragPanMode]);
+
   // PC Mouse drag-to-pan when content overflows the scroll container
   useEffect(() => {
     if (!scrollEl || !enableDragPan) return;
@@ -489,11 +703,23 @@ export function useUnifiedViewerZoom({
     let startScrollTop = 0;
 
     const handleMouseDown = (e: MouseEvent) => {
-      if (e.button !== 0) return;
+      const isMiddle = e.button === 1;
+      const isLeft = e.button === 0;
+      if (!isLeft && !isMiddle) return;
       if (isInteractiveTarget(e.target)) return;
+
       const canPanX = scrollEl.scrollWidth > scrollEl.clientWidth + 1;
       const canPanY = scrollEl.scrollHeight > scrollEl.clientHeight + 1;
       if (!canPanX && !canPanY) return;
+
+      if (dragPanMode === 'modifier-or-surface' && !isMiddle) {
+        const hasModifier = spacePressedRef.current || e.altKey;
+        const onPanSurface = isNonTextPanSurface(e.target, scrollEl, latestRef.current.stageEl);
+        if (!hasModifier && !onPanSurface) {
+          // Allow native browser text selection & copy inside zoomed documents
+          return;
+        }
+      }
 
       dragging = true;
       startX = e.clientX;
@@ -501,7 +727,7 @@ export function useUnifiedViewerZoom({
       startScrollLeft = scrollEl.scrollLeft;
       startScrollTop = scrollEl.scrollTop;
       setIsPanning(true);
-      latestRef.current.onGestureStart?.();
+      latestRef.current.onPanStart?.();
       e.preventDefault();
     };
 
@@ -530,10 +756,11 @@ export function useUnifiedViewerZoom({
       window.removeEventListener('mouseup', handleMouseUp);
       window.removeEventListener('blur', handleMouseUp);
     };
-  }, [scrollEl, enableDragPan]);
+  }, [scrollEl, enableDragPan, dragPanMode]);
 
   return {
     isPanning,
+    isSpacePanReady,
     commitDiscreteScale,
     cancelActiveGesture,
     handleExternalWheel,

@@ -331,14 +331,15 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
         })
         .toBe(true);
 
-      // Page 1 (far offscreen, previously visited) MUST NOT have re-rendered at the new scale
+      // Page 1 (far offscreen, > 14 pages away) must be released (data-rendered-scale cleared)
+      // and must NEVER have re-rendered at the new zoomed scale.
       const page1ScaleAfterScrollZoom = await page
         .locator('.pdf-page-slot[data-page-number="1"]')
         .getAttribute('data-rendered-scale');
       expect(
         page1ScaleAfterScrollZoom,
-        `[${vpLabel}] Far-offscreen visited page 1 must not re-render when zooming at page 25`
-      ).toBe(page1ScaleBeforeScrollZoom);
+        `[${vpLabel}] Far-offscreen page 1 must be released and clear data-rendered-scale when viewing page 25`
+      ).toBeNull();
 
       await closeActiveModal(page);
 
@@ -437,7 +438,13 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
       await closeActiveModal(page);
 
       // 8. Unified shell viewers: Markdown + Diff + Code (Source) + CSV Table + DOCX + HTML
-      const UNIFIED_VIEWER_CHROME = ['.modal-head', '.viewer-zoom-toolbar', '.viewer-footer'] as const;
+      const UNIFIED_VIEWER_CHROME = [
+        '.modal-head',
+        '.viewer-zoom-toolbar',
+        '.viewer-controls-top',
+        '.viewer-controls-bottom',
+        '.viewer-footer',
+      ] as const;
 
       const verifyUnifiedShellViewerZoom = async (
         screenPrefix: string,
@@ -464,9 +471,13 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
 
           const frame = page.frameLocator('iframe.html-sandbox-frame');
           await frame.locator('h1').waitFor({ state: 'visible' });
+          // Verify original JS with literal "</body></html>" string executed intact after bridge injection
+          await expect(frame.locator('#status')).toHaveAttribute('data-js-ok', '14');
 
           if (isIphoneProject) {
-            await frame.locator('body').evaluate((body) => {
+            // Multi-frame pinch across rAF boundaries (span 40 -> 50 -> 60 -> 72 = exact 1.80x ratio)
+            // Proves live GPU preview transform never feeds back into pinch distance calculation
+            await frame.locator('body').evaluate(async (body) => {
               const r = body.getBoundingClientRect();
               const cx = r.left + Math.max(80, r.width / 2);
               const cy = r.top + Math.max(80, r.height / 2);
@@ -495,9 +506,16 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
                 }
                 body.dispatchEvent(ev);
               };
+              const nextFrames = () =>
+                new Promise<void>((res) =>
+                  window.requestAnimationFrame(() => window.requestAnimationFrame(() => res()))
+                );
+
               send('touchstart', [makeTouch(1, cx - 40, cy), makeTouch(2, cx + 40, cy)]);
+              await nextFrames();
               for (const span of [50, 60, 72]) {
                 send('touchmove', [makeTouch(1, cx - span, cy), makeTouch(2, cx + span, cy)]);
+                await nextFrames();
               }
               send('touchend', []);
             });
@@ -533,6 +551,18 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
             Number(await page.locator('.viewer-zoom-scroll').getAttribute('data-zoom-scale'))
           )
           .toBeGreaterThan(115);
+
+        if (insideIframe && isIphoneProject) {
+          // Wait for gesture commit and verify scale matches 72/40 = 180% without runaway feedback
+          await expect
+            .poll(async () =>
+              page.locator('.viewer-zoom-scroll').getAttribute('data-zoom-interacting')
+            )
+            .toBeNull();
+          const finalScale = Number(await page.locator('.viewer-zoom-scroll').getAttribute('data-zoom-scale'));
+          expect(finalScale, `[${vpLabel}] HTML iframe multi-frame pinch must stay near 180%`).toBeGreaterThanOrEqual(170);
+          expect(finalScale, `[${vpLabel}] HTML iframe multi-frame pinch must not compound preview transform`).toBeLessThanOrEqual(190);
+        }
 
         await expect
           .poll(async () =>
@@ -711,9 +741,9 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
       });
     }
 
-    // Now simulate an ACTUAL window resize to narrow width (720x720 at 100% zoom, dpr=1)
+    // Now simulate an ACTUAL window resize to narrow width (800x720 at 100% zoom, dpr=1)
     await cdp.send('Emulation.setDeviceMetricsOverride', {
-      width: 720,
+      width: 800,
       height: 720,
       deviceScaleFactor: 1,
       mobile: false,
@@ -722,7 +752,142 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
     await expect(page.locator('html')).toHaveAttribute('data-layout-mode', 'mobile');
     await expect(page.locator('button[aria-label="メニューを開く"]')).toBeVisible();
 
+    // Browser ZOOM-OUT (80%, 67%) on that narrow 800px PC window must NOT flip mobile -> desktop
+    for (const zoomOut of [0.8, 0.67]) {
+      const zoomedW = Math.round(800 / zoomOut);
+      const zoomedH = Math.round(720 / zoomOut);
+      await cdp.send('Emulation.setDeviceMetricsOverride', {
+        width: zoomedW,
+        height: zoomedH,
+        deviceScaleFactor: zoomOut,
+        mobile: false,
+      });
+      await page.evaluate(() => window.dispatchEvent(new Event('resize')));
+      await expect(page.locator('html')).toHaveAttribute('data-layout-mode', 'mobile');
+    }
+
+    // Return to 100% on 800px narrow window -> remains mobile
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width: 800,
+      height: 720,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await page.evaluate(() => window.dispatchEvent(new Event('resize')));
+    await expect(page.locator('html')).toHaveAttribute('data-layout-mode', 'mobile');
+
     await cdp.send('Emulation.clearDeviceMetricsOverride');
     await cdp.detach();
+  });
+
+  test('document viewer shrink geometry (50%/20%), text selection + pan coexistence, and no-op boundary zoom', async ({
+    page,
+  }, testInfo) => {
+    test.skip(testInfo.project.name !== 'pc-chromium', 'Runs on pc-chromium');
+
+    await installMockApi(page, { authenticated: true });
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await openChatAndWaitReady(page, false);
+
+    // Open Markdown/Code/Diff artifact
+    await openArtifactByFilename(page, FIXTURE_ARTIFACTS[4].filename);
+    await page.locator('.viewer-zoom-scroll .md-body').waitFor({ state: 'visible' });
+
+    const scroll = page.locator('.viewer-zoom-scroll');
+    const stage = page.locator('.viewer-zoom-stage');
+
+    // 1. Shrink down to ~50% (3 clicks of −: 100 -> 80 -> 64 -> 51) and verify stage width & zero phantom overflow
+    const zoomOutBtn = page.locator('.viewer-zoom-toolbar button[aria-label="縮小"]');
+    const zoomInBtn = page.locator('.viewer-zoom-toolbar button[aria-label="拡大"]');
+    for (let i = 0; i < 3; i += 1) {
+      await zoomOutBtn.click();
+    }
+    const shrunk50 = await page.evaluate(() => {
+      const sc = document.querySelector('.viewer-zoom-scroll') as HTMLElement;
+      const st = document.querySelector('.viewer-zoom-stage') as HTMLElement;
+      return {
+        scale: Number(sc.dataset.zoomScale),
+        clientW: sc.clientWidth,
+        scrollW: sc.scrollWidth,
+        stageW: st.getBoundingClientRect().width,
+      };
+    });
+    expect(shrunk50.scale).toBeLessThanOrEqual(55);
+    expect(shrunk50.stageW).toBeLessThanOrEqual(shrunk50.clientW * 0.58);
+    expect(shrunk50.scrollW, 'Shrunk 50% view must have zero phantom horizontal scroll overflow').toBeLessThanOrEqual(
+      shrunk50.clientW + 2
+    );
+
+    // Continue shrinking to min scale (20%)
+    for (let i = 0; i < 6; i += 1) {
+      await zoomOutBtn.click();
+    }
+    const shrunk20 = await page.evaluate(() => {
+      const sc = document.querySelector('.viewer-zoom-scroll') as HTMLElement;
+      const st = document.querySelector('.viewer-zoom-stage') as HTMLElement;
+      return {
+        scale: Number(sc.dataset.zoomScale),
+        clientW: sc.clientWidth,
+        scrollW: sc.scrollWidth,
+        stageW: st.getBoundingClientRect().width,
+      };
+    });
+    expect(shrunk20.scale).toBe(20);
+    expect(shrunk20.stageW).toBeLessThanOrEqual(shrunk20.clientW * 0.25);
+    expect(shrunk20.scrollW, 'Shrunk 20% view must have zero phantom horizontal scroll overflow').toBeLessThanOrEqual(
+      shrunk20.clientW + 2
+    );
+
+    // Extra no-op clicks at min boundary must not throw or corrupt scroll/stage
+    await zoomOutBtn.click();
+    await zoomOutBtn.click();
+    expect(await scroll.getAttribute('data-zoom-scale')).toBe('20');
+
+    // Reset and zoom IN to ~200%
+    await page.locator('.viewer-zoom-toolbar button', { hasText: '画面に合わせる' }).click();
+    await expect(scroll).toHaveAttribute('data-zoom-scale', '100');
+    for (let i = 0; i < 3; i += 1) {
+      await zoomInBtn.click();
+    }
+    await expect.poll(async () => Number(await scroll.getAttribute('data-zoom-scale'))).toBeGreaterThanOrEqual(190);
+
+    // 2. Verify native text selection is NOT blocked inside zoomed Markdown viewer
+    const textMousedownPrevented = await page.evaluate(() => {
+      const p = document.querySelector('.viewer-zoom-scroll .md-body p');
+      if (!p) return true;
+      const ev = new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0 });
+      p.dispatchEvent(ev);
+      return ev.defaultPrevented;
+    });
+    expect(textMousedownPrevented, 'Left mousedown on zoomed document text must allow native text selection').toBe(false);
+
+    // Verify Alt+drag STILL pans the zoomed document cleanly
+    const box = await scroll.boundingBox();
+    expect(box).not.toBeNull();
+    await scroll.evaluate((el) => {
+      el.scrollLeft = 0;
+      el.scrollTop = 0;
+    });
+    await page.keyboard.down('Alt');
+    await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(box!.x + box!.width / 2 - 80, box!.y + box!.height / 2 - 80, { steps: 4 });
+    await page.mouse.up();
+    await page.keyboard.up('Alt');
+
+    const pannedOffsets = await scroll.evaluate((el) => ({ left: el.scrollLeft, top: el.scrollTop }));
+    expect(pannedOffsets.left > 0 || pannedOffsets.top > 0, 'Alt+drag must pan zoomed document').toBe(true);
+
+    // Verify stage still has valid dimensions after max-boundary no-op clicks
+    for (let i = 0; i < 8; i += 1) {
+      await zoomInBtn.click();
+    }
+    await expect(scroll).toHaveAttribute('data-zoom-scale', '500');
+    const stageWidthAtMax = await stage.evaluate((el) => el.getBoundingClientRect().width);
+    expect(stageWidthAtMax).toBeGreaterThan(2000);
+    await zoomInBtn.click(); // no-op at max
+    expect(await scroll.getAttribute('data-zoom-scale')).toBe('500');
+
+    await closeActiveModal(page);
   });
 });

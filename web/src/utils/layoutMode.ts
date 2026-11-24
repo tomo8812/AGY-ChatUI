@@ -85,9 +85,9 @@ export function createInitialLayoutTrackerState(input: LayoutModeInput): LayoutM
     const iw = Math.max(1, input.innerWidth);
     const ow = input.outerWidth;
     const availW = input.screenAvailWidth > 0 ? input.screenAvailWidth : 10000;
-    // On a cold reload while already browser-zoomed, outerWidth stays in unzoomed OS
-    // pixels while innerWidth shrinks and dpr scales up proportionally.
-    if (ow > 0 && ow <= availW + 64 && ow > iw * 1.08) {
+    // On a cold reload while already browser-zoomed (in or out), outerWidth stays in
+    // unzoomed OS pixels while innerWidth scales inversely and dpr scales proportionally.
+    if (ow > 0 && ow <= availW + 64 && Math.abs(ow / iw - 1) > 0.08) {
       const outerRatio = ow / iw;
       const snapped = nearestStandardDpr(dpr / outerRatio);
       if (snapped !== null) {
@@ -135,12 +135,12 @@ export function resolveLayoutMode(
   // Guard against misclassifying a staggered browser-zoom event (where DPR updates
   // one tick before innerWidth) as a monitor DPI switch:
   // 1. Only stage `pendingMonitorDpr` when DPR jumps to a standard OS DPR while
-  //    innerWidth stayed constant AND outerWidth does not indicate zoom.
+  //    innerWidth stayed constant AND outerWidth does not indicate zoom (in or out).
   // 2. Only commit the recalibrated `baseDpr` on a settled follow-up check where
-  //    innerWidth STILL did not shrink inversely.
+  //    innerWidth STILL did not change inversely.
   const dprChanged = Math.abs(dpr - state.prevDpr) > 0.15;
   const widthStable = Math.abs(iw - state.prevInnerWidth) <= 24;
-  const outerIndicatesZoom = outerRatio !== null && outerRatio > 1.08;
+  const outerIndicatesZoom = outerRatio !== null && Math.abs(outerRatio - 1) > 0.08;
 
   if (dprChanged && widthStable && !outerIndicatesZoom && nearestStandardDpr(dpr) !== null) {
     state.pendingMonitorDpr = dpr;
@@ -159,7 +159,7 @@ export function resolveLayoutMode(
     state.pendingMonitorDpr = null;
   }
 
-  // Cross-check with outerWidth/innerWidth if clearly zoomed (e.g. monitor change while zoomed)
+  // Cross-check with outerWidth/innerWidth if clearly zoomed (in or out)
   if (outerIndicatesZoom && outerRatio !== null) {
     const inferredBase = nearestStandardDpr(dpr / outerRatio);
     if (inferredBase !== null && Math.abs(dpr / state.baseDpr - outerRatio) > 0.2) {
@@ -171,11 +171,11 @@ export function resolveLayoutMode(
   state.prevDpr = dpr;
 
   const zoomFromDpr = state.baseDpr > 0 ? dpr / state.baseDpr : 1;
-  const clampedZoom = Math.max(0.5, Math.min(5, zoomFromDpr));
+  const clampedZoom = Math.max(0.25, Math.min(5, zoomFromDpr));
 
-  // When zoomed in (> 1.04x), recover unzoomed window dimensions so browser zoom
-  // does not collapse the desktop layout into mobile breakpoints.
-  const scaleForLayout = clampedZoom > 1.04 ? clampedZoom : 1;
+  // Recover unzoomed window dimensions for BOTH zoom-in (> 1.04x) and zoom-out (< 0.96x)
+  // so neither zooming in nor zooming out switches PC UI mode unexpectedly.
+  const scaleForLayout = Math.abs(clampedZoom - 1) > 0.04 ? clampedZoom : 1;
   const effectiveWidth = Math.round(iw * scaleForLayout);
   const effectiveHeight = Math.round(ih * scaleForLayout);
 
