@@ -175,6 +175,19 @@ describe('Lightweight Rich UI Core Security & Negative Self-Tests (NEG-06..NEG-0
     expect(mdRes.valid).toBe(false);
     expect(mdRes.primaryErrorCode).toBe('RICH_POST_EVAL_UNSAFE_MARKDOWN');
 
+    // 3b. Markdown inline javascript:/data: links and raw <a> tags are rejected
+    for (const payload of [
+      '[click](javascript:alert(1))',
+      '[click](data:text/html,<script>alert(1)</script>)',
+      '<a href="javascript:alert(1)">click</a>',
+    ]) {
+      const badLinkDoc = makeValidDoc({
+        computed: {},
+        root: { id: 'r', type: 'markdown', content: payload },
+      });
+      expect(validateRichDocument(badLinkDoc).valid).toBe(false);
+    }
+
     // 4. Mermaid attempting to weaken security or load external url()
     const badMermaid = makeValidDoc({
       computed: {},

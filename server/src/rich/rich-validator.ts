@@ -266,31 +266,58 @@ export function validateSvgAttrValue(attrName: string, rawVal: unknown): string 
 
 export function validateRichMarkdownContent(content: string): string | null {
   // Rich UI strict markdown mode: forbid raw HTML tags and external/data image URLs
-  if (/<\/?(?:script|iframe|object|embed|svg|foreignobject|img|style|link|meta|form|input)\b/i.test(content)) {
+  if (
+    /<\/?(?:script|iframe|object|embed|svg|foreignobject|img|style|link|meta|form|input|a|base|video|audio|source|button|textarea|select)\b/i.test(
+      content
+    )
+  ) {
     return 'Raw HTML elements are forbidden inside rich UI markdown nodes.';
   }
   if (/\son[a-z]+\s*=/i.test(content)) {
     return 'Inline event handlers are forbidden inside rich UI markdown nodes.';
   }
+  const normalizeScheme = (raw: string): string =>
+    raw
+      .replace(/^<|>$/g, '')
+      .replace(/[\x00-\x20]+/g, '')
+      .toLowerCase();
+
   // Markdown image syntax ![alt](url)
   const imgMatches = content.matchAll(/!\[[^\]]*\]\(\s*([^)\s]+)(?:\s+["'][^"']*["'])?\s*\)/g);
   for (const m of imgMatches) {
-    const target = m[1].replace(/^<|>$/g, '').trim().toLowerCase();
+    const target = normalizeScheme(m[1]);
     if (
       target.startsWith('http://') ||
       target.startsWith('https://') ||
       target.startsWith('data:') ||
       target.startsWith('javascript:') ||
+      target.startsWith('vbscript:') ||
       target.startsWith('//')
     ) {
       return `External or data-URI image reference '${m[1]}' is forbidden inside rich UI markdown nodes.`;
     }
   }
+  // Inline markdown links [text](url)
+  const linkMatches = content.matchAll(/(?<!!)\[[^\]]*\]\(\s*(<[^>]+>|[^)\s]+)(?:\s+["'][^"']*["'])?\s*\)/g);
+  for (const m of linkMatches) {
+    const target = normalizeScheme(m[1]);
+    if (target.startsWith('javascript:') || target.startsWith('vbscript:') || target.startsWith('data:')) {
+      return `Forbidden URI scheme in markdown link '${m[1]}'.`;
+    }
+  }
+  // Markdown autolinks <javascript:...> / <data:...> / <vbscript:...>
+  const autoLinkMatches = content.matchAll(/<\s*([a-zA-Z][a-zA-Z0-9+.-]*:[^>]+)>/g);
+  for (const m of autoLinkMatches) {
+    const target = normalizeScheme(m[1]);
+    if (target.startsWith('javascript:') || target.startsWith('vbscript:') || target.startsWith('data:')) {
+      return `Forbidden URI scheme in markdown autolink '${m[1]}'.`;
+    }
+  }
   // Reference-style markdown links/images [ref]: url
   const refMatches = content.matchAll(/^\s*\[[^\]]+\]:\s*(\S+)/gm);
   for (const m of refMatches) {
-    const target = m[1].replace(/^<|>$/g, '').trim().toLowerCase();
-    if (target.startsWith('javascript:') || target.startsWith('data:')) {
+    const target = normalizeScheme(m[1]);
+    if (target.startsWith('javascript:') || target.startsWith('vbscript:') || target.startsWith('data:')) {
       return `Forbidden URI scheme in markdown reference '${m[1]}'.`;
     }
   }
