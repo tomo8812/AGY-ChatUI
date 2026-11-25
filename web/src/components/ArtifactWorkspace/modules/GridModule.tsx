@@ -68,6 +68,8 @@ export function GridModule(props:WorkspaceModuleProps){
   const [sheetName,setSheetName]=useState('');
   const [search,setSearch]=useState('');
   const [searchAt,setSearchAt]=useState(-1);
+  const [searching,setSearching]=useState(false);
+  const searchAbort=useRef<AbortController|null>(null);
   const formulaInput=useRef<HTMLInputElement>(null);
   const scroll=useRef<HTMLDivElement>(null);
   const [viewport,setViewport]=useState({top:0,left:0,width:800,height:420});
@@ -218,15 +220,46 @@ export function GridModule(props:WorkspaceModuleProps){
     const op=editAction.startsWith('xlsx.')?{op:editAction,sheetId:sheet.id,...(needsName?{name:sheetName.trim()}:{})}:xlsx?{op:row?'xlsx.mutate_rows':'xlsx.mutate_columns',sheetId:sheet.id,index:idx+1,count:1,mode:editAction.startsWith('insert')?'insert':'delete'}:{op:editAction,index:idx,...(editAction==='insert_row'?{values:Array.from({length:Math.max(1,csvCols)},()=> '')}:{})};
     onDraft(artifact.revision,{key:'grid-structure',label:action.label,operation:op},'grid-structure');setEditAction('');setSheetName('');
   }
+  useEffect(()=>{setSearching(false);return()=>{searchAbort.current?.abort();searchAbort.current=null}},[search,revisionKey,sheet?.id,draft]);
   const searchMatches=useMemo(()=>{
-    const q=search.trim().toLocaleLowerCase();if(!q||!sheet)return [];
+    const q=search.trim().toLocaleLowerCase();if(!xlsx||!q||!sheet)return [];
     const matches:Coordinate[]=[];
     for(const key of visibleKeys){if(!cache.has(key))continue;const b=tileBounds(key,rowCount,colCount);
       for(let r=b.row0;r<=b.row1;r++)for(let c=b.col0;c<=b.col1;c++)if(value(r,c).toLocaleLowerCase().includes(q))matches.push({row:r,col:c});
     }
     return matches.sort((a,b)=>a.row-b.row||a.col-b.col);
   },[search,draft,sheet,cache,cacheVersion,visibleKeys.join(',')]);
-  function nextMatch(){if(!searchMatches.length)return;const n=(searchAt+1)%searchMatches.length;setSearchAt(n);const match=searchMatches[n];move(match.row,match.col)}
+  async function nextMatch(){
+    if(xlsx){if(!searchMatches.length)return;const n=(searchAt+1)%searchMatches.length;setSearchAt(n);const match=searchMatches[n];move(match.row,match.col);return;}
+    if(!search.trim()||!sheet||searching)return;
+    searchAbort.current?.abort();const controller=new AbortController();searchAbort.current=controller;setSearching(true);setPinError('');
+    const identity=latest.current,origin=current;
+    const fold=(s:string)=>Array.from(s,ch=>ch.toLowerCase()).join('');
+    const q=fold(search.trim()),compare=(a:Coordinate,b:Coordinate)=>a.row-b.row||a.col-b.col;
+    const circular=(a:Coordinate,b:Coordinate)=>Number(compare(a,origin)<=0)-Number(compare(b,origin)<=0)||compare(a,b);
+    const matchingDrafts=(draft?.entries??[]).flatMap(e=>{
+      const op=e.operation;
+      return op.op==='set_cell'&&Number.isSafeInteger(op.row)&&Number.isSafeInteger(op.col)&&fold(String(op.value??'')).includes(q)?[{row:Number(op.row),col:Number(op.col)}]:[];
+    }).sort(circular);
+    try{
+      let cursor=origin,hit:Coordinate|null=null;const seen=new Set<string>();
+      // A staged cell may hide a match in the persisted bytes. Skip only
+      // those overwritten hits; merge matching staged values in cyclic order.
+      while(!controller.signal.aborted){
+        const result=await workspaceApi.range<{match:Coordinate|null}>(artifact.id,{gridSearch:search.trim(),afterRow:cursor.row,afterCol:cursor.col},controller.signal);
+        assertRevision(artifact,result);
+        const next=result.match;if(!next)break;
+        const addressKey=key(next.row,next.col);if(seen.has(addressKey))break;seen.add(addressKey);
+        const staged=entries.get(addressKey);
+        if(!staged||fold(String(staged.operation.value??'')).includes(q)){hit=next;break;}
+        cursor=next;
+      }
+      if(controller.signal.aborted||latest.current!==identity&&latest.current.selectedRange!==identity.selectedRange)return;
+      const candidate=matchingDrafts[0];if(candidate&&(!hit||circular(candidate,hit)<0))hit=candidate;
+      if(hit)move(hit.row,hit.col);else setPinError('一致するセルがありません。');
+    }catch(e){if(!controller.signal.aborted)setPinError(e instanceof Error?e.message:'検索に失敗しました。')}
+    finally{if(searchAbort.current===controller){searchAbort.current=null;setSearching(false)}}
+  }
   const primary=<><span className="workspace-cell-address">{selectedRange}</span><span aria-hidden="true">ƒx</span><input ref={formulaInput} className="workspace-formula" aria-label="数式・セル値" value={ready?value(current.row,current.col):''} readOnly={!inputEnabled} onChange={e=>change(e.target.value)}/>{mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!ready||!inData} onClick={()=>void pin()}>セルを対象にする</button>}{mode==='edit'&&<>
       {xlsx&&<button type="button" className="btn btn-secondary btn-xs" aria-pressed={Boolean(styleEntry?.operation.bold??raw(current.row,current.col)?.bold)} disabled={!canStyle} onClick={toggleBold}>太字</button>}
     </>}</>;
@@ -238,7 +271,7 @@ export function GridModule(props:WorkspaceModuleProps){
   const toolbar=<ResponsiveCommandBar primary={primary} secondary={secondary} minInlineWidth={850} closeOnButton/>;
   const tabs=<div className="workspace-toolbar" role="group" aria-label="シート">{sheets.map(s=><button key={s.id} type="button" className={'btn btn-secondary btn-xs '+(s.id===sheet?.id?'active':'')} aria-pressed={s.id===sheet?.id} onClick={()=>{setSheetId(s.id);move(0,0);setSearchAt(-1)}}>{s.name}</button>)}
     <input aria-label="セル範囲へ移動" placeholder="A1:B2" value={jump} onChange={e=>setJump(e.target.value)} onKeyDown={e=>{if(e.key==='Enter')jumpToRange()}}/><button type="button" className="btn btn-secondary btn-xs" disabled={!jump.trim()} onClick={jumpToRange}>移動</button>
-    <input aria-label="表示範囲を検索" placeholder="範囲内検索" value={search} onChange={e=>{setSearch(e.target.value);setSearchAt(-1)}}/><button type="button" className="btn btn-secondary btn-xs" disabled={!searchMatches.length} onClick={nextMatch}>次の一致{search&&' ('+searchMatches.length+')'}</button></div>;
+    <input aria-label={xlsx?'表示範囲を検索':'表全体を検索'} placeholder={xlsx?'範囲内検索':'表全体を検索'} value={search} onChange={e=>{setSearch(e.target.value);setSearchAt(-1)}} onKeyDown={e=>{if(e.key==='Enter')void nextMatch()}}/><button type="button" className="btn btn-secondary btn-xs" disabled={xlsx?!searchMatches.length:!search.trim()||searching||!structure.ready} onClick={()=>void nextMatch()}>{searching?'検索中…':'次の一致'}{xlsx&&search&&' ('+searchMatches.length+')'}</button></div>;
   return <UnifiedViewerZoomShell resetKey={artifact.id+':grid'} controlsTop={toolbar} controlsBottom={tabs}>
     {(structure.error||rangeError||pinError)&&<div role="alert" className="error-box">{structure.error||rangeError||pinError}<button type="button" onClick={()=>{structure.retry();setRetry(v=>v+1);setPinError('')}}>再試行</button></div>}
     {structural&&<div className="workspace-toolbar" role="status">{structural.label}（保存時に反映）<button type="button" className="btn btn-secondary btn-xs" disabled={editingLocked} onClick={()=>artifact.revision!==undefined&&onDraft(artifact.revision,null,'grid-structure')}>取消</button></div>}

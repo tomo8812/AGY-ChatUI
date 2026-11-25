@@ -4284,13 +4284,24 @@ export class ArtifactService {
   ): Promise<Record<string, unknown>> {
     const MAX_RESPONSE_BYTES = 512 * 1024;
     const dimensionsOnly = range.gridDimensions === true || range.gridDimensions === 'true';
+    const searchQuery = typeof range.gridSearch === 'string' ? range.gridSearch.trim() : '';
+    // Stream a case-insensitive substring matcher independently of the value
+    // response budget. A large field never needs to be retained to find a hit.
+    const needle = [...Array.from(searchQuery, ch => ch.toLowerCase()).join('')];
+    const prefix = new Array<number>(needle.length).fill(0);
+    for (let i=1,j=0;i<needle.length;i++) {
+      while (j && needle[i]!==needle[j]) j=prefix[j-1];
+      if (needle[i]===needle[j]) j++;
+      prefix[i]=j;
+    }
     const delimiter = filename.toLowerCase().endsWith('.tsv') ? '\t' : ',';
     const safeIndex = (value: unknown, fallback: number) => {
       const number = Number(value ?? fallback);
       return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
     };
     const startRow = safeIndex(range.startRow, 0);
-    const targetEndRow = dimensionsOnly ? Number.MAX_SAFE_INTEGER
+    const afterRow = safeIndex(range.afterRow, -1), afterCol = safeIndex(range.afterCol, -1);
+    const targetEndRow = dimensionsOnly || needle.length ? Number.MAX_SAFE_INTEGER
       : Math.max(startRow, safeIndex(range.endRow, startRow + 99));
     const startCol = safeIndex(range.startCol, 0);
     const requestedEndCol = range.endCol == null ? Number.MAX_SAFE_INTEGER
@@ -4302,16 +4313,33 @@ export class ArtifactService {
     let currentRow: string[] = [];
     const rows: string[][] = [];
     let collectedBytes = 0, truncated = false, stoppedEarly = false, firstChar = true;
-    const collectRow = () => !dimensionsOnly && rowIndex >= startRow && rowIndex <= targetEndRow;
+    let matchLength=0, fieldMatched=false;
+    let firstMatch:{row:number;col:number}|null=null, nextMatch:{row:number;col:number}|null=null;
+    const collectRow = () => !dimensionsOnly && !needle.length && rowIndex >= startRow && rowIndex <= targetEndRow;
     const collectField = () => collectRow() && fieldCount >= startCol && fieldCount <= requestedEndCol;
     function append(ch: string) {
       fieldHasValue = true;
+      if(needle.length&&!fieldMatched){
+        for(const c of ch.toLowerCase()){
+          while(matchLength&&needle[matchLength]!==c)matchLength=prefix[matchLength-1];
+          if(needle[matchLength]===c)matchLength++;
+          if(matchLength===needle.length){fieldMatched=true;break;}
+        }
+      }
       if (collectField()) {
         if (field.length < MAX_RESPONSE_BYTES) field += ch;
         else truncated = true;
       }
     }
     function commitField() {
+      if(fieldMatched){
+        const hit={row:rowIndex,col:fieldCount};
+        firstMatch??=hit;
+        if(rowIndex>afterRow||(rowIndex===afterRow&&fieldCount>afterCol)){
+          nextMatch=hit;stoppedEarly=true;
+        }
+      }
+      matchLength=0;fieldMatched=false;
       if (collectField()) currentRow.push(field);
       fieldCount++;
       field = ''; fieldHasValue = false;
@@ -4344,7 +4372,7 @@ export class ArtifactService {
       else if (ch === delimiter) commitField();
       else if (ch === '\n' || ch === '\r') return commitRow();
       else append(ch);
-      return true;
+      return !stoppedEarly;
     }
     // Match CsvAdapter's CRLF normalization, including inside quoted cells.
     // Count skipped rows/columns without retaining their values, even in huge files.
@@ -4369,6 +4397,7 @@ export class ArtifactService {
       if (!stoppedEarly && pendingCr) { pendingCr = false; feed('\r'); }
       if (!stoppedEarly && (fieldHasValue || fieldCount > 0)) commitRow();
     }
+    if (needle.length) return {match:nextMatch??firstMatch,totalBytes};
     if (dimensionsOnly) return { totalRows: rowIndex, totalCols: observedMaxCols, totalBytes };
     const actualEndCol = Math.min(Math.max(0, observedMaxCols - 1), requestedEndCol);
     return {

@@ -82,6 +82,11 @@ for(const vp of targets){
         expect(await svc.readRange(userId,regression.id,{startRow:0,endRow:3,startCol:0,endCol:1})).toMatchObject({rows:[['a','b'],['c\rd','e'],['f','g'],['']]});
         const {parseCsvRows}=await import('../server/src/artifacts/adapters/csv-adapter.js');
         expect(parseCsvRows(csv.toString('utf8'),',')).toEqual([['a','b'],['c\rd','e'],['f','g'],['']]);
+        const longCsv=Buffer.from('first,match\r'+('x,y\r'.repeat(20000))+'last,"'+('Z'.repeat(65535))+'Needle"\r');
+        const large=(await svc.createArtifact({userId,scopeKind:'chat',chatId,relPath:'long-search.csv',content:longCsv,actorKind:'user',actorId:userId})).artifact;
+        expect(await svc.readRange(userId,large.id,{gridSearch:'needle',afterRow:0,afterCol:0})).toMatchObject({match:{row:20001,col:1}});
+        expect(await svc.readRange(userId,large.id,{gridSearch:'MATCH',afterRow:20001,afterCol:1})).toMatchObject({match:{row:0,col:1}});
+        expect(await svc.readRange(userId,large.id,{gridSearch:'absent'})).toMatchObject({match:null});
       }
       await page.setViewportSize({width:vp.width,height:vp.height});
       await page.route(url=>url.origin==='http://127.0.0.1:4174'&&url.pathname.startsWith('/api/'),async route=>{
@@ -163,6 +168,10 @@ for(const vp of targets){
                 await grid.press('ArrowRight');await grid.press('ArrowDown');
                 await expect(page.locator('.workspace-cell-address')).toHaveText('B2');
                 await expect(page.getByRole('gridcell',{name:'C2',exact:true})).toHaveCount(0);
+                await page.getByRole('textbox',{name:'表全体を検索'}).fill('Apple');
+                await page.getByRole('button',{name:'次の一致',exact:true}).click();
+                await expect(page.locator('.workspace-cell-address')).toHaveText('A2');
+                await page.getByRole('textbox',{name:'表全体を検索'}).fill('');
               }
               if(item.kind==='xlsx'){
                 const jump=page.getByRole('textbox',{name:'セル範囲へ移動'});
