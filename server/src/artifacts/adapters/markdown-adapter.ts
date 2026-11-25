@@ -316,6 +316,10 @@ export class MarkdownAdapter implements FormatAdapter {
       ctx.runtimeProfile === 'base_chatui'
         ? 'deploy/setup-doc-runtime.sh を実行してください。'
         : 'bubblewrap サンドボックスを有効化してください。';
+    const webRemediation =
+      ctx.runtimeProfile === 'full_runtime'
+        ? 'bubblewrap サンドボックスを有効化してください。'
+        : 'Full Runtime（deploy/setup-doc-runtime.sh, INSTALL_DOC_RUNTIME=full）を有効化してください。';
     return [
       ...editCapabilities('markdown', MARKDOWN_STRUCTURE_OPS),
       { operation: 'create', availability: 'supported', scope: 'mcp_and_ui' },
@@ -338,10 +342,16 @@ export class MarkdownAdapter implements FormatAdapter {
         remediation: docWorkerReady ? undefined : docRemediation,
       },
       {
+        operation: 'export:png',
+        availability: webWorkerReady ? 'supported' : 'disabled_by_resource_tier',
+        scope: 'mcp_and_ui',
+        remediation: webWorkerReady ? undefined : webRemediation,
+      },
+      {
         operation: 'render_png',
         availability: webWorkerReady ? 'supported' : 'disabled_by_resource_tier',
         scope: 'mcp_only',
-        remediation: webWorkerReady ? undefined : docRemediation,
+        remediation: webWorkerReady ? undefined : webRemediation,
       },
     ];
   }

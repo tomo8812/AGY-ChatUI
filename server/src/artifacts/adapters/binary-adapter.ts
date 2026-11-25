@@ -18,10 +18,12 @@ export class BinaryAdapter implements FormatAdapter {
 
   getOperations(_ctx: AdapterCapabilityContext): OperationCapability[] {
     return [
-      { operation: 'get_structure', availability: 'supported', scope: 'ui_view_only', notes: 'metadata only' },
-      { operation: 'create', availability: 'unsupported_by_format', scope: 'mcp_only' },
-      { operation: 'edit', availability: 'unsupported_by_format', scope: 'mcp_only' },
-      { operation: 'target_pin', availability: 'unsupported_by_format', scope: 'ui_view_only' },
+      { operation: 'get_structure', availability: 'supported', scope: 'mcp_and_ui', notes: 'サイズ・SHA-256・MIME 等のメタデータのみ。' },
+      { operation: 'read_range', availability: 'unsupported_by_format', scope: 'mcp_only', notes: 'バイナリファイルは範囲読取に非対応です。' },
+      { operation: 'create', availability: 'unsupported_by_format', scope: 'mcp_only', notes: 'バイナリファイルの新規作成は非対応です。' },
+      { operation: 'edit', availability: 'unsupported_by_format', scope: 'mcp_only', notes: 'バイナリファイルの編集は非対応です。' },
+      { operation: 'verify', availability: 'supported', scope: 'mcp_and_ui', notes: 'サイズ・SHA-256・MIME のみ。' },
+      { operation: 'target_pin', availability: 'unsupported_by_format', scope: 'ui_view_only', notes: 'バイナリファイルは対象指定に非対応です。' },
     ];
   }
 

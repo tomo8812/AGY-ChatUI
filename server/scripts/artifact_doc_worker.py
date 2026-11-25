@@ -1436,7 +1436,7 @@ def process_image(request, source, output):
             original.verify()
             return {"ok": True, "issues": [], "metrics": {"width": width, "height": height}}
         if action == "edit" and getattr(original, "is_animated", False):
-            raise ValueError("Editing animated images is unsupported")
+            raise UnsupportedByFormatError("Editing animated images is unsupported")
         image = ImageOps.exif_transpose(original).convert("RGBA")
     if action == "edit":
         for operation in request["operations"]:

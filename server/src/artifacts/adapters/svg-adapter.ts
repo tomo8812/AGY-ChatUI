@@ -20,6 +20,11 @@ export class SvgAdapter implements FormatAdapter {
   readonly requiresExternalWorker = false;
 
   getOperations(ctx: AdapterCapabilityContext): OperationCapability[] {
+    const workerReady = ctx.runtimeProfile !== 'base_chatui' && ctx.sandboxAvailable;
+    const remediation =
+      ctx.runtimeProfile === 'base_chatui'
+        ? 'deploy/setup-doc-runtime.sh を実行してください。'
+        : 'bubblewrap サンドボックスを有効化してください。';
     return [
       ...markupCapabilities('svg'),
       browserVerifyCapability(ctx),
@@ -30,15 +35,15 @@ export class SvgAdapter implements FormatAdapter {
       { operation: 'verify', availability: 'supported', scope: 'mcp_and_ui' },
       {
         operation: 'export:png',
-        availability: ctx.runtimeProfile !== 'base_chatui' && ctx.sandboxAvailable ? 'supported' : 'disabled_by_resource_tier',
+        availability: workerReady ? 'supported' : 'disabled_by_resource_tier',
         scope: 'mcp_and_ui',
-        remediation: ctx.runtimeProfile === 'base_chatui' ? 'deploy/setup-doc-runtime.sh を実行してください。' : undefined,
+        remediation: workerReady ? undefined : remediation,
       },
       {
         operation: 'render_png',
-        availability: ctx.runtimeProfile !== 'base_chatui' && ctx.sandboxAvailable ? 'supported' : 'disabled_by_resource_tier',
+        availability: workerReady ? 'supported' : 'disabled_by_resource_tier',
         scope: 'mcp_only',
-        remediation: ctx.runtimeProfile === 'base_chatui' ? 'deploy/setup-doc-runtime.sh を実行してください。' : undefined,
+        remediation: workerReady ? undefined : remediation,
       },
     ];
   }

@@ -26,6 +26,7 @@ export interface AdapterCapabilityContext {
   strictSandbox?: boolean;
   filename?: string;
   previewKind?: PreviewKind;
+  content?: Buffer;
 }
 
 export interface FormatAdapter {

@@ -71,6 +71,7 @@ const LIMITED_OPERATIONS: Record<string, string> = {
   'xlsx.remove_sheet': '他シート参照や図形・テーブル依存がないシートを削除（最低 1 枚の可視シートを保持）。',
   'xlsx.remove_empty_sheet': '参照と内容を持たない空のワークシートを削除。',
   'media.trim': '一度の操作で一つの連続区間を抽出。',
+  'image.rotate': '90 度単位の回転に対応。',
   'chart.create': '棒・縦棒・折線・円・ドーナツ・面・散布・複合/第 2 軸に対応（3D 特殊曲面・ピボットグラフ等は非対応）。',
   'chart.update_title_and_legend': '対応グラフ種別でタイトル・凡例を更新。',
   'chart.update_series_data': 'ローカル範囲または埋め込み XLSX とキャッシュを同時同期。',
@@ -78,10 +79,85 @@ const LIMITED_OPERATIONS: Record<string, string> = {
   'chart.add_or_remove_series': '対応グラフ種別の系列を追加・削除。',
 };
 
-export function documentFormatConstraint(format: ArtifactFormat, filename: string, operation: string, previewKind?: PreviewKind): string | undefined {
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+export function isAnimatedImage(content: Buffer): boolean {
+  if (content.length >= 13) {
+    const header = content.toString('ascii', 0, 6);
+    if (header === 'GIF87a' || header === 'GIF89a') {
+      const packed = content[10];
+      let pos = 13 + ((packed & 0x80) !== 0 ? 3 * (1 << ((packed & 0x07) + 1)) : 0);
+      let frames = 0;
+      while (pos < content.length) {
+        const introducer = content[pos++];
+        if (introducer === 0x3b) break;
+        if (introducer === 0x2c) {
+          if (++frames >= 2) return true;
+          if (pos + 9 > content.length) break;
+          const imgPacked = content[pos + 8];
+          pos += 9 + ((imgPacked & 0x80) !== 0 ? 3 * (1 << ((imgPacked & 0x07) + 1)) : 0);
+          if (pos >= content.length) break;
+          pos += 1; // LZW minimum code size
+          while (pos < content.length) {
+            const subLen = content[pos++];
+            if (subLen === 0) break;
+            pos += subLen;
+          }
+        } else if (introducer === 0x21) {
+          if (pos >= content.length) break;
+          pos += 1; // extension label
+          while (pos < content.length) {
+            const subLen = content[pos++];
+            if (subLen === 0) break;
+            pos += subLen;
+          }
+        } else {
+          break;
+        }
+      }
+      return false;
+    }
+  }
+  if (content.length >= 24 && content.subarray(0, 8).equals(PNG_SIGNATURE)) {
+    let pos = 8;
+    while (pos + 12 <= content.length) {
+      const length = content.readUInt32BE(pos);
+      const type = content.toString('ascii', pos + 4, pos + 8);
+      if (type === 'IDAT' || type === 'IEND') break;
+      if (type === 'acTL' && length >= 4 && pos + 12 <= content.length) {
+        return content.readUInt32BE(pos + 8) > 1;
+      }
+      pos += 12 + length;
+    }
+    return false;
+  }
+  if (
+    content.length >= 30 &&
+    content.toString('ascii', 0, 4) === 'RIFF' &&
+    content.toString('ascii', 8, 12) === 'WEBP' &&
+    content.toString('ascii', 12, 16) === 'VP8X'
+  ) {
+    return (content[20] & 0x02) !== 0;
+  }
+  return false;
+}
+
+export function documentFormatConstraint(
+  format: ArtifactFormat,
+  filename: string,
+  operation: string,
+  previewKind?: PreviewKind,
+  content?: Buffer
+): string | undefined {
   const extension = path.extname(filename).toLowerCase();
   if (format === 'xlsx' && extension === '.xls' && operation !== 'structure') {
     return '編集ワーカーは OOXML の XLSX に対応します。';
+  }
+  if (format === 'pptx' && ['.ppt', '.odp'].includes(extension) && operation !== 'structure') {
+    return '編集ワーカーは OOXML の PPTX に対応します。';
+  }
+  if (format === 'docx' && extension === '.doc' && operation !== 'structure') {
+    return '編集ワーカーは OOXML の DOCX に対応します。';
   }
   if (format === 'media' && extension && !['.mp4', '.webm', '.mp3', '.wav', '.m4a', '.ogg', '.flac', '.mov', '.mkv'].includes(extension) &&
       operation !== 'structure') {
@@ -92,6 +168,9 @@ export function documentFormatConstraint(format: ArtifactFormat, filename: strin
   }
   if (format === 'image' && operation === 'create' && extension && !['.png', '.jpg', '.jpeg', '.webp'].includes(extension)) {
     return '画像の新規作成は PNG、JPEG、WebP に対応します。';
+  }
+  if (format === 'image' && content && isAnimatedImage(content) && (operation === 'input_edit' || operation.startsWith('image.'))) {
+    return 'アニメーション画像（GIF / APNG / WebP）の編集は非対応です。';
   }
 }
 
@@ -107,14 +186,14 @@ class DocumentFormatAdapter implements FormatAdapter {
 
   getOperations(ctx: AdapterCapabilityContext): OperationCapability[] {
     const workerReady = ctx.runtimeProfile !== 'base_chatui' && ctx.sandboxAvailable;
-    const metadataOnly = Boolean(documentFormatConstraint(this.format, ctx.filename ?? '', 'input'));
+    const metadataOnly = Boolean(documentFormatConstraint(this.format, ctx.filename ?? '', 'input', ctx.previewKind, ctx.content));
     const operations: OperationCapability[] = [
       { operation: 'view', availability: 'supported', scope: 'ui_view_only' },
       { operation: 'target_pin', availability: 'supported', scope: 'mcp_and_ui' },
       ...DOCUMENT_ACTIONS[this.format].map((operation): OperationCapability => {
         const scope = DIRECT_EDITOR_OPERATIONS.has(operation) || operation === 'structure' || operation === 'read_range'
           ? 'mcp_and_ui' : 'mcp_only';
-        const constraint = documentFormatConstraint(this.format, ctx.filename ?? '', operation, ctx.previewKind);
+        const constraint = documentFormatConstraint(this.format, ctx.filename ?? '', operation, ctx.previewKind, ctx.content);
         if (constraint) return { operation, availability: 'unsupported_by_format', scope, notes: constraint };
         const notes = LIMITED_OPERATIONS[operation];
         if (!workerReady || metadataOnly) {
@@ -135,6 +214,10 @@ class DocumentFormatAdapter implements FormatAdapter {
     if (this.format === 'pdf') operations.push({
       operation: 'edit_body_reflow', availability: 'unsupported_by_format', scope: 'mcp_only',
       notes: 'PDF の既存本文削除・リフロー編集は形式方針により非対応です。注釈および新規オーバーレイを追加できます。',
+    });
+    if (this.format === 'media') operations.push({
+      operation: 'create', availability: 'unsupported_by_format', scope: 'mcp_only',
+      notes: '動画・音声の新規作成は非対応です。',
     });
     return operations;
   }
@@ -304,10 +387,13 @@ export class FormatAdapterRegistry {
     runtimeProfile: RuntimeProfile;
     sandboxIsolation: SandboxIsolationKind;
     stagingIsolation: StagingIsolationKind;
+    content?: Buffer;
   }): ArtifactCapabilitiesResponse {
     const adapter = this.resolve(params.filename, params.previewKind);
     const directEditSupported =
-      adapter.directEditUiSupported && !documentFormatConstraint(adapter.format, params.filename, 'input') &&
+      adapter.directEditUiSupported &&
+      !documentFormatConstraint(adapter.format, params.filename, 'input', params.previewKind, params.content) &&
+      !documentFormatConstraint(adapter.format, params.filename, 'input_edit', params.previewKind, params.content) &&
       (!adapter.requiresExternalWorker || (params.runtimeProfile !== 'base_chatui' && params.sandboxIsolation !== 'sandbox_required_blocked'));
     return {
       format: adapter.format,
@@ -323,6 +409,7 @@ export class FormatAdapterRegistry {
         previewKind: params.previewKind,
         sandboxAvailable: params.sandboxIsolation !== 'sandbox_required_blocked',
         strictSandbox: params.sandboxIsolation === 'bwrap',
+        content: params.content,
       }),
     };
   }

@@ -1,4 +1,4 @@
-import { ArtifactError } from '../errors.js';
+import { ArtifactError, unsupportedOperationError } from '../errors.js';
 import type { AdapterOperation } from '../types.js';
 import { sha256Text } from './base.js';
 
@@ -7,22 +7,74 @@ export const MERMAID_STRUCTURE_OPS = [
   'add_group', 'set_group', 'remove_group', 'move_group',
 ] as const;
 
+export const MERMAID_HEADER_RE =
+  /^\s*(graph|flowchart|sequenceDiagram|classDiagram|stateDiagram(?:-v2)?|erDiagram|gantt|pie|gitGraph|journey|mindmap|timeline|quadrantChart|sankey-beta|xychart-beta|block-beta)\b/;
+
 const IDENTIFIER = /^[\p{L}_][\p{L}\p{N}_-]*$/u;
 const EDGE_PATTERN = /^(?:<?--+>|<?-\.+->|<?==+>|---+|~~~+|--[ox]|[ox]--[ox]?|==+)(?:[ \t]*\|("[^"]*"|[^|]*)\|)?/;
 const NODE_START = /^[\p{L}_][\p{L}\p{N}_-]*/u;
 const RESERVED = /^(?:end|subgraph|direction|style|classDef|class|click|linkStyle)$/;
 const shapes = { rect: ['[', ']'], round: ['(', ')'], diamond: ['{', '}'], circle: ['((', '))'], stadium: ['([', '])'] };
 
+function skipLeadingTrivia(source: string): number {
+  let i = source.charCodeAt(0) === 0xfeff ? 1 : 0;
+  const len = source.length;
+  while (i < len && /[ \t\r\n]/.test(source[i])) i++;
+  if (/^---[ \t]*\r?\n/.test(source.slice(i))) {
+    const afterOpen = source.indexOf('\n', i) + 1;
+    const closeMatch = /^[ \t]*---[ \t]*(?:\r?\n|$)/m.exec(source.slice(afterOpen));
+    if (closeMatch) {
+      i = afterOpen + closeMatch.index + closeMatch[0].length;
+    }
+  }
+  while (i < len) {
+    while (i < len && /[ \t\r\n]/.test(source[i])) i++;
+    if (source.startsWith('%%{', i)) {
+      const endDirective = source.indexOf('}%%', i + 3);
+      if (endDirective >= 0) {
+        i = endDirective + 3;
+        continue;
+      }
+      return len;
+    }
+    if (source.startsWith('%%', i)) {
+      const nl = source.indexOf('\n', i);
+      if (nl < 0) return len;
+      i = nl + 1;
+      continue;
+    }
+    break;
+  }
+  return i;
+}
+
+export function findMermaidHeaderLine(source: string): { line: string; lineNo: number; offset: number } {
+  const offset = skipLeadingTrivia(source);
+  const line = source.slice(offset).split(/\r?\n/, 1)[0] ?? '';
+  const lineNo = offset === 0 ? 1 : source.slice(0, offset).split('\n').length;
+  return { line, lineNo, offset };
+}
+
+export function detectMermaidDiagramType(source: string): string {
+  const { line } = findMermaidHeaderLine(source);
+  const match = MERMAID_HEADER_RE.exec(line);
+  return match ? match[1] : 'unknown';
+}
+
+export function isMermaidFlowchartDiagramType(diagramType: string): boolean {
+  return diagramType === 'flowchart' || diagramType === 'graph';
+}
+
 interface Statement { start: number; end: number; text: string; groupId: string | null }
 interface Occurrence { id: string; start: number; end: number; label: string; kind: string; defined: boolean; statement: Statement }
 
-function statements(source: string): Statement[] {
+function statements(source: string, startOffset = 0): Statement[] {
   const found: Statement[] = [];
-  let start = 0;
+  let start = startOffset;
   let quote = false;
   let inComment = false;
   let depth = 0;
-  for (let i = 0; i <= source.length; i++) {
+  for (let i = startOffset; i <= source.length; i++) {
     const c = source[i];
     if (!inComment && !quote && c === '%' && source[i + 1] === '%' && depth === 0) inComment = true;
     if (!inComment && c === '"' && source[i - 1] !== '\\') quote = !quote;
@@ -78,9 +130,10 @@ function readNode(statement: Statement, offset: number): Occurrence | undefined 
 }
 
 export function flowchartStructure(source: string) {
-  const statementsInSource = statements(source);
-  const header = statementsInSource.find((statement) => /^(?:flowchart|graph)\b/.test(statement.text));
-  if (!header) return null;
+  const headerOffset = skipLeadingTrivia(source);
+  const statementsInSource = statements(source, headerOffset);
+  const header = statementsInSource.find((statement) => !statement.text.startsWith('%%'));
+  if (!header || !/^(?:flowchart|graph)\b/.test(header.text)) return null;
   const groups: Array<{ id: string; title: string; start: number; end: number; bodyEnd: number; groupId: string | null; fingerprint: string }> = [];
   const context: typeof groups = [];
   const occurrences: Occurrence[] = [];
@@ -146,7 +199,16 @@ export function editMermaidStructure(source: string, op: AdapterOperation): stri
   const action = op.op.replace(/^mermaid\./, '');
   if (!MERMAID_STRUCTURE_OPS.some((name) => name === action)) return;
   const model = flowchartStructure(source);
-  if (!model) throw new ArtifactError('MERMAID_STRUCTURE_FORMAT', 'Use flowchart or graph syntax for this operation.', 422);
+  if (!model) {
+    const diagramType = detectMermaidDiagramType(source);
+    throw unsupportedOperationError(
+      op.op,
+      'unsupported_by_format',
+      diagramType === 'unknown'
+        ? 'Mermaid structure edits require a flowchart or graph declaration header.'
+        : `Mermaid diagram type '${diagramType}' does not support structure edits (flowchart or graph only).`
+    );
+  }
   const replace = (start: number, end: number, value: string) => source.slice(0, start) + value + source.slice(end);
   const uniqueGroup = (id: unknown) => {
     const matches = model.groups.filter((group) => group.id === id);
@@ -167,7 +229,7 @@ export function editMermaidStructure(source: string, op: AdapterOperation): stri
     }
     const group = uniqueGroup(id);
     if (op.expectedFingerprint !== undefined && op.expectedFingerprint !== group.fingerprint) throw conflict();
-    const headerEnd = statements(source).find((item) => item.start === group.start)!.end;
+    const headerEnd = statements(source, group.start)[0].end;
     if (action === 'set_group') return replace(group.start, headerEnd, `subgraph ${id}["${labelText(op.title)}"]`);
     if (action === 'remove_group') return replace(group.start, group.end, source.slice(headerEnd, group.bodyEnd));
     if (target && target.start >= group.start && target.start < group.end) throw conflict();

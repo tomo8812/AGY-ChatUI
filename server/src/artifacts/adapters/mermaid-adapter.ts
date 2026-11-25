@@ -10,7 +10,6 @@ import type {
   TargetSelector,
 } from '../types.js';
 import {
-  editCapabilities,
   resolveTextSnippetByContext,
   sha256Text,
   splitLines,
@@ -18,10 +17,15 @@ import {
   type AdapterFileMeta,
   type FormatAdapter,
 } from './base.js';
-import { editMermaidStructure, flowchartStructure, MERMAID_STRUCTURE_OPS } from './mermaid-structure.js';
-
-const MERMAID_HEADER_RE =
-  /^\s*(graph|flowchart|sequenceDiagram|classDiagram|stateDiagram(?:-v2)?|erDiagram|gantt|pie|gitGraph|journey|mindmap|timeline|quadrantChart|sankey-beta|xychart-beta|block-beta)\b/;
+import {
+  detectMermaidDiagramType,
+  editMermaidStructure,
+  findMermaidHeaderLine,
+  flowchartStructure,
+  isMermaidFlowchartDiagramType,
+  MERMAID_HEADER_RE,
+  MERMAID_STRUCTURE_OPS,
+} from './mermaid-structure.js';
 
 interface ParsedMermaidNode {
   id: string;
@@ -67,12 +71,40 @@ export class MermaidAdapter implements FormatAdapter {
       ctx.runtimeProfile === 'full_runtime'
         ? 'bubblewrap サンドボックスを有効化してください。'
         : 'Full Runtime（deploy/setup-doc-runtime.sh, INSTALL_DOC_RUNTIME=full）を有効化してください。';
+    const diagramType = ctx.content !== undefined ? detectMermaidDiagramType(ctx.content.toString('utf8')) : null;
+    const structureCapability: Pick<OperationCapability, 'availability' | 'notes'> =
+      diagramType === null
+        ? {
+            availability: 'partial',
+            notes: 'flowchart / graph 図種のみ対応します（その他の図種は replace_source / replace_range / search_replace でソース編集してください）。',
+          }
+        : isMermaidFlowchartDiagramType(diagramType)
+          ? {
+              availability: 'supported',
+              notes: `図種 '${diagramType}' は flowchart / graph 構造編集に対応しています。`,
+            }
+          : {
+              availability: 'unsupported_by_format',
+              notes:
+                diagramType === 'unknown'
+                  ? 'flowchart / graph の図種宣言が確認できないため構造編集は非対応です（flowchart / graph のみ対応）。replace_source / replace_range / search_replace でソース編集してください。'
+                  : `図種 '${diagramType}' は構造編集に非対応です（flowchart / graph のみ対応）。replace_source / replace_range / search_replace でソース編集してください。`,
+            };
     return [
-      ...editCapabilities('mermaid', MERMAID_STRUCTURE_OPS),
+      ...MERMAID_STRUCTURE_OPS.map((operation): OperationCapability => ({
+        operation: `mermaid.${operation}`,
+        ...structureCapability,
+        scope: 'mcp_and_ui',
+      })),
       { operation: 'create', availability: 'supported', scope: 'mcp_and_ui' },
       { operation: 'get_structure', availability: 'supported', scope: 'mcp_and_ui' },
       { operation: 'read_range', availability: 'supported', scope: 'mcp_and_ui' },
-      { operation: 'edit', availability: 'supported', scope: 'mcp_and_ui' },
+      {
+        operation: 'edit',
+        availability: 'supported',
+        scope: 'mcp_and_ui',
+        notes: '全図種で replace_source / replace_range / search_replace のソース編集に対応します。',
+      },
       { operation: 'verify', availability: 'supported', scope: 'mcp_and_ui' },
       {
         operation: 'export:svg',
@@ -102,15 +134,14 @@ export class MermaidAdapter implements FormatAdapter {
   getStructure(buffer: Buffer, _meta: AdapterFileMeta): Record<string, unknown> {
     const text = buffer.toString('utf8');
     const lines = splitLines(text);
-    const firstNonComment = lines.find((l) => l.trim() && !l.trim().startsWith('%%')) ?? '';
-    const hdr = MERMAID_HEADER_RE.exec(firstNonComment);
+    const diagramType = detectMermaidDiagramType(text);
     const model = flowchartStructure(text);
     const nodes = model ? model.nodes.map(({ id, kind, label, statement }) => ({
       id, kind, label, labelHash: sha256Text(label), groupId: statement.groupId, line: text.slice(0, statement.start).split('\n').length,
     })) : parseMermaidNodes(text);
     return {
       format: 'mermaid',
-      diagramType: hdr ? hdr[1] : 'unknown',
+      diagramType,
       lineCount: lines.length,
       nodes,
       edges: model?.edges.map(({ fromId, toId, operator, label, fingerprint }) => ({ fromId, toId, operator, label, fingerprint })) ?? [],
@@ -167,15 +198,14 @@ export class MermaidAdapter implements FormatAdapter {
     const issues: AdapterVerifyIssue[] = [];
     const checks: AdapterVerifyCheck[] = [];
 
-    const firstIndex = lines.findIndex((l) => l.trim() && !l.trim().startsWith('%%'));
-    const first = firstIndex >= 0 ? lines[firstIndex] : '';
+    const { line: first, lineNo: headerLineNo } = findMermaidHeaderLine(text);
     const hdr = MERMAID_HEADER_RE.exec(first);
     if (!first || !hdr) {
       issues.push({
         severity: 'error',
         code: 'MERMAID_INVALID_HEADER',
         message: 'Missing recognized Mermaid diagram declaration header.',
-        location: `line:${firstIndex >= 0 ? firstIndex + 1 : 1}`,
+        location: `line:${headerLineNo}`,
       });
     } else if (hdr[1] === 'graph' || hdr[1] === 'flowchart') {
       const rest = first.trim().slice(hdr[1].length).trim();
@@ -184,14 +214,15 @@ export class MermaidAdapter implements FormatAdapter {
           severity: 'error',
           code: 'MERMAID_INVALID_DIRECTION',
           message: `Invalid ${hdr[1]} direction '${rest.split(/\s+/)[0]}'. Expected TB, TD, BT, RL, or LR.`,
-          location: `line:${firstIndex + 1}`,
+          location: `line:${headerLineNo}`,
         });
       }
     }
 
+    const firstIndex = headerLineNo - 1;
     const blockStack: number[] = [];
     const diagramType = hdr?.[1] ?? '';
-    for (let i = 0; i < lines.length; i++) {
+    for (let i = firstIndex; i < lines.length; i++) {
       const trimmed = lines[i].trim();
       if (!trimmed || trimmed.startsWith('%%')) continue;
       const lineNo = i + 1;

@@ -109,6 +109,28 @@ describe('Pure-JS artifact structure edits', () => {
     ]);
     expect(structure.groups).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'desktop', groupId: 'clients' })]));
     expect(output).toContain('%% keep unrelated comment');
+
+    const withFrontmatter = '---\ntitle: "Pipeline"\n---\n%%{init: {"theme": "neutral"}}%%\nflowchart TD\n  subgraph g1["Init"]\n    A[Start] --> B[End]\n  end\n';
+    expect(adapter.verify(Buffer.from(withFrontmatter), meta).ok).toBe(true);
+    const editedFrontmatter = apply(adapter, withFrontmatter, [
+      { op: 'mermaid.add_node', nodeId: 'C', label: 'Done' },
+      { op: 'mermaid.set_group', groupId: 'g1', title: 'Updated' },
+    ]);
+    expect(adapter.getStructure(Buffer.from(editedFrontmatter), meta)).toMatchObject({
+      diagramType: 'flowchart',
+      nodes: expect.arrayContaining([expect.objectContaining({ id: 'C', label: 'Done' })]),
+      groups: expect.arrayContaining([expect.objectContaining({ id: 'g1', title: 'Updated' })]),
+    });
+
+    const seqSource = 'sequenceDiagram\n  participant graph\n  graph->>B: hello\n';
+    expect(() => apply(adapter, seqSource, [{ op: 'mermaid.add_node', nodeId: 'C', label: 'Nope' }])).toThrow(
+      expect.objectContaining({
+        code: 'UNSUPPORTED_OPERATION',
+        statusCode: 422,
+        details: expect.objectContaining({ availability: 'unsupported_by_format' }),
+      }),
+    );
+    expect(apply(adapter, seqSource, [{ op: 'search_replace', search: 'hello', replace: 'world' }])).toContain('graph->>B: world');
   });
 
   it('publishes editable operations and commits through the revision and dependency path', async () => {

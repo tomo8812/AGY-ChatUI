@@ -32,6 +32,11 @@ export class HtmlAdapter implements FormatAdapter {
   readonly requiresExternalWorker = false;
 
   getOperations(ctx: AdapterCapabilityContext): OperationCapability[] {
+    const webReady = ctx.runtimeProfile === 'full_runtime' && ctx.sandboxAvailable;
+    const remediation =
+      ctx.runtimeProfile === 'full_runtime'
+        ? 'bubblewrap サンドボックスを有効化してください。'
+        : 'Full Runtime（deploy/setup-doc-runtime.sh, INSTALL_DOC_RUNTIME=full）を有効化してください。';
     return [
       ...markupCapabilities('html'),
       browserVerifyCapability(ctx),
@@ -42,15 +47,15 @@ export class HtmlAdapter implements FormatAdapter {
       { operation: 'verify', availability: 'supported', scope: 'mcp_and_ui' },
       {
         operation: 'render_png',
-        availability: ctx.runtimeProfile === 'full_runtime' && ctx.sandboxAvailable ? 'supported' : 'disabled_by_resource_tier',
+        availability: webReady ? 'supported' : 'disabled_by_resource_tier',
         scope: 'mcp_only',
-        remediation: ctx.runtimeProfile !== 'full_runtime' ? 'Full Runtime（deploy/setup-doc-runtime.sh --profile full）を有効化してください。' : undefined,
+        remediation: webReady ? undefined : remediation,
       },
       {
         operation: 'export:png',
-        availability: ctx.runtimeProfile === 'full_runtime' && ctx.sandboxAvailable ? 'supported' : 'disabled_by_resource_tier',
+        availability: webReady ? 'supported' : 'disabled_by_resource_tier',
         scope: 'mcp_and_ui',
-        remediation: ctx.runtimeProfile !== 'full_runtime' ? 'Full Runtime（deploy/setup-doc-runtime.sh --profile full）を有効化してください。' : undefined,
+        remediation: webReady ? undefined : remediation,
       },
     ];
   }

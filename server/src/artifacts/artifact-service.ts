@@ -3966,15 +3966,57 @@ export class ArtifactService {
     return outcome;
   }
 
+  private readCapabilityInspectionBytes(userId: string, artifactId: string, maxBytes: number): Buffer | undefined {
+    try {
+      const pinned = this.openPinnedBlobMeta(userId, artifactId);
+      try {
+        const toRead = Math.min(pinned.sizeBytes, maxBytes);
+        const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+        const fd = fs.openSync(pinned.blobPath, flags);
+        try {
+          const st = fs.fstatSync(fd);
+          if (!st.isFile() || st.size !== pinned.sizeBytes) return undefined;
+          const buf = Buffer.allocUnsafe(toRead);
+          let filled = 0;
+          while (filled < toRead) {
+            const n = fs.readSync(fd, buf, filled, toRead - filled, filled);
+            if (n <= 0) break;
+            filled += n;
+          }
+          return filled === toRead ? buf : buf.subarray(0, filled);
+        } finally {
+          fs.closeSync(fd);
+        }
+      } finally {
+        pinned.releasePin();
+      }
+    } catch {
+      return undefined;
+    }
+  }
+
   getCapabilities(userId: string, artifactId: string): ArtifactCapabilitiesResponse {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
+    const format = this.registry.resolve(artifact.filename, artifact.previewKind).format;
+    const ext = path.extname(artifact.filename).toLowerCase();
+    let content: Buffer | undefined;
+    if (format === 'mermaid') {
+      content = this.readCapabilityInspectionBytes(userId, artifactId, 64 * 1024);
+    } else if (format === 'image') {
+      if (ext === '.gif' || artifact.mimeType === 'image/gif') {
+        content = this.readCapabilityInspectionBytes(userId, artifactId, 4 * 1024 * 1024);
+      } else if (['.png', '.webp'].includes(ext) || artifact.mimeType === 'image/png' || artifact.mimeType === 'image/webp') {
+        content = this.readCapabilityInspectionBytes(userId, artifactId, 64 * 1024);
+      }
+    }
     return this.registry.buildCapabilitiesResponse({
       filename: artifact.filename,
       previewKind: artifact.previewKind,
       runtimeProfile: this.governor.getRuntimeProfile(),
       sandboxIsolation: this.sandboxWorker.getIsolationStatus(),
       stagingIsolation: this.getStagingIsolation(),
+      content,
     });
   }
 
