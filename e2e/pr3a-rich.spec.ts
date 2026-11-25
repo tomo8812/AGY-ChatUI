@@ -20,11 +20,11 @@ const children:RichNode[]=[
   ...charts,
   {id:'readings',type:'data_table',columns:[{key:'label',label:'Exhibit'},{key:'reading',label:'Lux',missingLabel:'Missing'}],
     rows:Array.from({length:160},(_,i)=>({label:'Exhibit '+String(i+1).padStart(3,'0'),reading:i===0?{value:null,missingReason:'Sensor offline',sourceId:'meter-a',asOf:'2026-01-01',fetchedAt:'2026-01-02T12:00:00Z'}:{value:i,sourceId:'meter-b',asOf:'2026-01-03',fetchedAt:'2026-01-04T12:00:00Z'}})),searchable:true,sortable:true,pageSize:160,selectedRowBind:'selected'},
-  {id:'selected',type:'text',content:{expr:'coalesce($state.selected.label, "None")'}},
+  {id:'selected',type:'text',content:{expr:'concat("Selected: ", $state.selected + 1)'}},
   {id:'sources',type:'source_attribution',sourceIds:['meter-a','meter-b']},
   {id:'reset',type:'button',label:'Reset lighting',onClick:[{type:'reset_state'}]}
 ];
-const doc:RichDocumentV1={schemaVersion:1,title:'Museum light planning',sources:[{id:'meter-a',name:'Meter A'},{id:'meter-b',name:'Meter B'}],state:{power:2,point:null,selected:{label:'None'}},computed:{total:'$state.power * 4'},root:{id:'root',type:'stack',direction:'col',children}};
+const doc:RichDocumentV1={schemaVersion:1,title:'Museum light planning',sources:[{id:'meter-a',name:'Meter A'},{id:'meter-b',name:'Meter B'}],state:{power:2,point:null,selected:-1},computed:{total:'$state.power * 4'},root:{id:'root',type:'stack',direction:'col',children}};
 for(const vp of [{width:1280,height:720,project:'pc-chromium'},{width:1440,height:900,project:'pc-chromium'},{width:1920,height:1080,project:'pc-chromium'},{width:375,height:812,project:'iphone-webkit'},{width:430,height:932,project:'iphone-webkit'}]){
   test('schema-only novel rich UI '+vp.width+'x'+vp.height,async({page},info)=>{
     test.skip(info.project.name!==vp.project);
@@ -53,7 +53,7 @@ for(const vp of [{width:1280,height:720,project:'pc-chromium'},{width:1440,heigh
     await scroll.evaluate(el=>el.scrollTop=el.scrollHeight);
     await expect(table.getByText('Exhibit 160',{exact:true})).toBeVisible();
     await table.getByText('Exhibit 160',{exact:true}).click();
-    await expect(page.locator('.rich-data-table + *').getByText('Exhibit 160',{exact:true})).toBeVisible().catch(async()=>{await expect(page.getByText('Exhibit 160',{exact:true})).toHaveCount(2)});
+    await expect(page.getByText('Selected: 160',{exact:true})).toBeVisible();
     await table.getByRole('searchbox').fill('Exhibit 001');
     await expect(table.getByText('Exhibit 001',{exact:true})).toBeVisible();
     await expect(table.getByText('Sensor offline',{exact:false})).toBeVisible();
