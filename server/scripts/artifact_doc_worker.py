@@ -1,6 +1,8 @@
 """Bounded document processing entry point for DocWorkerSandbox."""
 
 import json
+import io
+from copy import deepcopy
 import math
 import os
 from pathlib import Path, PurePosixPath
@@ -8,6 +10,7 @@ import posixpath
 import re
 import sys
 import subprocess
+import tempfile
 from urllib.parse import unquote, urlsplit
 import zipfile
 
@@ -190,59 +193,68 @@ def invalidate_calculation(package, replacements):
 
 def edit_workbook(package, operations, output):
     replacements = {}
+    changes_cells = False
     for operation in operations:
         op = operation["op"]
-        if op not in {"xlsx.set_cell", "xlsx.set_formula"}:
-            raise ValueError("Unsupported XLSX operation")
-        sheet_name = operation["sheetPart"]
-        address = operation["address"]
-        value = operation["value"]
-        if not re.fullmatch(r"xl/worksheets/[^/]+\.xml", sheet_name):
-            raise ValueError("Invalid worksheet part")
-        cell_coordinates(address)
-        if type(value) not in (str, bool, int, float, type(None)):
-            raise ValueError("Expected a scalar cell value")
-        sheet = replacements.get(sheet_name)
-        if sheet is None:
-            sheet = parse_xml(package.read(sheet_name))
-        cells = [cell for cell in sheet.iter(tag(SPREADSHEET, "c")) if cell.get("r") == address]
-        if len(cells) != 1:
-            raise ValueError("The operation requires an existing, unique cell")
-        cell = cells[0]
-        formula = cell.find(tag(SPREADSHEET, "f"))
-        if formula is not None and formula.get("t") not in (None, "normal"):
-            raise ValueError("Shared, table, and array formulas are protected")
-        for child in list(cell):
-            if child.tag in (tag(SPREADSHEET, "v"), tag(SPREADSHEET, "is"), tag(SPREADSHEET, "f")):
-                cell.remove(child)
-        cell.attrib.pop("t", None)
-        if op == "xlsx.set_formula":
-            if not isinstance(value, str) or not value.startswith("=") or len(value) < 2 or len(value) > 8192:
-                raise ValueError("Invalid formula text")
-            formula = XML.Element(tag(SPREADSHEET, "f"))
-            formula.text = value[1:]
-            cell.insert(0, formula)
-        elif isinstance(value, str):
-            if len(value.encode("utf-16-le")) > 65534:
-                raise ValueError("Cell value exceeds the Excel limit")
-            cell.set("t", "inlineStr")
-            inline = XML.Element(tag(SPREADSHEET, "is"))
-            cell.insert(0, inline)
-            text = XML.SubElement(inline, tag(SPREADSHEET, "t"))
-            text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-            text.text = value
-        elif value is not None:
-            value_element = XML.Element(tag(SPREADSHEET, "v"))
-            cell.insert(0, value_element)
-            if isinstance(value, bool):
-                cell.set("t", "b")
-                value_element.text = "1" if value else "0"
-            else:
-                value_element.text = json.dumps(value, allow_nan=False)
-        replacements[sheet_name] = sheet
-
-    removed = invalidate_calculation(package, replacements)
+        if op.startswith("chart."):
+            changes_cells |= edit_chart(package, "xlsx", operation, replacements)
+            continue
+        changes_cells = True
+        update_workbook_cell(package, operation, replacements)
+    removed = invalidate_calculation(package, replacements) if changes_cells else ()
     write_package(package, replacements, output, "xlsx", removed)
+
+
+def update_workbook_cell(package, operation, replacements):
+    op = operation["op"]
+    if op not in {"xlsx.set_cell", "xlsx.set_formula"}:
+        raise ValueError("Unsupported XLSX operation")
+    sheet_name = operation["sheetPart"]
+    address = operation["address"]
+    value = operation["value"]
+    if not re.fullmatch(r"xl/worksheets/[^/]+\.xml", sheet_name):
+        raise ValueError("Invalid worksheet part")
+    cell_coordinates(address)
+    if type(value) not in (str, bool, int, float, type(None)):
+        raise ValueError("Expected a scalar cell value")
+    sheet = replacements.get(sheet_name)
+    if sheet is None:
+        sheet = parse_xml(package.read(sheet_name))
+    cells = [cell for cell in sheet.iter(tag(SPREADSHEET, "c")) if cell.get("r") == address]
+    if len(cells) != 1:
+        raise ValueError("The operation requires an existing, unique cell")
+    cell = cells[0]
+    formula = cell.find(tag(SPREADSHEET, "f"))
+    if formula is not None and formula.get("t") not in (None, "normal"):
+        raise ValueError("Shared, table, and array formulas are protected")
+    for child in list(cell):
+        if child.tag in (tag(SPREADSHEET, "v"), tag(SPREADSHEET, "is"), tag(SPREADSHEET, "f")):
+            cell.remove(child)
+    cell.attrib.pop("t", None)
+    if op == "xlsx.set_formula":
+        if not isinstance(value, str) or not value.startswith("=") or len(value) < 2 or len(value) > 8192:
+            raise ValueError("Invalid formula text")
+        formula = XML.Element(tag(SPREADSHEET, "f"))
+        formula.text = value[1:]
+        cell.insert(0, formula)
+    elif isinstance(value, str):
+        if len(value.encode("utf-16-le")) > 65534:
+            raise ValueError("Cell value exceeds the Excel limit")
+        cell.set("t", "inlineStr")
+        inline = XML.Element(tag(SPREADSHEET, "is"))
+        cell.insert(0, inline)
+        text = XML.SubElement(inline, tag(SPREADSHEET, "t"))
+        text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        text.text = value
+    elif value is not None:
+        value_element = XML.Element(tag(SPREADSHEET, "v"))
+        cell.insert(0, value_element)
+        if isinstance(value, bool):
+            cell.set("t", "b")
+            value_element.text = "1" if value else "0"
+        else:
+            value_element.text = json.dumps(value, allow_nan=False)
+    replacements[sheet_name] = sheet
 
 
 def write_package(package, replacements, output, fmt, removed=()):
@@ -252,7 +264,9 @@ def write_package(package, replacements, output, fmt, removed=()):
                 continue
             root = replacements.get(entry.filename)
             data = package.read(entry)
-            if root is not None:
+            if isinstance(root, bytes):
+                data = root
+            elif root is not None:
                 data = XML.tostring(root, encoding="UTF-8", xml_declaration=True)
             edited.writestr(entry, data)
     with zipfile.ZipFile(output) as edited:
@@ -336,11 +350,23 @@ def image_encoding(value):
 
 def process_pdf(request, source, output):
     from pypdf import PdfReader, PdfWriter
-    from pypdf.annotations import FreeText, Text
+    from pypdf.annotations import Text
     from pypdf.errors import PdfReadError
 
     action = request["action"]
     if action == "create":
+        merge_count = bounded_integer(request.get("mergeSourceCount", 0), 0, 10)
+        if merge_count:
+            writer = PdfWriter()
+            for index in range(merge_count):
+                reader = PdfReader(source.parent / f"merge-{index}.pdf")
+                if reader.is_encrypted or len(writer.pages) + len(reader.pages) > 1000:
+                    raise ValueError("PDF merge sources are encrypted or contain too many pages")
+                writer.append(reader, import_outline=False)
+            if not writer.pages:
+                raise ValueError("PDF merge contains no pages")
+            writer.write(output)
+            return None
         from reportlab.pdfgen.canvas import Canvas
         options = request["params"]
         pages = options.get("pages", [""])
@@ -429,8 +455,20 @@ def process_pdf(request, source, output):
                         or rect[0] >= rect[2] or rect[1] >= rect[3]:
                     raise ValueError("Invalid annotation rectangle")
                 text = operation["text"][:10_000]
-                annotation = Text(text=text, rect=rect) if op == "pdf.add_note" else FreeText(text=text, rect=rect)
-                writer.add_annotation(index, annotation)
+                if op == "pdf.add_note":
+                    writer.add_annotation(index, Text(text=text, rect=rect))
+                else:
+                    from reportlab.pdfgen.canvas import Canvas
+                    drawing = io.BytesIO()
+                    original = writer.pages[index]
+                    width, height = float(original.mediabox.width), float(original.mediabox.height)
+                    if not 0 < width <= 14400 or not 0 < height <= 14400:
+                        raise ValueError("PDF overlay page geometry is out of bounds")
+                    canvas = Canvas(drawing, pagesize=(width, height), invariant=1)
+                    canvas.drawString(rect[0], rect[1], text.splitlines()[0][:1000] if text else "")
+                    canvas.save()
+                    drawing.seek(0)
+                    original.merge_page(PdfReader(drawing).pages[0])
             else:
                 raise ValueError("Unsupported PDF operation")
     writer.write(output)
@@ -581,6 +619,82 @@ def read_workbook_range(package, options):
     return {"sheetId": sheet["id"], "rangeA1": options.get("rangeA1", "A1"), "cells": cells}
 
 
+SAFE_CALC_FUNCTIONS = {
+    "ABS", "AND", "AVERAGE", "COUNT", "COUNTA", "IF", "IFERROR", "MAX", "MIN",
+    "NOT", "OR", "ROUND", "ROUNDDOWN", "ROUNDUP", "SUM", "SUMIF", "SUMIFS",
+}
+
+
+def safe_to_evaluate_workbook(package):
+    from openpyxl.formula import Tokenizer
+    from openpyxl.formula.tokenizer import TokenizerError
+
+    names = package.namelist()
+    if any(name.startswith("xl/externalLinks/") or name.lower().endswith(("vbaproject.bin", ".xlam"))
+           for name in names):
+        return False
+    for name in names:
+        if name.endswith(".rels"):
+            relationships = parse_xml(package.read(name))
+            if any(relation.get("TargetMode") == "External" for relation in relationships):
+                return False
+    for sheet in workbook_sheets(package):
+        root = parse_xml(package.read(sheet["part"]))
+        for formula in root.iter(tag(SPREADSHEET, "f")):
+            if not formula.text or formula.get("t") not in (None, "normal"):
+                return False
+            try:
+                tokens = Tokenizer("=" + formula.text).items
+            except TokenizerError:
+                return False
+            for token in tokens:
+                if token.type == "FUNC" and token.subtype == "OPEN" and token.value[:-1].upper() not in SAFE_CALC_FUNCTIONS:
+                    return False
+                if token.type == "OPERAND" and token.subtype == "RANGE":
+                    address = token.value.rsplit("!", 1)[-1].replace("$", "")
+                    if not re.fullmatch(r"[A-Z]{1,3}[1-9][0-9]{0,6}(?::[A-Z]{1,3}[1-9][0-9]{0,6})?", address):
+                        return False
+                    if "[" in token.value or "]" in token.value:
+                        return False
+    return True
+
+
+def evaluate_workbook_range(package, source, options, result):
+    if not safe_to_evaluate_workbook(package):
+        return result
+    with tempfile.TemporaryDirectory(prefix="calc-", dir=Path.cwd()) as scratch:
+        root = Path(scratch)
+        original = root / "workbook.xlsx"
+        original.write_bytes(source.read_bytes())
+        converted = root / "converted"
+        converted.mkdir()
+        try:
+            subprocess.run(["libreoffice", "-env:UserInstallation=" + (root / "profile").as_uri(),
+                            "--headless", "--convert-to", "xlsx:Calc MS Excel 2007 XML",
+                            "--outdir", str(converted), str(original)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            with zipfile.ZipFile(converted / original.name) as evaluated:
+                original_name = next(sheet["name"] for sheet in workbook_sheets(package)
+                                     if sheet["id"] == result["sheetId"])
+                sheet_id = next(sheet["id"] for sheet in workbook_sheets(evaluated)
+                                if sheet["name"] == original_name)
+                calculated = read_workbook_range(evaluated, {**options, "sheetId": sheet_id})
+        except (OSError, ValueError, LookupError, zipfile.BadZipFile, subprocess.CalledProcessError):
+            return result
+    evaluated_cells = {cell["address"]: cell for cell in calculated["cells"]}
+    for cell in result["cells"]:
+        if "formulaStatus" not in cell:
+            continue
+        evaluated = evaluated_cells.get(cell["address"])
+        if not evaluated or "formulaStatus" not in evaluated:
+            continue
+        state = evaluated["formulaStatus"]
+        if state in {"cached_existing", "error_formula"}:
+            cell["value"] = evaluated["value"]
+            cell["formulaStatus"] = "evaluated_lo" if state == "cached_existing" else "error_formula"
+    return result
+
+
 def edit_word(package, operations, output):
     main_part = MAIN_PART["docx"]
     document = parse_xml(package.read(main_part))
@@ -618,15 +732,303 @@ def edit_word(package, operations, output):
     write_package(package, {main_part: document}, output, "docx")
 
 
+CHART = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+SUPPORTED_CHARTS = {"areaChart", "barChart", "doughnutChart", "lineChart", "pieChart", "scatterChart"}
+
+
+def chart_series(root):
+    plot = root.find(".//" + tag(CHART, "plotArea"))
+    if plot is None:
+        raise ValueError("Chart has no plot area")
+    values = []
+    for child in plot:
+        if not isinstance(child.tag, str):
+            continue
+        series = child.findall(tag(CHART, "ser"))
+        if series and XML.QName(child).localname not in SUPPORTED_CHARTS:
+            raise ValueError("Chart series type is unsupported")
+        values.extend(series)
+    return values
+
+
+def update_chart_title_and_legend(root, operation):
+    chart = root.find(tag(CHART, "chart"))
+    if "title" in operation:
+        title_text = operation["title"]
+        if not isinstance(title_text, str) or len(title_text) > 2000:
+            raise ValueError("Invalid chart title")
+        title = chart.find(tag(CHART, "title"))
+        if title is None:
+            title = XML.Element(tag(CHART, "title"))
+            chart.insert(0, title)
+        title_tx = title.find(tag(CHART, "tx"))
+        if title_tx is None:
+            title_tx = XML.Element(tag(CHART, "tx"))
+            title.insert(0, title_tx)
+        if title_tx.find(tag(CHART, "strRef")) is not None:
+            raise ValueError("The chart title is linked to worksheet data")
+        rich = title_tx.find(tag(CHART, "rich"))
+        if rich is None:
+            rich = XML.SubElement(title_tx, tag(CHART, "rich"))
+            XML.SubElement(rich, tag(DRAWING, "bodyPr"))
+            XML.SubElement(rich, tag(DRAWING, "lstStyle"))
+            para = XML.SubElement(rich, tag(DRAWING, "p"))
+            run = XML.SubElement(para, tag(DRAWING, "r"))
+            XML.SubElement(run, tag(DRAWING, "t"))
+        texts = list(rich.iter(tag(DRAWING, "t")))
+        if len(texts) != 1:
+            raise ValueError("Chart title uses mixed formatting")
+        texts[0].text = title_text
+    if "legendPosition" in operation:
+        position = operation["legendPosition"]
+        if position not in {"b", "l", "r", "t", "tr", None}:
+            raise ValueError("Invalid chart legend position")
+        legend = chart.find(tag(CHART, "legend"))
+        if position is None:
+            if legend is not None:
+                chart.remove(legend)
+        else:
+            if legend is None:
+                legend = XML.Element(tag(CHART, "legend"))
+                chart.insert(chart.index(chart.find(tag(CHART, "plotArea"))) + 1, legend)
+            legend_position = legend.find(tag(CHART, "legendPos"))
+            if legend_position is None:
+                legend_position = XML.Element(tag(CHART, "legendPos"))
+                legend.insert(0, legend_position)
+            legend_position.set("val", position)
+
+
+def chart_value_cache(series):
+    refs = series.findall("./" + tag(CHART, "val") + "/" + tag(CHART, "numRef"))
+    if len(refs) != 1:
+        raise ValueError("Expected one numeric worksheet-backed series")
+    ref = refs[0]
+    cache = ref.find(tag(CHART, "numCache"))
+    if cache is None:
+        cache = XML.SubElement(ref, tag(CHART, "numCache"))
+    return ref.findtext(tag(CHART, "f")), cache
+
+
+def chart_cell_updates(package, formula, values):
+    if not isinstance(formula, str) or "!" not in formula:
+        raise ValueError("Chart series has no local range")
+    sheet_name, a1 = formula.rsplit("!", 1)
+    if sheet_name.startswith("'") and sheet_name.endswith("'"):
+        sheet_name = sheet_name[1:-1].replace("''", "'")
+    sheet = next((item for item in workbook_sheets(package) if item["name"] == sheet_name), None)
+    if sheet is None:
+        raise ValueError("Chart series references an external or unknown worksheet")
+    bounds = a1.replace("$", "").split(":")
+    first_row, first_col = cell_coordinates(bounds[0])
+    last_row, last_col = cell_coordinates(bounds[-1])
+    if len(bounds) > 2 or first_col != last_col or last_row - first_row + 1 != len(values):
+        raise ValueError("Chart series values must fit its existing vertical worksheet range")
+    column = CELL_ADDRESS.fullmatch(bounds[0]).group(1)
+    return [{"op": "xlsx.set_cell", "sheetPart": sheet["part"],
+             "address": f"{column}{row}", "value": value}
+            for row, value in enumerate(values, start=first_row)]
+
+
+def update_chart_values(package, fmt, chart_part, series, operation, replacements):
+    formula, cache = chart_value_cache(series)
+    values = operation["values"]
+    if not isinstance(values, list) or not 1 <= len(values) <= 1000 or any(
+            type(value) not in (float, int) or not math.isfinite(value) for value in values):
+        raise ValueError("Chart values must be finite numbers")
+    if fmt == "xlsx":
+        for change in chart_cell_updates(package, formula, values):
+            update_workbook_cell(package, change, replacements)
+    else:
+        relations = package_relationships(package, chart_part)
+        embed = [part for kind, part in relations.values()
+                 if kind.endswith("/package") and re.fullmatch(r"ppt/embeddings/[^/]+\.xlsx", part)]
+        if len(embed) != 1:
+            raise ValueError("Expected one embedded workbook for the chart")
+        workbook = replacements.get(embed[0])
+        if workbook is None:
+            workbook = package.read(embed[0])
+        with zipfile.ZipFile(io.BytesIO(workbook)) as embedded:
+            validate_package(embedded, "xlsx")
+            output = io.BytesIO()
+            edit_workbook(embedded, chart_cell_updates(embedded, formula, values), output)
+            replacements[embed[0]] = output.getvalue()
+    for entry in list(cache):
+        if entry.tag in (tag(CHART, "ptCount"), tag(CHART, "pt")):
+            cache.remove(entry)
+    ext = cache.find(tag(CHART, "extLst"))
+    end = cache.index(ext) if ext is not None else len(cache)
+    cache.insert(end, XML.Element(tag(CHART, "ptCount"), val=str(len(values))))
+    for index, value in enumerate(values):
+        point = XML.Element(tag(CHART, "pt"), idx=str(index))
+        XML.SubElement(point, tag(CHART, "v")).text = str(value)
+        cache.insert(end + index + 1, point)
+
+
+def add_chart_series(package, fmt, chart_part, series, all_series, operation, replacements):
+    template = deepcopy(series)
+    siblings = series.getparent().findall(tag(CHART, "ser"))
+    all_indices = [bounded_integer(item.find(tag(CHART, "idx")).get("val"), 0, 65535) for item in all_series]
+    new_index = max(all_indices) + 1
+    if len(siblings) >= 255 or new_index > 65535:
+        raise ValueError("Chart series limit exceeded")
+    template.find(tag(CHART, "idx")).set("val", str(new_index))
+    template.find(tag(CHART, "order")).set("val", str(new_index))
+    for existing in template.findall(tag(CHART, "tx")):
+        template.remove(existing)
+    name = operation["name"]
+    if not isinstance(name, str) or len(name) > 255:
+        raise ValueError("Invalid chart series name")
+    title = XML.Element(tag(CHART, "tx"))
+    XML.SubElement(title, tag(CHART, "v")).text = name
+    template.insert(2, title)
+    for local_name in ("dPt", "dLbls", "trendline", "errBars"):
+        for node in template.findall(tag(CHART, local_name)):
+            template.remove(node)
+    reference = template.find("./" + tag(CHART, "val") + "/" + tag(CHART, "numRef"))
+    if reference is None:
+        raise ValueError("The chart must use worksheet-backed series values")
+    if reference.findtext(tag(CHART, "f")) == operation["rangeFormula"]:
+        raise ValueError("New series must use a distinct worksheet range")
+    reference.find(tag(CHART, "f")).text = operation["rangeFormula"]
+    update_chart_values(package, fmt, chart_part, template, operation, replacements)
+    parent = series.getparent()
+    parent.insert(parent.index(siblings[-1]) + 1, template)
+
+
+def edit_chart(package, fmt, operation, replacements):
+    chart_part = operation["chartPart"]
+    prefix = "xl" if fmt == "xlsx" else "ppt"
+    if not re.fullmatch(prefix + r"/charts/[^/]+\.xml", chart_part):
+        raise ValueError("Invalid chart part")
+    root = replacements.get(chart_part)
+    if root is None:
+        root = parse_xml(package.read(chart_part))
+    all_series = chart_series(root)
+    op = operation["op"]
+    changes_cells = False
+    if op == "chart.update_title_and_legend":
+        update_chart_title_and_legend(root, operation)
+    else:
+        selected = [series for series in all_series if series.find(tag(CHART, "idx")).get("val") == str(operation["seriesIndex"])]
+        if len(selected) != 1:
+            raise ValueError("Expected a unique chart series index")
+        series = selected[0]
+        if op == "chart.add_or_remove_series":
+            mode = operation["mode"]
+            if mode == "remove":
+                if len(series.getparent().findall(tag(CHART, "ser"))) <= 1:
+                    raise ValueError("Cannot remove the final series of a plot")
+                series.getparent().remove(series)
+            elif mode == "add":
+                add_chart_series(package, fmt, chart_part, series, all_series, operation, replacements)
+                changes_cells = True
+            else:
+                raise ValueError("Unknown series operation")
+        elif op == "chart.update_series_data":
+            update_chart_values(package, fmt, chart_part, series, operation, replacements)
+            changes_cells = True
+        elif op == "chart.update_series_style":
+            rgb = operation["color"].removeprefix("#")
+            if not re.fullmatch(r"[0-9a-fA-F]{6}", rgb):
+                raise ValueError("Invalid chart color")
+            properties = series.find(tag(CHART, "spPr"))
+            if properties is None:
+                properties = XML.Element(tag(CHART, "spPr"))
+                title = series.find(tag(CHART, "tx"))
+                series.insert(series.index(title) + 1 if title is not None else 2, properties)
+            if XML.QName(series.getparent()).localname in {"lineChart", "scatterChart"}:
+                line = properties.find(tag(DRAWING, "ln"))
+                if line is None:
+                    line = XML.SubElement(properties, tag(DRAWING, "ln"))
+                properties = line
+            for child in list(properties):
+                if isinstance(child.tag, str) and XML.QName(child).localname in {
+                    "noFill", "solidFill", "gradFill", "blipFill", "pattFill", "grpFill"
+                }:
+                    properties.remove(child)
+            fill = XML.Element(tag(DRAWING, "solidFill"))
+            XML.SubElement(fill, tag(DRAWING, "srgbClr"), val=rgb.upper())
+            properties.insert(0, fill)
+        else:
+            raise ValueError("Unsupported chart operation")
+    replacements[chart_part] = root
+    return fmt == "xlsx" and changes_cells
+
+
+DIAGRAM_DRAWING = "http://schemas.microsoft.com/office/drawing/2008/diagram"
+
+
+def package_relationships(package, source_name):
+    parent = PurePosixPath(source_name).parent
+    name = parent / "_rels" / (PurePosixPath(source_name).name + ".rels")
+    if str(name) not in package.namelist():
+        return {}
+    root = parse_xml(package.read(str(name)))
+    return {relation.attrib["Id"]: (relation.attrib["Type"], resolve_relationship(str(parent), relation.attrib["Target"]))
+            for relation in root if isinstance(relation.tag, str) and relation.get("TargetMode") != "External"}
+
+
+def edit_smartart_text(package, operation, slide_root, replacements):
+    slide_part = operation["slidePart"]
+    data_part = operation["dataPart"]
+    model_id = operation["nodeId"]
+    text = operation["text"]
+    if not isinstance(text, str) or not text.strip() or len(text) > 2000 or "\r" in text or "\n" in text:
+        raise ValueError("SmartArt requires a nonempty, single-line label")
+    relationships = package_relationships(package, slide_part)
+    data_ids = [rel_id for rel_id, (kind, part) in relationships.items()
+                if kind.endswith("/diagramData") and part == data_part]
+    if len(data_ids) != 1 or not any(element.get(tag(OFFICE_REL, "dm")) == data_ids[0]
+                                      for element in slide_root.iter(tag(DIAGRAM, "relIds"))):
+        raise ValueError("The slide does not reference this SmartArt data model")
+    data = replacements.get(data_part)
+    if data is None:
+        data = parse_xml(package.read(data_part))
+    drawing_ids = [element.get("relId") for element in data.iter(tag(DIAGRAM_DRAWING, "dataModelExt"))]
+    if len(drawing_ids) != 1:
+        raise ValueError("SmartArt drawing cache relationship is missing or ambiguous")
+    drawing_type, drawing_part = relationships.get(drawing_ids[0], ("", ""))
+    if not drawing_type.endswith("/diagramDrawing"):
+        raise ValueError("SmartArt drawing cache is missing")
+    drawing = replacements.get(drawing_part)
+    if drawing is None:
+        drawing = parse_xml(package.read(drawing_part))
+    points = list(data.iter(tag(DIAGRAM, "pt")))
+    logical_points = [point for point in points if point.get("modelId") == model_id and point.get("type") in (None, "node")]
+    if len(logical_points) != 1:
+        raise ValueError("Expected a unique editable SmartArt node")
+    label = list(logical_points[0].iter(tag(DRAWING, "t")))
+    if len(label) != 1:
+        raise ValueError("SmartArt node has mixed formatting or no editable label")
+    display_ids = {point.get("modelId") for point in points if point.get("type") == "pres"
+                   and any(child.get("presAssocID") == model_id for child in point.findall(tag(DIAGRAM, "prSet")))}
+    matching_shapes = [shape for shape in drawing.iter(tag(DIAGRAM_DRAWING, "sp")) if shape.get("modelId") in display_ids]
+    display_labels = [list(shape.iter(tag(DRAWING, "t"))) for shape in matching_shapes]
+    display_labels = [labels for labels in display_labels if labels]
+    if not display_labels or any(len(labels) != 1 or labels[0].text != label[0].text for labels in display_labels):
+        raise ValueError("SmartArt data and drawing text cannot be synchronized safely")
+    label[0].text = text
+    for labels in display_labels:
+        labels[0].text = text
+    replacements[data_part] = data
+    replacements[drawing_part] = drawing
+
+
 def edit_presentation(package, operations, output):
     replacements = {}
     for operation in operations:
+        if operation["op"].startswith("chart."):
+            edit_chart(package, "pptx", operation, replacements)
+            continue
         slide = operation["slidePart"]
         if not re.fullmatch(r"ppt/slides/[^/]+\.xml", slide):
             raise ValueError("Invalid slide part")
         root = replacements.get(slide)
         if root is None:
             root = parse_xml(package.read(slide))
+        if operation["op"] == "pptx.smartart.update_node_text":
+            edit_smartart_text(package, operation, root, replacements)
+            continue
         tree = root.find(".//" + tag(PRESENTATION, "spTree"))
         shapes = []
         for shape in tree:
@@ -728,9 +1130,14 @@ def process_document(request, source, output):
         if action == "verify":
             return {"ok": True, "issues": [], "metrics": {"packageParts": len(names)}}
         if action == "range" and fmt == "xlsx":
-            return read_workbook_range(package, request["range"])
+            options = request["range"]
+            result = read_workbook_range(package, options)
+            if options.get("evaluate") is True and any("formulaStatus" in cell for cell in result["cells"]):
+                return evaluate_workbook_range(package, source, options, result)
+            return result
         main = parse_xml(package.read(MAIN_PART[fmt]))
-        result = {"format": fmt, "packageParts": len(names)}
+        result = {"format": fmt, "packageParts": len(names),
+                  "chartParts": sorted(name for name in names if re.fullmatch(r"(xl|ppt)/charts/[^/]+\.xml", name))}
         if fmt == "xlsx" and action == "structure":
             return {**result, "sheets": workbook_sheets(package)}
         if fmt == "docx" and action in {"structure", "range"}:
@@ -753,7 +1160,9 @@ def process_document(request, source, output):
                 raise ValueError("Unknown slide or SmartArt part")
             root = parse_xml(package.read(part))
             if part in diagrams:
-                return {**result, "part": part,
+                layout = next((node.get("loTypeId") for node in root.iter(tag(DIAGRAM, "prSet"))
+                               if node.get("loTypeId")), None)
+                return {**result, "part": part, "layout": layout,
                         "nodes": [{"id": node.get("modelId"), "type": node.get("type"), "text": text_content(node, DRAWING)}
                                   for node in root.iter(tag(DIAGRAM, "pt"))][:1000],
                         "connections": [dict(node.attrib) for node in root.iter(tag(DIAGRAM, "cxn"))][:1000]}

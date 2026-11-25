@@ -256,7 +256,7 @@ export class BuiltinArtifactMcpServer {
       assertArtifact(artifactId);
       return this.artifacts.getCapabilities(userId, artifactId);
     });
-    tool('artifact_create', 'Create an artifact in the current chat.', {
+    tool('artifact_create', 'Create an artifact in the current chat. PDF creation can merge PDFs listed in createParams.sourceArtifactIds.', {
       relPath: z.string().min(1).max(1024),
       content: z.string().optional(),
       createParams: object.optional(),
@@ -270,7 +270,7 @@ export class BuiltinArtifactMcpServer {
       assertArtifact(artifactId);
       return this.artifacts.getStructure(userId, artifactId);
     });
-    tool('artifact_read_range', 'Read a range of an artifact.', { ...artifactId, range: object }, ({ artifactId, range }) => {
+    tool('artifact_read_range', 'Read a range of an artifact. PDF uses pageIndex. XLSX uses sheetId and rangeA1 and can request evaluate.', { ...artifactId, range: object }, ({ artifactId, range }) => {
       assertArtifact(artifactId);
       return this.artifacts.readRange(userId, artifactId, range);
     });

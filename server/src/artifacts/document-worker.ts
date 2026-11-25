@@ -48,28 +48,36 @@ export class DocumentWorker {
     format: DocumentFormat | 'html' | 'mermaid' | 'markdown' | 'svg',
     filename: string,
     document: Buffer | undefined,
-    request: WorkerAction
+    request: WorkerAction,
+    mergeSources: readonly Buffer[] = []
   ): Promise<Buffer> {
     const profile = this.governor.getRuntimeProfile();
     const web = isWebRenderFormat(format);
     if (profile === 'base_chatui' || (web && profile !== 'full_runtime')) {
       throw unsupportedOperationError(request.action, 'disabled_by_resource_tier', 'Document runtime is unavailable.');
     }
-    if (document && document.length > DOCUMENT_WORKER_MAX_INPUT_BYTES) {
+    if ((document?.length ?? 0) + mergeSources.reduce((total, bytes) => total + bytes.length, 0) > DOCUMENT_WORKER_MAX_INPUT_BYTES) {
       throw new ArtifactError('DOC_WORKER_INPUT_TOO_LARGE', 'Document input exceeds the worker size limit.', 413);
     }
     const sandboxed = this.sandbox.getIsolationStatus() === 'bwrap';
     const runtimeDir = sandboxed ? '/opt/agy-doc-runtime' : this.config.docRuntimeDir;
     const workerScript = web ? webWorkerScript : docWorkerScript;
     const scriptName = path.basename(workerScript);
-    const officeConversion = (format === 'docx' || format === 'pptx' || format === 'xlsx') &&
-      (request.action === 'render' || request.action === 'export');
+    const officeConversion = ((format === 'docx' || format === 'pptx' || format === 'xlsx') &&
+      (request.action === 'render' || request.action === 'export')) ||
+      (format === 'xlsx' && request.action === 'range' && request.range.evaluate === true);
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-document-'));
     try {
       const input = path.join(directory, 'document');
       const manifest = path.join(directory, 'request.json');
       if (document) fs.writeFileSync(input, document, { mode: 0o600 });
-      fs.writeFileSync(manifest, JSON.stringify({ ...request, format, filename }), { mode: 0o600 });
+      const sourceInputs = mergeSources.map((bytes, index) => {
+        const sandboxName = `merge-${index}.pdf`;
+        const hostPath = path.join(directory, sandboxName);
+        fs.writeFileSync(hostPath, bytes, { mode: 0o600 });
+        return { hostPath, sandboxName };
+      });
+      fs.writeFileSync(manifest, JSON.stringify({ ...request, format, filename, mergeSourceCount: sourceInputs.length }), { mode: 0o600 });
       const result = await this.sandbox.run({
         kind: web ? 'chromium' : officeConversion ? 'libreoffice' : format === 'media' ? 'ffmpeg' : 'python',
         command: web ? (sandboxed ? '/usr/bin/node' : process.execPath) : path.join(runtimeDir, 'venv/bin/python3'),
@@ -80,6 +88,7 @@ export class DocumentWorker {
         } : undefined,
         inputFiles: [
           ...(document ? [{ hostPath: input, sandboxName: 'document' }] : []),
+          ...sourceInputs,
           { hostPath: manifest, sandboxName: 'request.json' },
           { hostPath: workerScript, sandboxName: scriptName },
         ],

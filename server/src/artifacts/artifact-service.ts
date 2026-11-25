@@ -1405,6 +1405,26 @@ export class ArtifactService {
   // Public Gateway Methods (ALL mutations & ingestions pass through here)
   // =========================================================================
 
+  private readPdfMergeSources(
+    userId: string, chatId: string | null | undefined, sourceIds: unknown
+  ): Buffer[] {
+    if (!chatId || !Array.isArray(sourceIds) || !sourceIds.length || sourceIds.length > 10 ||
+        sourceIds.some((id) => typeof id !== 'string' || !id.length)) {
+      throw new ArtifactError('INVALID_PDF_SOURCES', 'Specify one to ten PDF artifacts from this chat.', 422);
+    }
+    let remaining = DOCUMENT_WORKER_MAX_INPUT_BYTES;
+    return sourceIds.map((id) => {
+      const artifact = this.db.getArtifact(userId, id);
+      if (!artifact || artifact.chatId !== chatId || artifact.previewKind !== 'pdf') {
+        throw new ArtifactError('NOT_FOUND', 'A source PDF was not found in this chat.', 404);
+      }
+      const source = this.readActiveArtifactBytes(artifact, remaining);
+      if (!source) throw new ArtifactError('INVALID_PDF_SOURCE', 'A source PDF is missing or exceeds the merge limit.', 422);
+      remaining -= source.length;
+      return source;
+    });
+  }
+
   async createArtifact(params: {
     userId: string;
     scopeKind: ArtifactScopeKind;
@@ -1497,8 +1517,11 @@ export class ArtifactService {
             });
           }
 
+          const mergeSources = !contentBuf && workerCreateFormat === 'pdf' && createParams.sourceArtifactIds !== undefined
+            ? this.readPdfMergeSources(params.userId, params.scopeKind === 'chat' ? params.chatId : null, createParams.sourceArtifactIds)
+            : [];
           const buffer = workerCreateFormat && !contentBuf
-            ? await this.documentWorker.run(workerCreateFormat, filename, undefined, { action: 'create', params: createParams })
+            ? await this.documentWorker.run(workerCreateFormat, filename, undefined, { action: 'create', params: createParams }, mergeSources)
             : contentBuf!;
           const artifactId = crypto.randomUUID();
           return this.commitFileMutation({

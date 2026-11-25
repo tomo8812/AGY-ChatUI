@@ -24,12 +24,14 @@ import { MarkdownAdapter } from './markdown-adapter.js';
 import { MermaidAdapter } from './mermaid-adapter.js';
 import { SvgAdapter } from './svg-adapter.js';
 
+const CHART_EDITS = ['chart.update_title_and_legend', 'chart.update_series_data', 'chart.update_series_style', 'chart.add_or_remove_series'];
+
 export const DOCUMENT_ACTIONS = {
   pptx: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:pdf',
-    'pptx.set_shape_text', 'pptx.move_shape', 'pptx.smartart.get_structure'],
+    'pptx.set_shape_text', 'pptx.move_shape', 'pptx.smartart.get_structure', 'pptx.smartart.update_node_text', ...CHART_EDITS],
   docx: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:pdf',
     'docx.set_paragraph_text', 'docx.set_page_size'],
-  xlsx: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:pdf', 'xlsx.set_cell', 'xlsx.set_formula'],
+  xlsx: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:pdf', 'xlsx.set_cell', 'xlsx.set_formula', ...CHART_EDITS],
   pdf: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:png', 'export:txt',
     'pdf.rotate_page', 'pdf.reorder_pages', 'pdf.remove_page', 'pdf.add_note', 'pdf.add_overlay'],
   image: ['create', 'structure', 'verify', 'render_png', 'export:png', 'export:jpeg', 'export:webp',
@@ -63,6 +65,10 @@ class DocumentFormatAdapter implements FormatAdapter {
         } : {}),
       })),
     ];
+    if (this.format === 'pptx') operations.push({
+      operation: 'pptx.smartart.add_or_remove_node', availability: 'unsupported_by_format', scope: 'mcp_only',
+      notes: 'ノード追加・削除に必要な図形配置の再計算に対応していません。',
+    });
     if (this.format === 'pdf') operations.push({
       operation: 'edit_body_reflow', availability: 'unsupported_by_format', scope: 'mcp_only',
       notes: 'PDF の既存本文は変更できません。注釈を追加できます。',

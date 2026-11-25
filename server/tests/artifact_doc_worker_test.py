@@ -18,8 +18,12 @@ import zipfile
 from docx import Document
 from lxml import etree as XML
 from openpyxl import Workbook, load_workbook
+from openpyxl.chart import BarChart, Reference
 from PIL import Image
 from pptx import Presentation
+from pptx.chart.data import CategoryChartData
+from pptx.enum.chart import XL_CHART_TYPE
+from pptx.util import Inches
 from pypdf import PdfReader
 
 WORKER = Path(__file__).resolve().parents[1] / "scripts/artifact_doc_worker.py"
@@ -119,6 +123,83 @@ class DocumentWorkerTest(unittest.TestCase):
         self.assertEqual(reopened.slides[0].shapes[1].shape_id, title_id)
         self.assertEqual(reopened.slides[0].shapes[1].text, "After")
 
+    @unittest.skipUnless(os.environ.get("AGY_TEST_SMARTART_FILE"), "External SmartArt fixture not supplied")
+    def test_real_smartart_updates_data_and_cached_drawing(self):
+        # Apache POI test-data/slideshow/smartart-simple.pptx.
+        shutil.copyfile(os.environ["AGY_TEST_SMARTART_FILE"], self.source)
+        result = self.run_worker("pptx", "edit", operations=[{
+            "op": "pptx.smartart.update_node_text",
+            "slidePart": "ppt/slides/slide1.xml",
+            "dataPart": "ppt/diagrams/data1.xml",
+            "nodeId": "{63986E3B-5608-7F48-A1F2-C2D1F88EED58}",
+            "text": "Updated SmartArt Label",
+        }])
+        with zipfile.ZipFile(io.BytesIO(result)) as package:
+            for part in ("ppt/diagrams/data1.xml", "ppt/diagrams/drawing1.xml"):
+                self.assertIn(b"Updated SmartArt Label", package.read(part))
+        self.assertTrue(Presentation(io.BytesIO(result)).slides)
+
+    @unittest.skipUnless(shutil.which("libreoffice"), "LibreOffice runtime not installed")
+    def test_calc_evaluates_only_a_copy(self):
+        book = Workbook()
+        book.active["A1"] = 4
+        book.active["A2"] = "=SUM(A1,3)"
+        book.save(self.source)
+        original = self.source.read_bytes()
+        result = json.loads(self.run_worker("xlsx", "range", range={"sheetId": "1", "rangeA1": "A2", "evaluate": True}))
+        self.assertEqual(result["cells"][0]["formulaStatus"], "evaluated_lo")
+        self.assertEqual(float(result["cells"][0]["value"]), 7.0)
+        self.assertEqual(self.source.read_bytes(), original)
+
+    def test_xlsx_chart_updates_match_sheet_cells(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["Category", "Series", "Second"])
+        for category, value in (("A", 2), ("B", 5), ("C", 8)):
+            sheet.append([category, value, value])
+        chart = BarChart()
+        chart.add_data(Reference(sheet, min_col=2, min_row=1, max_row=4), titles_from_data=True)
+        chart.set_categories(Reference(sheet, min_col=1, min_row=2, max_row=4))
+        sheet.add_chart(chart, "D2")
+        workbook.save(self.source)
+        chart_part = "xl/charts/chart1.xml"
+        result = self.run_worker("xlsx", "edit", operations=[
+            {"op": "chart.update_title_and_legend", "chartPart": chart_part, "title": "Updated", "legendPosition": "b"},
+            {"op": "chart.update_series_data", "chartPart": chart_part, "seriesIndex": 0, "values": [3, 6, 9]},
+            {"op": "chart.update_series_style", "chartPart": chart_part, "seriesIndex": 0, "color": "#336699"},
+            {"op": "chart.add_or_remove_series", "chartPart": chart_part, "seriesIndex": 0, "mode": "add",
+             "rangeFormula": "'Sheet'!$C$2:$C$4", "name": "Second", "values": [6, 12, 18]},
+        ])
+        reopened = load_workbook(io.BytesIO(result))
+        self.assertEqual([reopened.active[f"B{row}"].value for row in range(2, 5)], [3, 6, 9])
+        with zipfile.ZipFile(io.BytesIO(result)) as package:
+            xml = package.read(chart_part)
+            self.assertIn(b"Updated", xml)
+            self.assertIn(b"336699", xml)
+            parsed = XML.fromstring(xml)
+            self.assertEqual(parsed.xpath('//*[local-name()="numCache"]//*[local-name()="v"]/text()'),
+                             ["3", "6", "9", "6", "12", "18"])
+        self.assertEqual([reopened.active[f"C{row}"].value for row in range(2, 5)], [6, 12, 18])
+
+    def test_pptx_chart_updates_match_embedded_workbook(self):
+        presentation = Presentation()
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        data = CategoryChartData()
+        data.categories = ["A", "B", "C"]
+        data.add_series("Series", (2, 4, 6))
+        slide.shapes.add_chart(XL_CHART_TYPE.COLUMN_CLUSTERED, Inches(1), Inches(1), Inches(5), Inches(3), data)
+        presentation.save(self.source)
+        chart_part = "ppt/charts/chart1.xml"
+        result = self.run_worker("pptx", "edit", operations=[
+            {"op": "chart.update_series_data", "chartPart": chart_part, "seriesIndex": 0, "values": [3, 5, 7]},
+        ])
+        chart = Presentation(io.BytesIO(result)).slides[0].shapes[0].chart
+        self.assertEqual(list(chart.series[0].values), [3, 5, 7])
+        with zipfile.ZipFile(io.BytesIO(result)) as package:
+            workbook_part = next(name for name in package.namelist() if name.endswith(".xlsx"))
+            book = load_workbook(io.BytesIO(package.read(workbook_part)))
+            self.assertEqual([book.active[f"B{row}"].value for row in range(2, 5)], [3, 5, 7])
+
     def test_pdf_annotation_and_rotation(self):
         self.source.write_bytes(self.run_worker("pdf", "create", params={"pages": ["First", "Second"]}))
         result = self.run_worker("pdf", "edit", operations=[
@@ -135,6 +216,17 @@ class DocumentWorkerTest(unittest.TestCase):
             self.source.write_bytes(result)
             with Image.open(io.BytesIO(self.run_worker("pdf", "render", pageIndex=0))) as page:
                 self.assertEqual(page.format, "PNG")
+
+    def test_pdf_merges_source_pages_without_rewriting_sources(self):
+        first = self.run_worker("pdf", "create", params={"pages": ["One"]})
+        second = self.run_worker("pdf", "create", params={"pages": ["Two", "Three"]})
+        (self.inputs / "merge-0.pdf").write_bytes(first)
+        (self.inputs / "merge-1.pdf").write_bytes(second)
+        merged = self.run_worker("pdf", "create", params={}, mergeSourceCount=2)
+        pages = PdfReader(io.BytesIO(merged)).pages
+        self.assertEqual([page.extract_text().strip() for page in pages], ["One", "Two", "Three"])
+        self.assertEqual((self.inputs / "merge-0.pdf").read_bytes(), first)
+        self.assertEqual((self.inputs / "merge-1.pdf").read_bytes(), second)
 
     def test_image_crop_and_convert(self):
         Image.new("RGB", (12, 6), "red").save(self.source, format="PNG")

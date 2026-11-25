@@ -21,6 +21,26 @@ it('uses the native ACP HTTP transport and attaches only a completed rich_create
   }
 });
 
+it('does not promote a provisional binding when the turn finishes without a tool receipt', async () => {
+  const srv = await createTestServer({ INSTALL_DOC_RUNTIME: '0' });
+  try {
+    const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'unattached', 'user:unattached');
+    const { data: { chat } } = await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Provisional block' });
+    await client.connectWs({ clientId: 'unattached-mcp-test' });
+    const response = await client.request('POST', `/api/chats/${chat.id}/messages`, { text: '[MCP_RICH_UNATTACHED]' });
+    expect(response.status).toBe(202);
+    await client.waitForFrame((frame) => frame.kind === 'event' && frame.event?.type === 'run.finished', 8000, false);
+    const blocks = srv.ctx.richContentService.listBlocksForChat(userId, chat.id);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].bindingState).toBe('tentative_sole_turn');
+    expect(blocks[0].confirmedMessageId).toBeNull();
+    const messages = srv.ctx.db.listMessages(userId, chat.id);
+    expect(messages.find((message) => message.role === 'assistant')?.richBlockIds).toEqual([]);
+  } finally {
+    await srv.cleanup();
+  }
+});
+
 it('enforces loopback headers, token revocation and boundaries over HTTP', async () => {
   const srv = await createTestServer({ INSTALL_DOC_RUNTIME: '0' });
   try {
@@ -53,6 +73,20 @@ it('enforces loopback headers, token revocation and boundaries over HTTP', async
       expect((await mcp.listTools()).tools.some(({ name }) => name === 'artifact_list')).toBe(false);
       const blocked = await mcp.callTool({ name: 'artifact_list', arguments: {} });
       expect(blocked.isError).toBe(true);
+      try {
+        srv.ctx.artifactService.commitFaultHook = (stage) => {
+          if (stage === 'after_T2') {
+            srv.ctx.db.setBuiltinMcpSettings(`chat:${chat.id}`, { enabled: true, disabledTools: ['artifact_create'] });
+          }
+        };
+        const write = await mcp.callTool({ name: 'artifact_create', arguments: {
+          relPath: 'denied.md', content: 'Rejected before placement', idempotencyKey: 'policy-change',
+        } });
+        expect(write.isError).toBe(true);
+        expect(srv.ctx.db.findArtifactByRelPath(userId, chat.id, 'denied.md')).toBeNull();
+      } finally {
+        srv.ctx.artifactService.commitFaultHook = undefined;
+      }
       binding!.revoke();
       expect((await fetch(url, { method: 'POST', headers: auth })).status).toBe(401);
     } finally {

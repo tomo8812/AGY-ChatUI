@@ -523,7 +523,7 @@ function runAcpServer(): void {
         return { stopReason: 'cancelled' as const };
       }
 
-      if (promptText.includes('[MCP_RICH_CREATE]')) {
+      if (promptText.includes('[MCP_RICH_CREATE]') || promptText.includes('[MCP_RICH_UNATTACHED]')) {
         const servers = state.mcpServers as Array<{
           name?: string; url?: string; headers?: Array<{ name: string; value: string }>;
         }>;
@@ -547,10 +547,12 @@ function runAcpServer(): void {
             document: { schemaVersion: 1, root: { type: 'markdown', id: 'sample', content: 'MCP fixture' } },
           } });
           if (result.isError) throw new Error(JSON.stringify(result.content));
-          await sendUpdate({
-            sessionId: state.id,
-            update: { sessionUpdate: 'tool_call_update', toolCallId, name, status: 'completed', rawOutput: result },
-          });
+          if (!promptText.includes('[MCP_RICH_UNATTACHED]')) {
+            await sendUpdate({
+              sessionId: state.id,
+              update: { sessionUpdate: 'tool_call_update', toolCallId, name, status: 'completed', rawOutput: result },
+            });
+          }
         } finally {
           await mcp.close();
         }
