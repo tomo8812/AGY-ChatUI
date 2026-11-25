@@ -66,7 +66,7 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
         const file=e.target.files?.[0],index=block?.blockIndex,revision=artifact.revision;
         e.target.value='';
         if(!file||index===undefined||revision===undefined||!can('docx.add_image'))return;
-        if(file.size>2*1024*1024||!['image/png','image/jpeg'].includes(file.type)){setImageError('PNG/JPEG（2 MB以下）を選択してください。');return}
+        if(file.size>6_000_000||!['image/png','image/jpeg'].includes(file.type)){setImageError('PNG/JPEG（6 MB以下）を選択してください。');return}
         const reader=new FileReader();
         reader.onload=()=>{
           if(latest.current.id!==artifact.id||latest.current.revision!==revision||typeof reader.result!=='string')return;

@@ -603,7 +603,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const session = requireAuth(req, reply, db);
     if (!session) return;
     const parsed = z.object({
-      expectedRevision:z.number().int().min(1), pageIndex:z.number().int().min(0).max(500),
+      expectedRevision:z.number().int().min(1), pageIndex:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
       shapeId:z.number().int().positive().max(2147483647),
       text:z.string().max(20000).optional(),
       boundsPt:z.tuple([z.number().finite().min(-14400).max(14400),z.number().finite().min(-14400).max(14400),z.number().finite().min(1).max(14400),z.number().finite().min(1).max(14400)]).optional(),
@@ -624,16 +624,16 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
   const draftSlidePartSchema=z.string().regex(/^ppt\/slides\/[^/]+\.xml$/).max(200);
   const draftSlideOperation=z.discriminatedUnion('op',[
     z.object({op:z.literal('pptx.add_shape'),slidePart:draftSlidePartSchema,kind:z.enum(['rectangle','ellipse','textbox']),boundsPt:draftBoundsSchema,text:z.string().max(20000)}).strict(),
-    z.object({op:z.literal('pptx.add_image'),slidePart:draftSlidePartSchema,boundsPt:draftBoundsSchema,imageBase64:z.string().min(1).max(2800000)}).strict(),
-    z.object({op:z.literal('pptx.add_table'),slidePart:draftSlidePartSchema,boundsPt:draftBoundsSchema,rows:z.array(z.array(z.string().max(2000)).min(1).max(10)).min(1).max(20)}).strict(),
+    z.object({op:z.literal('pptx.add_image'),slidePart:draftSlidePartSchema,boundsPt:draftBoundsSchema,imageBase64:z.string().min(1).max(8_000_000)}).strict(),
+    z.object({op:z.literal('pptx.add_table'),slidePart:draftSlidePartSchema,boundsPt:draftBoundsSchema,rows:z.array(z.array(z.string().max(20_000)).min(1).max(30)).min(1).max(100)}).strict(),
     z.object({op:z.literal('pptx.remove_shape'),slidePart:draftSlidePartSchema,shapeId:z.number().int().positive().max(2147483647)}).strict(),
-    z.object({op:z.literal('pptx.add_slide'),index:z.number().int().min(0).max(501),layoutPart:z.string().regex(/^ppt\/slideLayouts\/slideLayout[0-9]+\.xml$/)}).strict(),
-    z.object({op:z.literal('pptx.remove_slide'),index:z.number().int().min(0).max(500)}).strict(),
-    z.object({op:z.literal('pptx.reorder_slide'),index:z.number().int().min(0).max(500),toIndex:z.number().int().min(0).max(500)}).strict(),
+    z.object({op:z.literal('pptx.add_slide'),index:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),layoutPart:z.string().regex(/^ppt\/slideLayouts\/slideLayout[0-9]+\.xml$/)}).strict(),
+    z.object({op:z.literal('pptx.remove_slide'),index:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)}).strict(),
+    z.object({op:z.literal('pptx.reorder_slide'),index:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),toIndex:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)}).strict(),
   ]);
   app.post('/api/files/:artifactId/render-draft-slide',async(req,reply)=>{
     const session=requireAuth(req,reply,db);if(!session)return;
-    const parsed=z.object({expectedRevision:z.number().int().positive(),pageIndex:z.number().int().min(0).max(500),operation:draftSlideOperation}).strict().safeParse(req.body);
+    const parsed=z.object({expectedRevision:z.number().int().positive(),pageIndex:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),operation:draftSlideOperation}).strict().safeParse(req.body);
     if(!parsed.success)return reply.code(400).send({error:'INVALID_INPUT'});
     const {artifactId}=req.params as {artifactId:string};
     try{

@@ -177,6 +177,12 @@ for(const vp of targets){
               expect(invalid.status).toBe(400);
               const stale=await client.request('POST','/api/files/'+artifact.id+'/render-draft-slide',{expectedRevision:999,pageIndex:0,operation:{op:'pptx.add_shape',slidePart:'ppt/slides/slide1.xml',kind:'rectangle',text:'Never saved',boundsPt:[10,10,100,50]}});
               expect(stale.status).toBe(409);
+              // A large slide index is a valid request shape: revision conflict
+              // is checked before resolving slide identity, not an arbitrary UI cap.
+              const highIndex=await client.request('POST','/api/files/'+artifact.id+'/render-draft-slide',{expectedRevision:999,pageIndex:501,operation:{op:'pptx.reorder_slide',index:501,toIndex:502}});
+              expect(highIndex.status).toBe(409);
+              const largerTable=await client.request('POST','/api/files/'+artifact.id+'/render-draft-slide',{expectedRevision:999,pageIndex:0,operation:{op:'pptx.add_table',slidePart:'ppt/slides/slide1.xml',boundsPt:[10,10,100,50],rows:Array.from({length:21},()=>Array(11).fill(''))}});
+              expect(largerTable.status).toBe(409);
               expect(srv.ctx.db.getArtifact(userId,artifact.id)?.revision).toBe(1);
               const before=await svc.renderPng(userId,artifact.id,{pageIndex:0});
               record.beforeVisual=await capturePptx(page,info,before.png,'pptx-before');
@@ -270,7 +276,8 @@ for(const vp of targets){
             const first=items.filter({hasText:'Change this selected target'});
             await first.getByRole('button',{name:'指示を修正'}).click();
             await first.getByRole('textbox',{name:'依頼の修正'}).fill('Revised cell instruction');
-            await first.getByRole('button',{name:'修正を保存'}).click();
+            // The instruction is now an editable value, not stable DOM text.
+            await items.filter({has:page.getByRole('textbox',{name:'依頼の修正'})}).getByRole('button',{name:'修正を保存'}).click();
             await expect(items.filter({hasText:'Revised cell instruction'})).toBeVisible();
             await items.filter({hasText:'Change column label'}).getByRole('button',{name:'削除',exact:true}).click();
             await expect(items).toHaveCount(1);

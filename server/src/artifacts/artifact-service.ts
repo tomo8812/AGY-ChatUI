@@ -4611,7 +4611,7 @@ export class ArtifactService {
       throw unsupportedOperationError('render_png','unsupported_by_format','Editable PPTX required.');
     }
     if(revision.revision!==draft.expectedRevision)throw new ArtifactError('ARTIFACT_CONFLICT','ファイルが更新されました。',409);
-    if(!Number.isSafeInteger(draft.pageIndex)||draft.pageIndex<0||draft.pageIndex>500)throw new ArtifactError('INVALID_INPUT','Invalid slide index.',400);
+    if(!Number.isSafeInteger(draft.pageIndex)||draft.pageIndex<0)throw new ArtifactError('INVALID_INPUT','Invalid slide index.',400);
     const structure=JSON.parse((await this.documentWorker.run('pptx',artifact.filename,bytes,{action:'structure'})).toString('utf8')) as {slides?:Array<{part:string}>;layouts?:Array<{part:string}>};
     const slides=structure.slides??[],slidePart=slides[draft.pageIndex]?.part;
     if(!slidePart)throw new ArtifactError('INVALID_INPUT','Selected slide is unavailable.',400);
