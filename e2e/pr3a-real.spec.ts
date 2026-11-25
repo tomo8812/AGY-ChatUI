@@ -204,6 +204,19 @@ for(const vp of targets){
               await expect(mixed.locator('strong')).toHaveText('Keep ');
               await expect(mixed.locator('em')).toHaveText('formatting');
               await expect(page.getByText('書式・埋め込み要素を保持')).toBeVisible();
+              if(vp.width===1280||vp.width===375){
+                const addParagraph=page.getByRole('button',{name:'段落を追加',exact:true}),addTable=page.getByRole('button',{name:'表を追加',exact:true});
+                await openCommand(page,addParagraph);await addParagraph.click();
+                await page.getByRole('textbox',{name:'追加段落',exact:true}).fill('First appended');
+                await openCommand(page,addTable);await addTable.click();
+                await page.getByRole('button',{name:'行を追加',exact:true}).click();
+                await page.getByRole('button',{name:'列を追加',exact:true}).click();
+                await page.getByRole('textbox',{name:'追加表 2 3行 3列',exact:true}).fill('Third row and column');
+                await openCommand(page,addParagraph);await addParagraph.click();
+                await page.getByRole('textbox',{name:'追加段落 3',exact:true}).fill('Last appended');
+                // Revising the first draft must not reorder it after later insertions.
+                await page.getByRole('textbox',{name:'追加段落',exact:true}).fill('First appended revised');
+              }
             }else{
               const invalid=await client.request('POST','/api/files/'+artifact.id+'/render-draft-slide',{expectedRevision:1,pageIndex:0,operation:{op:'replace_source',content:'invalid'}});
               expect(invalid.status).toBe(400);
@@ -258,6 +271,10 @@ for(const vp of targets){
             }else if(item.kind==='docx'){
               const result=await svc.readRange(userId,artifact.id,{start:0,count:3});
               expect(result).toMatchObject({blocks:[{text:item.updated,marks:{bold:true}},{text:'Keep formatting',uiRuns:[{text:'Keep ',bold:true,underline:true},{text:'formatting',italic:true,underline:true}]},{text:'Keep table'}]});
+              if(vp.width===1280||vp.width===375){
+                const added=await svc.readRange(userId,artifact.id,{start:0,count:40}) as {blocks:Array<{type:string;text:string}>};
+                expect(added.blocks.slice(-3)).toMatchObject([{type:'p',text:'First appended revised'},{type:'tbl',text:expect.stringContaining('Third row and column')},{type:'p',text:'Last appended'}]);
+              }
             }else{
               const r=await svc.readRange(userId,artifact.id,{part:'ppt/slides/slide1.xml'});
               expect(r).toMatchObject({shapes:[{text:item.updated},{name:'Overlap'}]});
