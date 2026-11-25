@@ -1580,54 +1580,68 @@ def _verify_pdf(source, request):
         if len(issues) < 200:
             issues.append(entry)
 
-    qpdf_enc_info = ""
-    if shutil.which("qpdf"):
-        enc_proc = subprocess.run(["qpdf", "--show-encryption", str(source)], capture_output=True, text=True)
-        qpdf_enc_info = (enc_proc.stdout or enc_proc.stderr or "").strip()
+    qpdf_target = source
+    qpdf_staged = None
+    if shutil.which("qpdf") and source.suffix.lower() != ".pdf":
+        qpdf_staged = Path.cwd() / "verify-input.pdf"
+        shutil.copyfile(source, qpdf_staged)
+        qpdf_target = qpdf_staged
 
     try:
-        reader = PdfReader(source)
-    except PdfReadError as error:
-        add_issue("error", "PDF_MALFORMED", f"Malformed PDF: {error}")
-        add_check("pdf_structure", "failed", f"pypdf failed to parse PDF: {error}")
-        return {"ok": False, "coverage": "complete", "checks": checks, "issues": issues, "metrics": {}}
+        qpdf_enc_info = ""
+        if shutil.which("qpdf"):
+            enc_proc = subprocess.run(["qpdf", "--show-encryption", str(qpdf_target)], capture_output=True, text=True)
+            qpdf_enc_info = (enc_proc.stdout or enc_proc.stderr or "").strip()
 
-    encrypted = bool(reader.is_encrypted)
-    unlocked_empty = False
-    if encrypted:
         try:
-            unlocked_empty = bool(reader.decrypt(""))
-        except Exception:
-            unlocked_empty = False
-        if not unlocked_empty:
-            add_issue("warning", "PDF_ENCRYPTED_USER_PASSWORD", "PDF requires a user password to decrypt content.")
-            add_check("pdf_encryption", "failed", "PDF is encrypted and requires a user password.")
-            add_check("pdf_structure", "unverified", "Encrypted PDF structure could not be fully read without password.")
-            add_check("pdf_text_extraction", "unverified", "Text extraction blocked by user password encryption.")
-            add_check("pdf_diff", "unverified", "Differential verification blocked by user password encryption.")
-            return {
-                "ok": False,
-                "coverage": "partial",
-                "checks": checks,
-                "issues": issues,
-                "metrics": {"encrypted": True, "userPasswordRequired": True, "encryptionDetail": qpdf_enc_info[:400]},
-            }
-        add_issue("warning", "PDF_ENCRYPTED_OWNER_ONLY", "PDF is encrypted with owner restrictions (empty user password).")
-        add_check("pdf_encryption", "passed", f"Owner-encrypted PDF decrypted with empty user password. {qpdf_enc_info[:200]}".strip())
-    else:
-        add_check("pdf_encryption", "passed", "PDF is unencrypted.")
+            reader = PdfReader(source)
+        except PdfReadError as error:
+            add_issue("error", "PDF_MALFORMED", f"Malformed PDF: {error}")
+            add_check("pdf_structure", "failed", f"pypdf failed to parse PDF: {error}")
+            return {"ok": False, "coverage": "complete", "checks": checks, "issues": issues, "metrics": {}}
 
-    count = len(reader.pages)
-    qpdf_errors = 0
-    qpdf_warnings = 0
-    if shutil.which("qpdf"):
-        chk = subprocess.run(["qpdf", "--check", str(source)], capture_output=True, text=True)
-        if chk.returncode == 2:
-            qpdf_errors += 1
-            add_issue("error", "PDF_QPDF_STRUCTURE_ERROR", (chk.stderr or chk.stdout or "qpdf check failed")[:400])
-        elif chk.returncode == 3:
-            qpdf_warnings += 1
-            add_issue("warning", "PDF_QPDF_STRUCTURE_WARNING", (chk.stderr or chk.stdout or "qpdf check warning")[:400])
+        encrypted = bool(reader.is_encrypted)
+        unlocked_empty = False
+        if encrypted:
+            try:
+                unlocked_empty = bool(reader.decrypt(""))
+            except Exception:
+                unlocked_empty = False
+            if not unlocked_empty:
+                add_issue("warning", "PDF_ENCRYPTED_USER_PASSWORD", "PDF requires a user password to decrypt content.")
+                add_check("pdf_encryption", "failed", "PDF is encrypted and requires a user password.")
+                add_check("pdf_structure", "unverified", "Encrypted PDF structure could not be fully read without password.")
+                add_check("pdf_text_extraction", "unverified", "Text extraction blocked by user password encryption.")
+                add_check("pdf_diff", "unverified", "Differential verification blocked by user password encryption.")
+                return {
+                    "ok": False,
+                    "coverage": "partial",
+                    "checks": checks,
+                    "issues": issues,
+                    "metrics": {"encrypted": True, "userPasswordRequired": True, "encryptionDetail": qpdf_enc_info[:400]},
+                }
+            add_issue("warning", "PDF_ENCRYPTED_OWNER_ONLY", "PDF is encrypted with owner restrictions (empty user password).")
+            add_check("pdf_encryption", "passed", f"Owner-encrypted PDF decrypted with empty user password. {qpdf_enc_info[:200]}".strip())
+        else:
+            add_check("pdf_encryption", "passed", "PDF is unencrypted.")
+
+        count = len(reader.pages)
+        qpdf_errors = 0
+        qpdf_warnings = 0
+        if shutil.which("qpdf"):
+            chk = subprocess.run(["qpdf", "--check", str(qpdf_target)], capture_output=True, text=True)
+            if chk.returncode == 2:
+                qpdf_errors += 1
+                add_issue("error", "PDF_QPDF_STRUCTURE_ERROR", (chk.stderr or chk.stdout or "qpdf check failed")[:400])
+            elif chk.returncode == 3:
+                qpdf_warnings += 1
+                add_issue("warning", "PDF_QPDF_STRUCTURE_WARNING", (chk.stderr or chk.stdout or "qpdf check warning")[:400])
+    finally:
+        if qpdf_staged is not None:
+            try:
+                qpdf_staged.unlink(missing_ok=True)
+            except OSError:
+                pass
     bad_geom = 0
     for idx, page in enumerate(reader.pages):
         w, h = float(page.mediabox.width), float(page.mediabox.height)
