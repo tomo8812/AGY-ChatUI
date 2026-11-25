@@ -94,7 +94,15 @@ for(const vp of targets){
           const record:Record<string,unknown>={kind:item.kind,artifactId:artifact.id,beforeRevision:artifact.revision};
           if(item.kind==='pdf'){
             await expect(page.locator('canvas').first()).toBeVisible({timeout:30000});
-            await page.getByRole('button',{name:/次/}).click();
+            await page.getByRole('button',{name:'ナビゲーション',exact:true}).click();
+            await page.getByRole('button',{name:'検索',exact:true}).click();
+            await page.getByRole('searchbox',{name:'PDF全文検索'}).fill('Wide second page');
+            await page.getByRole('button',{name:'検索実行'}).click();
+            await page.getByRole('button',{name:/ページ 2 Wide second page/}).click();
+            await expect(page.locator('.pdf-page-indicator')).toContainText('2 / 2');
+            await page.getByRole('button',{name:'本文',exact:true}).click();
+            await expect(page.getByRole('textbox',{name:'ページ本文'})).toHaveValue('Wide second page');
+            await page.locator('.pdf-navigation-panel').getByRole('button',{name:'閉じる',exact:true}).click();
             await expect(page.locator('.pdf-page-indicator')).toContainText('2 / 2');
             await page.getByRole('button',{name:'拡大',exact:true}).click();
             const scale=await page.locator('[data-viewer-zoom-surface]').getAttribute('data-zoom-scale');

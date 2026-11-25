@@ -3,6 +3,7 @@ import type { StructuredPatch } from 'diff';
 import DOMPurify from 'dompurify';
 import hljs from 'highlight.js';
 import type * as PdfJsTypes from 'pdfjs-dist';
+import {PdfNavigationPanel} from './shared-ui/document/PdfNavigationPanel';
 import React, { useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, api } from '../api/client';
 import { useUnifiedViewerZoom, type ZoomAnchorAdapter } from '../hooks/useUnifiedViewerZoom';
@@ -247,8 +248,10 @@ export const PdfCanvasViewer: React.FC<{
   url: string;
   /** Stable identity enables page/zoom/scroll restoration on a newer revision. */
   documentKey?: string;
-  onSelectPage?: (pageIndex: number, pageCount: number) => void;
-}> = React.memo(({ url, documentKey = url, onSelectPage }) => {
+  onSelectPage?: (pageIndex: number, pageCount: number, selectedText?: string) => void;
+  enhancedNavigation?: boolean;
+}> = React.memo(({ url, documentKey = url, onSelectPage, enhancedNavigation=false }) => {
+  const [navigation,setNavigation]=useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
   const pagesListRef = useRef<HTMLDivElement | null>(null);
@@ -1076,6 +1079,7 @@ export const PdfCanvasViewer: React.FC<{
           >
             次 <ChevronIcon size={14} dir="right" />
           </button>
+          {enhancedNavigation&&<button type="button" className="btn btn-secondary btn-xs" aria-expanded={navigation} onClick={()=>setNavigation(v=>!v)}>ナビゲーション</button>}
           {onSelectPage && <button type="button" className="btn btn-secondary btn-xs" disabled={!numPages}
             onClick={() => onSelectPage(pageNumRef.current - 1, numPages)}>ページを対象にする</button>}
         </div>
@@ -1109,6 +1113,7 @@ export const PdfCanvasViewer: React.FC<{
           </button>
         </div>
       </div>
+      {enhancedNavigation&&navigation&&pdfDoc&&<PdfNavigationPanel doc={pdfDoc} page={pageNum} onJump={scrollToPage} onClose={()=>setNavigation(false)} onSelectText={onSelectPage?text=>onSelectPage(pageNumRef.current-1,numPages,text):undefined}/>}
       {pageRenderErrorCount > 0 && (
         <div className="warn-banner pdf-render-error-banner" role="status">
           <span>一部ページの描画に失敗しました（他のページは閲覧を継続できます）。</span>
