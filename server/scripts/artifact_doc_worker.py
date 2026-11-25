@@ -1152,14 +1152,69 @@ def chart_cell_updates(package, formula, values):
             for row, value in enumerate(values, start=first_row)]
 
 
-def update_chart_values(package, fmt, chart_part, series, operation, replacements):
+def set_chart_cache(cache, values):
+    for entry in list(cache):
+        if entry.tag in (tag(CHART, "ptCount"), tag(CHART, "pt")):
+            cache.remove(entry)
+    ext = cache.find(tag(CHART, "extLst"))
+    end = cache.index(ext) if ext is not None else len(cache)
+    cache.insert(end, XML.Element(tag(CHART, "ptCount"), val=str(len(values))))
+    for index, value in enumerate(values):
+        point = XML.Element(tag(CHART, "pt"), idx=str(index))
+        XML.SubElement(point, tag(CHART, "v")).text = str(value)
+        cache.insert(end + index + 1, point)
+
+
+def update_chart_categories(series, all_series, categories):
+    path = "./" + tag(CHART, "cat") + "/*"
+    incoming = [node for node in series.findall(path) if node.tag in (tag(CHART, "strRef"), tag(CHART, "numRef"))]
+    if len(incoming) != 1:
+        raise ValueError("Expected worksheet-backed chart categories")
+    formula = incoming[0].findtext(tag(CHART, "f"))
+    for item in all_series:
+        for reference in item.findall(path):
+            if reference.tag not in (tag(CHART, "strRef"), tag(CHART, "numRef")) \
+                    or reference.findtext(tag(CHART, "f")) != formula:
+                continue
+            if reference.tag == tag(CHART, "numRef"):
+                text_ref = XML.Element(tag(CHART, "strRef"))
+                XML.SubElement(text_ref, tag(CHART, "f")).text = formula
+                reference.getparent().replace(reference, text_ref)
+                reference = text_ref
+            cache = reference.find(tag(CHART, "strCache"))
+            if cache is None:
+                cache = XML.SubElement(reference, tag(CHART, "strCache"))
+            set_chart_cache(cache, categories)
+    return formula
+
+
+def update_chart_values(package, fmt, chart_part, series, operation, replacements, all_series):
     formula, cache = chart_value_cache(series)
     values = operation["values"]
     if not isinstance(values, list) or not 1 <= len(values) <= 1000 or any(
             type(value) not in (float, int) or not math.isfinite(value) for value in values):
         raise ValueError("Chart values must be finite numbers")
+    ranges = [(formula, values)]
+    if "categories" in operation:
+        categories = operation["categories"]
+        if not isinstance(categories, list) or len(categories) != len(values) or any(
+                not isinstance(value, str) or len(value) > 2000 for value in categories):
+            raise ValueError("Chart categories must be text and match the series length")
+        category_formula = update_chart_categories(series, all_series, categories)
+        if category_formula == formula:
+            raise ValueError("Chart categories and values cannot share a worksheet range")
+        ranges.append((category_formula, categories))
+
+    def changes_for(workbook):
+        changes = [change for source_formula, cells in ranges
+                   for change in chart_cell_updates(workbook, source_formula, cells)]
+        addresses = {(change["sheetPart"], change["address"]) for change in changes}
+        if len(addresses) != len(changes):
+            raise ValueError("Chart category and value ranges overlap")
+        return changes
+
     if fmt == "xlsx":
-        for change in chart_cell_updates(package, formula, values):
+        for change in changes_for(package):
             update_workbook_cell(package, change, replacements)
     else:
         relations = package_relationships(package, chart_part)
@@ -1173,18 +1228,9 @@ def update_chart_values(package, fmt, chart_part, series, operation, replacement
         with zipfile.ZipFile(io.BytesIO(workbook)) as embedded:
             validate_package(embedded, "xlsx")
             output = io.BytesIO()
-            edit_workbook(embedded, chart_cell_updates(embedded, formula, values), output)
+            edit_workbook(embedded, changes_for(embedded), output)
             replacements[embed[0]] = output.getvalue()
-    for entry in list(cache):
-        if entry.tag in (tag(CHART, "ptCount"), tag(CHART, "pt")):
-            cache.remove(entry)
-    ext = cache.find(tag(CHART, "extLst"))
-    end = cache.index(ext) if ext is not None else len(cache)
-    cache.insert(end, XML.Element(tag(CHART, "ptCount"), val=str(len(values))))
-    for index, value in enumerate(values):
-        point = XML.Element(tag(CHART, "pt"), idx=str(index))
-        XML.SubElement(point, tag(CHART, "v")).text = str(value)
-        cache.insert(end + index + 1, point)
+    set_chart_cache(cache, values)
 
 
 def add_chart_series(package, fmt, chart_part, series, all_series, operation, replacements):
@@ -1213,7 +1259,7 @@ def add_chart_series(package, fmt, chart_part, series, all_series, operation, re
     if reference.findtext(tag(CHART, "f")) == operation["rangeFormula"]:
         raise ValueError("New series must use a distinct worksheet range")
     reference.find(tag(CHART, "f")).text = operation["rangeFormula"]
-    update_chart_values(package, fmt, chart_part, template, operation, replacements)
+    update_chart_values(package, fmt, chart_part, template, operation, replacements, [*all_series, template])
     parent = series.getparent()
     parent.insert(parent.index(siblings[-1]) + 1, template)
 
@@ -1248,7 +1294,7 @@ def edit_chart(package, fmt, operation, replacements):
             else:
                 raise ValueError("Unknown series operation")
         elif op == "chart.update_series_data":
-            update_chart_values(package, fmt, chart_part, series, operation, replacements)
+            update_chart_values(package, fmt, chart_part, series, operation, replacements, all_series)
             changes_cells = True
         elif op == "chart.update_series_style":
             rgb = operation["color"].removeprefix("#")
@@ -1421,6 +1467,39 @@ def edit_presentation(package, operations, output):
     write_package(package, replacements, output, "pptx")
 
 
+SPREADSHEET_DRAWING = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+
+
+def append_chart_to_worksheet_drawing(original, generated, worksheet_part, old_drawing, new_drawing, new_names):
+    old_rels = package_relationships(original, worksheet_part)
+    new_rels = package_relationships(generated, worksheet_part)
+    old_path = old_rels[old_drawing.attrib[tag(OFFICE_REL, "id")]][1]
+    new_path = new_rels[new_drawing.attrib[tag(OFFICE_REL, "id")]][1]
+    if old_path != new_path:
+        raise ValueError("Chart creation would move the original worksheet drawing")
+    old_part = parse_xml(original.read(old_path))
+    new_part = parse_xml(generated.read(new_path))
+    chart_rels = package_relationships(generated, new_path)
+    matches = []
+    for anchor in new_part:
+        for chart in anchor.iter(tag(CHART, "chart")):
+            relation_id = chart.attrib[tag(OFFICE_REL, "id")]
+            if chart_rels[relation_id][1] in new_names:
+                matches.append((anchor, chart))
+    if len(matches) != 1:
+        raise ValueError("Cannot isolate the new chart anchor")
+    anchor, chart = matches[0]
+    existing_ids = {node.get("id") for node in old_part.iter(tag(SPREADSHEET_DRAWING, "cNvPr"))}
+    properties = next(anchor.iter(tag(SPREADSHEET_DRAWING, "cNvPr")), None)
+    if properties is None:
+        raise ValueError("New chart anchor has no shape identifier")
+    if properties.get("id") in existing_ids:
+        available = next(str(number) for number in range(1, len(existing_ids) + 2) if str(number) not in existing_ids)
+        properties.set("id", available)
+    old_part.append(anchor)
+    return old_path, old_part, chart
+
+
 def create_chart_document(source, fmt, operation, destination):
     generated_source = io.BytesIO()
     if fmt == "xlsx":
@@ -1436,14 +1515,19 @@ def create_chart_document(source, fmt, operation, destination):
         if fmt == "xlsx":
             old_drawing = old_part.find(tag(SPREADSHEET, "drawing"))
             drawing = new_part.find(tag(SPREADSHEET, "drawing"))
-            if old_drawing is not None or drawing is None:
-                raise ValueError("Chart creation requires a worksheet without an existing drawing")
-            trailing = {"legacyDrawing", "legacyDrawingHF", "picture", "oleObjects", "controls",
-                        "webPublishItems", "tableParts", "extLst"}
-            offset = next((index for index, node in enumerate(old_part)
-                           if isinstance(node.tag, str) and XML.QName(node).localname in trailing), len(old_part))
-            old_part.insert(offset, drawing)
-            relation_id = drawing.attrib[tag(OFFICE_REL, "id")]
+            if drawing is None:
+                raise ValueError("Chart creation produced no worksheet drawing")
+            if old_drawing is not None:
+                part, old_part, attachment = append_chart_to_worksheet_drawing(
+                    original, generated, part, old_drawing, drawing, new_names
+                )
+            else:
+                trailing = {"legacyDrawing", "legacyDrawingHF", "picture", "oleObjects", "controls",
+                            "webPublishItems", "tableParts", "extLst"}
+                offset = next((index for index, node in enumerate(old_part)
+                               if isinstance(node.tag, str) and XML.QName(node).localname in trailing), len(old_part))
+                old_part.insert(offset, drawing)
+                attachment = drawing
         else:
             old_tree = old_part.find(".//" + tag(PRESENTATION, "spTree"))
             new_tree = new_part.find(".//" + tag(PRESENTATION, "spTree"))
@@ -1454,9 +1538,9 @@ def create_chart_document(source, fmt, operation, destination):
                 raise ValueError("Cannot isolate the new chart from the original slide")
             extension = old_tree.find(tag(PRESENTATION, "extLst"))
             old_tree.insert(old_tree.index(extension) if extension is not None else len(old_tree), added[0])
-            chart = added[0].find(".//" + tag(CHART, "chart"))
-            relation_id = chart.attrib[tag(OFFICE_REL, "id")]
+            attachment = added[0].find(".//" + tag(CHART, "chart"))
 
+        relation_id = attachment.attrib[tag(OFFICE_REL, "id")]
         name = PurePosixPath(part)
         relation_part = str(name.parent / "_rels" / (name.name + ".rels"))
         new_rels = parse_xml(generated.read(relation_part))
@@ -1469,8 +1553,11 @@ def create_chart_document(source, fmt, operation, destination):
         else:
             merged_rels = XML.Element(tag(RELATIONSHIPS, "Relationships"), nsmap={None: RELATIONSHIPS})
             additions.pop(relation_part, None)
-        if any(element.get("Id") == relation_id for element in merged_rels):
-            raise ValueError("The new chart relationship would replace an existing relationship")
+        used_ids = {element.get("Id") for element in merged_rels}
+        if relation_id in used_ids:
+            relation_id = next(f"rId{number}" for number in range(1, len(used_ids) + 2) if f"rId{number}" not in used_ids)
+            attachment.set(tag(OFFICE_REL, "id"), relation_id)
+            relation.set("Id", relation_id)
         merged_rels.append(relation)
 
         type_part = "[Content_Types].xml"

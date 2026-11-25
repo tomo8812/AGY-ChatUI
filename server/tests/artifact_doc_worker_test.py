@@ -243,6 +243,13 @@ class DocumentWorkerTest(unittest.TestCase):
             "anchor": "E4", "categoryColumn": 1,
         }])
         self.assertEqual(len(load_workbook(io.BytesIO(sheet_chart)).active._charts), 1)
+        self.source.write_bytes(sheet_chart)
+        second_chart = self.run_worker("xlsx", "edit", operations=[{
+            "op": "chart.create", "kind": "line", "sheetName": "Sheet", "dataRange": "C1:C3",
+            "anchor": "E20", "categoryColumn": 1,
+        }])
+        self.assertEqual(len(load_workbook(io.BytesIO(second_chart)).active._charts), 2)
+
         presentation = Presentation()
         presentation.slides.add_slide(presentation.slide_layouts[6])
         presentation.save(self.source)
@@ -298,14 +305,17 @@ class DocumentWorkerTest(unittest.TestCase):
         presentation.save(self.source)
         chart_part = "ppt/charts/chart1.xml"
         result = self.run_worker("pptx", "edit", operations=[
-            {"op": "chart.update_series_data", "chartPart": chart_part, "seriesIndex": 0, "values": [3, 5, 7]},
+            {"op": "chart.update_series_data", "chartPart": chart_part, "seriesIndex": 0,
+             "values": [3, 5, 7], "categories": ["North", "South", "West"]},
         ])
         chart = Presentation(io.BytesIO(result)).slides[0].shapes[0].chart
         self.assertEqual(list(chart.series[0].values), [3, 5, 7])
+        self.assertEqual([category.label for category in chart.plots[0].categories], ["North", "South", "West"])
         with zipfile.ZipFile(io.BytesIO(result)) as package:
             workbook_part = next(name for name in package.namelist() if name.endswith(".xlsx"))
             book = load_workbook(io.BytesIO(package.read(workbook_part)))
             self.assertEqual([book.active[f"B{row}"].value for row in range(2, 5)], [3, 5, 7])
+            self.assertEqual([book.active[f"A{row}"].value for row in range(2, 5)], ["North", "South", "West"])
 
     def test_pdf_annotation_and_rotation(self):
         self.source.write_bytes(self.run_worker("pdf", "create", params={"pages": ["First", "Second"]}))
