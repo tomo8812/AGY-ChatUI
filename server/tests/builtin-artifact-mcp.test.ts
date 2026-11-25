@@ -262,7 +262,7 @@ it('exports CSV to valid OOXML XLSX and renders real Markdown HTML in Base ChatU
       '',
       '### Skipped Level',
       '',
-      'See **bold**, `code`, [valid](#release-notes), [broken](#no-such-anchor), and [pct](#100%).',
+      'See **bold**, `code`, [valid](#release-notes), [broken](#no-such-anchor), [pct](#100%), and [docs](https://example.com/?a=1&b=2).',
       '',
       '| Key | Val |',
       '| --- | ---: |',
@@ -285,6 +285,8 @@ it('exports CSV to valid OOXML XLSX and renders real Markdown HTML in Base ChatU
     expect(html).toContain('<h1 id="release-notes">Release Notes</h1>');
     expect(html).toContain('<strong>bold</strong>');
     expect(html).toContain('<code>code</code>');
+    expect(html).toContain('<a href="https://example.com/?a=1&amp;b=2">docs</a>');
+    expect(html).not.toContain('&amp;amp;');
     expect(html).toContain('<table><thead><tr><th>Key</th><th style="text-align:right">Val</th></tr></thead>');
     expect(html).toContain('type="checkbox" disabled checked');
     expect(html).not.toContain('<pre># Release Notes');

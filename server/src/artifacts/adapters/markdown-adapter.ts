@@ -36,8 +36,17 @@ function escapeHtml(text: string): string {
     .replace(/"/g, '&quot;');
 }
 
+function unescapeBasicHtmlEntities(value: string): string {
+  return value
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
 function sanitizeHref(raw: string): string {
-  const trimmed = raw.trim();
+  const trimmed = unescapeBasicHtmlEntities(raw.trim()).trim();
   if (!trimmed) return '#';
   const lower = trimmed.toLowerCase();
   if (
