@@ -20,9 +20,16 @@ const SingleParagraph=Extension.create({
   addProseMirrorPlugins(){return [new Plugin({filterTransaction:tr=>{
     if(!tr.docChanged)return true;
     if(tr.doc.childCount!==1||tr.doc.firstChild?.type.name!=='paragraph')return false;
-    let length=0,segments=0;
-    tr.doc.descendants(n=>{if(n.isText||n.type.name==='hardBreak'){length+=n.isText?n.text?.length??0:1;segments++}});
-    return length<=20000&&segments<=400;
+    let length=0,segments=0,lastKey='',lastOrigin=0;
+    tr.doc.descendants(n=>{
+      if(!n.isText&&n.type.name!=='hardBreak')return;
+      length+=n.isText?n.text?.length??0:1;
+      const origin=Number(n.marks.find(m=>m.type.name==='wordOrigin')?.attrs.originIndex??lastOrigin);
+      const key=JSON.stringify([origin,...MARKS.map(name=>n.marks.some(m=>m.type.name===name))]);
+      if(key!==lastKey){segments++;lastKey=key}
+      lastOrigin=origin;
+    });
+    return length<=20000&&segments<=200;
   }})]},
 });
 function content(runs:WordRun[]):JSONContent {
