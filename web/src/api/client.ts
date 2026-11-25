@@ -52,7 +52,7 @@ export function getCsrfToken(): string {
   return '';
 }
 
-async function apiFetch<T>(
+export async function apiFetch<T>(
   url: string,
   options: {
     method?: string;

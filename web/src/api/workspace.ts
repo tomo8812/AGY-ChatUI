@@ -1,0 +1,37 @@
+import type { ArtifactRecord } from '../types';
+import { apiFetch, ApiError } from './client';
+
+export type WorkspaceFormat='pptx'|'pdf'|'docx'|'xlsx'|'csv'|'markdown'|'code'|'image'|'svg'|'html'|'diff'|'mermaid'|'media'|'binary';
+export interface WorkspaceOperationCapability {operation:string;availability:'supported'|'partial'|'disabled_by_resource_tier'|'unsupported_by_format';scope:'mcp_and_ui'|'mcp_only'|'ui_view_only';notes?:string;remediation?:string}
+export interface WorkspaceCapabilities {format:WorkspaceFormat;directEditUiSupported:boolean;targetPinSupported:boolean;operations:WorkspaceOperationCapability[]}
+export type EditOperation={op:string;[key:string]:unknown};
+export interface RevisionResponse {artifactId:string;revision:number;sha256:string}
+export interface WorkspaceTarget {selector:{kind:string;[key:string]:unknown};baseRevision:number;label:string;selectedContentSnapshot?:string;surroundingContext?:string;range?:Record<string,unknown>;contentCoords?:Record<string,unknown>}
+export interface EditRequestRecord {id:string;artifactId:string|null;instruction:string;status:string;selector:WorkspaceTarget['selector'];baseRevision:number;selectedContentSnapshot:string}
+const path=(id:string,suffix:string)=>'/api/files/'+encodeURIComponent(id)+'/'+suffix;
+export const workspaceApi={
+  capabilities:(id:string,signal?:AbortSignal)=>apiFetch<WorkspaceCapabilities>(path(id,'capabilities'),{signal}),
+  structure:<T extends object>(id:string,signal?:AbortSignal)=>apiFetch<T&RevisionResponse>(path(id,'structure'),{signal}),
+  range:<T extends object>(id:string,query:Record<string,string|number|boolean>,signal?:AbortSignal)=>apiFetch<T&RevisionResponse>(path(id,'range')+'?'+new URLSearchParams(Object.entries(query).map(([k,v])=>[k,String(v)])),{signal}),
+  async render(artifact:ArtifactRecord,query:Record<string,string|number>,signal?:AbortSignal):Promise<Blob>{
+    const res=await fetch(path(artifact.id,'render')+'?'+new URLSearchParams(Object.entries(query).map(([k,v])=>[k,String(v)])),{signal,credentials:'include'});
+    if(!res.ok)throw new ApiError(res.status,'RENDER_FAILED','描画できませんでした。');
+    if(Number(res.headers.get('X-Artifact-Revision'))!==artifact.revision||res.headers.get('X-Artifact-Sha256')!==artifact.sha256)throw new ApiError(409,'ARTIFACT_CHANGED','ファイルが更新されました。');
+    if(!res.headers.get('content-type')?.includes('image/png'))throw new Error('画像形式が無効です。');
+    return res.blob();
+  },
+  edit:(id:string,expectedRevision:number,operations:EditOperation[],idempotencyKey:string)=>apiFetch<{artifact:ArtifactRecord;noOp:boolean;summary:string}>(path(id,'edit'),{method:'POST',body:{expectedRevision,operations,idempotencyKey}}),
+  listRequests:(chatId:string,artifactId:string,signal?:AbortSignal)=>apiFetch<{requests:EditRequestRecord[]}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests?'+new URLSearchParams({artifactId}),{signal}),
+  createRequest:(chatId:string,artifactId:string,target:WorkspaceTarget,instruction:string)=>apiFetch<{request:EditRequestRecord}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests',{method:'POST',body:{
+    targetKind:'artifact',artifactId,baseRevision:target.baseRevision,selector:target.selector,range:target.range,contentCoords:target.contentCoords,
+    selectedContentSnapshot:target.selectedContentSnapshot,surroundingContext:target.surroundingContext,instruction,
+  }}),
+  updateRequest:(chatId:string,id:string,instruction:string)=>apiFetch<{request:EditRequestRecord}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests/'+encodeURIComponent(id),{method:'PATCH',body:{instruction}}),
+  deleteRequest:(chatId:string,id:string)=>apiFetch<{ok:boolean}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests/'+encodeURIComponent(id),{method:'DELETE'}),
+  verify:(id:string)=>apiFetch<{ok:boolean;revision?:number;checks?:Array<{id:string;status:string;evidence:string}>;issues:Array<{severity:string;message:string}>}>(path(id,'verify'),{method:'POST',body:{}}),
+};
+export function supportsOperation(cap:WorkspaceCapabilities|null,op:string):boolean {
+  if(!cap?.directEditUiSupported)return false;
+  const capability=cap.operations.find(item=>item.operation===op);
+  return Boolean(capability&&capability.scope==='mcp_and_ui'&&(capability.availability==='supported'||capability.availability==='partial'));
+}
