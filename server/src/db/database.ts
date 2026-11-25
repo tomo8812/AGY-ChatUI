@@ -236,6 +236,7 @@ export class AppDatabase {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_runs_chat_created ON runs(chat_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_runs_active_user_chat ON runs(user_id, chat_id, created_at) WHERE status IN ('queued', 'running', 'awaiting_permission');
 
       CREATE TABLE IF NOT EXISTS pending_permissions (
         id TEXT PRIMARY KEY,
@@ -1762,7 +1763,7 @@ export class AppDatabase {
       .prepare(
         `SELECT * FROM runs
          WHERE chat_id = ? AND user_id = ? AND status IN ('queued', 'running', 'awaiting_permission')
-         ORDER BY CASE WHEN status IN ('running', 'awaiting_permission') THEN 0 ELSE 1 END ASC, created_at ASC LIMIT 1`
+         ORDER BY CASE WHEN status IN ('running', 'awaiting_permission') THEN 0 ELSE 1 END ASC, created_at ASC, id ASC LIMIT 1`
       )
       .get(chatId, userId) as Record<string, unknown> | undefined;
     return row ? this.mapRun(row) : null;
@@ -2582,8 +2583,21 @@ export class AppDatabase {
         ...p,
         files: this.listProjectFiles(userId, p.id),
       }));
+      // Select one active run per chat in a single query. Keep the exact
+      // running/permission-before-queued ordering of getActiveRunForChat.
+      const activeRunRows = this.db.prepare(
+        `SELECT * FROM (
+           SELECT runs.*, ROW_NUMBER() OVER (
+             PARTITION BY chat_id ORDER BY
+             CASE WHEN status IN ('running', 'awaiting_permission') THEN 0 ELSE 1 END,
+             created_at, id
+           ) AS active_rank
+           FROM runs WHERE user_id = ? AND status IN ('queued', 'running', 'awaiting_permission')
+         ) WHERE active_rank = 1`
+      ).all(userId) as Array<Record<string, unknown>>;
+      const activeRuns = new Map(activeRunRows.map(row => [String(row.chat_id), this.mapRun(row)]));
       const chats = this.listChats(userId).map(chat => ({
-        ...chat, activeRun: this.getActiveRunForChat(userId, chat.id),
+        ...chat, activeRun: activeRuns.get(chat.id) ?? null,
       }));
       const activeChat = activeChatId ? this.getChat(userId, activeChatId) : null;
       const activeChatDetail = activeChat ? {
@@ -2592,7 +2606,7 @@ export class AppDatabase {
         artifacts: this.listArtifactsForChat(userId, activeChat.id),
         pendingPermissions: this.listPendingPermissionsForChat(userId, activeChat.id),
         pendingElicitations: this.listPendingElicitationsForChat(userId, activeChat.id),
-        activeRun: this.getActiveRunForChat(userId, activeChat.id),
+        activeRun: activeRuns.get(activeChat.id) ?? null,
         project: activeChat.projectId ? this.getProject(userId, activeChat.projectId) : null,
       } : null;
       const agyProfile = this.getAgyProfile(userId);
