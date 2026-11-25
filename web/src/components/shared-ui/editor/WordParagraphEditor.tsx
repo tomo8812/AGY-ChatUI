@@ -2,6 +2,7 @@ import React,{useEffect,useRef} from 'react';
 import {useEditor,EditorContent,type Editor, type JSONContent} from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import {Extension} from '@tiptap/core';
+import {Fragment,Slice,type Node as ProseMirrorNode} from '@tiptap/pm/model';
 
 export type WordMark='bold'|'italic'|'underline';
 export type WordRun={text:string}&Partial<Record<WordMark,boolean>>;
@@ -45,9 +46,9 @@ export function WordParagraphEditor({label,runs,readOnly,onChange,onFocus}:Props
         if(text===undefined||props.current.readOnly)return false;
         event.preventDefault();
         const limited=text.slice(0,20000).replace(/\r\n?/g,'\n');
-        const nodes:JSONContent[]=[];
-        limited.split('\n').forEach((line,i)=>{if(i)nodes.push({type:'hardBreak'});if(line)nodes.push({type:'text',text:line})});
-        if(nodes.length)editor?.commands.insertContent(nodes);
+        const nodes:ProseMirrorNode[]=[];
+        limited.split('\n').forEach((line,i)=>{if(i)nodes.push(view.state.schema.nodes.hardBreak.create());if(line)nodes.push(view.state.schema.text(line))});
+        if(nodes.length)view.dispatch(view.state.tr.replaceSelection(new Slice(Fragment.fromArray(nodes),0,0)));
         return true;
       },
       handleDrop:()=>true,
