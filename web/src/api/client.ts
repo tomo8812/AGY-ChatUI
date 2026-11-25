@@ -19,6 +19,7 @@ import type {
   QuotaSnapshotRecord,
   RunRecord,
   SandboxStatus,
+  SyncSnapshotResponse,
   SkillDetail,
   SkillScope,
   SkillsListResponse,
@@ -57,6 +58,7 @@ async function apiFetch<T>(
     method?: string;
     body?: unknown;
     formData?: FormData;
+    signal?: AbortSignal;
   } = {}
 ): Promise<T> {
   const method = (options.method ?? 'GET').toUpperCase();
@@ -82,6 +84,7 @@ async function apiFetch<T>(
     headers,
     body: fetchBody,
     credentials: 'include',
+    signal: options.signal,
   });
 
   const contentType = res.headers.get('content-type') || '';
@@ -116,6 +119,11 @@ export const api = {
     apiFetch<BuiltinMcpSettings>('/api/mcp/builtin-artifact', { method: 'PUT', body: { scope, id, ...settings } }),
 
   bootstrap: () => apiFetch<BootstrapResponse>('/api/auth/bootstrap'),
+  getSyncSnapshot: (chatId: string | null, signal?: AbortSignal) => {
+    const query = new URLSearchParams();
+    if (chatId) query.set('chatId', chatId);
+    return apiFetch<SyncSnapshotResponse>(`/api/sync/snapshot?${query}`, { signal });
+  },
 
   register: (payload: { username: string; displayName?: string; password: string }) =>
     apiFetch<{

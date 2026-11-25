@@ -2573,13 +2573,7 @@ export class AppDatabase {
   /**
    * Single read transaction returning consistent snapshotUserSeq and entity state for full WS resync.
    */
-  getSyncSnapshot(userId: string): {
-    snapshotUserSeq: number;
-    latestSeq: number;
-    projects: Array<ProjectRecord & { files: ProjectFileRecord[] }>;
-    chats: ChatRecord[];
-    artifacts: ArtifactRecord[];
-  } {
+  getSyncSnapshot(userId: string, activeChatId?: string) {
     this.db.exec('BEGIN;');
     try {
       const snapshotUserSeq = this.getLatestUserSyncSeq(userId);
@@ -2588,13 +2582,27 @@ export class AppDatabase {
         ...p,
         files: this.listProjectFiles(userId, p.id),
       }));
-      const chats = this.listChats(userId);
+      const chats = this.listChats(userId).map(chat => ({
+        ...chat, activeRun: this.getActiveRunForChat(userId, chat.id),
+      }));
+      const activeChat = activeChatId ? this.getChat(userId, activeChatId) : null;
+      const activeChatDetail = activeChat ? {
+        chat: activeChat,
+        messages: this.listMessages(userId, activeChat.id),
+        artifacts: this.listArtifactsForChat(userId, activeChat.id),
+        pendingPermissions: this.listPendingPermissionsForChat(userId, activeChat.id),
+        pendingElicitations: this.listPendingElicitationsForChat(userId, activeChat.id),
+        activeRun: this.getActiveRunForChat(userId, activeChat.id),
+        project: activeChat.projectId ? this.getProject(userId, activeChat.projectId) : null,
+      } : null;
+      const agyProfile = this.getAgyProfile(userId);
+      const preferences = this.getPreferences(userId);
       const artRows = this.db
         .prepare("SELECT * FROM artifacts WHERE user_id = ? AND lifecycle_state = 'active' ORDER BY updated_at DESC")
         .all(userId) as Array<Record<string, unknown>>;
       const artifacts = artRows.map((r) => this.mapArtifact(r));
       this.db.exec('COMMIT;');
-      return { snapshotUserSeq, latestSeq, projects, chats, artifacts };
+      return { snapshotUserSeq, latestSeq, projects, chats, artifacts, activeChatDetail, agyProfile, preferences };
     } catch (err) {
       this.db.exec('ROLLBACK;');
       throw err;

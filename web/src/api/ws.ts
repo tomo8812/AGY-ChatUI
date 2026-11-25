@@ -1,4 +1,5 @@
 import type { SyncEventEnvelope, WsIncomingMessage } from '../types';
+import { UserSequenceBuffer } from './userSequence';
 
 export type WsConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
 
@@ -20,7 +21,8 @@ export function getTabClientId(): string {
 export interface SyncSocketCallbacks {
   onStatusChange: (status: WsConnectionStatus) => void;
   onHello: (msg: Extract<WsIncomingMessage, { kind: 'hello' }>) => void;
-  onDurableEvent: (event: SyncEventEnvelope) => void;
+  onDurableEvent: (event: SyncEventEnvelope, replay: boolean) => void;
+  onResync: (signal: AbortSignal) => Promise<{ snapshotUserSeq: number; latestSeq: number }>;
   onEphemeralEvent: (event: Extract<WsIncomingMessage, { kind: 'ephemeral' }>['event']) => void;
   onAuthLost: (reason: string) => void;
 }
@@ -31,7 +33,12 @@ export class SyncSocketClient {
   private reconnectAttempts = 0;
   private reconnectTimer: number | null = null;
   private heartbeatTimer: number | null = null;
-  private lastSeq = 0;
+  private readonly sequence = new UserSequenceBuffer<SyncEventEnvelope>();
+  private latestUserSeq = 0;
+  private snapshotController: AbortController | null = null;
+  private snapshotRetry: number | null = null;
+  private legacyLastSeq = 0;
+  private legacyProtocol = false;
   private readonly clientId = getTabClientId();
   private pushEndpoint: string | null = null;
 
@@ -42,7 +49,7 @@ export class SyncSocketClient {
   }
 
   getLastSeq(): number {
-    return this.lastSeq;
+    return this.legacyProtocol ? this.legacyLastSeq : this.sequence.lastSeq;
   }
 
   setPushEndpoint(endpoint: string | null): void {
@@ -82,6 +89,10 @@ export class SyncSocketClient {
 
   stop(): void {
     this.closedExplicitly = true;
+    this.snapshotController?.abort();
+    this.snapshotController = null;
+    if (this.snapshotRetry !== null) window.clearTimeout(this.snapshotRetry);
+    this.snapshotRetry = null;
     document.removeEventListener('visibilitychange', this.handleVisibilityChange);
     window.removeEventListener('online', this.handleNetworkOnline);
     window.removeEventListener('pageshow', this.handlePageShow);
@@ -153,9 +164,10 @@ export class SyncSocketClient {
     this.callbacks.onStatusChange(this.reconnectAttempts > 0 ? 'reconnecting' : 'connecting');
 
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${proto}//${window.location.host}/api/ws?sinceSeq=${this.lastSeq}&clientId=${encodeURIComponent(
-      this.clientId
-    )}`;
+    const cursor = this.legacyProtocol
+      ? `sinceSeq=${this.legacyLastSeq}`
+      : `sinceUserSeq=${this.sequence.contiguousUserSeq}`;
+    const wsUrl = `${proto}//${window.location.host}/api/ws?${cursor}&clientId=${encodeURIComponent(this.clientId)}`;
 
     const ws = new WebSocket(wsUrl);
     this.ws = ws;
@@ -179,29 +191,53 @@ export class SyncSocketClient {
     };
 
     ws.onmessage = (ev) => {
+      if (this.ws !== ws || this.closedExplicitly) return;
       try {
         const msg = JSON.parse(String(ev.data)) as WsIncomingMessage;
         if (msg.kind === 'hello') {
-          this.lastSeq = Math.max(this.lastSeq, msg.latestSeq || 0);
-          for (const item of msg.events) {
-            if (item.seq > this.lastSeq) this.lastSeq = item.seq;
-          }
+          this.legacyProtocol = !Number.isSafeInteger(msg.latestUserSeq);
           this.callbacks.onHello(msg);
-        } else if (msg.kind === 'event') {
-          if (msg.event.seq > this.lastSeq) {
-            this.lastSeq = msg.event.seq;
+          if (this.legacyProtocol) {
+            for (const item of msg.events) {
+              if (item.seq <= this.legacyLastSeq) continue;
+              this.callbacks.onDurableEvent(item, true);
+              this.legacyLastSeq = item.seq;
+            }
+            if (msg.resyncRequired) this.requestSnapshot();
+            return;
           }
-          this.callbacks.onDurableEvent(msg.event);
+          this.latestUserSeq = Math.max(this.latestUserSeq, msg.latestUserSeq);
+          if (msg.resyncRequired) this.sequence.beginSnapshot();
+          for (const item of msg.events) this.sequence.offer(item);
+          if (msg.resyncRequired) this.requestSnapshot();
+          this.sequence.drain(item => this.callbacks.onDurableEvent(item, true));
+          this.recoverGap();
+        } else if (msg.kind === 'event') {
+          if (this.legacyProtocol) {
+            if (msg.event.seq <= this.legacyLastSeq) return;
+            this.callbacks.onDurableEvent(msg.event, false);
+            this.legacyLastSeq = msg.event.seq;
+            return;
+          }
+          this.sequence.offer(msg.event);
+          this.latestUserSeq = Math.max(this.latestUserSeq, msg.event.userSeq);
+          this.sequence.drain(item => this.callbacks.onDurableEvent(item, false));
+          this.recoverGap();
+        } else if (msg.kind === 'pong' && Number.isSafeInteger(msg.latestUserSeq)) {
+          this.latestUserSeq = Math.max(this.latestUserSeq, msg.latestUserSeq);
+          this.recoverGap();
         } else if (msg.kind === 'ephemeral') {
           this.callbacks.onEphemeralEvent(msg.event);
         }
       } catch {
-        // ignore malformed frames
+        // Do not acknowledge a failed durable apply. Reconnect from the last applied cursor.
+        this.ws?.close(4000, 'sync_replay');
       }
     };
 
     ws.onclose = (ev) => {
-      if (this.ws === ws) this.ws = null;
+      if (this.ws !== ws) return;
+      this.ws = null;
       this.clearTimers();
 
       if (this.closedExplicitly) {
@@ -221,6 +257,35 @@ export class SyncSocketClient {
     ws.onerror = () => {
       // onclose will follow cleanly
     };
+  }
+
+  private recoverGap(): void {
+    if (!this.legacyProtocol && this.sequence.needsReplay(this.latestUserSeq) &&
+        this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.close(4000, 'sync_gap');
+    }
+  }
+
+  private requestSnapshot(): void {
+    if (this.closedExplicitly || this.snapshotController || this.snapshotRetry !== null) return;
+    this.sequence.beginSnapshot();
+    const controller = new AbortController();
+    this.snapshotController = controller;
+    void this.callbacks.onResync(controller.signal).then(snapshot => {
+      if (controller.signal.aborted || this.snapshotController !== controller) return;
+      this.sequence.completeSnapshot(snapshot.snapshotUserSeq, snapshot.latestSeq);
+      this.legacyLastSeq = snapshot.latestSeq;
+      this.sequence.drain(item => this.callbacks.onDurableEvent(item, true));
+      this.recoverGap();
+    }).catch(() => {
+      if (controller.signal.aborted || this.closedExplicitly) return;
+      this.snapshotRetry = window.setTimeout(() => {
+        this.snapshotRetry = null;
+        this.requestSnapshot();
+      }, 1000);
+    }).finally(() => {
+      if (this.snapshotController === controller) this.snapshotController = null;
+    });
   }
 
   private scheduleReconnect(): void {

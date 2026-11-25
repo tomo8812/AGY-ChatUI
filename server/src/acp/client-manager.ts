@@ -1003,6 +1003,12 @@ export class AcpClientManager {
     }
   }
 
+  /** Read options from an existing worker without starting, resuming or modifying ACP. */
+  peekSessionOptions(userId: string, chatId: string): ParsedSessionOptions | null {
+    if (!this.db.getChat(userId, chatId)) return null;
+    return this.workers.get(`${userId}:${chatId}`)?.parsedOptions ?? null;
+  }
+
   async ensureSessionOptions(userId: string, chatId: string): Promise<ParsedSessionOptions> {
     const chat = this.db.getChat(userId, chatId);
     const worker = await this.getOrStartWorker(userId, chatId);
