@@ -56,9 +56,16 @@ export class SvgAdapter implements FormatAdapter {
       { operation: 'edit', availability: 'supported', scope: 'mcp_and_ui' },
       { operation: 'verify', availability: 'supported', scope: 'mcp_and_ui' },
       {
-        operation: 'export_png',
+        operation: 'export:png',
         availability: ctx.runtimeProfile !== 'base_chatui' && ctx.sandboxAvailable ? 'supported' : 'disabled_by_resource_tier',
         scope: 'mcp_and_ui',
+        remediation: ctx.runtimeProfile === 'base_chatui' ? 'deploy/setup-doc-runtime.sh を実行してください。' : undefined,
+      },
+      {
+        operation: 'render_png',
+        availability: ctx.runtimeProfile !== 'base_chatui' && ctx.sandboxAvailable ? 'supported' : 'disabled_by_resource_tier',
+        scope: 'mcp_only',
+        remediation: ctx.runtimeProfile === 'base_chatui' ? 'deploy/setup-doc-runtime.sh を実行してください。' : undefined,
       },
     ];
   }

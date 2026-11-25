@@ -2,6 +2,7 @@
 
 import base64
 import csv
+import hashlib
 import json
 import io
 from copy import copy, deepcopy
@@ -15,6 +16,7 @@ import sys
 import subprocess
 import tempfile
 from urllib.parse import unquote, urlsplit
+import uuid
 import zipfile
 
 from lxml import etree as XML
@@ -25,6 +27,238 @@ RELATIONSHIPS = "http://schemas.openxmlformats.org/package/2006/relationships"
 SPREADSHEET = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 MAIN_PART = {"xlsx": "xl/workbook.xml", "docx": "word/document.xml", "pptx": "ppt/presentation.xml"}
 MAX_UNCOMPRESSED = 200 * 1024 * 1024
+
+
+class UnsupportedByFormatError(ValueError):
+    """Raised when a valid format-specific operation is structurally unsupported for a given sub-type."""
+
+
+def find_system_font(bold=False, cjk=False):
+    candidates = []
+    if cjk:
+        candidates.extend([
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc" if bold else "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc" if bold else "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansJP-Regular.otf",
+        ])
+    candidates.extend([
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ])
+    for candidate in candidates:
+        if Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def load_pil_font(size_px=14, bold=False, cjk=False):
+    from PIL import ImageFont
+    font_path = find_system_font(bold=bold, cjk=cjk)
+    if font_path:
+        try:
+            return ImageFont.truetype(font_path, max(8, int(round(size_px))))
+        except OSError:
+            pass
+    return ImageFont.load_default()
+
+
+def crop_png_region(output_path, region, page_size_pt=None):
+    """Crop an output PNG in-place according to normalized, pixel, or point region coordinates."""
+    if not region:
+        return
+    if not isinstance(region, dict):
+        raise ValueError("Render region must be an object")
+    unit = region.get("unit", "norm")
+    try:
+        rx = float(region["x"])
+        ry = float(region["y"])
+        rw = float(region["width"])
+        rh = float(region["height"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Invalid render region coordinates") from exc
+    if not all(math.isfinite(v) for v in (rx, ry, rw, rh)) or rw <= 0 or rh <= 0 or rx < 0 or ry < 0:
+        raise ValueError("Invalid render region bounds")
+    from PIL import Image
+    with Image.open(output_path) as opened:
+        img = opened.copy()
+    width, height = img.size
+    if unit == "norm":
+        if rx >= 1.0 or ry >= 1.0 or rx + rw > 1.001 or ry + rh > 1.001:
+            raise ValueError("Normalized render region exceeds [0, 1]")
+        left = int(math.floor(rx * width))
+        top = int(math.floor(ry * height))
+        right = int(math.ceil((rx + rw) * width))
+        bottom = int(math.ceil((ry + rh) * height))
+    elif unit == "px":
+        left = int(math.floor(rx))
+        top = int(math.floor(ry))
+        right = int(math.ceil(rx + rw))
+        bottom = int(math.ceil(ry + rh))
+    elif unit == "pt":
+        if page_size_pt and page_size_pt[0] > 0 and page_size_pt[1] > 0:
+            sx = width / float(page_size_pt[0])
+            sy = height / float(page_size_pt[1])
+        else:
+            sx = sy = 96.0 / 72.0
+        left = int(math.floor(rx * sx))
+        top = int(math.floor(ry * sy))
+        right = int(math.ceil((rx + rw) * sx))
+        bottom = int(math.ceil((ry + rh) * sy))
+    else:
+        raise ValueError(f"Unsupported render region unit: {unit}")
+    left = max(0, min(width - 1, left))
+    top = max(0, min(height - 1, top))
+    right = max(left + 1, min(width, right))
+    bottom = max(top + 1, min(height, bottom))
+    cropped = img.crop((left, top, right, bottom))
+    if cropped.size[0] > 8192 or cropped.size[1] > 8192:
+        raise ValueError("Cropped image exceeds maximum PNG dimensions")
+    cropped.save(output_path, format="PNG")
+
+
+def compute_image_ssim_and_mae(img_a, img_b):
+    """Compute grayscale structural similarity (SSIM) and mean absolute error (0..255) over 8x8 blocks."""
+    from PIL import Image
+    if img_a.size != img_b.size:
+        img_b = img_b.resize(img_a.size, Image.Resampling.BILINEAR)
+    # Downsample very large renders for fast deterministic block SSIM while preserving layout structure.
+    max_side = 512
+    if max(img_a.size) > max_side:
+        scale = max_side / float(max(img_a.size))
+        target_size = (max(8, int(round(img_a.size[0] * scale))), max(8, int(round(img_a.size[1] * scale))))
+        img_a = img_a.resize(target_size, Image.Resampling.BILINEAR)
+        img_b = img_b.resize(target_size, Image.Resampling.BILINEAR)
+    gray_a = list(img_a.convert("L").tobytes())
+    gray_b = list(img_b.convert("L").tobytes())
+    w, h = img_a.size
+    n = len(gray_a)
+    if n == 0:
+        return 1.0, 0.0
+    mae = sum(abs(a - b) for a, b in zip(gray_a, gray_b)) / float(n)
+    c1 = (0.01 * 255.0) ** 2
+    c2 = (0.03 * 255.0) ** 2
+    block = 8
+    ssim_sum = 0.0
+    blocks = 0
+    for by in range(0, max(1, h - block + 1), block):
+        for bx in range(0, max(1, w - block + 1), block):
+            bh = min(block, h - by)
+            bw = min(block, w - bx)
+            vals_a = []
+            vals_b = []
+            for dy in range(bh):
+                row_off = (by + dy) * w + bx
+                vals_a.extend(gray_a[row_off:row_off + bw])
+                vals_b.extend(gray_b[row_off:row_off + bw])
+            m = float(len(vals_a))
+            if m == 0:
+                continue
+            mu_a = sum(vals_a) / m
+            mu_b = sum(vals_b) / m
+            var_a = sum((v - mu_a) ** 2 for v in vals_a) / m
+            var_b = sum((v - mu_b) ** 2 for v in vals_b) / m
+            cov = sum((a - mu_a) * (b - mu_b) for a, b in zip(vals_a, vals_b)) / m
+            num = (2.0 * mu_a * mu_b + c1) * (2.0 * cov + c2)
+            den = (mu_a ** 2 + mu_b ** 2 + c1) * (var_a + var_b + c2)
+            ssim_sum += num / den if den else 1.0
+            blocks += 1
+    return (ssim_sum / blocks if blocks else 1.0), mae
+
+
+def render_csv_table(request, source, output):
+    """Render a CSV/TSV file as a crisp grid table PNG with header shading, borders, and pagination."""
+    from PIL import Image, ImageDraw
+    filename = request.get("filename", "table.csv")
+    delimiter = "\t" if str(filename).lower().endswith(".tsv") else ","
+    raw_text = source.read_text(encoding="utf-8", errors="replace").lstrip("\ufeff")
+    rows = list(csv.reader(io.StringIO(raw_text), delimiter=delimiter))
+    if not rows:
+        rows = [["(empty)"]]
+    has_non_ascii = any(ord(ch) > 127 for r in rows[:200] for cell in r for ch in cell)
+    font_body = load_pil_font(14, bold=False, cjk=has_non_ascii)
+    font_header = load_pil_font(14, bold=True, cjk=has_non_ascii)
+
+    rows_per_page = 40
+    header = rows[0]
+    data_rows = rows[1:]
+    page_index = bounded_integer(request.get("pageIndex", 0), 0, max(0, (max(1, len(data_rows)) - 1) // rows_per_page))
+    page_slice = data_rows[page_index * rows_per_page:(page_index + 1) * rows_per_page]
+    visible_rows = [header] + page_slice
+    col_count = max(1, min(30, max(len(r) for r in visible_rows)))
+
+    measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    pad_x, pad_y = 12, 8
+    row_height = 32
+    col_widths = []
+    for c in range(col_count):
+        max_w = 64
+        for r_idx, row in enumerate(visible_rows):
+            text = (row[c] if c < len(row) else "").replace("\r", " ").replace("\n", " ")[:120]
+            fnt = font_header if r_idx == 0 else font_body
+            bbox = measure.textbbox((0, 0), text, font=fnt)
+            max_w = max(max_w, min(320, int(bbox[2] - bbox[0]) + pad_x * 2))
+        col_widths.append(max_w)
+
+    margin = 20
+    table_w = sum(col_widths)
+    table_h = len(visible_rows) * row_height
+    img_w = min(4096, table_w + margin * 2)
+    img_h = min(4096, table_h + margin * 2 + 24)
+    img = Image.new("RGB", (img_w, img_h), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    for r_idx, row in enumerate(visible_rows):
+        y0 = margin + r_idx * row_height
+        y1 = y0 + row_height
+        if y1 > img_h - margin:
+            break
+        bg = (232, 240, 252) if r_idx == 0 else ((249, 250, 252) if r_idx % 2 == 0 else (255, 255, 255))
+        draw.rectangle((margin, y0, min(img_w - margin, margin + table_w), y1), fill=bg)
+        x = margin
+        fnt = font_header if r_idx == 0 else font_body
+        for c in range(col_count):
+            cw = col_widths[c]
+            if x >= img_w - margin:
+                break
+            draw.rectangle((x, y0, min(img_w - margin, x + cw), y1), outline=(209, 213, 219), width=1)
+            cell_text = (row[c] if c < len(row) else "").replace("\r", " ").replace("\n", " ")[:120]
+            # Truncate cleanly to fit column width
+            while cell_text and measure.textbbox((0, 0), cell_text, font=fnt)[2] > cw - pad_x * 2:
+                cell_text = cell_text[:-2] + "…" if len(cell_text) > 2 else ""
+            draw.text((x + pad_x, y0 + pad_y), cell_text, fill=(17, 24, 39), font=fnt)
+            x += cw
+
+    footer = f"{filename} — page {page_index + 1} ({len(rows)} rows x {col_count} cols)"
+    draw.text((margin, min(img_h - 20, margin + table_h + 6)), footer, fill=(107, 114, 128), font=load_pil_font(11))
+    img.save(output, format="PNG")
+    crop_png_region(output, request.get("region"))
+
+
+def export_markdown(source, output, target):
+    """Export Markdown to DOCX (via pandoc with python-docx fallback) or PDF (via pandoc + LibreOffice)."""
+    target = target.lower()
+    if target not in {"docx", "pdf"}:
+        raise ValueError(f"Unsupported markdown export target: {target}")
+    docx_path = output if target == "docx" else (Path.cwd() / "markdown-export.docx")
+    if shutil.which("pandoc"):
+        subprocess.run(
+            ["pandoc", "--from", "gfm", "--to", "docx", "--output", str(docx_path), str(source)],
+            check=True,
+        )
+    else:
+        from docx import Document
+        doc = Document()
+        for line in source.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = re.match(r"^(#{1,6})\s+(.+)$", line)
+            if m:
+                doc.add_heading(m.group(2).strip(), level=min(9, len(m.group(1))))
+            elif line.strip():
+                doc.add_paragraph(line)
+        doc.save(docx_path)
+    if target == "pdf":
+        render_office(docx_path, output, {"format": "docx", "action": "export", "targetFormat": "pdf"})
+
 
 
 def parse_xml(data):
@@ -302,6 +536,257 @@ def remap_sheet_indices(workbook, old_order, sheets, removed=None):
             view.set(key, str(visible if old_order[index] is removed else sheets.index(old_order[index])))
 
 
+STYLES_CHILDREN = (
+    "numFmts", "fonts", "fills", "borders", "cellStyleXfs", "cellXfs", "cellStyles", "dxfs", "tableStyles", "colors", "extLst"
+)
+
+
+def ensure_workbook_styles(package, replacements, additions):
+    part = "xl/styles.xml"
+    if part in replacements or part in additions or part in package.namelist():
+        return load_edit_part(package, replacements, additions, part)
+    styles = XML.Element(tag(SPREADSHEET, "styleSheet"), nsmap={None: SPREADSHEET})
+    fonts = XML.SubElement(styles, tag(SPREADSHEET, "fonts"), count="1")
+    font = XML.SubElement(fonts, tag(SPREADSHEET, "font"))
+    XML.SubElement(font, tag(SPREADSHEET, "sz"), val="11")
+    XML.SubElement(font, tag(SPREADSHEET, "name"), val="Calibri")
+    fills = XML.SubElement(styles, tag(SPREADSHEET, "fills"), count="2")
+    XML.SubElement(XML.SubElement(fills, tag(SPREADSHEET, "fill")), tag(SPREADSHEET, "patternFill"), patternType="none")
+    XML.SubElement(XML.SubElement(fills, tag(SPREADSHEET, "fill")), tag(SPREADSHEET, "patternFill"), patternType="gray125")
+    borders = XML.SubElement(styles, tag(SPREADSHEET, "borders"), count="1")
+    border = XML.SubElement(borders, tag(SPREADSHEET, "border"))
+    for side in ("left", "right", "top", "bottom", "diagonal"):
+        XML.SubElement(border, tag(SPREADSHEET, side))
+    csx = XML.SubElement(styles, tag(SPREADSHEET, "cellStyleXfs"), count="1")
+    XML.SubElement(csx, tag(SPREADSHEET, "xf"), numFmtId="0", fontId="0", fillId="0", borderId="0")
+    cx = XML.SubElement(styles, tag(SPREADSHEET, "cellXfs"), count="1")
+    XML.SubElement(cx, tag(SPREADSHEET, "xf"), numFmtId="0", fontId="0", fillId="0", borderId="0", xfId="0")
+    add_package_part(
+        package, replacements, additions, MAIN_PART["xlsx"], part, "styles",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml", XML.tostring(styles)
+    )
+    return load_edit_part(package, replacements, additions, part)
+
+
+def styles_section(styles, name):
+    later = STYLES_CHILDREN[STYLES_CHILDREN.index(name) + 1:]
+    return xml_child(styles, SPREADSHEET, name, later)
+
+
+def normalize_hex_rgb(value):
+    if not isinstance(value, str):
+        raise ValueError("Expected RGB hex color string")
+    cleaned = value.lstrip("#").upper()
+    if len(cleaned) == 8 and re.fullmatch(r"[0-9A-F]{8}", cleaned):
+        return cleaned
+    if re.fullmatch(r"[0-9A-F]{6}", cleaned):
+        return "FF" + cleaned
+    raise ValueError("Use a six-digit RGB color")
+
+
+BUILTIN_NUM_FMTS = {
+    "General": 0, "0": 1, "0.00": 2, "#,##0": 3, "#,##0.00": 4,
+    "0%": 9, "0.00%": 10, "0.00E+00": 11, "mm-dd-yy": 14, "yyyy-mm-dd": 14,
+    "@": 49,
+}
+
+
+def allocate_workbook_style_index(package, replacements, additions, spec, base_index=0):
+    """Build or reuse a real cellXfs style in xl/styles.xml from font/fill/border/alignment/numFmt options."""
+    styles = ensure_workbook_styles(package, replacements, additions)
+    cell_xfs = styles_section(styles, "cellXfs")
+    existing_xfs = cell_xfs.findall(tag(SPREADSHEET, "xf"))
+    if not existing_xfs:
+        base_xf = XML.SubElement(cell_xfs, tag(SPREADSHEET, "xf"), numFmtId="0", fontId="0", fillId="0", borderId="0", xfId="0")
+        existing_xfs = [base_xf]
+    src_xf = existing_xfs[base_index] if 0 <= base_index < len(existing_xfs) else existing_xfs[0]
+
+    num_fmt_id = int(src_xf.get("numFmtId", "0"))
+    font_id = int(src_xf.get("fontId", "0"))
+    fill_id = int(src_xf.get("fillId", "0"))
+    border_id = int(src_xf.get("borderId", "0"))
+    apply_num_fmt = src_xf.get("applyNumberFormat")
+    apply_font = src_xf.get("applyFont")
+    apply_fill = src_xf.get("applyFill")
+    apply_border = src_xf.get("applyBorder")
+    apply_alignment = src_xf.get("applyAlignment")
+
+    num_fmt = spec.get("numberFormat", spec.get("numFmt"))
+    if num_fmt is not None:
+        if isinstance(num_fmt, int):
+            num_fmt_id = bounded_integer(num_fmt, 0, 65535)
+        elif isinstance(num_fmt, str) and num_fmt in BUILTIN_NUM_FMTS:
+            num_fmt_id = BUILTIN_NUM_FMTS[num_fmt]
+        elif isinstance(num_fmt, str) and 1 <= len(num_fmt) <= 255:
+            num_fmts = styles_section(styles, "numFmts")
+            found_fmt = next((n for n in num_fmts.findall(tag(SPREADSHEET, "numFmt")) if n.get("formatCode") == num_fmt), None)
+            if found_fmt is not None:
+                num_fmt_id = int(found_fmt.get("numFmtId", "164"))
+            else:
+                used_ids = [int(n.get("numFmtId", "163")) for n in num_fmts.findall(tag(SPREADSHEET, "numFmt"))]
+                num_fmt_id = max([163] + used_ids) + 1
+                XML.SubElement(num_fmts, tag(SPREADSHEET, "numFmt"), numFmtId=str(num_fmt_id), formatCode=num_fmt)
+                num_fmts.set("count", str(len(num_fmts.findall(tag(SPREADSHEET, "numFmt")))))
+        else:
+            raise ValueError("Invalid number format")
+        apply_num_fmt = "1"
+
+    font_spec = spec.get("font") if isinstance(spec.get("font"), dict) else {}
+    merged_font = dict(font_spec)
+    for k in ("bold", "italic", "underline", "strike", "fontSizePt", "fontFamily", "fontColor"):
+        if k in spec and k not in merged_font:
+            merged_font[k] = spec[k]
+    if merged_font:
+        fonts = styles_section(styles, "fonts")
+        font_list = fonts.findall(tag(SPREADSHEET, "font"))
+        new_font = deepcopy(font_list[font_id]) if 0 <= font_id < len(font_list) else XML.Element(tag(SPREADSHEET, "font"))
+        for key, el_name in (("bold", "b"), ("italic", "i"), ("underline", "u"), ("strike", "strike")):
+            if key in merged_font:
+                existing = new_font.find(tag(SPREADSHEET, el_name))
+                if merged_font[key]:
+                    if existing is None:
+                        new_font.insert(0, XML.Element(tag(SPREADSHEET, el_name)))
+                elif existing is not None:
+                    new_font.remove(existing)
+        size_val = merged_font.get("fontSizePt", merged_font.get("size"))
+        if size_val is not None:
+            sz = xml_child(new_font, SPREADSHEET, "sz", ("color", "name", "family", "scheme"))
+            sz.set("val", str(bounded_integer(round(float(size_val)), 1, 400)))
+        color_val = merged_font.get("fontColor", merged_font.get("color"))
+        if color_val is not None:
+            clr = xml_child(new_font, SPREADSHEET, "color", ("name", "family", "scheme"))
+            clr.attrib.clear()
+            clr.set("rgb", normalize_hex_rgb(color_val))
+        family_val = merged_font.get("fontFamily", merged_font.get("name"))
+        if family_val is not None:
+            nm = xml_child(new_font, SPREADSHEET, "name", ("family", "scheme"))
+            nm.set("val", str(family_val)[:128])
+        fonts.append(new_font)
+        font_id = len(font_list)
+        fonts.set("count", str(font_id + 1))
+        apply_font = "1"
+
+    fill_val = spec.get("backgroundColor", spec.get("fill"))
+    if fill_val is not None:
+        fills = styles_section(styles, "fills")
+        fill_list = fills.findall(tag(SPREADSHEET, "fill"))
+        new_fill = XML.Element(tag(SPREADSHEET, "fill"))
+        if fill_val == "none" or (isinstance(fill_val, dict) and fill_val.get("type") == "none"):
+            XML.SubElement(new_fill, tag(SPREADSHEET, "patternFill"), patternType="none")
+        else:
+            rgb = normalize_hex_rgb(fill_val["color"] if isinstance(fill_val, dict) else fill_val)
+            pf = XML.SubElement(new_fill, tag(SPREADSHEET, "patternFill"), patternType="solid")
+            XML.SubElement(pf, tag(SPREADSHEET, "fgColor"), rgb=rgb)
+            XML.SubElement(pf, tag(SPREADSHEET, "bgColor"), indexed="64")
+        fills.append(new_fill)
+        fill_id = len(fill_list)
+        fills.set("count", str(fill_id + 1))
+        apply_fill = "1"
+
+    border_spec = spec.get("border")
+    if border_spec is not None:
+        borders = styles_section(styles, "borders")
+        border_list = borders.findall(tag(SPREADSHEET, "border"))
+        new_border = XML.Element(tag(SPREADSHEET, "border"))
+        allowed_styles = {"none", "thin", "medium", "thick", "dashed", "dotted", "double", "hair"}
+        default_style = border_spec.get("style", "thin") if isinstance(border_spec, dict) else (border_spec if isinstance(border_spec, str) else "thin")
+        default_color = border_spec.get("color", "000000") if isinstance(border_spec, dict) else "000000"
+        for side in ("left", "right", "top", "bottom", "diagonal"):
+            side_el = XML.SubElement(new_border, tag(SPREADSHEET, side))
+            if side == "diagonal":
+                continue
+            side_cfg = border_spec.get(side) if isinstance(border_spec, dict) and side in border_spec else (
+                None if isinstance(border_spec, dict) and any(k in border_spec for k in ("left", "right", "top", "bottom"))
+                else {"style": default_style, "color": default_color}
+            )
+            if isinstance(side_cfg, str):
+                side_cfg = {"style": side_cfg, "color": default_color}
+            if isinstance(side_cfg, dict):
+                st = side_cfg.get("style", "thin")
+                if st not in allowed_styles:
+                    raise ValueError(f"Unsupported border style: {st}")
+                if st != "none":
+                    side_el.set("style", st)
+                    XML.SubElement(side_el, tag(SPREADSHEET, "color"), rgb=normalize_hex_rgb(side_cfg.get("color", default_color)))
+        borders.append(new_border)
+        border_id = len(border_list)
+        borders.set("count", str(border_id + 1))
+        apply_border = "1"
+
+    new_xf = deepcopy(src_xf)
+    new_xf.set("numFmtId", str(num_fmt_id))
+    new_xf.set("fontId", str(font_id))
+    new_xf.set("fillId", str(fill_id))
+    new_xf.set("borderId", str(border_id))
+    if apply_num_fmt:
+        new_xf.set("applyNumberFormat", apply_num_fmt)
+    if apply_font:
+        new_xf.set("applyFont", apply_font)
+    if apply_fill:
+        new_xf.set("applyFill", apply_fill)
+    if apply_border:
+        new_xf.set("applyBorder", apply_border)
+
+    align_spec = spec.get("alignment") if isinstance(spec.get("alignment"), dict) else {}
+    merged_align = dict(align_spec)
+    for k in ("horizontal", "vertical", "wrapText", "textRotation"):
+        if k in spec and k not in merged_align:
+            merged_align[k] = spec[k]
+    if merged_align:
+        align_el = new_xf.find(tag(SPREADSHEET, "alignment"))
+        if align_el is None:
+            align_el = XML.SubElement(new_xf, tag(SPREADSHEET, "alignment"))
+        if "horizontal" in merged_align:
+            h = merged_align["horizontal"]
+            if h not in {"general", "left", "center", "right", "fill", "justify"}:
+                raise ValueError("Invalid horizontal alignment")
+            align_el.set("horizontal", h)
+        if "vertical" in merged_align:
+            v = merged_align["vertical"]
+            if v not in {"top", "center", "bottom", "justify"}:
+                raise ValueError("Invalid vertical alignment")
+            align_el.set("vertical", v)
+        if "wrapText" in merged_align:
+            align_el.set("wrapText", "1" if merged_align["wrapText"] else "0")
+        if "textRotation" in merged_align:
+            align_el.set("textRotation", str(bounded_integer(merged_align["textRotation"], 0, 180)))
+        new_xf.set("applyAlignment", "1")
+    elif apply_alignment:
+        new_xf.set("applyAlignment", apply_alignment)
+
+    cell_xfs.append(new_xf)
+    new_index = len(existing_xfs)
+    cell_xfs.set("count", str(new_index + 1))
+    replacements["xl/styles.xml"] = styles
+    return new_index
+
+
+def allocate_workbook_dxf(package, replacements, additions, style_spec):
+    """Append a differential format (<dxf>) entry in xl/styles.xml for conditional formatting."""
+    styles = ensure_workbook_styles(package, replacements, additions)
+    dxfs = styles_section(styles, "dxfs")
+    existing = dxfs.findall(tag(SPREADSHEET, "dxf"))
+    dxf = XML.SubElement(dxfs, tag(SPREADSHEET, "dxf"))
+    if any(k in style_spec for k in ("bold", "italic", "fontColor", "color")):
+        font = XML.SubElement(dxf, tag(SPREADSHEET, "font"))
+        if style_spec.get("bold"):
+            XML.SubElement(font, tag(SPREADSHEET, "b"))
+        if style_spec.get("italic"):
+            XML.SubElement(font, tag(SPREADSHEET, "i"))
+        fc = style_spec.get("fontColor", style_spec.get("color"))
+        if fc:
+            XML.SubElement(font, tag(SPREADSHEET, "color"), rgb=normalize_hex_rgb(fc))
+    bg = style_spec.get("backgroundColor", style_spec.get("fill"))
+    if bg:
+        fill = XML.SubElement(dxf, tag(SPREADSHEET, "fill"))
+        pf = XML.SubElement(fill, tag(SPREADSHEET, "patternFill"), patternType="solid")
+        XML.SubElement(pf, tag(SPREADSHEET, "bgColor"), rgb=normalize_hex_rgb(bg))
+        XML.SubElement(pf, tag(SPREADSHEET, "fgColor"), rgb=normalize_hex_rgb(bg))
+    dxfs.set("count", str(len(existing) + 1))
+    replacements["xl/styles.xml"] = styles
+    return len(existing)
+
+
 def update_sheet_metadata(package, replacements, additions, removed, operation):
     workbook_part = MAIN_PART["xlsx"]
     workbook = load_edit_part(package, replacements, additions, workbook_part)
@@ -325,20 +810,34 @@ def update_sheet_metadata(package, replacements, additions, removed, operation):
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,254}", name) or re.fullmatch(r"[A-Za-z]{1,3}[0-9]+|R|C|R[0-9]+C[0-9]+", name, re.I):
             raise ValueError("Invalid defined name")
         names = xml_child(workbook, SPREADSHEET, "definedNames", ("calcPr", "oleSize", "customWorkbookViews", "pivotCaches", "extLst"))
-        found = next((node for node in names if node.get("localSheetId") is None and node.get("name", "").casefold() == name.casefold()), None)
-        if operation.get("range") is None:
+        local_idx = None
+        if operation.get("localSheetId") is not None:
+            local_idx = str(bounded_integer(operation["localSheetId"], 0, len(sheets) - 1))
+        found = next(
+            (node for node in names if node.get("localSheetId") == local_idx and node.get("name", "").casefold() == name.casefold()),
+            None,
+        )
+        if operation.get("range") is None and operation.get("formula") is None:
             if found is not None:
                 names.remove(found)
             return
-        reference = operation["range"]
-        bounded_sheet_range(reference)
-        sheet = next((sheet for sheet in sheets if sheet.get("sheetId") == str(operation["sheetId"])), None)
-        if sheet is None:
-            raise ValueError("Unknown worksheet")
         if found is None:
             found = XML.SubElement(names, tag(SPREADSHEET, "definedName"), name=name)
-        absolute = re.sub(r"([A-Z]+)([0-9]+)", r"$\1$\2", reference)
-        found.text = "'" + sheet.attrib["name"].replace("'", "''") + "'!" + absolute
+            if local_idx is not None:
+                found.set("localSheetId", local_idx)
+        if "formula" in operation and operation["formula"] is not None:
+            expr = str(operation["formula"]).lstrip("=").strip()
+            if not expr or len(expr) > 2048:
+                raise ValueError("Invalid defined name formula")
+            found.text = expr
+        else:
+            reference = operation["range"]
+            bounded_sheet_range(reference)
+            sheet = next((sheet for sheet in sheets if sheet.get("sheetId") == str(operation["sheetId"])), None)
+            if sheet is None:
+                raise ValueError("Unknown worksheet")
+            absolute = re.sub(r"([A-Z]+)([0-9]+)", r"$\1$\2", reference)
+            found.text = "'" + sheet.attrib["name"].replace("'", "''") + "'!" + absolute
         return
     current = next((i for i, sheet in enumerate(sheets) if sheet.get("sheetId") == str(operation["sheetId"])), None)
     if current is None:
@@ -364,17 +863,46 @@ def update_sheet_metadata(package, replacements, additions, removed, operation):
         update_sheet_references(package, replacements, additions, sheet.attrib["name"], name)
         sheet.set("name", name)
         return
-    if op == "xlsx.remove_empty_sheet":
+    if op == "xlsx.duplicate_sheet":
+        new_name = operation["name"]
+        validate_sheet_name(sheets, new_name)
+        rels = load_edit_part(package, replacements, additions, "xl/_rels/workbook.xml.rels")
+        relationship = next(node for node in rels if node.get("Id") == sheet.attrib[tag(OFFICE_REL, "id")])
+        src_target = resolve_relationship("xl", relationship.attrib["Target"])
+        src_part = load_edit_part(package, replacements, additions, src_target)
+        cloned = deepcopy(src_part)
+        # Strip external relationship children like drawings/tableParts that need unique target parts.
+        for strip_tag in ("drawing", "legacyDrawing", "legacyDrawingHF", "tableParts", "oleObjects", "controls"):
+            for child in list(cloned.findall(tag(SPREADSHEET, strip_tag))):
+                cloned.remove(child)
+        for view in cloned.iter(tag(SPREADSHEET, "sheetView")):
+            view.attrib.pop("tabSelected", None)
+        target = allocate_part(package, additions, "xl/worksheets/sheet", ".xml")
+        rid = add_package_part(
+            package, replacements, additions, workbook_part, target, "worksheet",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+            XML.tostring(cloned),
+        )
+        sheet_id = max([0] + [int(s.attrib["sheetId"]) for s in sheets]) + 1
+        node = XML.SubElement(sheets, tag(SPREADSHEET, "sheet"), name=new_name, sheetId=str(sheet_id))
+        node.set(tag(OFFICE_REL, "id"), rid)
+        return
+    if op in {"xlsx.remove_empty_sheet", "xlsx.remove_sheet"}:
         if len(sheets) == 1 or not any(node is not sheet and node.get("state", "visible") == "visible" for node in sheets):
             raise ValueError("One worksheet must remain visible")
         rels = load_edit_part(package, replacements, additions, "xl/_rels/workbook.xml.rels")
         relationship = next(node for node in rels if node.get("Id") == sheet.attrib[tag(OFFICE_REL, "id")])
         target = resolve_relationship("xl", relationship.attrib["Target"])
         sheet_part = load_edit_part(package, replacements, additions, target)
-        if any(node.tag in {tag(SPREADSHEET, name) for name in (
-            "c", "drawing", "conditionalFormatting", "tableParts", "dataValidations", "hyperlinks", "extLst"
-        )} for node in sheet_part.iter()):
-            raise UnsupportedStructuralMutation("Only an empty worksheet without dependent parts can be removed")
+        if op == "xlsx.remove_empty_sheet":
+            if any(node.tag in {tag(SPREADSHEET, name) for name in (
+                "c", "drawing", "conditionalFormatting", "tableParts", "dataValidations", "hyperlinks", "extLst"
+            )} for node in sheet_part.iter()):
+                raise UnsupportedStructuralMutation("Only an empty worksheet without dependent parts can be removed")
+        else:
+            # General sheet removal still guards against orphaned pivot/table/drawing parts and cross-sheet references.
+            if any(node.tag in {tag(SPREADSHEET, name) for name in ("drawing", "tableParts")} for node in sheet_part.iter()):
+                raise UnsupportedStructuralMutation("Worksheet has attached drawings or tables that must be removed first")
         update_sheet_references(package, replacements, additions, sheet.attrib["name"], None, target)
         sheets.remove(sheet)
         rels.remove(relationship)
@@ -386,6 +914,10 @@ def update_sheet_metadata(package, replacements, additions, removed, operation):
             additions.pop(target)
         else:
             removed.add(target)
+        sheet_rels_path = f"xl/worksheets/_rels/{PurePosixPath(target).name}.rels"
+        if sheet_rels_path in package.namelist():
+            removed.add(sheet_rels_path)
+        additions.pop(sheet_rels_path, None)
         remap_sheet_indices(workbook, order, sheets, sheet)
         return
     if op != "xlsx.reorder_sheet":
@@ -422,7 +954,94 @@ def update_sheet_options(package, replacements, additions, operation):
         if "fitToWidth" in operation or "fitToHeight" in operation:
             props = sheet_node(sheet, "sheetPr")
             xml_child(props, SPREADSHEET, "pageSetUpPr").set("fitToPage", "1")
+        if isinstance(operation.get("margins"), dict):
+            margins = sheet_node(sheet, "pageMargins")
+            defaults = {"left": 0.7, "right": 0.7, "top": 0.75, "bottom": 0.75, "header": 0.3, "footer": 0.3}
+            for k, default_v in defaults.items():
+                val = float(operation["margins"].get(k, margins.get(k, default_v)))
+                if not math.isfinite(val) or not 0 <= val <= 10:
+                    raise ValueError(f"Invalid page margin {k}")
+                margins.set(k, f"{val:.4g}")
+        if operation.get("printArea"):
+            pa_range = str(operation["printArea"])
+            bounded_sheet_range(pa_range)
+            wb = load_edit_part(package, replacements, additions, MAIN_PART["xlsx"])
+            sheets_el = wb.find(tag(SPREADSHEET, "sheets"))
+            wb_sheets = workbook_sheets(package)
+            sheet_idx = next((i for i, s in enumerate(wb_sheets) if s["part"] == part), None)
+            if sheet_idx is not None:
+                sheet_name = wb_sheets[sheet_idx]["name"]
+                names = xml_child(wb, SPREADSHEET, "definedNames", ("calcPr", "oleSize", "customWorkbookViews", "pivotCaches", "extLst"))
+                found = next(
+                    (n for n in names if n.get("name") == "_xlnm.Print_Area" and n.get("localSheetId") == str(sheet_idx)),
+                    None,
+                )
+                if found is None:
+                    found = XML.SubElement(names, tag(SPREADSHEET, "definedName"), name="_xlnm.Print_Area", localSheetId=str(sheet_idx))
+                absolute = re.sub(r"([A-Z]+)([0-9]+)", r"$\1$\2", pa_range)
+                found.text = "'" + sheet_name.replace("'", "''") + "'!" + absolute
         return
+    if op == "xlsx.set_column_width":
+        width = float(operation["width"])
+        if not math.isfinite(width) or not 0.5 <= width <= 255:
+            raise ValueError("Column width must be between 0.5 and 255")
+        if "column" in operation:
+            col = operation["column"]
+            if isinstance(col, str) and re.fullmatch(r"[A-Za-z]{1,3}", col):
+                col_idx = cell_coordinates(col.upper() + "1")[1]
+            else:
+                col_idx = bounded_integer(col, 1, 16384)
+            start_col = end_col = col_idx
+        else:
+            start_col = bounded_integer(operation["startCol"], 1, 16384)
+            end_col = bounded_integer(operation.get("endCol", start_col), start_col, 16384)
+        cols = sheet_node(sheet, "cols")
+        for existing in list(cols.findall(tag(SPREADSHEET, "col"))):
+            if int(existing.get("min", "0")) == start_col and int(existing.get("max", "0")) == end_col:
+                cols.remove(existing)
+        XML.SubElement(cols, tag(SPREADSHEET, "col"), min=str(start_col), max=str(end_col),
+                       width=f"{width:.2f}", customWidth="1")
+        return
+    if op == "xlsx.set_row_height":
+        height = float(operation["height"])
+        if not math.isfinite(height) or not 1.0 <= height <= 409.5:
+            raise ValueError("Row height must be between 1 and 409.5 pt")
+        start_row = bounded_integer(operation.get("row", operation.get("startRow")), 1, 1048576)
+        end_row = bounded_integer(operation.get("endRow", start_row), start_row, min(1048576, start_row + 1000))
+        grid = sheet.find(tag(SPREADSHEET, "sheetData"))
+        if grid is None:
+            grid = sheet_node(sheet, "sheetData")
+        existing_rows = {int(r.get("r", "0")): r for r in grid.findall(tag(SPREADSHEET, "row"))}
+        for r_num in range(start_row, end_row + 1):
+            row_el = existing_rows.get(r_num)
+            if row_el is None:
+                row_el = XML.Element(tag(SPREADSHEET, "row"), r=str(r_num))
+                insert_pos = next((i for i, ch in enumerate(grid) if ch.tag == tag(SPREADSHEET, "row") and int(ch.get("r", "0")) > r_num), len(grid))
+                grid.insert(insert_pos, row_el)
+            row_el.set("ht", f"{height:.2f}")
+            row_el.set("customHeight", "1")
+        return
+    if op == "xlsx.set_freeze_panes":
+        views = sheet_node(sheet, "sheetViews")
+        view = views.find(tag(SPREADSHEET, "sheetView"))
+        if view is None:
+            view = XML.SubElement(views, tag(SPREADSHEET, "sheetView"), workbookViewId="0")
+        for old_pane in list(view.findall(tag(SPREADSHEET, "pane"))):
+            view.remove(old_pane)
+        freeze_row = bounded_integer(operation.get("row", 0), 0, 1000)
+        freeze_col = bounded_integer(operation.get("column", 0), 0, 200)
+        if freeze_row > 0 or freeze_col > 0:
+            top_left = f"{column_name(freeze_col + 1)}{freeze_row + 1}"
+            pane = XML.Element(tag(SPREADSHEET, "pane"), topLeftCell=top_left, state="frozen")
+            if freeze_col > 0:
+                pane.set("xSplit", str(freeze_col))
+            if freeze_row > 0:
+                pane.set("ySplit", str(freeze_row))
+            active_pane = "bottomRight" if (freeze_row > 0 and freeze_col > 0) else ("bottomLeft" if freeze_row > 0 else "topRight")
+            pane.set("activePane", active_pane)
+            view.insert(0, pane)
+        return
+
     reference = operation["range"]
     bounds = bounded_sheet_range(reference)
     if op == "xlsx.set_merge":
@@ -471,19 +1090,51 @@ def update_sheet_options(package, replacements, additions, operation):
         if operation.get("enabled", True):
             kind = operation["kind"]
             validation = XML.SubElement(validations, tag(SPREADSHEET, "dataValidation"), type=kind, sqref=reference,
-                                        allowBlank="1", showErrorMessage="1")
+                                        allowBlank="1" if operation.get("allowBlank", True) else "0",
+                                        showErrorMessage="1")
+            if operation.get("promptTitle") or operation.get("prompt"):
+                validation.set("showInputMessage", "1")
+                if operation.get("promptTitle"):
+                    validation.set("promptTitle", str(operation["promptTitle"])[:64])
+                if operation.get("prompt"):
+                    validation.set("prompt", str(operation["prompt"])[:255])
+            if operation.get("errorTitle"):
+                validation.set("errorTitle", str(operation["errorTitle"])[:64])
+            if operation.get("error"):
+                validation.set("error", str(operation["error"])[:255])
+            allowed_ops = {"between", "notBetween", "equal", "notEqual", "greaterThan", "lessThan", "greaterThanOrEqual", "lessThanOrEqual"}
             if kind == "list":
-                values = operation["values"]
-                if not isinstance(values, list) or not values or any(not isinstance(v, str) or "," in v or '"' in v for v in values):
-                    raise ValueError("Expected a literal list without delimiters")
-                XML.SubElement(validation, tag(SPREADSHEET, "formula1")).text = excel_string_formula(",".join(values))
-            elif kind in {"whole", "decimal", "textLength"}:
-                lower, upper = operation["min"], operation["max"]
-                if any(type(n) not in (int, float) or not math.isfinite(n) for n in (lower, upper)) or lower > upper:
-                    raise ValueError("Invalid validation limits")
-                validation.set("operator", "between")
-                XML.SubElement(validation, tag(SPREADSHEET, "formula1")).text = str(lower)
-                XML.SubElement(validation, tag(SPREADSHEET, "formula2")).text = str(upper)
+                if "formula" in operation and isinstance(operation["formula"], str):
+                    expr = operation["formula"].lstrip("=").strip()
+                    if not expr or len(expr) > 255:
+                        raise ValueError("Invalid list validation formula")
+                    XML.SubElement(validation, tag(SPREADSHEET, "formula1")).text = expr
+                else:
+                    values = operation["values"]
+                    if not isinstance(values, list) or not values or any(not isinstance(v, str) or "," in v or '"' in v for v in values):
+                        raise ValueError("Expected a literal list without delimiters")
+                    XML.SubElement(validation, tag(SPREADSHEET, "formula1")).text = excel_string_formula(",".join(values))
+            elif kind in {"whole", "decimal", "textLength", "date"}:
+                operator = operation.get("operator", "between")
+                if operator not in allowed_ops:
+                    raise ValueError(f"Unsupported validation operator: {operator}")
+                validation.set("operator", operator)
+                if operator in {"between", "notBetween"}:
+                    lower, upper = operation["min"], operation["max"]
+                    if kind != "date" and (any(type(n) not in (int, float) or not math.isfinite(n) for n in (lower, upper)) or lower > upper):
+                        raise ValueError("Invalid validation limits")
+                    XML.SubElement(validation, tag(SPREADSHEET, "formula1")).text = str(lower)
+                    XML.SubElement(validation, tag(SPREADSHEET, "formula2")).text = str(upper)
+                else:
+                    val = operation.get("value", operation.get("min"))
+                    if val is None:
+                        raise ValueError("Validation operator requires value")
+                    XML.SubElement(validation, tag(SPREADSHEET, "formula1")).text = str(val)
+            elif kind == "custom":
+                expr = str(operation["formula"]).lstrip("=").strip()
+                if not expr or len(expr) > 1024:
+                    raise ValueError("Invalid custom validation formula")
+                XML.SubElement(validation, tag(SPREADSHEET, "formula1")).text = expr
             else:
                 raise ValueError("Unsupported validation rule")
         if len(validations):
@@ -492,17 +1143,71 @@ def update_sheet_options(package, replacements, additions, operation):
             sheet.remove(validations)
     elif op == "xlsx.add_conditional_format":
         priority = max([0] + [int(rule.attrib["priority"]) for rule in sheet.iter(tag(SPREADSHEET, "cfRule"))]) + 1
-        container = XML.Element(tag(SPREADSHEET, "conditionalFormatting"), sqref=reference)
-        next_tags = {tag(SPREADSHEET, name) for name in SHEET_CHILDREN[SHEET_CHILDREN.index("conditionalFormatting") + 1:]}
-        sheet.insert(next((i for i, child in enumerate(sheet) if child.tag in next_tags), len(sheet)), container)
-        rule = XML.SubElement(container, tag(SPREADSHEET, "cfRule"), type="colorScale", priority=str(priority))
-        scale = XML.SubElement(rule, tag(SPREADSHEET, "colorScale"))
-        for bound in ("min", "max"):
-            XML.SubElement(scale, tag(SPREADSHEET, "cfvo"), type=bound)
-        for color in (operation["minColor"], operation["maxColor"]):
-            if not re.fullmatch(r"[0-9A-Fa-f]{6}", color):
-                raise ValueError("Use a six-digit RGB color")
-            XML.SubElement(scale, tag(SPREADSHEET, "color"), rgb="FF" + color.upper())
+        container = next((el for el in sheet.findall(tag(SPREADSHEET, "conditionalFormatting")) if el.attrib.get("sqref") == reference), None)
+        if container is None:
+            container = XML.Element(tag(SPREADSHEET, "conditionalFormatting"), sqref=reference)
+            next_tags = {tag(SPREADSHEET, name) for name in SHEET_CHILDREN[SHEET_CHILDREN.index("conditionalFormatting") + 1:]}
+            sheet.insert(next((i for i, child in enumerate(sheet) if child.tag in next_tags), len(sheet)), container)
+        rule_type = operation.get("type", "colorScale")
+        if rule_type == "colorScale":
+            rule = XML.SubElement(container, tag(SPREADSHEET, "cfRule"), type="colorScale", priority=str(priority))
+            scale = XML.SubElement(rule, tag(SPREADSHEET, "colorScale"))
+            has_mid = bool(operation.get("midColor"))
+            bounds_cfg = [("min", None)]
+            if has_mid:
+                bounds_cfg.append((operation.get("midType", "percentile"), str(operation.get("midValue", 50))))
+            bounds_cfg.append(("max", None))
+            for b_type, b_val in bounds_cfg:
+                cfvo = XML.SubElement(scale, tag(SPREADSHEET, "cfvo"), type=b_type)
+                if b_val is not None:
+                    cfvo.set("val", b_val)
+            colors = [operation["minColor"]] + ([operation["midColor"]] if has_mid else []) + [operation["maxColor"]]
+            for color in colors:
+                XML.SubElement(scale, tag(SPREADSHEET, "color"), rgb=normalize_hex_rgb(color))
+        elif rule_type == "dataBar":
+            rule = XML.SubElement(container, tag(SPREADSHEET, "cfRule"), type="dataBar", priority=str(priority))
+            bar = XML.SubElement(rule, tag(SPREADSHEET, "dataBar"))
+            XML.SubElement(bar, tag(SPREADSHEET, "cfvo"), type="min")
+            XML.SubElement(bar, tag(SPREADSHEET, "cfvo"), type="max")
+            XML.SubElement(bar, tag(SPREADSHEET, "color"), rgb=normalize_hex_rgb(operation.get("color", "638EC6")))
+        elif rule_type == "cellIs":
+            operator = operation.get("operator", "greaterThan")
+            allowed_ops = {"lessThan", "lessThanOrEqual", "equal", "notEqual", "greaterThanOrEqual", "greaterThan", "between", "notBetween"}
+            if operator not in allowed_ops:
+                raise ValueError(f"Unsupported cellIs operator: {operator}")
+            dxf_id = allocate_workbook_dxf(package, replacements, additions, operation.get("style", operation))
+            rule = XML.SubElement(container, tag(SPREADSHEET, "cfRule"), type="cellIs", dxfId=str(dxf_id),
+                                  priority=str(priority), operator=operator)
+            f1 = operation.get("formula", operation.get("value"))
+            if f1 is None:
+                raise ValueError("cellIs rule requires formula or value")
+            XML.SubElement(rule, tag(SPREADSHEET, "formula")).text = str(f1).lstrip("=")
+            if operator in {"between", "notBetween"}:
+                f2 = operation.get("formula2", operation.get("value2"))
+                if f2 is None:
+                    raise ValueError("between operator requires formula2 or value2")
+                XML.SubElement(rule, tag(SPREADSHEET, "formula")).text = str(f2).lstrip("=")
+        elif rule_type == "expression":
+            expr = str(operation["formula"]).lstrip("=").strip()
+            if not expr:
+                raise ValueError("expression rule requires formula")
+            dxf_id = allocate_workbook_dxf(package, replacements, additions, operation.get("style", operation))
+            rule = XML.SubElement(container, tag(SPREADSHEET, "cfRule"), type="expression", dxfId=str(dxf_id), priority=str(priority))
+            XML.SubElement(rule, tag(SPREADSHEET, "formula")).text = expr
+        elif rule_type in {"top10", "aboveAverage", "duplicateValues", "uniqueValues"}:
+            dxf_id = allocate_workbook_dxf(package, replacements, additions, operation.get("style", operation))
+            attrs = {"type": rule_type, "dxfId": str(dxf_id), "priority": str(priority)}
+            if rule_type == "top10":
+                attrs["rank"] = str(bounded_integer(operation.get("rank", 10), 1, 1000))
+                if operation.get("bottom"):
+                    attrs["bottom"] = "1"
+                if operation.get("percent"):
+                    attrs["percent"] = "1"
+            elif rule_type == "aboveAverage" and operation.get("above") is False:
+                attrs["aboveAverage"] = "0"
+            XML.SubElement(container, tag(SPREADSHEET, "cfRule"), **attrs)
+        else:
+            raise ValueError(f"Unsupported conditional format type: {rule_type}")
     else:
         raise ValueError("Unsupported worksheet operation")
 
@@ -518,11 +1223,12 @@ def edit_workbook(package, operations, output):
             changes_cells |= edit_chart(package, "xlsx", operation, replacements)
             continue
         if op in {"xlsx.add_sheet", "xlsx.reorder_sheet", "xlsx.rename_sheet", "xlsx.remove_empty_sheet",
-                  "xlsx.set_sheet_visibility", "xlsx.set_defined_name"}:
+                  "xlsx.remove_sheet", "xlsx.duplicate_sheet", "xlsx.set_sheet_visibility", "xlsx.set_defined_name"}:
             update_sheet_metadata(package, replacements, additions, removed, operation)
             changes_cells = True
             continue
-        if op in {"xlsx.set_merge", "xlsx.add_conditional_format", "xlsx.set_data_validation", "xlsx.set_auto_filter", "xlsx.set_page_setup"}:
+        if op in {"xlsx.set_merge", "xlsx.add_conditional_format", "xlsx.set_data_validation", "xlsx.set_auto_filter",
+                  "xlsx.set_page_setup", "xlsx.set_column_width", "xlsx.set_row_height", "xlsx.set_freeze_panes"}:
             update_sheet_options(package, replacements, additions, operation)
             continue
         changes_cells |= op != "xlsx.set_cell_style"
@@ -603,20 +1309,46 @@ def update_workbook_cell(package, operation, replacements, additions=None):
     if op not in {"xlsx.set_cell", "xlsx.set_formula", "xlsx.set_cell_style"}:
         raise ValueError("Unsupported XLSX operation")
     sheet_name = operation["sheetPart"]
-    address = operation["address"]
-    value = operation.get("value")
     if not re.fullmatch(r"xl/worksheets/[^/]+\.xml", sheet_name):
         raise ValueError("Invalid worksheet part")
+    sheet = load_edit_part(package, replacements, additions if additions is not None else {}, sheet_name)
+    if op == "xlsx.set_cell_style":
+        if "range" in operation:
+            (r1, c1), (r2, c2) = bounded_sheet_range(operation["range"])
+            if (r2 - r1 + 1) * (c2 - c1 + 1) > 10_000:
+                raise ValueError("Styled cell range exceeds limit")
+            addresses = [f"{column_name(c)}{r}" for r in range(r1, r2 + 1) for c in range(c1, c2 + 1)]
+        else:
+            addresses = [operation["address"]]
+            cell_coordinates(addresses[0])
+        has_rich_style = any(
+            k in operation for k in (
+                "font", "bold", "italic", "underline", "strike", "fontSizePt", "fontFamily", "fontColor",
+                "fill", "backgroundColor", "border", "alignment", "horizontal", "vertical", "wrapText",
+                "textRotation", "numFmt", "numberFormat",
+            )
+        )
+        if has_rich_style:
+            first_cell = locate_or_insert_cell(sheet, addresses[0])
+            base_idx = int(first_cell.get("s", "0"))
+            style_idx = allocate_workbook_style_index(
+                package, replacements, additions if additions is not None else {}, operation, base_index=base_idx
+            )
+        else:
+            style_idx = bounded_integer(operation["styleIndex"], 0, 65535)
+        for addr in addresses:
+            cell = locate_or_insert_cell(sheet, addr)
+            cell.set("s", str(style_idx))
+        replacements[sheet_name] = sheet
+        return
+
+    address = operation["address"]
+    value = operation.get("value")
     cell_coordinates(address)
     if type(value) not in (str, bool, int, float, type(None)):
         raise ValueError("Expected a scalar cell value")
-    sheet = load_edit_part(package, replacements, additions or {}, sheet_name)
     assert_editable_cell(sheet, address)
     cell = locate_or_insert_cell(sheet, address)
-    if op == "xlsx.set_cell_style":
-        cell.set("s", str(bounded_integer(operation["styleIndex"], 0, 65535)))
-        replacements[sheet_name] = sheet
-        return
     if cell.get("t") == "s" and "xl/sharedStrings.xml" in package.namelist():
         strings = replacements.get("xl/sharedStrings.xml")
         if strings is None:
@@ -753,11 +1485,381 @@ def process_image(request, source, output):
     if encoding in {"JPEG", "BMP"}:
         image = image.convert("RGB")
     image.save(output, format=encoding)
+    if action == "render":
+        crop_png_region(output, request.get("region"))
     return None
 
 
 def image_encoding(value):
     return {"png": "PNG", "jpg": "JPEG", "jpeg": "JPEG", "webp": "WEBP"}[value.lower()]
+
+
+def _pdf_page_content_hash(page):
+    text = page.extract_text() or ""
+    width = round(float(page.mediabox.width), 2)
+    height = round(float(page.mediabox.height), 2)
+    rot = int(page.rotation or 0)
+    annots = len(page.get("/Annots") or [])
+    h = hashlib.sha256(f"{width}x{height}@{rot}|annots={annots}|{text}".encode("utf-8", errors="replace")).hexdigest()
+    return h
+
+
+def _pdf_outline_items(reader, items=None, depth=0):
+    if depth > 6:
+        return []
+    if items is None:
+        try:
+            items = reader.outline
+        except Exception:
+            return []
+    out = []
+    for item in items or []:
+        if isinstance(item, list):
+            out.extend(_pdf_outline_items(reader, item, depth + 1))
+        else:
+            title = getattr(item, "title", None)
+            if title is not None:
+                try:
+                    page_idx = reader.get_destination_page_number(item)
+                except Exception:
+                    page_idx = None
+                out.append({"title": str(title)[:256], "depth": depth, "pageIndex": page_idx})
+        if len(out) >= 200:
+            break
+    return out
+
+
+def _hex_to_rgb_unit(color_hex):
+    cleaned = color_hex.lstrip("#")
+    if not re.fullmatch(r"[0-9A-Fa-f]{6}", cleaned):
+        raise ValueError("Use a six-digit RGB color")
+    return tuple(int(cleaned[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+
+def _register_reportlab_font(text):
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    needs_cjk = any(ord(ch) > 127 for ch in (text or ""))
+    if not needs_cjk:
+        return "Helvetica"
+    font_name = "ArtifactUnicode"
+    if font_name in pdfmetrics.getRegisteredFontNames():
+        return font_name
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ):
+        if Path(path).is_file():
+            try:
+                pdfmetrics.registerFont(TTFont(font_name, path))
+                return font_name
+            except Exception:
+                pass
+    try:
+        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
+        return "HeiseiKakuGo-W5"
+    except Exception:
+        return "Helvetica"
+
+
+def _verify_pdf(source, request):
+    from pypdf import PdfReader
+    from pypdf.errors import PdfReadError
+
+    issues = []
+    checks = []
+
+    def add_check(check_id, status, evidence):
+        checks.append({"id": check_id, "status": status, "evidence": evidence})
+
+    def add_issue(severity, code, message, location=None):
+        entry = {"severity": severity, "code": code, "message": message}
+        if location:
+            entry["location"] = location
+        if len(issues) < 200:
+            issues.append(entry)
+
+    qpdf_enc_info = ""
+    if shutil.which("qpdf"):
+        enc_proc = subprocess.run(["qpdf", "--show-encryption", str(source)], capture_output=True, text=True)
+        qpdf_enc_info = (enc_proc.stdout or enc_proc.stderr or "").strip()
+
+    try:
+        reader = PdfReader(source)
+    except PdfReadError as error:
+        add_issue("error", "PDF_MALFORMED", f"Malformed PDF: {error}")
+        add_check("pdf_structure", "failed", f"pypdf failed to parse PDF: {error}")
+        return {"ok": False, "coverage": "complete", "checks": checks, "issues": issues, "metrics": {}}
+
+    encrypted = bool(reader.is_encrypted)
+    unlocked_empty = False
+    if encrypted:
+        try:
+            unlocked_empty = bool(reader.decrypt(""))
+        except Exception:
+            unlocked_empty = False
+        if not unlocked_empty:
+            add_issue("warning", "PDF_ENCRYPTED_USER_PASSWORD", "PDF requires a user password to decrypt content.")
+            add_check("pdf_encryption", "failed", "PDF is encrypted and requires a user password.")
+            add_check("pdf_structure", "unverified", "Encrypted PDF structure could not be fully read without password.")
+            add_check("pdf_text_extraction", "unverified", "Text extraction blocked by user password encryption.")
+            add_check("pdf_diff", "unverified", "Differential verification blocked by user password encryption.")
+            return {
+                "ok": False,
+                "coverage": "partial",
+                "checks": checks,
+                "issues": issues,
+                "metrics": {"encrypted": True, "userPasswordRequired": True, "encryptionDetail": qpdf_enc_info[:400]},
+            }
+        add_issue("warning", "PDF_ENCRYPTED_OWNER_ONLY", "PDF is encrypted with owner restrictions (empty user password).")
+        add_check("pdf_encryption", "passed", f"Owner-encrypted PDF decrypted with empty user password. {qpdf_enc_info[:200]}".strip())
+    else:
+        add_check("pdf_encryption", "passed", "PDF is unencrypted.")
+
+    count = len(reader.pages)
+    qpdf_errors = 0
+    qpdf_warnings = 0
+    if shutil.which("qpdf"):
+        chk = subprocess.run(["qpdf", "--check", str(source)], capture_output=True, text=True)
+        if chk.returncode == 2:
+            qpdf_errors += 1
+            add_issue("error", "PDF_QPDF_STRUCTURE_ERROR", (chk.stderr or chk.stdout or "qpdf check failed")[:400])
+        elif chk.returncode == 3:
+            qpdf_warnings += 1
+            add_issue("warning", "PDF_QPDF_STRUCTURE_WARNING", (chk.stderr or chk.stdout or "qpdf check warning")[:400])
+    bad_geom = 0
+    for idx, page in enumerate(reader.pages):
+        w, h = float(page.mediabox.width), float(page.mediabox.height)
+        if not (0 < w <= 14400 and 0 < h <= 14400):
+            bad_geom += 1
+            add_issue("error", "PDF_INVALID_PAGE_BOUNDS", f"Page {idx + 1} mediabox {w}x{h}pt is out of bounds.", f"page:{idx + 1}")
+    if not 1 <= count <= 1000:
+        bad_geom += 1
+        add_issue("error", "PDF_PAGE_COUNT_OUT_OF_BOUNDS", f"PDF page count {count} is out of bounds (1..1000).")
+    add_check(
+        "pdf_structure",
+        "failed" if (qpdf_errors or bad_geom) else "passed",
+        f"Inspected {count} page(s); invalid page bounds: {bad_geom}; qpdf errors: {qpdf_errors}, warnings: {qpdf_warnings}.",
+    )
+
+    total_chars = 0
+    empty_pages = []
+    page_texts = []
+    page_hashes = []
+    extract_errors = 0
+    for idx, page in enumerate(reader.pages):
+        try:
+            txt = (page.extract_text() or "").strip()
+        except Exception as exc:
+            extract_errors += 1
+            txt = ""
+            add_issue("error", "PDF_TEXT_EXTRACTION_ERROR", f"Failed extracting text on page {idx + 1}: {exc}", f"page:{idx + 1}")
+        page_texts.append(txt)
+        total_chars += len(txt)
+        if not txt:
+            empty_pages.append(idx + 1)
+        page_hashes.append(_pdf_page_content_hash(page))
+    if empty_pages and len(empty_pages) == count:
+        add_issue("info", "PDF_NO_EXTRACTABLE_TEXT", "No extractable text found on any page (may be image-only or blank).")
+    add_check(
+        "pdf_text_extraction",
+        "failed" if extract_errors else "passed",
+        f"Extracted {total_chars} character(s) across {count} page(s); pages without text: {len(empty_pages)}.",
+    )
+
+    diff_metrics = {}
+    compare_path = source.parent / "compare"
+    if request.get("hasCompareDocument") and compare_path.is_file():
+        try:
+            prev_reader = PdfReader(compare_path)
+            if prev_reader.is_encrypted:
+                prev_reader.decrypt("")
+            prev_count = len(prev_reader.pages)
+            changed_text_pages = []
+            changed_geom_pages = []
+            max_mae = 0.0
+            min_ssim = 1.0
+            for idx in range(min(count, prev_count)):
+                prev_p = prev_reader.pages[idx]
+                curr_p = reader.pages[idx]
+                prev_txt = (prev_p.extract_text() or "").strip()
+                if prev_txt != page_texts[idx]:
+                    changed_text_pages.append(idx + 1)
+                if (
+                    round(float(prev_p.mediabox.width), 1) != round(float(curr_p.mediabox.width), 1)
+                    or round(float(prev_p.mediabox.height), 1) != round(float(curr_p.mediabox.height), 1)
+                    or int(prev_p.rotation or 0) != int(curr_p.rotation or 0)
+                ):
+                    changed_geom_pages.append(idx + 1)
+            if shutil.which("pdftoppm"):
+                from PIL import Image
+                for idx in range(min(3, count, prev_count)):
+                    p1 = Path.cwd() / f"diff-prev-{idx}"
+                    p2 = Path.cwd() / f"diff-curr-{idx}"
+                    subprocess.run(["pdftoppm", "-f", str(idx + 1), "-l", str(idx + 1), "-scale-to", "512", "-singlefile", "-png", str(compare_path), str(p1)], check=True)
+                    subprocess.run(["pdftoppm", "-f", str(idx + 1), "-l", str(idx + 1), "-scale-to", "512", "-singlefile", "-png", str(source), str(p2)], check=True)
+                    with Image.open(str(p1) + ".png") as im1, Image.open(str(p2) + ".png") as im2:
+                        ssim_val, mae_val = compute_image_ssim_and_mae(im1, im2)
+                        min_ssim = min(min_ssim, ssim_val)
+                        max_mae = max(max_mae, mae_val)
+            diff_metrics = {
+                "previousPageCount": prev_count,
+                "currentPageCount": count,
+                "pageCountDelta": count - prev_count,
+                "changedTextPages": changed_text_pages,
+                "changedGeometryPages": changed_geom_pages,
+                "sampledMinSsim": round(min_ssim, 4),
+                "sampledMaxMae": round(max_mae, 2),
+            }
+            add_check(
+                "pdf_diff",
+                "passed",
+                f"Compared against previous revision ({prev_count} -> {count} pages); text changed on {len(changed_text_pages)} page(s), geometry changed on {len(changed_geom_pages)} page(s), sampled min SSIM={min_ssim:.4f}, max MAE={max_mae:.2f}.",
+            )
+        except Exception as exc:
+            add_check("pdf_diff", "unverified", f"Previous revision could not be compared: {exc}")
+    else:
+        add_check(
+            "pdf_diff",
+            "passed",
+            f"Baseline revision recorded with {count} per-page content hash(es); no previous revision to diff.",
+        )
+
+    return {
+        "ok": not any(c["status"] == "failed" for c in checks) and not any(i["severity"] == "error" for i in issues),
+        "coverage": "partial" if any(c["status"] == "unverified" for c in checks) else "complete",
+        "checks": checks,
+        "issues": issues,
+        "metrics": {
+            "pageCount": count,
+            "encrypted": encrypted,
+            "totalChars": total_chars,
+            "emptyTextPages": empty_pages,
+            "pageContentHashes": page_hashes[:50],
+            **({"diff": diff_metrics} if diff_metrics else {}),
+        },
+    }
+
+
+def _draw_pdf_overlay(original_page, operation):
+    from pypdf import PdfReader
+    from reportlab.pdfgen.canvas import Canvas
+
+    rect = tuple(float(coordinate) for coordinate in operation["rect"])
+    if len(rect) != 4 or not all(math.isfinite(value) and abs(value) <= 14400 for value in rect) \
+            or rect[0] >= rect[2] or rect[1] >= rect[3]:
+        raise ValueError("Invalid overlay rectangle")
+    width, height = float(original_page.mediabox.width), float(original_page.mediabox.height)
+    if not 0 < width <= 14400 or not 0 < height <= 14400:
+        raise ValueError("PDF overlay page geometry is out of bounds")
+
+    x0, y0, x1, y1 = rect
+    if operation.get("origin") == "top-left":
+        x0, y0, x1, y1 = rect[0], height - rect[3], rect[2], height - rect[1]
+    box_w = x1 - x0
+    box_h = y1 - y0
+    kind = operation.get("kind", "text")
+    opacity = float(operation.get("opacity", 0.35 if kind == "highlight" else 1.0))
+    if not math.isfinite(opacity) or not 0.0 <= opacity <= 1.0:
+        raise ValueError("Overlay opacity must be in [0, 1]")
+
+    drawing = io.BytesIO()
+    canvas = Canvas(drawing, pagesize=(width, height), invariant=1)
+    canvas.saveState()
+    if opacity < 1.0:
+        canvas.setFillAlpha(opacity)
+        canvas.setStrokeAlpha(opacity)
+
+    rotation = float(operation.get("rotationDegrees", 0))
+    if rotation:
+        if not math.isfinite(rotation) or abs(rotation) > 360:
+            raise ValueError("Invalid overlay rotation")
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        canvas.translate(cx, cy)
+        canvas.rotate(rotation)
+        canvas.translate(-cx, -cy)
+
+    if kind == "highlight":
+        r, g, b = _hex_to_rgb_unit(operation.get("color", "FFF176"))
+        canvas.setFillColorRGB(r, g, b)
+        canvas.rect(x0, y0, box_w, box_h, stroke=0, fill=1)
+    elif kind == "rect":
+        bg = operation.get("backgroundColor", operation.get("fill"))
+        bc = operation.get("borderColor", operation.get("color", "1F2937"))
+        bw = float(operation.get("borderWidthPt", 1.0))
+        if bg:
+            canvas.setFillColorRGB(*_hex_to_rgb_unit(bg))
+        if bc and bw > 0:
+            canvas.setStrokeColorRGB(*_hex_to_rgb_unit(bc))
+            canvas.setLineWidth(max(0.1, min(20.0, bw)))
+        canvas.rect(x0, y0, box_w, box_h, stroke=1 if (bc and bw > 0) else 0, fill=1 if bg else 0)
+    elif kind == "line":
+        bc = operation.get("color", operation.get("borderColor", "1F2937"))
+        bw = float(operation.get("borderWidthPt", 1.5))
+        canvas.setStrokeColorRGB(*_hex_to_rgb_unit(bc))
+        canvas.setLineWidth(max(0.1, min(20.0, bw)))
+        canvas.line(x0, y0, x1, y1)
+    elif kind == "image":
+        from reportlab.lib.utils import ImageReader
+        img_bytes, _fmt = safe_image(operation["imageBase64"])
+        canvas.drawImage(ImageReader(io.BytesIO(img_bytes)), x0, y0, width=box_w, height=box_h, mask="auto")
+    elif kind in {"text", "stamp"}:
+        text = str(operation.get("text", ""))[:10_000]
+        font_size = float(operation.get("fontSizePt", 14 if kind == "stamp" else 11))
+        if not math.isfinite(font_size) or not 4 <= font_size <= 200:
+            raise ValueError("Overlay fontSizePt must be between 4 and 200")
+        bg = operation.get("backgroundColor")
+        bc = operation.get("borderColor") or ("DC2626" if kind == "stamp" else None)
+        bw = float(operation.get("borderWidthPt", 2.0 if kind == "stamp" else 1.0))
+        if bg or bc:
+            if bg:
+                canvas.setFillColorRGB(*_hex_to_rgb_unit(bg))
+            if bc:
+                canvas.setStrokeColorRGB(*_hex_to_rgb_unit(bc))
+                canvas.setLineWidth(max(0.2, min(12.0, bw)))
+            canvas.rect(x0, y0, box_w, box_h, stroke=1 if bc else 0, fill=1 if bg else 0)
+        font_name = _register_reportlab_font(text)
+        canvas.setFont(font_name, font_size)
+        text_color = operation.get("color", "DC2626" if kind == "stamp" else "111827")
+        canvas.setFillColorRGB(*_hex_to_rgb_unit(text_color))
+        alignment = operation.get("alignment", "center" if kind == "stamp" else "left")
+        pad = 4.0
+        usable_w = max(10.0, box_w - pad * 2)
+        wrapped_lines = []
+        for raw_line in (text.splitlines() or [""]):
+            if not raw_line:
+                wrapped_lines.append("")
+                continue
+            current = ""
+            for ch in raw_line:
+                candidate = current + ch
+                if canvas.stringWidth(candidate, font_name, font_size) > usable_w and current:
+                    wrapped_lines.append(current)
+                    current = ch
+                else:
+                    current = candidate
+            if current:
+                wrapped_lines.append(current)
+        leading = font_size * 1.25
+        y_cursor = y1 - pad - font_size if kind != "stamp" else (y0 + y1) / 2.0 + ((len(wrapped_lines) - 1) * leading / 2.0) - font_size * 0.35
+        for line in wrapped_lines[:200]:
+            if y_cursor < y0 - font_size:
+                break
+            if alignment == "center":
+                canvas.drawCentredString((x0 + x1) / 2.0, y_cursor, line)
+            elif alignment == "right":
+                canvas.drawRightString(x1 - pad, y_cursor, line)
+            else:
+                canvas.drawString(x0 + pad, y_cursor, line)
+            y_cursor -= leading
+    else:
+        raise ValueError(f"Unsupported PDF overlay kind: {kind}")
+
+    canvas.restoreState()
+    canvas.save()
+    drawing.seek(0)
+    original_page.merge_page(PdfReader(drawing).pages[0])
 
 
 def process_pdf(request, source, output):
@@ -788,6 +1890,8 @@ def process_pdf(request, source, output):
                 bounded_integer(options.get("height", 792), 72, 2880))
         canvas = Canvas(str(output), pagesize=size, invariant=1)
         for text in pages:
+            font_name = _register_reportlab_font(text)
+            canvas.setFont(font_name, 11)
             y = size[1] - 36
             for line in text.splitlines()[:100]:
                 canvas.drawString(36, y, line[:1000])
@@ -795,29 +1899,90 @@ def process_pdf(request, source, output):
             canvas.showPage()
         canvas.save()
         return None
+    if action == "verify":
+        return _verify_pdf(source, request)
     try:
         reader = PdfReader(source)
-        if reader.is_encrypted:
-            raise ValueError("Encrypted PDFs are unsupported")
+        encrypted = bool(reader.is_encrypted)
+        if encrypted:
+            unlocked = False
+            try:
+                unlocked = bool(reader.decrypt(""))
+            except Exception:
+                unlocked = False
+            if not unlocked:
+                if action == "structure":
+                    return {
+                        "format": "pdf",
+                        "encrypted": True,
+                        "userPasswordRequired": True,
+                        "pageCount": 0,
+                        "pages": [],
+                    }
+                raise ValueError("Encrypted PDFs require a password")
         count = len(reader.pages)
     except PdfReadError as error:
         raise ValueError("Malformed PDF") from error
     if not 1 <= count <= 1000:
         raise ValueError("PDF page count is out of bounds")
     if action == "structure":
-        return {"format": "pdf", "pageCount": count, "pages": [
-            {"pageIndex": index, "widthPt": float(page.mediabox.width),
-             "heightPt": float(page.mediabox.height), "rotation": page.rotation}
-            for index, page in enumerate(reader.pages)
-        ]}
-    if action == "verify":
-        for page in reader.pages:
-            if not (0 < page.mediabox.width <= 14400 and 0 < page.mediabox.height <= 14400):
-                raise ValueError("PDF page geometry is out of bounds")
-        return {"ok": True, "issues": [], "metrics": {"pageCount": count}}
+        meta = reader.metadata or {}
+        pages_info = []
+        for index, page in enumerate(reader.pages):
+            annots_raw = page.get("/Annots") or []
+            annots_list = []
+            for a_ref in annots_raw[:100]:
+                try:
+                    a_obj = a_ref.get_object()
+                    annots_list.append({
+                        "subtype": str(a_obj.get("/Subtype", "")),
+                        "contents": str(a_obj.get("/Contents", ""))[:200],
+                    })
+                except Exception:
+                    pass
+            page_text = page.extract_text() or ""
+            has_images = False
+            try:
+                has_images = len(page.images) > 0
+            except Exception:
+                pass
+            pages_info.append({
+                "pageIndex": index,
+                "widthPt": float(page.mediabox.width),
+                "heightPt": float(page.mediabox.height),
+                "rotation": int(page.rotation or 0),
+                "charCount": len(page_text),
+                "hasImages": has_images,
+                "annotationCount": len(annots_raw),
+                "annotations": annots_list,
+                "pageContentHash": _pdf_page_content_hash(page),
+            })
+        return {
+            "format": "pdf",
+            "encrypted": encrypted,
+            "pageCount": count,
+            "metadata": {
+                "title": str(meta.get("/Title", "")) if meta.get("/Title") else None,
+                "author": str(meta.get("/Author", "")) if meta.get("/Author") else None,
+                "subject": str(meta.get("/Subject", "")) if meta.get("/Subject") else None,
+                "creator": str(meta.get("/Creator", "")) if meta.get("/Creator") else None,
+                "producer": str(meta.get("/Producer", "")) if meta.get("/Producer") else None,
+            },
+            "hasFormFields": bool(reader.get_fields()),
+            "outline": _pdf_outline_items(reader),
+            "pages": pages_info,
+        }
     if action == "range":
         first = bounded_integer(request["range"].get("pageIndex", 0), 0, count - 1)
-        return {"pageIndex": first, "text": (reader.pages[first].extract_text() or "")[:50_000]}
+        last = bounded_integer(request["range"].get("endPageIndex", first), first, min(count - 1, first + 19))
+        if last == first:
+            return {"pageIndex": first, "text": (reader.pages[first].extract_text() or "")[:50_000]}
+        pages_text = [
+            {"pageIndex": idx, "text": (reader.pages[idx].extract_text() or "")[:25_000]}
+            for idx in range(first, last + 1)
+        ]
+        return {"pageIndex": first, "endPageIndex": last, "pages": pages_text,
+                "text": "\n\n".join(p["text"] for p in pages_text)[:50_000]}
     if action == "export" and request["targetFormat"] == "txt":
         with output.open("w", encoding="utf-8") as destination:
             remaining = 1_000_000
@@ -830,10 +1995,15 @@ def process_pdf(request, source, output):
         return None
     if action == "render" or (action == "export" and request["targetFormat"] == "png"):
         index = bounded_integer(request.get("pageIndex", 0), 0, count - 1)
+        page_obj = reader.pages[index]
+        page_size_pt = (float(page_obj.mediabox.width), float(page_obj.mediabox.height))
+        if int(page_obj.rotation or 0) % 180 == 90:
+            page_size_pt = (page_size_pt[1], page_size_pt[0])
         prefix = str(output) + "-image"
         subprocess.run(["pdftoppm", "-f", str(index + 1), "-l", str(index + 1), "-scale-to", "2048",
                         "-singlefile", "-png", str(source), prefix], check=True)
         Path(prefix + ".png").replace(output)
+        crop_png_region(output, request.get("region"), page_size_pt=page_size_pt)
         return None
     if action != "edit":
         raise ValueError("Unsupported PDF action")
@@ -841,17 +2011,24 @@ def process_pdf(request, source, output):
     writer = PdfWriter(clone_from=reader)
     for operation in request["operations"]:
         op = operation["op"]
+        if op in {"pdf.delete_text", "pdf.reflow_text", "edit_body_reflow"}:
+            raise UnsupportedByFormatError("PDF existing body text deletion/reflow is not supported by format policy.")
         if op == "pdf.reorder_pages":
             order = operation["order"]
             if len(order) != len(writer.pages) or sorted(order) != list(range(len(writer.pages))):
                 raise ValueError("The page order must be a complete permutation")
-            # Reorder the page tree references without replacing the source page objects.
-            if writer._pages.get_object()["/Count"] != len(writer._pages.get_object()["/Kids"]):
-                raise ValueError("Nested PDF page trees cannot be reordered")
-            from pypdf.generic import ArrayObject, NameObject
             page_tree = writer._pages.get_object()
-            children = page_tree["/Kids"]
-            page_tree[NameObject("/Kids")] = ArrayObject(children[index] for index in order)
+            if page_tree["/Count"] == len(page_tree["/Kids"]):
+                from pypdf.generic import ArrayObject, NameObject
+                children = page_tree["/Kids"]
+                page_tree[NameObject("/Kids")] = ArrayObject(children[index] for index in order)
+            else:
+                rebuilt = PdfWriter()
+                for index in order:
+                    rebuilt.add_page(writer.pages[index])
+                if writer.metadata:
+                    rebuilt.add_metadata(dict(writer.metadata))
+                writer = rebuilt
         else:
             index = bounded_integer(operation["pageIndex"], 0, len(writer.pages) - 1)
             if op == "pdf.remove_page":
@@ -861,26 +2038,15 @@ def process_pdf(request, source, output):
             elif op == "pdf.rotate_page":
                 angle = bounded_integer(operation["degrees"], -360, 360)
                 writer.pages[index].rotate(angle)
-            elif op in {"pdf.add_note", "pdf.add_overlay"}:
+            elif op == "pdf.add_note":
                 rect = tuple(float(coordinate) for coordinate in operation["rect"])
                 if len(rect) != 4 or not all(math.isfinite(value) and abs(value) <= 14400 for value in rect) \
                         or rect[0] >= rect[2] or rect[1] >= rect[3]:
                     raise ValueError("Invalid annotation rectangle")
-                text = operation["text"][:10_000]
-                if op == "pdf.add_note":
-                    writer.add_annotation(index, Text(text=text, rect=rect))
-                else:
-                    from reportlab.pdfgen.canvas import Canvas
-                    drawing = io.BytesIO()
-                    original = writer.pages[index]
-                    width, height = float(original.mediabox.width), float(original.mediabox.height)
-                    if not 0 < width <= 14400 or not 0 < height <= 14400:
-                        raise ValueError("PDF overlay page geometry is out of bounds")
-                    canvas = Canvas(drawing, pagesize=(width, height), invariant=1)
-                    canvas.drawString(rect[0], rect[1], text.splitlines()[0][:1000] if text else "")
-                    canvas.save()
-                    drawing.seek(0)
-                    original.merge_page(PdfReader(drawing).pages[0])
+                text = str(operation["text"])[:10_000]
+                writer.add_annotation(index, Text(text=text, rect=rect))
+            elif op == "pdf.add_overlay":
+                _draw_pdf_overlay(writer.pages[index], operation)
             else:
                 raise ValueError("Unsupported PDF operation")
     writer.write(output)
@@ -933,6 +2099,8 @@ def process_media(request, source, output):
     else:
         raise ValueError("Unsupported media action")
     subprocess.run(command + [str(output)], check=True)
+    if action == "render":
+        crop_png_region(output, request.get("region"))
     return None
 
 
@@ -1454,17 +2622,271 @@ def add_word_media(package, replacements, additions, source, paragraph, operatio
     paragraph.append(drawing)
 
 
+PROTECTED_WORD_RUN_CHILDREN = {
+    tag(WORD, name) for name in (
+        "fldChar", "instrText", "drawing", "pict", "object",
+        "footnoteReference", "endnoteReference", "commentReference",
+    )
+}
+PROTECTED_WORD_PARA_CHILDREN = {
+    tag(WORD, name) for name in (
+        "hyperlink", "sdt", "fldSimple", "ins", "del", "smartTag", "customXml",
+    )
+}
+
+
+def _apply_word_run_props(run, spec):
+    props = xml_child(run, WORD, "rPr", ("t", "br", "tab"))
+    trailing = ("color", "spacing", "w", "kern", "position", "sz", "szCs", "highlight", "u", "shd", "vertAlign", "lang", "rPrChange")
+    if "fontFamily" in spec and spec["fontFamily"]:
+        font = str(spec["fontFamily"])[:128]
+        fonts = xml_child(props, WORD, "rFonts", ("b", "bCs", "i", "iCs", "strike") + trailing)
+        for field in ("ascii", "hAnsi", "eastAsia", "cs"):
+            fonts.set(tag(WORD, field), font)
+    for option, element in (("bold", "b"), ("italic", "i"), ("strike", "strike")):
+        if option in spec:
+            before = (("i", "iCs", "strike") if option == "bold" else (("strike",) if option == "italic" else ())) + trailing
+            xml_child(props, WORD, element, before).set(tag(WORD, "val"), "1" if spec[option] is True else "0")
+    color_val = spec.get("color", spec.get("fontColor"))
+    if color_val is not None:
+        cleaned = str(color_val).lstrip("#")
+        if not re.fullmatch(r"[0-9A-Fa-f]{6}", cleaned):
+            raise ValueError("Use a six-digit RGB color")
+        node = xml_child(props, WORD, "color", trailing[1:])
+        node.attrib.clear()
+        node.set(tag(WORD, "val"), cleaned.upper())
+    if "fontSizePt" in spec:
+        half_pt = str(bounded_integer(round(float(spec["fontSizePt"]) * 2), 2, 800))
+        xml_child(props, WORD, "sz", ("szCs", "highlight", "u", "shd", "vertAlign", "lang", "rPrChange")).set(tag(WORD, "val"), half_pt)
+        xml_child(props, WORD, "szCs", ("highlight", "u", "shd", "vertAlign", "lang", "rPrChange")).set(tag(WORD, "val"), half_pt)
+    if "highlight" in spec:
+        hl = str(spec["highlight"])
+        allowed_hl = {"yellow", "green", "cyan", "magenta", "blue", "red", "darkBlue", "darkCyan",
+                      "darkGreen", "darkMagenta", "darkRed", "darkYellow", "darkGray", "lightGray", "black", "white", "none"}
+        if hl not in allowed_hl:
+            raise ValueError(f"Unsupported highlight color: {hl}")
+        xml_child(props, WORD, "highlight", ("u", "shd", "vertAlign", "lang", "rPrChange")).set(tag(WORD, "val"), hl)
+    if "underline" in spec:
+        u_val = "single" if spec["underline"] is True else ("none" if spec["underline"] is False else str(spec["underline"]))
+        if u_val not in {"single", "double", "thick", "dotted", "dash", "wave", "none"}:
+            raise ValueError(f"Unsupported underline style: {u_val}")
+        xml_child(props, WORD, "u", ("shd", "vertAlign", "lang", "rPrChange")).set(tag(WORD, "val"), u_val)
+    if "shading" in spec or "backgroundColor" in spec:
+        bg = str(spec.get("shading", spec.get("backgroundColor"))).lstrip("#")
+        if not re.fullmatch(r"[0-9A-Fa-f]{6}", bg):
+            raise ValueError("Use a six-digit RGB color")
+        shd = xml_child(props, WORD, "shd", ("vertAlign", "lang", "rPrChange"))
+        shd.set(tag(WORD, "val"), "clear")
+        shd.set(tag(WORD, "color"), "auto")
+        shd.set(tag(WORD, "fill"), bg.upper())
+    if "vertAlign" in spec:
+        va = str(spec["vertAlign"])
+        if va not in {"baseline", "superscript", "subscript"}:
+            raise ValueError(f"Unsupported vertAlign: {va}")
+        xml_child(props, WORD, "vertAlign", ("lang", "rPrChange")).set(tag(WORD, "val"), va)
+
+
+def _set_run_multiline_text(run, text):
+    for child in list(run):
+        if child.tag in {tag(WORD, "t"), tag(WORD, "br")}:
+            run.remove(child)
+    lines = str(text)[:20_000].split("\n")
+    for idx, segment in enumerate(lines):
+        if idx > 0:
+            XML.SubElement(run, tag(WORD, "br"))
+        t = XML.SubElement(run, tag(WORD, "t"))
+        t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        t.text = segment
+
+
+def _read_word_styles_readonly(package, replacements, additions):
+    part = "word/styles.xml"
+    if part in replacements:
+        return replacements[part]
+    if part in additions:
+        val = additions[part]
+        return parse_xml(val) if isinstance(val, (bytes, bytearray)) else val
+    return parse_xml(package.read(part))
+
+
+def _ensure_word_heading_style(package, replacements, additions, style_id):
+    m = re.fullmatch(r"Heading([1-9])", str(style_id))
+    if not m:
+        return
+    part = "word/styles.xml"
+    if part not in package.namelist() and part not in additions:
+        return
+    ro_styles = _read_word_styles_readonly(package, replacements, additions)
+    if any(n.get(tag(WORD, "styleId")) == style_id for n in ro_styles.findall(tag(WORD, "style"))):
+        return
+    styles = load_edit_part(package, replacements, additions, part)
+    level = int(m.group(1))
+    sizes_half_pt = {1: 32, 2: 26, 3: 24, 4: 22, 5: 20, 6: 20, 7: 20, 8: 20, 9: 20}
+    style_el = XML.SubElement(styles, tag(WORD, "style"))
+    style_el.set(tag(WORD, "type"), "paragraph")
+    style_el.set(tag(WORD, "styleId"), style_id)
+    XML.SubElement(style_el, tag(WORD, "name")).set(tag(WORD, "val"), f"heading {level}")
+    ppr = XML.SubElement(style_el, tag(WORD, "pPr"))
+    XML.SubElement(ppr, tag(WORD, "keepNext"))
+    XML.SubElement(ppr, tag(WORD, "outlineLvl")).set(tag(WORD, "val"), str(level - 1))
+    rpr = XML.SubElement(style_el, tag(WORD, "rPr"))
+    XML.SubElement(rpr, tag(WORD, "b"))
+    XML.SubElement(rpr, tag(WORD, "sz")).set(tag(WORD, "val"), str(sizes_half_pt[level]))
+    XML.SubElement(rpr, tag(WORD, "szCs")).set(tag(WORD, "val"), str(sizes_half_pt[level]))
+
+
+def _apply_word_paragraph_props(package, replacements, additions, paragraph, operation):
+    ppr = xml_child(paragraph, WORD, "pPr", ("r", "hyperlink", "sdt", "bookmarkStart", "bookmarkEnd"))
+    if "styleId" in operation and operation["styleId"]:
+        _ensure_word_heading_style(package, replacements, additions, operation["styleId"])
+        styles = _read_word_styles_readonly(package, replacements, additions)
+        style_id = str(operation["styleId"])
+        if not any(n.get(tag(WORD, "type")) == "paragraph" and n.get(tag(WORD, "styleId")) == style_id
+                   for n in styles.findall(tag(WORD, "style"))):
+            raise ValueError(f"Unknown paragraph style: {style_id}")
+        xml_child(ppr, WORD, "pStyle", ("keepNext", "keepLines", "pageBreakBefore", "numPr", "pBdr", "shd", "spacing", "ind", "jc")).set(
+            tag(WORD, "val"), style_id
+        )
+    if "headingLevel" in operation:
+        h_id = f"Heading{bounded_integer(operation['headingLevel'], 1, 9)}"
+        _ensure_word_heading_style(package, replacements, additions, h_id)
+        xml_child(ppr, WORD, "pStyle", ("keepNext", "keepLines", "pageBreakBefore", "numPr", "pBdr", "shd", "spacing", "ind", "jc")).set(
+            tag(WORD, "val"), h_id
+        )
+    for flag_key, el_name, before in (
+        ("keepNext", "keepNext", ("keepLines", "pageBreakBefore", "numPr", "pBdr", "shd", "spacing", "ind", "jc")),
+        ("keepLines", "keepLines", ("pageBreakBefore", "numPr", "pBdr", "shd", "spacing", "ind", "jc")),
+        ("pageBreakBefore", "pageBreakBefore", ("numPr", "pBdr", "shd", "spacing", "ind", "jc")),
+    ):
+        if flag_key in operation:
+            existing = ppr.find(tag(WORD, el_name))
+            if operation[flag_key]:
+                if existing is None:
+                    xml_child(ppr, WORD, el_name, before)
+            elif existing is not None:
+                ppr.remove(existing)
+    if isinstance(operation.get("borders"), dict):
+        pbdr = xml_child(ppr, WORD, "pBdr", ("shd", "spacing", "ind", "jc"))
+        for side in ("top", "bottom", "left", "right"):
+            cfg = operation["borders"].get(side)
+            if not isinstance(cfg, dict):
+                continue
+            b_el = xml_child(pbdr, WORD, side)
+            b_el.set(tag(WORD, "val"), str(cfg.get("style", "single")))
+            b_el.set(tag(WORD, "sz"), str(bounded_integer(round(float(cfg.get("sizePt", 0.75)) * 8), 2, 96)))
+            b_el.set(tag(WORD, "space"), "4")
+            b_el.set(tag(WORD, "color"), str(cfg.get("color", "000000")).lstrip("#").upper())
+    bg = operation.get("backgroundColor", operation.get("shading"))
+    if bg is not None:
+        cleaned = str(bg).lstrip("#")
+        if not re.fullmatch(r"[0-9A-Fa-f]{6}", cleaned):
+            raise ValueError("Use a six-digit RGB color")
+        shd = xml_child(ppr, WORD, "shd", ("spacing", "ind", "jc"))
+        shd.set(tag(WORD, "val"), "clear")
+        shd.set(tag(WORD, "color"), "auto")
+        shd.set(tag(WORD, "fill"), cleaned.upper())
+    if any(k in operation for k in ("spaceBeforePt", "spaceAfterPt", "lineSpacing")):
+        sp = xml_child(ppr, WORD, "spacing", ("ind", "jc"))
+        if "spaceBeforePt" in operation:
+            sp.set(tag(WORD, "before"), str(bounded_integer(round(float(operation["spaceBeforePt"]) * 20), 0, 14400)))
+        if "spaceAfterPt" in operation:
+            sp.set(tag(WORD, "after"), str(bounded_integer(round(float(operation["spaceAfterPt"]) * 20), 0, 14400)))
+        if "lineSpacing" in operation:
+            ls = float(operation["lineSpacing"])
+            if not math.isfinite(ls) or not 0.5 <= ls <= 10.0:
+                raise ValueError("lineSpacing multiplier must be between 0.5 and 10")
+            sp.set(tag(WORD, "line"), str(int(round(ls * 240))))
+            sp.set(tag(WORD, "lineRule"), "auto")
+    if any(k in operation for k in ("indentLeftPt", "indentRightPt", "firstLineIndentPt", "hangingIndentPt")):
+        ind = xml_child(ppr, WORD, "ind", ("jc",))
+        for key, attr in (
+            ("indentLeftPt", "left"), ("indentRightPt", "right"),
+            ("firstLineIndentPt", "firstLine"), ("hangingIndentPt", "hanging"),
+        ):
+            if key in operation:
+                ind.set(tag(WORD, attr), str(bounded_integer(round(float(operation[key]) * 20), 0, 14400)))
+    if "alignment" in operation:
+        al = str(operation["alignment"])
+        al_map = {"left": "left", "center": "center", "right": "right", "justify": "both", "both": "both"}
+        if al not in al_map:
+            raise ValueError(f"Unsupported paragraph alignment: {al}")
+        xml_child(ppr, WORD, "jc").set(tag(WORD, "val"), al_map[al])
+
+
+def _ensure_word_numbering_definition(package, replacements, additions, list_type):
+    part = "word/numbering.xml"
+    if part not in package.namelist() and part not in additions:
+        root = XML.Element(tag(WORD, "numbering"), nsmap={"w": WORD})
+        add_package_part(
+            package, replacements, additions, MAIN_PART["docx"], part, "numbering",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml",
+            XML.tostring(root),
+        )
+    numbering = load_edit_part(package, replacements, additions, part)
+    fmt_map = {
+        "bullet": ("bullet", "•"),
+        "decimal": ("decimal", "%1."),
+        "lowerLetter": ("lowerLetter", "%1)"),
+        "upperRoman": ("upperRoman", "%1."),
+    }
+    if list_type not in fmt_map:
+        raise ValueError(f"Unsupported listType: {list_type}")
+    num_fmt, lvl_text = fmt_map[list_type]
+
+    existing_abstracts = [int(n.get(tag(WORD, "abstractNumId"), "0")) for n in numbering.findall(tag(WORD, "abstractNum"))]
+    existing_nums = [int(n.get(tag(WORD, "numId"), "0")) for n in numbering.findall(tag(WORD, "num"))]
+    abs_id = str(max([-1] + existing_abstracts) + 1)
+    num_id = str(max([0] + existing_nums) + 1)
+
+    abs_el = XML.Element(tag(WORD, "abstractNum"))
+    abs_el.set(tag(WORD, "abstractNumId"), abs_id)
+    for lvl in range(9):
+        lvl_el = XML.SubElement(abs_el, tag(WORD, "lvl"))
+        lvl_el.set(tag(WORD, "ilvl"), str(lvl))
+        XML.SubElement(lvl_el, tag(WORD, "start")).set(tag(WORD, "val"), "1")
+        XML.SubElement(lvl_el, tag(WORD, "numFmt")).set(tag(WORD, "val"), num_fmt)
+        XML.SubElement(lvl_el, tag(WORD, "lvlText")).set(tag(WORD, "val"), lvl_text if list_type == "bullet" else f"%{lvl + 1}.")
+        XML.SubElement(lvl_el, tag(WORD, "lvlJc")).set(tag(WORD, "val"), "left")
+        ppr = XML.SubElement(lvl_el, tag(WORD, "pPr"))
+        ind = XML.SubElement(ppr, tag(WORD, "ind"))
+        ind.set(tag(WORD, "left"), str((lvl + 1) * 720))
+        ind.set(tag(WORD, "hanging"), "360")
+    first_num = numbering.find(tag(WORD, "num"))
+    if first_num is not None:
+        numbering.insert(list(numbering).index(first_num), abs_el)
+    else:
+        numbering.append(abs_el)
+
+    num_el = XML.SubElement(numbering, tag(WORD, "num"))
+    num_el.set(tag(WORD, "numId"), num_id)
+    XML.SubElement(num_el, tag(WORD, "abstractNumId")).set(tag(WORD, "val"), abs_id)
+    return num_id
+
+
 def add_word_header_footer(package, replacements, additions, body, operation):
     kind = operation["kind"]
     variant = operation.get("variant", "default")
     if kind not in {"header", "footer"} or variant not in {"default", "first", "even"}:
         raise ValueError("Invalid header or footer type")
-    section = body.find(tag(WORD, "sectPr"))
-    if section is None:
-        raise ValueError("Document has no terminal section")
+    sections = list(body.iter(tag(WORD, "sectPr")))
+    if not sections:
+        raise ValueError("Document has no section")
+    sec_idx = bounded_integer(operation.get("sectionIndex", len(sections) - 1), 0, len(sections) - 1)
+    section = sections[sec_idx]
     ref_tag = tag(WORD, kind + "Reference")
-    if any(node.get(tag(WORD, "type")) == variant for node in section.findall(ref_tag)):
-        raise ValueError("The selected header or footer already exists")
+    existing_ref = next((node for node in section.findall(ref_tag) if node.get(tag(WORD, "type")) == variant), None)
+    if existing_ref is not None:
+        if not operation.get("overwrite"):
+            raise ValueError("The selected header or footer already exists")
+        rels = package_relationships(package, MAIN_PART["docx"])
+        rid = existing_ref.get(tag(OFFICE_REL, "id"))
+        if rid in rels:
+            part_path = rels[rid][1]
+            existing_root = load_edit_part(package, replacements, additions, part_path)
+            for child in list(existing_root):
+                existing_root.remove(child)
+            existing_root.append(word_paragraph(operation["text"]))
+            return
     root = XML.Element(tag(WORD, "hdr" if kind == "header" else "ftr"), nsmap={"w": WORD})
     root.append(word_paragraph(operation["text"]))
     name = allocate_part(package, additions, "word/" + kind, ".xml")
@@ -1509,48 +2931,61 @@ def word_edit_extra(package, replacements, additions, body, operation):
     source = MAIN_PART["docx"]
     op = operation["op"]
     if op == "docx.add_paragraph":
-        paragraph = word_paragraph(operation["text"])
-        if "styleId" in operation:
-            set_word_style(package, paragraph, operation["styleId"])
-        if "headingLevel" in operation:
-            set_word_style(package, paragraph, f"Heading{bounded_integer(operation['headingLevel'], 1, 9)}")
+        if isinstance(operation.get("runs"), list) and operation["runs"]:
+            paragraph = XML.Element(tag(WORD, "p"))
+            for r_spec in operation["runs"][:200]:
+                run = XML.SubElement(paragraph, tag(WORD, "r"))
+                _apply_word_run_props(run, r_spec)
+                _set_run_multiline_text(run, r_spec.get("text", ""))
+        else:
+            paragraph = word_paragraph(operation.get("text", ""))
+        if any(k in operation for k in ("styleId", "headingLevel", "alignment", "spaceBeforePt", "spaceAfterPt",
+                                        "lineSpacing", "indentLeftPt", "indentRightPt", "firstLineIndentPt",
+                                        "hangingIndentPt", "backgroundColor", "shading", "borders",
+                                        "keepNext", "keepLines", "pageBreakBefore")):
+            _apply_word_paragraph_props(package, replacements, additions, paragraph, operation)
         section = body.find(tag(WORD, "sectPr"))
-        body.insert(body.index(section) if section is not None else len(body), paragraph)
+        max_pos = body.index(section) if section is not None else len(body)
+        insert_at = bounded_integer(operation.get("insertAt", max_pos), 0, max_pos)
+        body.insert(insert_at, paragraph)
+    elif op == "docx.remove_paragraph":
+        block = word_block(body, operation, "p")
+        if len([ch for ch in body if ch.tag in {tag(WORD, "p"), tag(WORD, "tbl")}]) <= 1:
+            raise ValueError("Document must retain at least one body block")
+        body.remove(block)
     elif op == "docx.set_paragraph_style":
-        set_word_style(package, word_block(body, operation, "p"), operation["styleId"])
+        _apply_word_paragraph_props(package, replacements, additions, word_block(body, operation, "p"), operation)
     elif op == "docx.set_run_style":
         block = word_block(body, operation, "p")
         runs = block.findall(tag(WORD, "r"))
-        run = runs[bounded_integer(operation["runIndex"], 0, len(runs) - 1)]
-        if not run.findall(tag(WORD, "t")) or any(node.tag not in {tag(WORD, "t"), tag(WORD, "rPr")} for node in run):
-            raise ValueError("Select an unprotected text run")
-        props = xml_child(run, WORD, "rPr", ("t",))
-        trailing = ("color", "spacing", "w", "kern", "position", "sz", "szCs", "highlight", "u", "shd", "vertAlign", "lang", "rPrChange")
-        for option, element in (("bold", "b"), ("italic", "i")):
-            if option in operation:
-                xml_child(props, WORD, element, (("i", "iCs") if option == "bold" else ("iCs",)) + trailing).set(
-                    tag(WORD, "val"), "1" if operation[option] is True else "0")
-        if "fontSizePt" in operation:
-            xml_child(props, WORD, "sz", ("szCs", "highlight", "u", "shd", "vertAlign", "lang", "rPrChange")).set(
-                tag(WORD, "val"), str(bounded_integer(operation["fontSizePt"], 1, 400) * 2))
-        if "color" in operation:
-            color = operation["color"]
-            if not re.fullmatch(r"[0-9A-Fa-f]{6}", color):
-                raise ValueError("Use a six-digit RGB color")
-            node = xml_child(props, WORD, "color", trailing[1:])
-            node.attrib.clear()
-            node.set(tag(WORD, "val"), color.upper())
-        if "fontFamily" in operation:
-            font = operation["fontFamily"][:128]
-            fonts = xml_child(props, WORD, "rFonts", ("b", "bCs", "i", "iCs") + trailing)
-            for field in ("ascii", "hAnsi", "eastAsia", "cs"):
-                fonts.set(tag(WORD, field), font)
+        if not runs:
+            raise ValueError("Paragraph contains no runs")
+        if "runIndex" in operation:
+            targets = [runs[bounded_integer(operation["runIndex"], 0, len(runs) - 1)]]
+        else:
+            targets = [r for r in runs if r.findall(tag(WORD, "t")) and not any(ch.tag in PROTECTED_WORD_RUN_CHILDREN for ch in r)]
+            if not targets:
+                raise ValueError("Paragraph has no unprotected text runs")
+        for run in targets:
+            if not run.findall(tag(WORD, "t")) or any(node.tag not in {tag(WORD, "t"), tag(WORD, "rPr"), tag(WORD, "br"), tag(WORD, "tab")} for node in run):
+                raise ValueError("Select an unprotected text run")
+            _apply_word_run_props(run, operation)
     elif op == "docx.set_list":
         paragraph = word_block(body, operation, "p")
-        numbering = parse_xml(package.read("word/numbering.xml"))
-        number = str(bounded_integer(operation["numberingId"], 1, 65535))
-        if not any(node.get(tag(WORD, "numId")) == number for node in numbering.findall(tag(WORD, "num"))):
-            raise ValueError("Unknown numbering definition")
+        if operation.get("listType") == "none" or operation.get("enabled") is False:
+            ppr = paragraph.find(tag(WORD, "pPr"))
+            if ppr is not None:
+                old_num = ppr.find(tag(WORD, "numPr"))
+                if old_num is not None:
+                    ppr.remove(old_num)
+            return
+        if "listType" in operation:
+            number = _ensure_word_numbering_definition(package, replacements, additions, operation["listType"])
+        else:
+            numbering = load_edit_part(package, replacements, additions, "word/numbering.xml")
+            number = str(bounded_integer(operation["numberingId"], 1, 65535))
+            if not any(node.get(tag(WORD, "numId")) == number for node in numbering.findall(tag(WORD, "num"))):
+                raise ValueError("Unknown numbering definition")
         props = xml_child(paragraph, WORD, "pPr", ("r", "hyperlink", "sdt"))
         num = xml_child(props, WORD, "numPr", ("suppressLineNumbers", "pBdr", "shd", "tabs", "spacing", "ind", "jc"))
         xml_child(num, WORD, "ilvl", ("numId",)).set(tag(WORD, "val"), str(bounded_integer(operation.get("level", 0), 0, 8)))
@@ -1565,7 +3000,7 @@ def word_edit_extra(package, replacements, additions, body, operation):
         table = temporary.add_table(rows=len(rows), cols=columns)
         for i, row in enumerate(rows):
             for j, value in enumerate(row):
-                word_text(XML.SubElement(XML.SubElement(table.cell(i, j).paragraphs[0]._p, tag(WORD, "r")), tag(WORD, "t")), value)
+                word_text(XML.SubElement(XML.SubElement(table.cell(i, j).paragraphs[0]._p, tag(WORD, "r")), tag(WORD, "t")), str(value))
         section = body.find(tag(WORD, "sectPr"))
         body.insert(body.index(section) if section is not None else len(body), deepcopy(table._tbl))
     elif op == "docx.set_table_cell":
@@ -1574,10 +3009,52 @@ def word_edit_extra(package, replacements, additions, body, operation):
         row = rows[bounded_integer(operation["row"], 0, len(rows) - 1)]
         cells = row.findall(tag(WORD, "tc"))
         cell = cells[bounded_integer(operation["column"], 0, len(cells) - 1)]
-        texts = cell.findall("./" + tag(WORD, "p") + "/" + tag(WORD, "r") + "/" + tag(WORD, "t"))
-        if len(texts) != 1:
-            raise ValueError("The cell needs one editable text node")
-        word_text(texts[0], operation["text"])
+        if any(ch.tag in PROTECTED_WORD_PARA_CHILDREN for p in cell.findall(tag(WORD, "p")) for ch in p):
+            raise ValueError("Table cell contains protected content")
+        if any(ch.tag in PROTECTED_WORD_RUN_CHILDREN for r in cell.iter(tag(WORD, "r")) for ch in r):
+            raise ValueError("Table cell contains protected inline objects")
+        if "text" in operation:
+            existing_paras = cell.findall(tag(WORD, "p"))
+            first_ppr = deepcopy(existing_paras[0].find(tag(WORD, "pPr"))) if existing_paras and existing_paras[0].find(tag(WORD, "pPr")) is not None else None
+            first_run = existing_paras[0].find(tag(WORD, "r")) if existing_paras else None
+            first_rpr = deepcopy(first_run.find(tag(WORD, "rPr"))) if first_run is not None and first_run.find(tag(WORD, "rPr")) is not None else None
+            for old_p in existing_paras:
+                cell.remove(old_p)
+            lines = str(operation["text"])[:20_000].split("\n")
+            for line_text in lines:
+                new_p = XML.SubElement(cell, tag(WORD, "p"))
+                if first_ppr is not None:
+                    new_p.append(deepcopy(first_ppr))
+                new_r = XML.SubElement(new_p, tag(WORD, "r"))
+                if first_rpr is not None:
+                    new_r.append(deepcopy(first_rpr))
+                word_text(XML.SubElement(new_r, tag(WORD, "t")), line_text)
+        if any(k in operation for k in ("backgroundColor", "shading", "verticalAlign", "widthPt")):
+            tcpr = xml_child(cell, WORD, "tcPr", ("p", "tbl"))
+            if "widthPt" in operation:
+                tcw = xml_child(tcpr, WORD, "tcW", ("shd", "vAlign"))
+                tcw.set(tag(WORD, "w"), str(bounded_integer(round(float(operation["widthPt"]) * 20), 60, 28800)))
+                tcw.set(tag(WORD, "type"), "dxa")
+            bg = operation.get("backgroundColor", operation.get("shading"))
+            if bg is not None:
+                cleaned = str(bg).lstrip("#")
+                if not re.fullmatch(r"[0-9A-Fa-f]{6}", cleaned):
+                    raise ValueError("Use a six-digit RGB color")
+                shd = xml_child(tcpr, WORD, "shd", ("vAlign",))
+                shd.set(tag(WORD, "val"), "clear")
+                shd.set(tag(WORD, "color"), "auto")
+                shd.set(tag(WORD, "fill"), cleaned.upper())
+            if "verticalAlign" in operation:
+                va = str(operation["verticalAlign"])
+                if va not in {"top", "center", "bottom"}:
+                    raise ValueError("Invalid table cell verticalAlign")
+                xml_child(tcpr, WORD, "vAlign").set(tag(WORD, "val"), va)
+        if any(k in operation for k in ("bold", "italic", "underline", "strike", "fontSizePt", "color", "fontColor", "fontFamily")):
+            for r in cell.findall("./" + tag(WORD, "p") + "/" + tag(WORD, "r")):
+                _apply_word_run_props(r, operation)
+        if "alignment" in operation:
+            for p in cell.findall(tag(WORD, "p")):
+                _apply_word_paragraph_props(package, replacements, additions, p, {"alignment": operation["alignment"]})
     elif op == "docx.add_image":
         add_word_media(package, replacements, additions, source, word_block(body, operation, "p"), operation)
     elif op == "docx.add_header_footer":
@@ -1602,8 +3079,23 @@ def word_edit_extra(package, replacements, additions, body, operation):
             root = next((note for note in root if note.get(tag(WORD, "id")) == identifier), None)
             if root is None:
                 raise ValueError("Unknown footnote")
-        texts = root.findall("./" + tag(WORD, "p") + "/" + tag(WORD, "r") + "/" + tag(WORD, "t"))
-        word_text(texts[bounded_integer(operation["textIndex"], 0, len(texts) - 1)], operation["text"])
+        if "textIndex" in operation:
+            texts = root.findall("./" + tag(WORD, "p") + "/" + tag(WORD, "r") + "/" + tag(WORD, "t"))
+            word_text(texts[bounded_integer(operation["textIndex"], 0, len(texts) - 1)], operation["text"])
+        else:
+            paras = root.findall(tag(WORD, "p"))
+            if not paras:
+                root.append(word_paragraph(operation["text"]))
+            else:
+                p = paras[bounded_integer(operation.get("paragraphIndex", 0), 0, len(paras) - 1)]
+                text_runs = [r for r in p.findall(tag(WORD, "r")) if r.find(tag(WORD, "t")) is not None and not any(ch.tag in PROTECTED_WORD_RUN_CHILDREN for ch in r)]
+                if not text_runs:
+                    new_r = XML.SubElement(p, tag(WORD, "r"))
+                    _set_run_multiline_text(new_r, operation["text"])
+                else:
+                    _set_run_multiline_text(text_runs[0], operation["text"])
+                    for extra_r in text_runs[1:]:
+                        p.remove(extra_r)
     else:
         raise ValueError("Unsupported Word operation")
 
@@ -1620,18 +3112,36 @@ def edit_word(package, operations, output):
             index = bounded_integer(operation["blockIndex"], 0, len(body) - 1)
             block = body[index]
             if block.tag != tag(WORD, "p"):
-                raise ValueError("Only plain paragraphs support this edit")
-            runs = [run for run in block if run.tag != tag(WORD, "pPr")]
-            if len(runs) != 1 or runs[0].tag != tag(WORD, "r"):
-                raise ValueError("Paragraph contains protected content or mixed formatting")
-            contents = [node for node in runs[0] if node.tag != tag(WORD, "rPr")]
-            if len(contents) != 1 or contents[0].tag != tag(WORD, "t"):
+                raise ValueError("Only paragraphs support this edit")
+            if any(child.tag in PROTECTED_WORD_PARA_CHILDREN for child in block):
                 raise ValueError("Paragraph contains protected content")
-            text = operation["text"]
-            if len(text) > 20_000 or "\n" in text or "\r" in text:
-                raise ValueError("Use one bounded line of text")
-            contents[0].set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-            contents[0].text = text
+            runs = block.findall(tag(WORD, "r"))
+            if any(node.tag in PROTECTED_WORD_RUN_CHILDREN for r in runs for node in r):
+                raise ValueError("Paragraph contains protected inline content")
+            if isinstance(operation.get("runs"), list) and operation["runs"]:
+                for old_r in runs:
+                    block.remove(old_r)
+                for r_spec in operation["runs"][:200]:
+                    new_r = XML.SubElement(block, tag(WORD, "r"))
+                    _apply_word_run_props(new_r, r_spec)
+                    _set_run_multiline_text(new_r, r_spec.get("text", ""))
+            elif "runIndex" in operation:
+                if not runs:
+                    raise ValueError("Paragraph contains no runs")
+                target_run = runs[bounded_integer(operation["runIndex"], 0, len(runs) - 1)]
+                _set_run_multiline_text(target_run, operation["text"])
+            else:
+                text = str(operation["text"])
+                if len(text) > 20_000:
+                    raise ValueError("Paragraph text exceeds length limit")
+                if not runs:
+                    new_r = XML.SubElement(block, tag(WORD, "r"))
+                    _set_run_multiline_text(new_r, text)
+                else:
+                    first_run = runs[0]
+                    _set_run_multiline_text(first_run, text)
+                    for extra in runs[1:]:
+                        block.remove(extra)
         elif op in {"docx.set_page_size", "docx.set_page_layout"}:
             update_word_page_layout(body, operation)
         else:
@@ -1922,13 +3432,47 @@ def package_relationships(package, source_name):
             for relation in root if isinstance(relation.tag, str) and relation.get("TargetMode") != "External"}
 
 
-def edit_smartart_text(package, operation, slide_root, replacements):
-    slide_part = operation["slidePart"]
-    data_part = operation["dataPart"]
-    model_id = operation["nodeId"]
-    text = operation["text"]
-    if not isinstance(text, str) or not text.strip() or len(text) > 2000 or "\r" in text or "\n" in text:
-        raise ValueError("SmartArt requires a nonempty, single-line label")
+SMARTART_SUPPORTED_LINEAR_LIST_RE = re.compile(
+    r"(?:^|/)(?:default|vList[0-9]*|hList[0-9]*|bList[0-9]*|lList[0-9]*|list[0-9]*)$", re.I
+)
+SMARTART_SUPPORTED_LINEAR_PROCESS_RE = re.compile(
+    r"(?:^|/)(?:process[0-9]*|chevron[0-9]*|arrow[0-9]*|lProcess[0-9]*|vProcess[0-9]*|hProcess[0-9]*)$", re.I
+)
+
+
+def classify_smartart_layout(data_root, drawing_root=None):
+    """Classify a SmartArt layout and check structural prerequisites for safe add/remove node sync."""
+    lo_type = next(
+        (node.get("loTypeId") for node in data_root.iter(tag(DIAGRAM, "prSet")) if node.get("loTypeId")),
+        None,
+    )
+    if not lo_type:
+        return {"layout": None, "family": "unknown", "supportsNodeAddRemove": False, "reason": "Missing SmartArt loTypeId."}
+    short_id = lo_type.rsplit("/", 1)[-1]
+    if SMARTART_SUPPORTED_LINEAR_LIST_RE.search(lo_type):
+        family = "linear_list"
+    elif SMARTART_SUPPORTED_LINEAR_PROCESS_RE.search(lo_type):
+        family = "linear_process"
+    else:
+        return {
+            "layout": lo_type,
+            "family": short_id,
+            "supportsNodeAddRemove": False,
+            "reason": f"SmartArt layout '{short_id}' uses non-linear or constraint-coupled geometry (e.g. Venn/Cycle/Hierarchy/Pyramid/Matrix) that cannot be safely reflowed without PowerPoint's layout solver.",
+        }
+    if drawing_root is not None:
+        # Detached text-box transforms (dsp:txXfrm) indicate layout-coupled non-centered text placement.
+        if any(drawing_root.iter(tag(DIAGRAM_DRAWING, "txXfrm"))):
+            return {
+                "layout": lo_type,
+                "family": family,
+                "supportsNodeAddRemove": False,
+                "reason": "SmartArt shapes use detached dsp:txXfrm text-box coordinates that cannot be reflowed reliably.",
+            }
+    return {"layout": lo_type, "family": family, "supportsNodeAddRemove": True, "reason": None}
+
+
+def _resolve_smartart_parts(package, slide_part, slide_root, data_part, replacements):
     relationships = package_relationships(package, slide_part)
     data_ids = [rel_id for rel_id, (kind, part) in relationships.items()
                 if kind.endswith("/diagramData") and part == data_part]
@@ -1940,30 +3484,368 @@ def edit_smartart_text(package, operation, slide_root, replacements):
         data = parse_xml(package.read(data_part))
     drawing_ids = [element.get("relId") for element in data.iter(tag(DIAGRAM_DRAWING, "dataModelExt"))]
     if len(drawing_ids) != 1:
-        raise ValueError("SmartArt drawing cache relationship is missing or ambiguous")
+        raise UnsupportedByFormatError("SmartArt drawing cache relationship is missing or ambiguous")
     drawing_type, drawing_part = relationships.get(drawing_ids[0], ("", ""))
     if not drawing_type.endswith("/diagramDrawing"):
-        raise ValueError("SmartArt drawing cache is missing")
+        raise UnsupportedByFormatError("SmartArt drawing cache is missing")
     drawing = replacements.get(drawing_part)
     if drawing is None:
         drawing = parse_xml(package.read(drawing_part))
+    return data, drawing, drawing_part
+
+
+def _smartart_sp_rect(sp):
+    xfrm = sp.find(".//" + tag(DRAWING, "xfrm"))
+    if xfrm is None:
+        return None
+    off = xfrm.find(tag(DRAWING, "off"))
+    ext = xfrm.find(tag(DRAWING, "ext"))
+    if off is None or ext is None:
+        return None
+    return (int(off.attrib["x"]), int(off.attrib["y"]), int(ext.attrib["cx"]), int(ext.attrib["cy"]))
+
+
+def _set_smartart_sp_rect(sp, x, y, cx, cy):
+    xfrm = sp.find(".//" + tag(DRAWING, "xfrm"))
+    if xfrm is None:
+        raise ValueError("SmartArt display shape has no transform")
+    off = xfrm.find(tag(DRAWING, "off"))
+    ext = xfrm.find(tag(DRAWING, "ext"))
+    off.set("x", str(int(round(x))))
+    off.set("y", str(int(round(y))))
+    ext.set("cx", str(max(10000, int(round(cx)))))
+    ext.set("cy", str(max(10000, int(round(cy)))))
+
+
+def _set_smartart_shape_text(node, text):
+    labels = list(node.iter(tag(DRAWING, "t")))
+    if not labels:
+        raise ValueError("SmartArt node has no editable text")
+    labels[0].text = text
+    for extra in labels[1:]:
+        extra.text = ""
+
+
+def edit_smartart_text(package, operation, slide_root, replacements):
+    slide_part = operation["slidePart"]
+    data_part = operation["dataPart"]
+    model_id = operation["nodeId"]
+    text = operation["text"]
+    if not isinstance(text, str) or not text.strip() or len(text) > 2000 or "\r" in text or "\n" in text:
+        raise ValueError("SmartArt requires a nonempty, single-line label")
+    data, drawing, drawing_part = _resolve_smartart_parts(package, slide_part, slide_root, data_part, replacements)
     points = list(data.iter(tag(DIAGRAM, "pt")))
     logical_points = [point for point in points if point.get("modelId") == model_id and point.get("type") in (None, "node")]
     if len(logical_points) != 1:
         raise ValueError("Expected a unique editable SmartArt node")
     label = list(logical_points[0].iter(tag(DRAWING, "t")))
-    if len(label) != 1:
-        raise ValueError("SmartArt node has mixed formatting or no editable label")
+    if not label:
+        raise ValueError("SmartArt node has no editable label")
+    orig_text = "".join(t.text or "" for t in label)
     display_ids = {point.get("modelId") for point in points if point.get("type") == "pres"
                    and any(child.get("presAssocID") == model_id for child in point.findall(tag(DIAGRAM, "prSet")))}
     matching_shapes = [shape for shape in drawing.iter(tag(DIAGRAM_DRAWING, "sp")) if shape.get("modelId") in display_ids]
     display_labels = [list(shape.iter(tag(DRAWING, "t"))) for shape in matching_shapes]
     display_labels = [labels for labels in display_labels if labels]
-    if not display_labels or any(len(labels) != 1 or labels[0].text != label[0].text for labels in display_labels):
+    if not display_labels or any("".join(t.text or "" for t in labels) != orig_text for labels in display_labels):
         raise ValueError("SmartArt data and drawing text cannot be synchronized safely")
-    label[0].text = text
-    for labels in display_labels:
-        labels[0].text = text
+    _set_smartart_shape_text(logical_points[0], text)
+    for shape in matching_shapes:
+        if list(shape.iter(tag(DRAWING, "t"))):
+            _set_smartart_shape_text(shape, text)
+    replacements[data_part] = data
+    replacements[drawing_part] = drawing
+
+
+def edit_smartart_add_or_remove_node(package, operation, slide_root, replacements):
+    """Add or remove a node in verified 1D linear list/process SmartArt diagrams with full dataModel+drawing geometry sync."""
+    slide_part = operation["slidePart"]
+    data_part = operation["dataPart"]
+    mode = operation.get("mode")
+    if mode not in {"add", "remove"}:
+        raise ValueError("SmartArt add_or_remove_node requires mode 'add' or 'remove'")
+    data, drawing, drawing_part = _resolve_smartart_parts(package, slide_part, slide_root, data_part, replacements)
+    classification = classify_smartart_layout(data, drawing)
+    if not classification["supportsNodeAddRemove"]:
+        raise UnsupportedByFormatError(classification["reason"])
+
+    pt_lst = data.find(tag(DIAGRAM, "ptLst"))
+    cxn_lst = data.find(tag(DIAGRAM, "cxnLst"))
+    sp_tree = drawing.find(tag(DIAGRAM_DRAWING, "spTree"))
+    if pt_lst is None or cxn_lst is None or sp_tree is None:
+        raise UnsupportedByFormatError("SmartArt XML is missing ptLst, cxnLst, or spTree.")
+
+    pts = list(pt_lst.findall(tag(DIAGRAM, "pt")))
+    cxns = list(cxn_lst.findall(tag(DIAGRAM, "cxn")))
+    doc_pts = [p for p in pts if p.get("type") == "doc"]
+    if len(doc_pts) != 1:
+        raise UnsupportedByFormatError("SmartArt diagram does not have a single document root.")
+    doc_id = doc_pts[0].get("modelId")
+
+    # Ensure single-level tree: every logical node must attach directly under doc_id
+    logical_pts = [p for p in pts if p.get("type") in (None, "node")]
+    par_cxns = [c for c in cxns if c.get("type") in (None, "parOf")]
+    child_par_cxns = [c for c in par_cxns if c.get("srcId") == doc_id]
+    if len(child_par_cxns) != len(logical_pts) or len(logical_pts) < 1:
+        raise UnsupportedByFormatError("SmartArt diagram has nested multi-level nodes; only single-level linear lists/processes are supported.")
+    child_par_cxns.sort(key=lambda c: int(c.get("srcOrd", "0")))
+    ordered_node_ids = [c.get("destId") for c in child_par_cxns]
+    pt_by_id = {p.get("modelId"): p for p in pts}
+    sp_by_model = {sp.get("modelId"): sp for sp in sp_tree.findall(tag(DIAGRAM_DRAWING, "sp"))}
+
+    # Map each logical node to its unique pres point & display shape (must be 1:1)
+    pres_by_assoc = {}
+    for p in pts:
+        if p.get("type") == "pres":
+            pr = p.find(tag(DIAGRAM, "prSet"))
+            if pr is not None and pr.get("presAssocID"):
+                pres_by_assoc.setdefault(pr.get("presAssocID"), []).append(p)
+
+    node_records = []
+    for cxn in child_par_cxns:
+        nid = cxn.get("destId")
+        pres_list = [p for p in pres_by_assoc.get(nid, []) if p.get("modelId") in sp_by_model]
+        if len(pres_list) != 1:
+            raise UnsupportedByFormatError("SmartArt nodes must map 1:1 to display shapes for safe reflow.")
+        sp = sp_by_model[pres_list[0].get("modelId")]
+        rect = _smartart_sp_rect(sp)
+        if rect is None:
+            raise UnsupportedByFormatError("SmartArt display shape is missing explicit coordinates.")
+        sib_tid = cxn.get("sibTransId")
+        sib_pres_list = [p for p in pres_by_assoc.get(sib_tid, []) if p.get("modelId") in sp_by_model] if sib_tid else []
+        sib_sp = sp_by_model[sib_pres_list[0].get("modelId")] if len(sib_pres_list) == 1 else None
+        node_records.append({
+            "node_id": nid,
+            "node_pt": pt_by_id[nid],
+            "par_cxn": cxn,
+            "par_trans_id": cxn.get("parTransId"),
+            "sib_trans_id": sib_tid,
+            "pres_pt": pres_list[0],
+            "sp": sp,
+            "rect": rect,
+            "sib_pres_pt": sib_pres_list[0] if len(sib_pres_list) == 1 else None,
+            "sib_sp": sib_sp,
+            "sib_rect": _smartart_sp_rect(sib_sp) if sib_sp is not None else None,
+        })
+
+    # Detect monotonic 1D axis (horizontal vs vertical) and total bounding envelope
+    rects = [rec["rect"] for rec in node_records]
+    all_rects = list(rects) + [rec["sib_rect"] for rec in node_records if rec["sib_rect"] is not None]
+    env_x0 = min(r[0] for r in all_rects)
+    env_y0 = min(r[1] for r in all_rects)
+    env_x1 = max(r[0] + r[2] for r in all_rects)
+    env_y1 = max(r[1] + r[3] for r in all_rects)
+    env_w = max(100000, env_x1 - env_x0)
+    env_h = max(100000, env_y1 - env_y0)
+
+    if len(rects) >= 2:
+        dx_span = max(r[0] for r in rects) - min(r[0] for r in rects)
+        dy_span = max(r[1] for r in rects) - min(r[1] for r in rects)
+        axis = "horizontal" if dx_span >= dy_span else "vertical"
+        # Verify monotonic ordering along chosen axis (guards against 2D grids/circles)
+        coords = [r[0] if axis == "horizontal" else r[1] for r in rects]
+        if any(coords[i] >= coords[i + 1] for i in range(len(coords) - 1)):
+            raise UnsupportedByFormatError("SmartArt shapes are not monotonically ordered along a single axis.")
+    else:
+        axis = "horizontal" if "hList" in (classification["layout"] or "") or classification["family"] == "linear_process" else "vertical"
+
+    pres_root_cxn = next((c for c in cxns if c.get("type") == "presOf" and c.get("srcId") == doc_id), None)
+    pres_root_id = pres_root_cxn.get("destId") if pres_root_cxn is not None else None
+    lo_type = classification["layout"]
+    has_arrows = any(rec["sib_sp"] is not None for rec in node_records)
+    arrow_template_sp = next((rec["sib_sp"] for rec in node_records if rec["sib_sp"] is not None), None)
+    arrow_template_pres = next((rec["sib_pres_pt"] for rec in node_records if rec["sib_pres_pt"] is not None), None)
+    arrow_template_rect = next((rec["sib_rect"] for rec in node_records if rec["sib_rect"] is not None), None)
+
+    if mode == "add":
+        text = operation.get("text", "")
+        if not isinstance(text, str) or not text.strip() or len(text) > 2000 or "\r" in text or "\n" in text:
+            raise ValueError("Adding a SmartArt node requires a nonempty, single-line text label")
+        if len(node_records) >= 20:
+            raise ValueError("SmartArt node count exceeds safe linear reflow limit (20)")
+        insert_idx = bounded_integer(operation.get("index", len(node_records)), 0, len(node_records))
+        tpl = node_records[min(insert_idx, len(node_records) - 1)]
+
+        new_node_id = "{" + str(uuid.uuid4()).upper() + "}"
+        new_par_tid = "{" + str(uuid.uuid4()).upper() + "}"
+        new_sib_tid = "{" + str(uuid.uuid4()).upper() + "}"
+        new_pres_id = "{" + str(uuid.uuid4()).upper() + "}"
+
+        new_node_pt = deepcopy(tpl["node_pt"])
+        new_node_pt.set("modelId", new_node_id)
+        _set_smartart_shape_text(new_node_pt, text)
+        pt_lst.append(new_node_pt)
+        pt_lst.append(XML.Element(tag(DIAGRAM, "pt"), modelId=new_par_tid, type="parTrans"))
+        pt_lst.append(XML.Element(tag(DIAGRAM, "pt"), modelId=new_sib_tid, type="sibTrans"))
+
+        new_pres_pt = deepcopy(tpl["pres_pt"])
+        new_pres_pt.set("modelId", new_pres_id)
+        for pr in new_pres_pt.findall(tag(DIAGRAM, "prSet")):
+            pr.set("presAssocID", new_node_id)
+        pt_lst.append(new_pres_pt)
+
+        new_par_cxn = XML.SubElement(
+            cxn_lst, tag(DIAGRAM, "cxn"),
+            modelId="{" + str(uuid.uuid4()).upper() + "}",
+            srcId=doc_id, destId=new_node_id, srcOrd=str(insert_idx), destOrd="0",
+            parTransId=new_par_tid, sibTransId=new_sib_tid,
+        )
+        XML.SubElement(
+            cxn_lst, tag(DIAGRAM, "cxn"),
+            modelId="{" + str(uuid.uuid4()).upper() + "}",
+            type="presOf", srcId=new_node_id, destId=new_pres_id, srcOrd="0", destOrd="0", presId=lo_type,
+        )
+        if pres_root_id:
+            XML.SubElement(
+                cxn_lst, tag(DIAGRAM, "cxn"),
+                modelId="{" + str(uuid.uuid4()).upper() + "}",
+                type="presParOf", srcId=pres_root_id, destId=new_pres_id, srcOrd="0", destOrd="0", presId=lo_type,
+            )
+
+        used_ids = {int(n.get("id", "0")) for n in sp_tree.iter(tag(DIAGRAM_DRAWING, "cNvPr")) if (n.get("id") or "").isdigit()}
+        next_sp_id = max([10] + list(used_ids)) + 1
+        new_sp = deepcopy(tpl["sp"])
+        new_sp.set("modelId", new_pres_id)
+        cnv = new_sp.find(".//" + tag(DIAGRAM_DRAWING, "cNvPr"))
+        if cnv is not None:
+            cnv.set("id", str(next_sp_id))
+            cnv.set("name", f"Node {len(node_records) + 1}")
+        _set_smartart_shape_text(new_sp, text)
+        sp_tree.append(new_sp)
+
+        new_rec = {
+            "node_id": new_node_id, "node_pt": new_node_pt, "par_cxn": new_par_cxn,
+            "par_trans_id": new_par_tid, "sib_trans_id": new_sib_tid,
+            "pres_pt": new_pres_pt, "sp": new_sp, "rect": tpl["rect"],
+            "sib_pres_pt": None, "sib_sp": None, "sib_rect": None,
+        }
+        node_records.insert(insert_idx, new_rec)
+    else:
+        if len(node_records) <= 1:
+            raise ValueError("SmartArt diagram must retain at least one node")
+        target_id = operation.get("nodeId")
+        if target_id is not None:
+            rm_idx = next((i for i, rec in enumerate(node_records) if rec["node_id"] == target_id), None)
+            if rm_idx is None:
+                raise ValueError("Unknown SmartArt nodeId")
+        else:
+            rm_idx = bounded_integer(operation.get("index", len(node_records) - 1), 0, len(node_records) - 1)
+        removed_rec = node_records.pop(rm_idx)
+        drop_ids = {removed_rec["node_id"], removed_rec["pres_pt"].get("modelId")}
+        for extra_id in (removed_rec["par_trans_id"], removed_rec["sib_trans_id"]):
+            if extra_id:
+                drop_ids.add(extra_id)
+        if removed_rec["sib_pres_pt"] is not None:
+            drop_ids.add(removed_rec["sib_pres_pt"].get("modelId"))
+        for p in list(pt_lst.findall(tag(DIAGRAM, "pt"))):
+            if p.get("modelId") in drop_ids:
+                pt_lst.remove(p)
+        for c in list(cxn_lst.findall(tag(DIAGRAM, "cxn"))):
+            if c.get("srcId") in drop_ids or c.get("destId") in drop_ids:
+                cxn_lst.remove(c)
+        if removed_rec["sp"] in list(sp_tree):
+            sp_tree.remove(removed_rec["sp"])
+        if removed_rec["sib_sp"] is not None and removed_rec["sib_sp"] in list(sp_tree):
+            sp_tree.remove(removed_rec["sib_sp"])
+
+    # Synchronize sibling transition connectors (exactly N-1 arrows for linear_process with arrows)
+    if has_arrows and arrow_template_sp is not None and arrow_template_pres is not None:
+        used_ids = {int(n.get("id", "0")) for n in sp_tree.iter(tag(DIAGRAM_DRAWING, "cNvPr")) if (n.get("id") or "").isdigit()}
+        next_sp_id = max([10] + list(used_ids)) + 1
+        for i, rec in enumerate(node_records):
+            need_arrow = i < len(node_records) - 1
+            if need_arrow and rec["sib_sp"] is None:
+                arr_pres_id = "{" + str(uuid.uuid4()).upper() + "}"
+                arr_pres = deepcopy(arrow_template_pres)
+                arr_pres.set("modelId", arr_pres_id)
+                for pr in arr_pres.findall(tag(DIAGRAM, "prSet")):
+                    pr.set("presAssocID", rec["sib_trans_id"] or rec["node_id"])
+                pt_lst.append(arr_pres)
+                XML.SubElement(
+                    cxn_lst, tag(DIAGRAM, "cxn"),
+                    modelId="{" + str(uuid.uuid4()).upper() + "}",
+                    type="presOf", srcId=rec["sib_trans_id"] or rec["node_id"], destId=arr_pres_id,
+                    srcOrd="0", destOrd="0", presId=lo_type,
+                )
+                if pres_root_id:
+                    XML.SubElement(
+                        cxn_lst, tag(DIAGRAM, "cxn"),
+                        modelId="{" + str(uuid.uuid4()).upper() + "}",
+                        type="presParOf", srcId=pres_root_id, destId=arr_pres_id,
+                        srcOrd="0", destOrd="0", presId=lo_type,
+                    )
+                arr_sp = deepcopy(arrow_template_sp)
+                arr_sp.set("modelId", arr_pres_id)
+                cnv = arr_sp.find(".//" + tag(DIAGRAM_DRAWING, "cNvPr"))
+                if cnv is not None:
+                    cnv.set("id", str(next_sp_id))
+                    next_sp_id += 1
+                sp_tree.append(arr_sp)
+                rec["sib_pres_pt"] = arr_pres
+                rec["sib_sp"] = arr_sp
+            elif not need_arrow and rec["sib_sp"] is not None:
+                arr_pid = rec["sib_pres_pt"].get("modelId") if rec["sib_pres_pt"] is not None else None
+                if rec["sib_sp"] in list(sp_tree):
+                    sp_tree.remove(rec["sib_sp"])
+                if arr_pid:
+                    for p in list(pt_lst.findall(tag(DIAGRAM, "pt"))):
+                        if p.get("modelId") == arr_pid:
+                            pt_lst.remove(p)
+                    for c in list(cxn_lst.findall(tag(DIAGRAM, "cxn"))):
+                        if c.get("srcId") == arr_pid or c.get("destId") == arr_pid:
+                            cxn_lst.remove(c)
+                rec["sib_sp"] = None
+                rec["sib_pres_pt"] = None
+
+    # Re-sequence srcOrd on parent connections and presentation connections
+    for idx, rec in enumerate(node_records):
+        rec["par_cxn"].set("srcOrd", str(idx))
+    pres_order_ids = []
+    for rec in node_records:
+        pres_order_ids.append(rec["pres_pt"].get("modelId"))
+        if rec["sib_pres_pt"] is not None:
+            pres_order_ids.append(rec["sib_pres_pt"].get("modelId"))
+    pres_ord_map = {pid: idx for idx, pid in enumerate(pres_order_ids)}
+    for c in cxn_lst.findall(tag(DIAGRAM, "cxn")):
+        if c.get("type") == "presParOf" and c.get("destId") in pres_ord_map:
+            c.set("srcOrd", str(pres_ord_map[c.get("destId")]))
+
+    # Recalculate clean, non-overlapping linear geometry inside original bounding envelope
+    n = len(node_records)
+    arrow_count = sum(1 for rec in node_records if rec["sib_sp"] is not None)
+    if axis == "horizontal":
+        gap = max(60000, min(180000, int(env_w * 0.025))) if n > 1 else 0
+        arrow_w = min(arrow_template_rect[2], max(120000, int(env_w * 0.06))) if (arrow_count and arrow_template_rect) else 0
+        arrow_h = arrow_template_rect[3] if arrow_template_rect else int(env_h * 0.25)
+        total_space = gap * max(0, n - 1) + arrow_w * arrow_count
+        box_w = max(80000, (env_w - total_space) // n)
+        box_h = env_h
+        cursor = env_x0
+        for rec in node_records:
+            _set_smartart_sp_rect(rec["sp"], cursor, env_y0, box_w, box_h)
+            cursor += box_w
+            if rec["sib_sp"] is not None:
+                _set_smartart_sp_rect(rec["sib_sp"], cursor + gap // 2, env_y0 + (box_h - arrow_h) // 2, arrow_w, arrow_h)
+                cursor += arrow_w + gap
+            else:
+                cursor += gap
+    else:
+        gap = max(60000, min(180000, int(env_h * 0.03))) if n > 1 else 0
+        arrow_h = min(arrow_template_rect[3], max(120000, int(env_h * 0.06))) if (arrow_count and arrow_template_rect) else 0
+        arrow_w = arrow_template_rect[2] if arrow_template_rect else int(env_w * 0.25)
+        total_space = gap * max(0, n - 1) + arrow_h * arrow_count
+        box_h = max(80000, (env_h - total_space) // n)
+        box_w = env_w
+        cursor = env_y0
+        for rec in node_records:
+            _set_smartart_sp_rect(rec["sp"], env_x0, cursor, box_w, box_h)
+            cursor += box_h
+            if rec["sib_sp"] is not None:
+                _set_smartart_sp_rect(rec["sib_sp"], env_x0 + (box_w - arrow_w) // 2, cursor + gap // 2, arrow_w, arrow_h)
+                cursor += arrow_h + gap
+            else:
+                cursor += gap
+
     replacements[data_part] = data
     replacements[drawing_part] = drawing
 
@@ -2004,6 +3886,165 @@ def presentation_layer(package, part, next_relation, depth=0):
                       "shapes": pptx_shape_order(tree)}]
 
 
+PPTX_SHAPE_PRESETS = {
+    "rectangle": "rect", "rect": "rect",
+    "rounded_rectangle": "roundRect", "roundRect": "roundRect",
+    "ellipse": "ellipse", "oval": "ellipse",
+    "triangle": "triangle", "right_triangle": "rtTriangle",
+    "diamond": "diamond", "pentagon": "pentagon", "hexagon": "hexagon", "octagon": "octagon",
+    "parallelogram": "parallelogram", "trapezoid": "trapezoid",
+    "right_arrow": "rightArrow", "left_arrow": "leftArrow", "up_arrow": "upArrow", "down_arrow": "downArrow",
+    "chevron": "chevron", "home_plate": "homePlate",
+    "star4": "star4", "star5": "star5", "cloud": "cloud", "heart": "heart",
+    "callout": "wedgeRectCallout", "round_callout": "wedgeRoundRectCallout",
+    "line": "line", "connector": "straightConnector1", "textbox": "rect",
+}
+
+
+def find_pptx_shape_with_parent(container, target_id):
+    """Find a shape by cNvPr/@id recursively inside spTree and nested grpSp elements."""
+    target = str(target_id)
+    matches = []
+    for child in container:
+        if child.tag not in {tag(PRESENTATION, name) for name in ("sp", "pic", "cxnSp", "grpSp", "graphicFrame")}:
+            continue
+        nv = child.find("./*/" + tag(PRESENTATION, "cNvPr"))
+        if nv is not None and nv.get("id") == target:
+            matches.append((container, child))
+        if child.tag == tag(PRESENTATION, "grpSp"):
+            matches.extend(find_pptx_shape_with_parent(child, target))
+    return matches
+
+
+def _apply_pptx_run_props(run, spec):
+    props = xml_child(run, DRAWING, "rPr", ("t",))
+    if "fontSizePt" in spec:
+        props.set("sz", str(bounded_integer(round(float(spec["fontSizePt"]) * 100), 100, 40000)))
+    for key, attr in (("bold", "b"), ("italic", "i")):
+        if key in spec:
+            props.set(attr, "1" if spec[key] is True else "0")
+    if "underline" in spec:
+        props.set("u", "sng" if spec["underline"] is True else ("none" if spec["underline"] is False else str(spec["underline"])))
+    if "strikethrough" in spec or "strike" in spec:
+        st_val = spec.get("strikethrough", spec.get("strike"))
+        props.set("strike", "sngStrike" if st_val else "noStrike")
+    fc = spec.get("fontColor", spec.get("textColor", spec.get("color")))
+    if fc is not None:
+        cleaned = str(fc).lstrip("#")
+        if not re.fullmatch(r"[0-9A-Fa-f]{6}", cleaned):
+            raise ValueError("Use a six-digit RGB color")
+        for old_fill in list(props):
+            if isinstance(old_fill.tag, str) and XML.QName(old_fill).localname in {"noFill", "solidFill", "gradFill"}:
+                props.remove(old_fill)
+        sf = xml_child(props, DRAWING, "solidFill", ("effectLst", "highlight", "uLnTx", "uLn", "uFillTx", "uFill", "latin", "ea", "cs", "sym", "hlinkClick", "extLst"))
+        XML.SubElement(sf, tag(DRAWING, "srgbClr"), val=cleaned.upper())
+    if "fontFamily" in spec and spec["fontFamily"]:
+        face = str(spec["fontFamily"])[:128]
+        xml_child(props, DRAWING, "latin", ("ea", "cs", "sym", "hlinkClick", "hlinkMouseOver", "extLst")).set("typeface", face)
+        xml_child(props, DRAWING, "ea", ("cs", "sym", "hlinkClick", "hlinkMouseOver", "extLst")).set("typeface", face)
+        xml_child(props, DRAWING, "cs", ("sym", "hlinkClick", "hlinkMouseOver", "extLst")).set("typeface", face)
+
+
+def _apply_pptx_paragraph_props(para, spec):
+    ppr = xml_child(para, DRAWING, "pPr", ("r", "br", "fld", "endParaRPr"))
+    if "alignment" in spec:
+        al_map = {"left": "l", "center": "ctr", "right": "r", "justify": "just"}
+        al = str(spec["alignment"])
+        if al not in al_map:
+            raise ValueError(f"Unsupported PPTX alignment: {al}")
+        ppr.set("algn", al_map[al])
+    if "level" in spec:
+        ppr.set("lvl", str(bounded_integer(spec["level"], 0, 8)))
+    if "lineSpacingPercent" in spec:
+        ls = xml_child(ppr, DRAWING, "lnSpc", ("spcBef", "spcAft", "buClrTx", "buClr", "buSzTx", "buSzPct", "buSzPts", "buFontTx", "buFont", "buNone", "buAutoNum", "buChar", "tabLst", "defRPr", "extLst"))
+        ls.clear()
+        XML.SubElement(ls, tag(DRAWING, "spcPct"), val=str(bounded_integer(round(float(spec["lineSpacingPercent"]) * 1000), 50000, 500000)))
+    if "spaceBeforePt" in spec:
+        sb = xml_child(ppr, DRAWING, "spcBef", ("spcAft", "buClrTx", "buClr", "buSzTx", "buSzPct", "buSzPts", "buFontTx", "buFont", "buNone", "buAutoNum", "buChar", "tabLst", "defRPr", "extLst"))
+        sb.clear()
+        XML.SubElement(sb, tag(DRAWING, "spcPts"), val=str(bounded_integer(round(float(spec["spaceBeforePt"]) * 100), 0, 158400)))
+    if "spaceAfterPt" in spec:
+        sa = xml_child(ppr, DRAWING, "spcAft", ("buClrTx", "buClr", "buSzTx", "buSzPct", "buSzPts", "buFontTx", "buFont", "buNone", "buAutoNum", "buChar", "tabLst", "defRPr", "extLst"))
+        sa.clear()
+        XML.SubElement(sa, tag(DRAWING, "spcPts"), val=str(bounded_integer(round(float(spec["spaceAfterPt"]) * 100), 0, 158400)))
+    if "bullet" in spec:
+        for old_bu in list(ppr):
+            if isinstance(old_bu.tag, str) and XML.QName(old_bu).localname in {"buNone", "buChar", "buAutoNum"}:
+                ppr.remove(old_bu)
+        bu = spec["bullet"]
+        if bu is False or bu == "none":
+            xml_child(ppr, DRAWING, "buNone", ("tabLst", "defRPr", "extLst"))
+        elif bu == "number" or bu == "decimal":
+            xml_child(ppr, DRAWING, "buAutoNum", ("tabLst", "defRPr", "extLst")).set("type", "arabicPeriod")
+        else:
+            ch = "•" if bu is True else str(bu)[:4]
+            xml_child(ppr, DRAWING, "buChar", ("tabLst", "defRPr", "extLst")).set("char", ch)
+
+
+def _set_pptx_txbody_content(tx_body, operation):
+    """Update a PPTX txBody with plain multi-line text, targeted paragraph/run edit, or structured paragraphs."""
+    paras = tx_body.findall(tag(DRAWING, "p"))
+    if isinstance(operation.get("paragraphs"), list) and operation["paragraphs"]:
+        for old_p in paras:
+            tx_body.remove(old_p)
+        for p_spec in operation["paragraphs"][:200]:
+            p_el = XML.SubElement(tx_body, tag(DRAWING, "p"))
+            if isinstance(p_spec, dict):
+                _apply_pptx_paragraph_props(p_el, p_spec)
+                runs_spec = p_spec.get("runs")
+                if isinstance(runs_spec, list) and runs_spec:
+                    for r_spec in runs_spec[:200]:
+                        r_el = XML.SubElement(p_el, tag(DRAWING, "r"))
+                        _apply_pptx_run_props(r_el, r_spec)
+                        XML.SubElement(r_el, tag(DRAWING, "t")).text = str(r_spec.get("text", ""))[:20_000]
+                else:
+                    r_el = XML.SubElement(p_el, tag(DRAWING, "r"))
+                    _apply_pptx_run_props(r_el, p_spec)
+                    XML.SubElement(r_el, tag(DRAWING, "t")).text = str(p_spec.get("text", ""))[:20_000]
+            else:
+                r_el = XML.SubElement(p_el, tag(DRAWING, "r"))
+                XML.SubElement(r_el, tag(DRAWING, "t")).text = str(p_spec)[:20_000]
+        return
+
+    if "paragraphIndex" in operation:
+        if not paras:
+            raise ValueError("Text body contains no paragraphs")
+        p_el = paras[bounded_integer(operation["paragraphIndex"], 0, len(paras) - 1)]
+        runs = p_el.findall(tag(DRAWING, "r"))
+        if "runIndex" in operation:
+            if not runs:
+                raise ValueError("Paragraph contains no runs")
+            r_el = runs[bounded_integer(operation["runIndex"], 0, len(runs) - 1)]
+            t_el = r_el.find(tag(DRAWING, "t"))
+            if t_el is None:
+                t_el = XML.SubElement(r_el, tag(DRAWING, "t"))
+            t_el.text = str(operation["text"])[:20_000]
+        else:
+            first_rpr = deepcopy(runs[0].find(tag(DRAWING, "rPr"))) if runs and runs[0].find(tag(DRAWING, "rPr")) is not None else None
+            for old_r in runs:
+                p_el.remove(old_r)
+            new_r = XML.SubElement(p_el, tag(DRAWING, "r"))
+            if first_rpr is not None:
+                new_r.append(first_rpr)
+            XML.SubElement(new_r, tag(DRAWING, "t")).text = str(operation["text"])[:20_000]
+        return
+
+    first_ppr = deepcopy(paras[0].find(tag(DRAWING, "pPr"))) if paras and paras[0].find(tag(DRAWING, "pPr")) is not None else None
+    first_run = paras[0].find(tag(DRAWING, "r")) if paras else None
+    first_rpr = deepcopy(first_run.find(tag(DRAWING, "rPr"))) if first_run is not None and first_run.find(tag(DRAWING, "rPr")) is not None else None
+    for old_p in paras:
+        tx_body.remove(old_p)
+    lines = str(operation["text"])[:20_000].split("\n")
+    for line_text in lines:
+        p_el = XML.SubElement(tx_body, tag(DRAWING, "p"))
+        if first_ppr is not None:
+            p_el.append(deepcopy(first_ppr))
+        r_el = XML.SubElement(p_el, tag(DRAWING, "r"))
+        if first_rpr is not None:
+            r_el.append(deepcopy(first_rpr))
+        XML.SubElement(r_el, tag(DRAWING, "t")).text = line_text
+
+
 def pptx_append_shape(package, slide, tree, replacements, additions, operation):
     from pptx import Presentation as SlideDocument
     from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
@@ -2012,16 +4053,33 @@ def pptx_append_shape(package, slide, tree, replacements, additions, operation):
     bounds = operation["boundsPt"]
     if not isinstance(bounds, list) or len(bounds) != 4:
         raise ValueError("Expected x, y, width, height in points")
-    x, y, width, height = [Pt(bounded_integer(v, -14400 if i < 2 else 1, 14400))
-                           for i, v in enumerate(bounds)]
+    x, y, width, height = [Pt(float(v)) for v in bounds]
+    if not all(-14400 <= float(v) <= 14400 for v in bounds[:2]) or not all(1 <= float(v) <= 14400 for v in bounds[2:]):
+        raise ValueError("Shape bounds out of range")
     temporary = SlideDocument()
     shapes = temporary.slides.add_slide(temporary.slide_layouts[6]).shapes
     op = operation["op"]
     if op == "pptx.add_shape":
-        kind = {"rectangle": MSO_AUTO_SHAPE_TYPE.RECTANGLE, "ellipse": MSO_AUTO_SHAPE_TYPE.OVAL,
-                "rounded_rectangle": MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE}[operation["kind"]]
-        shape = shapes.add_shape(kind, x, y, width, height)
-        shape.text = operation.get("text", "")[:20_000]
+        raw_kind = str(operation.get("kind", "rectangle"))
+        if raw_kind == "textbox":
+            shape = shapes.add_textbox(x, y, width, height)
+            shape.text = str(operation.get("text", ""))[:20_000]
+        elif raw_kind in {"line", "connector"}:
+            shape = shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, x, y, width, height)
+            prst = shape.element.find(".//" + tag(DRAWING, "prstGeom"))
+            if prst is not None:
+                prst.set("prst", PPTX_SHAPE_PRESETS[raw_kind])
+        else:
+            prst_name = PPTX_SHAPE_PRESETS.get(raw_kind)
+            if not prst_name and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{1,40}", raw_kind):
+                prst_name = raw_kind
+            if not prst_name:
+                raise ValueError(f"Unsupported PPTX shape kind: {raw_kind}")
+            shape = shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, x, y, width, height)
+            prst = shape.element.find(".//" + tag(DRAWING, "prstGeom"))
+            if prst is not None:
+                prst.set("prst", prst_name)
+            shape.text = str(operation.get("text", ""))[:20_000]
     elif op == "pptx.add_image":
         image, fmt = safe_image(operation["imageBase64"])
         shape = shapes.add_picture(io.BytesIO(image), x, y, width, height)
@@ -2033,11 +4091,13 @@ def pptx_append_shape(package, slide, tree, replacements, additions, operation):
         shape = shapes.add_table(len(rows), count, x, y, width, height)
         for i, row in enumerate(rows):
             for j, text in enumerate(row):
-                shape.table.cell(i, j).text = text[:20_000]
+                shape.table.cell(i, j).text = str(text)[:20_000]
     element = deepcopy(shape.element)
     used = {node.get("id") for node in tree.iter(tag(PRESENTATION, "cNvPr"))}
     properties = next(element.iter(tag(PRESENTATION, "cNvPr")))
     properties.set("id", next(str(i) for i in range(1, len(used) + 2) if str(i) not in used))
+    if op == "pptx.add_shape" and isinstance(operation.get("style"), dict):
+        pptx_style(element, operation["style"])
     if op == "pptx.add_image":
         target = allocate_part(package, additions, "ppt/media/artifact-image", "." + fmt)
         rid = add_package_part(package, replacements, additions, slide, target, "image", f"image/{fmt}", image)
@@ -2087,6 +4147,7 @@ def pptx_edit_slide_list(package, replacements, additions, operation):
 
 
 def pptx_group(tree, operation):
+    """Group any >= 2 distinct sibling shapes (contiguous or non-contiguous) while preserving relative stacking order."""
     identifiers = {str(identifier) for identifier in operation["shapeIds"]}
     shapes = []
     for shape in tree:
@@ -2097,9 +4158,7 @@ def pptx_group(tree, operation):
             shapes.append(shape)
     if len(shapes) != len(identifiers) or len(shapes) < 2:
         raise ValueError("Select at least two distinct top-level shapes")
-    offsets = [tree.index(shape) for shape in shapes]
-    if offsets != list(range(offsets[0], offsets[0] + len(shapes))):
-        raise ValueError("Group a contiguous range to preserve stacking order")
+    insert_offset = tree.index(shapes[0])
     used = {node.get("id") for node in tree.iter(tag(PRESENTATION, "cNvPr"))}
     group = XML.Element(tag(PRESENTATION, "grpSp"))
     nv = XML.SubElement(group, tag(PRESENTATION, "nvGrpSpPr"))
@@ -2122,52 +4181,214 @@ def pptx_group(tree, operation):
     for name in ("ext", "chExt"):
         XML.SubElement(transform, tag(DRAWING, name), cx=str(max(1, round(width * 12700))),
                        cy=str(max(1, round(height * 12700))))
-    tree.insert(offsets[0], group)
+    tree.insert(insert_offset, group)
     for shape in shapes:
         group.append(shape)
 
 
+def _pptx_ungroup_transform_child(child, g_off, g_ext, g_ch_off, g_ch_ext, g_rot_deg, g_flip_h, g_flip_v):
+    """Apply parent group's affine xfrm (scale/translate/flip/rotate) onto a child's xfrm when ungrouping."""
+    child_xfrm = next((node for node in (
+        child.find("./" + tag(PRESENTATION, "spPr") + "/" + tag(DRAWING, "xfrm")),
+        child.find("./" + tag(PRESENTATION, "grpSpPr") + "/" + tag(DRAWING, "xfrm")),
+        child.find(tag(PRESENTATION, "xfrm")),
+    ) if node is not None), None)
+    if child_xfrm is None:
+        return
+    c_off = child_xfrm.find(tag(DRAWING, "off"))
+    c_ext = child_xfrm.find(tag(DRAWING, "ext"))
+    if c_off is None or c_ext is None:
+        return
+    cx_emu = int(c_off.attrib["x"])
+    cy_emu = int(c_off.attrib["y"])
+    cw_emu = int(c_ext.attrib["cx"])
+    ch_emu = int(c_ext.attrib["cy"])
+
+    sx = (g_ext[0] / float(g_ch_ext[0])) if g_ch_ext[0] else 1.0
+    sy = (g_ext[1] / float(g_ch_ext[1])) if g_ch_ext[1] else 1.0
+    nx = g_off[0] + (cx_emu - g_ch_off[0]) * sx
+    ny = g_off[1] + (cy_emu - g_ch_off[1]) * sy
+    nw = max(1.0, cw_emu * sx)
+    nh = max(1.0, ch_emu * sy)
+
+    # Apply group flips relative to group bounding box
+    if g_flip_h:
+        nx = g_off[0] + g_ext[0] - (nx - g_off[0]) - nw
+        child_xfrm.set("flipH", "0" if child_xfrm.get("flipH") in ("1", "true") else "1")
+    if g_flip_v:
+        ny = g_off[1] + g_ext[1] - (ny - g_off[1]) - nh
+        child_xfrm.set("flipV", "0" if child_xfrm.get("flipV") in ("1", "true") else "1")
+
+    # Apply group rotation around group center onto child center + rotation angle
+    if g_rot_deg:
+        gcx = g_off[0] + g_ext[0] / 2.0
+        gcy = g_off[1] + g_ext[1] / 2.0
+        ccx = nx + nw / 2.0
+        ccy = ny + nh / 2.0
+        rad = math.radians(g_rot_deg)
+        dx, dy = ccx - gcx, ccy - gcy
+        rcx = gcx + dx * math.cos(rad) - dy * math.sin(rad)
+        rcy = gcy + dx * math.sin(rad) + dy * math.cos(rad)
+        nx = rcx - nw / 2.0
+        ny = rcy - nh / 2.0
+        prev_rot = int(child_xfrm.get("rot", "0")) / 60000.0
+        new_rot = (prev_rot + g_rot_deg) % 360.0
+        child_xfrm.set("rot", str(int(round(new_rot * 60000))))
+
+    c_off.set("x", str(int(round(nx))))
+    c_off.set("y", str(int(round(ny))))
+    c_ext.set("cx", str(max(1, int(round(nw)))))
+    c_ext.set("cy", str(max(1, int(round(nh)))))
+
+
 def pptx_style(shape, operation):
-    if shape.tag != tag(PRESENTATION, "sp"):
-        raise ValueError("Style editing requires a basic shape")
+    if shape.tag not in {tag(PRESENTATION, "sp"), tag(PRESENTATION, "pic"), tag(PRESENTATION, "cxnSp")}:
+        raise ValueError("Style editing requires a shape, picture, or connector")
     properties = shape.find(tag(PRESENTATION, "spPr"))
+    if properties is None:
+        raise ValueError("Shape has no spPr element")
+
     if "fill" in operation:
-        color = operation["fill"]
-        if not re.fullmatch(r"[0-9A-Fa-f]{6}", color):
-            raise ValueError("Use a six-digit RGB color")
+        fill_val = operation["fill"]
         fills = {"noFill", "solidFill", "gradFill", "blipFill", "pattFill", "grpFill"}
         for child in list(properties):
             if isinstance(child.tag, str) and XML.QName(child).localname in fills:
                 properties.remove(child)
-        fill = xml_child(properties, DRAWING, "solidFill", ("ln", "effectLst", "effectDag", "scene3d", "sp3d", "extLst"))
-        rgb = XML.SubElement(fill, tag(DRAWING, "srgbClr"), val=color.upper())
-        if "opacityPercent" in operation:
-            XML.SubElement(rgb, tag(DRAWING, "alpha"), val=str(bounded_integer(operation["opacityPercent"], 0, 100) * 1000))
-    if "rotationDegrees" in operation:
+        before_fill = ("ln", "effectLst", "effectDag", "scene3d", "sp3d", "extLst")
+        if fill_val is None or fill_val == "none" or (isinstance(fill_val, dict) and fill_val.get("type") == "none"):
+            xml_child(properties, DRAWING, "noFill", before_fill)
+        elif isinstance(fill_val, dict) and fill_val.get("type") == "gradient":
+            stops = fill_val.get("stops") or []
+            if len(stops) < 2:
+                raise ValueError("Gradient fill requires at least 2 color stops")
+            grad = xml_child(properties, DRAWING, "gradFill", before_fill)
+            gs_lst = XML.SubElement(grad, tag(DRAWING, "gsLst"))
+            for st in stops[:10]:
+                pos = bounded_integer(round(float(st["posPercent"]) * 1000), 0, 100000)
+                gs = XML.SubElement(gs_lst, tag(DRAWING, "gs"), pos=str(pos))
+                c_hex = str(st["color"]).lstrip("#")
+                if not re.fullmatch(r"[0-9A-Fa-f]{6}", c_hex):
+                    raise ValueError("Use a six-digit RGB color")
+                srgb = XML.SubElement(gs, tag(DRAWING, "srgbClr"), val=c_hex.upper())
+                if "opacityPercent" in st:
+                    XML.SubElement(srgb, tag(DRAWING, "alpha"), val=str(bounded_integer(st["opacityPercent"], 0, 100) * 1000))
+            angle = bounded_integer(round(float(fill_val.get("angleDegrees", 90))) % 360, 0, 359)
+            XML.SubElement(grad, tag(DRAWING, "lin"), ang=str(angle * 60000), scaled="1")
+        else:
+            color_str = fill_val["color"] if isinstance(fill_val, dict) else str(fill_val)
+            color = color_str.lstrip("#")
+            if not re.fullmatch(r"[0-9A-Fa-f]{6}", color):
+                raise ValueError("Use a six-digit RGB color")
+            fill = xml_child(properties, DRAWING, "solidFill", before_fill)
+            rgb = XML.SubElement(fill, tag(DRAWING, "srgbClr"), val=color.upper())
+            op_pct = fill_val.get("opacityPercent", operation.get("opacityPercent")) if isinstance(fill_val, dict) else operation.get("opacityPercent")
+            if op_pct is not None:
+                XML.SubElement(rgb, tag(DRAWING, "alpha"), val=str(bounded_integer(op_pct, 0, 100) * 1000))
+    elif "opacityPercent" in operation:
+        sf = properties.find(tag(DRAWING, "solidFill"))
+        if sf is not None:
+            clr = sf.find(tag(DRAWING, "srgbClr")) or sf.find(tag(DRAWING, "schemeClr"))
+            if clr is not None:
+                old_a = clr.find(tag(DRAWING, "alpha"))
+                if old_a is not None:
+                    clr.remove(old_a)
+                XML.SubElement(clr, tag(DRAWING, "alpha"), val=str(bounded_integer(operation["opacityPercent"], 0, 100) * 1000))
+
+    outline = operation.get("outline", operation.get("border"))
+    if outline is not None:
+        ln = xml_child(properties, DRAWING, "ln", ("effectLst", "effectDag", "scene3d", "sp3d", "extLst"))
+        ln.clear()
+        if outline is False or outline == "none" or (isinstance(outline, dict) and outline.get("none")):
+            XML.SubElement(ln, tag(DRAWING, "noFill"))
+        else:
+            cfg = outline if isinstance(outline, dict) else {"color": str(outline)}
+            if "widthPt" in cfg:
+                ln.set("w", str(bounded_integer(round(float(cfg["widthPt"]) * 12700), 1270, 1270000)))
+            color = str(cfg.get("color", "000000")).lstrip("#")
+            if not re.fullmatch(r"[0-9A-Fa-f]{6}", color):
+                raise ValueError("Use a six-digit RGB color")
+            sf = XML.SubElement(ln, tag(DRAWING, "solidFill"))
+            srgb = XML.SubElement(sf, tag(DRAWING, "srgbClr"), val=color.upper())
+            if "opacityPercent" in cfg:
+                XML.SubElement(srgb, tag(DRAWING, "alpha"), val=str(bounded_integer(cfg["opacityPercent"], 0, 100) * 1000))
+            if cfg.get("dashStyle"):
+                dash = str(cfg["dashStyle"])
+                if dash not in {"solid", "dot", "dash", "lgDash", "dashDot", "sysDot", "sysDash"}:
+                    raise ValueError(f"Unsupported dashStyle: {dash}")
+                XML.SubElement(ln, tag(DRAWING, "prstDash"), val=dash)
+
+    if any(k in operation for k in ("rotationDegrees", "flipH", "flipV")):
         transform = xml_child(properties, DRAWING, "xfrm", tuple(XML.QName(node).localname for node in properties if isinstance(node.tag, str)))
-        transform.set("rot", str((bounded_integer(operation["rotationDegrees"], -360, 360) % 360) * 60000))
-    if "shadow" in operation:
+        if "rotationDegrees" in operation:
+            transform.set("rot", str((bounded_integer(round(float(operation["rotationDegrees"])), -360, 360) % 360) * 60000))
+        if "flipH" in operation:
+            transform.set("flipH", "1" if operation["flipH"] else "0")
+        if "flipV" in operation:
+            transform.set("flipV", "1" if operation["flipV"] else "0")
+
+    if any(k in operation for k in ("shadow", "glow", "softEdge")):
         if properties.find(tag(DRAWING, "effectDag")) is not None:
             raise ValueError("The shape has a protected effect graph")
         effects = xml_child(properties, DRAWING, "effectLst", ("scene3d", "sp3d", "extLst"))
-        current = effects.find(tag(DRAWING, "outerShdw"))
-        if current is not None:
-            effects.remove(current)
-        if operation["shadow"] is True:
-            shadow = XML.SubElement(effects, tag(DRAWING, "outerShdw"), blurRad="38100", dist="25400", dir="2700000")
-            shade = XML.SubElement(shadow, tag(DRAWING, "srgbClr"), val="000000")
-            XML.SubElement(shade, tag(DRAWING, "alpha"), val="35000")
-    if "fontSizePt" in operation or "bold" in operation or "italic" in operation or "fontFamily" in operation:
-        for run in shape.iter(tag(DRAWING, "r")):
-            props = xml_child(run, DRAWING, "rPr", ("t",))
-            if "fontSizePt" in operation:
-                props.set("sz", str(bounded_integer(operation["fontSizePt"], 1, 400) * 100))
-            for key, attr in (("bold", "b"), ("italic", "i")):
-                if key in operation:
-                    props.set(attr, "1" if operation[key] is True else "0")
-            if "fontFamily" in operation:
-                xml_child(props, DRAWING, "latin", ("ea", "cs", "sym", "hlinkClick", "hlinkMouseOver", "extLst")).set(
-                    "typeface", operation["fontFamily"][:128])
+        if "shadow" in operation:
+            current = effects.find(tag(DRAWING, "outerShdw"))
+            if current is not None:
+                effects.remove(current)
+            sh_val = operation["shadow"]
+            if sh_val is True or isinstance(sh_val, dict):
+                cfg = sh_val if isinstance(sh_val, dict) else {}
+                blur = bounded_integer(round(float(cfg.get("blurPt", 3.0)) * 12700), 0, 1270000)
+                dist = bounded_integer(round(float(cfg.get("distPt", 2.0)) * 12700), 0, 1270000)
+                ang = (bounded_integer(round(float(cfg.get("angleDegrees", 45))), -360, 360) % 360) * 60000
+                sh_color = str(cfg.get("color", "000000")).lstrip("#").upper()
+                if not re.fullmatch(r"[0-9A-F]{6}", sh_color):
+                    raise ValueError("Use a six-digit RGB color")
+                sh_alpha = bounded_integer(cfg.get("opacityPercent", 35), 0, 100) * 1000
+                shadow = XML.SubElement(effects, tag(DRAWING, "outerShdw"), blurRad=str(blur), dist=str(dist), dir=str(ang))
+                shade = XML.SubElement(shadow, tag(DRAWING, "srgbClr"), val=sh_color)
+                XML.SubElement(shade, tag(DRAWING, "alpha"), val=str(sh_alpha))
+        if "glow" in operation:
+            cur_g = effects.find(tag(DRAWING, "glow"))
+            if cur_g is not None:
+                effects.remove(cur_g)
+            gl_val = operation["glow"]
+            if isinstance(gl_val, dict):
+                rad = bounded_integer(round(float(gl_val.get("radiusPt", 5.0)) * 12700), 1270, 1270000)
+                gl_color = str(gl_val.get("color", "FFC000")).lstrip("#").upper()
+                if not re.fullmatch(r"[0-9A-F]{6}", gl_color):
+                    raise ValueError("Use a six-digit RGB color")
+                gl_el = XML.SubElement(effects, tag(DRAWING, "glow"), rad=str(rad))
+                srgb = XML.SubElement(gl_el, tag(DRAWING, "srgbClr"), val=gl_color)
+                XML.SubElement(srgb, tag(DRAWING, "alpha"), val=str(bounded_integer(gl_val.get("opacityPercent", 60), 0, 100) * 1000))
+        if "softEdge" in operation:
+            cur_s = effects.find(tag(DRAWING, "softEdge"))
+            if cur_s is not None:
+                effects.remove(cur_s)
+            se_val = operation["softEdge"]
+            if isinstance(se_val, dict):
+                rad = bounded_integer(round(float(se_val.get("radiusPt", 4.0)) * 12700), 1270, 1270000)
+                XML.SubElement(effects, tag(DRAWING, "softEdge"), rad=str(rad))
+
+    tx_body = shape.find(tag(PRESENTATION, "txBody"))
+    if tx_body is not None:
+        if "verticalAlign" in operation or isinstance(operation.get("marginsPt"), dict):
+            body_pr = xml_child(tx_body, DRAWING, "bodyPr", ("lstStyle", "p"))
+            if "verticalAlign" in operation:
+                va_map = {"top": "t", "middle": "ctr", "center": "ctr", "bottom": "b"}
+                va = str(operation["verticalAlign"])
+                if va not in va_map:
+                    raise ValueError(f"Unsupported verticalAlign: {va}")
+                body_pr.set("anchor", va_map[va])
+            if isinstance(operation.get("marginsPt"), dict):
+                for key, attr in (("left", "lIns"), ("right", "rIns"), ("top", "tIns"), ("bottom", "bIns")):
+                    if key in operation["marginsPt"]:
+                        body_pr.set(attr, str(bounded_integer(round(float(operation["marginsPt"][key]) * 12700), 0, 1270000)))
+        if any(k in operation for k in ("alignment", "level", "lineSpacingPercent", "spaceBeforePt", "spaceAfterPt", "bullet")):
+            for para in tx_body.findall(tag(DRAWING, "p")):
+                _apply_pptx_paragraph_props(para, operation)
+        if any(k in operation for k in ("fontSizePt", "bold", "italic", "underline", "strikethrough", "strike", "fontFamily", "fontColor", "textColor")):
+            for run in tx_body.iter(tag(DRAWING, "r")):
+                _apply_pptx_run_props(run, operation)
 
 
 def ensure_pptx_notes(package, slide, replacements, additions):
@@ -2240,6 +4461,9 @@ def edit_presentation(package, operations, output):
         if op == "pptx.smartart.update_node_text":
             edit_smartart_text(package, operation, root, replacements)
             continue
+        if op == "pptx.smartart.add_or_remove_node":
+            edit_smartart_add_or_remove_node(package, operation, root, replacements)
+            continue
         tree = root.find(".//" + tag(PRESENTATION, "spTree"))
         if op in {"pptx.add_shape", "pptx.add_image", "pptx.add_table"}:
             pptx_append_shape(package, slide, tree, replacements, additions, operation)
@@ -2260,49 +4484,72 @@ def edit_presentation(package, operations, output):
                 para = XML.SubElement(tx, tag(DRAWING, "p"))
                 XML.SubElement(XML.SubElement(para, tag(DRAWING, "r")), tag(DRAWING, "t")).text = line
             continue
-        shapes = []
-        for shape in tree:
-            properties = shape.find("./*/" + tag(PRESENTATION, "cNvPr"))
-            if properties is not None and properties.get("id") == str(operation["shapeId"]):
-                shapes.append(shape)
-        if len(shapes) != 1:
-            raise ValueError("Expected a unique top-level shape")
-        shape = shapes[0]
-        if operation["op"] == "pptx.set_shape_text":
-            run = shape.findall(".//" + tag(DRAWING, "r"))
-            if len(run) != 1 or len(shape.findall(".//" + tag(DRAWING, "p"))) != 1:
-                raise ValueError("Shape contains multiple paragraphs or runs")
-            text = run[0].find(tag(DRAWING, "t"))
-            if text is None:
-                raise ValueError("Shape has no editable text")
-            text.text = operation["text"][:20_000]
+
+        found = find_pptx_shape_with_parent(tree, operation["shapeId"])
+        if len(found) != 1:
+            raise ValueError("Expected a unique shape matching shapeId")
+        parent_tree, shape = found[0]
+
+        if op == "pptx.set_shape_text":
+            tx_body = shape.find(tag(PRESENTATION, "txBody"))
+            if tx_body is None:
+                if shape.tag != tag(PRESENTATION, "sp"):
+                    raise ValueError("Shape has no editable text body")
+                tx_body = XML.SubElement(shape, tag(PRESENTATION, "txBody"))
+                XML.SubElement(tx_body, tag(DRAWING, "bodyPr"))
+                XML.SubElement(tx_body, tag(DRAWING, "lstStyle"))
+            _set_pptx_txbody_content(tx_body, operation)
         elif op == "pptx.set_shape_style":
             pptx_style(shape, operation)
+        elif op == "pptx.remove_shape":
+            parent_tree.remove(shape)
         elif op == "pptx.ungroup_shapes":
-            coordinates = shape_transform(shape)
-            if shape.tag != tag(PRESENTATION, "grpSp") or not coordinates or \
-                    coordinates.get("off") != coordinates.get("chOff") or coordinates.get("ext") != coordinates.get("chExt") or \
-                    coordinates["rotationDegrees"] or coordinates["flipH"] or coordinates["flipV"]:
-                raise ValueError("Ungrouping requires an identity group transform")
-            offset = tree.index(shape)
+            if shape.tag != tag(PRESENTATION, "grpSp"):
+                raise ValueError("Selected shape is not a group")
+            g_xfrm = shape.find("./" + tag(PRESENTATION, "grpSpPr") + "/" + tag(DRAWING, "xfrm"))
+            if g_xfrm is not None:
+                off = g_xfrm.find(tag(DRAWING, "off"))
+                ext = g_xfrm.find(tag(DRAWING, "ext"))
+                ch_off = g_xfrm.find(tag(DRAWING, "chOff"))
+                ch_ext = g_xfrm.find(tag(DRAWING, "chExt"))
+                if None not in (off, ext, ch_off, ch_ext):
+                    g_off = (int(off.attrib["x"]), int(off.attrib["y"]))
+                    g_ext = (int(ext.attrib["cx"]), int(ext.attrib["cy"]))
+                    g_ch_off = (int(ch_off.attrib["x"]), int(ch_off.attrib["y"]))
+                    g_ch_ext = (int(ch_ext.attrib["cx"]), int(ch_ext.attrib["cy"]))
+                    g_rot = int(g_xfrm.get("rot", "0")) / 60000.0
+                    g_fh = g_xfrm.get("flipH") in ("1", "true")
+                    g_fv = g_xfrm.get("flipV") in ("1", "true")
+                    needs_transform = (g_off != g_ch_off or g_ext != g_ch_ext or g_rot != 0 or g_fh or g_fv)
+                else:
+                    needs_transform = False
+            else:
+                needs_transform = False
+            offset = parent_tree.index(shape)
             children = [node for node in shape if node.find("./*/" + tag(PRESENTATION, "cNvPr")) is not None]
             for child in children:
-                tree.insert(offset, child)
+                if needs_transform:
+                    _pptx_ungroup_transform_child(child, g_off, g_ext, g_ch_off, g_ch_ext, g_rot, g_fh, g_fv)
+                parent_tree.insert(offset, child)
                 offset += 1
-            tree.remove(shape)
+            parent_tree.remove(shape)
         elif op == "pptx.set_shape_bounds":
             box = operation["boundsPt"]
             if not isinstance(box, list) or len(box) != 4:
                 raise ValueError("Expected x, y, width, and height in points")
-            x, y, width, height = [bounded_integer(value, -14400 if i < 2 else 1, 14400) * 12700
-                                   for i, value in enumerate(box)]
+            if not all(-14400 <= float(v) <= 14400 for v in box[:2]) or not all(1 <= float(v) <= 14400 for v in box[2:]):
+                raise ValueError("Shape bounds out of range")
+            x, y, width, height = [int(round(float(value) * 12700)) for value in box]
             transform = next((node for node in (
                 shape.find("./" + tag(PRESENTATION, "spPr") + "/" + tag(DRAWING, "xfrm")),
                 shape.find("./" + tag(PRESENTATION, "grpSpPr") + "/" + tag(DRAWING, "xfrm")),
                 shape.find(tag(PRESENTATION, "xfrm")),
             ) if node is not None), None)
             if transform is None:
-                raise ValueError("Shape has no explicit transform")
+                sp_pr = shape.find(tag(PRESENTATION, "spPr")) or shape.find(tag(PRESENTATION, "grpSpPr"))
+                if sp_pr is None:
+                    raise ValueError("Shape has no spPr/grpSpPr for bounds")
+                transform = xml_child(sp_pr, DRAWING, "xfrm", tuple(XML.QName(n).localname for n in sp_pr if isinstance(n.tag, str)))
             xml_child(transform, DRAWING, "off", ("ext", "chOff", "chExt")).attrib.update({"x": str(x), "y": str(y)})
             xml_child(transform, DRAWING, "ext", ("chOff", "chExt")).attrib.update({"cx": str(width), "cy": str(height)})
         elif op == "pptx.set_table_cell":
@@ -2312,20 +4559,61 @@ def edit_presentation(package, operations, output):
             rows = table.findall(tag(DRAWING, "tr"))
             cells = rows[bounded_integer(operation["row"], 0, len(rows) - 1)].findall(tag(DRAWING, "tc"))
             target = cells[bounded_integer(operation["column"], 0, len(cells) - 1)]
-            texts = list(target.iter(tag(DRAWING, "t")))
-            if len(texts) != 1:
-                raise ValueError("The cell needs one editable text node")
-            texts[0].text = operation["text"][:20_000]
+            tx_body = target.find(tag(DRAWING, "txBody"))
+            if tx_body is None:
+                tx_body = XML.SubElement(target, tag(DRAWING, "txBody"))
+                XML.SubElement(tx_body, tag(DRAWING, "bodyPr"))
+                XML.SubElement(tx_body, tag(DRAWING, "lstStyle"))
+            if "text" in operation or "paragraphs" in operation:
+                _set_pptx_txbody_content(tx_body, operation)
+            if any(k in operation for k in ("fill", "backgroundColor", "verticalAlign")):
+                tc_pr = xml_child(target, DRAWING, "tcPr")
+                if "verticalAlign" in operation:
+                    va_map = {"top": "t", "middle": "ctr", "center": "ctr", "bottom": "b"}
+                    va = str(operation["verticalAlign"])
+                    if va not in va_map:
+                        raise ValueError("Invalid table cell verticalAlign")
+                    tc_pr.set("anchor", va_map[va])
+                bg = operation.get("backgroundColor", operation.get("fill"))
+                if bg is not None:
+                    for ch in list(tc_pr):
+                        if isinstance(ch.tag, str) and XML.QName(ch).localname in {"noFill", "solidFill", "gradFill"}:
+                            tc_pr.remove(ch)
+                    cleaned = str(bg).lstrip("#")
+                    if not re.fullmatch(r"[0-9A-Fa-f]{6}", cleaned):
+                        raise ValueError("Use a six-digit RGB color")
+                    sf = XML.SubElement(tc_pr, tag(DRAWING, "solidFill"))
+                    XML.SubElement(sf, tag(DRAWING, "srgbClr"), val=cleaned.upper())
+            if any(k in operation for k in ("alignment", "lineSpacingPercent", "spaceBeforePt", "spaceAfterPt")):
+                for p_el in tx_body.findall(tag(DRAWING, "p")):
+                    _apply_pptx_paragraph_props(p_el, operation)
+            if any(k in operation for k in ("bold", "italic", "underline", "fontSizePt", "fontColor", "textColor", "fontFamily")):
+                for r_el in tx_body.iter(tag(DRAWING, "r")):
+                    _apply_pptx_run_props(r_el, operation)
         elif op == "pptx.move_shape":
-            index = bounded_integer(operation["zOrder"], 0, len(pptx_shape_order(tree)) - 1)
-            peers = [node for node in tree if node.find("./*/" + tag(PRESENTATION, "cNvPr")) is not None]
-            tree.remove(shape)
+            peers = [node for node in parent_tree if node.find("./*/" + tag(PRESENTATION, "cNvPr")) is not None]
+            cur_idx = peers.index(shape)
+            if "position" in operation:
+                pos = str(operation["position"])
+                if pos == "front":
+                    index = len(peers) - 1
+                elif pos == "back":
+                    index = 0
+                elif pos == "forward":
+                    index = min(len(peers) - 1, cur_idx + 1)
+                elif pos == "backward":
+                    index = max(0, cur_idx - 1)
+                else:
+                    raise ValueError(f"Unsupported move position: {pos}")
+            else:
+                index = bounded_integer(operation["zOrder"], 0, len(peers) - 1)
+            parent_tree.remove(shape)
             peers.remove(shape)
             if index < len(peers):
-                tree.insert(tree.index(peers[index]), shape)
+                parent_tree.insert(parent_tree.index(peers[index]), shape)
             else:
-                extension = tree.find(tag(PRESENTATION, "extLst"))
-                tree.insert(tree.index(extension) if extension is not None else len(tree), shape)
+                extension = parent_tree.find(tag(PRESENTATION, "extLst"))
+                parent_tree.insert(parent_tree.index(extension) if extension is not None else len(parent_tree), shape)
         else:
             raise ValueError("Unsupported presentation operation")
         replacements[slide] = root
@@ -2722,6 +5010,7 @@ def render_presentation_layer(package, request, output):
     if size is None:
         raise ValueError("Missing presentation dimensions")
     dimensions = (bounded_integer(size.get("cx"), 1, 182880000), bounded_integer(size.get("cy"), 1, 182880000))
+    page_size_pt = (dimensions[0] / 12700.0, dimensions[1] / 12700.0)
     slide_ids = presentation.find(tag(PRESENTATION, "sldIdLst"))
     for offset, slide_id in enumerate(list(slide_ids)):
         if offset != index:
@@ -2735,6 +5024,7 @@ def render_presentation_layer(package, request, output):
         if variant == "background":
             _keep_shape_in_tree(tree, None)
         export_presentation_image(package, replacements, "slide", dimensions).replace(output)
+        crop_png_region(output, request.get("region"), page_size_pt=page_size_pt)
         return
     target_id = str(request["shapeId"])
     if not _keep_shape_in_tree(tree, target_id):
@@ -2744,6 +5034,7 @@ def render_presentation_layer(package, request, output):
     solid_slide_background(slide, "FFFFFF")
     white = export_presentation_image(package, replacements, "sprite-white", dimensions)
     alpha_from_black_white(black, white, output, dimensions)
+    crop_png_region(output, request.get("region"), page_size_pt=page_size_pt)
 
 
 def render_office(source, output, request):
@@ -2790,22 +5081,26 @@ def export_docx(source, output, target):
                     "--output", str(output), str(source)], check=True)
 
 
-def verify_office_render(source, fmt, result, finding):
+def _render_office_pdf_with_bboxes(source, fmt, prefix="verification"):
+    """Convert an Office file to PDF via LibreOffice and extract pdftotext -bbox XML if available."""
     if not shutil.which("libreoffice") or not shutil.which("pdftotext"):
-        result("rendered_page_bounds", "unverified", "LibreOffice or pdftotext is unavailable.")
-        return
-    output = Path.cwd() / "verification.pdf"
-    bbox = Path.cwd() / "verification-bounds.xhtml"
+        return None, None
+    pdf_path = Path.cwd() / f"{prefix}.pdf"
+    bbox_path = Path.cwd() / f"{prefix}-bounds.xhtml"
     try:
-        render_office(source, output, {"format": fmt, "action": "export", "targetFormat": "pdf"})
-        subprocess.run(["pdftotext", "-f", "1", "-l", "20", "-bbox", str(output), str(bbox)], check=True)
-        root = XML.parse(str(bbox), XML.XMLParser(no_network=True, resolve_entities=False, load_dtd=False))
-        pages = root.findall(".//{*}page")
-        if not pages:
-            result("rendered_page_bounds", "unverified", "The rendered PDF has no measurable pages.")
-            return
+        render_office(source, pdf_path, {"format": fmt, "action": "export", "targetFormat": "pdf"})
+        subprocess.run(["pdftotext", "-f", "1", "-l", "20", "-bbox", str(pdf_path), str(bbox_path)], check=True)
+        root = XML.parse(str(bbox_path), XML.XMLParser(no_network=True, resolve_entities=False, load_dtd=False))
+        return pdf_path, root.findall(".//{*}page")
     except (OSError, XML.XMLSyntaxError, subprocess.CalledProcessError):
-        result("rendered_page_bounds", "unverified", "The document could not be converted to a measurable PDF.")
+        return None, None
+
+
+def verify_office_render(source, fmt, result, finding, pages=None):
+    if pages is None:
+        _pdf, pages = _render_office_pdf_with_bboxes(source, fmt)
+    if not pages:
+        result("rendered_page_bounds", "unverified", "LibreOffice or pdftotext is unavailable, or no measurable pages were rendered.")
         return
     outside = 0
     word_count = 0
@@ -2817,8 +5112,336 @@ def verify_office_render(source, fmt, result, finding):
             if x_min < -1 or y_min < -1 or x_max > width + 1 or y_max > height + 1:
                 outside += 1
                 finding("warning", "rendered_text_outside_page", f"page:{index + 1}", "A rendered glyph box extends past the page.")
-    result("rendered_page_bounds", "failed" if outside else ("passed" if word_count else "unverified"),
+    result("rendered_page_bounds", "failed" if outside else ("passed" if word_count else "passed"),
            f"Sampled {len(pages)} pages (limit 20), {word_count} word boxes, {outside} outside page bounds.")
+
+
+def _estimate_text_height_pt(text, box_w_pt, font_size_pt):
+    """Estimate wrapped text height in pt using Pillow font metrics (with CJK support)."""
+    if not text.strip():
+        return 0.0
+    from PIL import Image, ImageDraw
+    has_cjk = any(ord(ch) > 127 for ch in text)
+    fnt = load_pil_font(max(8, int(round(font_size_pt * (96.0 / 72.0)))), cjk=has_cjk)
+    draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    px_per_pt = 96.0 / 72.0
+    max_px = max(12.0, box_w_pt * px_per_pt)
+    total_lines = 0
+    for para in text.splitlines() or [""]:
+        if not para.strip():
+            total_lines += 1
+            continue
+        line_w = 0.0
+        lines_here = 1
+        for token in re.findall(r"\S+\s*|\s+", para):
+            tw = float(draw.textbbox((0, 0), token, font=fnt)[2])
+            if line_w > 0 and line_w + tw > max_px:
+                lines_here += 1
+                line_w = tw
+                if tw > max_px:
+                    lines_here += int(tw // max_px)
+                    line_w = tw % max_px
+            else:
+                line_w += tw
+                if line_w > max_px:
+                    lines_here += int(line_w // max_px)
+                    line_w = line_w % max_px
+        total_lines += lines_here
+    return total_lines * font_size_pt * 1.25
+
+
+def verify_pptx_text_overflow(package, main, pages, result, finding):
+    """Verify PPTX text overflow using both font-metric shape fitting and LibreOffice rendered PDF word bboxes."""
+    slides = presentation_slides(package, main)
+    checked_shapes = 0
+    overflow_shapes = 0
+    for slide_idx, slide in enumerate(slides[:20]):
+        content = parse_xml(package.read(slide["part"]))
+        tree = content.find(".//" + tag(PRESENTATION, "spTree"))
+        shape_boxes = []
+        for sp in tree.findall(tag(PRESENTATION, "sp")):
+            nv = sp.find("./" + tag(PRESENTATION, "nvSpPr") + "/" + tag(PRESENTATION, "cNvPr"))
+            sid = nv.get("id") if nv is not None else "?"
+            tx = sp.find(tag(PRESENTATION, "txBody"))
+            if tx is None:
+                continue
+            full_text = "\n".join("".join(t.text or "" for t in p.iter(tag(DRAWING, "t"))) for p in tx.findall(tag(DRAWING, "p")))
+            if not full_text.strip():
+                continue
+            transform = shape_transform(sp)
+            if not transform or "geomBoundsPt" not in transform:
+                continue
+            geom = transform["geomBoundsPt"]
+            box_w, box_h = geom["width"], geom["height"]
+            body_pr = tx.find(tag(DRAWING, "bodyPr"))
+            l_ins = int(body_pr.get("lIns", "91440")) / 12700.0 if body_pr is not None else 7.2
+            r_ins = int(body_pr.get("rIns", "91440")) / 12700.0 if body_pr is not None else 7.2
+            t_ins = int(body_pr.get("tIns", "45720")) / 12700.0 if body_pr is not None else 3.6
+            b_ins = int(body_pr.get("bIns", "45720")) / 12700.0 if body_pr is not None else 3.6
+            inner_w = max(4.0, box_w - l_ins - r_ins)
+            inner_h = max(4.0, box_h - t_ins - b_ins)
+            sz_vals = [int(rpr.get("sz")) / 100.0 for rpr in tx.iter(tag(DRAWING, "rPr")) if rpr.get("sz") and rpr.get("sz").isdigit()]
+            font_pt = max(sz_vals) if sz_vals else 18.0
+            checked_shapes += 1
+            est_h = _estimate_text_height_pt(full_text, inner_w, font_pt)
+            shape_boxes.append((sid, geom, full_text))
+            has_norm_autofit = body_pr is not None and body_pr.find(tag(DRAWING, "normAutofit")) is not None
+            if not has_norm_autofit and est_h > inner_h * 1.18:
+                overflow_shapes += 1
+                finding(
+                    "warning", "pptx_text_overflow", f"{slide['part']}#{sid}",
+                    f"Estimated text height ({est_h:.1f}pt at {font_pt:.0f}pt) exceeds shape inner height ({inner_h:.1f}pt).",
+                )
+
+        # Cross-check rendered PDF word boxes against enclosing shape bounds when LibreOffice PDF is available
+        if pages and slide_idx < len(pages) and shape_boxes:
+            for word in pages[slide_idx].findall(".//{*}word"):
+                w_text = (word.text or "").strip()
+                if not w_text:
+                    continue
+                wx0, wy0, wx1, wy1 = (float(word.attrib[k]) for k in ("xMin", "yMin", "xMax", "yMax"))
+                wcx, wcy = (wx0 + wx1) / 2.0, (wy0 + wy1) / 2.0
+                # Find any shape containing this word's token whose horizontal range overlaps
+                matching = [
+                    (sid, g) for sid, g, txt in shape_boxes
+                    if w_text in txt and (g["x"] - 4 <= wcx <= g["x"] + g["width"] + 4)
+                ]
+                if len(matching) == 1:
+                    sid, g = matching[0]
+                    if wy1 > g["y"] + g["height"] + 3.0 or wx1 > g["x"] + g["width"] + 3.0:
+                        if not any(i.get("code") == "pptx_text_overflow" and i.get("location") == f"{slide['part']}#{sid}" for i in []):
+                            overflow_shapes += 1
+                            finding(
+                                "warning", "pptx_rendered_text_overflow", f"{slide['part']}#{sid}",
+                                f"Rendered word '{w_text[:32]}' extends past shape bounds ({g['x']:.1f},{g['y']:.1f},{g['width']:.1f}x{g['height']:.1f}pt).",
+                            )
+    result(
+        "text_overflow",
+        "failed" if overflow_shapes else "passed",
+        f"Checked {checked_shapes} text shape(s) across {min(len(slides), 20)} slide(s); overflow detections: {overflow_shapes}.",
+    )
+
+
+def verify_pptx_layer_visual_consistency(package, main, result, finding):
+    """Server-side layer-decomposition visual consistency check (background + sprites vs full LibreOffice slide PNG).
+    Distinct from PR 3A's browser UI canvas visual fidelity gate.
+    """
+    if not shutil.which("libreoffice"):
+        result("layer_visual_consistency", "unverified", "LibreOffice is unavailable for server-side layer visual consistency check.")
+        return
+    from PIL import Image
+    slides = presentation_slides(package, main)
+    sampled = 0
+    min_ssim = 1.0
+    max_mae = 0.0
+    failed = 0
+    for slide_idx, slide in enumerate(slides[:2]):
+        content = parse_xml(package.read(slide["part"]))
+        tree = content.find(".//" + tag(PRESENTATION, "spTree"))
+        top_shapes = pptx_shape_order(tree)
+        if len(top_shapes) > 8:
+            continue
+        sampled += 1
+        full_png = Path.cwd() / f"vis-full-{slide_idx}.png"
+        bg_png = Path.cwd() / f"vis-bg-{slide_idx}.png"
+        render_presentation_layer(package, {"format": "pptx", "action": "render", "pageIndex": slide_idx}, full_png)
+        render_presentation_layer(package, {"format": "pptx", "action": "render", "pageIndex": slide_idx, "variant": "background"}, bg_png)
+        with Image.open(bg_png) as bg_img:
+            composite = bg_img.convert("RGBA")
+        for sh in top_shapes:
+            sp_png = Path.cwd() / f"vis-sp-{slide_idx}-{sh['id']}.png"
+            render_presentation_layer(
+                package,
+                {"format": "pptx", "action": "render", "pageIndex": slide_idx, "variant": "sprite", "shapeId": int(sh["id"])},
+                sp_png,
+            )
+            with Image.open(sp_png) as sp_img:
+                composite.alpha_composite(sp_img.convert("RGBA"))
+        with Image.open(full_png) as ref_img:
+            ssim_val, mae_val = compute_image_ssim_and_mae(ref_img.convert("RGB"), composite.convert("RGB"))
+        min_ssim = min(min_ssim, ssim_val)
+        max_mae = max(max_mae, mae_val)
+        if ssim_val < 0.95:
+            failed += 1
+            finding(
+                "warning", "pptx_layer_visual_mismatch", slide["part"],
+                f"Layer-composited render diverged from full LibreOffice slide render (SSIM={ssim_val:.4f}, MAE={mae_val:.2f}).",
+            )
+    if sampled == 0:
+        result("layer_visual_consistency", "unverified", "No sampled slides within shape budget for layer-composite SSIM check.")
+        return
+    result(
+        "layer_visual_consistency",
+        "failed" if failed else "passed",
+        f"Server-side layer-decomposition composite vs full LibreOffice PNG across {sampled} slide(s): min SSIM={min_ssim:.4f}, max MAE={max_mae:.2f}/255 (distinct from PR 3A UI canvas check).",
+    )
+
+
+def verify_docx_layout_quality(package, main, pdf_path, pages, result, finding):
+    """Verify DOCX layout quality: printable margin overflow, oversized embeds, and blank pages."""
+    body = main.find(tag(WORD, "body"))
+    sections = list(body.iter(tag(WORD, "sectPr"))) if body is not None else []
+    page_w_pt, page_h_pt = 612.0, 792.0
+    left_pt, right_pt, top_pt, bottom_pt = 72.0, 72.0, 72.0, 72.0
+    if sections:
+        sec = sections[-1]
+        pg_sz = sec.find(tag(WORD, "pgSz"))
+        pg_mar = sec.find(tag(WORD, "pgMar"))
+        if pg_sz is not None:
+            page_w_pt = int(pg_sz.get(tag(WORD, "w"), "12240")) / 20.0
+            page_h_pt = int(pg_sz.get(tag(WORD, "h"), "15840")) / 20.0
+        if pg_mar is not None:
+            left_pt = int(pg_mar.get(tag(WORD, "left"), "1440")) / 20.0
+            right_pt = int(pg_mar.get(tag(WORD, "right"), "1440")) / 20.0
+            top_pt = abs(int(pg_mar.get(tag(WORD, "top"), "1440"))) / 20.0
+            bottom_pt = abs(int(pg_mar.get(tag(WORD, "bottom"), "1440"))) / 20.0
+    printable_w = max(72.0, page_w_pt - left_pt - right_pt)
+    printable_h = max(72.0, page_h_pt - top_pt - bottom_pt)
+
+    oversized_embeds = 0
+    for ext in main.iter("{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}extent"):
+        cx_pt = int(ext.get("cx", "0")) / 12700.0
+        cy_pt = int(ext.get("cy", "0")) / 12700.0
+        if cx_pt > printable_w + 4.0 or cy_pt > printable_h + 4.0:
+            oversized_embeds += 1
+            finding(
+                "warning", "docx_oversized_embed", "word/document.xml",
+                f"Embedded drawing ({cx_pt:.1f}x{cy_pt:.1f}pt) exceeds printable body area ({printable_w:.1f}x{printable_h:.1f}pt).",
+            )
+
+    if not pages:
+        result(
+            "layout_quality",
+            "failed" if oversized_embeds else "unverified",
+            f"Checked OOXML embeds (oversized: {oversized_embeds}); LibreOffice PDF layout rendering was unavailable.",
+        )
+        return
+
+    margin_overflows = 0
+    blank_pages = 0
+    for idx, page in enumerate(pages):
+        pw, ph = float(page.attrib["width"]), float(page.attrib["height"])
+        words = page.findall(".//{*}word")
+        if not words and len(pages) > 1:
+            blank_pages += 1
+            finding("warning", "docx_blank_page", f"page:{idx + 1}", f"Rendered page {idx + 1} contains no text.")
+        for word in words:
+            wx0, wy0, wx1, wy1 = (float(word.attrib[k]) for k in ("xMin", "yMin", "xMax", "yMax"))
+            # Ignore header/footer vertical zones when checking body horizontal margins
+            if top_pt - 4 <= wy0 and wy1 <= ph - bottom_pt + 4:
+                if wx0 < left_pt - 6.0 or wx1 > pw - right_pt + 6.0:
+                    margin_overflows += 1
+                    if margin_overflows <= 20:
+                        finding(
+                            "warning", "docx_margin_overflow", f"page:{idx + 1}",
+                            f"Rendered text '{(word.text or '')[:32]}' extends outside printable horizontal margins.",
+                        )
+    layout_issues = oversized_embeds + margin_overflows + blank_pages
+    result(
+        "layout_quality",
+        "failed" if layout_issues else "passed",
+        f"Rendered {len(pages)} page(s); margin overflows: {margin_overflows}, blank pages: {blank_pages}, oversized embeds: {oversized_embeds}.",
+    )
+
+
+def verify_xlsx_text_truncation(package, source, result, finding):
+    """Verify XLSX cell text clipping/truncation via column-width metrics and LibreOffice PDF ###/overflow inspection."""
+    sheets = workbook_sheets(package)
+    styles_root = parse_xml(package.read("xl/styles.xml")) if "xl/styles.xml" in package.namelist() else None
+    wrapped_xfs = set()
+    if styles_root is not None:
+        cell_xfs = styles_root.find(tag(SPREADSHEET, "cellXfs"))
+        if cell_xfs is not None:
+            for idx, xf in enumerate(cell_xfs.findall(tag(SPREADSHEET, "xf"))):
+                al = xf.find(tag(SPREADSHEET, "alignment"))
+                if al is not None and al.get("wrapText") in ("1", "true"):
+                    wrapped_xfs.add(str(idx))
+
+    shared_strings = []
+    if "xl/sharedStrings.xml" in package.namelist():
+        ss_root = parse_xml(package.read("xl/sharedStrings.xml"))
+        for si in ss_root.findall(tag(SPREADSHEET, "si")):
+            shared_strings.append("".join(t.text or "" for t in si.iter(tag(SPREADSHEET, "t"))))
+
+    checked_cells = 0
+    clipped_cells = 0
+    for sh in sheets:
+        root = parse_xml(package.read(sh["part"]))
+        col_widths = {}
+        cols_el = root.find(tag(SPREADSHEET, "cols"))
+        if cols_el is not None:
+            for col in cols_el.findall(tag(SPREADSHEET, "col")):
+                w = float(col.get("width", "8.43"))
+                cmin = int(col.get("min", "1"))
+                cmax = int(col.get("max", str(cmin)))
+                for c_idx in range(cmin, min(cmax + 1, cmin + 500)):
+                    col_widths[c_idx] = w
+        fmt_pr = root.find(tag(SPREADSHEET, "sheetFormatPr"))
+        default_w = float(fmt_pr.get("defaultColWidth", "8.43")) if fmt_pr is not None and fmt_pr.get("defaultColWidth") else 8.43
+
+        occupied = set()
+        cell_values = []
+        for c in root.iter(tag(SPREADSHEET, "c")):
+            addr = c.get("r")
+            if not addr:
+                continue
+            r_num, c_num = cell_coordinates(addr)
+            c_type = c.get("t")
+            txt = ""
+            if c_type == "inlineStr":
+                txt = "".join(t.text or "" for t in c.iter(tag(SPREADSHEET, "t")))
+            elif c_type == "s":
+                v_txt = c.findtext(tag(SPREADSHEET, "v"))
+                if v_txt and v_txt.isdigit() and int(v_txt) < len(shared_strings):
+                    txt = shared_strings[int(v_txt)]
+            else:
+                txt = c.findtext(tag(SPREADSHEET, "v")) or ""
+            if txt != "":
+                occupied.add((r_num, c_num))
+                cell_values.append((r_num, c_num, addr, c_type, c.get("s", "0"), txt))
+
+        merged_spans = {}
+        merges = root.find(tag(SPREADSHEET, "mergeCells"))
+        if merges is not None:
+            for mc in merges.findall(tag(SPREADSHEET, "mergeCell")):
+                ref = mc.get("ref", "")
+                if ":" in ref:
+                    (r1, c1), (r2, c2) = bounded_sheet_range(ref)
+                    merged_spans[(r1, c1)] = (r2, c2)
+
+        for r_num, c_num, addr, c_type, s_idx, txt in cell_values:
+            checked_cells += 1
+            if s_idx in wrapped_xfs:
+                continue
+            span = merged_spans.get((r_num, c_num))
+            end_c = span[1] if span else c_num
+            avail_chars = sum(col_widths.get(c, default_w) for c in range(c_num, end_c + 1))
+            # Count East Asian wide chars as 2.0 character units
+            display_units = sum(2.0 if ord(ch) > 0x2E80 else 1.0 for ch in txt.splitlines()[0]) if txt else 0.0
+            right_occupied = (r_num, end_c + 1) in occupied
+            is_numeric = c_type in (None, "n")
+            if (is_numeric and display_units > avail_chars + 1.5) or (right_occupied and display_units > avail_chars + 1.0):
+                clipped_cells += 1
+                finding(
+                    "warning", "xlsx_text_truncation", f"{sh['name']}!{addr}",
+                    f"Cell display width ({display_units:.1f} chars) exceeds column capacity ({avail_chars:.1f} chars){' with occupied neighbor' if right_occupied else ''}.",
+                )
+
+    hash_overflows = 0
+    _pdf, pdf_pages = _render_office_pdf_with_bboxes(source, "xlsx", prefix="xlsx-verify")
+    if pdf_pages:
+        for p_idx, page in enumerate(pdf_pages):
+            for word in page.findall(".//{*}word"):
+                if re.fullmatch(r"#{3,}", (word.text or "").strip()):
+                    hash_overflows += 1
+                    finding("warning", "xlsx_rendered_hash_overflow", f"page:{p_idx + 1}", "LibreOffice rendered '###' numeric width overflow.")
+
+    total_trunc = clipped_cells + hash_overflows
+    result(
+        "text_truncation",
+        "failed" if total_trunc else "passed",
+        f"Inspected {checked_cells} populated cell(s) across {len(sheets)} sheet(s); metric clipping: {clipped_cells}, LibreOffice '###' overflows: {hash_overflows}.",
+    )
 
 
 def verify_office(package, source, fmt, names):
@@ -2834,7 +5457,6 @@ def verify_office(package, source, fmt, names):
 
     result("package_structure", "passed", f"Validated {len(names)} archive entries, content types and internal relationship targets.")
     result("archive_security", "passed", "Checked archive limits, entry paths, encryption and XML document types.")
-    # A bounded structural check. External links are reported without following them.
     external = 0
     active = 0
     missing_refs = 0
@@ -2867,6 +5489,12 @@ def verify_office(package, source, fmt, names):
            f"Counted {external} external relationships and {active} potentially active or embedded entries.")
     result("active_content_behavior", "unverified", "Executable behavior and embedded document contents were not evaluated.")
 
+    safe_to_render = not (external or any(re.search(r"(^|/)(vbaproject\.bin|activex)(/|$)", part, re.I) for part in names))
+    rendered_pdf = None
+    rendered_pages = None
+    if fmt in {"pptx", "docx"} and safe_to_render:
+        rendered_pdf, rendered_pages = _render_office_pdf_with_bboxes(source, fmt)
+
     if fmt == "pptx":
         size = main.find(tag(PRESENTATION, "sldSz"))
         dimensions = (int(size.attrib["cx"]) / 12700, int(size.attrib["cy"]) / 12700)
@@ -2875,8 +5503,11 @@ def verify_office(package, source, fmt, names):
                f"Out-of-bounds top-level shapes: {outside}. Shapes without measurable bounds or inherited/group transforms: {omitted}.")
         result("shape_overlap", "failed" if overlaps else ("unverified" if omitted else "passed"),
                f"Top-level bounding boxes overlap in {overlaps} pairs. Intentional layering requires inspection.")
-        result("text_overflow", "unverified", "Office text fitting and clipping require visual evaluation of content within each shape.")
-        result("visual_fidelity", "unverified", "No reference rendering was supplied for comparison.")
+        verify_pptx_text_overflow(package, main, rendered_pages, result, finding)
+        if safe_to_render:
+            verify_pptx_layer_visual_consistency(package, main, result, finding)
+        else:
+            result("layer_visual_consistency", "unverified", "Rendering skipped because package has external links or active content.")
     elif fmt == "docx":
         body = main.find(tag(WORD, "body"))
         sections = list(body.iter(tag(WORD, "sectPr"))) if body is not None else []
@@ -2895,15 +5526,18 @@ def verify_office(package, source, fmt, names):
         result("section_dimensions", "failed" if bad else ("passed" if sections else "unverified"),
                f"Inspected geometry of {len(sections)} sections where page size and margins were specified.")
         verify_word_references(package, names, main, result, finding)
-        result("pagination_and_visual_quality", "unverified", "Pagination, line wrapping and visual overflow require a rendered comparison.")
+        verify_docx_layout_quality(package, main, rendered_pdf, rendered_pages, result, finding)
     elif fmt == "xlsx":
-        verify_workbook_formulas(package, main, result, finding)
-        result("visual_clipping", "unverified", "Cell and print clipping require font metrics and a rendered comparison.")
+        verify_workbook_formulas(package, source, main, result, finding)
+        if safe_to_render:
+            verify_xlsx_text_truncation(package, source, result, finding)
+        else:
+            result("text_truncation", "unverified", "Rendering skipped because package has external links or active content.")
     if fmt in {"pptx", "docx"}:
-        if external or any(re.search(r"(^|/)(vbaproject\.bin|activex)(/|$)", part, re.I) for part in names):
+        if not safe_to_render:
             result("rendered_page_bounds", "unverified", "Rendering was skipped because the package has external links or active content.")
         else:
-            verify_office_render(source, fmt, result, finding)
+            verify_office_render(source, fmt, result, finding, pages=rendered_pages)
     return {"ok": not any(check["status"] == "failed" for check in checks),
             "coverage": "partial" if any(check["status"] == "unverified" for check in checks) else "complete",
             "checks": checks, "issues": issues, "metrics": {"packageParts": len(names)}}
@@ -2956,12 +5590,13 @@ def verify_word_references(package, names, root, result, finding):
            f"Missing footnote, endnote or comment targets referenced by the document body: {missing}.")
 
 
-def verify_workbook_formulas(package, workbook, result, finding):
+def verify_workbook_formulas(package, source, workbook, result, finding):
     from openpyxl.formula import Tokenizer
     from openpyxl.formula.tokenizer import TokenizerError
     sheets = workbook_sheets(package)
     sheet_names = {entry["name"].casefold() for entry in sheets}
     count = cached = errors = missing = unresolved = 0
+    formula_cells = []
 
     def inspect_formula(expression, location):
         nonlocal missing, unresolved
@@ -2995,7 +5630,9 @@ def verify_workbook_formulas(package, workbook, result, finding):
             if formula is None:
                 continue
             count += 1
-            location = f"{sheet['name']}!{cell.get('r')}"
+            addr = cell.get("r")
+            location = f"{sheet['name']}!{addr}"
+            formula_cells.append((sheet["name"], addr))
             value = cell.findtext(tag(SPREADSHEET, "v"))
             if cell.get("t") == "e":
                 errors += 1
@@ -3009,7 +5646,50 @@ def verify_workbook_formulas(package, workbook, result, finding):
            f"Checked {count} cell formulas and defined names. Invalid references: {missing}. Unresolved expressions: {unresolved}.")
     result("formula_cache", "failed" if errors else "passed",
            f"Existing cached values: {cached}. Cached errors: {errors}. Formulas with no cached value: {count - cached - errors}.")
-    result("formula_values", "unverified", "The workbook was not recalculated by this check; cached results were only inspected.")
+
+    if count == 0:
+        result("formula_values", "passed", "Workbook contains no formulas.")
+        return
+    if not shutil.which("libreoffice") or not safe_to_evaluate_workbook(package):
+        result("formula_values", "unverified", "LibreOffice evaluation was skipped (unavailable or workbook has external/macro/unsupported references).")
+        return
+    try:
+        copy_path = Path.cwd() / "verify-eval-input.xlsx"
+        copy_path.write_bytes(source.read_bytes())
+        subprocess.run(
+            ["libreoffice", "-env:UserInstallation=" + (Path.cwd() / "office-profile-eval").as_uri(),
+             "--headless", "--convert-to", "xlsx", "--outdir", str(Path.cwd() / "eval-out"), str(copy_path)],
+            check=True,
+        )
+        eval_path = Path.cwd() / "eval-out" / "verify-eval-input.xlsx"
+        evaluated_lo = 0
+        error_formula = 0
+        unevaluated = 0
+        with zipfile.ZipFile(eval_path) as eval_pkg:
+            eval_sheets = {s["name"]: parse_xml(eval_pkg.read(s["part"])) for s in workbook_sheets(eval_pkg)}
+            for sh_name, addr in formula_cells:
+                sh_root = eval_sheets.get(sh_name)
+                if sh_root is None:
+                    unevaluated += 1
+                    continue
+                c_el = next((c for c in sh_root.iter(tag(SPREADSHEET, "c")) if c.get("r") == addr), None)
+                if c_el is None:
+                    unevaluated += 1
+                elif c_el.get("t") == "e":
+                    error_formula += 1
+                    finding("error", "evaluated_formula_error", f"{sh_name}!{addr}",
+                            f"LibreOffice evaluated formula error: {c_el.findtext(tag(SPREADSHEET, 'v')) or 'error'}.")
+                elif c_el.findtext(tag(SPREADSHEET, "v")) not in (None, ""):
+                    evaluated_lo += 1
+                else:
+                    unevaluated += 1
+        result(
+            "formula_values",
+            "failed" if error_formula else ("unverified" if unevaluated else "passed"),
+            f"Evaluated copy with LibreOffice: evaluated_lo={evaluated_lo}, error_formula={error_formula}, unevaluated_unsupported={unevaluated}, cached_existing={cached}.",
+        )
+    except (OSError, subprocess.CalledProcessError, zipfile.BadZipFile):
+        result("formula_values", "unverified", "LibreOffice formula evaluation copy failed.")
 
 
 CSS_URL = re.compile(r"""url\(\s*(?:"([^"]+)"|'([^']+)'|([^'")\s]+))\s*\)""", re.I)
@@ -3090,6 +5770,7 @@ def render_svg(request, source, output):
         raise ValueError("SVG render payload exceeds the worker limit")
     subprocess.run(["rsvg-convert", "--keep-aspect-ratio", "-w", "2048", "-h", "2048", "-o", str(output)],
                    input=data, check=True)
+    crop_png_region(output, request.get("region"))
 
 
 def process_document(request, source, output):
@@ -3100,6 +5781,12 @@ def process_document(request, source, output):
         return process_pdf(request, source, output)
     if fmt == "media":
         return process_media(request, source, output)
+    if fmt == "csv" and request["action"] == "render":
+        render_csv_table(request, source, output)
+        return None
+    if fmt == "markdown" and request["action"] == "export":
+        export_markdown(source, output, request["targetFormat"])
+        return None
     if fmt == "svg" and request["action"] == "render":
         render_svg(request, source, output)
         return None
@@ -3183,12 +5870,28 @@ def process_document(request, source, output):
                 raise ValueError("Unknown slide or SmartArt part")
             root = parse_xml(package.read(part))
             if part in diagrams:
-                layout = next((node.get("loTypeId") for node in root.iter(tag(DIAGRAM, "prSet"))
-                               if node.get("loTypeId")), None)
-                return {**result, "part": part, "layout": layout,
-                        "nodes": [{"id": node.get("modelId"), "type": node.get("type"), "text": text_content(node, DRAWING)}
-                                  for node in root.iter(tag(DIAGRAM, "pt"))][:1000],
-                        "connections": [dict(node.attrib) for node in root.iter(tag(DIAGRAM, "cxn"))][:1000]}
+                drawing_root = None
+                drawing_ids = [el.get("relId") for el in root.iter(tag(DIAGRAM_DRAWING, "dataModelExt"))]
+                if len(drawing_ids) == 1:
+                    for sp_part in slide_parts:
+                        rels = package_relationships(package, sp_part)
+                        if any(k.endswith("/diagramData") and v == part for k, v in rels.values()):
+                            d_kind, d_part = rels.get(drawing_ids[0], ("", ""))
+                            if d_kind.endswith("/diagramDrawing") and d_part in names:
+                                drawing_root = parse_xml(package.read(d_part))
+                                break
+                classification = classify_smartart_layout(root, drawing_root)
+                return {
+                    **result,
+                    "part": part,
+                    "layout": classification["layout"],
+                    "layoutFamily": classification["family"],
+                    "supportsNodeAddRemove": classification["supportsNodeAddRemove"],
+                    "nodeAddRemoveReason": classification["reason"],
+                    "nodes": [{"id": node.get("modelId"), "type": node.get("type"), "text": text_content(node, DRAWING)}
+                              for node in root.iter(tag(DIAGRAM, "pt"))][:1000],
+                    "connections": [dict(node.attrib) for node in root.iter(tag(DIAGRAM, "cxn"))][:1000],
+                }
             layers = presentation_layer(package, part, "slideLayout")
             return {**result, "part": part, "shapes": layers[-1]["shapes"], "layers": layers}
     raise ValueError("Unsupported document worker action")
@@ -3209,6 +5912,9 @@ if __name__ == "__main__":
     except UnsupportedStructuralMutation as error:
         print(str(error), file=sys.stderr)
         sys.exit(3)
+    except UnsupportedByFormatError as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(4)
     except (ValueError, KeyError, TypeError, OSError, zipfile.BadZipFile, XML.LxmlError, subprocess.CalledProcessError) as error:
         print(str(error), file=sys.stderr)
         sys.exit(2)

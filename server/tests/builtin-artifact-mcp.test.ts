@@ -231,3 +231,191 @@ it.each(['load', 'resume'] as const)('restores the MCP connection via session/%s
     vi.unstubAllEnvs();
   }
 }, 35_000);
+
+it('exports CSV to valid OOXML XLSX and renders real Markdown HTML in Base ChatUI without external workers', async () => {
+  const srv = await createTestServer({ INSTALL_DOC_RUNTIME: '0' });
+  try {
+    const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'purejs', 'user:purejs');
+    const { data: { chat } } = await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Pure-JS Exports' });
+
+    // 1. CSV -> XLSX in Base ChatUI + UTF-8/quote/column verify
+    const { artifact: csvArt } = await srv.ctx.artifactService.createArtifact({
+      userId, scopeKind: 'chat', chatId: chat.id, relPath: 'sales.csv',
+      content: Buffer.from('Region,Amount,Code\nEast,1200,00123\nWest,950,=SUM(A1)\n', 'utf8'),
+      actorKind: 'user',
+    });
+    const csvVerify = await srv.ctx.artifactService.verifyArtifact(userId, csvArt.id);
+    expect(csvVerify.ok).toBe(true);
+    expect(csvVerify.checks?.map((c) => c.id)).toEqual(expect.arrayContaining(['csv_encoding', 'csv_quotes', 'csv_column_consistency']));
+
+    const { artifact: xlsxArt, exported: xlsxExp } = await srv.ctx.artifactService.exportArtifact({
+      userId, artifactId: csvArt.id, targetFormat: 'xlsx', actorKind: 'user',
+    });
+    expect(xlsxArt.filename).toBe('sales.xlsx');
+    // ZIP magic bytes PK\x03\x04 and OOXML parts
+    expect(xlsxExp.buffer.subarray(0, 4).toString('hex')).toBe('504b0304');
+    expect(xlsxExp.buffer.includes(Buffer.from('xl/worksheets/sheet1.xml'))).toBe(true);
+
+    // 2. Markdown -> real rendered HTML (not <pre>) + heading/anchor verification
+    const mdSource = [
+      '# Release Notes',
+      '',
+      '### Skipped Level',
+      '',
+      'See **bold**, `code`, [valid](#release-notes), and [broken](#no-such-anchor).',
+      '',
+      '| Key | Val |',
+      '| --- | ---: |',
+      '| A | 10 |',
+      '',
+      '- [x] Done task',
+      '',
+    ].join('\n');
+    const { artifact: mdArt } = await srv.ctx.artifactService.createArtifact({
+      userId, scopeKind: 'chat', chatId: chat.id, relPath: 'notes.md',
+      content: Buffer.from(mdSource, 'utf8'),
+      actorKind: 'user',
+    });
+    const mdVerify = await srv.ctx.artifactService.verifyArtifact(userId, mdArt.id);
+    expect(mdVerify.issues.map((i) => i.code)).toEqual(expect.arrayContaining(['MD_HEADING_LEVEL_SKIP', 'MD_BROKEN_ANCHOR_LINK']));
+    const { exported: htmlExp } = await srv.ctx.artifactService.exportArtifact({
+      userId, artifactId: mdArt.id, targetFormat: 'html', actorKind: 'user',
+    });
+    const html = htmlExp.buffer.toString('utf8');
+    expect(html).toContain('<h1 id="release-notes">Release Notes</h1>');
+    expect(html).toContain('<strong>bold</strong>');
+    expect(html).toContain('<code>code</code>');
+    expect(html).toContain('<table><thead><tr><th>Key</th><th style="text-align:right">Val</th></tr></thead>');
+    expect(html).toContain('type="checkbox" disabled checked');
+    expect(html).not.toContain('<pre># Release Notes');
+
+    // 3. Mermaid static syntax verification with exact line numbers in Base ChatUI
+    const { artifact: mmdArt } = await srv.ctx.artifactService.createArtifact({
+      userId, scopeKind: 'chat', chatId: chat.id, relPath: 'bad.mmd',
+      content: Buffer.from('flowchart TD\n  subgraph Box\n    A[Start] -->\n', 'utf8'),
+      actorKind: 'user',
+    });
+    const mmdVerify = await srv.ctx.artifactService.verifyArtifact(userId, mmdArt.id);
+    expect(mmdVerify.ok).toBe(false);
+    expect(mmdVerify.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'MERMAID_MALFORMED_EDGE', location: 'line:3' }),
+      expect.objectContaining({ code: 'MERMAID_UNBALANCED_SUBGRAPH', location: 'line:2' }),
+    ]));
+  } finally {
+    await srv.cleanup();
+  }
+});
+
+it('supports Full Runtime Mermaid SVG export, parser syntax line errors, CSV PNG + region render, and Markdown PDF/DOCX via MCP when runtime is installed', async () => {
+  const runtimeDir = process.env.AGY_TEST_FULL_RUNTIME_DIR;
+  if (!runtimeDir) return;
+  const srv = await createTestServer({
+    docRuntimeDir: runtimeDir,
+    installDocRuntime: 'full',
+    allowUnsandboxedDocWorkers: true,
+    sandboxMode: 'off',
+  });
+  try {
+    const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'fullrt', 'user:fullrt');
+    const { data: { chat } } = await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Full Runtime MCP' });
+    const binding = await srv.ctx.mcpService.bindBuiltinArtifactServer({ userId, chatId: chat.id, tentativeTurn: () => null }, []);
+    const auth = Object.fromEntries(binding!.server.headers.map(({ name, value }) => [name, value]));
+    const mcp = new Client({ name: 'full-rt-test', version: '1.0.0' });
+    await mcp.connect(new StreamableHTTPClientTransport(new URL(binding!.server.url), { requestInit: { headers: auth } }));
+    try {
+      // 1. Mermaid SVG export + valid/invalid syntax verification with real mermaid.parse()
+      const { artifact: goodMmd } = await srv.ctx.artifactService.createArtifact({
+        userId, scopeKind: 'chat', chatId: chat.id, relPath: 'arch.mmd',
+        content: Buffer.from('flowchart LR\n  A[Client] --> B[Server]\n', 'utf8'), actorKind: 'user',
+      });
+      const goodCheck = await srv.ctx.artifactService.verifyArtifact(userId, goodMmd.id);
+      expect(goodCheck.ok).toBe(true);
+      expect(goodCheck.checks).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'mermaid_parser_syntax', status: 'passed' })]));
+
+      const { exported: svgExp } = await srv.ctx.artifactService.exportArtifact({
+        userId, artifactId: goodMmd.id, targetFormat: 'svg', actorKind: 'ai',
+      });
+      expect(svgExp.buffer.toString('utf8')).toContain('<svg');
+
+      const { artifact: badMmd } = await srv.ctx.artifactService.createArtifact({
+        userId, scopeKind: 'chat', chatId: chat.id, relPath: 'broken.mmd',
+        content: Buffer.from('flowchart LR\n  A[Client] --> B[Server]\n  C ---===>>> D\n', 'utf8'), actorKind: 'user',
+      });
+      const badCheck = await srv.ctx.artifactService.verifyArtifact(userId, badMmd.id);
+      expect(badCheck.ok).toBe(false);
+      expect(badCheck.issues[0]?.code).toBe('MERMAID_SYNTAX_ERROR');
+      expect(badCheck.issues[0]?.location).toMatch(/^line:\d+$/);
+
+      // 2. artifact_render with region via MCP on Mermaid & CSV/TSV
+      const fullRes = await mcp.callTool({ name: 'artifact_render', arguments: { artifactId: goodMmd.id } });
+      const cropRes = await mcp.callTool({
+        name: 'artifact_render',
+        arguments: { artifactId: goodMmd.id, region: { x: 0, y: 0, width: 0.5, height: 0.5, unit: 'norm' } },
+      });
+      expect(fullRes.isError).toBeFalsy();
+      expect(cropRes.isError).toBeFalsy();
+      const fullImg = (fullRes.content as Array<{ type: string; data?: string }>).find((c) => c.type === 'image')!;
+      const cropImg = (cropRes.content as Array<{ type: string; data?: string }>).find((c) => c.type === 'image')!;
+      const fullBuf = Buffer.from(fullImg.data!, 'base64');
+      const cropBuf = Buffer.from(cropImg.data!, 'base64');
+      expect(cropBuf.readUInt32BE(16)).toBeLessThan(fullBuf.readUInt32BE(16));
+      expect(cropBuf.readUInt32BE(20)).toBeLessThan(fullBuf.readUInt32BE(20));
+
+      // 3. CSV/TSV -> table PNG via MCP artifact_render with region + CSV -> XLSX verified by Python worker
+      const { artifact: csvArt } = await srv.ctx.artifactService.createArtifact({
+        userId, scopeKind: 'chat', chatId: chat.id, relPath: 'grid.tsv',
+        content: Buffer.from('ColA\tColB\n10\tAlpha\n20\tBeta\n', 'utf8'), actorKind: 'user',
+      });
+      const csvPngRes = await mcp.callTool({
+        name: 'artifact_render',
+        arguments: { artifactId: csvArt.id, region: { x: 0, y: 0, width: 0.6, height: 0.6, unit: 'norm' } },
+      });
+      expect(csvPngRes.isError).toBeFalsy();
+      const { artifact: exportedXlsx } = await srv.ctx.artifactService.exportArtifact({
+        userId, artifactId: csvArt.id, targetFormat: 'xlsx', actorKind: 'ai',
+      });
+      const xlsxVerify = await srv.ctx.artifactService.verifyArtifact(userId, exportedXlsx.id);
+      expect(xlsxVerify.ok).toBe(true);
+
+      // 4. Markdown -> PDF and DOCX via MCP artifact_export
+      const { artifact: mdArt } = await srv.ctx.artifactService.createArtifact({
+        userId, scopeKind: 'chat', chatId: chat.id, relPath: 'spec.md',
+        content: Buffer.from('# Spec\n\nRendered via Full Runtime.\n', 'utf8'), actorKind: 'user',
+      });
+      const pdfExpRes = await mcp.callTool({
+        name: 'artifact_export',
+        arguments: { artifactId: mdArt.id, targetFormat: 'pdf', idempotencyKey: 'md-pdf-1' },
+      });
+      const docxExpRes = await mcp.callTool({
+        name: 'artifact_export',
+        arguments: { artifactId: mdArt.id, targetFormat: 'docx', idempotencyKey: 'md-docx-1' },
+      });
+      expect(pdfExpRes.isError).toBeFalsy();
+      expect(docxExpRes.isError).toBeFalsy();
+
+      // 5. PDF rev 1 -> rev 2 overlay + differential verification via ArtifactService
+      const { artifact: pdfArt } = await srv.ctx.artifactService.createArtifact({
+        userId, scopeKind: 'chat', chatId: chat.id, relPath: 'brief.pdf',
+        createParams: { pages: ['Original executive summary'] }, actorKind: 'ai',
+      });
+      await srv.ctx.artifactService.editArtifact({
+        userId, artifactId: pdfArt.id, expectedRevision: 1, actorKind: 'ai',
+        operations: [
+          { op: 'pdf.add_overlay', pageIndex: 0, kind: 'stamp', rect: [300, 700, 500, 760], text: 'REVIEWED' },
+        ],
+      });
+      const pdfVerify = await srv.ctx.artifactService.verifyArtifact(userId, pdfArt.id);
+      expect(pdfVerify.ok).toBe(true);
+      expect(pdfVerify.checks).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: 'pdf_structure', status: 'passed' }),
+        expect.objectContaining({ id: 'pdf_diff', status: 'passed' }),
+      ]));
+    } finally {
+      await mcp.close();
+      binding?.revoke();
+    }
+  } finally {
+    await srv.cleanup();
+  }
+}, 60_000);
+

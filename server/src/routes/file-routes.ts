@@ -570,6 +570,11 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     timeSeconds: z.coerce.number().finite().min(0).optional(),
     variant: z.enum(['background', 'sprite']).optional(),
     shapeId: z.coerce.number().int().positive().optional(),
+    regionX: z.coerce.number().finite().min(0).optional(),
+    regionY: z.coerce.number().finite().min(0).optional(),
+    regionWidth: z.coerce.number().finite().positive().optional(),
+    regionHeight: z.coerce.number().finite().positive().optional(),
+    regionUnit: z.enum(['norm', 'px', 'pt']).optional(),
   });
 
   app.get('/api/files/:artifactId/render', async (req, reply) => {
@@ -577,9 +582,17 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     if (!session) return;
     const query = renderQuerySchema.safeParse(req.query);
     if (!query.success) return reply.code(400).send({ error: 'INVALID_RENDER_OPTIONS' });
+    const { regionX, regionY, regionWidth, regionHeight, regionUnit, ...baseOptions } = query.data;
+    const hasAnyRegion = [regionX, regionY, regionWidth, regionHeight].some((v) => v !== undefined);
+    if (hasAnyRegion && [regionX, regionY, regionWidth, regionHeight].some((v) => v === undefined)) {
+      return reply.code(400).send({ error: 'INVALID_RENDER_REGION' });
+    }
+    const region = hasAnyRegion
+      ? { x: regionX!, y: regionY!, width: regionWidth!, height: regionHeight!, unit: regionUnit }
+      : undefined;
     const { artifactId } = req.params as { artifactId: string };
     try {
-      const { png, revision, sha256 } = await artifactService.renderPng(session.user.id, artifactId, query.data);
+      const { png, revision, sha256 } = await artifactService.renderPng(session.user.id, artifactId, { ...baseOptions, region });
       return reply.type('image/png').header('Cache-Control', 'private, no-store')
         .header('X-Artifact-Revision', revision).header('X-Artifact-Sha256', sha256).send(png);
     } catch (error) {

@@ -4035,14 +4035,27 @@ export class ArtifactService {
     return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
   }
 
-  async renderPng(userId: string, artifactId: string, options: { pageIndex?: number; timeSeconds?: number; variant?: 'background' | 'sprite'; shapeId?: number } = {}): Promise<{ png: Buffer; revision: number; sha256: string }> {
+  async renderPng(
+    userId: string,
+    artifactId: string,
+    options: { pageIndex?: number; timeSeconds?: number; variant?: 'background' | 'sprite'; shapeId?: number; region?: { x: number; y: number; width: number; height: number; unit?: 'norm' | 'px' | 'pt' } } = {}
+  ): Promise<{ png: Buffer; revision: number; sha256: string }> {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', 'Artifact not found.', 404);
     const format = this.registry.resolve(artifact.filename, artifact.previewKind).format;
     if (options.variant && (format !== 'pptx' || (options.variant === 'sprite' && options.shapeId === undefined))) {
       throw new ArtifactError('INVALID_RENDER_VARIANT', 'Choose a PPTX slide and shape for the requested rendition.', 422);
     }
-    if (!isDocumentFormat(format) && !isWebRenderFormat(format) && format !== 'svg') {
+    if (options.region) {
+      const { x, y, width, height, unit = 'norm' } = options.region;
+      if (![x, y, width, height].every(Number.isFinite) || width <= 0 || height <= 0 || x < 0 || y < 0) {
+        throw new ArtifactError('INVALID_RENDER_REGION', 'Render region requires finite non-negative x, y and positive width, height.', 400);
+      }
+      if (unit === 'norm' && (x >= 1 || y >= 1 || x + width > 1.001 || y + height > 1.001)) {
+        throw new ArtifactError('INVALID_RENDER_REGION', 'Normalized render region must fall within [0, 1].', 400);
+      }
+    }
+    if (!isDocumentFormat(format) && !isWebRenderFormat(format) && format !== 'svg' && format !== 'csv') {
       throw unsupportedOperationError('render_png', 'unsupported_by_format', 'PNG rendering is unavailable for this format.');
     }
     const constraint = documentFormatConstraint(format, artifact.filename, 'render_png', artifact.previewKind);
@@ -4052,7 +4065,7 @@ export class ArtifactService {
     const dependencies = isWebRenderFormat(format) || format === 'svg'
       ? this.readRenderDependencies(snapshot.artifact, snapshot.revision.revision, DOCUMENT_WORKER_MAX_INPUT_BYTES - source.length)
       : [];
-    const png = artifact.mimeType === 'image/png' && !this.documentWorker.available
+    const png = artifact.mimeType === 'image/png' && !this.documentWorker.available && !options.region
       ? source
       : await this.documentWorker.run(format, artifact.filename, source, { action: 'render', ...options }, [], { entry: artifact.relPath, dependencies });
     if (png.length < 24 || png.length > 16 * 1024 * 1024 ||
@@ -4074,11 +4087,39 @@ export class ArtifactService {
     const identity = { revision: revision.revision, sha256: revision.sha256 };
     const format = adapter.format;
     if (this.documentWorker.available && isDocumentFormat(format)) {
+      let compareDocument: Buffer | undefined;
+      if (format === 'pdf' && revision.revision > 1) {
+        const previousRev = this.db.db
+          .prepare('SELECT blob_sha256 FROM artifact_revisions WHERE artifact_id = ? AND revision = ?')
+          .get(artifactId, revision.revision - 1) as { blob_sha256: string | null } | undefined;
+        if (previousRev?.blob_sha256) {
+          const prevBytes = this.blobManager.readBlob(userId, previousRev.blob_sha256);
+          if (prevBytes && prevBytes.length <= DOCUMENT_WORKER_MAX_INPUT_BYTES - buf.length) {
+            compareDocument = prevBytes;
+          }
+        }
+      }
       try {
-        return { ...JSON.parse((await this.documentWorker.run(format, artifact.filename, buf, { action: 'verify' })).toString('utf8')), ...identity };
+        return {
+          ...JSON.parse((await this.documentWorker.run(
+            format, artifact.filename, buf, { action: 'verify' }, [],
+            compareDocument ? { entry: artifact.relPath, dependencies: [], compareDocument } : undefined
+          )).toString('utf8')),
+          ...identity,
+        };
       } catch (error) {
         if (!(error instanceof ArtifactError) || error.code !== 'DOCUMENT_WORKER_REJECTED') throw error;
         return { ...identity, ok: false, issues: [{ severity: 'error', code: error.code, message: error.message }] };
+      }
+    }
+    if (format === 'mermaid' && this.documentWorker.fullWebRuntimeAvailable) {
+      try {
+        const parsedReport = JSON.parse(
+          (await this.documentWorker.run('mermaid', artifact.filename, buf, { action: 'verify' })).toString('utf8')
+        ) as AdapterVerifyResult;
+        return { ...parsedReport, ...identity };
+      } catch (error) {
+        if (!(error instanceof ArtifactError) || error.code !== 'DOCUMENT_WORKER_REJECTED') throw error;
       }
     }
     return { ...adapter.verify(buf, artifact), ...identity };
@@ -4101,26 +4142,44 @@ export class ArtifactService {
       throw new ArtifactError('FORBIDDEN', 'AI/内蔵MCPからプロジェクト原本スコープへのエクスポートは禁止されています。', 403);
     }
     const adapter = this.registry.resolve(src.filename, src.previewKind);
-    const maxBytes = isDocumentFormat(adapter.format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
-    const buf = this.readActiveArtifactBytes(src, maxBytes);
-    if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
+    const fmt = adapter.format;
+    const target = params.targetFormat.toLowerCase();
+    const maxBytes = isDocumentFormat(fmt) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
+    const snapshot = this.readCurrentRevision(params.userId, params.artifactId, maxBytes);
+    const buf = snapshot.bytes;
     let exported: AdapterExportResult;
-    if (adapter.exportAs) {
-      exported = adapter.exportAs(buf, params.targetFormat, src);
-    } else if (isDocumentFormat(adapter.format) &&
-      DOCUMENT_ACTIONS[adapter.format].includes(`export:${params.targetFormat}`)) {
-      const filename = `${path.parse(src.filename).name}.${params.targetFormat}`;
+    const workerMarkdownExport = fmt === 'markdown' && (target === 'pdf' || target === 'docx' || target === 'png');
+    const workerMermaidExport = fmt === 'mermaid' && (target === 'svg' || target === 'png');
+    const workerSvgOrHtmlPng = (fmt === 'svg' || fmt === 'html') && target === 'png';
+    if (adapter.exportAs && !workerMarkdownExport) {
+      exported = adapter.exportAs(buf, target, src);
+    } else if (workerMarkdownExport || workerMermaidExport || workerSvgOrHtmlPng) {
+      const filename = `${path.parse(src.filename).name}.${target}`;
+      const dependencies = isWebRenderFormat(fmt) || fmt === 'svg'
+        ? this.readRenderDependencies(snapshot.artifact, snapshot.revision.revision, DOCUMENT_WORKER_MAX_INPUT_BYTES - buf.length)
+        : [];
+      const buffer = fmt === 'svg' && target === 'png'
+        ? await this.documentWorker.run('svg', src.filename, buf, { action: 'render' }, [], { entry: src.relPath, dependencies })
+        : await this.documentWorker.run(fmt, src.filename, buf, { action: 'export', targetFormat: target }, [], { entry: src.relPath, dependencies });
       exported = {
         filename,
         mimeType: detectMimeAndPreviewKind(filename, null).mimeType,
-        buffer: await this.documentWorker.run(adapter.format, src.filename, buf, {
-          action: 'export', targetFormat: params.targetFormat,
+        buffer,
+      };
+    } else if (isDocumentFormat(fmt) &&
+      DOCUMENT_ACTIONS[fmt].includes(`export:${target}`)) {
+      const filename = `${path.parse(src.filename).name}.${target}`;
+      exported = {
+        filename,
+        mimeType: detectMimeAndPreviewKind(filename, null).mimeType,
+        buffer: await this.documentWorker.run(fmt, src.filename, buf, {
+          action: 'export', targetFormat: target,
         }),
       };
     } else {
       throw unsupportedOperationError(
-        `export:${params.targetFormat}`, 'unsupported_by_format',
-        `Cannot export '${adapter.format}' as '${params.targetFormat}'.`
+        `export:${target}`, 'unsupported_by_format',
+        `Cannot export '${fmt}' as '${target}'.`
       );
     }
     const outRelPath = params.outputRelPath ? normalizeRelPath(params.outputRelPath) : normalizeRelPath(exported.filename);
@@ -4136,7 +4195,7 @@ export class ArtifactService {
       actorKind: params.actorKind,
       actorId: params.actorId ?? null,
       idempotencyKey: params.idempotencyKey,
-      operationSummary: `Exported ${src.filename} to ${params.targetFormat}`,
+      operationSummary: `Exported ${src.filename} to ${target}`,
       assertAuthorized: params.assertAuthorized,
     });
     return { artifact: created.artifact, exported };

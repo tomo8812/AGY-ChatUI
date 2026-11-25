@@ -304,9 +304,16 @@ export class BuiltinArtifactMcpServer {
         assertAuthorized: () => { authorize(); assertArtifact(input.artifactId); },
       });
     });
-    tool('artifact_render', 'Get a PNG rendition. PPTX can render a background plate or an isolated transparent sprite for shapeId.', {
+    tool('artifact_render', 'Get a PNG rendition of a page, slide, frame, table, or cropped region. PPTX can also render a background plate or an isolated transparent sprite for shapeId.', {
       ...artifactId, pageIndex: z.number().int().min(0).optional(), timeSeconds: z.number().min(0).optional(),
       variant: z.enum(['background', 'sprite']).optional(), shapeId: z.number().int().positive().optional(),
+      region: z.object({
+        x: z.number().finite().min(0),
+        y: z.number().finite().min(0),
+        width: z.number().finite().positive(),
+        height: z.number().finite().positive(),
+        unit: z.enum(['norm', 'px', 'pt']).optional(),
+      }).optional(),
     }, async ({ artifactId, ...options }) => {
       assertArtifact(artifactId);
       const { png, revision, sha256 } = await this.artifacts.renderPng(userId, artifactId, options);

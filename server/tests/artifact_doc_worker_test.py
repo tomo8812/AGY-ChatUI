@@ -196,7 +196,9 @@ class DocumentWorkerTest(unittest.TestCase):
         report = json.loads(self.run_worker("xlsx", "verify"))
         self.assertFalse(report["ok"])
         self.assertIn("invalid_formula_reference", [issue["code"] for issue in report["issues"]])
-        self.assertIn(("formula_values", "unverified"), [(c["id"], c["status"]) for c in report["checks"]])
+        check_map = {c["id"]: c["status"] for c in report["checks"]}
+        self.assertEqual(check_map["formula_values"], "failed")
+        self.assertIn(check_map["text_truncation"], ("passed", "failed"))
         presentation = Presentation()
         slide = presentation.slides.add_slide(presentation.slide_layouts[6])
         slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(-1), Inches(1), Inches(3), Inches(2))
@@ -206,7 +208,9 @@ class DocumentWorkerTest(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertIn("shape_outside_slide", [issue["code"] for issue in report["issues"]])
         self.assertIn("shape_bounds_overlap", [issue["code"] for issue in report["issues"]])
-        self.assertIn(("visual_fidelity", "unverified"), [(c["id"], c["status"]) for c in report["checks"]])
+        pptx_checks = {c["id"]: c["status"] for c in report["checks"]}
+        self.assertEqual(pptx_checks["text_overflow"], "passed")
+        self.assertEqual(pptx_checks["layer_visual_consistency"], "passed")
 
     def test_xlsx_clears_formula_cache_and_all_chain_registrations(self):
         book = Workbook()
@@ -536,3 +540,459 @@ class DocumentWorkerTest(unittest.TestCase):
         with Image.open(io.BytesIO(exported)) as image:
             self.assertEqual(image.size, (4, 8))
             self.assertEqual(image.format, "WEBP")
+
+    def test_csv_table_png_render_and_region_crop(self):
+        self.source.write_text("Name,Score,Note\nAlice,95,Pass\nBob,82,Pass\n", encoding="utf-8")
+        full_png = self.run_worker("csv", "render", filename="scores.csv")
+        cropped_png = self.run_worker(
+            "csv", "render", filename="scores.csv",
+            region={"x": 0.0, "y": 0.0, "width": 0.5, "height": 0.5, "unit": "norm"},
+        )
+        with Image.open(io.BytesIO(full_png)) as full_img, Image.open(io.BytesIO(cropped_png)) as crop_img:
+            self.assertEqual(full_img.format, "PNG")
+            self.assertEqual(crop_img.format, "PNG")
+            self.assertLess(crop_img.width, full_img.width)
+            self.assertLess(crop_img.height, full_img.height)
+
+    def test_markdown_exports_real_docx_and_pdf(self):
+        md = "# Quarterly Summary\n\n**Revenue** increased by `15%`.\n\n| Region | Sales |\n| --- | ---: |\n| East | 120 |\n| West | 98 |\n"
+        self.source.write_text(md, encoding="utf-8")
+        docx_bytes = self.run_worker("markdown", "export", filename="report.md", targetFormat="docx")
+        doc = Document(io.BytesIO(docx_bytes))
+        joined = "\n".join(p.text for p in doc.paragraphs)
+        self.assertIn("Quarterly Summary", joined)
+        self.assertGreaterEqual(len(doc.tables), 1)
+        pdf_bytes = self.run_worker("markdown", "export", filename="report.md", targetFormat="pdf")
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        self.assertGreaterEqual(len(reader.pages), 1)
+        self.assertIn("Quarterly Summary", reader.pages[0].extract_text() or "")
+
+    def test_pptx_advanced_multi_run_rich_style_non_contiguous_group_and_scaled_ungroup(self):
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        s1 = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.5), Inches(0.5), Inches(2), Inches(1))
+        p1 = s1.text_frame.paragraphs[0]
+        p1.add_run().text = "First"
+        p1.add_run().text = " Second"
+        s2 = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(3.0), Inches(0.5), Inches(2), Inches(1))
+        s2.text = "Middle"
+        s3 = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(5.5), Inches(0.5), Inches(2), Inches(1))
+        s3.text = "Third"
+        tbl_shape = slide.shapes.add_table(2, 2, Inches(0.5), Inches(2.5), Inches(4), Inches(1.5))
+        cell_p = tbl_shape.table.cell(0, 0).text_frame.paragraphs[0]
+        cell_p.add_run().text = "RunA"
+        cell_p.add_run().text = "RunB"
+        prs.save(self.source)
+
+        edited = self.run_worker("pptx", "edit", operations=[
+            {"op": "pptx.set_shape_text", "slidePart": "ppt/slides/slide1.xml", "shapeId": s1.shape_id, "text": "Line 1\nLine 2"},
+            {"op": "pptx.set_shape_style", "slidePart": "ppt/slides/slide1.xml", "shapeId": s1.shape_id,
+             "fill": {"type": "gradient", "angleDegrees": 45, "stops": [{"posPercent": 0, "color": "1D4ED8"}, {"posPercent": 100, "color": "3B82F6"}]},
+             "outline": {"color": "0F172A", "widthPt": 2, "dashStyle": "dash"},
+             "fontColor": "FFFFFF", "alignment": "center", "glow": {"radiusPt": 4, "color": "F59E0B"}},
+            {"op": "pptx.add_shape", "slidePart": "ppt/slides/slide1.xml", "kind": "right_arrow", "boundsPt": [40, 320, 140, 50], "text": "Go"},
+            {"op": "pptx.set_table_cell", "slidePart": "ppt/slides/slide1.xml", "shapeId": tbl_shape.shape_id,
+             "row": 0, "column": 0, "text": "Cell L1\nCell L2", "fill": "DBEAFE", "bold": True},
+            # Non-contiguous grouping (s1 and s3, skipping s2)
+            {"op": "pptx.group_shapes", "slidePart": "ppt/slides/slide1.xml", "shapeIds": [s1.shape_id, s3.shape_id]},
+        ])
+        reopened = Presentation(io.BytesIO(edited))
+        re_shapes = list(reopened.slides[0].shapes)
+        grp = next(sh for sh in re_shapes if sh.shape_type == 6)
+        self.assertEqual(len(grp.shapes), 2)
+        self.assertTrue(any("Line 1" in sh.text and "Line 2" in sh.text for sh in grp.shapes))
+        self.assertTrue(any(sh.has_text_frame and sh.text == "Go" for sh in re_shapes))
+        # Scale the group's ext (2x width) and ungroup -> children must receive true affine transform!
+        with zipfile.ZipFile(io.BytesIO(edited)) as zin, zipfile.ZipFile(self.source, "w") as zout:
+            s_root = XML.fromstring(zin.read("ppt/slides/slide1.xml"))
+            g_xfrm = s_root.find(".//{http://schemas.openxmlformats.org/presentationml/2006/main}grpSpPr/{http://schemas.openxmlformats.org/drawingml/2006/main}xfrm")
+            ext_el = g_xfrm.find("{http://schemas.openxmlformats.org/drawingml/2006/main}ext")
+            ext_el.set("cx", str(int(ext_el.attrib["cx"]) * 2))
+            for info in zin.infolist():
+                zout.writestr(info, XML.tostring(s_root) if info.filename == "ppt/slides/slide1.xml" else zin.read(info.filename))
+        ungrouped = self.run_worker("pptx", "edit", operations=[
+            {"op": "pptx.ungroup_shapes", "slidePart": "ppt/slides/slide1.xml", "shapeId": grp.shape_id},
+        ])
+        after = Presentation(io.BytesIO(ungrouped))
+        restored_s1 = next(sh for sh in after.slides[0].shapes if sh.shape_id == s1.shape_id)
+        self.assertAlmostEqual(restored_s1.width / 914400.0, 4.0, places=1)
+
+    def test_docx_advanced_multi_run_direct_style_auto_numbering_and_styled_table(self):
+        doc = Document()
+        p = doc.add_paragraph()
+        p.add_run("PartA ")
+        p.add_run("PartB")
+        tbl = doc.add_table(rows=2, cols=2)
+        cp = tbl.cell(0, 0).paragraphs[0]
+        cp.add_run("One ")
+        cp.add_run("Two")
+        doc.save(self.source)
+
+        edited = self.run_worker("docx", "edit", operations=[
+            {"op": "docx.set_paragraph_text", "blockIndex": 0, "text": "Unified multi-run\nSecond line"},
+            {"op": "docx.set_paragraph_style", "blockIndex": 0, "alignment": "center", "spaceBeforePt": 12,
+             "spaceAfterPt": 6, "backgroundColor": "EFF6FF", "borders": {"bottom": {"color": "2563EB", "sizePt": 1.5}}},
+            {"op": "docx.set_run_style", "blockIndex": 0, "bold": True, "underline": "single", "highlight": "yellow", "fontSizePt": 13},
+            {"op": "docx.add_paragraph", "text": "Bullet item", "alignment": "left"},
+            {"op": "docx.set_list", "blockIndex": 2, "listType": "bullet", "level": 0},
+            {"op": "docx.set_table_cell", "blockIndex": 1, "row": 0, "column": 0, "text": "Updated Cell", "backgroundColor": "FEF3C7", "bold": True},
+        ])
+        reopened = Document(io.BytesIO(edited))
+        self.assertIn("Unified multi-run", reopened.paragraphs[0].text)
+        self.assertIn("Second line", reopened.paragraphs[0].text)
+        self.assertEqual(reopened.tables[0].cell(0, 0).text, "Updated Cell")
+        with zipfile.ZipFile(io.BytesIO(edited)) as pkg:
+            self.assertIn("word/numbering.xml", pkg.namelist())
+            doc_xml = pkg.read("word/document.xml").decode("utf-8")
+            self.assertIn("EFF6FF", doc_xml)
+            self.assertIn("FEF3C7", doc_xml)
+            self.assertIn("numPr", doc_xml)
+
+    def test_xlsx_advanced_rich_cell_style_conditional_formats_validation_and_sheet_ops(self):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Metrics"
+        ws["A1"] = "Item"
+        ws["B1"] = "Value"
+        ws["A2"] = "Alpha"
+        ws["B2"] = 1200
+        ws["A3"] = "Beta"
+        ws["B3"] = 450
+        wb.create_sheet("Lookup")["A1"] = "High"
+        wb["Lookup"]["A2"] = "Low"
+        wb.save(self.source)
+
+        edited = self.run_worker("xlsx", "edit", operations=[
+            {"op": "xlsx.set_cell_style", "sheetPart": "xl/worksheets/sheet1.xml", "range": "A1:B1",
+             "bold": True, "fontColor": "FFFFFF", "backgroundColor": "1E3A8A",
+             "border": {"style": "thin", "color": "CBD5E1"}, "horizontal": "center"},
+            {"op": "xlsx.set_cell_style", "sheetPart": "xl/worksheets/sheet1.xml", "address": "B2", "numberFormat": "#,##0"},
+            {"op": "xlsx.add_conditional_format", "sheetPart": "xl/worksheets/sheet1.xml", "range": "B2:B3",
+             "type": "cellIs", "operator": "greaterThan", "value": 500, "style": {"backgroundColor": "DCFCE7", "bold": True}},
+            {"op": "xlsx.add_conditional_format", "sheetPart": "xl/worksheets/sheet1.xml", "range": "B2:B3",
+             "type": "dataBar", "color": "2563EB"},
+            {"op": "xlsx.set_data_validation", "sheetPart": "xl/worksheets/sheet1.xml", "range": "C2:C3",
+             "kind": "list", "formula": "=Lookup!$A$1:$A$2", "promptTitle": "Tier"},
+            {"op": "xlsx.set_column_width", "sheetPart": "xl/worksheets/sheet1.xml", "column": "A", "width": 24},
+            {"op": "xlsx.set_row_height", "sheetPart": "xl/worksheets/sheet1.xml", "row": 1, "height": 28},
+            {"op": "xlsx.set_freeze_panes", "sheetPart": "xl/worksheets/sheet1.xml", "row": 1, "column": 0},
+            {"op": "xlsx.duplicate_sheet", "sheetId": 1, "name": "Metrics Copy"},
+        ])
+        reopened = load_workbook(io.BytesIO(edited))
+        self.assertEqual(reopened.sheetnames, ["Metrics", "Lookup", "Metrics Copy"])
+        self.assertTrue(reopened["Metrics"]["A1"].font.bold)
+        self.assertEqual(reopened["Metrics"]["B2"].number_format, "#,##0")
+        self.assertEqual(reopened["Metrics"].freeze_panes, "A2")
+        cf_rules = [rule for cf in reopened["Metrics"].conditional_formatting for rule in cf.rules]
+        self.assertGreaterEqual(len(cf_rules), 2)
+        self.assertEqual({rule.type for rule in cf_rules}, {"cellIs", "dataBar"})
+
+        # General non-empty sheet removal on the duplicated sheet
+        self.source.write_bytes(edited)
+        after_rm = self.run_worker("xlsx", "edit", operations=[
+            {"op": "xlsx.remove_sheet", "sheetId": 3},
+        ])
+        self.assertEqual(load_workbook(io.BytesIO(after_rm)).sheetnames, ["Metrics", "Lookup"])
+
+    def test_pdf_structure_encryption_diff_verification_and_rich_overlays(self):
+        v1 = self.run_worker("pdf", "create", params={"pages": ["Page one original", "Page two original"]})
+        self.source.write_bytes(v1)
+        struct = json.loads(self.run_worker("pdf", "structure"))
+        self.assertEqual(struct["pageCount"], 2)
+        self.assertFalse(struct["encrypted"])
+        self.assertIn("pageContentHash", struct["pages"][0])
+
+        # Rich overlays: multi-line text, highlight, rect, stamp, top-left origin
+        v2 = self.run_worker("pdf", "edit", operations=[
+            {"op": "pdf.add_overlay", "pageIndex": 0, "kind": "highlight", "rect": [30, 720, 220, 760], "color": "FEF08A", "opacity": 0.4},
+            {"op": "pdf.add_overlay", "pageIndex": 0, "kind": "stamp", "rect": [350, 700, 520, 750], "text": "APPROVED", "rotationDegrees": -10},
+            {"op": "pdf.add_overlay", "pageIndex": 0, "kind": "text", "rect": [36, 620, 300, 680],
+             "text": "Multiline overlay\nSecond overlay line", "backgroundColor": "F8FAFC", "borderColor": "94A3B8"},
+        ])
+        self.source.write_bytes(v2)
+        (self.inputs / "compare").write_bytes(v1)
+        report = json.loads(self.run_worker("pdf", "verify", hasCompareDocument=True))
+        self.assertTrue(report["ok"])
+        check_ids = {c["id"]: c["status"] for c in report["checks"]}
+        self.assertEqual(check_ids["pdf_structure"], "passed")
+        self.assertEqual(check_ids["pdf_encryption"], "passed")
+        self.assertEqual(check_ids["pdf_text_extraction"], "passed")
+        self.assertEqual(check_ids["pdf_diff"], "passed")
+        self.assertIn(1, report["metrics"]["diff"]["changedTextPages"])
+
+        # Verify region crop on PDF render
+        full_render = self.run_worker("pdf", "render", pageIndex=0)
+        crop_render = self.run_worker("pdf", "render", pageIndex=0, region={"x": 0, "y": 0, "width": 200, "height": 150, "unit": "pt"})
+        with Image.open(io.BytesIO(full_render)) as fimg, Image.open(io.BytesIO(crop_render)) as cimg:
+            self.assertLess(cimg.width, fimg.width)
+            self.assertLess(cimg.height, fimg.height)
+
+        # Verify encrypted PDF detection without crashing
+        from pypdf import PdfWriter
+        enc_writer = PdfWriter(clone_from=PdfReader(io.BytesIO(v1)))
+        enc_writer.encrypt(user_password="secret", owner_password="owner")
+        enc_buf = io.BytesIO()
+        enc_writer.write(enc_buf)
+        self.source.write_bytes(enc_buf.getvalue())
+        enc_report = json.loads(self.run_worker("pdf", "verify"))
+        self.assertFalse(enc_report["ok"])
+        self.assertEqual({c["id"]: c["status"] for c in enc_report["checks"]}["pdf_encryption"], "failed")
+
+        # Verify pdf.delete_text returns exit code 4 (unsupported_by_format)
+        self.source.write_bytes(v1)
+        (self.inputs / "request.json").write_text(json.dumps({
+            "format": "pdf", "filename": "test.pdf", "action": "edit",
+            "operations": [{"op": "pdf.delete_text", "pageIndex": 0}],
+        }), encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(WORKER)],
+            env=dict(os.environ, AGY_WORKER_IN_DIR=str(self.inputs), AGY_WORKER_OUT_DIR=str(self.outputs)),
+            cwd=self.directory, capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 4)
+
+    def test_office_verification_detects_pptx_overflow_docx_layout_and_xlsx_truncation(self):
+        # 1. PPTX text overflow detection + server-side layer SSIM check
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        tiny_box = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(1), Inches(1), Inches(1.5), Inches(0.4))
+        tiny_box.text = "This is a deliberately very long text string that will overflow a tiny 1.5x0.4 inch slide shape box easily."
+        prs.save(self.source)
+        pptx_report = json.loads(self.run_worker("pptx", "verify"))
+        pptx_checks = {c["id"]: c["status"] for c in pptx_report["checks"]}
+        self.assertEqual(pptx_checks["text_overflow"], "failed")
+        self.assertEqual(pptx_checks["layer_visual_consistency"], "passed")
+
+        # 2. DOCX layout quality check (clean document passes layout_quality)
+        doc = Document()
+        doc.add_heading("Layout Verification", level=1)
+        doc.add_paragraph("Body text comfortably within page margins.")
+        doc.save(self.source)
+        docx_report = json.loads(self.run_worker("docx", "verify"))
+        docx_checks = {c["id"]: c["status"] for c in docx_report["checks"]}
+        self.assertEqual(docx_checks["layout_quality"], "passed")
+
+        # 3. XLSX text truncation detection (long text next to occupied neighbor + narrow column)
+        wb = Workbook()
+        ws = wb.active
+        ws.column_dimensions["A"].width = 6
+        ws["A1"] = "VeryLongUnwrappedHeaderTextThatGetsClipped"
+        ws["B1"] = "Blocker"
+        wb.save(self.source)
+        xlsx_report = json.loads(self.run_worker("xlsx", "verify"))
+        xlsx_checks = {c["id"]: c["status"] for c in xlsx_report["checks"]}
+        self.assertEqual(xlsx_checks["text_truncation"], "failed")
+        self.assertIn("xlsx_text_truncation", [i["code"] for i in xlsx_report["issues"]])
+
+    def _build_linear_smartart_pptx(self, lo_type_id, axis, items, with_arrows):
+        import uuid
+        DGM = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
+        DSP = "http://schemas.microsoft.com/office/drawing/2008/diagram"
+        A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+        P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+        R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+        REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+        CT = "http://schemas.openxmlformats.org/package/2006/content-types"
+
+        prs = Presentation()
+        prs.slides.add_slide(prs.slide_layouts[6])
+        buf = io.BytesIO()
+        prs.save(buf)
+        buf.seek(0)
+        frame_x, frame_y, frame_cx, frame_cy = 914400, 914400, 7315200, 4572000
+        doc_id = "{" + str(uuid.uuid4()).upper() + "}"
+        pres_root_id = "{" + str(uuid.uuid4()).upper() + "}"
+
+        data_root = XML.Element(f"{{{DGM}}}dataModel", nsmap={"dgm": DGM, "a": A, "r": R})
+        pt_lst = XML.SubElement(data_root, f"{{{DGM}}}ptLst")
+        cxn_lst = XML.SubElement(data_root, f"{{{DGM}}}cxnLst")
+        XML.SubElement(data_root, f"{{{DGM}}}bg")
+        XML.SubElement(data_root, f"{{{DGM}}}whole")
+        ext_lst = XML.SubElement(data_root, f"{{{DGM}}}extLst")
+        ext = XML.SubElement(ext_lst, f"{{{A}}}ext", uri=DSP)
+        XML.SubElement(ext, f"{{{DSP}}}dataModelExt", relId="rId5", minVer=A)
+
+        doc_pt = XML.SubElement(pt_lst, f"{{{DGM}}}pt", modelId=doc_id, type="doc")
+        XML.SubElement(doc_pt, f"{{{DGM}}}prSet", loTypeId=lo_type_id)
+        XML.SubElement(doc_pt, f"{{{DGM}}}spPr")
+        pr_pt = XML.SubElement(pt_lst, f"{{{DGM}}}pt", modelId=pres_root_id, type="pres")
+        XML.SubElement(pr_pt, f"{{{DGM}}}prSet", presAssocID=doc_id, presName="root", loTypeId=lo_type_id)
+        XML.SubElement(pr_pt, f"{{{DGM}}}spPr")
+        XML.SubElement(cxn_lst, f"{{{DGM}}}cxn", modelId="{" + str(uuid.uuid4()).upper() + "}",
+                       type="presOf", srcId=doc_id, destId=pres_root_id, srcOrd="0", destOrd="0", presId=lo_type_id)
+
+        draw_root = XML.Element(f"{{{DSP}}}drawing", nsmap={"dgm": DGM, "dsp": DSP, "a": A})
+        sp_tree = XML.SubElement(draw_root, f"{{{DSP}}}spTree")
+        nv_grp = XML.SubElement(sp_tree, f"{{{DSP}}}nvGrpSpPr")
+        XML.SubElement(nv_grp, f"{{{DSP}}}cNvPr", id="0", name="")
+        XML.SubElement(nv_grp, f"{{{DSP}}}cNvGrpSpPr")
+        XML.SubElement(sp_tree, f"{{{DSP}}}grpSpPr")
+
+        n = len(items)
+        gap = 160000
+        arrow_w = 280000 if with_arrows else 0
+        box_w = (frame_cx - (gap + arrow_w) * (n - 1)) // n if axis == "horizontal" else frame_cx
+        box_h = frame_cy if axis == "horizontal" else (frame_cy - (gap + arrow_w) * (n - 1)) // n
+        pres_ord = 0
+        for idx, label in enumerate(items):
+            nid = "{" + str(uuid.uuid4()).upper() + "}"
+            ptid = "{" + str(uuid.uuid4()).upper() + "}"
+            stid = "{" + str(uuid.uuid4()).upper() + "}"
+            pid = "{" + str(uuid.uuid4()).upper() + "}"
+            npt = XML.SubElement(pt_lst, f"{{{DGM}}}pt", modelId=nid)
+            XML.SubElement(npt, f"{{{DGM}}}prSet")
+            XML.SubElement(npt, f"{{{DGM}}}spPr")
+            dt = XML.SubElement(npt, f"{{{DGM}}}t")
+            XML.SubElement(dt, f"{{{A}}}bodyPr")
+            XML.SubElement(dt, f"{{{A}}}lstStyle")
+            XML.SubElement(XML.SubElement(XML.SubElement(dt, f"{{{A}}}p"), f"{{{A}}}r"), f"{{{A}}}t").text = label
+            XML.SubElement(pt_lst, f"{{{DGM}}}pt", modelId=ptid, type="parTrans")
+            XML.SubElement(pt_lst, f"{{{DGM}}}pt", modelId=stid, type="sibTrans")
+            ppt = XML.SubElement(pt_lst, f"{{{DGM}}}pt", modelId=pid, type="pres")
+            XML.SubElement(ppt, f"{{{DGM}}}prSet", presAssocID=nid, presName="node", loTypeId=lo_type_id)
+            XML.SubElement(ppt, f"{{{DGM}}}spPr")
+            XML.SubElement(cxn_lst, f"{{{DGM}}}cxn", modelId="{" + str(uuid.uuid4()).upper() + "}",
+                           srcId=doc_id, destId=nid, srcOrd=str(idx), destOrd="0", parTransId=ptid, sibTransId=stid)
+            XML.SubElement(cxn_lst, f"{{{DGM}}}cxn", modelId="{" + str(uuid.uuid4()).upper() + "}",
+                           type="presOf", srcId=nid, destId=pid, srcOrd="0", destOrd="0", presId=lo_type_id)
+            XML.SubElement(cxn_lst, f"{{{DGM}}}cxn", modelId="{" + str(uuid.uuid4()).upper() + "}",
+                           type="presParOf", srcId=pres_root_id, destId=pid, srcOrd=str(pres_ord), destOrd="0", presId=lo_type_id)
+            pres_ord += 1
+            x = idx * (box_w + gap + arrow_w) if axis == "horizontal" else 0
+            y = 0 if axis == "horizontal" else idx * (box_h + gap + arrow_w)
+            sp = XML.SubElement(sp_tree, f"{{{DSP}}}sp", modelId=pid)
+            nv = XML.SubElement(sp, f"{{{DSP}}}nvSpPr")
+            XML.SubElement(nv, f"{{{DSP}}}cNvPr", id=str(10 + pres_ord), name=f"Node {idx + 1}")
+            XML.SubElement(nv, f"{{{DSP}}}cNvSpPr")
+            sp_pr = XML.SubElement(sp, f"{{{DSP}}}spPr")
+            xf = XML.SubElement(sp_pr, f"{{{A}}}xfrm")
+            XML.SubElement(xf, f"{{{A}}}off", x=str(x), y=str(y))
+            XML.SubElement(xf, f"{{{A}}}ext", cx=str(box_w), cy=str(box_h))
+            XML.SubElement(XML.SubElement(sp_pr, f"{{{A}}}prstGeom", prst="roundRect"), f"{{{A}}}avLst")
+            XML.SubElement(XML.SubElement(sp_pr, f"{{{A}}}solidFill"), f"{{{A}}}srgbClr", val="4F81BD")
+            tx = XML.SubElement(sp, f"{{{DSP}}}txBody")
+            XML.SubElement(tx, f"{{{A}}}bodyPr", wrap="square", anchor="ctr")
+            XML.SubElement(tx, f"{{{A}}}lstStyle")
+            r_el = XML.SubElement(XML.SubElement(tx, f"{{{A}}}p"), f"{{{A}}}r")
+            XML.SubElement(r_el, f"{{{A}}}rPr", lang="en-US", sz="1400")
+            XML.SubElement(r_el, f"{{{A}}}t").text = label
+            if with_arrows and idx < n - 1:
+                apid = "{" + str(uuid.uuid4()).upper() + "}"
+                apt = XML.SubElement(pt_lst, f"{{{DGM}}}pt", modelId=apid, type="pres")
+                XML.SubElement(apt, f"{{{DGM}}}prSet", presAssocID=stid, presName="sibTrans", loTypeId=lo_type_id)
+                XML.SubElement(apt, f"{{{DGM}}}spPr")
+                XML.SubElement(cxn_lst, f"{{{DGM}}}cxn", modelId="{" + str(uuid.uuid4()).upper() + "}",
+                               type="presOf", srcId=stid, destId=apid, srcOrd="0", destOrd="0", presId=lo_type_id)
+                XML.SubElement(cxn_lst, f"{{{DGM}}}cxn", modelId="{" + str(uuid.uuid4()).upper() + "}",
+                               type="presParOf", srcId=pres_root_id, destId=apid, srcOrd=str(pres_ord), destOrd="0", presId=lo_type_id)
+                pres_ord += 1
+                asp = XML.SubElement(sp_tree, f"{{{DSP}}}sp", modelId=apid)
+                anv = XML.SubElement(asp, f"{{{DSP}}}nvSpPr")
+                XML.SubElement(anv, f"{{{DSP}}}cNvPr", id=str(10 + pres_ord), name=f"Arrow {idx + 1}")
+                XML.SubElement(anv, f"{{{DSP}}}cNvSpPr")
+                apr = XML.SubElement(asp, f"{{{DSP}}}spPr")
+                axf = XML.SubElement(apr, f"{{{A}}}xfrm")
+                XML.SubElement(axf, f"{{{A}}}off", x=str(x + box_w + gap // 2), y=str(box_h // 2 - 120000))
+                XML.SubElement(axf, f"{{{A}}}ext", cx=str(arrow_w), cy="240000")
+                XML.SubElement(XML.SubElement(apr, f"{{{A}}}prstGeom", prst="rightArrow"), f"{{{A}}}avLst")
+                XML.SubElement(XML.SubElement(apr, f"{{{A}}}solidFill"), f"{{{A}}}srgbClr", val="808080")
+
+        out = io.BytesIO()
+        with zipfile.ZipFile(buf) as zin, zipfile.ZipFile(out, "w") as zout:
+            slide = XML.fromstring(zin.read("ppt/slides/slide1.xml"))
+            tree = slide.find(f".//{{{P}}}spTree")
+            gf = XML.SubElement(tree, f"{{{P}}}graphicFrame")
+            nvgf = XML.SubElement(gf, f"{{{P}}}nvGraphicFramePr")
+            XML.SubElement(nvgf, f"{{{P}}}cNvPr", id="2", name="SmartArt1")
+            XML.SubElement(nvgf, f"{{{P}}}cNvGraphicFramePr")
+            XML.SubElement(nvgf, f"{{{P}}}nvPr")
+            gxf = XML.SubElement(gf, f"{{{P}}}xfrm")
+            XML.SubElement(gxf, f"{{{A}}}off", x=str(frame_x), y=str(frame_y))
+            XML.SubElement(gxf, f"{{{A}}}ext", cx=str(frame_cx), cy=str(frame_cy))
+            gdata = XML.SubElement(XML.SubElement(gf, f"{{{A}}}graphic"), f"{{{A}}}graphicData", uri=DGM)
+            rids = XML.SubElement(gdata, f"{{{DGM}}}relIds")
+            rids.set(f"{{{R}}}dm", "rId2")
+            rids.set(f"{{{R}}}lo", "rId3")
+            rids.set(f"{{{R}}}qs", "rId4")
+            rids.set(f"{{{R}}}cs", "rId6")
+            srels = XML.fromstring(zin.read("ppt/slides/_rels/slide1.xml.rels"))
+            for rid, rtype, tgt in (
+                ("rId2", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData", "../diagrams/data1.xml"),
+                ("rId3", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramLayout", "../diagrams/layout1.xml"),
+                ("rId4", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramQuickStyle", "../diagrams/quickStyle1.xml"),
+                ("rId5", "http://schemas.microsoft.com/office/2007/relationships/diagramDrawing", "../diagrams/drawing1.xml"),
+                ("rId6", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramColors", "../diagrams/colors1.xml"),
+            ):
+                XML.SubElement(srels, f"{{{REL}}}Relationship", Id=rid, Type=rtype, Target=tgt)
+            ct = XML.fromstring(zin.read("[Content_Types].xml"))
+            for part, ctype in (
+                ("/ppt/diagrams/data1.xml", "application/vnd.openxmlformats-officedocument.drawingml.diagramData+xml"),
+                ("/ppt/diagrams/layout1.xml", "application/vnd.openxmlformats-officedocument.drawingml.diagramLayout+xml"),
+                ("/ppt/diagrams/quickStyle1.xml", "application/vnd.openxmlformats-officedocument.drawingml.diagramStyle+xml"),
+                ("/ppt/diagrams/colors1.xml", "application/vnd.openxmlformats-officedocument.drawingml.diagramColors+xml"),
+                ("/ppt/diagrams/drawing1.xml", "application/vnd.ms-office.drawingml.diagramDrawing+xml"),
+            ):
+                XML.SubElement(ct, f"{{{CT}}}Override", PartName=part, ContentType=ctype)
+            repls = {
+                "ppt/slides/slide1.xml": XML.tostring(slide),
+                "ppt/slides/_rels/slide1.xml.rels": XML.tostring(srels),
+                "[Content_Types].xml": XML.tostring(ct),
+            }
+            for info in zin.infolist():
+                zout.writestr(info, repls.get(info.filename, zin.read(info.filename)))
+            zout.writestr("ppt/diagrams/data1.xml", XML.tostring(data_root))
+            zout.writestr("ppt/diagrams/drawing1.xml", XML.tostring(draw_root))
+            zout.writestr("ppt/diagrams/layout1.xml", b'<dgm:layoutDef xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram"/>')
+            zout.writestr("ppt/diagrams/quickStyle1.xml", b'<dgm:styleDef xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram"/>')
+            zout.writestr("ppt/diagrams/colors1.xml", b'<dgm:colorsDef xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram"/>')
+        return out.getvalue()
+
+    def test_smartart_add_or_remove_node_supported_linear_and_rejects_venn(self):
+        # 1. Verified linear process (process1 with arrows): add 4th step, then remove 2nd step, render in real LibreOffice
+        proc_pptx = self._build_linear_smartart_pptx(
+            "urn:microsoft.com/office/officeart/2005/8/layout/process1", "horizontal", ["Step1", "Step2", "Step3"], True
+        )
+        self.source.write_bytes(proc_pptx)
+        info = json.loads(self.run_worker("pptx", "range", range={"part": "ppt/diagrams/data1.xml"}))
+        self.assertTrue(info["supportsNodeAddRemove"])
+        self.assertEqual(info["layoutFamily"], "linear_process")
+
+        added = self.run_worker("pptx", "edit", operations=[
+            {"op": "pptx.smartart.add_or_remove_node", "slidePart": "ppt/slides/slide1.xml",
+             "dataPart": "ppt/diagrams/data1.xml", "mode": "add", "text": "Step4"},
+        ])
+        self.source.write_bytes(added)
+        pdf_added = self.run_worker("pptx", "export", targetFormat="pdf")
+        txt_added = PdfReader(io.BytesIO(pdf_added)).pages[0].extract_text() or ""
+        for step in ("Step1", "Step2", "Step3", "Step4"):
+            self.assertIn(step, txt_added)
+
+        removed = self.run_worker("pptx", "edit", operations=[
+            {"op": "pptx.smartart.add_or_remove_node", "slidePart": "ppt/slides/slide1.xml",
+             "dataPart": "ppt/diagrams/data1.xml", "mode": "remove", "index": 1},
+        ])
+        self.source.write_bytes(removed)
+        pdf_removed = self.run_worker("pptx", "export", targetFormat="pdf")
+        txt_removed = PdfReader(io.BytesIO(pdf_removed)).pages[0].extract_text() or ""
+        self.assertIn("Step1", txt_removed)
+        self.assertNotIn("Step2", txt_removed)
+        self.assertIn("Step4", txt_removed)
+
+        # 2. Real PowerPoint Venn fixture (smartart-simple.pptx -> venn1): must report unsupported and exit code 4
+        fixture = os.environ.get("AGY_TEST_SMARTART_FILE")
+        if fixture and Path(fixture).is_file():
+            self.source.write_bytes(Path(fixture).read_bytes())
+            venn_info = json.loads(self.run_worker("pptx", "range", range={"part": "ppt/diagrams/data1.xml"}))
+            self.assertFalse(venn_info["supportsNodeAddRemove"])
+            (self.inputs / "request.json").write_text(json.dumps({
+                "format": "pptx", "filename": "venn.pptx", "action": "edit",
+                "operations": [{"op": "pptx.smartart.add_or_remove_node", "slidePart": "ppt/slides/slide1.xml",
+                                "dataPart": "ppt/diagrams/data1.xml", "mode": "add", "text": "Extra"}],
+            }), encoding="utf-8")
+            proc = subprocess.run(
+                [sys.executable, str(WORKER)],
+                env=dict(os.environ, AGY_WORKER_IN_DIR=str(self.inputs), AGY_WORKER_OUT_DIR=str(self.outputs)),
+                cwd=self.directory, capture_output=True, text=True,
+            )
+            self.assertEqual(proc.returncode, 4)
+

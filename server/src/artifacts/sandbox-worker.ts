@@ -111,9 +111,22 @@ function readProcessTreeRssMb(rootPid: number): number {
   let totalKb = 0;
   const readOne = (pid: number) => {
     try {
-      const status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
-      const m = /^VmRSS:\s+(\d+)\s+kB$/m.exec(status);
-      if (m) totalKb += Number(m[1]);
+      let measured = false;
+      try {
+        const rollup = fs.readFileSync(`/proc/${pid}/smaps_rollup`, 'utf8');
+        const pss = /^Pss:\s+(\d+)\s+kB$/m.exec(rollup);
+        if (pss) {
+          totalKb += Number(pss[1]);
+          measured = true;
+        }
+      } catch {
+        // smaps_rollup unavailable on older kernels or restricted procfs; fall back to VmRSS
+      }
+      if (!measured) {
+        const status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
+        const m = /^VmRSS:\s+(\d+)\s+kB$/m.exec(status);
+        if (m) totalKb += Number(m[1]);
+      }
     } catch {
       // process may have exited
     }

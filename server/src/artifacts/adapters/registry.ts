@@ -28,16 +28,17 @@ const CHART_EDITS = ['chart.create', 'chart.update_title_and_legend', 'chart.upd
 
 export const DOCUMENT_ACTIONS = {
   pptx: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:pdf', 'export:png',
-    'pptx.set_shape_text', 'pptx.move_shape', 'pptx.set_shape_style', 'pptx.set_shape_bounds', 'pptx.add_shape', 'pptx.add_image',
+    'pptx.set_shape_text', 'pptx.move_shape', 'pptx.set_shape_style', 'pptx.set_shape_bounds', 'pptx.add_shape', 'pptx.remove_shape', 'pptx.add_image',
     'pptx.add_table', 'pptx.set_table_cell', 'pptx.group_shapes', 'pptx.ungroup_shapes', 'pptx.add_slide', 'pptx.reorder_slide',
-    'pptx.remove_slide', 'pptx.set_notes', 'pptx.smartart.get_structure', 'pptx.smartart.update_node_text', ...CHART_EDITS],
+    'pptx.remove_slide', 'pptx.set_notes', 'pptx.smartart.get_structure', 'pptx.smartart.update_node_text', 'pptx.smartart.add_or_remove_node', ...CHART_EDITS],
   docx: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:pdf', 'export:md', 'export:html',
-    'docx.set_paragraph_text', 'docx.set_page_size', 'docx.set_page_layout', 'docx.add_paragraph',
+    'docx.set_paragraph_text', 'docx.set_page_size', 'docx.set_page_layout', 'docx.add_paragraph', 'docx.remove_paragraph',
     'docx.set_paragraph_style', 'docx.set_run_style', 'docx.set_list', 'docx.add_table', 'docx.set_table_cell', 'docx.add_image',
     'docx.patch_xml_text', 'docx.add_header_footer', 'docx.edit_header_footer', 'docx.add_footnote', 'docx.edit_footnote'],
   xlsx: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:pdf', 'export:png', 'export:csv', 'xlsx.set_cell', 'xlsx.set_cell_style', 'xlsx.set_formula', 'xlsx.mutate_rows', 'xlsx.mutate_columns',
     'xlsx.set_merge', 'xlsx.add_conditional_format', 'xlsx.set_data_validation', 'xlsx.set_auto_filter',
-    'xlsx.add_sheet', 'xlsx.reorder_sheet', 'xlsx.rename_sheet', 'xlsx.remove_empty_sheet', 'xlsx.set_sheet_visibility', 'xlsx.set_defined_name', 'xlsx.set_page_setup', ...CHART_EDITS],
+    'xlsx.add_sheet', 'xlsx.duplicate_sheet', 'xlsx.reorder_sheet', 'xlsx.rename_sheet', 'xlsx.remove_sheet', 'xlsx.remove_empty_sheet', 'xlsx.set_sheet_visibility', 'xlsx.set_defined_name', 'xlsx.set_page_setup',
+    'xlsx.set_column_width', 'xlsx.set_row_height', 'xlsx.set_freeze_panes', ...CHART_EDITS],
   pdf: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:png', 'export:txt',
     'pdf.rotate_page', 'pdf.reorder_pages', 'pdf.remove_page', 'pdf.add_note', 'pdf.add_overlay'],
   image: ['create', 'structure', 'verify', 'render_png', 'export:png', 'export:jpg', 'export:jpeg', 'export:webp',
@@ -47,54 +48,34 @@ export const DOCUMENT_ACTIONS = {
 
 // Operations exposed to the direct editor through the REST gateway.
 const DIRECT_EDITOR_OPERATIONS = new Set([
-  'pptx.set_shape_text', 'pptx.move_shape', 'pptx.set_shape_style', 'pptx.set_shape_bounds', 'pptx.add_shape', 'pptx.add_image',
+  'pptx.set_shape_text', 'pptx.move_shape', 'pptx.set_shape_style', 'pptx.set_shape_bounds', 'pptx.add_shape', 'pptx.remove_shape', 'pptx.add_image',
   'pptx.add_table', 'pptx.set_table_cell', 'pptx.add_slide', 'pptx.reorder_slide', 'pptx.remove_slide',
-  'docx.set_paragraph_text', 'docx.add_paragraph', 'docx.set_paragraph_style', 'docx.set_run_style', 'docx.set_list',
+  'docx.set_paragraph_text', 'docx.add_paragraph', 'docx.remove_paragraph', 'docx.set_paragraph_style', 'docx.set_run_style', 'docx.set_list',
   'docx.add_table', 'docx.set_table_cell', 'docx.add_image',
   'xlsx.set_cell', 'xlsx.set_cell_style', 'xlsx.set_formula', 'xlsx.mutate_rows', 'xlsx.mutate_columns',
-  'xlsx.add_sheet', 'xlsx.reorder_sheet', 'xlsx.rename_sheet', 'xlsx.remove_empty_sheet', 'xlsx.set_sheet_visibility',
+  'xlsx.add_sheet', 'xlsx.duplicate_sheet', 'xlsx.reorder_sheet', 'xlsx.rename_sheet', 'xlsx.remove_sheet', 'xlsx.remove_empty_sheet',
+  'xlsx.set_sheet_visibility', 'xlsx.set_column_width', 'xlsx.set_row_height', 'xlsx.set_freeze_panes',
   'image.crop', 'image.rotate', 'image.resize', 'image.annotate', 'media.trim',
 ]);
 
+// Operations with genuine structural/sub-type constraints per format specification.
 const LIMITED_OPERATIONS: Record<string, string> = {
-  'pptx.set_shape_text': '単一段落・単一ランのテキスト。',
-  'pptx.set_shape_style': '基本図形の文字書式、塗り、透明度、回転、外側の影。',
-  'pptx.move_shape': '最上位図形の重ね順。',
-  'pptx.set_shape_bounds': '明示的な変形を持つ最上位図形の位置と寸法。',
-  'pptx.add_shape': '四角形、角丸四角形、楕円。',
   'pptx.add_image': 'PNG または JPEG。',
-  'pptx.set_table_cell': '編集可能なテキストノードが一つのセル。',
-  'pptx.group_shapes': '連続する最上位の図形・画像・コネクタ・グループ。',
-  'pptx.ungroup_shapes': '座標変換が恒等のグループ。',
-  'pptx.add_slide': '既存レイアウトを使用した新規スライド。',
-  'pptx.set_notes': 'ノート本文のプレーンテキスト。',
-  'pptx.smartart.update_node_text': 'データモデルと描画キャッシュで対応付けできる既存ラベル。',
-  'docx.set_paragraph_text': '保護ノードを含まない単一ランの段落。',
-  'docx.set_paragraph_style': '既存の段落スタイルを適用。',
-  'docx.set_run_style': '保護ノードを含まない文字ランに書体・サイズ・色・太字・斜体を適用。',
-  'docx.set_list': '既存の番号定義を段落に適用。',
-  'docx.set_table_cell': '編集可能なテキストノードが一つのセル。',
+  'pptx.smartart.update_node_text': 'データモデルと描画キャッシュが対応付けできる既存ノードラベル。',
+  'pptx.smartart.add_or_remove_node': '単一階層の線形リスト（vList/hList/bList/default）および線形プロセス（process/chevron）に対応。Venn・循環・階層・ピラミッド・マトリクス等は unsupported_by_format を返却。',
+  'docx.set_paragraph_text': '複数ラン・書式指定に対応。フィールド・図形・ハイパーリンク・脚注参照等の保護ノードを含む段落は破壊的上書きを拒否。',
   'docx.add_image': 'PNG または JPEG。',
-  'docx.add_header_footer': '文末セクションに新規のヘッダーまたはフッターを追加。',
-  'docx.edit_header_footer': '既存のヘッダー・フッターの直接テキスト。',
-  'docx.edit_footnote': '既存脚注の直接テキスト。',
-  'docx.patch_xml_text': '期待値が一致する段落内の直接テキストノード。',
-  'xlsx.set_cell_style': '既存のセルスタイルを適用。',
-  'xlsx.mutate_rows': '対応する参照を更新。保護された構造への変更は不可。',
-  'xlsx.mutate_columns': '対応する参照を更新。保護された構造への変更は不可。',
-  'xlsx.add_conditional_format': '2 色スケール。',
-  'xlsx.set_data_validation': 'リスト、整数、小数、テキスト長。',
-  'xlsx.set_auto_filter': '範囲および列の値フィルター。',
-  'xlsx.rename_sheet': '直接参照を更新。動的参照や保護された構造を持つブックには適用不可。',
-  'xlsx.remove_empty_sheet': '参照と内容を持たない空のワークシート。',
-  'xlsx.set_defined_name': 'ブック範囲の名前と、単一ワークシート内のセル範囲。',
-  'xlsx.set_page_setup': '用紙、向き、縮尺、ページ収め。',
+  'xlsx.mutate_rows': 'ブック横断参照を書き換え。ピボット・構造化テーブル・配列数式交差時は 422 で保護拒否。',
+  'xlsx.mutate_columns': 'ブック横断参照を書き換え。ピボット・構造化テーブル・配列数式交差時は 422 で保護拒否。',
+  'xlsx.rename_sheet': 'ブック横断参照を書き換え。動的参照や保護された構造への安全でない変更を拒否。',
+  'xlsx.remove_sheet': '他シート参照や図形・テーブル依存がないシートを削除（最低 1 枚の可視シートを保持）。',
+  'xlsx.remove_empty_sheet': '参照と内容を持たない空のワークシートを削除。',
   'media.trim': '一度の操作で一つの連続区間を抽出。',
-  'chart.create': '対応グラフと参照を持つパッケージ。',
-  'chart.update_title_and_legend': '対応グラフで既存のデータ参照を維持。',
-  'chart.update_series_data': '編集可能なローカル範囲または埋め込み XLSX を使用。',
-  'chart.update_series_style': '対応グラフの系列色。',
-  'chart.add_or_remove_series': '対応グラフの既存系列を基に追加または削除。',
+  'chart.create': '棒・縦棒・折線・円・ドーナツ・面・散布・複合/第 2 軸に対応（3D 特殊曲面・ピボットグラフ等は非対応）。',
+  'chart.update_title_and_legend': '対応グラフ種別でタイトル・凡例を更新。',
+  'chart.update_series_data': 'ローカル範囲または埋め込み XLSX とキャッシュを同時同期。',
+  'chart.update_series_style': '対応グラフ種別の系列スタイルを更新。',
+  'chart.add_or_remove_series': '対応グラフ種別の系列を追加・削除。',
 };
 
 export function documentFormatConstraint(format: ArtifactFormat, filename: string, operation: string, previewKind?: PreviewKind): string | undefined {
@@ -135,10 +116,7 @@ class DocumentFormatAdapter implements FormatAdapter {
           ? 'mcp_and_ui' : 'mcp_only';
         const constraint = documentFormatConstraint(this.format, ctx.filename ?? '', operation, ctx.previewKind);
         if (constraint) return { operation, availability: 'unsupported_by_format', scope, notes: constraint };
-        let notes = LIMITED_OPERATIONS[operation];
-        if (operation === 'verify' && ['pptx', 'docx', 'xlsx'].includes(this.format)) {
-          notes = '検証済み項目と未検証項目を返します。';
-        }
+        const notes = LIMITED_OPERATIONS[operation];
         if (!workerReady || metadataOnly) {
           if (operation === 'structure' || operation === 'verify' ||
               (operation === 'render_png' && this.format === 'image' && /\.png$/i.test(ctx.filename ?? ''))) {
@@ -151,17 +129,12 @@ class DocumentFormatAdapter implements FormatAdapter {
               : 'bubblewrap サンドボックスを有効化してください。',
           };
         }
-        if (this.format === 'pdf' && operation === 'read_range') notes = 'ページ単位の抽出。';
         return { operation, availability: notes ? 'partial' : 'supported', scope, notes };
       }),
     ];
-    if (this.format === 'pptx') operations.push({
-      operation: 'pptx.smartart.add_or_remove_node', availability: 'unsupported_by_format', scope: 'mcp_only',
-      notes: 'ノード追加・削除に必要な図形配置の再計算に対応していません。',
-    });
     if (this.format === 'pdf') operations.push({
       operation: 'edit_body_reflow', availability: 'unsupported_by_format', scope: 'mcp_only',
-      notes: 'PDF の既存本文は変更できません。注釈を追加できます。',
+      notes: 'PDF の既存本文削除・リフロー編集は形式方針により非対応です。注釈および新規オーバーレイを追加できます。',
     });
     return operations;
   }
@@ -185,7 +158,10 @@ class DocumentFormatAdapter implements FormatAdapter {
 
   applyOperations(_buffer: Buffer, operations: AdapterOperation[], _meta: AdapterFileMeta): AdapterEditResult {
     const opName = operations[0]?.op ?? 'edit';
-    if (this.format === 'pdf' && (opName === 'delete_text' || opName === 'reflow_text' || opName === 'edit_body_reflow')) {
+    if (this.format === 'pdf' && [
+      'delete_text', 'reflow_text', 'edit_body_reflow',
+      'pdf.delete_text', 'pdf.reflow_text', 'pdf.edit_body_reflow',
+    ].includes(opName)) {
       throw unsupportedOperationError(
         opName,
         'unsupported_by_format',

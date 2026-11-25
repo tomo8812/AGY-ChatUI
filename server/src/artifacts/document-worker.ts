@@ -7,7 +7,7 @@ import { documentFormatConstraint } from './adapters/registry.js';
 import { ArtifactError, unsupportedOperationError } from './errors.js';
 import type { ResourceGovernor } from './resource-governor.js';
 import type { DocWorkerSandbox } from './sandbox-worker.js';
-import type { AdapterOperation, ArtifactFormat } from './types.js';
+import type { AdapterOperation, ArtifactFormat, RenderRegion } from './types.js';
 
 export type DocumentFormat = Extract<ArtifactFormat, 'docx' | 'pptx' | 'xlsx' | 'pdf' | 'image' | 'media'>;
 
@@ -26,8 +26,8 @@ type WorkerAction =
   | { action: 'range'; range: Record<string, unknown> }
   | { action: 'edit'; operations: AdapterOperation[] }
   | { action: 'create'; params: Record<string, unknown> }
-  | { action: 'render'; pageIndex?: number; timeSeconds?: number; variant?: 'background' | 'sprite'; shapeId?: number }
-  | { action: 'export'; targetFormat: string };
+  | { action: 'render'; pageIndex?: number; timeSeconds?: number; variant?: 'background' | 'sprite'; shapeId?: number; region?: RenderRegion }
+  | { action: 'export'; targetFormat: string; region?: RenderRegion };
 
 const docWorkerScript = fileURLToPath(new URL('../../scripts/artifact_doc_worker.py', import.meta.url));
 
@@ -45,23 +45,36 @@ export class DocumentWorker {
       this.sandbox.getIsolationStatus() !== 'sandbox_required_blocked';
   }
 
+  get fullWebRuntimeAvailable(): boolean {
+    return this.governor.getRuntimeProfile() === 'full_runtime' &&
+      this.sandbox.getIsolationStatus() !== 'sandbox_required_blocked';
+  }
+
   async run(
-    format: DocumentFormat | 'html' | 'mermaid' | 'markdown' | 'svg',
+    format: DocumentFormat | 'html' | 'mermaid' | 'markdown' | 'svg' | 'csv',
     filename: string,
     document: Buffer | undefined,
     request: WorkerAction,
     mergeSources: readonly Buffer[] = [],
-    renderSnapshot?: { entry: string; dependencies: ReadonlyArray<{ relPath: string; mimeType: string; bytes: Buffer }> }
+    renderSnapshot?: {
+      entry: string;
+      dependencies: ReadonlyArray<{ relPath: string; mimeType: string; bytes: Buffer }>;
+      compareDocument?: Buffer;
+    }
   ): Promise<Buffer> {
     const operation = request.action === 'export' ? `export:${request.targetFormat}` : request.action;
     const constraint = documentFormatConstraint(format, filename, operation);
     if (constraint) throw unsupportedOperationError(operation, 'unsupported_by_format', constraint);
     const profile = this.governor.getRuntimeProfile();
-    const web = isWebRenderFormat(format);
+    const markdownDocExport = format === 'markdown' && request.action === 'export' &&
+      (request.targetFormat === 'docx' || (request.targetFormat === 'pdf' && profile !== 'full_runtime'));
+    const web = isWebRenderFormat(format) && !markdownDocExport;
     if (profile === 'base_chatui' || (web && profile !== 'full_runtime')) {
-      throw unsupportedOperationError(request.action, 'disabled_by_resource_tier', 'Document runtime is unavailable.');
+      throw unsupportedOperationError(operation, 'disabled_by_resource_tier', 'Document runtime is unavailable.');
     }
-    if ((document?.length ?? 0) + mergeSources.reduce((total, bytes) => total + bytes.length, 0) > DOCUMENT_WORKER_MAX_INPUT_BYTES) {
+    const compareBytes = renderSnapshot?.compareDocument;
+    if ((document?.length ?? 0) + (compareBytes?.length ?? 0) +
+        mergeSources.reduce((total, bytes) => total + bytes.length, 0) > DOCUMENT_WORKER_MAX_INPUT_BYTES) {
       throw new ArtifactError('DOC_WORKER_INPUT_TOO_LARGE', 'Document input exceeds the worker size limit.', 413);
     }
     const sandboxed = this.sandbox.getIsolationStatus() === 'bwrap';
@@ -71,13 +84,16 @@ export class DocumentWorker {
     const officeConversion = ((format === 'docx' || format === 'pptx' || format === 'xlsx') &&
       (request.action === 'render' ||
         (request.action === 'export' && ['png', 'pdf'].includes(request.targetFormat)))) ||
+      (format === 'markdown' && request.action === 'export' && request.targetFormat === 'pdf') ||
       (format === 'xlsx' && request.action === 'range' && request.range.evaluate === true) ||
-      ((format === 'pptx' || format === 'docx') && request.action === 'verify');
+      ((format === 'pptx' || format === 'docx' || format === 'xlsx') && request.action === 'verify');
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-document-'));
     try {
       const input = path.join(directory, 'document');
       const manifest = path.join(directory, 'request.json');
       if (document) fs.writeFileSync(input, document, { mode: 0o600 });
+      const compareInput = compareBytes ? path.join(directory, 'compare') : undefined;
+      if (compareBytes && compareInput) fs.writeFileSync(compareInput, compareBytes, { mode: 0o600 });
       const sourceInputs = mergeSources.map((bytes, index) => {
         const sandboxName = `merge-${index}.pdf`;
         const hostPath = path.join(directory, sandboxName);
@@ -92,29 +108,41 @@ export class DocumentWorker {
       });
       fs.writeFileSync(manifest, JSON.stringify({
         ...request, format, filename, mergeSourceCount: sourceInputs.length,
+        hasCompareDocument: Boolean(compareInput),
         entry: renderSnapshot?.entry,
         assets: assets.map(({ relPath, mimeType, sandboxName }) => ({ relPath, mimeType, sandboxName })),
       }), { mode: 0o600 });
+      const webEnv: Record<string, string> = {
+        AGY_DOC_RUNTIME_DIR: runtimeDir,
+        PLAYWRIGHT_BROWSERS_PATH: path.join(runtimeDir, 'playwright'),
+      };
+      if (!sandboxed && process.env.PLAYWRIGHT_EXECUTABLE_PATH) {
+        webEnv.PLAYWRIGHT_EXECUTABLE_PATH = process.env.PLAYWRIGHT_EXECUTABLE_PATH;
+      }
       const result = await this.sandbox.run({
         kind: web ? 'chromium' : officeConversion ? 'libreoffice' : format === 'media' ? 'ffmpeg' : 'python',
         command: web ? (sandboxed ? '/usr/bin/node' : process.execPath) : path.join(runtimeDir, 'venv/bin/python3'),
         args: [sandboxed ? `/work/in/${scriptName}` : workerScript],
-        env: web ? {
-          AGY_DOC_RUNTIME_DIR: runtimeDir,
-          PLAYWRIGHT_BROWSERS_PATH: path.join(runtimeDir, 'playwright'),
-        } : undefined,
+        env: web ? webEnv : undefined,
         inputFiles: [
           ...(document ? [{ hostPath: input, sandboxName: 'document' }] : []),
+          ...(compareInput ? [{ hostPath: compareInput, sandboxName: 'compare' }] : []),
           ...sourceInputs,
           ...assets.map(({ hostPath, sandboxName }) => ({ hostPath, sandboxName })),
           { hostPath: manifest, sandboxName: 'request.json' },
           { hostPath: workerScript, sandboxName: scriptName },
         ],
         expectedOutputRelPath: 'result',
-        timeoutMs: request.action === 'export' ? this.config.docWorkerExportTimeoutMs : undefined,
+        timeoutMs: request.action === 'export' || (officeConversion && request.action === 'verify')
+          ? this.config.docWorkerExportTimeoutMs
+          : undefined,
       });
       if (result.exitCode === 3) {
         throw new ArtifactError('UNSUPPORTED_STRUCTURAL_MUTATION', 'The workbook contains protected structures or references.', 422);
+      }
+      if (result.exitCode === 4) {
+        const detail = result.stderr.trim().split('\n')[0] || 'This operation is not supported for this document layout or format.';
+        throw unsupportedOperationError(operation, 'unsupported_by_format', detail);
       }
       if (result.exitCode !== 0 || !result.outputBuffer) {
         throw new ArtifactError('DOCUMENT_WORKER_REJECTED', 'Document processing rejected the input or operation.', 422);
