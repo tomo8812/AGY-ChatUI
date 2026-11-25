@@ -112,7 +112,11 @@ for(const vp of targets){
             }else if(item.kind==='xlsx'||item.kind==='csv'){
               await page.getByRole('gridcell',{name:'A1',exact:true}).click({timeout:30000});
               await page.getByRole('textbox',{name:'数式・セル値'}).fill(item.updated);
-              if(item.kind==='xlsx')await expect(page.getByRole('gridcell',{name:'B1',exact:true})).toHaveText('84');
+              if(item.kind==='xlsx'){
+                await expect(page.getByRole('gridcell',{name:'B1',exact:true})).toHaveText('84');
+                await page.getByRole('button',{name:'太字',exact:true}).click();
+                await expect(page.getByRole('button',{name:'太字',exact:true})).toHaveAttribute('aria-pressed','true');
+              }
             }else if(item.kind==='docx'){
               const word=page.getByRole('textbox',{name:'段落 1',exact:true});
               await word.fill(item.updated,{timeout:30000});
@@ -150,7 +154,7 @@ for(const vp of targets){
               expect(fs.readFileSync(pinned.blobPath,'utf8')).toBe(item.updated);
               await expect.poll(()=>page.locator('.cm-line').allTextContents()).toEqual(item.updated.split('\n'));
             }else if(item.kind==='xlsx'){
-              expect(await svc.readRange(userId,artifact.id,{sheetId:'1',rangeA1:'A1:B1'})).toMatchObject({cells:[{address:'A1',value:'42'},{address:'B1',formula:'A1*2'}]});
+              expect(await svc.readRange(userId,artifact.id,{sheetId:'1',rangeA1:'A1:B1'})).toMatchObject({cells:[{address:'A1',value:'42',bold:true},{address:'B1',formula:'A1*2'}]});
             }else if(item.kind==='csv'){
               expect(await svc.readRange(userId,artifact.id,{startRow:0,endRow:1,startCol:0,endCol:1})).toMatchObject({rows:[['Updated item','Quantity'],['Apple','7']]});
             }else if(item.kind==='docx'){

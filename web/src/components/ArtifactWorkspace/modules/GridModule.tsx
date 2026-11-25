@@ -94,22 +94,23 @@ export function GridModule(props:WorkspaceModuleProps){
   }
   const inRange=selected.row>=row0&&selected.row<row0+ROWS&&selected.col>=col0&&selected.col<col0+COLS;
   const inData=xlsx||selected.row< (data?.totalRows??data?.rows?.length??0)&&selected.col<(data?.totalCols??COLS);
-  const inputEnabled=ready&&inRange&&mode==='edit'&&!cellEditLocked;
-  const structuralEnabled=ready&&inRange&&mode==='edit'&&!editingLocked&&(!draft||!!structural)&&artifact.revision!==undefined;
+  const editableCoordinate=xlsx||(selected.row<=(data?.totalRows??0)&&selected.col<=(data?.totalCols??0));
+  const inputEnabled=ready&&inRange&&editableCoordinate&&mode==='edit'&&!cellEditLocked;
+  const structuralEnabled=ready&&inRange&&editableCoordinate&&mode==='edit'&&!editingLocked&&(!draft||!!structural)&&artifact.revision!==undefined;
   const styleKey='style:'+key(selected.row,selected.col);
   const styleEntry=entries.get(styleKey);
   const canStyle=xlsx&&inputEnabled&&supportsOperation(capabilities,'xlsx.set_cell_style');
   function toggleBold(){if(!canStyle||!sheet||artifact.revision===undefined)return;const existing=raw(selected.row,selected.col)?.bold===true;const next=!(styleEntry?.operation.bold??existing);onDraft(artifact.revision,next===existing?null:{key:styleKey,label:address(selected.row,selected.col)+' 太字',operation:{op:'xlsx.set_cell_style',sheetPart:sheet.part,address:address(selected.row,selected.col),bold:next}},styleKey)}
   const actions=[{id:'insert_row',label:'行を挿入'},{id:'delete_row',label:'行を削除'},{id:'insert_col',label:'列を挿入'},{id:'delete_col',label:'列を削除'},...(xlsx?[{id:'xlsx.add_sheet',label:'シートを追加'},{id:'xlsx.rename_sheet',label:'シート名変更'},{id:'xlsx.remove_empty_sheet',label:'空のシートを削除'}]:[])].filter(action=>supportsOperation(capabilities,xlsx?(action.id.startsWith('xlsx.')?action.id:action.id.endsWith('row')?'xlsx.mutate_rows':'xlsx.mutate_columns'):'edit'));
   const needsName=['xlsx.add_sheet','xlsx.rename_sheet'].includes(editAction);
-  const validName=!needsName||(sheetName.trim().length>0&&sheetName.trim().length<=31&&!/[\\[\\]:*?/\\\\]/.test(sheetName)&&!sheets.some(s=>s.name.toLowerCase()===sheetName.trim().toLowerCase()&&(editAction!=='xlsx.rename_sheet'||s.id!==sheet?.id)));
+  const validName=!needsName||(sheetName.trim().length>0&&sheetName.trim().length<=31&&!Array.from('[]:*?/\\').some(ch=>sheetName.includes(ch))&&!sheets.some(s=>s.name.toLowerCase()===sheetName.trim().toLowerCase()&&(editAction!=='xlsx.rename_sheet'||s.id!==sheet?.id)));
   function stageStructure(){
     if(!structuralEnabled||structural||!sheet||artifact.revision===undefined||!validName)return;
     const action=actions.find(a=>a.id===editAction);if(!action)return;
     const row=editAction.endsWith('row'),idx=row?selected.row:selected.col;
     if(!xlsx&&editAction.startsWith('delete')&&!inData)return;
     if(editAction.startsWith('delete')||editAction==='xlsx.remove_empty_sheet')if(!window.confirm(action.label+'しますか？'))return;
-    const op=editAction.startsWith('xlsx.')?{op:editAction,sheetId:sheet.id,...(needsName?{name:sheetName.trim()}:{})}:xlsx?{op:row?'xlsx.mutate_rows':'xlsx.mutate_columns',sheetPart:sheet.part,index:idx+1,count:1,mode:editAction.startsWith('insert')?'insert':'delete'}:{op:editAction,index:idx,...(editAction==='insert_row'?{values:Array.from({length:Math.max(1,data?.totalCols??1)},()=> '')}:{})};
+    const op=editAction.startsWith('xlsx.')?{op:editAction,sheetId:sheet.id,...(needsName?{name:sheetName.trim()}:{})}:xlsx?{op:row?'xlsx.mutate_rows':'xlsx.mutate_columns',sheetId:sheet.id,index:idx+1,count:1,mode:editAction.startsWith('insert')?'insert':'delete'}:{op:editAction,index:idx,...(editAction==='insert_row'?{values:Array.from({length:Math.max(1,Math.min(16384,data?.totalCols??1))},()=> '')}:{})};
     onDraft(artifact.revision,{key:'grid-structure',label:action.label,operation:op},'grid-structure');setEditAction('');setSheetName('');
   }
   const searchMatches=useMemo(()=>{const q=search.trim().toLocaleLowerCase();if(!q||!data||!sheet)return [];const matches:{row:number;col:number}[]=[];for(let r=0;r<rowCount;r++)for(let col=0;col<colCount;col++){const rr=row0+r,cc=col0+col;if(value(rr,cc).toLocaleLowerCase().includes(q))matches.push({row:rr,col:cc})}return matches},[search,data,draft,row0,col0,sheet,rowCount,colCount]);
@@ -132,7 +133,7 @@ export function GridModule(props:WorkspaceModuleProps){
         <div role="row" className="workspace-grid-header" style={{height:CELL_HEIGHT}}><div role="columnheader" className="workspace-grid-corner" style={{width:HEADER}}/>{cols.getVirtualItems().map(c=><div key={c.key} role="columnheader" className="workspace-grid-col" style={{left:c.start,width:c.size}}>{colName(col0+c.index)}</div>)}</div>
         {rows.getVirtualItems().map(r=><div key={r.key} role="row" aria-rowindex={r.index+2} className="workspace-grid-row" style={{top:r.start,height:r.size}}>
           <div role="rowheader" className="workspace-grid-rowhead" style={{width:HEADER}}>{row0+r.index+1}</div>
-          {cols.getVirtualItems().map(c=>{const row=row0+r.index,col=col0+c.index,addr=address(row,col),cell=raw(row,col),pending=entries.has(key(row,col)),active=selected.row===row&&selected.col===col,preview=previews.get(addr);return <div key={c.key} role="gridcell" aria-colindex={c.index+2} aria-selected={active} aria-label={addr} onClick={()=>{setSelected({row,col});scroll.current?.focus({preventScroll:true})}} title={preview!==undefined?'未保存の数式プレビュー':cell?.formulaStatus} data-formula-preview={preview!==undefined?'true':undefined} className={'workspace-grid-cell'+(pending?' pending':'')} style={{left:c.start,width:c.size,fontWeight:entries.get('style:'+key(row,col))?.operation.bold??cell?.bold?'bold':undefined}}>{preview??(pending?value(row,col):xlsx?String(cell?.value??''):original(row,col))}</div>})}
+          {cols.getVirtualItems().map(c=>{const row=row0+r.index,col=col0+c.index,addr=address(row,col),cell=raw(row,col),pending=entries.has(key(row,col)),active=selected.row===row&&selected.col===col,preview=previews.get(addr);return <div key={c.key} role="gridcell" aria-colindex={c.index+2} aria-selected={active} aria-label={addr} onClick={()=>{move(row,col);scroll.current?.focus({preventScroll:true})}} title={preview!==undefined?'未保存の数式プレビュー':cell?.formulaStatus} data-formula-preview={preview!==undefined?'true':undefined} className={'workspace-grid-cell'+(pending?' pending':'')} style={{left:c.start,width:c.size,fontWeight:entries.get('style:'+key(row,col))?.operation.bold??cell?.bold?'bold':undefined}}>{preview??(pending?value(row,col):xlsx?String(cell?.value??''):original(row,col))}</div>})}
         </div>)}
       </div>
     </div>}
