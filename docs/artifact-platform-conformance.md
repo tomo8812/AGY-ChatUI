@@ -191,6 +191,8 @@
 
 検証専用の予算は 512 KiB、深さ 128、12,000 ノード（HTML は要素とコメント、XML は要素）。YAML のマップ・フローコレクションは 1,024 項目、SVG の交差判定は 400 図形と 200 万回の射影、HTML の CSS 検査は 1 ブロック 32,768 UTF-16 コード単位まで。診断は最大 25 件に抑え、検出数は可能な範囲で維持する。入力サイズは Revision のブロブを読み込む前に確認する。この予算は `artifact_verify` の検査に適用する。
 
+Node.js 24 の単発計測では、上限付近の YAML（511 KiB）で CPU 10 ms・ヒープ増分 0.73 MiB、XML（511 KiB）で 32 ms・0.59 MiB、HTML（約 488 KiB）で 132 ms・12.60 MiB。HTML 11,500 要素で 143 ms・16.51 MiB、重なりの多い SVG 350 矩形で 132 ms・6.76 MiB だった。16 MiB の入力はパーサーに渡さず `partial` を返した。ヒープ増分は呼び出し前後の差で、ピーク使用量とは異なる。
+
 既存ビューアを Chromium で開き、応答ヘッダーと `sandbox="allow-scripts"` の組み合わせを確認した。インラインスクリプト、インライン CSS、`data:` 画像が動作し、相対 URL の画像・スタイル・スクリプトと `fetch()` はブラウザが遮断した。再現コマンドは `PLAYWRIGHT_EXECUTABLE_PATH=/usr/bin/chromium npm --workspace=server run test -- tests/adapter-verification.test.ts`。
 
 ---
@@ -279,7 +281,10 @@
 | --- | --- | --- | --- |
 | **`VERIFIED (REAL RUNTIME)`** | `AGY_TEST_FULL_RUNTIME_DIR=/tmp/agy-doc-runtime PLAYWRIGHT_EXECUTABLE_PATH=/usr/bin/google-chrome npx vitest run server/tests/builtin-artifact-mcp.test.ts` | **13 passed / 0 skipped / 0 failed** | Mermaid SVG・`mermaid.parse()` 行エラー・CSV 表 PNG＋領域指定・Markdown PDF/DOCX・PDF 差分検証・任意スライド PPTX 検証に加え、**`sandboxMode: 'strict'` / `allowUnsandboxedDocWorkers: false` による実 `bwrap` サンドボックス内での Python・LibreOffice・pandoc・qpdf 実行**まで合格（`bwrap` で `/etc/libreoffice` 未マウントにより LibreOffice が `NoSuchElementException` で異常終了する実バグを検出し `sandbox-worker.ts` で修正済み）。 |
 | **`VERIFIED (REAL RUNTIME)`** | `AGY_TEST_SMARTART_FILE=/tmp/smartart-simple.pptx /tmp/agy-doc-runtime/venv/bin/python3 -m unittest server.tests.artifact_doc_worker_test -v` | **34 / 34 passed** | 実 PowerPoint `smartart-simple.pptx`（`venn1`）・`cycle4`・`pyramid1`・`matrix_snake`・`hierarchy1`・`process1` の SmartArt ノード増減＋再編集＋`chMax=7` 超過拒否（終了コード 4）、任意スライド PPTX 視覚整合＋リソース予算 4 状態、XLSX/DOCX `XML.iterparse` ストリーミング範囲読取を含む全 34 テスト合格。 |
-| **`VERIFIED (REAL RUNTIME)`** | `npm run typecheck && npm run build && npm test`（`8122eeb` 時点の記録。 `AGY_TEST_FULL_RUNTIME_DIR` 未設定の Base ChatUI モード） | **全 23 スイート合格（154 passed / Full Runtime 等 3 テストは明示的に `SKIPPED`）** | `adapter-verification.test.ts`（Code JSON/YAML/XML・SVG XML/viewBox/XSS/重なり・HTML 構文/相対参照/CSP の正常・異常テスト 9 件）および `architecture-conformance.test.ts`（0 違反）を含む全 23 スイート合格。`it.skipIf(...)` により、未実行の Full Runtime / strict `bwrap` テストが誤って `passed` として計上されないことを保証。 |
+| **`VERIFIED (REAL RUNTIME)`** | `npm run typecheck && npm run build && npm test`（`8122eeb` 時点の記録。`AGY_TEST_FULL_RUNTIME_DIR` 未設定の Base ChatUI モード） | **全 23 スイート合格（154 passed / Full Runtime 等 3 テストは明示的に `SKIPPED`）** | `adapter-verification.test.ts`（Code JSON/YAML/XML・SVG XML/viewBox/XSS/重なり・HTML 構文/相対参照/CSP の正常・異常テスト 9 件）および `architecture-conformance.test.ts`（0 違反）を含む全 23 スイート合格。`it.skipIf(...)` により、未実行の Full Runtime / strict `bwrap` テストが誤って `passed` として計上されないことを保証。 |
+| **`VERIFIED (REAL RUNTIME)`** | 修正後の型チェック・ビルド、`adapter-verification.test.ts`、`artifact-capabilities.test.ts`、`layout-mode-and-sandbox.test.ts`、`architecture-conformance.test.ts` | **77 / 77 passed** | 既存 HTML ビューアを Chromium 156 で実行。構文の正常・異常、SVG の変換と除外、CSP と依存の区別、検証予算を確認。 |
+| **`VERIFIED (REAL RUNTIME)`** | 修正後の `server.tests.artifact_doc_worker_test` | **34 / 34 passed** | ポータブル LibreOffice 26.2.7 と PowerPoint 生成の SmartArt フィクスチャを用いた Python ワーカーの実ファイル検証。 |
+| **`UNVERIFIED`** | 修正後の Full Runtime MCP の PPTX 視覚検証、strict `bwrap` | **PPTX テスト 1 件失敗、strict 1 件スキップ** | ワーカーの固定 PATH に LibreOffice がなく、PPTX の視覚検証は `scope: none` だった。この環境の `bwrap` は UID マップ設定で起動に失敗した。 |
 | **`VERIFIED (MOCK / EMULATION)`** | `acp-transparency.test.ts`, `builtin-artifact-mcp.test.ts`（ACP ターン帰属・`session/load`・`session/resume` 経路） | **passed** | `agyMode: 'mock'` の拡張モック ACP クライアントによる検証。 |
 | **`UNVERIFIED`** | 実 `agy` バイナリ / 実 Microsoft PowerPoint・Word・Excel デスクトップアプリ / 物理 iPhone（iOS Safari・PWA） | **未検証（環境非搭載）** | LibreOffice やモック検証をもって検証済みと混同しない。実 `agy` 検証は `AGY_REAL_TEST=1 node scripts/verify-real-agy-artifact-mcp.mjs` を実機環境で実行すること。 |
 
