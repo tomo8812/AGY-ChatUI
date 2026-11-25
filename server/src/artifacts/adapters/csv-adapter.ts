@@ -13,6 +13,7 @@ import type {
   TargetSelector,
 } from '../types.js';
 import { sha256Text, type AdapterCapabilityContext, type AdapterFileMeta, type FormatAdapter } from './base.js';
+import { textVerificationReport } from './text-verification.js';
 
 function detectDelimiter(filename: string): string {
   return path.extname(filename).toLowerCase() === '.tsv' ? '\t' : ',';
@@ -541,13 +542,7 @@ export class CsvAdapter implements FormatAdapter {
       evidence: `Checked ${rows.length} rows against ${expectedCols} header columns; ${mismatchedRows} mismatched.`,
     });
 
-    return {
-      ok: !issues.some((i) => i.severity === 'error'),
-      coverage: 'complete',
-      checks,
-      issues,
-      metrics: { rowCount: rows.length, colCount: expectedCols, validUtf8, hasBom },
-    };
+    return textVerificationReport(checks, issues, { rowCount: rows.length, colCount: expectedCols, validUtf8, hasBom });
   }
 
   exportAs(buffer: Buffer, targetFormat: string, meta: AdapterFileMeta): AdapterExportResult {

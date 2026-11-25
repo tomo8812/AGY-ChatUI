@@ -3,7 +3,9 @@ import path from 'node:path';
 import { chromium, type Browser } from 'playwright';
 import { describe, expect, it } from 'vitest';
 import { CodeAdapter } from '../src/artifacts/adapters/code-adapter.js';
+import { CsvAdapter } from '../src/artifacts/adapters/csv-adapter.js';
 import { HtmlAdapter } from '../src/artifacts/adapters/html-adapter.js';
+import { MarkdownAdapter } from '../src/artifacts/adapters/markdown-adapter.js';
 import { SvgAdapter } from '../src/artifacts/adapters/svg-adapter.js';
 import { MAX_TEXT_VERIFY_BYTES, MAX_VERIFY_DIAGNOSTICS } from '../src/artifacts/adapters/text-verification.js';
 import type { AdapterVerifyResult } from '../src/artifacts/types.js';
@@ -21,6 +23,25 @@ const verifyHtml = (source: string) => html.verify(Buffer.from(source), meta('ex
 const check = (result: AdapterVerifyResult, id: string, status: 'passed' | 'failed' | 'unverified') => {
   expect(result.checks).toContainEqual(expect.objectContaining({ id, status }));
 };
+
+describe('Verification reports with failed warning-level checks', () => {
+  it.each([['example.csv', ','], ['example.tsv', '\t']])('fails the overall report on inconsistent columns in %s', (filename, delimiter) => {
+    const report = new CsvAdapter().verify(Buffer.from(`first${delimiter}second\none\n`), meta(filename));
+    expect(report).toMatchObject({ ok: false, coverage: 'complete' });
+    check(report, 'csv_column_consistency', 'failed');
+    expect(report.issues).toEqual([expect.objectContaining({ severity: 'warning', code: 'CSV_COLUMN_COUNT_MISMATCH' })]);
+  });
+
+  it.each([
+    ['# Title\n### Skipped level\n', 'markdown_headings', 'MD_HEADING_LEVEL_SKIP'],
+    ['# Title\n[Missing](#absent)\n', 'markdown_links', 'MD_BROKEN_ANCHOR_LINK'],
+  ])('fails the overall Markdown report for %s', (source, id, issueCode) => {
+    const report = new MarkdownAdapter().verify(Buffer.from(source), meta('example.md'));
+    expect(report).toMatchObject({ ok: false, coverage: 'complete' });
+    check(report, id, 'failed');
+    expect(report.issues).toEqual([expect.objectContaining({ severity: 'warning', code: issueCode })]);
+  });
+});
 
 describe('Code adapter syntax verification', () => {
   it('parses JSON, YAML streams and the repository workflow', () => {

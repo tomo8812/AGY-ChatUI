@@ -19,6 +19,7 @@ import {
   type AdapterFileMeta,
   type FormatAdapter,
 } from './base.js';
+import { textVerificationReport } from './text-verification.js';
 
 function slugifyHeading(text: string): string {
   return text
@@ -578,13 +579,11 @@ export class MarkdownAdapter implements FormatAdapter {
       evidence: `Checked ${links.length} Markdown links; ${brokenAnchors} empty or broken internal anchors.`,
     });
 
-    return {
-      ok: !issues.some((i) => i.severity === 'error'),
-      coverage: 'complete',
-      checks,
-      issues,
-      metrics: { lineCount: lines.length, headingCount: headingSlugs.size, linkCount: links.length },
-    };
+    return textVerificationReport(checks, issues, {
+      lineCount: lines.length,
+      headingCount: headingSlugs.size,
+      linkCount: links.length,
+    });
   }
 
   exportAs(buffer: Buffer, targetFormat: string, meta: AdapterFileMeta): AdapterExportResult {
