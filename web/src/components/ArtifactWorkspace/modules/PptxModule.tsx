@@ -1,5 +1,6 @@
 import React,{useEffect,useRef,useState} from 'react';
 import { workspaceApi,supportsOperation,type EditOperation } from '../../../api/workspace';
+import {ResponsiveCommandBar} from '../../shared-ui/layout/ResponsiveCommandBar';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
 import { PdfCanvasViewer } from '../../shared-ui/document/PdfCanvasCore';
 import { artifactVersionKey, buildArtifactContentUrl } from '../../../utils/viewerCache';
@@ -167,16 +168,19 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   }
   const choose=(id:string)=>{setSelected(id);setDrag(null)};
   const pin=()=>{if(shape&&slide&&artifact.revision!==undefined)onTarget({baseRevision:artifact.revision,label:'スライド '+(index+1)+' / '+shape.name,selector:{kind:'pptx_shape',slideId:slide.id,slidePart:slide.part,shapeId:Number(shape.id),expectedElementFingerprint:artifact.sha256},selectedContentSnapshot:shape.text,contentCoords:shape.transform?.geomBoundsPt?{...shape.transform.geomBoundsPt}:undefined})};
-  const toolbar=<div className="workspace-toolbar"><span>スライド {index+1} / {slides.length}</span>
+  const primary=<><span className="workspace-slide-counter" title="スライド番号">{index+1} / {slides.length}</span>
     {mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!shape||!scene.ready} onClick={pin}>要素を対象にする</button>}
-    {mode==='edit'&&shape?.type==='sp'&&<input aria-label="図形テキスト" value={String(draft?.entries.find(e=>e.key===key(shape.id,'text'))?.operation.text??shape.text)} readOnly={lock||!scene.ready||!supportsOperation(capabilities,'pptx.set_shape_text')} onChange={e=>editText(e.target.value)}/>}
-    {mode==='edit'&&shape&&bounds(shape)&&['x','y','width','height'].map(field=><label key={field} className="workspace-bound">{field}<input aria-label={field} type="number" value={bounds(shape)![field as keyof Bounds]} disabled={lock||!scene.ready||!supportsOperation(capabilities,'pptx.set_shape_bounds')} onChange={e=>{const value=e.target.valueAsNumber;if(Number.isFinite(value)&&((field==='x'||field==='y')?Math.abs(value)<=14400:value>=1&&value<=14400))writeBounds(shape,{...bounds(shape)!,[field]:value})}}/></label>)}
-    {mode==='edit'&&styleEnabled&&<>
+    {mode==='edit'&&shape?.type==='sp'&&<input className="workspace-command-text" aria-label="図形テキスト" value={String(draft?.entries.find(e=>e.key===key(shape.id,'text'))?.operation.text??shape.text)} readOnly={lock||!scene.ready||!supportsOperation(capabilities,'pptx.set_shape_text')} onChange={e=>editText(e.target.value)}/>}
+  </>;
+  const secondary=mode==='edit'?<>
+    {shape&&bounds(shape)&&['x','y','width','height'].map(field=><label key={field} className="workspace-bound">{field}<input aria-label={field} type="number" value={bounds(shape)![field as keyof Bounds]} disabled={lock||!scene.ready||!supportsOperation(capabilities,'pptx.set_shape_bounds')} onChange={e=>{const value=e.target.valueAsNumber;if(Number.isFinite(value)&&((field==='x'||field==='y')?Math.abs(value)<=14400:value>=1&&value<=14400))writeBounds(shape,{...bounds(shape)!,[field]:value})}}/></label>)}
+    {styleEnabled&&<>
       {shape?.type==='sp'&&<><button type="button" className="btn btn-secondary btn-xs" onClick={()=>stageStyle({bold:true})}>太字</button><button type="button" className="btn btn-secondary btn-xs" onClick={()=>stageStyle({bold:false})}>標準</button><label className="workspace-bound">文字サイズ<input aria-label="文字サイズ" type="number" min={6} max={200} placeholder="pt" value={String(styleDraft?.fontSizePt??'')} onChange={e=>{const v=e.target.valueAsNumber;if(v>=6&&v<=200)stageStyle({fontSizePt:v})}}/></label><label>文字色<input aria-label="文字色" type="color" value={String(styleDraft?.fontColor??'#000000')} onChange={e=>stageStyle({fontColor:e.target.value})}/></label></>}
       <label>塗り<input aria-label="図形の塗り" type="color" value={String(styleDraft?.fill??'#ffffff')} onChange={e=>stageStyle({fill:e.target.value})}/></label>
     </>}
-    {mode==='edit'&&<select aria-label="スライド編集操作" disabled={!structureEnabled} value={operationKind} onChange={e=>chooseOperation(e.target.value)}><option value="">スライド操作…</option>{availableActions.map(a=><option key={a.id} value={a.id}>{a.label}</option>)}</select>}
-  </div>;
+    {<select aria-label="スライド編集操作" disabled={!structureEnabled} value={operationKind} onChange={e=>chooseOperation(e.target.value)}><option value="">スライド操作…</option>{availableActions.map(a=><option key={a.id} value={a.id}>{a.label}</option>)}</select>}
+  </>:null;
+  const toolbar=<ResponsiveCommandBar primary={primary} secondary={secondary} minInlineWidth={1100}/>;
   const operationForm=mode==='edit'&&operationKind&&!structural?<div className="workspace-pptx-operation" role="group" aria-label="追加・構造変更">
     {addingElement&&<div className="workspace-toolbar">{['X','Y','幅','高さ'].map((label,i)=><label key={label} className="workspace-bound">{label}<input aria-label={'追加要素 '+label} type="number" value={Number.isFinite(newBounds[i])?newBounds[i]:''} onChange={e=>setNewBounds(v=>v.map((n,j)=>i===j?e.target.valueAsNumber:n) as [number,number,number,number])}/></label>)}</div>}
     {operationKind==='pptx.add_shape'&&<div className="workspace-toolbar"><select aria-label="追加図形" value={shapeKind} onChange={e=>setShapeKind(e.target.value as typeof shapeKind)}><option value="rectangle">四角形</option><option value="ellipse">楕円</option><option value="textbox">テキストボックス</option></select><input aria-label="追加図形テキスト" value={shapeText} maxLength={20000} onChange={e=>setShapeText(e.target.value)}/></div>}

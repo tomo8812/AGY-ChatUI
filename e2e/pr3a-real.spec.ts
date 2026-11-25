@@ -20,6 +20,10 @@ const cases=[
   {kind:'pdf',filename:'sample.pdf',updated:''},
 ] as const;
 
+async function openCommand(page:Page,control:ReturnType<Page['getByRole']>){
+  if(!await control.isVisible())await page.getByRole('button',{name:'その他の編集操作',exact:true}).click();
+  await expect(control).toBeVisible();
+}
 async function readySlide(page:Page){
   const scene=page.locator('[data-slide-canvas="true"]');
   await expect(scene).toBeVisible({timeout:60000});
@@ -158,6 +162,7 @@ for(const vp of targets){
               record.beforeVisual=await capturePptx(page,info,before.png,'pptx-before');
               await page.getByRole('button',{name:'Title',exact:true}).click();
               await page.getByRole('textbox',{name:'図形テキスト'}).fill(item.updated);
+              await openCommand(page,page.getByRole('button',{name:'太字',exact:true}));
               await page.getByRole('button',{name:'太字',exact:true}).click();
               // Await actual worker output for the unsaved text; no document mutation yet.
               await expect(page.locator('[data-slide-canvas]')).toHaveAttribute('data-preview-ready','true',{timeout:90000});
@@ -233,6 +238,7 @@ for(const vp of targets){
             const select=page.getByRole('combobox',{name:'スライド編集操作'});
             let revision=2;
             const saveStructural=async(op:string,configure:()=>Promise<void>,renderIndex:number)=>{
+              await openCommand(page,select);
               await expect(select).toBeEnabled({timeout:90000});
               await select.selectOption(op);await configure();
               await page.getByRole('button',{name:'適用',exact:true}).click();

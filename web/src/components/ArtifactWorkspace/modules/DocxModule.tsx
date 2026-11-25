@@ -2,6 +2,7 @@ import React,{useRef,useState} from 'react';
 import type {Editor} from '@tiptap/react';
 import {WordParagraphEditor,type WordRun,type WordMark} from '../../shared-ui/editor/WordParagraphEditor';
 import { workspaceApi,supportsOperation } from '../../../api/workspace';
+import {ResponsiveCommandBar} from '../../shared-ui/layout/ResponsiveCommandBar';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
 import { PdfCanvasViewer } from '../../shared-ui/document/PdfCanvasCore';
 import { buildArtifactContentUrl } from '../../../utils/viewerCache';
@@ -39,12 +40,19 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   const tableDraft=draft?.entries.find(e=>e.key==='new-table');
   const tableRows=tableDraft?.operation.rows as string[][]|undefined;
   const addParagraph=draft?.entries.find(e=>e.key==='new-paragraph');
-  const toolbar=<div className="workspace-toolbar">
+  const pageControls=<>
     <button type="button" className="btn btn-secondary btn-xs" disabled={!page} onClick={()=>setPage(p=>p-1)}>前の段落</button><span>段落 {page*PAGE+1}–{Math.min((page+1)*PAGE,resource.data?.blockCount??(page+1)*PAGE)}</span>
     <button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready||!resource.data?.hasMore} onClick={()=>setPage(p=>p+1)}>次の段落</button>
+  </>;
+  const primary=<>
+    {mode==='view'&&pageControls}
     {mode==='edit'&&<>
       <button type="button" className="btn btn-secondary btn-xs" disabled={locked||!block?.editableText} onMouseDown={e=>e.preventDefault()} onClick={()=>{const ed=activeEditor.current;if(ed&&!ed.isDestroyed&&ed.isEditable)ed.chain().focus().selectAll().run()}}>段落全選択</button>
       {([['bold','太字'],['italic','斜体'],['underline','下線']] as const).map(([mark,label])=><button key={mark} type="button" className="btn btn-secondary btn-xs" disabled={locked||!block?.editableText} onMouseDown={e=>e.preventDefault()} onClick={()=>{const ed=activeEditor.current;if(ed&&!ed.isDestroyed&&ed.isEditable)ed.chain().focus().toggleMark(mark).run()}}>{label}</button>)}
+    </>}
+    {mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready||!block||artifact.revision===undefined} onClick={()=>{if(resource.ready&&block&&artifact.revision!==undefined)onTarget({baseRevision:artifact.revision,label:'段落 '+(block.blockIndex+1),selector:{kind:'docx_paragraph',blockIndex:block.blockIndex,expectedBlockHash:artifact.sha256},selectedContentSnapshot:block.text})}}>選択段落を対象にする</button>}
+  </>;
+  const secondary=mode!=='view'?<>{pageControls}{mode==='edit'&&<>
       <button type="button" className="btn btn-secondary btn-xs" disabled={!block?.editableText||!can('docx.set_paragraph_style')} onClick={()=>styleParagraph({op:'docx.set_paragraph_style',headingLevel:1},'style')}>見出し</button>
       <button type="button" className="btn btn-secondary btn-xs" disabled={!block?.editableText||!can('docx.set_list')} onClick={()=>styleParagraph({op:'docx.set_list',listType:'bullet'},'list')}>箇条書き</button>
       <button type="button" className="btn btn-secondary btn-xs" disabled={!can('docx.add_paragraph')||!!addParagraph} onClick={()=>stage('new-paragraph',{op:'docx.add_paragraph',text:''},'段落を追加')}>段落を追加</button>
@@ -63,8 +71,8 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
         };reader.onerror=()=>setImageError('画像を読み込めませんでした。');reader.readAsDataURL(file);
       }}/>
     </>}
-    {mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready||!block||artifact.revision===undefined} onClick={()=>{if(resource.ready&&block&&artifact.revision!==undefined)onTarget({baseRevision:artifact.revision,label:'段落 '+(block.blockIndex+1),selector:{kind:'docx_paragraph',blockIndex:block.blockIndex,expectedBlockHash:artifact.sha256},selectedContentSnapshot:block.text})}}>選択段落を対象にする</button>}
-  </div>;
+  </>:null;
+  const toolbar=<ResponsiveCommandBar primary={primary} secondary={secondary} minInlineWidth={1100}/>;
   if(mode==='view'&&reading==='page'&&canRender)return <div className="workspace-page-view">
     <div className="workspace-toolbar"><button className="btn btn-secondary btn-xs" type="button" onClick={()=>setReading('text')}>読取表示</button></div>
     <PdfCanvasViewer enhancedNavigation documentKey={artifact.id} url={buildArtifactContentUrl(artifact,{convertedPdf:true})}/>

@@ -2,6 +2,7 @@ import React,{useMemo,useRef,useState} from 'react';
 import {useVirtualizer} from '@tanstack/react-virtual';
 import {previewFormulas} from '../formulaPreview';
 import { workspaceApi,supportsOperation } from '../../../api/workspace';
+import {ResponsiveCommandBar} from '../../shared-ui/layout/ResponsiveCommandBar';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
 import { assertRevision,useRevisionResource } from '../useRevisionResource';
 import type { WorkspaceModuleProps } from '../types';
@@ -122,12 +123,15 @@ export function GridModule(props:WorkspaceModuleProps){
   }
   const searchMatches=useMemo(()=>{const q=search.trim().toLocaleLowerCase();if(!q||!data||!sheet)return [];const matches:{row:number;col:number}[]=[];for(let r=0;r<rowCount;r++)for(let col=0;col<colCount;col++){const rr=row0+r,cc=col0+col;if(value(rr,cc).toLocaleLowerCase().includes(q))matches.push({row:rr,col:cc})}return matches},[search,data,draft,row0,col0,sheet,rowCount,colCount]);
   function nextMatch(){if(!searchMatches.length)return;const n=(searchAt+1)%searchMatches.length;setSearchAt(n);const match=searchMatches[n];move(match.row,match.col)}
-  const toolbar=<div className="workspace-toolbar"><span className="workspace-cell-address">{address(selected.row,selected.col)}</span><span aria-hidden="true">ƒx</span><input ref={formulaInput} className="workspace-formula" aria-label="数式・セル値" value={data&&inRange?value(selected.row,selected.col):''} readOnly={!inputEnabled} onChange={e=>change(e.target.value)}/>{mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!ready||!inRange||!inData} onClick={()=>void pin()}>セルを対象にする</button>}{mode==='edit'&&<>
+  const primary=<><span className="workspace-cell-address">{address(selected.row,selected.col)}</span><span aria-hidden="true">ƒx</span><input ref={formulaInput} className="workspace-formula" aria-label="数式・セル値" value={data&&inRange?value(selected.row,selected.col):''} readOnly={!inputEnabled} onChange={e=>change(e.target.value)}/>{mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!ready||!inRange||!inData} onClick={()=>void pin()}>セルを対象にする</button>}{mode==='edit'&&<>
       {xlsx&&<button type="button" className="btn btn-secondary btn-xs" aria-pressed={Boolean(styleEntry?.operation.bold??raw(selected.row,selected.col)?.bold)} disabled={!canStyle} onClick={toggleBold}>太字</button>}
+    </>}</>;
+  const secondary=mode==='edit'?<>
       <select aria-label="表の編集操作" disabled={!structuralEnabled||!!structural} value={editAction} onChange={e=>{setEditAction(e.target.value);setSheetName(e.target.value==='xlsx.rename_sheet'?sheet?.name??'':'')}}><option value="">表の操作…</option>{actions.map(a=><option key={a.id} value={a.id}>{a.label}</option>)}</select>
       {needsName&&<input aria-label="シート名" value={sheetName} maxLength={31} onChange={e=>setSheetName(e.target.value)}/>}
       {editAction&&<button type="button" className="btn btn-secondary btn-xs" disabled={!structuralEnabled||!validName} onClick={stageStructure}>適用</button>}
-    </>}</div>;
+    </>:null;
+  const toolbar=<ResponsiveCommandBar primary={primary} secondary={secondary} minInlineWidth={760}/>;
   const tabs=<div className="workspace-toolbar" role="group" aria-label="シート">{sheets.map(s=><button key={s.id} type="button" className={'btn btn-secondary btn-xs '+(s.id===sheet?.id?'active':'')} aria-pressed={s.id===sheet?.id} onClick={()=>{setSheetId(s.id);move(0,0)}}>{s.name}</button>)}
     <input aria-label="表示範囲を検索" placeholder="範囲内検索" value={search} onChange={e=>{setSearch(e.target.value);setSearchAt(-1)}}/><button type="button" className="btn btn-secondary btn-xs" disabled={!searchMatches.length} onClick={nextMatch}>次の一致{search&&' ('+searchMatches.length+')'}</button>
     <button type="button" className="btn btn-secondary btn-xs" disabled={page===0} onClick={()=>move(Math.max(0,row0-ROWS),col0)}>前の行</button><button type="button" className="btn btn-secondary btn-xs" disabled={row0+ROWS>=1048576||(!xlsx&&!data?.hasMore&&row0+ROWS>(data?.totalRows??row0+ROWS-1))} onClick={()=>move(row0+ROWS,col0)}>次の行</button><button type="button" className="btn btn-secondary btn-xs" disabled={colPage===0} onClick={()=>move(row0,Math.max(0,col0-COLS))}>前の列</button><button type="button" className="btn btn-secondary btn-xs" disabled={col0+COLS>=16384||(!xlsx&&!data?.hasMore&&col0+COLS>(data?.totalCols??col0+COLS-1))} onClick={()=>move(row0,col0+COLS)}>次の列</button></div>;
