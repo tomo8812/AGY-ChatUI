@@ -5,12 +5,13 @@ import {defaultKeymap,history,historyKeymap,indentWithTab} from '@codemirror/com
 import {syntaxHighlighting,defaultHighlightStyle} from '@codemirror/language';
 import {javascript} from '@codemirror/lang-javascript';
 import {markdown} from '@codemirror/lang-markdown';
-import {search,searchKeymap} from '@codemirror/search';
+import {search,searchKeymap,SearchQuery,setSearchQuery,findNext} from '@codemirror/search';
 import {Compartment} from '@codemirror/state';
 
 const externalUpdate=Annotation.define<boolean>();
 export interface SourceEditorHandle {
   selectAll:()=>void;
+  findNext:(query:string)=>boolean;
   getSelection:()=>{startLine:number;endLine:number};
   wrapSelection:(before:string,after:string)=>void;
 }
@@ -37,6 +38,7 @@ export function SourceEditor({value,readOnly,language,onChange,editorRef}:Props)
     ]})});
     view.current=instance;
     editorRef.current={
+      findNext:query=>{if(!query)return false;instance.dispatch({effects:setSearchQuery.of(new SearchQuery({search:query,literal:true}))});instance.focus();return findNext(instance)},
       selectAll:()=>{instance.focus();instance.dispatch({selection:{anchor:0,head:instance.state.doc.length},scrollIntoView:true})},
       getSelection:()=>{
         const {from,to}=instance.state.selection.main;

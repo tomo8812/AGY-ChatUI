@@ -118,6 +118,14 @@ for(const vp of targets){
             await expect(page.locator('.workspace-selection')).toContainText('ページ 2');
             record.page=2;record.zoom=scale;
           }else{
+            if(item.kind==='markdown'){
+              await page.getByRole('button',{name:'目次',exact:true}).click();
+              await page.getByRole('navigation',{name:'文書目次'}).getByRole('button',{name:'Notes',exact:true}).click();
+              await page.getByRole('textbox',{name:'検索',exact:true}).fill('Original text');
+              await page.getByRole('button',{name:'次の一致',exact:true}).click();
+              await expect.poll(()=>page.evaluate(()=>window.getSelection()?.toString())).toBe('Original text');
+              await page.getByRole('textbox',{name:'検索',exact:true}).fill('');
+            }
             await page.getByRole('button',{name:'編集',exact:true}).click({timeout:30000});
             if(item.kind==='markdown'||item.kind==='code'){
               const editor=page.getByRole('textbox',{name:'ソース'});

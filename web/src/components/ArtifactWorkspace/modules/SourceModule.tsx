@@ -1,4 +1,4 @@
-import React,{useRef,useState} from 'react';
+import React,{useLayoutEffect,useRef,useState} from 'react';
 import { buildArtifactContentUrl } from '../../../utils/viewerCache';
 import { MarkdownContent,CodeBlock } from '../../MarkdownContent';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
@@ -16,6 +16,10 @@ export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget
     return response.text();
   });
   const [query,setQuery]=useState('');
+  const [outlineOpen,setOutlineOpen]=useState(false);
+  const [outline,setOutline]=useState<{label:string;level:number}[]>([]);
+  const preview=useRef<HTMLDivElement>(null);
+  const searchOffset=useRef(0);
   const [pinError,setPinError]=useState('');
   const editor=useRef<SourceEditorHandle|null>(null);
   const text=resource.data??'';
@@ -23,6 +27,25 @@ export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget
   const markdown=artifact.previewKind==='markdown';
   const language=artifact.filename.split('.').pop()??'text';
   const matches=query?value.toLowerCase().split(query.toLowerCase()).length-1:0;
+  useLayoutEffect(()=>{
+    const root=preview.current;if(!root||!markdown||mode==='pin'){setOutline([]);return}
+    const update=()=>setOutline(Array.from(root.querySelectorAll('h1,h2,h3,h4,h5,h6')).slice(0,300).map(el=>({label:el.textContent??'',level:Number(el.tagName[1])})));
+    update();const observer=new MutationObserver(update);observer.observe(root,{childList:true,subtree:true,characterData:true});return()=>observer.disconnect();
+  },[resource.data!==null,markdown,mode]);
+  function jumpHeading(index:number){preview.current?.querySelectorAll('h1,h2,h3,h4,h5,h6')[index]?.scrollIntoView({block:'nearest',inline:'nearest'});setOutlineOpen(false)}
+  function find(){
+    if(!query)return;
+    if(mode!=='view'){editor.current?.findNext(query);return}
+    const root=preview.current;if(!root)return;
+    // Search visible rendered text, not raw markdown delimiters or hidden controls.
+    const walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT,{acceptNode:n=>n.parentElement?.closest('button,script,style,svg,[aria-hidden=true]')?NodeFilter.FILTER_REJECT:NodeFilter.FILTER_ACCEPT});
+    const nodes:Text[]=[];let full='',node:Node|null;
+    while((node=walker.nextNode())&&full.length<4*1024*1024){nodes.push(node as Text);full+=node.textContent??''}
+    const needle=query.toLocaleLowerCase(),hay=full.toLocaleLowerCase();let at=hay.indexOf(needle,searchOffset.current);if(at<0)at=hay.indexOf(needle);if(at<0)return;
+    let start:Text|null=null,end:Text|null=null,startOffset=0,endOffset=0,pos=0;
+    for(const n of nodes){const len=n.length;if(!start&&at<pos+len){start=n;startOffset=at-pos}if(start&&at+query.length<=pos+len){end=n;endOffset=at+query.length-pos;break}pos+=len}
+    if(start&&end&&startOffset>=0&&endOffset<=end.length){const range=document.createRange();range.setStart(start,startOffset);range.setEnd(end,endOffset);const selection=window.getSelection();selection?.removeAllRanges();selection?.addRange(range);start.parentElement?.scrollIntoView({block:'nearest',inline:'nearest'});searchOffset.current=at+query.length}
+  }
   async function selectLines(){
     if(!resource.ready||artifact.revision===undefined||!editor.current)return;
     const {startLine:start,endLine:end}=editor.current.getSelection();
@@ -33,14 +56,14 @@ export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget
       setPinError('');
     }catch{setPinError('選択対象の識別情報を作成できませんでした。')}
   }
-  const tools=<div className="workspace-toolbar"><input aria-label="検索" placeholder="検索" value={query} onChange={e=>setQuery(e.target.value)}/>{query&&<small>{matches} 件</small>}{mode!=='view'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready} onClick={()=>editor.current?.selectAll()}>全選択</button>}{mode==='edit'&&markdown&&<>{[['太字','**','**'],['斜体','*','*'],['見出し','## ',''],['コード','`','`']].map(([label,a,b])=><button key={label} type="button" disabled={editingLocked||!resource.ready} className="btn btn-secondary btn-xs" onClick={()=>editor.current?.wrapSelection(a,b)}>{label}</button>)}</>}{mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready} onClick={()=>void selectLines()}>選択行を対象にする</button>}</div>;
-  return <UnifiedViewerZoomShell resetKey={artifact.id+':source'} controlsTop={tools}>
+  const tools=<div className="workspace-toolbar"><input aria-label="検索" placeholder="検索" value={query} onChange={e=>{setQuery(e.target.value);searchOffset.current=0}} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();find()}}}/>{query&&<><small>{matches} 件（ソース）</small><button type="button" className="btn btn-secondary btn-xs" onClick={find}>次の一致</button></>}{markdown&&mode!=='pin'&&<button type="button" className="btn btn-secondary btn-xs" aria-expanded={outlineOpen} onClick={()=>setOutlineOpen(v=>!v)}>目次</button>}{mode!=='view'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready} onClick={()=>editor.current?.selectAll()}>全選択</button>}{mode==='edit'&&markdown&&<>{[['太字','**','**'],['斜体','*','*'],['見出し','## ',''],['コード','`','`']].map(([label,a,b])=><button key={label} type="button" disabled={editingLocked||!resource.ready} className="btn btn-secondary btn-xs" onClick={()=>editor.current?.wrapSelection(a,b)}>{label}</button>)}</>}{mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready} onClick={()=>void selectLines()}>選択行を対象にする</button>}</div>;
+  return <UnifiedViewerZoomShell resetKey={artifact.id+':source'} controlsTop={<>{tools}{outlineOpen&&markdown&&mode!=='pin'&&<nav className="workspace-source-outline" aria-label="文書目次">{outline.length?outline.map((item,index)=><button key={index} type="button" style={{paddingInlineStart:8+(item.level-1)*10}} onClick={()=>jumpHeading(index)}>{item.label}</button>):<span className="muted-xs">見出しがありません。</span>}</nav>}</>}>
     {resource.error&&<div className="error-box" role="alert">{resource.error}<button type="button" onClick={resource.retry}>再試行</button></div>}
     {pinError&&<div role="alert">{pinError}</div>}
     {resource.loading&&<p className="muted-xs">読み込み中…</p>}
     {resource.data!==null&&<div className={'workspace-source'+(markdown&&mode==='edit'?' split':'')}>
       {mode!=='view'?<SourceEditor editorRef={editor} language={language} value={mode==='pin'?text:value} readOnly={mode!=='edit'||editingLocked||!resource.ready} onChange={content=>{if(artifact.revision!==undefined)onDraft(artifact.revision,content===text?null:{key:'source',label:'ソースの変更',operation:{op:'replace_source',content}},'source')}}/>:null}
-      {(mode==='view'||markdown&&mode==='edit')&&(markdown?<MarkdownContent content={value} chatId={artifact.chatId}/>:<CodeBlock code={value} language={language}/>)}
+      {(mode==='view'||markdown&&mode==='edit')&&<div className="workspace-source-preview" ref={preview}>{markdown?<MarkdownContent content={value} chatId={artifact.chatId}/>:<CodeBlock code={value} language={language}/>}</div>}
     </div>}
   </UnifiedViewerZoomShell>
 }
