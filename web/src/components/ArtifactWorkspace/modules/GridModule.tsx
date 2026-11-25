@@ -10,6 +10,12 @@ import type { WorkspaceModuleProps } from '../types';
 type Sheet={id:string;name:string;part:string};
 type Cell={address:string;value:unknown;type?:string;formula?:string;formulaStatus?:string;bold?:boolean};
 type Coordinate={row:number;col:number};
+const FORMULA_STATUS:Record<string,string>={
+  evaluated_lo:'再計算済み',
+  cached_existing:'ファイルに保存された計算結果',
+  unevaluated_unsupported:'数式の計算結果を取得できませんでした',
+  error_formula:'数式エラー',
+};
 type GridTile={cells:Map<string,Cell>;rows?:string[][]};
 type CsvRange={rows:string[][];truncated?:boolean};
 const ROWS=50,COLS=20,CELL_WIDTH=112,CELL_HEIGHT=28,HEADER=44;
@@ -229,7 +235,7 @@ export function GridModule(props:WorkspaceModuleProps){
   }
   useEffect(()=>{setSearching(false);return()=>{searchAbort.current?.abort();searchAbort.current=null}},[search,revisionKey,sheet?.id,draft]);
   async function nextMatch(){
-    if(!search.trim()||!sheet||searching)return;
+    if(!search.trim()||!sheet||!structure.ready||searchAbort.current)return;
     searchAbort.current?.abort();const controller=new AbortController();searchAbort.current=controller;setSearching(true);setPinError('');
     const identity=latest.current,origin=current;
     const fold=(s:string)=>Array.from(s,ch=>ch.toLowerCase()).join('');
@@ -263,7 +269,10 @@ export function GridModule(props:WorkspaceModuleProps){
     }catch(e){if(!controller.signal.aborted)setPinError(e instanceof Error?e.message:'検索に失敗しました。')}
     finally{if(searchAbort.current===controller){searchAbort.current=null;setSearching(false)}}
   }
-  const primary=<><span className="workspace-cell-address">{selectedRange}</span><span aria-hidden="true">ƒx</span><input ref={formulaInput} className="workspace-formula" aria-label="数式・セル値" value={ready?value(current.row,current.col):''} readOnly={!inputEnabled} onChange={e=>change(e.target.value)}/>{mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!ready||!inData} onClick={()=>void pin()}>セルを対象にする</button>}{mode==='edit'&&<>
+  const activeFormulaStatus=raw(current.row,current.col)?.formulaStatus;
+  const formulaWarning=(activeFormulaStatus==='unevaluated_unsupported'||activeFormulaStatus==='error_formula')
+    && !entries.has(key(current.row,current.col)) && !previews.has(address(current.row,current.col));
+  const primary=<><span className="workspace-cell-address">{selectedRange}</span><span aria-hidden="true">ƒx</span><input ref={formulaInput} className="workspace-formula" aria-label="数式・セル値" value={ready?value(current.row,current.col):''} readOnly={!inputEnabled} onChange={e=>change(e.target.value)}/>{formulaWarning&&<small title={FORMULA_STATUS[activeFormulaStatus]}>{activeFormulaStatus==='error_formula'?'数式エラー':'未評価'}</small>}{mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!ready||!inData} onClick={()=>void pin()}>セルを対象にする</button>}{mode==='edit'&&<>
       {xlsx&&<button type="button" className="btn btn-secondary btn-xs" aria-pressed={Boolean(styleEntry?.operation.bold??raw(current.row,current.col)?.bold)} disabled={!canStyle} onClick={toggleBold}>太字</button>}
     </>}</>;
   const secondary=mode==='edit'?<>
@@ -274,7 +283,7 @@ export function GridModule(props:WorkspaceModuleProps){
   const toolbar=<ResponsiveCommandBar primary={primary} secondary={secondary} minInlineWidth={850} closeOnButton/>;
   const tabs=<div className="workspace-toolbar" role="group" aria-label="シート">{sheets.map(s=><button key={s.id} type="button" className={'btn btn-secondary btn-xs '+(s.id===sheet?.id?'active':'')} aria-pressed={s.id===sheet?.id} onClick={()=>{setSheetId(s.id);move(0,0)}}>{s.name}</button>)}
     <input aria-label="セル範囲へ移動" placeholder="A1:B2" value={jump} onChange={e=>setJump(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();jumpToRange()}}}/><button type="button" className="btn btn-secondary btn-xs" disabled={!jump.trim()} onClick={jumpToRange}>移動</button>
-    <input aria-label={xlsx?'シート全体を検索':'表全体を検索'} placeholder={xlsx?'シート全体を検索':'表全体を検索'} value={search} onChange={e=>{setSearch(e.target.value)}} onKeyDown={e=>{if(e.key==='Enter')void nextMatch()}}/><button type="button" className="btn btn-secondary btn-xs" disabled={!search.trim()||searching||!structure.ready} onClick={()=>void nextMatch()}>{searching?'検索中…':'次の一致'}</button></div>;
+    <input aria-label={xlsx?'シート全体を検索':'表全体を検索'} placeholder={xlsx?'シート全体を検索':'表全体を検索'} value={search} onChange={e=>{setSearch(e.target.value)}} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();void nextMatch()}}}/><button type="button" className="btn btn-secondary btn-xs" disabled={!search.trim()||searching||!structure.ready} onClick={()=>void nextMatch()}>{searching?'検索中…':'次の一致'}</button></div>;
   return <UnifiedViewerZoomShell resetKey={artifact.id+':grid'} controlsTop={toolbar} controlsBottom={tabs}>
     {(structure.error||rangeError||pinError)&&<div role="alert" className="error-box">{structure.error||rangeError||pinError}<button type="button" onClick={()=>{structure.retry();setRetry(v=>v+1);setPinError('')}}>再試行</button></div>}
     {structural&&<div className="workspace-toolbar" role="status">{structural.label}（保存時に反映）<button type="button" className="btn btn-secondary btn-xs" disabled={editingLocked} onClick={()=>artifact.revision!==undefined&&onDraft(artifact.revision,null,'grid-structure')}>取消</button></div>}
@@ -283,7 +292,7 @@ export function GridModule(props:WorkspaceModuleProps){
         <div role="row" className="workspace-grid-header" style={{height:CELL_HEIGHT}}><div role="columnheader" className="workspace-grid-corner" style={{width:HEADER}}/>{cols.map(c=><div key={colAxis.start+c.index} role="columnheader" className="workspace-grid-col" style={{left:c.start,width:c.size}}>{colName(colAxis.start+c.index)}</div>)}</div>
         {rows.map(r=>{const row=rowAxis.start+r.index;return <div key={row} role="row" aria-rowindex={row+2} className="workspace-grid-row" style={{top:r.start,height:r.size}}>
           <div role="rowheader" className="workspace-grid-rowhead" style={{width:HEADER}}>{row+1}</div>
-          {cols.map(c=>{const col=colAxis.start+c.index,addr=address(row,col),cell=raw(row,col),pending=entries.has(key(row,col)),active=row>=bounds.row0&&row<=bounds.row1&&col>=bounds.col0&&col<=bounds.col1,preview=previews.get(addr),loaded=!!tile(row,col);return <div key={col} role="gridcell" aria-colindex={col+2} aria-selected={active} aria-label={addr} aria-busy={!loaded} onClick={e=>{move(row,col,e.shiftKey);scroll.current?.focus({preventScroll:true})}} title={preview!==undefined?'未保存の数式プレビュー':cell?.formulaStatus} data-formula-preview={preview!==undefined?'true':undefined} className={'workspace-grid-cell'+(pending?' pending':'')} style={{left:c.start,width:c.size,fontWeight:entries.get('style:'+key(row,col))?.operation.bold??cell?.bold?'bold':undefined}}>{preview??(pending?value(row,col):!loaded?'…':xlsx?String(cell?.value??''):original(row,col))}</div>})}
+          {cols.map(c=>{const col=colAxis.start+c.index,addr=address(row,col),cell=raw(row,col),pending=entries.has(key(row,col)),active=row>=bounds.row0&&row<=bounds.row1&&col>=bounds.col0&&col<=bounds.col1,preview=previews.get(addr),loaded=!!tile(row,col);return <div key={col} role="gridcell" aria-colindex={col+2} aria-selected={active} aria-label={addr} aria-busy={!loaded} onClick={e=>{move(row,col,e.shiftKey);scroll.current?.focus({preventScroll:true})}} title={preview!==undefined?'未保存の数式プレビュー':cell?.formulaStatus?FORMULA_STATUS[cell.formulaStatus]:undefined} data-formula-preview={preview!==undefined?'true':undefined} className={'workspace-grid-cell'+(pending?' pending':'')} style={{left:c.start,width:c.size,fontWeight:entries.get('style:'+key(row,col))?.operation.bold??cell?.bold?'bold':undefined}}>{preview??(pending?value(row,col):!loaded?'…':xlsx?String(cell?.value??''):original(row,col))}</div>})}
         </div>})}
       </div>
     </div>}

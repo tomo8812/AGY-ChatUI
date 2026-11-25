@@ -57,6 +57,7 @@ export async function apiFetch<T>(
   options: {
     method?: string;
     body?: unknown;
+    textBody?: string;
     formData?: FormData;
     signal?: AbortSignal;
   } = {}
@@ -74,6 +75,9 @@ export async function apiFetch<T>(
   let fetchBody: BodyInit | undefined;
   if (options.formData) {
     fetchBody = options.formData;
+  } else if (options.textBody !== undefined) {
+    headers['Content-Type'] = 'text/plain; charset=utf-8';
+    fetchBody = options.textBody;
   } else if (options.body !== undefined) {
     headers['Content-Type'] = 'application/json';
     fetchBody = JSON.stringify(options.body);

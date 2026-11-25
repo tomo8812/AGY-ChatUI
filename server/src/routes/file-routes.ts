@@ -676,6 +676,44 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     }
   });
 
+  const sourceEditQuery = z.object({
+    expectedRevision: z.coerce.number().int().min(1),
+    idempotencyKey: z.string().min(1).max(200).optional(),
+  });
+
+  app.post('/api/files/:artifactId/edit-source', {
+    bodyLimit: deps.config.maxUploadBytes,
+    onRequest: async (req, reply) => {
+      if (!requireAuth(req, reply, db)) return;
+      if (req.headers['content-type']?.split(';', 1)[0].trim().toLowerCase() !== 'text/plain') {
+        return reply.code(415).send({ error: 'UNSUPPORTED_MEDIA_TYPE' });
+      }
+    },
+  }, async (req, reply) => {
+    const session = requireAuth(req, reply, db);
+    if (!session) return;
+    const { artifactId } = req.params as { artifactId: string };
+    const query = sourceEditQuery.safeParse(req.query);
+    if (!query.success || typeof req.body !== 'string') {
+      return reply.code(400).send({ error: 'INVALID_INPUT' });
+    }
+
+    try {
+      return await artifactService.editArtifact({
+        userId: session.user.id,
+        artifactId,
+        expectedRevision: query.data.expectedRevision,
+        operations: [{ op: 'replace_source', content: req.body }],
+        actorKind: 'user',
+        actorId: session.user.id,
+        idempotencyKey: query.data.idempotencyKey,
+        assertAuthorized: buildLiveSessionAuthVerifier(req, db, session.user.id),
+      });
+    } catch (err) {
+      return sendArtifactError(reply, err);
+    }
+  });
+
   app.post('/api/files/:artifactId/batch-edit', async (req, reply) => {
     const session = requireAuth(req, reply, db);
     if (!session) return;

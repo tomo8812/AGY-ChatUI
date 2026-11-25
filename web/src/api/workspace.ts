@@ -38,7 +38,15 @@ export const workspaceApi={
        !res.headers.get('content-type')?.includes('image/png'))throw new ApiError(409,'ARTIFACT_CHANGED','ファイルが更新されました。');
     return res.blob();
   },
-  edit:(id:string,expectedRevision:number,operations:EditOperation[],idempotencyKey:string)=>apiFetch<{artifact:ArtifactRecord;noOp:boolean;summary:string}>(path(id,'edit'),{method:'POST',body:{expectedRevision,operations,idempotencyKey}}),
+  edit(id:string,expectedRevision:number,operations:EditOperation[],idempotencyKey:string){
+    const source=operations.length===1&&operations[0].op==='replace_source'&&typeof operations[0].content==='string'
+      ? operations[0].content : undefined;
+    if(source!==undefined){
+      const query=new URLSearchParams({expectedRevision:String(expectedRevision),idempotencyKey});
+      return apiFetch<{artifact:ArtifactRecord;noOp:boolean;summary:string}>(path(id,'edit-source')+'?'+query,{method:'POST',textBody:source});
+    }
+    return apiFetch<{artifact:ArtifactRecord;noOp:boolean;summary:string}>(path(id,'edit'),{method:'POST',body:{expectedRevision,operations,idempotencyKey}});
+  },
   listRequests:(chatId:string,artifactId:string,signal?:AbortSignal)=>apiFetch<{requests:EditRequestRecord[]}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests?'+new URLSearchParams({artifactId}),{signal}),
   createRequest:(chatId:string,artifactId:string,target:WorkspaceTarget,instruction:string)=>apiFetch<{request:EditRequestRecord}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests',{method:'POST',body:{
     targetKind:'artifact',artifactId,baseRevision:target.baseRevision,selector:target.selector,range:target.range,contentCoords:target.contentCoords,

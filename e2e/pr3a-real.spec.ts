@@ -92,6 +92,15 @@ for(const vp of targets){
         expect(await svc.readRange(userId,huge.id,{startRow:0,endRow:0,startCol:0,endCol:1})).toMatchObject({rows:[],truncated:true});
         expect(await svc.readRange(userId,huge.id,{startRow:0,endRow:0,startCol:0,endCol:0})).toMatchObject({rows:[['small']],truncated:false});
         expect(await svc.readRange(userId,huge.id,{gridDimensions:true})).toMatchObject({totalRows:1,totalCols:2});
+        const source=(await svc.createArtifact({userId,scopeKind:'chat',chatId,relPath:'large.ts',content:Buffer.from('// Original\n'),actorKind:'user',actorId:userId})).artifact;
+        const content='// '+ 'x'.repeat(11*1024*1024)+'\n';
+        const sourceEditUrl=srv.baseUrl+'/api/files/'+source.id+'/edit-source?expectedRevision=1&idempotencyKey=large-source';
+        const sourceHeaders={'Content-Type':'text/plain; charset=utf-8',Cookie:client.cookieHeader,'x-csrf-token':decodeURIComponent(client.csrfToken)};
+        const saved=await fetch(sourceEditUrl,{method:'POST',headers:sourceHeaders,body:content});
+        expect(saved.status).toBe(200);
+        const savedBlob=svc.getRevisionContentBlob(userId,source.id,2);
+        expect(fs.readFileSync(savedBlob.blobPath,'utf8')===content).toBe(true);
+        evidence.push({kind:'large-source-save',bytes:Buffer.byteLength(content),revision:2});
       }
       await page.setViewportSize({width:vp.width,height:vp.height});
       await page.route(url=>url.origin==='http://127.0.0.1:4174'&&url.pathname.startsWith('/api/'),async route=>{
