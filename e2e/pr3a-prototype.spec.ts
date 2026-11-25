@@ -15,7 +15,7 @@ async function setup(page:Page,kind:string){
     if(endpoint==='capabilities')return json({format:kind,directEditUiSupported:kind!=='pdf',targetPinSupported:kind!=='pdf',operations:opNames.map(operation=>({operation,availability:'supported',scope:'mcp_and_ui'}))});
     if(endpoint==='structure')return json({...meta,...(kind==='xlsx'?{sheets:[{id:'1',name:'Sheet1',part:'xl/worksheets/sheet1.xml'}]}:{slides:[{id:'1',part:'ppt/slides/slide1.xml'}],slideSize:{widthPt:640,heightPt:360}})});
     if(endpoint==='range')return json({...meta,...(kind==='xlsx'?{cells:[{address:'A1',value:7}]}:kind==='csv'?{rows:[['Item','Quantity'],['Apple','7']],totalCols:2,hasMore:false}:kind==='docx'?{blocks:[{blockIndex:0,type:'p',text:'Introduction',editableText:true},{blockIndex:1,type:'p',text:'Protected content',editableText:false}],blockCount:2,hasMore:false}:{shapes:[{id:'2',type:'sp',name:'Title',text:'Original title',zOrder:0,transform:{geomBoundsPt:{x:50,y:30,width:250,height:100}}}]})});
-    if(endpoint==='render')return route.fulfill({body:png,contentType:'image/png',headers:{'X-Artifact-Revision':'1','X-Artifact-Sha256':sha}});
+    if(endpoint==='render'||endpoint==='render-draft-sprite')return route.fulfill({body:png,contentType:'image/png',headers:{'X-Artifact-Revision':'1','X-Artifact-Sha256':sha}});
     if(endpoint==='content')return route.fulfill({body:kind==='pdf'?buildSyntheticPdf([{width:595,height:842,label:'Artifact test'}]):'# Notes\n\nOriginal text\n',contentType:kind==='pdf'?'application/pdf':'text/plain'});
     if(endpoint==='edit'){ops.push(route.request().postDataJSON());return json({artifact:{id:'fixture',userId:'fixture-user',chatId:'fixture-chat',revision:1,sha256:sha},noOp:true,summary:'fixture'})}
     return json({});

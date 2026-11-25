@@ -4525,6 +4525,45 @@ export class ArtifactService {
     return converted;
   }
 
+  /** Render an edited sprite from an isolated copy without publishing any revision.
+   * Only the two basic canvas operations are accepted here; the regular edit
+   * transaction remains the sole path for committing bytes or emitting events.
+   */
+  async renderPptxDraftSprite(userId: string, artifactId: string, draft: {
+    expectedRevision: number; pageIndex: number; shapeId: number; text?: string;
+    boundsPt?: [number, number, number, number];
+  }): Promise<{png: Buffer; revision: number; sha256: string}> {
+    const snapshot = this.readCurrentRevision(userId, artifactId, DOCUMENT_WORKER_MAX_INPUT_BYTES);
+    const {artifact, revision, bytes} = snapshot;
+    if (this.registry.resolve(artifact.filename, artifact.previewKind).format !== 'pptx' ||
+        documentFormatConstraint('pptx', artifact.filename, 'edit', artifact.previewKind)) {
+      throw unsupportedOperationError('render_png', 'unsupported_by_format', 'Editable PPTX required.');
+    }
+    if (revision.revision !== draft.expectedRevision) {
+      throw new ArtifactError('ARTIFACT_CONFLICT', 'ファイルが更新されました。', 409);
+    }
+    const validBounds = draft.boundsPt === undefined ||
+      (draft.boundsPt.length === 4 && draft.boundsPt.every(Number.isFinite) &&
+        Math.abs(draft.boundsPt[0]) <= 14400 && Math.abs(draft.boundsPt[1]) <= 14400 &&
+        draft.boundsPt[2] >= 1 && draft.boundsPt[2] <= 14400 && draft.boundsPt[3] >= 1 && draft.boundsPt[3] <= 14400);
+    if (!Number.isInteger(draft.pageIndex) || draft.pageIndex < 0 ||
+        !Number.isSafeInteger(draft.shapeId) || draft.shapeId < 1 || !validBounds ||
+        (draft.text !== undefined && (typeof draft.text !== 'string' || draft.text.length > 20000)) ||
+        (draft.text === undefined && draft.boundsPt === undefined)) {
+      throw new ArtifactError('INVALID_INPUT', 'Invalid draft sprite request.', 400);
+    }
+    const structure = JSON.parse((await this.documentWorker.run('pptx', artifact.filename, bytes, {action:'structure'})).toString('utf8')) as {slides?:Array<{part:string}>};
+    const slidePart = structure.slides?.[draft.pageIndex]?.part;
+    if (!slidePart) throw new ArtifactError('INVALID_INPUT', 'Selected slide is unavailable.', 400);
+    const operations: AdapterOperation[] = [];
+    if (draft.text !== undefined) operations.push({op:'pptx.set_shape_text', slidePart, shapeId:draft.shapeId, text:draft.text});
+    if (draft.boundsPt !== undefined) operations.push({op:'pptx.set_shape_bounds', slidePart, shapeId:draft.shapeId, boundsPt:draft.boundsPt});
+    const edited = await this.documentWorker.run('pptx', artifact.filename, bytes, {action:'edit',operations});
+    const png = await this.documentWorker.run('pptx', artifact.filename, edited, {action:'render',pageIndex:draft.pageIndex,variant:'sprite',shapeId:draft.shapeId});
+    this.assertRenderPng(png);
+    return {png,revision:revision.revision,sha256:revision.sha256};
+  }
+
   async renderPng(
     userId: string,
     artifactId: string,
@@ -4558,6 +4597,11 @@ export class ArtifactService {
     const png = artifact.mimeType === 'image/png' && !this.documentWorker.available && !options.region
       ? source
       : await this.documentWorker.run(format, artifact.filename, source, { action: 'render', ...options }, [], { entry: artifact.relPath, dependencies });
+    this.assertRenderPng(png);
+    return { png, revision: snapshot.revision.revision, sha256: snapshot.revision.sha256 };
+  }
+
+  private assertRenderPng(png: Buffer): void {
     if (png.length < 24 || png.length > 16 * 1024 * 1024 ||
       !png.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex')) ||
       png.toString('ascii', 12, 16) !== 'IHDR' ||
@@ -4565,7 +4609,6 @@ export class ArtifactService {
       png.readUInt32BE(20) < 1 || png.readUInt32BE(20) > 8192) {
       throw new ArtifactError('INVALID_RENDER_IMAGE', 'Invalid or oversized PNG.', 422);
     }
-    return { png, revision: snapshot.revision.revision, sha256: snapshot.revision.sha256 };
   }
 
   async verifyArtifact(

@@ -2,7 +2,7 @@ import React,{useEffect,useRef,useState} from 'react';
 import { workspaceApi,supportsOperation } from '../../../api/workspace';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
 import { PdfCanvasViewer } from '../../ArtifactViewerModal';
-import { buildArtifactContentUrl } from '../../../utils/viewerCache';
+import { artifactVersionKey, buildArtifactContentUrl } from '../../../utils/viewerCache';
 import { assertRevision,useRevisionResource } from '../useRevisionResource';
 import type { WorkspaceModuleProps } from '../types';
 type Slide={id:string;part:string};
@@ -52,6 +52,43 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   });
   const data=scene.data;
   const shape=data?.shapes.find(s=>s.id===selected);
+  type PreviewChange={shapeId:number;text?:string;boundsPt?:[number,number,number,number]};
+  type PreviewResult={signature:string;images:Map<number,Blob>;status:'pending'|'ready'|'error'};
+  const changes:PreviewChange[]=[];
+  if(mode==='edit'&&scene.ready&&draft&&draft.baseRevision===artifact.revision&&slide){
+    for(const s of data?.shapes??[]){
+      const change:PreviewChange={shapeId:Number(s.id)};
+      const entries=draft.entries.filter(e=>e.operation.slidePart===slide.part&&e.operation.shapeId===change.shapeId);
+      const text=entries.find(e=>e.operation.op==='pptx.set_shape_text')?.operation.text;
+      const b=entries.find(e=>e.operation.op==='pptx.set_shape_bounds')?.operation.boundsPt;
+      if(typeof text==='string')change.text=text;
+      if(Array.isArray(b)&&b.length===4)change.boundsPt=b as [number,number,number,number];
+      if(change.text!==undefined||change.boundsPt!==undefined)changes.push(change);
+    }
+  }
+  const signature=JSON.stringify([artifactVersionKey(artifact),slide?.part,changes]);
+  const [preview,setPreview]=useState<PreviewResult|null>(null);
+  const [previewRetry,setPreviewRetry]=useState(0);
+  useEffect(()=>{
+    if(!changes.length){setPreview(null);return;}
+    const controller=new AbortController();
+    const images=new Map<number,Blob>();
+    setPreview({signature,images,status:'pending'});
+    // Dragging and typing are immediate local operations; only settled drafts
+    // invoke the heavier copy/render worker. The latest signature owns results.
+    const timer=window.setTimeout(async()=>{
+      try{
+        for(const change of changes){
+          if(controller.signal.aborted)return;
+          images.set(change.shapeId,await workspaceApi.renderDraftSprite(artifact,{pageIndex:index,...change},controller.signal));
+        }
+        if(!controller.signal.aborted)setPreview({signature,images:new Map(images),status:'ready'});
+      }catch{if(!controller.signal.aborted)setPreview({signature,images:new Map(),status:'error'})}
+    },650);
+    return()=>{window.clearTimeout(timer);controller.abort()};
+  },[signature,previewRetry]);
+  const currentPreview=preview?.signature===signature?preview:null;
+  const previewReady=changes.length>0&&currentPreview?.status==='ready';
   const key=(id:string,kind:string)=>String(slide?.part)+':'+id+':'+kind;
   const bounds=(s:Shape):Bounds|undefined=>{const b=s.transform?.geomBoundsPt;if(!b)return;const next=draft?.entries.find(e=>e.key===key(s.id,'bounds'))?.operation.boundsPt;if(Array.isArray(next)&&next.length===4)return {x:Number(next[0]),y:Number(next[1]),width:Number(next[2]),height:Number(next[3])};return b};
   function writeBounds(s:Shape,b:Bounds){
@@ -75,13 +112,16 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     <UnifiedViewerZoomShell resetKey={artifact.id+':pptx'} controlsTop={toolbar}>
       {(structure.error||scene.error)&&<div className="error-box" role="alert">{structure.error||scene.error}<button type="button" onClick={()=>{structure.retry();scene.retry()}}>再試行</button></div>}
       {scene.loading&&data&&<p className="workspace-refresh muted-xs" role="status">最新の内容を読み込み中…</p>}
-      {!data||!size?.widthPt||!size.heightPt?<div className="workspace-loading">{scene.error||structure.error?'スライドを表示できません。':'読み込み中…'}</div>:<div className="workspace-slide" ref={stage} style={{aspectRatio:size.widthPt+'/'+size.heightPt}} data-slide-canvas="true">
+      {!data||!size?.widthPt||!size.heightPt?<div className="workspace-loading">{scene.error||structure.error?'スライドを表示できません。':'読み込み中…'}</div>:<div className="workspace-slide" ref={stage} style={{aspectRatio:size.widthPt+'/'+size.heightPt}} data-slide-canvas="true" data-preview-ready={previewReady?'true':'false'}>
         <Layer blob={data.background} alt="スライド背景"/>
-        {data.layers.map(({shape:s,image})=>{const orig=s.transform?.geomBoundsPt,b=bounds(s);const dx=(b&&orig?b.x-orig.x:0)+(drag?.id===s.id?drag.dx:0),dy=(b&&orig?b.y-orig.y:0)+(drag?.id===s.id?drag.dy:0);
+        {data.layers.map(({shape:s,image})=>{
+          const exact=previewReady?currentPreview?.images.get(Number(s.id)):undefined;
+          const b=bounds(s),orig=exact?b:s.transform?.geomBoundsPt;
+          const dx=(b&&orig?b.x-orig.x:0)+(drag?.id===s.id?drag.dx:0),dy=(b&&orig?b.y-orig.y:0)+(drag?.id===s.id?drag.dy:0);
           // One full-slide transparent sprite per element. Scale around the original
           // geometry origin, then translate; never retain a second original layer.
           const sx=orig&&b&&orig.width>0?b.width/orig.width:1,sy=orig&&b&&orig.height>0?b.height/orig.height:1;
-          return <Layer key={s.id} blob={image} style={{transformOrigin:orig?(orig.x/size.widthPt*100+'% '+orig.y/size.heightPt*100+'%'):undefined,
+          return <Layer key={s.id} blob={exact??image} style={{transformOrigin:orig?(orig.x/size.widthPt*100+'% '+orig.y/size.heightPt*100+'%'):undefined,
             transform:'translate('+dx/size.widthPt*100+'%,'+dy/size.heightPt*100+'%) scale('+sx+','+sy+')'}}/>})}
         {data.shapes.map(s=>{const b=bounds(s);if(!b||b.width<=0||b.height<=0)return null;const active=selected===s.id||target?.selector.shapeId===Number(s.id);return <button key={s.id} type="button" aria-label={s.name||'図形 '+s.id} className={'workspace-shape-hit '+(active?'selected':'')} style={{left:(b.x+(drag?.id===s.id?drag.dx:0))/size.widthPt*100+'%',top:(b.y+(drag?.id===s.id?drag.dy:0))/size.heightPt*100+'%',width:b.width/size.widthPt*100+'%',height:b.height/size.heightPt*100+'%'}} onClick={()=>choose(s.id)}
           onPointerDown={e=>{choose(s.id);if(mode!=='edit'||editingLocked||!scene.ready||!slide||artifact.revision===undefined||!supportsOperation(capabilities,'pptx.set_shape_bounds'))return;pointer.current={id:s.id,x:e.clientX,y:e.clientY,bounds:b,revision:artifact.revision,part:slide.part};e.currentTarget.setPointerCapture(e.pointerId)}}
@@ -90,6 +130,6 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
           onPointerUp={e=>{const p=pointer.current,rect=stage.current?.getBoundingClientRect();pointer.current=null;setDrag(null);if(p?.id===s.id&&p.revision===artifact.revision&&p.part===slide?.part&&rect?.width&&rect.height){const dx=(e.clientX-p.x)/rect.width*size.widthPt,dy=(e.clientY-p.y)/rect.height*size.heightPt;if(Math.abs(dx)+Math.abs(dy)>0.5)writeBounds(s,{...p.bounds,x:p.bounds.x+dx,y:p.bounds.y+dy})}}}/>}
         )}
       </div>}
-      {mode==='edit'&&draft?.entries.some(e=>e.operation.op==='pptx.set_shape_text'||e.operation.op==='pptx.set_shape_bounds')&&<p className="muted-xs">テキストとサイズ変更の正式な描画は保存後に更新されます。</p>}
+      {changes.length>0&&!previewReady&&<p className="muted-xs workspace-draft-preview-status">{currentPreview?.status==='error'?<>変更後の描画に失敗しました。<button type="button" className="btn btn-secondary btn-xs" onClick={()=>setPreviewRetry(v=>v+1)}>再試行</button></>:'変更後の描画を更新中…'}</p>}
     </UnifiedViewerZoomShell></div>
 }

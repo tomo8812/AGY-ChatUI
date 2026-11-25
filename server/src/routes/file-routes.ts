@@ -599,6 +599,25 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     }
   });
 
+  app.post('/api/files/:artifactId/render-draft-sprite', async (req, reply) => {
+    const session = requireAuth(req, reply, db);
+    if (!session) return;
+    const parsed = z.object({
+      expectedRevision:z.number().int().min(1), pageIndex:z.number().int().min(0).max(500),
+      shapeId:z.number().int().positive().max(2147483647),
+      text:z.string().max(20000).optional(),
+      boundsPt:z.tuple([z.number().finite().min(-14400).max(14400),z.number().finite().min(-14400).max(14400),z.number().finite().min(1).max(14400),z.number().finite().min(1).max(14400)]).optional(),
+    }).strict().refine(body=>body.text!==undefined||body.boundsPt!==undefined).safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({error:'INVALID_INPUT'});
+    const {artifactId}=req.params as {artifactId:string};
+    try {
+      const result=await artifactService.renderPptxDraftSprite(session.user.id,artifactId,parsed.data);
+      await buildLiveSessionAuthVerifier(req,db,session.user.id)();
+      return reply.type('image/png').header('Cache-Control','private, no-store')
+        .header('X-Artifact-Revision',result.revision).header('X-Artifact-Sha256',result.sha256).send(result.png);
+    } catch (error) { return sendArtifactError(reply,error); }
+  });
+
   const editBodySchema = z.object({
     expectedRevision: z.number().int().min(1),
     operations: z.array(z.object({ op: z.string().min(1) }).passthrough()).min(1),

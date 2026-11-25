@@ -113,6 +113,12 @@ for(const vp of targets){
               record.beforeVisual=await capturePptx(page,info,before.png,'pptx-before');
               await page.getByRole('button',{name:'Title',exact:true}).click();
               await page.getByRole('textbox',{name:'図形テキスト'}).fill(item.updated);
+              // Await actual worker output for the unsaved text; no document mutation yet.
+              await expect(page.locator('[data-slide-canvas]')).toHaveAttribute('data-preview-ready','true',{timeout:90000});
+              expect(srv.ctx.db.getArtifact(userId,artifact.id)?.revision).toBe(1);
+              await expect.poll(()=>page.locator('[data-slide-canvas] img').evaluateAll(imgs=>imgs.length===3&&imgs.every(img=>(img as HTMLImageElement).complete&&(img as HTMLImageElement).naturalWidth>0))).toBe(true);
+              const style=await page.addStyleTag({content:'.workspace-shape-hit{visibility:hidden!important}'});
+              try{await page.locator('[data-slide-canvas]').screenshot({path:info.outputPath('pptx-draft-canvas.png'),scale:'css'});}finally{await style.evaluate(el=>el.remove())}
             }
             await expect(page.getByRole('button',{name:'保存',exact:true})).toBeEnabled();
             await page.getByRole('button',{name:'拡大',exact:true}).click();
@@ -145,6 +151,10 @@ for(const vp of targets){
               // Restore fit for the comparison, without altering the saved file.
               await page.getByRole('button',{name:'画面に合わせる'}).click();
               record.afterVisual=await capturePptx(page,info,after.png,'pptx-after');
+              const draftVisual=comparePng(info.outputPath('pptx-draft-canvas.png'),info.outputPath('pptx-after-reference.png'));
+              expect(draftVisual.ssim,'Unsaved sprite preview vs final saved slide').toBeGreaterThanOrEqual(.95);
+              expect(draftVisual.mae).toBeLessThanOrEqual(5);
+              record.draftVisual=draftVisual;
             }
             await page.getByRole('button',{name:'依頼',exact:true}).click({timeout:30000});
             if(item.kind==='markdown'||item.kind==='code'){

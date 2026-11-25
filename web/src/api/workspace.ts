@@ -1,5 +1,5 @@
 import type { ArtifactRecord } from '../types';
-import { apiFetch, ApiError } from './client';
+import { apiFetch, ApiError, getCsrfToken } from './client';
 
 export type WorkspaceFormat='pptx'|'pdf'|'docx'|'xlsx'|'csv'|'markdown'|'code'|'image'|'svg'|'html'|'diff'|'mermaid'|'media'|'binary';
 export interface WorkspaceOperationCapability {operation:string;availability:'supported'|'partial'|'disabled_by_resource_tier'|'unsupported_by_format';scope:'mcp_and_ui'|'mcp_only'|'ui_view_only';notes?:string;remediation?:string}
@@ -18,6 +18,15 @@ export const workspaceApi={
     if(!res.ok)throw new ApiError(res.status,'RENDER_FAILED','描画できませんでした。');
     if(Number(res.headers.get('X-Artifact-Revision'))!==artifact.revision||res.headers.get('X-Artifact-Sha256')!==artifact.sha256)throw new ApiError(409,'ARTIFACT_CHANGED','ファイルが更新されました。');
     if(!res.headers.get('content-type')?.includes('image/png'))throw new Error('画像形式が無効です。');
+    return res.blob();
+  },
+  async renderDraftSprite(artifact:ArtifactRecord,query:{pageIndex:number;shapeId:number;text?:string;boundsPt?:[number,number,number,number]},signal?:AbortSignal):Promise<Blob>{
+    const res=await fetch(path(artifact.id,'render-draft-sprite'),{method:'POST',credentials:'include',signal,
+      headers:{'Content-Type':'application/json','x-csrf-token':getCsrfToken()},
+      body:JSON.stringify({...query,expectedRevision:artifact.revision})});
+    if(!res.ok)throw new ApiError(res.status,'DRAFT_RENDER_FAILED','変更後の描画に失敗しました。');
+    if(Number(res.headers.get('X-Artifact-Revision'))!==artifact.revision||res.headers.get('X-Artifact-Sha256')!==artifact.sha256||
+      !res.headers.get('content-type')?.includes('image/png'))throw new ApiError(409,'ARTIFACT_CHANGED','ファイルが更新されました。');
     return res.blob();
   },
   edit:(id:string,expectedRevision:number,operations:EditOperation[],idempotencyKey:string)=>apiFetch<{artifact:ArtifactRecord;noOp:boolean;summary:string}>(path(id,'edit'),{method:'POST',body:{expectedRevision,operations,idempotencyKey}}),
