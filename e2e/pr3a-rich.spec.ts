@@ -5,7 +5,7 @@ const types:RichChartNode['chartType'][]=['line','bar','hbar','pie','donut','sca
 // Novel use case: museum exhibition lighting. No production-specific widget is used.
 const charts:RichChartNode[]=types.map((chartType,i)=>({
   id:'chart-'+chartType,type:'chart',chartType,title:chartType,
-  categories:['Morning','Noon','Evening'],legend:'bottom',
+  categories:chartType==='scatter'?[1,2,3]:['Morning','Noon','Evening'],legend:'bottom',
   ...(chartType==='scatter'?{xAxis:{type:'number'}}:{}),
   ...(chartType==='combo'?{yAxis:{label:'Power'},yAxisRight:{label:'Temperature'}}:{}),
   series:[{key:'power',label:'Power',...(chartType==='combo'?{type:'bar' as const}:{}),data:{expr:'[2, null, $computed.total]'}},
@@ -38,7 +38,7 @@ for(const vp of [{width:1280,height:720,project:'pc-chromium'},{width:1440,heigh
     await expect(page.locator('svg circle').first()).toHaveAttribute('r','10');
     for(const chartType of types){
       const chart=page.locator('figure.rich-chart[aria-label="'+chartType+'"]');
-      await expect(chart.locator('svg title').filter({hasText:'Power · Evening · 20'})).toHaveCount(1);
+      await expect(chart.locator('svg title').filter({hasText:chartType==='scatter'?'Power · 3 · 20':'Power · Evening · 20'})).toHaveCount(1);
       await expect(chart.locator('summary')).toContainText('欠損値 1 件');
     }
     await expect(page.locator('figure[aria-label="combo"] svg text').filter({hasText:'Temperature'})).toHaveCount(1);
