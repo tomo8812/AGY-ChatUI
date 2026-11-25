@@ -611,8 +611,9 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     if (!parsed.success) return reply.code(400).send({error:'INVALID_INPUT'});
     const {artifactId}=req.params as {artifactId:string};
     try {
-      const result=await artifactService.renderPptxDraftSprite(session.user.id,artifactId,parsed.data);
-      await buildLiveSessionAuthVerifier(req,db,session.user.id)();
+      const assertAuthorized=buildLiveSessionAuthVerifier(req,db,session.user.id);
+      const result=await artifactService.renderPptxDraftSprite(session.user.id,artifactId,parsed.data,assertAuthorized);
+      await assertAuthorized();
       return reply.type('image/png').header('Cache-Control','private, no-store')
         .header('X-Artifact-Revision',result.revision).header('X-Artifact-Sha256',result.sha256).send(result.png);
     } catch (error) { return sendArtifactError(reply,error); }

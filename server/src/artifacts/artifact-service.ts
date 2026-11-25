@@ -4532,7 +4532,8 @@ export class ArtifactService {
   async renderPptxDraftSprite(userId: string, artifactId: string, draft: {
     expectedRevision: number; pageIndex: number; shapeId: number; text?: string;
     boundsPt?: [number, number, number, number];
-  }): Promise<{png: Buffer; revision: number; sha256: string}> {
+  }, assertAuthorized?: () => void | Promise<void>): Promise<{png: Buffer; revision: number; sha256: string}> {
+    await assertAuthorized?.();
     const snapshot = this.readCurrentRevision(userId, artifactId, DOCUMENT_WORKER_MAX_INPUT_BYTES);
     const {artifact, revision, bytes} = snapshot;
     if (this.registry.resolve(artifact.filename, artifact.previewKind).format !== 'pptx' ||
@@ -4558,8 +4559,11 @@ export class ArtifactService {
     const operations: AdapterOperation[] = [];
     if (draft.text !== undefined) operations.push({op:'pptx.set_shape_text', slidePart, shapeId:draft.shapeId, text:draft.text});
     if (draft.boundsPt !== undefined) operations.push({op:'pptx.set_shape_bounds', slidePart, shapeId:draft.shapeId, boundsPt:draft.boundsPt});
+    await assertAuthorized?.();
     const edited = await this.documentWorker.run('pptx', artifact.filename, bytes, {action:'edit',operations});
+    await assertAuthorized?.();
     const png = await this.documentWorker.run('pptx', artifact.filename, edited, {action:'render',pageIndex:draft.pageIndex,variant:'sprite',shapeId:draft.shapeId});
+    await assertAuthorized?.();
     this.assertRenderPng(png);
     return {png,revision:revision.revision,sha256:revision.sha256};
   }
