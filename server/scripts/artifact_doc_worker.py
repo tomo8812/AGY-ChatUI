@@ -2407,7 +2407,7 @@ def read_workbook_range(package, options):
                         needed_ss.add(ss_idx)
                     elif cell_type == "inlineStr":
                         value = text_content(cell, SPREADSHEET)
-                    raw_cells.append((address, value, cell_type, ss_idx, formula.text if formula is not None else None))
+                    raw_cells.append((address, value, cell_type, ss_idx, formula.text if formula is not None else None, int(cell.get("s", "0"))))
             row_el.clear()
             parent = row_el.getparent()
             if parent is not None:
@@ -2434,11 +2434,24 @@ def read_workbook_range(package, options):
         if len(ss_lookup) != len(needed_ss):
             raise ValueError("Worksheet references out-of-bounds shared string index")
 
+    # Read native font style metadata only for cells in the requested range.
+    bold_styles = set()
+    if "xl/styles.xml" in package.namelist():
+        styles = parse_xml(package.read("xl/styles.xml"))
+        fonts = styles.find(tag(SPREADSHEET, "fonts"))
+        xfs = styles.find(tag(SPREADSHEET, "cellXfs"))
+        if fonts is not None and xfs is not None:
+            for idx, xf in enumerate(xfs):
+                font_idx = int(xf.get("fontId", "0"))
+                if 0 <= font_idx < len(fonts):
+                    bold = fonts[font_idx].find(tag(SPREADSHEET, "b"))
+                    if bold is not None and bold.get("val", "1") not in ("0", "false", "off"):
+                        bold_styles.add(idx)
     cells = []
-    for address, value, cell_type, ss_idx, formula_text in raw_cells:
+    for address, value, cell_type, ss_idx, formula_text, style_index in raw_cells:
         if ss_idx is not None:
             value = ss_lookup[ss_idx]
-        record = {"address": address, "value": value, "type": cell_type}
+        record = {"address": address, "value": value, "type": cell_type, "bold": style_index in bold_styles}
         if formula_text is not None:
             record.update(formula=formula_text, formulaStatus=(
                 "error_formula" if cell_type == "e" else
