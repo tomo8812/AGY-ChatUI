@@ -4283,174 +4283,102 @@ export class ArtifactService {
     range: Record<string, unknown>
   ): Promise<Record<string, unknown>> {
     const MAX_RESPONSE_BYTES = 512 * 1024;
+    const dimensionsOnly = range.gridDimensions === true || range.gridDimensions === 'true';
     const delimiter = filename.toLowerCase().endsWith('.tsv') ? '\t' : ',';
-    const rawStartRow = Number(range.startRow ?? 0);
-    const startRow = Number.isFinite(rawStartRow) ? Math.max(0, Math.floor(rawStartRow)) : 0;
-    const rawEndRow = Number(range.endRow ?? startRow + 99);
-    const targetEndRow = Number.isFinite(rawEndRow) ? Math.max(startRow, Math.floor(rawEndRow)) : startRow + 99;
-    const rawStartCol = Number(range.startCol ?? 0);
-    const startCol = Number.isFinite(rawStartCol) ? Math.max(0, Math.floor(rawStartCol)) : 0;
-    const hasEndCol = range.endCol !== undefined && range.endCol !== null;
-    const requestedEndCol = hasEndCol && Number.isFinite(Number(range.endCol))
-      ? Math.max(startCol, Math.floor(Number(range.endCol)))
-      : undefined;
-
-    return new Promise((resolve, reject) => {
-      const stream = fs.createReadStream(blobPath, { highWaterMark: 64 * 1024 });
-      const decoder = new StringDecoder('utf8');
-      let rowIndex = 0;
-      let observedMaxCols = 0;
-      let inQuotes = false;
-      let pendingQuote = false;
-      let pendingCr = false;
-      let field = '';
-      let currentRow: string[] = [];
-      let fieldCountInRow = 0;
-      let isFirstChar = true;
-      const rows: string[][] = [];
-      let collectedBytes = 0;
-      let truncated = false;
-      let stoppedEarly = false;
-      let reachedEof = false;
-      let settled = false;
-
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        const maxColIndex = Math.max(0, observedMaxCols - 1);
-        const actualEndCol = requestedEndCol !== undefined ? Math.min(maxColIndex, requestedEndCol) : maxColIndex;
-        const sliced = rows.map((r) => r.slice(startCol, actualEndCol + 1));
-        const actualEndRow = sliced.length > 0 ? startRow + sliced.length - 1 : Math.min(startRow, Math.max(0, rowIndex - 1));
-        resolve({
-          startRow,
-          endRow: actualEndRow,
-          startCol,
-          endCol: actualEndCol,
-          ...(reachedEof ? { totalRows: rowIndex } : {}),
-          totalCols: observedMaxCols,
-          totalBytes,
-          hasMore: stoppedEarly || !reachedEof,
-          truncated,
-          rows: sliced,
-          valuesHash: crypto.createHash('sha256').update(JSON.stringify(sliced)).digest('hex'),
-        });
-      };
-
-      const commitField = () => {
-        if (rowIndex >= startRow && rowIndex <= targetEndRow) {
-          currentRow.push(field);
+    const safeIndex = (value: unknown, fallback: number) => {
+      const number = Number(value ?? fallback);
+      return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
+    };
+    const startRow = safeIndex(range.startRow, 0);
+    const targetEndRow = dimensionsOnly ? Number.MAX_SAFE_INTEGER
+      : Math.max(startRow, safeIndex(range.endRow, startRow + 99));
+    const startCol = safeIndex(range.startCol, 0);
+    const requestedEndCol = range.endCol == null ? Number.MAX_SAFE_INTEGER
+      : Math.max(startCol, safeIndex(range.endCol, startCol));
+    const stream = fs.createReadStream(blobPath, { highWaterMark: 64 * 1024 });
+    const decoder = new StringDecoder('utf8');
+    let rowIndex = 0, observedMaxCols = 0, fieldCount = 0;
+    let field = '', fieldHasValue = false, inQuotes = false, pendingQuote = false, pendingCr = false;
+    let currentRow: string[] = [];
+    const rows: string[][] = [];
+    let collectedBytes = 0, truncated = false, stoppedEarly = false, firstChar = true;
+    const collectRow = () => !dimensionsOnly && rowIndex >= startRow && rowIndex <= targetEndRow;
+    const collectField = () => collectRow() && fieldCount >= startCol && fieldCount <= requestedEndCol;
+    function append(ch: string) {
+      fieldHasValue = true;
+      if (collectField()) {
+        if (field.length < MAX_RESPONSE_BYTES) field += ch;
+        else truncated = true;
+      }
+    }
+    function commitField() {
+      if (collectField()) currentRow.push(field);
+      fieldCount++;
+      field = ''; fieldHasValue = false;
+    }
+    function commitRow(): boolean {
+      commitField();
+      observedMaxCols = Math.max(observedMaxCols, fieldCount);
+      if (collectRow()) {
+        const rowBytes = Buffer.byteLength(JSON.stringify(currentRow), 'utf8');
+        if (collectedBytes + rowBytes > MAX_RESPONSE_BYTES && rows.length > 0) {
+          truncated = true; stoppedEarly = true;
+        } else {
+          rows.push(currentRow); collectedBytes += rowBytes;
         }
-        fieldCountInRow += 1;
-        field = '';
-      };
-
-      const commitRow = (): boolean => {
-        commitField();
-        if (fieldCountInRow > observedMaxCols) observedMaxCols = fieldCountInRow;
-        let keepGoing = true;
-        if (rowIndex >= startRow && rowIndex <= targetEndRow) {
-          const rowBytes = Buffer.byteLength(JSON.stringify(currentRow), 'utf8');
-          if (collectedBytes + rowBytes > MAX_RESPONSE_BYTES && rows.length > 0) {
-            truncated = true;
-            stoppedEarly = true;
-            keepGoing = false;
-          } else {
-            rows.push(currentRow);
-            collectedBytes += rowBytes;
-          }
+      }
+      currentRow = []; fieldCount = 0; rowIndex++;
+      if (rowIndex > targetEndRow) stoppedEarly = true;
+      return !stoppedEarly;
+    }
+    function feed(ch: string): boolean {
+      if (pendingQuote) {
+        pendingQuote = false;
+        if (ch === '"') { append('"'); return true; }
+        inQuotes = false;
+      }
+      if (inQuotes) {
+        if (ch === '"') pendingQuote = true;
+        else append(ch);
+      } else if (ch === '"') inQuotes = true;
+      else if (ch === delimiter) commitField();
+      else if (ch === '\n') return commitRow();
+      else append(ch);
+      return true;
+    }
+    // Match CsvAdapter's CRLF normalization, including inside quoted cells.
+    // Count skipped rows/columns without retaining their values, even in huge files.
+    function processText(text: string): boolean {
+      for (const ch of text) {
+        if (firstChar) { firstChar = false; if (ch === '\uFEFF') continue; }
+        if (pendingCr) {
+          pendingCr = false;
+          if (ch === '\n') { if (!feed('\n')) return false; continue; }
+          if (!feed('\r')) return false;
         }
-        currentRow = [];
-        fieldCountInRow = 0;
-        rowIndex += 1;
-        if (rowIndex > targetEndRow) {
-          stoppedEarly = true;
-          keepGoing = false;
-        }
-        return keepGoing;
-      };
-
-      const processText = (text: string): boolean => {
-        for (let i = 0; i < text.length; i++) {
-          const ch = text[i];
-          if (isFirstChar) {
-            isFirstChar = false;
-            if (ch === '\uFEFF') continue;
-          }
-          if (pendingCr) {
-            pendingCr = false;
-            if (ch === '\n') continue;
-          }
-          if (pendingQuote) {
-            pendingQuote = false;
-            if (ch === '"') {
-              if (rowIndex >= startRow && rowIndex <= targetEndRow && field.length < MAX_RESPONSE_BYTES) {
-                field += '"';
-              }
-              continue;
-            }
-            inQuotes = false;
-          }
-          if (inQuotes) {
-            if (ch === '"') {
-              pendingQuote = true;
-            } else if (rowIndex >= startRow && rowIndex <= targetEndRow && field.length < MAX_RESPONSE_BYTES) {
-              field += ch;
-            }
-            continue;
-          }
-          if (ch === '"' && field.length === 0) {
-            inQuotes = true;
-          } else if (ch === delimiter) {
-            commitField();
-          } else if (ch === '\r') {
-            pendingCr = true;
-            if (!commitRow()) return false;
-          } else if (ch === '\n') {
-            if (!commitRow()) return false;
-          } else if (rowIndex >= startRow && rowIndex <= targetEndRow && field.length < MAX_RESPONSE_BYTES) {
-            field += ch;
-          }
-        }
-        return true;
-      };
-
-      stream.on('data', (chunk: Buffer | string) => {
-        if (settled) return;
-        const text = typeof chunk === 'string' ? chunk : decoder.write(chunk);
-        if (!processText(text)) {
-          stream.destroy();
-          finish();
-        }
-      });
-
-      stream.on('end', () => {
-        if (settled) return;
-        const rem = decoder.end();
-        if (rem && !processText(rem)) {
-          finish();
-          return;
-        }
-        if (pendingQuote) {
-          pendingQuote = false;
-          inQuotes = false;
-        }
-        if (field.length > 0 || fieldCountInRow > 0) {
-          commitRow();
-        }
-        reachedEof = true;
-        finish();
-      });
-
-      stream.on('close', () => {
-        if (!settled) finish();
-      });
-
-      stream.on('error', (err) => {
-        if (settled) return;
-        settled = true;
-        reject(err);
-      });
-    });
+        if (ch === '\r') pendingCr = true;
+        else if (!feed(ch)) return false;
+      }
+      return true;
+    }
+    for await (const chunk of stream) {
+      if (!processText(decoder.write(chunk as Buffer))) break;
+    }
+    if (!stoppedEarly) {
+      processText(decoder.end());
+      if (!stoppedEarly && pendingCr) { pendingCr = false; feed('\r'); }
+      if (!stoppedEarly && (fieldHasValue || fieldCount > 0)) commitRow();
+    }
+    if (dimensionsOnly) return { totalRows: rowIndex, totalCols: observedMaxCols, totalBytes };
+    const actualEndCol = Math.min(Math.max(0, observedMaxCols - 1), requestedEndCol);
+    return {
+      startRow,
+      endRow: rows.length ? startRow + rows.length - 1 : Math.min(startRow, Math.max(0, rowIndex - 1)),
+      startCol, endCol: actualEndCol,
+      ...(!stoppedEarly ? { totalRows: rowIndex } : {}),
+      totalCols: observedMaxCols, totalBytes, hasMore: stoppedEarly, truncated, rows,
+      valuesHash: crypto.createHash('sha256').update(JSON.stringify(rows)).digest('hex'),
+    };
   }
 
   async readRange(userId: string, artifactId: string, range: Record<string, unknown>): Promise<Record<string, unknown>> {
