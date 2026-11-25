@@ -119,7 +119,7 @@ for(const vp of targets){
             // pin the page indicator indefinitely.
             await page.locator('.pdf-canvas-scroll').evaluate(el=>{el.scrollTop=0});
             await expect(page.locator('.pdf-page-indicator')).toContainText('1 / 2');
-            await page.getByRole('button',{name:/次のページ/}).click();
+            await page.locator('.pdf-nav-group').getByRole('button',{name:'次',exact:true}).click();
             await expect(page.locator('.pdf-page-indicator')).toContainText('2 / 2');
             await page.getByRole('button',{name:'拡大',exact:true}).click();
             const scale=await page.locator('[data-viewer-zoom-surface]').getAttribute('data-zoom-scale');
