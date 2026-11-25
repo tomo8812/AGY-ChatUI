@@ -213,7 +213,11 @@ export const PdfCanvasViewer: React.FC<{
   const isZoomInteractingRef = useRef(false);
   // Explicit navigation owns the active page until the user scrolls the document.
   // Wall-clock timeouts cannot distinguish a delayed layout event from user input.
-  const programmaticScrollRef = useRef<{ targetPage: number; offsetRatio: number } | null>(null);
+  const programmaticScrollRef = useRef<{ targetPage: number; offsetRatio: number; settled?: { top:number;width:number;height:number;scrollHeight:number } } | null>(null);
+  const rememberScrollPosition=(container:HTMLDivElement)=>{
+    const anchor=programmaticScrollRef.current;
+    if(anchor)anchor.settled={top:container.scrollTop,width:container.clientWidth,height:container.clientHeight,scrollHeight:container.scrollHeight};
+  };
   const scrollRafRef = useRef<number | null>(null);
   const scheduleRenderRef = useRef<() => void>(() => {});
   const pageNumRef = useRef(1);
@@ -483,6 +487,7 @@ export const PdfCanvasViewer: React.FC<{
     programmaticScrollRef.current = { targetPage: anchor.page, offsetRatio: -anchor.offsetY / Math.max(1,slot.getBoundingClientRect().height) };
     sc.scrollTo({ top: Math.max(0, sc.scrollTop + slot.getBoundingClientRect().top - sc.getBoundingClientRect().top - anchor.offsetY),
       left: anchor.scrollLeft, behavior: 'instant' });
+    rememberScrollPosition(sc);
     pageNumRef.current = anchor.page;
     setPageNum(anchor.page);
   }, [loading, pdfDoc, pageSizes, containerSize.width, scrollEl]);
@@ -498,6 +503,7 @@ export const PdfCanvasViewer: React.FC<{
     const rect=slot.getBoundingClientRect(), viewport=sc.getBoundingClientRect();
     const padding=parseFloat(window.getComputedStyle(sc).paddingTop)||0;
     sc.scrollTo({top:Math.max(0,sc.scrollTop+rect.top-viewport.top-padding+lock.offsetRatio*rect.height),behavior:'instant'});
+    rememberScrollPosition(sc);
     pageNumRef.current=lock.targetPage;setPageNum(lock.targetPage);
     scheduleRenderRef.current();
   },[containerSize.width,containerSize.height,pageSizes,pdfDoc,loading,scrollEl,fitMode]);
@@ -796,6 +802,7 @@ export const PdfCanvasViewer: React.FC<{
         const paddingTop = parseFloat(window.getComputedStyle(container).paddingTop) || 0;
         const nextTop = container.scrollTop + (targetRect.top - containerRect.top) - paddingTop;
         container.scrollTo({ top: Math.max(0, nextTop), behavior: 'instant' });
+        rememberScrollPosition(container);
       }
       if (!isZoomInteractingRef.current) {
         scheduleRenderRef.current();
@@ -862,7 +869,18 @@ export const PdfCanvasViewer: React.FC<{
       const container = scrollRef.current;
       if (!container || numPages <= 0) return;
 
-      if (programmaticScrollRef.current) return;
+      const anchor=programmaticScrollRef.current;
+      if(anchor){
+        const settled=anchor.settled;
+        // Layout changes can clamp scrollTop before ResizeObserver commits
+        // the new fit geometry. The layout effect restores the anchor.
+        if(!settled||settled.width!==container.clientWidth||settled.height!==container.clientHeight||settled.scrollHeight!==container.scrollHeight)return;
+        // The recorded position is our own last scroll, not an indefinite
+        // input lock. Scrollbar, accessibility or script navigation on the
+        // same geometry releases it even without pointer/wheel events.
+        if(Math.abs(container.scrollTop-settled.top)<=2)return;
+        programmaticScrollRef.current=null;
+      }
 
       const containerRect = container.getBoundingClientRect();
       const paddingTop = parseFloat(window.getComputedStyle(container).paddingTop) || 0;
@@ -942,6 +960,7 @@ export const PdfCanvasViewer: React.FC<{
         if (Math.abs(deltaY) > 0.5) {
           container.scrollTop = Math.max(0, container.scrollTop + deltaY);
         }
+        rememberScrollPosition(container);
         if (anchor.pageNum !== pageNumRef.current) {
           pageNumRef.current = anchor.pageNum;
           setPageNum(anchor.pageNum);
@@ -999,6 +1018,7 @@ export const PdfCanvasViewer: React.FC<{
     setFitMode('auto');
     if (scrollRef.current) {
       scrollRef.current.scrollLeft = 0;
+      rememberScrollPosition(scrollRef.current);
     }
   }, [cancelActiveGesture]);
 

@@ -114,6 +114,13 @@ for(const vp of targets){
               return Math.min(a.bottom,b.bottom)-Math.max(a.top,b.top)>Math.min(a.height,b.height)*0.4;
             });
             await expect.poll(secondPageVisible).toBe(true);
+            // Scroll without a pointer or wheel input (as with native
+            // scrollbar/accessibility navigation). A settled jump must not
+            // pin the page indicator indefinitely.
+            await page.locator('.pdf-canvas-scroll').evaluate(el=>{el.scrollTop=0});
+            await expect(page.locator('.pdf-page-indicator')).toContainText('1 / 2');
+            await page.getByRole('button',{name:/次のページ/}).click();
+            await expect(page.locator('.pdf-page-indicator')).toContainText('2 / 2');
             await page.getByRole('button',{name:'拡大',exact:true}).click();
             const scale=await page.locator('[data-viewer-zoom-surface]').getAttribute('data-zoom-scale');
             await page.getByRole('button',{name:'依頼',exact:true}).click();
@@ -138,6 +145,13 @@ for(const vp of targets){
               await editor.focus();await page.getByRole('button',{name:'全選択',exact:true}).click();await page.keyboard.insertText(item.updated);
               await expect.poll(()=>page.locator('.cm-line').allTextContents()).toEqual(item.updated.split('\n'));
             }else if(item.kind==='xlsx'||item.kind==='csv'){
+              if(item.kind==='csv'){
+                const grid=page.getByRole('grid',{name:'表データ'});
+                await page.getByRole('gridcell',{name:'B2',exact:true}).click({timeout:30000});
+                await grid.press('ArrowRight');await grid.press('ArrowDown');
+                await expect(page.locator('.workspace-cell-address')).toHaveText('B2');
+                await expect(page.getByRole('gridcell',{name:'C2',exact:true})).toHaveCount(0);
+              }
               await page.getByRole('gridcell',{name:'A1',exact:true}).click({timeout:30000});
               await page.getByRole('textbox',{name:'数式・セル値'}).fill(item.updated);
               if(item.kind==='xlsx'){

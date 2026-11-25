@@ -44,8 +44,13 @@ export function GridModule(props:WorkspaceModuleProps){
   });
   const ready=structure.ready&&range.ready&&!!sheet;
   const data=range.data;
-  const csvMaxRow=Math.min(1048575,data?.totalRows??row0+(data?.rows?.length??0)+(data?.hasMore?1:0));
-  const csvMaxCol=Math.min(16383,data?.hasMore?Math.max(col0+COLS-1,data?.totalCols??0):data?.totalCols??col0+COLS-1);
+  // Counts are exclusive; editing a phantom coordinate would grow the CSV.
+  // Only a deliberate edit to A1 may initialize a genuinely empty file.
+  const csvLoadedRows=data?.rows?.length??0;
+  const csvEmpty=ready&&!xlsx&&data?.totalRows===0&&csvLoadedRows===0;
+  const csvLastRow=Math.min(1048575,Math.max(0,(data?.totalRows??row0+csvLoadedRows)-1));
+  const csvLastCol=Math.min(16383,Math.max(0,(data?.totalCols??0)-1));
+  const csvNavLastRow=data?.hasMore?Math.min(1048575,Math.max(csvLastRow,row0+ROWS)):csvLastRow;
   const cells=useMemo(()=>new Map(data?.cells.map(cell=>[cell.address,cell])),[data]);
   const raw=(r:number,c:number)=>xlsx?cells.get(address(r,c)):undefined;
   const key=(r:number,c:number)=>String(sheet?.id)+':'+address(r,c);
@@ -57,7 +62,7 @@ export function GridModule(props:WorkspaceModuleProps){
   function change(v:string){
     if(!ready||cellEditLocked||artifact.revision===undefined||!sheet)return;
     const {row,col}=selected;
-    if(row<row0||row>=row0+ROWS||col<col0||col>=col0+COLS||!xlsx&&(row>csvMaxRow||col>csvMaxCol))return;
+    if(row<row0||row>=row0+ROWS||col<col0||col>=col0+COLS||!xlsx&&!(row>=row0&&row<row0+csvLoadedRows&&col<=csvLastCol||csvEmpty&&row===0&&col===0))return;
     const formula=xlsx&&v.startsWith('=');
     const op=xlsx?(formula?'xlsx.set_formula':'xlsx.set_cell'):'set_cell';
     if(!supportsOperation(capabilities,xlsx?op:'edit'))return;
@@ -65,7 +70,7 @@ export function GridModule(props:WorkspaceModuleProps){
     onDraft(artifact.revision,v===original(row,col)?null:{key:k,displayValue:v,label:sheet.name+' '+address(row,col),operation:xlsx?{op,sheetPart:sheet.part,address:address(row,col),value:formula?v:(/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(v)&&Number.isFinite(Number(v))?Number(v):v)}:{op,row,col,value:v}},k);
   }
   const scroll=useRef<HTMLDivElement>(null);
-  const rowCount=Math.min(ROWS,1048576-row0),colCount=Math.min(COLS,16384-col0);
+  const rowCount=xlsx?Math.min(ROWS,1048576-row0):Math.max(1,Math.min(ROWS,csvLoadedRows)),colCount=xlsx?Math.min(COLS,16384-col0):Math.max(1,Math.min(COLS,csvLastCol-col0+1));
   const rows=useVirtualizer({count:rowCount,getScrollElement:()=>scroll.current,estimateSize:()=>CELL_HEIGHT,overscan:4,scrollMargin:CELL_HEIGHT});
   const cols=useVirtualizer({horizontal:true,count:colCount,getScrollElement:()=>scroll.current,estimateSize:()=>CELL_WIDTH,overscan:2,scrollMargin:HEADER});
   const previews=useMemo(()=>{
@@ -80,12 +85,12 @@ export function GridModule(props:WorkspaceModuleProps){
     return previewFormulas(values,sheet.name,{row0,col0,rows:rowCount,cols:colCount});
   },[xlsx,sheet,data,draft,ready,row0,col0,rowCount,colCount]);
   function move(row:number,col:number){
-    row=Math.max(0,Math.min(xlsx?1048575:csvMaxRow,row));col=Math.max(0,Math.min(xlsx?16383:csvMaxCol,col));
+    row=Math.max(0,Math.min(xlsx?1048575:csvNavLastRow,row));col=Math.max(0,Math.min(xlsx?16383:csvLastCol,col));
     setSelected({row,col});setPage(Math.floor(row/ROWS));setColPage(Math.floor(col/COLS));
     if(Math.floor(row/ROWS)===page&&Math.floor(col/COLS)===colPage){rows.scrollToIndex(row-row0,{align:'auto'});cols.scrollToIndex(col-col0,{align:'auto'})}else scroll.current?.scrollTo(0,0);
   }
   async function pin(){
-    if(!ready||artifact.revision===undefined||!sheet)return;
+    if(!ready||artifact.revision===undefined||!sheet||!inData)return;
     const {row,col}=selected;
     const cell=address(row,col),snippet=original(row,col);
     try{
@@ -101,8 +106,8 @@ export function GridModule(props:WorkspaceModuleProps){
     }catch{setPinError('選択対象を識別できませんでした。')}
   }
   const inRange=selected.row>=row0&&selected.row<row0+ROWS&&selected.col>=col0&&selected.col<col0+COLS;
-  const inData=xlsx||selected.row< (data?.totalRows??row0+(data?.rows?.length??0))&&selected.col<(data?.totalCols??COLS);
-  const editableCoordinate=xlsx||(selected.row<=csvMaxRow&&selected.col<=csvMaxCol);
+  const inData=xlsx||selected.row>=row0&&selected.row<row0+csvLoadedRows&&selected.col>=col0&&selected.col<=csvLastCol;
+  const editableCoordinate=inData||csvEmpty&&selected.row===0&&selected.col===0;
   const inputEnabled=ready&&inRange&&editableCoordinate&&mode==='edit'&&!cellEditLocked;
   const structuralEnabled=ready&&inRange&&editableCoordinate&&mode==='edit'&&!editingLocked&&(!draft||!!structural)&&artifact.revision!==undefined;
   const styleKey='style:'+key(selected.row,selected.col);
@@ -134,7 +139,7 @@ export function GridModule(props:WorkspaceModuleProps){
   const toolbar=<ResponsiveCommandBar primary={primary} secondary={secondary} minInlineWidth={850} closeOnButton/>;
   const tabs=<div className="workspace-toolbar" role="group" aria-label="シート">{sheets.map(s=><button key={s.id} type="button" className={'btn btn-secondary btn-xs '+(s.id===sheet?.id?'active':'')} aria-pressed={s.id===sheet?.id} onClick={()=>{setSheetId(s.id);move(0,0)}}>{s.name}</button>)}
     <input aria-label="表示範囲を検索" placeholder="範囲内検索" value={search} onChange={e=>{setSearch(e.target.value);setSearchAt(-1)}}/><button type="button" className="btn btn-secondary btn-xs" disabled={!searchMatches.length} onClick={nextMatch}>次の一致{search&&' ('+searchMatches.length+')'}</button>
-    <button type="button" className="btn btn-secondary btn-xs" disabled={page===0} onClick={()=>move(Math.max(0,row0-ROWS),col0)}>前の行</button><button type="button" className="btn btn-secondary btn-xs" disabled={row0+ROWS>=1048576||(!xlsx&&!data?.hasMore&&row0+ROWS>(data?.totalRows??row0+ROWS-1))} onClick={()=>move(row0+ROWS,col0)}>次の行</button><button type="button" className="btn btn-secondary btn-xs" disabled={colPage===0} onClick={()=>move(row0,Math.max(0,col0-COLS))}>前の列</button><button type="button" className="btn btn-secondary btn-xs" disabled={col0+COLS>=16384||(!xlsx&&!data?.hasMore&&col0+COLS>(data?.totalCols??col0+COLS-1))} onClick={()=>move(row0,col0+COLS)}>次の列</button></div>;
+    <button type="button" className="btn btn-secondary btn-xs" disabled={page===0} onClick={()=>move(Math.max(0,row0-ROWS),col0)}>前の行</button><button type="button" className="btn btn-secondary btn-xs" disabled={row0+ROWS>=1048576||(!xlsx&&!data?.hasMore&&row0+ROWS>csvLastRow)} onClick={()=>move(row0+ROWS,col0)}>次の行</button><button type="button" className="btn btn-secondary btn-xs" disabled={colPage===0} onClick={()=>move(row0,Math.max(0,col0-COLS))}>前の列</button><button type="button" className="btn btn-secondary btn-xs" disabled={col0+COLS>=16384||(!xlsx&&col0+COLS>csvLastCol)} onClick={()=>move(row0,col0+COLS)}>次の列</button></div>;
   return <UnifiedViewerZoomShell resetKey={artifact.id+':grid'} controlsTop={toolbar} controlsBottom={tabs}>
     {(structure.error||range.error||pinError)&&<div role="alert" className="error-box">{structure.error||range.error||pinError}<button type="button" onClick={()=>{structure.retry();range.retry()}}>再試行</button></div>}
     {structural&&<div className="workspace-toolbar" role="status">{structural.label}（保存時に反映）<button type="button" className="btn btn-secondary btn-xs" disabled={editingLocked} onClick={()=>artifact.revision!==undefined&&onDraft(artifact.revision,null,'grid-structure')}>取消</button></div>}
