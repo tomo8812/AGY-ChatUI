@@ -357,6 +357,25 @@ it('streams bounded ranges for large text/CSV artifacts without full-file reads 
     expect(midSlice.hasMore).toBe(true);
     expect(midSlice.text).toBe(textLines.slice(24_999, 25_002).join('\n'));
 
+    const lineEndings = [
+      { source: '', text: '', lines: 1 },
+      { source: 'one', text: 'one', lines: 1 },
+      { source: 'one\n', text: 'one\n', lines: 2 },
+      { source: 'one\r\ntwo\r\n', text: 'one\ntwo\n', lines: 3 },
+      { source: 'one\n\n', text: 'one\n\n', lines: 3 },
+      { source: 'one\r', text: 'one\r', lines: 1 },
+    ];
+    for (const [index, { source, text, lines }] of lineEndings.entries()) {
+      const { artifact } = await srv.ctx.artifactService.createArtifact({
+        userId, scopeKind: 'chat', chatId: chat.id, relPath: 'line-endings-' + index + '.txt',
+        content: Buffer.from(source), actorKind: 'user',
+      });
+      const structure = await srv.ctx.artifactService.getStructure(userId, artifact.id);
+      expect(structure.lineCount).toBe(lines);
+      const read = await srv.ctx.artifactService.readRange(userId, artifact.id, { startLine: 1, endLine: 10 });
+      expect(read).toMatchObject({ startLine: 1, endLine: lines, totalLines: lines, text, hasMore: false });
+    }
+
     // Bounded byte-window read via fs.readSync at arbitrary offset
     const byteSlice = await srv.ctx.artifactService.readRange(userId, bigText.id, { offsetBytes: 100_000, maxBytes: 128 }) as Record<string, unknown>;
     expect(byteSlice.offsetBytes).toBe(100_000);

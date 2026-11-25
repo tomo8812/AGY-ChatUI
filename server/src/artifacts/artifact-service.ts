@@ -4151,7 +4151,6 @@ export class ArtifactService {
       };
 
       const pushLine = (line: string) => {
-        const clean = line.endsWith('\r') ? line.slice(0, -1) : line;
         if (lineNo >= startLine && lineNo <= targetEndLine) {
           const remaining = maxResponseBytes - collectedBytes;
           if (remaining <= 0) {
@@ -4159,16 +4158,16 @@ export class ArtifactService {
             stoppedEarly = true;
             return false;
           }
-          const lineBytes = Buffer.byteLength(clean, 'utf8') + (collected.length > 0 ? 1 : 0);
+          const lineBytes = Buffer.byteLength(line, 'utf8') + (collected.length > 0 ? 1 : 0);
           if (lineBytes > remaining) {
-            const sliceBuf = Buffer.from(clean, 'utf8').subarray(0, Math.max(0, remaining - (collected.length > 0 ? 1 : 0)));
+            const sliceBuf = Buffer.from(line, 'utf8').subarray(0, Math.max(0, remaining - (collected.length > 0 ? 1 : 0)));
             collected.push(sliceBuf.toString('utf8'));
             collectedBytes = maxResponseBytes;
             truncated = true;
             stoppedEarly = true;
             return false;
           }
-          collected.push(clean);
+          collected.push(line);
           collectedBytes += lineBytes;
         }
         return true;
@@ -4200,7 +4199,7 @@ export class ArtifactService {
           const segment = text.slice(cursor, nlIdx);
           const fullLine = lineNo >= startLine && lineNo <= targetEndLine ? pending + segment : '';
           pending = '';
-          const ok = pushLine(fullLine);
+          const ok = pushLine(fullLine.endsWith('\r') ? fullLine.slice(0, -1) : fullLine);
           lineNo += 1;
           cursor = nlIdx + 1;
           if (!ok || lineNo > targetEndLine) {
@@ -4214,13 +4213,9 @@ export class ArtifactService {
 
       stream.on('end', () => {
         if (settled) return;
-        const rem = decoder.end();
-        if (rem && lineNo >= startLine && lineNo <= targetEndLine) {
-          pending += rem;
-        }
-        if (lineNo >= startLine && lineNo <= targetEndLine) {
-          pushLine(pending);
-        }
+        // Match splitLines() used by source adapters and structure/target
+        // coordinates. A final LF opens an empty logical line at EOF.
+        pushLine(pending + decoder.end());
         reachedEof = true;
         finish();
       });
