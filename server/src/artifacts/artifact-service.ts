@@ -4534,7 +4534,24 @@ export class ArtifactService {
         if (!(error instanceof ArtifactError) || error.code !== 'DOCUMENT_WORKER_REJECTED') throw error;
       }
     }
-    return { ...adapter.verify(buf, artifact), ...identity };
+    let verifyMeta: Parameters<typeof adapter.verify>[1] = artifact;
+    if (format === 'html' || format === 'svg') {
+      const depRows = this.db.db
+        .prepare(
+          `SELECT rel_path, status
+           FROM artifact_revision_deps
+           WHERE user_id = ? AND artifact_id = ? AND revision = ?`
+        )
+        .all(userId, artifactId, revision.revision) as Array<{
+        rel_path: string;
+        status: 'present' | 'missing' | 'outside_root';
+      }>;
+      verifyMeta = {
+        ...artifact,
+        dependencies: depRows.map((row) => ({ relPath: row.rel_path, status: row.status })),
+      };
+    }
+    return { ...adapter.verify(buf, verifyMeta), ...identity };
   }
 
   async exportArtifact(params: {
