@@ -2688,6 +2688,37 @@ PROTECTED_WORD_PARA_CHILDREN = {
 }
 
 
+def _word_ui_simple_paragraph(block):
+    # UI rich editing only applies to one ordinary text run. Unknown XML,
+    # hyperlinks, tabs, fields, bookmarks, tracked changes and drawings are
+    # never rebuilt by the browser editor.
+    if block.tag != tag(WORD, "p") or any(child.tag not in {tag(WORD, "pPr"), tag(WORD, "r")} for child in block):
+        return False
+    runs = block.findall(tag(WORD, "r"))
+    return len(runs) <= 1 and all(
+        child.tag in {tag(WORD, "rPr"), tag(WORD, "t"), tag(WORD, "br")}
+        and (child.tag != tag(WORD, "br") or child.get(tag(WORD, "type")) in (None, "textWrapping"))
+        for r in runs for child in r
+    )
+
+
+def _word_ui_marks(block):
+    props = block.find("./" + tag(WORD, "r") + "/" + tag(WORD, "rPr"))
+    result = {}
+    if props is not None:
+        for name, element in (("bold", "b"), ("italic", "i"), ("underline", "u")):
+            el = props.find(tag(WORD, element))
+            if el is not None:
+                result[name] = el.get(tag(WORD, "val"), "1") not in ("0", "false", "off", "none")
+    return result
+
+
+def _word_ui_text(block):
+    return "".join((node.text or "") if node.tag == tag(WORD, "t") else "\n"
+                   for run in block.findall(tag(WORD, "r")) for node in run
+                   if node.tag in (tag(WORD, "t"), tag(WORD, "br")))
+
+
 def _apply_word_run_props(run, spec):
     props = xml_child(run, WORD, "rPr", ("t", "br", "tab"))
     trailing = ("color", "spacing", "w", "kern", "position", "sz", "szCs", "highlight", "u", "shd", "vertAlign", "lang", "rPrChange")
@@ -3171,7 +3202,29 @@ def edit_word(package, operations, output):
             runs = block.findall(tag(WORD, "r"))
             if any(node.tag in PROTECTED_WORD_RUN_CHILDREN for r in runs for node in r):
                 raise ValueError("Paragraph contains protected inline content")
-            if isinstance(operation.get("runs"), list) and operation["runs"]:
+            if operation.get("preserveRunProperties") is True:
+                # This is an opt-in guarded UI operation, not a general
+                # replacement of arbitrary rich Word paragraphs.
+                if not _word_ui_simple_paragraph(block):
+                    raise ValueError("Paragraph has protected or multiple existing runs")
+                specs = operation.get("runs")
+                if not isinstance(specs, list) or not 1 <= len(specs) <= 200 or any(
+                    not isinstance(spec, dict) or not isinstance(spec.get("text"), str)
+                    or set(spec) - {"text", "bold", "italic", "underline"}
+                    or any(not isinstance(spec[k], bool) for k in ("bold", "italic", "underline") if k in spec)
+                    for spec in specs
+                ) or sum(len(spec["text"]) for spec in specs) > 20000:
+                    raise ValueError("Invalid simple paragraph runs")
+                original_rpr = runs[0].find(tag(WORD, "rPr")) if runs else None
+                for old_r in runs:
+                    block.remove(old_r)
+                for spec in specs:
+                    new_r = XML.SubElement(block, tag(WORD, "r"))
+                    if original_rpr is not None:
+                        new_r.append(deepcopy(original_rpr))
+                    _apply_word_run_props(new_r, {k: v for k, v in spec.items() if k != "text"})
+                    _set_run_multiline_text(new_r, spec["text"])
+            elif isinstance(operation.get("runs"), list) and operation["runs"]:
                 for old_r in runs:
                     block.remove(old_r)
                 for r_spec in operation["runs"][:200]:
@@ -6844,7 +6897,8 @@ def process_document(request, source, output):
                                         "blockIndex": block_count,
                                         "type": XML.QName(elem).localname,
                                         "text": text_content(elem, WORD),
-                                        "editableText": elem.tag == tag(WORD, "p") and not any(child.tag in PROTECTED_WORD_PARA_CHILDREN for child in elem) and not any(node.tag in PROTECTED_WORD_RUN_CHILDREN for r in elem.findall(tag(WORD, "r")) for node in r) and len(elem.findall(tag(WORD, "r"))) <= 1,
+                                        "editableText": _word_ui_simple_paragraph(elem),
+                                        **({"text": _word_ui_text(elem), "marks": _word_ui_marks(elem)} if _word_ui_simple_paragraph(elem) else {}),
                                     })
                                 block_count += 1
                             elem.clear()
