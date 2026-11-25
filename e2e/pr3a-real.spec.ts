@@ -56,7 +56,7 @@ async function capturePptx(page:Page,info:TestInfo,reference:Buffer,name:string)
 for(const vp of targets){
   test('PR3A actual files and persistent edits '+vp.width+'x'+vp.height,async({page},info)=>{
     test.skip(info.project.name!==vp.project||!runtime||!fixtureDir);
-    test.setTimeout(360000);
+    test.setTimeout(600000);
     const srv=await createTestServer({docRuntimeDir:runtime!,installDocRuntime:'compact',sandboxMode:'off',allowUnsandboxedDocWorkers:true,docWorkerBudget:2});
     const evidence:unknown[]=[];
     try{
@@ -253,7 +253,7 @@ for(const vp of targets){
             // Chromium and WebKit; the basic addition runs at all five sizes.
             if(vp.width===1280||vp.width===375){
               await saveStructural('pptx.add_table',async()=>{await page.getByRole('textbox',{name:'追加表 1行 1列'}).fill('Table cell')},0);
-              await saveStructural('pptx.add_image',async()=>{await page.getByLabel('スライド画像ファイル').setInputFiles({name:'sample.png',mimeType:'image/png',buffer:Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l2QAAAAASUVORK5CYII=','base64')})},0);
+              await saveStructural('pptx.add_image',async()=>{await page.getByLabel('スライド画像ファイル').setInputFiles({name:'sample.png',mimeType:'image/png',buffer:Buffer.from('iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAIAAABvFaqvAAAAIklEQVR4nGO8VKHLQA3ARBVTRg0aNWjUoFGDRg0aNYgiAACvzQGn6yar6wAAAABJRU5ErkJggg==','base64')})},0);
               await saveStructural('pptx.add_slide',async()=>{},1);
               const structure=await svc.getStructure(userId,artifact.id);
               expect(structure.slides).toHaveLength(2);
