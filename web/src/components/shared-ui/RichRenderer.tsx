@@ -99,11 +99,11 @@ function expressionKeys(expr:string,keys:Set<string>){
       case 'array':ast.items.forEach(walk);break;
     }
   }
-  walk(parseRichExpr(expr));
+  try{walk(parseRichExpr(expr))}catch{keys.add('state:*');keys.add('computed:*');keys.add('theme')}
 }
 /** Children subscribe independently; SVG internals and chart series belong to
  * the node that paints them. Whole-record or dynamic indices stay conservative. */
-export function richNodeProjection(node:RichNode):string[]{
+export function richNodeProjection(node:RichNode,repeat=true):string[]{
   const keys=new Set<string>();
   const visit=(value:unknown,field:string)=>{
     if(typeof value==='string'){
@@ -113,7 +113,7 @@ export function richNodeProjection(node:RichNode):string[]{
     else if(value&&typeof value==='object')Object.entries(value).forEach(([k,v])=>visit(v,k));
   };
   for(const [k,v] of Object.entries(node)){
-    if(['children','headerAction','footer','trigger'].includes(k))continue;
+    if(['children','headerAction','footer','trigger'].includes(k)||k==='repeat'&&!repeat)continue;
     if((node.type==='popover'||node.type==='tooltip')&&k==='content'&&Array.isArray(v))continue;
     if(node.type==='tabs'&&k==='items'){for(const item of node.items){visit(item.label,'label');visit(item.badge,'badge')}continue}
     visit(v,k);
@@ -168,10 +168,20 @@ function RichRendererInner({document:doc,userId,chatId,artifacts=noArtifacts,act
   },[store,doc,authorized,prefix,actions]);
   return <section className="rich-document"><RichTitle value={doc.title} store={store}/>{error&&<div className="error-box" role="alert">{error}<button className="btn btn-ghost btn-xs" type="button" onClick={()=>setError(null)}>閉じる</button></div>}<RichNodeView node={doc.root} local={emptyLocal} path="root" environment={environment}/></section>;
 }
-const RichNodeView=React.memo(function RichNodeView({node,local,path,environment,repeat=true}:{node:RichNode;local:LocalContext;path:string;environment:NodeEnvironment;repeat?:boolean}){
+const RichNodeView=React.memo(function RichNodePaint({node,local,path,environment,repeat=true}:{node:RichNode;local:LocalContext;path:string;environment:NodeEnvironment;repeat?:boolean}){
   const {store,doc,authorized,prefix,host,fail,dispatch,select,explicit}=environment;
-  const keys=useMemo(()=>richNodeProjection(node),[node]);
-  useProjection(store,keys);
+  const keys=useMemo(()=>richNodeProjection(node,repeat),[node,repeat]);
+  const heavy=['chart','svg_scene','node_edge_diagram','mermaid'].includes(node.type)&&!node.visibleWhen&&!(repeat&&node.repeat);
+  const paintRef=useRef<HTMLDivElement>(null);
+  const [visible,setVisible]=useState(true);
+  useEffect(()=>{
+    if(!heavy||!paintRef.current||typeof IntersectionObserver==='undefined')return;
+    const element=paintRef.current;
+    const observer=new IntersectionObserver(([entry])=>setVisible(entry.isIntersecting||element.contains(document.activeElement)),{rootMargin:'200px'});
+    observer.observe(element);return()=>observer.disconnect();
+  },[heavy]);
+  const pausedKeys=useMemo<string[]>(()=>[],[]);
+  useProjection(store,heavy&&!visible?pausedKeys:keys);
   // RichStateStore validates the entire expanded document atomically, including
   // global limits, before publishing. Keep a bounded evaluator for each paint.
   const cycle:RenderCycle={budget:createRichEvalBudget(),nodes:0,svgElements:0};
@@ -247,7 +257,7 @@ const RichNodeView=React.memo(function RichNodeView({node,local,path,environment
       case 'media_asset':{const alt=label(v(node.alt));let media:ReactNode;if(node.sourceKind==='inline_svg'&&node.svgScene)media=renderSvgScene(node.svgScene,c,cycle,unique,dispatch);else{const artifact=authorized.get(label(v(node.artifactId)));if(!artifact)throw Error('ファイルを表示できません。');const src=buildArtifactContentUrl(artifact);media=artifact.previewKind==='image'||artifact.previewKind==='svg'?<img alt={alt} src={src} loading="lazy"/>:artifact.previewKind==='video'?<video controls playsInline preload="metadata" src={src} aria-label={alt}/>:artifact.previewKind==='audio'?<audio controls preload="metadata" src={src} aria-label={alt}/>:<button type="button" className="btn btn-secondary" disabled={!host.openArtifact} onClick={()=>{void Promise.resolve(host.openArtifact?.(artifact.id)).catch(fail)}}>{artifact.filename}</button>}body=<figure className="rich-media">{media}{node.caption&&<figcaption>{label(v(node.caption))}</figcaption>}</figure>;break}
       default:body=<div className="error-box">この項目は表示できません。</div>;
     }
-    return <div className={'rich-node'+(node.layout?.hideOn?' rich-hide-'+node.layout.hideOn:'')} style={styleLayout(node.layout)} data-rich-node-id={node.id} aria-label={node.ariaLabel?label(v(node.ariaLabel)):undefined}>{body}</div>;
+    return <div ref={heavy?paintRef:undefined} onFocusCapture={heavy?()=>setVisible(true):undefined} className={'rich-node'+(node.layout?.hideOn?' rich-hide-'+node.layout.hideOn:'')} style={styleLayout(node.layout)} data-rich-node-id={node.id} aria-label={node.ariaLabel?label(v(node.ariaLabel)):undefined}>{body}</div>;
 });
 
 export function RichRenderer(props:RichRendererProps){

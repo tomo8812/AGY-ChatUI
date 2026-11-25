@@ -18,6 +18,7 @@ book = Workbook()
 book.active.title = "Sheet1"
 book.active["A1"] = 7
 book.active["B1"] = "=A1*2"
+book.active["U51"] = "Beyond old grid window"
 book.create_sheet("Other")["A1"] = "Keep"
 book.save(out / "sample.xlsx")
 doc = Document()
@@ -44,6 +45,18 @@ other.name = "Overlap"
 other.fill.solid()
 other.fill.fore_color.rgb = RGBColor(172, 89, 39)
 other.rotation = 9
+# Explicit geometry is painted by the browser, not one full-slide PNG per shape.
+# Keep the complex text and rotated shape in the same scene to test Z order.
+for index in range(61):
+    basic = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.1 + index % 31 * 0.31),
+                                   Inches(5 + index // 31 * 0.22), Inches(0.20), Inches(0.15))
+    basic.name = f"Basic {index + 1}"
+    basic.fill.solid()
+    basic.fill.fore_color.rgb = RGBColor(55, 130, 160)
+    basic.line.fill.background()
+    style = basic._element.find("{http://schemas.openxmlformats.org/presentationml/2006/main}style")
+    if style is not None:
+        basic._element.remove(style)
 deck.save(out / "sample.pptx")
 pdf = Canvas(str(out / "sample.pdf"), pagesize=(595, 842), invariant=1)
 pdf.drawString(45, 770, "First page")

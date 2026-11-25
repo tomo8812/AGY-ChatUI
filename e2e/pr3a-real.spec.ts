@@ -38,6 +38,7 @@ async function capturePptx(page:Page,info:TestInfo,reference:Buffer,name:string)
   const scene=await readySlide(page);
   // Wait for all transparent shape layers rather than comparing a background-only intermediate.
   await expect(scene.locator('img')).toHaveCount(3,{timeout:60000});
+  await expect(scene.locator('[data-basic-geometry]')).toHaveCount(61);
   await expect.poll(async()=>scene.locator('img').evaluateAll(imgs=>imgs.every(img=>(img as HTMLImageElement).complete&&(img as HTMLImageElement).naturalWidth>0)),{timeout:60000}).toBe(true);
   await expect.poll(()=>scene.evaluate(el=>{
     const viewport=el.closest('.workspace-pptx-scroll');
@@ -151,6 +152,12 @@ for(const vp of targets){
                 await grid.press('ArrowRight');await grid.press('ArrowDown');
                 await expect(page.locator('.workspace-cell-address')).toHaveText('B2');
                 await expect(page.getByRole('gridcell',{name:'C2',exact:true})).toHaveCount(0);
+              }
+              if(item.kind==='xlsx'){
+                const jump=page.getByRole('textbox',{name:'セル範囲へ移動'});
+                await jump.fill('U51');await jump.press('Enter');
+                await expect(page.getByRole('gridcell',{name:'U51',exact:true})).toHaveText('Beyond old grid window',{timeout:30000});
+                await jump.fill('A1');await jump.press('Enter');
               }
               await page.getByRole('gridcell',{name:'A1',exact:true}).click({timeout:30000});
               await page.getByRole('textbox',{name:'数式・セル値'}).fill(item.updated);

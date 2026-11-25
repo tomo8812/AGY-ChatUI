@@ -500,6 +500,14 @@ export const PdfCanvasViewer: React.FC<{
     if(!lock||!sc||loading||!pdfDoc||isZoomInteractingRef.current||!containerSize.width||!containerSize.height)return;
     const slot=pageElementsRef.current.get(lock.targetPage);
     if(!slot)return;
+    const settled=lock.settled;
+    // A ResizeObserver callback can be queued before an accessibility or
+    // scrollbar scroll. Never restore an old page over new input when the
+    // actual viewport and document geometry are unchanged.
+    if(settled&&settled.width===sc.clientWidth&&settled.height===sc.clientHeight&&settled.scrollHeight===sc.scrollHeight){
+      if(Math.abs(sc.scrollTop-settled.top)>2){programmaticScrollRef.current=null;return;}
+      if(fitMode==='manual')return;
+    }
     const rect=slot.getBoundingClientRect(), viewport=sc.getBoundingClientRect();
     const padding=parseFloat(window.getComputedStyle(sc).paddingTop)||0;
     sc.scrollTo({top:Math.max(0,sc.scrollTop+rect.top-viewport.top-padding+lock.offsetRatio*rect.height),behavior:'instant'});
@@ -862,6 +870,10 @@ export const PdfCanvasViewer: React.FC<{
 
   const handleScroll = useCallback(() => {
     if (isZoomInteractingRef.current) return;
+    const sc=scrollRef.current,lock=programmaticScrollRef.current,settled=lock?.settled;
+    if(sc&&settled&&settled.width===sc.clientWidth&&settled.height===sc.clientHeight&&settled.scrollHeight===sc.scrollHeight&&Math.abs(sc.scrollTop-settled.top)>2){
+      programmaticScrollRef.current=null;
+    }
     if (scrollRafRef.current !== null) return;
     scrollRafRef.current = window.requestAnimationFrame(() => {
       scrollRafRef.current = null;
