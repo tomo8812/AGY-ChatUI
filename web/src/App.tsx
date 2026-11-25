@@ -1550,7 +1550,7 @@ export const App: React.FC = () => {
           setPendingPermissions(detail.pendingPermissions);
           setPendingElicitations(detail.pendingElicitations);
           setActiveRun(detail.activeRun);
-          if (snapshot.sessionOptions) setSessionOptions(snapshot.sessionOptions);
+          setSessionOptions(snapshot.sessionOptions);
           const { contextUsed, contextSize } = detail.chat;
           setContextUsage(contextUsed != null && contextSize != null && contextSize > 0
             ? { used: contextUsed, size: contextSize } : null);
