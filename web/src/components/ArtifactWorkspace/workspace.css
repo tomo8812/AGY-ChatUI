@@ -55,3 +55,5 @@
 .workspace-shape-hit.selected{border:2px solid #4075c8;box-shadow:0 0 0 1px #fff}
 .workspace-bound{display:flex;align-items:center;gap:3px;font-size:11px}.workspace-bound input{width:64px}
 @media(max-width:600px){.workspace-presentation{flex-direction:column}.workspace-slide-nav{flex:0 0 64px;flex-direction:row;padding:4px;border-right:0;border-bottom:1px solid var(--border,#ddd);align-items:stretch}.workspace-slide-nav-item{flex:0 0 76px;min-height:0}.workspace-slide-nav-item img{max-height:38px;object-fit:contain}.workspace-word{margin:6px auto}.workspace-source{padding:6px}}
+
+.workspace-page-view{display:flex;flex-direction:column;flex:1;min-height:0;min-width:0;overflow:hidden}.workspace-page-view>.pdf-viewer-wrap{flex:1;min-height:0}

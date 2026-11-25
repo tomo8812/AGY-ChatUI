@@ -223,7 +223,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const { req, reply, userId, artifactId, revNum, query, immutableByPath } = params;
     const { artifact, revision, blobPath, sizeBytes } = artifactService.getRevisionContentBlob(userId, artifactId, revNum);
     const forceDownload = query.download === '1' || query.download === 'true';
-    const isConvertedPdf = query.converted === 'pdf' && artifact.previewKind === 'pptx';
+    const isConvertedPdf = query.converted === 'pdf' && (artifact.previewKind === 'pptx' || artifact.previewKind === 'docx');
 
     let serveAbsPath = blobPath;
     let serveSize = sizeBytes;
@@ -231,7 +231,9 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     let serveFilename = artifact.filename;
 
     if (isConvertedPdf) {
-      const convertedPath = await convertPresentationToPdfCached({
+      const convertedPath = artifact.previewKind === 'docx'
+        ? await artifactService.renderDocxPreviewPdf(userId, artifact.id, revision.revision)
+        : await convertPresentationToPdfCached({
         artifactService,
         artifactId: artifact.id,
         revision: revision.revision,

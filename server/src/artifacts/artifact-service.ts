@@ -4493,6 +4493,38 @@ export class ArtifactService {
     }
   }
 
+  /** Revision-pinned, read-only document preview. Unlike the legacy PPTX viewer,
+   * DOCX conversion uses the resource-governed document worker and its isolation policy.
+   * No exported artifact or workspace mutation is created.
+   */
+  async renderDocxPreviewPdf(userId: string, artifactId: string, revisionNumber: number): Promise<string> {
+    const pinned = this.getRevisionContentBlob(userId, artifactId, revisionNumber);
+    const { artifact, revision } = pinned;
+    if (this.registry.resolve(artifact.filename, artifact.previewKind).format !== 'docx') {
+      throw unsupportedOperationError('export:pdf', 'unsupported_by_format', 'DOCX preview requires a Word document.');
+    }
+    if (!this.documentWorker.available) {
+      throw unsupportedOperationError('export:pdf', 'disabled_by_resource_tier', 'Document runtime is unavailable.');
+    }
+    const snapshot = this.readRevisionSnapshot(pinned, DOCUMENT_WORKER_MAX_INPUT_BYTES);
+    const converted = await this.renderCache.getOrRender({
+      keyInput: {
+        artifactId, revision: revision.revision, sha256: revision.sha256,
+        dependencyManifestHash: revision.dependencyManifestHash, variant: 'docx_view_pdf',
+        engineVersion: 'document-worker-v1',
+      },
+      ext: '.pdf',
+      produce: async (output) => {
+        const pdf = await this.documentWorker.run('docx', artifact.filename, snapshot.bytes, { action: 'export', targetFormat: 'pdf' });
+        if (pdf.length < 8 || pdf.length > DOCUMENT_WORKER_MAX_INPUT_BYTES || pdf.subarray(0, 5).toString('ascii') !== '%PDF-') return false;
+        fs.writeFileSync(output, pdf, { mode: 0o600 });
+        return true;
+      },
+    });
+    if (!converted) throw new ArtifactError('CONVERSION_UNAVAILABLE', '文書のページ表示に失敗しました。読取表示をご利用ください。', 422);
+    return converted;
+  }
+
   async renderPng(
     userId: string,
     artifactId: string,

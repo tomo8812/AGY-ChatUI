@@ -294,7 +294,7 @@ export function buildArtifactContentUrl(
 ): string {
   const qs = versionQuery(artifact, true);
   if (opts?.download) qs.set('download', '1');
-  if (opts?.convertedPdf && artifact.previewKind === 'pptx') {
+  if (opts?.convertedPdf && (artifact.previewKind === 'pptx' || (artifact.previewKind === 'docx' && artifact.revision !== undefined))) {
     qs.set('converted', 'pdf');
   }
   const suffix = qs.toString();

@@ -6,7 +6,7 @@ const sha='a'.repeat(64);
 async function setup(page:Page,kind:string){
   const ops:unknown[]=[];
   const meta={artifactId:'fixture',revision:1,sha256:sha};
-  const opNames=kind==='xlsx'?['xlsx.set_cell','xlsx.set_formula']:kind==='docx'?['docx.set_paragraph_text']:kind==='pptx'?['pptx.set_shape_text','pptx.set_shape_bounds']:['edit'];
+  const opNames=kind==='xlsx'?['xlsx.set_cell','xlsx.set_formula']:kind==='docx'?['docx.set_paragraph_text']:kind==='pptx'?['pptx.set_shape_text','pptx.set_shape_bounds','render_png']:['edit'];
   const png=buildSyntheticPng(640,360);
   await page.route('**/api/files/fixture/**',async route=>{
     const u=new URL(route.request().url());
