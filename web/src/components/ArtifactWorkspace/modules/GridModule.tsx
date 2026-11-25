@@ -236,7 +236,7 @@ export function GridModule(props:WorkspaceModuleProps){
   useEffect(()=>{setSearching(false);return()=>{searchAbort.current?.abort();searchAbort.current=null}},[search,revisionKey,sheet?.id,draft]);
   async function nextMatch(){
     if(!search.trim()||!sheet||!structure.ready||searchAbort.current)return;
-    searchAbort.current?.abort();const controller=new AbortController();searchAbort.current=controller;setSearching(true);setPinError('');
+    const controller=new AbortController();searchAbort.current=controller;setSearching(true);setPinError('');
     const identity=latest.current,origin=current;
     const fold=(s:string)=>Array.from(s,ch=>ch.toLowerCase()).join('');
     const q=fold(search.trim()),compare=(a:Coordinate,b:Coordinate)=>a.row-b.row||a.col-b.col;
