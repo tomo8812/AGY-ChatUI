@@ -1675,19 +1675,19 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
   const versionKey = artifactVersionKey(artifact);
   const contentUrl = useMemo(
     () => buildArtifactContentUrl(artifact),
-    [artifact.id, artifact.sha256, artifact.previewKind]
+    [versionKey, artifact.previewKind]
   );
   const convertedPdfUrl = useMemo(
     () => buildArtifactContentUrl(artifact, { convertedPdf: true }),
-    [artifact.id, artifact.sha256, artifact.previewKind]
+    [versionKey, artifact.previewKind]
   );
   const downloadUrl = useMemo(
     () => buildArtifactContentUrl(artifact, { download: true }),
-    [artifact.id, artifact.sha256, artifact.previewKind]
+    [versionKey, artifact.previewKind]
   );
   const sandboxUrl = useMemo(
     () => buildArtifactSandboxUrl(artifact),
-    [artifact.id, artifact.sha256]
+    [versionKey]
   );
 
   const [textContent, setTextContent] = useState<string | null>(() => artifactTextCache.get(versionKey) ?? null);

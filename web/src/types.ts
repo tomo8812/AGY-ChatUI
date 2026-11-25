@@ -383,7 +383,10 @@ export interface ArtifactRecord {
   mimeType: string;
   sizeBytes: number;
   sha256: string;
-  source: 'attachment' | 'generated' | 'project_copy';
+  /** Optional for legacy client-side records; current server records always carry these. */
+  revision?: number;
+  dependencyManifestHash?: string | null;
+  source: 'attachment' | 'generated' | 'project_copy' | 'project_upload' | 'user_edit' | 'mcp';
   previewKind: PreviewKind;
   diffPatch: string | null;
   createdAt: number;

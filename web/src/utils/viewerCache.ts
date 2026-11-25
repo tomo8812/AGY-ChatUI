@@ -278,27 +278,33 @@ export function detectCodeLanguage(filename: string): string | null {
   return EXT_TO_HLJS_LANG[ext] ?? null;
 }
 
+type ArtifactContentVersion = Pick<ArtifactRecord, 'id' | 'sha256' | 'revision' | 'dependencyManifestHash'>;
+
+function versionQuery(artifact: ArtifactContentVersion, pinRevision: boolean): URLSearchParams {
+  const qs = new URLSearchParams();
+  if (pinRevision && artifact.revision !== undefined) qs.set('rev', String(artifact.revision));
+  if (artifact.sha256) qs.set('v', artifact.sha256.slice(0, 12));
+  if (artifact.dependencyManifestHash) qs.set('d', artifact.dependencyManifestHash.slice(0, 8));
+  return qs;
+}
+
 export function buildArtifactContentUrl(
-  artifact: Pick<ArtifactRecord, 'id' | 'sha256' | 'previewKind'>,
+  artifact: ArtifactContentVersion & Pick<ArtifactRecord, 'previewKind'>,
   opts?: { download?: boolean; convertedPdf?: boolean }
 ): string {
-  if (opts?.download) {
-    return `/api/files/${artifact.id}/content?download=1`;
-  }
-  const qs = new URLSearchParams();
+  const qs = versionQuery(artifact, true);
+  if (opts?.download) qs.set('download', '1');
   if (opts?.convertedPdf && artifact.previewKind === 'pptx') {
     qs.set('converted', 'pdf');
-  }
-  if (artifact.sha256) {
-    qs.set('v', artifact.sha256.slice(0, 12));
   }
   const suffix = qs.toString();
   return `/api/files/${artifact.id}/content${suffix ? `?${suffix}` : ''}`;
 }
 
-export function buildArtifactSandboxUrl(artifact: Pick<ArtifactRecord, 'id' | 'sha256'>): string {
-  const suffix = artifact.sha256 ? `?v=${artifact.sha256.slice(0, 12)}` : '';
-  return `/api/files/${artifact.id}/sandbox${suffix}`;
+export function buildArtifactSandboxUrl(artifact: ArtifactContentVersion): string {
+  // The existing HTML sandbox route serves the live workspace; do not invent historical sandbox support.
+  const suffix = versionQuery(artifact, false).toString();
+  return `/api/files/${artifact.id}/sandbox${suffix ? `?${suffix}` : ''}`;
 }
 
 export function normalizeClientLinkReference(rawReference: string): string | null {
@@ -338,6 +344,7 @@ export function normalizeClientLinkReference(rawReference: string): string | nul
 // ---------- User-scoped viewer caches ----------
 
 let activeCacheUserId: string | null = null;
+let cacheGeneration = 0;
 
 // Per-chat known artifacts and link resolution caches
 const knownArtifactsByChat = new Map<string, Map<string, ArtifactRecord>>(); // chatId -> (by id AND by normalized relPath -> ArtifactRecord)
@@ -431,11 +438,23 @@ export const skillFileCache = new ByteLruCache<string, { relPath: string; conten
   sizeOf: (v) => v.content.length * 2 + 128,
 });
 
-export function artifactVersionKey(artifact: Pick<ArtifactRecord, 'id' | 'sha256' | 'updatedAt'>): string {
-  return `${artifact.id}:${artifact.sha256 || artifact.updatedAt}`;
+type ArtifactVersion = ArtifactContentVersion & Pick<ArtifactRecord, 'updatedAt'>;
+
+export function artifactVersionKey(artifact: ArtifactVersion): string {
+  return `${artifact.id}:${artifact.revision ?? 'legacy'}:${artifact.sha256 || artifact.updatedAt}:${artifact.dependencyManifestHash ?? ''}`;
+}
+
+export function isStaleArtifactVersion(current: ArtifactVersion, incoming: ArtifactVersion): boolean {
+  if (current.id !== incoming.id) return false;
+  if (current.revision !== undefined) {
+    if (incoming.revision === undefined) return true;
+    return incoming.revision < current.revision;
+  }
+  return incoming.revision === undefined && incoming.updatedAt < current.updatedAt;
 }
 
 export function clearAllViewerCaches(): void {
+  cacheGeneration += 1;
   knownArtifactsByChat.clear();
   resolvedLinkCache.clear();
   inFlightLinkResolves.clear();
@@ -464,11 +483,16 @@ export function invalidateChatViewerCache(chatId: string): void {
   resolvedLinkCache.deleteWhere((k) => k.startsWith(prefix));
 }
 
-function purgeOldArtifactPayloads(artifact: Pick<ArtifactRecord, 'id' | 'sha256' | 'updatedAt'>): void {
+function purgeOldArtifactPayloads(artifact: ArtifactVersion): void {
   const currentKey = artifactVersionKey(artifact);
   const prefix = `${artifact.id}:`;
   const pdfPrefix = `/api/files/${artifact.id}/content`;
-  const shortV = artifact.sha256 ? artifact.sha256.slice(0, 12) : '';
+  const expected = versionQuery(artifact, true);
+  const stalePdf = (key: string): boolean => {
+    if (!key.startsWith(`${pdfPrefix}?`) && key !== pdfPrefix && !key.startsWith(`${pdfPrefix}@`)) return false;
+    const query = new URLSearchParams(key.slice(pdfPrefix.length).split('@p')[0].replace(/^\?/, ''));
+    return ['rev', 'v', 'd'].some((name) => query.get(name) !== expected.get(name));
+  };
   const staleCheck = (k: string) =>
     k.startsWith(prefix) && k !== currentKey && !k.startsWith(`${currentKey}:`);
   artifactTextCache.deleteWhere(staleCheck);
@@ -477,20 +501,25 @@ function purgeOldArtifactPayloads(artifact: Pick<ArtifactRecord, 'id' | 'sha256'
   tableSheetsCache.deleteWhere(staleCheck);
   docxHtmlCache.deleteWhere(staleCheck);
   svgMarkupCache.deleteWhere(staleCheck);
-  pdfBytesCache.deleteWhere((k) => k.startsWith(pdfPrefix) && (!shortV || !k.includes(`v=${shortV}`)));
-  pdfPageBitmapCache.deleteWhere((k) => k.startsWith(pdfPrefix) && (!shortV || !k.includes(`v=${shortV}`)));
+  pdfBytesCache.deleteWhere(stalePdf);
+  pdfPageBitmapCache.deleteWhere(stalePdf);
 }
 
-function upsertKnownArtifactInternal(artifact: ArtifactRecord): { changed: boolean } {
+function upsertKnownArtifactInternal(artifact: ArtifactRecord): { changed: boolean; artifact: ArtifactRecord } {
   let chatMap = knownArtifactsByChat.get(artifact.chatId);
   if (!chatMap) {
     chatMap = new Map<string, ArtifactRecord>();
     knownArtifactsByChat.set(artifact.chatId, chatMap);
   }
-  const prev = chatMap.get(artifact.id) ?? chatMap.get(`rel:${artifact.relPath}`);
+  const prev = chatMap.get(artifact.id);
+  if (prev && isStaleArtifactVersion(prev, artifact)) return { changed: false, artifact: prev };
+  if (prev && prev.relPath !== artifact.relPath && chatMap.get(`rel:${prev.relPath}`)?.id === artifact.id) {
+    chatMap.delete(`rel:${prev.relPath}`);
+    resolvedLinkCache.deleteWhere((key, cached) => key.startsWith(`${artifact.chatId}\0`) && cached.artifact.id === artifact.id);
+  }
   const changed =
     !prev ||
-    prev.sha256 !== artifact.sha256 ||
+    artifactVersionKey(prev) !== artifactVersionKey(artifact) ||
     prev.sizeBytes !== artifact.sizeBytes ||
     prev.updatedAt !== artifact.updatedAt ||
     prev.diffPatch !== artifact.diffPatch ||
@@ -519,11 +548,11 @@ function upsertKnownArtifactInternal(artifact: ArtifactRecord): { changed: boole
     return matchesSame;
   }, entry);
 
-  if (prev && (prev.sha256 !== artifact.sha256 || prev.updatedAt !== artifact.updatedAt)) {
+  if (prev && artifactVersionKey(prev) !== artifactVersionKey(artifact)) {
     purgeOldArtifactPayloads(artifact);
   }
 
-  return { changed };
+  return { changed, artifact };
 }
 
 export function seedChatArtifacts(chatId: string, artifacts: ArtifactRecord[]): void {
@@ -622,24 +651,21 @@ export async function resolveLinkCached(
   const existingPromise = !opts?.forceRefresh ? inFlightLinkResolves.get(cacheKey) : undefined;
   if (existingPromise) return existingPromise;
 
-  const capturedUser = activeCacheUserId;
+  const capturedGeneration = cacheGeneration;
   const resolveFn = opts?.fetcher ?? ((cid: string, ref: string) => api.resolveLink(cid, ref));
   const promise = resolveFn(chatId, reference)
     .then((res) => {
-      const normalizedUrl = buildArtifactContentUrl(res.artifact);
+      if (cacheGeneration !== capturedGeneration) {
+        throw new Error('VIEWER_CACHE_SCOPE_CHANGED');
+      }
+      const { changed, artifact } = upsertKnownArtifactInternal(res.artifact);
       const enriched: ResolvedLinkEntry = {
-        artifact: res.artifact,
-        previewUrl: res.previewUrl.includes('?v=') ? res.previewUrl : normalizedUrl,
-        downloadUrl: res.downloadUrl || buildArtifactContentUrl(res.artifact, { download: true }),
+        artifact,
+        previewUrl: buildArtifactContentUrl(artifact),
+        downloadUrl: buildArtifactContentUrl(artifact, { download: true }),
       };
-      if (activeCacheUserId !== capturedUser) {
-        return enriched;
-      }
-      const { changed } = upsertKnownArtifactInternal(enriched.artifact);
       resolvedLinkCache.set(cacheKey, enriched);
-      if (changed) {
-        emitArtifactUpdated(enriched.artifact);
-      }
+      if (changed) emitArtifactUpdated(artifact);
       return enriched;
     })
     .finally(() => {
