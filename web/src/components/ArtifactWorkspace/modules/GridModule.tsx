@@ -1,5 +1,4 @@
 import React,{useEffect,useMemo,useRef,useState} from 'react';
-import {useVirtualizer} from '@tanstack/react-virtual';
 import {previewFormulas} from '../formulaPreview';
 import { workspaceApi,supportsOperation } from '../../../api/workspace';
 import {ResponsiveCommandBar} from '../../shared-ui/layout/ResponsiveCommandBar';
@@ -95,8 +94,8 @@ export function GridModule(props:WorkspaceModuleProps){
   const rowAxis=axis(rowCount,CELL_HEIGHT,CELL_HEIGHT,viewport.height,viewport.top),colAxis=axis(colCount,CELL_WIDTH,HEADER,viewport.width,viewport.left);
   // TanStack only measures a bounded moving segment. The plane, coordinates and
   // scrollbar are continuous across the entire logical sheet, not page numbers.
-  const rows=useVirtualizer({count:rowAxis.length,getScrollElement:()=>scroll.current,estimateSize:()=>CELL_HEIGHT,overscan:4,scrollMargin:rowAxis.margin});
-  const cols=useVirtualizer({horizontal:true,count:colAxis.length,getScrollElement:()=>scroll.current,estimateSize:()=>CELL_WIDTH,overscan:2,scrollMargin:colAxis.margin});
+  const items=(a:ReturnType<typeof axis>)=>Array.from({length:a.length},(_,index)=>({index,start:a.margin+index*a.cell,size:a.cell}));
+  const rows=items(rowAxis),cols=items(colAxis);
   const current={row:Math.min(rowCount-1,selected.row),col:Math.min(colCount-1,selected.col)};
   useEffect(()=>{if(current.row!==selected.row||current.col!==selected.col){setSelected(current);setAnchor(current)}},[rowCount,colCount]);
   const bounds={row0:Math.min(anchor.row,current.row),row1:Math.max(anchor.row,current.row),col0:Math.min(anchor.col,current.col),col1:Math.max(anchor.col,current.col)};
@@ -171,7 +170,7 @@ export function GridModule(props:WorkspaceModuleProps){
   function move(row:number,col:number,extend=false){
     row=Math.max(0,Math.min(rowCount-1,row));col=Math.max(0,Math.min(colCount-1,col));
     setSelected({row,col});if(!extend)setAnchor({row,col});
-    scroll.current?.scrollTo({top:reveal(rowAxis,row),left:reveal(colAxis,col),behavior:'instant'});
+    const el=scroll.current;if(el){el.scrollTop=reveal(rowAxis,row);el.scrollLeft=reveal(colAxis,col);updateViewport()}
   }
   function jumpToRange(){
     const parts=jump.split(':'),first=parseAddress(parts[0]),last=parts.length===2?parseAddress(parts[1]):first;
@@ -245,10 +244,10 @@ export function GridModule(props:WorkspaceModuleProps){
     {structural&&<div className="workspace-toolbar" role="status">{structural.label}（保存時に反映）<button type="button" className="btn btn-secondary btn-xs" disabled={editingLocked} onClick={()=>artifact.revision!==undefined&&onDraft(artifact.revision,null,'grid-structure')}>取消</button></div>}
     {!sheet?<div className="workspace-loading">{structure.error?'表を表示できません。':'読み込み中…'}</div>:<div className="workspace-virtual-grid" ref={scroll} role="grid" aria-label="表データ" aria-busy={loading} aria-rowcount={rowCount+1} aria-colcount={colCount+1} tabIndex={0} onScroll={updateViewport} onKeyDown={e=>{const delta:Record<string,[number,number]>={ArrowUp:[-1,0],ArrowDown:[1,0],ArrowLeft:[0,-1],ArrowRight:[0,1]};if(delta[e.key]){e.preventDefault();move(current.row+delta[e.key][0],current.col+delta[e.key][1],e.shiftKey)}else if(e.key==='Enter'&&mode==='edit'){e.preventDefault();formulaInput.current?.focus()}}}>
       <div className="workspace-grid-plane" style={{width:colAxis.plane,height:rowAxis.plane}}>
-        <div role="row" className="workspace-grid-header" style={{height:CELL_HEIGHT}}><div role="columnheader" className="workspace-grid-corner" style={{width:HEADER}}/>{cols.getVirtualItems().map(c=><div key={colAxis.start+c.index} role="columnheader" className="workspace-grid-col" style={{left:c.start,width:c.size}}>{colName(colAxis.start+c.index)}</div>)}</div>
-        {rows.getVirtualItems().map(r=>{const row=rowAxis.start+r.index;return <div key={row} role="row" aria-rowindex={row+2} className="workspace-grid-row" style={{top:r.start,height:r.size}}>
+        <div role="row" className="workspace-grid-header" style={{height:CELL_HEIGHT}}><div role="columnheader" className="workspace-grid-corner" style={{width:HEADER}}/>{cols.map(c=><div key={colAxis.start+c.index} role="columnheader" className="workspace-grid-col" style={{left:c.start,width:c.size}}>{colName(colAxis.start+c.index)}</div>)}</div>
+        {rows.map(r=>{const row=rowAxis.start+r.index;return <div key={row} role="row" aria-rowindex={row+2} className="workspace-grid-row" style={{top:r.start,height:r.size}}>
           <div role="rowheader" className="workspace-grid-rowhead" style={{width:HEADER}}>{row+1}</div>
-          {cols.getVirtualItems().map(c=>{const col=colAxis.start+c.index,addr=address(row,col),cell=raw(row,col),pending=entries.has(key(row,col)),active=row>=bounds.row0&&row<=bounds.row1&&col>=bounds.col0&&col<=bounds.col1,preview=previews.get(addr),loaded=!!tile(row,col);return <div key={col} role="gridcell" aria-colindex={col+2} aria-selected={active} aria-label={addr} aria-busy={!loaded} onClick={e=>{move(row,col,e.shiftKey);scroll.current?.focus({preventScroll:true})}} title={preview!==undefined?'未保存の数式プレビュー':cell?.formulaStatus} data-formula-preview={preview!==undefined?'true':undefined} className={'workspace-grid-cell'+(pending?' pending':'')} style={{left:c.start,width:c.size,fontWeight:entries.get('style:'+key(row,col))?.operation.bold??cell?.bold?'bold':undefined}}>{preview??(pending?value(row,col):!loaded?'…':xlsx?String(cell?.value??''):original(row,col))}</div>})}
+          {cols.map(c=>{const col=colAxis.start+c.index,addr=address(row,col),cell=raw(row,col),pending=entries.has(key(row,col)),active=row>=bounds.row0&&row<=bounds.row1&&col>=bounds.col0&&col<=bounds.col1,preview=previews.get(addr),loaded=!!tile(row,col);return <div key={col} role="gridcell" aria-colindex={col+2} aria-selected={active} aria-label={addr} aria-busy={!loaded} onClick={e=>{move(row,col,e.shiftKey);scroll.current?.focus({preventScroll:true})}} title={preview!==undefined?'未保存の数式プレビュー':cell?.formulaStatus} data-formula-preview={preview!==undefined?'true':undefined} className={'workspace-grid-cell'+(pending?' pending':'')} style={{left:c.start,width:c.size,fontWeight:entries.get('style:'+key(row,col))?.operation.bold??cell?.bold?'bold':undefined}}>{preview??(pending?value(row,col):!loaded?'…':xlsx?String(cell?.value??''):original(row,col))}</div>})}
         </div>})}
       </div>
     </div>}
