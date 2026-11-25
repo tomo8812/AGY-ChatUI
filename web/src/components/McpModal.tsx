@@ -73,6 +73,97 @@ function formatServerStatusBadge(server: McpServerRecord): { label: string; tone
   return { label: '認証なし', tone: 'muted' };
 }
 
+function BuiltinArtifactSettings({ scope, id }: { scope: McpScope; id?: string }) {
+  const [settings, setSettings] = useState<Awaited<ReturnType<typeof api.getBuiltinMcpSettings>>>();
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [disabledTools, setDisabledTools] = useState<string[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    api.getBuiltinMcpSettings(scope, id).then((result) => {
+      if (active) {
+        if (!result?.effective || !Array.isArray(result.tools)) {
+          setError('内蔵ツールの設定を読み込めませんでした。');
+          return;
+        }
+        setSettings(result);
+        setEnabled(result.enabled);
+        setDisabledTools(result.disabledTools);
+      }
+    }).catch((failure) => {
+      if (active) setError(failure instanceof ApiError ? failure.message : '設定を読み込めませんでした。');
+    });
+    return () => { active = false; };
+  }, [scope, id]);
+
+  const save = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setBusy(true);
+    setError(undefined);
+    setSaved(false);
+    try {
+      const result = await api.putBuiltinMcpSettings(scope, id, { enabled, disabledTools });
+      setSettings(result);
+      setSaved(true);
+    } catch (failure) {
+      setError(failure instanceof ApiError ? failure.message : '設定を保存できませんでした。');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const activeDisabledTools = disabledTools ?? settings?.effective.disabledTools ?? [];
+  return (
+    <details className="skills-form-section" style={{ margin: '0 12px 12px' }}>
+      <summary>内蔵の成果物ツール</summary>
+      {error && <div className="error-box" role="alert">{error}</div>}
+      {settings && (
+        <form onSubmit={save}>
+          <fieldset disabled={busy}>
+            <label>
+              利用設定
+              <select value={enabled === null ? 'inherit' : String(enabled)} onChange={(event) => {
+                setSaved(false);
+                setEnabled(event.target.value === 'inherit' ? null : event.target.value === 'true');
+              }}>
+                <option value="inherit">既定の設定を使用</option>
+                <option value="true">有効</option>
+                <option value="false">無効</option>
+              </select>
+            </label>
+            <p className="muted-xs">現在の設定は{settings.effective.enabled ? '有効' : '無効'}です。</p>
+            <label>
+              <input type="checkbox" checked={disabledTools !== null} onChange={(event) => {
+                setSaved(false);
+                setDisabledTools(event.target.checked ? [...activeDisabledTools] : null);
+              }} />
+              操作ごとの許可を設定
+            </label>
+            {disabledTools !== null && settings.tools.map(({ name, label }) => (
+              <div key={name}>
+                <label>
+                  <input type="checkbox" checked={!disabledTools.includes(name)} onChange={(event) => {
+                    setSaved(false);
+                    setDisabledTools(event.target.checked
+                      ? disabledTools.filter((disabled) => disabled !== name)
+                      : [...disabledTools, name]);
+                  }} />
+                  {label}
+                </label>
+              </div>
+            ))}
+          </fieldset>
+          <button type="submit" className="btn btn-primary btn-xs" disabled={busy}>保存</button>
+          {saved && <span role="status">保存しました。</span>}
+        </form>
+      )}
+    </details>
+  );
+}
+
 export const McpModal: React.FC<McpModalProps> = ({
   mode = 'global',
   projectId = null,
@@ -1458,6 +1549,12 @@ export const McpModal: React.FC<McpModalProps> = ({
           <div className="muted-xs" style={{ padding: '0 12px 8px' }}>
             {scopeHint}
           </div>
+
+          {canUseCurrentScope && <BuiltinArtifactSettings
+            key={`${scopeTab}:${projectId ?? chatId ?? ''}`}
+            scope={scopeTab}
+            id={(mode === 'project' ? projectId : mode === 'chat' ? chatId : null) ?? undefined}
+          />}
 
           {!canUseCurrentScope ? (
             <div className="empty-box muted-sm" style={{ margin: '0 12px 12px' }}>

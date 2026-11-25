@@ -34,6 +34,14 @@ export type RuntimeProfile = 'full_runtime' | 'compact_doc_runtime' | 'base_chat
 export type SandboxIsolationKind = 'bwrap' | 'unsandboxed_explicit' | 'sandbox_required_blocked';
 export type StagingIsolationKind = 'bwrap_mount_isolated' | 'non_isolated_same_uid';
 
+export interface RenderRegion {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  unit?: 'norm' | 'px' | 'pt';
+}
+
 export interface ArtifactCapabilitiesResponse {
   format: ArtifactFormat;
   previewKind: PreviewKind;
@@ -190,7 +198,17 @@ export interface AdapterVerifyIssue {
   location?: string;
 }
 
+export interface AdapterVerifyCheck {
+  id: string;
+  status: 'passed' | 'failed' | 'unverified';
+  evidence: string;
+}
+
 export interface AdapterVerifyResult {
+  revision?: number;
+  sha256?: string;
+  coverage?: 'complete' | 'partial';
+  checks?: AdapterVerifyCheck[];
   ok: boolean;
   issues: AdapterVerifyIssue[];
   metrics?: Record<string, unknown>;

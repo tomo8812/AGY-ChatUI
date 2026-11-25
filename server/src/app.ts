@@ -17,6 +17,7 @@ import { loadConfig, type AppConfig } from './config.js';
 import { AppDatabase } from './db/database.js';
 import { EditRequestService } from './edit-requests/edit-request-service.js';
 import { McpService } from './mcp/mcp-service.js';
+import { BuiltinArtifactMcpServer } from './mcp/builtin-artifact-mcp.js';
 import { PushNotificationService } from './notifications/web-push.js';
 import { RichContentService } from './rich/rich-content-service.js';
 import { registerAuthRoutes, requireAuth } from './routes/auth-routes.js';
@@ -81,7 +82,8 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
   const pushService = new PushNotificationService(config, db, hub);
   const quotaService = new QuotaService(config, db, hub);
   const skillService = new SkillService(config, db, hub);
-  const mcpService = new McpService(config, db, hub);
+  const builtinMcp = new BuiltinArtifactMcpServer(db, artifactService, editRequestService, richContentService);
+  const mcpService = new McpService(config, db, hub, builtinMcp);
   const acp = new AcpClientManager(config, db, hub, artifactService, skillService, pushService, mcpService);
   const agyAuth = new AgyAuthManager(config, db, hub, acp);
   const scheduler = new ExecutionScheduler(config, db, hub, acp, pushService, quotaService);

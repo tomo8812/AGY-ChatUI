@@ -548,6 +548,11 @@ export class AppDatabase {
       );
       CREATE INDEX IF NOT EXISTS idx_sync_events_user_seq ON sync_events(user_id, seq);
 
+      CREATE TABLE IF NOT EXISTS builtin_mcp_settings (
+        scope_key TEXT PRIMARY KEY,
+        enabled INTEGER CHECK (enabled IN (0, 1)),
+        disabled_tools_json TEXT
+      );
       CREATE TABLE IF NOT EXISTS mcp_servers (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -1699,19 +1704,14 @@ export class AppDatabase {
     };
   }
 
-  appendConfirmedRichBlockToMessageInTx(userId: string, messageId: string, blockId: string, now: number): string[] {
-    const row = this.db
-      .prepare('SELECT rich_block_ids_json FROM messages WHERE id = ? AND user_id = ?')
-      .get(messageId, userId) as { rich_block_ids_json?: string } | undefined;
-    if (!row) return [];
-    const current = JSON.parse(row.rich_block_ids_json ? String(row.rich_block_ids_json) : '[]') as string[];
-    if (!current.includes(blockId)) {
-      current.push(blockId);
-      this.db
-        .prepare('UPDATE messages SET rich_block_ids_json = ?, updated_at = ? WHERE id = ? AND user_id = ?')
-        .run(JSON.stringify(current), now, messageId, userId);
-    }
-    return current;
+  syncConfirmedRichBlocksForMessageInTx(userId: string, messageId: string, now: number): void {
+    const ids = this.db.prepare(`
+      SELECT id FROM rich_blocks
+      WHERE user_id = ? AND confirmed_message_id = ? AND binding_state = 'confirmed_by_tool_call'
+      ORDER BY created_seq
+    `).all(userId, messageId) as Array<{ id: string }>;
+    this.db.prepare('UPDATE messages SET rich_block_ids_json = ?, updated_at = ? WHERE id = ? AND user_id = ?')
+      .run(JSON.stringify(ids.map(({ id }) => id)), now, messageId, userId);
   }
 
   // ---- Runs & Permissions ----
@@ -2699,6 +2699,27 @@ export class AppDatabase {
       )
       .all(adminUserId) as Array<Record<string, unknown>>;
     return rows.map((r) => this.mapMcpServerRow(r));
+  }
+
+  getBuiltinMcpSettings(scopeKey: string): { enabled: boolean | null; disabledTools: string[] | null } {
+    const row = this.db.prepare(
+      'SELECT enabled, disabled_tools_json FROM builtin_mcp_settings WHERE scope_key = ?'
+    ).get(scopeKey) as { enabled: number | null; disabled_tools_json: string | null } | undefined;
+    return {
+      enabled: row?.enabled == null ? null : Boolean(row.enabled),
+      disabledTools: row?.disabled_tools_json == null ? null : JSON.parse(row.disabled_tools_json),
+    };
+  }
+
+  setBuiltinMcpSettings(scopeKey: string, settings: { enabled: boolean | null; disabledTools: string[] | null }): void {
+    this.db.prepare(`
+      INSERT INTO builtin_mcp_settings (scope_key, enabled, disabled_tools_json) VALUES (?, ?, ?)
+      ON CONFLICT(scope_key) DO UPDATE SET enabled = excluded.enabled, disabled_tools_json = excluded.disabled_tools_json
+    `).run(
+      scopeKey,
+      settings.enabled === null ? null : Number(settings.enabled),
+      settings.disabledTools === null ? null : JSON.stringify(settings.disabledTools)
+    );
   }
 
   listEffectiveMcpServersForUser(

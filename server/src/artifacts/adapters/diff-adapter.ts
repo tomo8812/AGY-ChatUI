@@ -10,6 +10,7 @@ import type {
   TargetSelector,
 } from '../types.js';
 import {
+  editCapabilities,
   resolveTextSnippetByContext,
   sha256Text,
   splitLines,
@@ -17,6 +18,59 @@ import {
   type AdapterFileMeta,
   type FormatAdapter,
 } from './base.js';
+
+const HUNK_OPS = ['replace_hunk', 'remove_hunk'] as const;
+const hunkHeader = (h: ReturnType<typeof parsePatch>[number]['hunks'][number]) =>
+  `@@ -${h.oldStart},${h.oldLines} +${h.newStart},${h.newLines} @@`;
+
+function editHunk(source: string, op: AdapterOperation, remove: boolean): string {
+  const parsed = parsePatch(source);
+  const headers = [...source.matchAll(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@[^\r\n]*(?:\r?\n|$)/gm)];
+  let position = 0;
+  const candidates = parsed.flatMap((file, fileIndex) => file.hunks.map((hunk, hunkIndex) => ({
+    file, fileIndex, hunk, hunkIndex, location: headers[position++],
+  })));
+  const matches = candidates.filter(({ file, fileIndex, hunk, hunkIndex }) => (
+    (op.fileIndex === undefined || fileIndex === op.fileIndex) &&
+    (op.filePath === undefined || (file.newFileName || file.oldFileName || '').replace(/^[ab]\//, '') === op.filePath) &&
+    (op.hunkIndex !== undefined ? hunkIndex === op.hunkIndex : typeof op.hunkHeader === 'string' && hunkHeader(hunk) === op.hunkHeader)
+  ));
+  if (matches.length !== 1 || !matches[0].location ||
+      (op.expectedHunkHash !== undefined && sha256Text(matches[0].hunk.lines.join('\n')) !== op.expectedHunkHash)) {
+    throw new ArtifactError('DIFF_HUNK_CONFLICT', 'Select a unique hunk from the current structure.', 409);
+  }
+  const { file, hunk, hunkIndex, location } = matches[0];
+  const lines = remove ? [] : op.lines;
+  if (!Array.isArray(lines) || (!remove && (!lines.length || lines.some((line) => typeof line !== 'string' ||
+      /[\r\n]/.test(line) || !/^(?:[ +\-]|\\ No newline at end of file$)/.test(line))))) {
+    throw new ArtifactError('INVALID_DIFF_HUNK', 'Provide an array of unified diff body lines.', 400);
+  }
+  const start = location.index;
+  const bodyStart = start + location[0].length;
+  let end = bodyStart;
+  for (let i = 0; i < hunk.lines.length; i++) {
+    const newline = source.indexOf('\n', end);
+    end = newline < 0 ? source.length : newline + 1;
+  }
+  const newCount = lines.filter((line) => line.startsWith('+') || line.startsWith(' ')).length;
+  const oldCount = lines.filter((line) => line.startsWith('-') || line.startsWith(' ')).length;
+  const delta = newCount - oldCount - (hunk.newLines - hunk.oldLines);
+  if (!remove && hunkIndex + 1 < file.hunks.length && hunk.oldStart + oldCount > file.hunks[hunkIndex + 1].oldStart) {
+    throw new ArtifactError('DIFF_HUNK_OVERLAP', 'The edited hunk overlaps the next hunk.', 422);
+  }
+  let suffix = source.slice(end);
+  for (const next of candidates.filter((item) => item.file === file && item.hunkIndex > hunkIndex).reverse()) {
+    const offset = next.location.index - end;
+    const updated = next.location[0].replace(/ \+(\d+)/, (_, n) => ` +${Number(n) + delta}`);
+    suffix = suffix.slice(0, offset) + updated + suffix.slice(offset + next.location[0].length);
+  }
+  const eol = location[0].endsWith('\r\n') ? '\r\n' : '\n';
+  const header = location[0].replace(/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/,
+    `@@ -${hunk.oldStart - Number(oldCount === 0)},${oldCount} +${hunk.newStart - Number(newCount === 0)},${newCount} @@`).trimEnd();
+  const revised = source.slice(0, start) + (remove ? '' : header + eol + lines.join(eol) + (suffix || source.endsWith('\n') ? eol : '')) + suffix;
+  parsePatch(revised);
+  return revised;
+}
 
 export class DiffAdapter implements FormatAdapter {
   readonly format = 'diff' as const;
@@ -27,6 +81,7 @@ export class DiffAdapter implements FormatAdapter {
 
   getOperations(_ctx: AdapterCapabilityContext): OperationCapability[] {
     return [
+      ...editCapabilities('diff', HUNK_OPS),
       { operation: 'create', availability: 'supported', scope: 'mcp_and_ui' },
       { operation: 'get_structure', availability: 'supported', scope: 'mcp_and_ui' },
       { operation: 'read_range', availability: 'supported', scope: 'mcp_and_ui' },
@@ -50,11 +105,13 @@ export class DiffAdapter implements FormatAdapter {
     return {
       format: 'diff',
       lineCount: splitLines(text).length,
-      files: parsed.map((f) => ({
+      files: parsed.map((f, fileIndex) => ({
+        fileIndex,
         oldFileName: f.oldFileName,
         newFileName: f.newFileName,
-        hunks: f.hunks.map((h) => ({
-          header: `@@ -${h.oldStart},${h.oldLines} +${h.newStart},${h.newLines} @@`,
+        hunks: f.hunks.map((h, hunkIndex) => ({
+          hunkIndex,
+          header: hunkHeader(h),
           hunkHash: sha256Text(h.lines.join('\n')),
         })),
       })),
@@ -83,6 +140,13 @@ export class DiffAdapter implements FormatAdapter {
           throw new ArtifactError('SEARCH_NOT_FOUND', 'Diff search target not found.', 409);
         }
         text = text.replace(op.search, op.replace);
+      } else if (HUNK_OPS.some((name) => op.op === `diff.${name}` || op.op === name)) {
+        try {
+          text = editHunk(text, op, op.op.endsWith('remove_hunk'));
+        } catch (error) {
+          if (error instanceof ArtifactError) throw error;
+          throw new ArtifactError('INVALID_DIFF_HUNK', error instanceof Error ? error.message : 'Invalid diff.', 422);
+        }
       } else {
         throw unsupportedOperationError(op.op, 'unsupported_by_format', `Diff adapter does not support op '${op.op}'.`);
       }

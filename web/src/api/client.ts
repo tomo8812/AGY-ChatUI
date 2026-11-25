@@ -96,7 +96,25 @@ async function apiFetch<T>(
   return data as T;
 }
 
+interface BuiltinMcpPolicy {
+  enabled: boolean | null;
+  disabledTools: string[] | null;
+}
+
+interface BuiltinMcpSettings extends BuiltinMcpPolicy {
+  effective: { enabled: boolean; disabledTools: string[] };
+  tools: Array<{ name: string; label: string }>;
+}
+
 export const api = {
+  getBuiltinMcpSettings: (scope: McpScope, id?: string) => {
+    const query = new URLSearchParams({ scope });
+    if (id) query.set('id', id);
+    return apiFetch<BuiltinMcpSettings>(`/api/mcp/builtin-artifact?${query}`);
+  },
+  putBuiltinMcpSettings: (scope: McpScope, id: string | undefined, settings: BuiltinMcpPolicy) =>
+    apiFetch<BuiltinMcpSettings>('/api/mcp/builtin-artifact', { method: 'PUT', body: { scope, id, ...settings } }),
+
   bootstrap: () => apiFetch<BootstrapResponse>('/api/auth/bootstrap'),
 
   register: (payload: { username: string; displayName?: string; password: string }) =>

@@ -28,27 +28,19 @@ export function readMemAvailableMb(): number | null {
 
 export function detectRuntimeProfile(config: AppConfig): RuntimeProfile {
   const explicit = config.installDocRuntime;
-  if (explicit === '0' || explicit === 'base' || explicit === 'base_chatui' || explicit === 'none') {
+  if (['0', 'false', 'no', 'off', 'base', 'base_chatui', 'none'].includes(explicit)) {
     return 'base_chatui';
   }
-  const hasRuntimeDir = fs.existsSync(config.docRuntimeDir);
-  const hasPythonVenv = hasRuntimeDir && fs.existsSync(path.join(config.docRuntimeDir, 'venv'));
-  const hasChromium = hasRuntimeDir && fs.existsSync(path.join(config.docRuntimeDir, 'playwright'));
-  const totalRamGb = os.totalmem() / (1024 * 1024 * 1024);
-
-  if (explicit === 'full' && (hasRuntimeDir || totalRamGb >= 3.5)) {
-    return hasRuntimeDir ? 'full_runtime' : 'base_chatui';
-  }
-  if (!hasRuntimeDir || totalRamGb < 2.2) {
+  if (!fs.existsSync(path.join(config.docRuntimeDir, 'venv/bin/python3'))) {
     return 'base_chatui';
   }
-  if (hasPythonVenv && hasChromium && totalRamGb >= 3.5) {
-    return 'full_runtime';
-  }
-  if (hasPythonVenv) {
-    return 'compact_doc_runtime';
-  }
-  return 'base_chatui';
+  const totalRamGib = os.totalmem() / (1024 ** 3);
+  const forcedCompact = ['1', 'true', 'yes', 'on', 'compact', 'compact_doc_runtime'].includes(explicit);
+  const forcedFull = explicit === 'full' || explicit === 'full_runtime';
+  if (!forcedCompact && !forcedFull && totalRamGib < 2.2) return 'base_chatui';
+  const hasChromium = fs.existsSync(path.join(config.docRuntimeDir, 'playwright'));
+  if (!forcedCompact && hasChromium && (forcedFull || totalRamGib >= 3.5)) return 'full_runtime';
+  return 'compact_doc_runtime';
 }
 
 interface Waiter {

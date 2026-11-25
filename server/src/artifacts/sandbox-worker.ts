@@ -111,9 +111,22 @@ function readProcessTreeRssMb(rootPid: number): number {
   let totalKb = 0;
   const readOne = (pid: number) => {
     try {
-      const status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
-      const m = /^VmRSS:\s+(\d+)\s+kB$/m.exec(status);
-      if (m) totalKb += Number(m[1]);
+      let measured = false;
+      try {
+        const rollup = fs.readFileSync(`/proc/${pid}/smaps_rollup`, 'utf8');
+        const pss = /^Pss:\s+(\d+)\s+kB$/m.exec(rollup);
+        if (pss) {
+          totalKb += Number(pss[1]);
+          measured = true;
+        }
+      } catch {
+        // smaps_rollup unavailable on older kernels or restricted procfs; fall back to VmRSS
+      }
+      if (!measured) {
+        const status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
+        const m = /^VmRSS:\s+(\d+)\s+kB$/m.exec(status);
+        if (m) totalKb += Number(m[1]);
+      }
     } catch {
       // process may have exited
     }
@@ -221,7 +234,7 @@ export class DocWorkerSandbox {
             '--tmpfs', '/tmp',
             '--ro-bind', '/usr', '/usr',
           ];
-          for (const sysDir of ['/bin', '/lib', '/lib64', '/etc/fonts', '/etc/alternatives']) {
+          for (const sysDir of ['/bin', '/lib', '/lib64', '/etc/fonts', '/etc/alternatives', '/etc/libreoffice', '/etc/ld.so.cache']) {
             if (fs.existsSync(sysDir)) {
               bwrapArgs.push('--ro-bind', sysDir, sysDir);
             }
@@ -253,7 +266,17 @@ export class DocWorkerSandbox {
               cwd: tmpDir,
               env,
               stdio: ['ignore', 'pipe', 'pipe'],
+              detached: isolation !== 'bwrap',
             });
+
+            const killWorker = () => {
+              try {
+                if (isolation === 'bwrap') child.kill('SIGKILL');
+                else if (child.pid) process.kill(-child.pid, 'SIGKILL');
+              } catch {
+                // The process may have already exited.
+              }
+            };
 
             let stdout = '';
             let stderr = '';
@@ -273,11 +296,7 @@ export class DocWorkerSandbox {
                 `ドキュメント処理が制限時間（${timeoutMs}ms）を超過しました。`,
                 504
               );
-              try {
-                child.kill('SIGKILL');
-              } catch {
-                // ignore
-              }
+              killWorker();
             }, timeoutMs);
 
             const rssWatchdog = setInterval(() => {
@@ -289,11 +308,7 @@ export class DocWorkerSandbox {
                   `ドキュメント処理がメモリ上限（${rssLimitMb}MB）を超過しました（${rssMb}MB）。`,
                   503
                 );
-                try {
-                  child.kill('SIGKILL');
-                } catch {
-                  // ignore
-                }
+                killWorker();
               }
             }, 250);
             rssWatchdog.unref();

@@ -31,8 +31,13 @@ function stripQueryAndHash(raw: string): string {
 
 function resolveRelativeFrom(baseRelPath: string, rawRef: string): string | null {
   if (!isRelativeAssetRef(rawRef)) return null;
-  const clean = stripQueryAndHash(rawRef);
-  if (!clean) return null;
+  let clean: string;
+  try {
+    clean = decodeURIComponent(stripQueryAndHash(rawRef));
+  } catch {
+    return null;
+  }
+  if (!clean || /[\\\0]/.test(clean)) return null;
   const baseDir = path.posix.dirname(baseRelPath);
   const joined = baseDir === '.' ? clean : path.posix.join(baseDir, clean);
   if (joined.startsWith('..') || path.posix.isAbsolute(joined)) return null;
@@ -50,8 +55,8 @@ function extractCssUrls(cssText: string): { imports: string[]; urls: string[] } 
   for (const m of cssText.matchAll(/@import\s+(?:url\(\s*)?['"]([^'"]+)['"]\s*\)?/gi)) {
     imports.push(m[1]);
   }
-  for (const m of cssText.matchAll(/url\(\s*['"]?([^'")\s]+)['"]?\s*\)/gi)) {
-    urls.push(m[1]);
+  for (const m of cssText.matchAll(/url\(\s*(?:"([^"]+)"|'([^']+)'|([^'")\s]+))\s*\)/gi)) {
+    urls.push(m[1] ?? m[2] ?? m[3]);
   }
   return { imports, urls };
 }
@@ -63,6 +68,14 @@ function extractRawRefsForText(previewKind: PreviewKind, relPath: string, text: 
   if (previewKind === 'html') {
     for (const m of text.matchAll(/<(?:link|script|img|source)\b[^>]*\b(?:href|src)\s*=\s*['"]([^'"]+)['"]/gi)) {
       refs.push(m[1]);
+    }
+    for (const m of text.matchAll(/<(?:img|source)\b[^>]*\ssrcset\s*=\s*(["'])(.*?)\1/gi)) {
+      if (!m[2].includes('data:')) {
+        refs.push(...m[2].split(',').map((candidate) => candidate.trim().split(/\s+/)[0]));
+      }
+    }
+    for (const m of text.matchAll(/\sstyle\s*=\s*(["'])(.*?)\1/gi)) {
+      refs.push(...extractCssUrls(m[2]).urls);
     }
     for (const m of text.matchAll(/<video\b[^>]*\bposter\s*=\s*['"]([^'"]+)['"]/gi)) {
       refs.push(m[1]);

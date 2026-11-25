@@ -4,6 +4,7 @@ import { ArtifactError, unsupportedOperationError } from '../errors.js';
 import type {
   AdapterEditResult,
   AdapterOperation,
+  AdapterVerifyCheck,
   AdapterVerifyIssue,
   AdapterVerifyResult,
   OperationCapability,
@@ -18,6 +19,32 @@ import {
   type AdapterFileMeta,
   type FormatAdapter,
 } from './base.js';
+import { validateXmlWellFormedness } from './xml-validator.js';
+import { validateYamlSyntax } from './yaml-validator.js';
+import { decodeVerificationText, textVerificationReport, verificationMessage } from './text-verification.js';
+
+const XML_EXTENSIONS = new Set([
+  '.xml',
+  '.xhtml',
+  '.xsd',
+  '.xsl',
+  '.xslt',
+  '.plist',
+  '.rss',
+  '.atom',
+  '.csproj',
+  '.pom',
+]);
+
+const YAML_EXTENSIONS = new Set(['.yaml', '.yml']);
+
+export function codeVerificationChecks(filename: string): [string, ...string[]] {
+  const ext = path.extname(filename).toLowerCase();
+  if (ext === '.json') return ['code_encoding', 'json_syntax'];
+  if (YAML_EXTENSIONS.has(ext)) return ['code_encoding', 'yaml_syntax'];
+  if (XML_EXTENSIONS.has(ext)) return ['code_encoding', 'xml_syntax'];
+  return ['code_encoding'];
+}
 
 export class CodeAdapter implements FormatAdapter {
   readonly format = 'code' as const;
@@ -115,26 +142,36 @@ export class CodeAdapter implements FormatAdapter {
   }
 
   verify(buffer: Buffer, meta: AdapterFileMeta): AdapterVerifyResult {
-    const text = buffer.toString('utf8');
-    const ext = path.extname(meta.filename).toLowerCase();
+    const ids = codeVerificationChecks(meta.filename);
+    const input = decodeVerificationText(buffer, ids);
+    if ('report' in input) return input.report;
+    const { text } = input;
     const issues: AdapterVerifyIssue[] = [];
+    const checks: AdapterVerifyCheck[] = [{ id: 'code_encoding', status: 'passed', evidence: 'Valid UTF-8 with no NUL bytes.' }];
 
-    if (ext === '.json') {
+    if (ids.includes('json_syntax')) {
       try {
         JSON.parse(text);
-      } catch (err) {
-        issues.push({
-          severity: 'error',
-          code: 'JSON_SYNTAX_ERROR',
-          message: err instanceof Error ? err.message : 'Invalid JSON',
-        });
+        checks.push({ id: 'json_syntax', status: 'passed', evidence: 'Parsed JSON successfully.' });
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+        const message = verificationMessage(error.message);
+        checks.push({ id: 'json_syntax', status: 'failed', evidence: message });
+        issues.push({ severity: 'error', code: 'JSON_SYNTAX_ERROR', message });
       }
-    }
-    if (buffer.includes(0)) {
-      issues.push({ severity: 'error', code: 'BINARY_NULL_BYTE', message: 'NUL byte detected in text/code file.' });
+    } else if (ids.includes('yaml_syntax')) {
+      const yaml = validateYamlSyntax(text);
+      checks.push(...yaml.checks);
+      issues.push(...yaml.issues);
+    } else if (ids.includes('xml_syntax')) {
+      const xml = validateXmlWellFormedness(text);
+      checks.push({ id: 'xml_syntax', status: xml.status, evidence: xml.evidence });
+      issues.push(...xml.issues);
     }
 
-    return { ok: !issues.some((i) => i.severity === 'error'), issues };
+    let lineCount = 1;
+    for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) === 10) lineCount++;
+    return textVerificationReport(checks, issues, { lineCount, byteLength: buffer.length });
   }
 
   resolveTarget(buffer: Buffer, selector: TargetSelector, _meta: AdapterFileMeta): TargetResolutionResult {

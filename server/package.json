@@ -16,19 +16,29 @@
     "@fastify/multipart": "^10.1.8",
     "@fastify/static": "^10.1.11",
     "@fastify/websocket": "^11.3.7",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "css-select": "^6.0.0",
+    "css-tree": "^3.2.1",
     "diff": "^8.0.2",
     "fastify": "^5.12.8",
+    "mdast-util-from-markdown": "^2.1.0",
+    "mdast-util-gfm": "^3.1.0",
+    "micromark-extension-gfm": "^3.0.0",
     "mime-types": "^3.0.1",
+    "parse5": "^8.1.1",
+    "saxes": "^6.0.0",
+    "yaml": "^2.9.1",
     "zod": "^3.25.0"
   },
   "devDependencies": {
+    "@types/css-tree": "^2.3.11",
     "@types/diff": "^8.0.0",
     "@types/mime-types": "^3.0.1",
     "@types/node": "^24.19.2",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.19.4",
     "typescript": "^5.8.3",
     "vitest": "^5.1.0",
-    "ws": "^8.18.0",
-    "@types/ws": "^8.18.1"
+    "ws": "^8.18.0"
   }
 }

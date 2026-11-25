@@ -9,6 +9,8 @@
  *            tool calls, `session/request_permission`, `session/cancel`, and file creation inside `cwd`.
  */
 
+import { Client as McpClient } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -137,6 +139,8 @@ interface SessionState {
   mcpServers: unknown[];
   history: string[];
   cancelled: boolean;
+  restoreMethod?: 'load' | 'resume';
+  pendingMcpReceipt?: { toolCallId: string; name: string; rawOutput: unknown };
 }
 
 function buildConfigOptions({ modelId, effortValue, mode }: SessionState): SessionConfigOption[] {
@@ -296,7 +300,7 @@ function runAcpServer(): void {
       return {
         protocolVersion: Math.min(params.protocolVersion, PROTOCOL_VERSION),
         agentCapabilities: {
-          loadSession: true,
+          loadSession: process.env.MOCK_ACP_RESTORE_METHOD !== 'resume',
           mcpCapabilities: {
             http: true,
             sse: true,
@@ -388,6 +392,7 @@ function runAcpServer(): void {
       } else {
         state.mcpServers = Array.isArray(params.mcpServers) ? params.mcpServers : [];
       }
+      state.restoreMethod = 'load';
       await client.notify(methods.client.session.update, {
         sessionId: state.id,
         update: {
@@ -421,6 +426,7 @@ function runAcpServer(): void {
       } else {
         state.mcpServers = Array.isArray(params.mcpServers) ? params.mcpServers : [];
       }
+      state.restoreMethod = 'resume';
       await client.notify(methods.client.session.update, {
         sessionId: state.id,
         update: {
@@ -521,6 +527,87 @@ function runAcpServer(): void {
         return { stopReason: 'cancelled' as const };
       }
 
+      if (promptText.includes('[MCP_RICH_FLUSH]') && state.pendingMcpReceipt) {
+        const receipt = state.pendingMcpReceipt;
+        state.pendingMcpReceipt = undefined;
+        await sendUpdate({
+          sessionId: state.id,
+          update: { sessionUpdate: 'tool_call_update', status: 'completed', ...receipt },
+        });
+        return { stopReason: 'end_turn' as const };
+      }
+
+      const richMode = /\[MCP_RICH_(CREATE|UNATTACHED|DEFER|CHILD|UNTRACKED|CANCEL_WAIT)\]/.exec(promptText)?.[1];
+      const richReference = /\[MCP_RICH_REFERENCE:([a-f0-9-]{36})\]/.exec(promptText)?.[1];
+      if (richMode || richReference) {
+        const servers = state.mcpServers as Array<{
+          name?: string; url?: string; headers?: Array<{ name: string; value: string }>;
+        }>;
+        const server = servers.find((entry) => entry.name === 'agy_artifact');
+        if (!server?.url) throw new Error('Built-in Artifact MCP was not provided');
+        const mcp = new McpClient({ name: 'mock-agy', version: '1.0.0' });
+        await mcp.connect(new StreamableHTTPClientTransport(new URL(server.url), {
+          requestInit: { headers: Object.fromEntries((server.headers ?? []).map(({ name, value }) => [name, value])) },
+        }));
+        try {
+          const { tools } = await mcp.listTools();
+          if (tools.length !== 22) throw new Error('The built-in server did not advertise 22 tools');
+          if (richReference) {
+            const result = await mcp.callTool({ name: 'rich_get', arguments: { blockId: richReference } });
+            const content = result.content as Array<{ text?: string }>;
+            const block = !result.isError && JSON.parse(content[0].text ?? '{}');
+            const text = block && block.id === richReference
+              ? `${state.restoreMethod ?? 'initial'}: agy-rich://${richReference}`
+              : 'Rich reference denied';
+            await sendUpdate({ sessionId: state.id, update: {
+              sessionUpdate: 'agent_message_chunk', content: { type: 'text', text },
+            } });
+            return { stopReason: 'end_turn' as const };
+          }
+          const toolCallId = randomUUID();
+          const title = 'Create a rich document';
+          const name = 'mcp(agy_artifact/rich_create)';
+          const childId = richMode === 'CHILD' || richMode === 'UNTRACKED' ? `${state.id}-mcp-child` : null;
+          if (richMode === 'CHILD' && childId) {
+            await sendUpdate({
+              sessionId: state.id,
+              update: { sessionUpdate: 'subagent_update', sessionId: childId, title: 'MCP worker', state: { state: 'running' } },
+            });
+          }
+          if (richMode !== 'UNTRACKED') {
+            await sendUpdate({
+              sessionId: childId ?? state.id,
+              update: { sessionUpdate: 'tool_call', toolCallId, name, title, status: 'in_progress' },
+            });
+          }
+          const result = await mcp.callTool({ name: 'rich_create', arguments: {
+            document: { schemaVersion: 1, root: { type: 'markdown', id: 'sample', content: 'MCP fixture' } },
+          } });
+          if (result.isError) throw new Error(JSON.stringify(result.content));
+          const receipt = { toolCallId, name, rawOutput: result };
+          if (richMode === 'DEFER') {
+            state.pendingMcpReceipt = receipt;
+          } else if (richMode === 'CANCEL_WAIT') {
+            for (let tick = 0; tick < 120 && !state.cancelled; tick++) await delay(40);
+            return { stopReason: state.cancelled ? 'cancelled' as const : 'end_turn' as const };
+          } else if (richMode !== 'UNATTACHED') {
+            await sendUpdate({
+              sessionId: childId ?? state.id,
+              update: { sessionUpdate: 'tool_call_update', status: 'completed', ...receipt },
+            });
+          }
+          if (richMode === 'CHILD' && childId) {
+            await sendUpdate({
+              sessionId: state.id,
+              update: { sessionUpdate: 'subagent_update', sessionId: childId, state: { state: 'idle' } },
+            });
+          }
+        } finally {
+          await mcp.close();
+        }
+        return { stopReason: 'end_turn' as const };
+      }
+
       if (promptText.includes('[MCP_INSPECT]')) {
         await sendUpdate({
           sessionId: state.id,
@@ -528,7 +615,11 @@ function runAcpServer(): void {
             sessionUpdate: 'agent_message_chunk',
             content: {
               type: 'text',
-              text: `MCP_SERVERS:${JSON.stringify(state.mcpServers)}`,
+              text: `MCP_SERVERS:${JSON.stringify(state.mcpServers.filter((server) => {
+                const entry = server as { url?: string; name?: string };
+                return !/^agy_artifact(?:_builtin(?:_[0-9]+)?)?$/.test(entry.name ?? '') ||
+                  !/^http:\/\/127\.0\.0\.1:[0-9]+\/mcp$/.test(entry.url ?? '');
+              }))}`,
             },
           },
         });

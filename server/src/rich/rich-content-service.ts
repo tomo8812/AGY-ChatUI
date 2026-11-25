@@ -42,6 +42,7 @@ export interface RichArtifactSaveGateway {
     actorId?: string | null;
     idempotencyKey?: string;
     operationSummary?: string;
+    assertAuthorized?: () => void | Promise<void>;
   }): Promise<{ artifact: ArtifactRecord; noOp?: boolean }>;
 }
 
@@ -336,8 +337,9 @@ export class RichContentService {
     }
     const existing = this.getBlock(params.userId, params.chatId, params.blockId);
     if (!existing) return null;
+    if (existing.bindingState === 'confirmed_by_tool_call') return existing;
     const msg = this.db.getMessage(params.userId, params.messageId);
-    if (!msg || msg.chatId !== params.chatId) {
+    if (!msg || msg.chatId !== params.chatId || msg.role !== 'assistant') {
       throw new RichContentError('FORBIDDEN', 'Target message does not belong to this chat.', 403);
     }
 
@@ -357,7 +359,7 @@ export class RichContentService {
         )
         .run(params.messageId, params.runId ?? null, params.toolCallId, now, params.blockId, params.userId, params.chatId);
 
-      this.db.appendConfirmedRichBlockToMessageInTx(params.userId, params.messageId, params.blockId, now);
+      this.db.syncConfirmedRichBlocksForMessageInTx(params.userId, params.messageId, now);
 
       const updated = this.getBlockInternal(params.blockId)!;
       envelope = this.db.insertSyncEventInTx({
@@ -671,6 +673,7 @@ export class RichContentService {
     actorKind?: 'user' | 'ai' | 'system';
     actorId?: string | null;
     idempotencyKey?: string;
+    assertAuthorized?: () => void | Promise<void>;
   }): Promise<{ artifact: ArtifactRecord; noOp?: boolean }> {
     if (!this.artifactGateway) {
       throw new RichContentError('ARTIFACT_GATEWAY_UNAVAILABLE', 'ArtifactService is not configured.', 500);
@@ -699,6 +702,7 @@ export class RichContentService {
       actorKind: params.actorKind ?? 'user',
       actorId: params.actorId ?? params.userId,
       idempotencyKey: params.idempotencyKey,
+      assertAuthorized: params.assertAuthorized,
       operationSummary: `Save rich block ${block.id} as ${params.filename}`,
     });
   }

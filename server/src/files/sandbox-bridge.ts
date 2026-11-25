@@ -1,3 +1,6 @@
+export const HTML_SANDBOX_CSP =
+  "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; form-action 'none'; frame-ancestors 'self';";
+
 /**
  * Sandboxed HTML zoom-gesture bridge.
  *

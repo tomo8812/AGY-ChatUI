@@ -7,6 +7,7 @@ on:
   pull_request:
     branches:
       - main
+      - feat/artifact-platform-pr1
   workflow_dispatch:
     inputs:
       bump:
@@ -88,6 +89,18 @@ jobs:
 
       - name: Run automated test suite
         run: npm test
+
+      - name: Round-trip real document fixtures
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice-calc libreoffice-impress libreoffice-writer poppler-utils pandoc qpdf ffmpeg librsvg2-bin
+          python3 -m venv "${RUNNER_TEMP}/artifact-doc-tests"
+          "${RUNNER_TEMP}/artifact-doc-tests/bin/pip" install lxml openpyxl python-docx python-pptx pillow pypdf reportlab
+          curl --fail --silent --show-error --retry 3 \
+            https://raw.githubusercontent.com/apache/poi/cc7fcdfab3aad498c568ac6a562a48bd82df4030/test-data/slideshow/smartart-simple.pptx \
+            -o "${RUNNER_TEMP}/smartart-simple.pptx"
+          AGY_TEST_SMARTART_FILE="${RUNNER_TEMP}/smartart-simple.pptx" \
+            "${RUNNER_TEMP}/artifact-doc-tests/bin/python" -m unittest discover -s server/tests -p artifact_doc_worker_test.py
 
       - name: Package self-contained runtime bundle
         run: |

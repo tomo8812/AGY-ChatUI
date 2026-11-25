@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import { createTwoFilesPatch } from 'diff';
 import { probeBwrapSandbox } from '../acp/env-isolation.js';
 import type { AppConfig } from '../config.js';
@@ -29,7 +30,20 @@ import type {
   ProjectFileRecord,
   SyncEventEnvelope,
 } from '../types.js';
-import { detectArtifactFormat, FormatAdapterRegistry } from './adapters/registry.js';
+import {
+  DOCUMENT_WORKER_MAX_INPUT_BYTES,
+  WEB_VERIFY_MAX_INPUT_BYTES,
+  WEB_VERIFY_ASSET_BUDGET,
+  DocumentWorker,
+  isDocumentFormat,
+  isWebRenderFormat,
+  type DocumentVerifyOptions,
+} from './document-worker.js';
+import { detectArtifactFormat, documentFormatConstraint, DOCUMENT_ACTIONS, FormatAdapterRegistry } from './adapters/registry.js';
+import { codeVerificationChecks } from './adapters/code-adapter.js';
+import { HTML_VERIFICATION_CHECKS } from './adapters/html-validator.js';
+import { SVG_VERIFICATION_CHECKS } from './adapters/svg-verifier.js';
+import { MAX_TEXT_VERIFY_BYTES, MAX_VERIFY_NODES, skippedTextVerification, textVerificationReport } from './adapters/text-verification.js';
 import { executeRestoreBundle, getRestoreBatchRecord, recoverPendingRestoreBatches } from './batch-restore.js';
 import { PerUserBlobManager, type BlobLease } from './blob-store.js';
 import { recoverPendingCommits, type DeleteTargetInspection, type RecoveryReport } from './commit-recovery.js';
@@ -161,6 +175,7 @@ export class ArtifactService {
   public readonly undoService: ArtifactUndoService;
 
   private stagingIsolationOverride?: StagingIsolationKind;
+  private readonly documentWorker: DocumentWorker;
   private sameFsCheckOverride?: (pathA: string, pathB: string) => boolean;
   public commitFaultHook?: CommitFaultHook;
   private readonly updateListeners = new Set<(artifact: ArtifactRecord) => void>();
@@ -181,6 +196,7 @@ export class ArtifactService {
     this.registry = new FormatAdapterRegistry();
     this.governor = new ResourceGovernor(config);
     this.sandboxWorker = new DocWorkerSandbox(config, this.governor);
+    this.documentWorker = new DocumentWorker(config, this.governor, this.sandboxWorker);
     this.renderCache = new RenderCacheManager(config);
     this.undoService = new ArtifactUndoService(db);
     this.stagingIsolationOverride = opts.stagingIsolationOverride;
@@ -293,11 +309,11 @@ export class ArtifactService {
     });
   }
 
-  readActiveArtifactBytes(artifact: ArtifactRecord): Buffer | null {
+  readActiveArtifactBytes(artifact: ArtifactRecord, maxBytes?: number): Buffer | null {
     const rootDir = this.resolveScopeRootDir(artifact.userId, artifact.scopeKind, artifact.chatId, artifact.projectId);
     if (!rootDir) return null;
     try {
-      const res = readContainedRegularFileNoFollowStable(rootDir, artifact.relPath);
+      const res = readContainedRegularFileNoFollowStable(rootDir, artifact.relPath, { maxBytes });
       return res.buffer;
     } catch {
       return null;
@@ -1402,6 +1418,26 @@ export class ArtifactService {
   // Public Gateway Methods (ALL mutations & ingestions pass through here)
   // =========================================================================
 
+  private readPdfMergeSources(
+    userId: string, chatId: string | null | undefined, sourceIds: unknown
+  ): Buffer[] {
+    if (!chatId || !Array.isArray(sourceIds) || !sourceIds.length || sourceIds.length > 10 ||
+        sourceIds.some((id) => typeof id !== 'string' || !id.length)) {
+      throw new ArtifactError('INVALID_PDF_SOURCES', 'Specify one to ten PDF artifacts from this chat.', 422);
+    }
+    let remaining = DOCUMENT_WORKER_MAX_INPUT_BYTES;
+    return sourceIds.map((id) => {
+      const artifact = this.db.getArtifact(userId, id);
+      if (!artifact || artifact.chatId !== chatId || artifact.previewKind !== 'pdf') {
+        throw new ArtifactError('NOT_FOUND', 'A source PDF was not found in this chat.', 404);
+      }
+      const source = this.readActiveArtifactBytes(artifact, remaining);
+      if (!source) throw new ArtifactError('INVALID_PDF_SOURCE', 'A source PDF is missing or exceeds the merge limit.', 422);
+      remaining -= source.length;
+      return source;
+    });
+  }
+
   async createArtifact(params: {
     userId: string;
     scopeKind: ArtifactScopeKind;
@@ -1442,31 +1478,23 @@ export class ArtifactService {
       await params.assertAuthorized?.();
     };
 
-    const contentBuf =
-      params.content !== undefined
-        ? params.content
-        : (() => {
-            const adapter = this.registry.resolve(filename, detected.previewKind);
-            if (!adapter.create) {
-              throw unsupportedOperationError(
-                'create',
-                adapter.requiresExternalWorker ? 'disabled_by_resource_tier' : 'unsupported_by_format',
-                `形式 '${adapter.format}' の新規作成はこの環境ではサポートされていません。`
-              );
-            }
-            return adapter.create(params.createParams ?? {}, {
-              filename,
-              relPath,
-              mimeType: detected.mimeType,
-            });
-          })();
+    const adapter = this.registry.resolve(filename, detected.previewKind);
+    const workerCreateFormat = isDocumentFormat(adapter.format) && adapter.format !== 'media' ? adapter.format : null;
+    const createParams = params.createParams ?? {};
+    const fileMeta = { filename, relPath, mimeType: detected.mimeType };
+    const contentBuf = params.content ?? (!workerCreateFormat ? adapter.create?.(createParams, fileMeta) : undefined);
+    if (!contentBuf && !workerCreateFormat) {
+      throw unsupportedOperationError('create', 'unsupported_by_format', `Cannot create '${adapter.format}'.`);
+    }
 
     const fingerprint = computeRequestFingerprint({
       actorKind: params.actorKind,
       actorId: params.actorId ?? null,
       operationType: 'create',
       target: { scopeKind: params.scopeKind, scopeId, relPath },
-      operations: { sha256: crypto.createHash('sha256').update(contentBuf).digest('hex') },
+      operations: contentBuf
+        ? { sha256: crypto.createHash('sha256').update(contentBuf).digest('hex') }
+        : { filename, mimeType: detected.mimeType, createParams },
       baseRevision: 0,
     });
 
@@ -1502,6 +1530,12 @@ export class ArtifactService {
             });
           }
 
+          const mergeSources = !contentBuf && workerCreateFormat === 'pdf' && createParams.sourceArtifactIds !== undefined
+            ? this.readPdfMergeSources(params.userId, params.scopeKind === 'chat' ? params.chatId : null, createParams.sourceArtifactIds)
+            : [];
+          const buffer = workerCreateFormat && !contentBuf
+            ? await this.documentWorker.run(workerCreateFormat, filename, undefined, { action: 'create', params: createParams }, mergeSources)
+            : contentBuf!;
           const artifactId = crypto.randomUUID();
           return this.commitFileMutation({
             userId: params.userId,
@@ -1528,7 +1562,7 @@ export class ArtifactService {
             expectedPrevFingerprint: null,
             prevBuffer: null,
             prevDepHash: null,
-            newBuffer: contentBuf,
+            newBuffer: buffer,
             actorKind: params.actorKind,
             actorId: params.actorId ?? null,
             operationType: 'create',
@@ -3834,7 +3868,9 @@ export class ArtifactService {
           const rootDir = this.resolveScopeRootDir(current.userId, current.scopeKind, current.chatId, current.projectId);
           if (!rootDir) throw new ArtifactError('NOT_FOUND', '作業ディレクトリが見つかりません。', 404);
 
-          const prevRead = readContainedRegularFileNoFollowStable(rootDir, current.relPath);
+          const adapter = this.registry.resolve(current.filename, current.previewKind);
+          const maxBytes = isDocumentFormat(adapter.format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
+          const prevRead = readContainedRegularFileNoFollowStable(rootDir, current.relPath, { maxBytes });
           if (prevRead.sha256 !== current.sha256) {
             this.recordExternalSyncOnRecovery({
               userId: params.userId,
@@ -3857,12 +3893,22 @@ export class ArtifactService {
             );
           }
 
-          const adapter = this.registry.resolve(current.filename, current.previewKind);
-          const editResult = adapter.applyOperations(prevRead.buffer, params.operations, {
-            filename: current.filename,
-            relPath: current.relPath,
-            mimeType: current.mimeType,
-          });
+          if (isDocumentFormat(adapter.format)) {
+            const supported = DOCUMENT_ACTIONS[adapter.format];
+            const unsupported = params.operations.find(({ op }) => !supported.includes(op) || !op.includes('.') || op.endsWith('.get_structure'));
+            if (unsupported) {
+              throw unsupportedOperationError(unsupported.op, 'unsupported_by_format', `Cannot apply '${unsupported.op}' to '${adapter.format}'.`);
+            }
+          }
+          const editResult = isDocumentFormat(adapter.format)
+            ? {
+                buffer: await this.documentWorker.run(adapter.format, current.filename, prevRead.buffer, {
+                  action: 'edit',
+                  operations: params.operations,
+                }),
+                summary: 'Updated document',
+              }
+            : adapter.applyOperations(prevRead.buffer, params.operations, current);
 
           const committed = await this.commitFileMutation({
             userId: params.userId,
@@ -3920,64 +3966,693 @@ export class ArtifactService {
     return outcome;
   }
 
+  private readCapabilityInspectionBytes(userId: string, artifactId: string, maxBytes: number): Buffer | undefined {
+    try {
+      const pinned = this.openPinnedBlobMeta(userId, artifactId);
+      try {
+        const toRead = Math.min(pinned.sizeBytes, maxBytes);
+        const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+        const fd = fs.openSync(pinned.blobPath, flags);
+        try {
+          const st = fs.fstatSync(fd);
+          if (!st.isFile() || st.size !== pinned.sizeBytes) return undefined;
+          const buf = Buffer.allocUnsafe(toRead);
+          let filled = 0;
+          while (filled < toRead) {
+            const n = fs.readSync(fd, buf, filled, toRead - filled, filled);
+            if (n <= 0) break;
+            filled += n;
+          }
+          return filled === toRead ? buf : buf.subarray(0, filled);
+        } finally {
+          fs.closeSync(fd);
+        }
+      } finally {
+        pinned.releasePin();
+      }
+    } catch {
+      return undefined;
+    }
+  }
+
   getCapabilities(userId: string, artifactId: string): ArtifactCapabilitiesResponse {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
+    const format = this.registry.resolve(artifact.filename, artifact.previewKind).format;
+    const ext = path.extname(artifact.filename).toLowerCase();
+    let content: Buffer | undefined;
+    if (format === 'mermaid') {
+      content = this.readCapabilityInspectionBytes(userId, artifactId, 64 * 1024);
+    } else if (format === 'image') {
+      if (ext === '.gif' || artifact.mimeType === 'image/gif') {
+        content = this.readCapabilityInspectionBytes(userId, artifactId, 4 * 1024 * 1024);
+      } else if (['.png', '.webp'].includes(ext) || artifact.mimeType === 'image/png' || artifact.mimeType === 'image/webp') {
+        content = this.readCapabilityInspectionBytes(userId, artifactId, 64 * 1024);
+      }
+    }
     return this.registry.buildCapabilitiesResponse({
       filename: artifact.filename,
       previewKind: artifact.previewKind,
       runtimeProfile: this.governor.getRuntimeProfile(),
       sandboxIsolation: this.sandboxWorker.getIsolationStatus(),
       stagingIsolation: this.getStagingIsolation(),
+      content,
     });
   }
 
-  getStructure(userId: string, artifactId: string): Record<string, unknown> {
-    const artifact = this.db.getArtifact(userId, artifactId);
-    if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
-    const buf = this.readActiveArtifactBytes(artifact);
-    if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
-    const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
-    return {
-      artifactId: artifact.id,
-      revision: artifact.revision,
-      sha256: artifact.sha256,
-      ...adapter.getStructure(buf, {
-        filename: artifact.filename,
-        relPath: artifact.relPath,
-        mimeType: artifact.mimeType,
-      }),
-    };
+  private getCurrentRevisionSnapshot(userId: string, artifactId: string) {
+    const current = this.db.getArtifact(userId, artifactId);
+    if (!current) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
+    const artifact = this.ensureLegacyHistoryMigrated(current);
+    return this.getRevisionContentBlob(userId, artifactId, artifact.revision);
   }
 
-  readRange(userId: string, artifactId: string, range: Record<string, unknown>): Record<string, unknown> {
-    const artifact = this.db.getArtifact(userId, artifactId);
-    if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
-    const buf = this.readActiveArtifactBytes(artifact);
-    if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
-    const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
-    return {
-      artifactId: artifact.id,
-      revision: artifact.revision,
-      ...adapter.readRange(buf, range, {
-        filename: artifact.filename,
-        relPath: artifact.relPath,
-        mimeType: artifact.mimeType,
-      }),
-    };
+  private readCurrentRevision(userId: string, artifactId: string, maxBytes?: number) {
+    return this.readRevisionSnapshot(this.getCurrentRevisionSnapshot(userId, artifactId), maxBytes);
   }
 
-  verifyArtifact(userId: string, artifactId: string): AdapterVerifyResult {
-    const artifact = this.db.getArtifact(userId, artifactId);
-    if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
-    const buf = this.readActiveArtifactBytes(artifact);
-    if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
-    const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
-    return adapter.verify(buf, {
-      filename: artifact.filename,
-      relPath: artifact.relPath,
-      mimeType: artifact.mimeType,
+  private readRevisionSnapshot(snapshot: ReturnType<ArtifactService['getRevisionContentBlob']>, maxBytes?: number) {
+    if (maxBytes !== undefined && snapshot.sizeBytes > maxBytes) {
+      throw new ArtifactError('DOC_WORKER_INPUT_TOO_LARGE', 'Document input exceeds the worker size limit.', 413);
+    }
+    const bytes = fs.readFileSync(snapshot.blobPath);
+    if (crypto.createHash('sha256').update(bytes).digest('hex') !== snapshot.revision.sha256) {
+      throw new ArtifactError('REVISION_SNAPSHOT_UNAVAILABLE', 'Revision snapshot failed integrity verification.', 422);
+    }
+    return { artifact: snapshot.artifact, bytes, revision: snapshot.revision };
+  }
+
+  private readRenderDependencies(artifact: ArtifactRecord, revision: number, byteBudget: number) {
+    const rows = this.db.db.prepare(
+      `SELECT rel_path, blob_sha256, size_bytes, mime_type
+       FROM artifact_revision_deps WHERE user_id = ? AND artifact_id = ? AND revision = ? AND status = 'present'`
+    ).all(artifact.userId, artifact.id, revision) as Array<{
+      rel_path: string; blob_sha256: string | null; size_bytes: number; mime_type: string;
+    }>;
+    if (rows.length > 2000) {
+      throw new ArtifactError('DOC_WORKER_INPUT_TOO_LARGE', 'Too many render dependencies.', 413);
+    }
+    return rows.map((row) => {
+      byteBudget -= row.size_bytes;
+      if (byteBudget < 0) {
+        throw new ArtifactError('DOC_WORKER_INPUT_TOO_LARGE', 'Render dependencies exceed the worker size limit.', 413);
+      }
+      const bytes = row.blob_sha256 && this.blobManager.readBlob(artifact.userId, row.blob_sha256);
+      if (!bytes || bytes.length !== row.size_bytes ||
+          crypto.createHash('sha256').update(bytes).digest('hex') !== row.blob_sha256) {
+        throw new ArtifactError('REVISION_SNAPSHOT_UNAVAILABLE', 'A render dependency snapshot is unavailable.', 422);
+      }
+      return { relPath: row.rel_path, mimeType: row.mime_type, bytes };
     });
+  }
+
+  async getStructure(userId: string, artifactId: string): Promise<Record<string, unknown>> {
+    const artifact = this.db.getArtifact(userId, artifactId);
+    if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
+    const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
+    const maxBytes = isDocumentFormat(adapter.format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
+    const { bytes: buf, revision } = this.readCurrentRevision(userId, artifactId, maxBytes);
+    const format = adapter.format;
+    const structure = this.documentWorker.available && isDocumentFormat(format) &&
+      !documentFormatConstraint(format, artifact.filename, 'input')
+      ? JSON.parse((await this.documentWorker.run(format, artifact.filename, buf, { action: 'structure' })).toString('utf8'))
+      : adapter.getStructure(buf, artifact);
+    return {
+      ...structure,
+      artifactId: artifact.id,
+      revision: revision.revision,
+      sha256: revision.sha256,
+    };
+  }
+
+  private openPinnedBlobMeta(userId: string, artifactId: string): {
+    artifact: ArtifactRecord;
+    revision: ArtifactRevisionRecord;
+    blobPath: string;
+    sizeBytes: number;
+    releasePin: () => void;
+  } {
+    const current = this.db.getArtifact(userId, artifactId);
+    if (!current) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
+    const artifact = this.ensureLegacyHistoryMigrated(current);
+    const snapshot = this.getRevisionContentBlob(userId, artifactId, artifact.revision);
+    const releasePin = this.blobManager.pinBlob(userId, snapshot.revision.sha256);
+    try {
+      const st = fs.lstatSync(snapshot.blobPath);
+      if (!st.isFile() || st.isSymbolicLink() || st.size !== snapshot.sizeBytes) {
+        throw new ArtifactError('REVISION_SNAPSHOT_UNAVAILABLE', 'Revision snapshot failed integrity verification.', 422);
+      }
+      return {
+        artifact,
+        revision: snapshot.revision,
+        blobPath: snapshot.blobPath,
+        sizeBytes: snapshot.sizeBytes,
+        releasePin,
+      };
+    } catch (err) {
+      releasePin();
+      if (err instanceof ArtifactError) throw err;
+      throw new ArtifactError('REVISION_SNAPSHOT_UNAVAILABLE', 'Revision snapshot is unavailable.', 422);
+    }
+  }
+
+  private readByteRangeFromBlob(blobPath: string, totalBytes: number, range: Record<string, unknown>): Record<string, unknown> {
+    const MAX_BYTE_WINDOW = 512 * 1024;
+    const rawOffset = Number(range.offsetBytes ?? 0);
+    const offsetBytes = Number.isFinite(rawOffset) ? Math.max(0, Math.min(totalBytes, Math.floor(rawOffset))) : 0;
+    const rawMax = Number(range.maxBytes ?? 64 * 1024);
+    const requestedBytes = Number.isFinite(rawMax) ? Math.max(1, Math.min(MAX_BYTE_WINDOW, Math.floor(rawMax))) : 64 * 1024;
+    const toRead = Math.max(0, Math.min(requestedBytes, totalBytes - offsetBytes));
+    const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+    const fd = fs.openSync(blobPath, flags);
+    try {
+      const st = fs.fstatSync(fd);
+      if (!st.isFile() || st.size !== totalBytes) {
+        throw new ArtifactError('REVISION_SNAPSHOT_UNAVAILABLE', 'Revision snapshot failed integrity verification.', 422);
+      }
+      const chunk = Buffer.allocUnsafe(toRead);
+      let filled = 0;
+      while (filled < toRead) {
+        const n = fs.readSync(fd, chunk, filled, toRead - filled, offsetBytes + filled);
+        if (n <= 0) break;
+        filled += n;
+      }
+      const slice = filled === toRead ? chunk : chunk.subarray(0, filled);
+      return {
+        offsetBytes,
+        byteLength: slice.length,
+        totalBytes,
+        hasMore: offsetBytes + slice.length < totalBytes,
+        truncated: offsetBytes + slice.length < totalBytes,
+        text: slice.toString('utf8'),
+      };
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
+  private async streamLineRangeFromBlob(blobPath: string, totalBytes: number, range: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const MAX_RESPONSE_BYTES = 512 * 1024;
+    const rawStart = Number(range.startLine ?? 1);
+    const startLine = Number.isFinite(rawStart) ? Math.max(1, Math.floor(rawStart)) : 1;
+    const hasExplicitEnd = range.endLine !== undefined && range.endLine !== null;
+    const rawEnd = hasExplicitEnd ? Number(range.endLine) : startLine + 499;
+    const targetEndLine = Number.isFinite(rawEnd) ? Math.max(startLine, Math.floor(rawEnd)) : startLine + 499;
+    const rawMaxBytes = Number(range.maxBytes ?? MAX_RESPONSE_BYTES);
+    const maxResponseBytes = Number.isFinite(rawMaxBytes)
+      ? Math.max(1024, Math.min(MAX_RESPONSE_BYTES, Math.floor(rawMaxBytes)))
+      : MAX_RESPONSE_BYTES;
+
+    if (totalBytes === 0) {
+      return { startLine: 1, endLine: 1, totalLines: 1, totalBytes: 0, hasMore: false, truncated: false, text: '' };
+    }
+
+    return new Promise((resolve, reject) => {
+      const stream = fs.createReadStream(blobPath, { highWaterMark: 64 * 1024 });
+      const decoder = new StringDecoder('utf8');
+      let lineNo = 1;
+      let pending = '';
+      const collected: string[] = [];
+      let collectedBytes = 0;
+      let truncated = false;
+      let stoppedEarly = false;
+      let reachedEof = false;
+      let settled = false;
+
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        const actualEndLine = collected.length > 0 ? startLine + collected.length - 1 : Math.min(startLine, lineNo);
+        resolve({
+          startLine,
+          endLine: actualEndLine,
+          ...(reachedEof ? { totalLines: lineNo } : {}),
+          totalBytes,
+          hasMore: stoppedEarly || !reachedEof,
+          truncated,
+          text: collected.join('\n'),
+        });
+      };
+
+      const pushLine = (line: string) => {
+        if (lineNo >= startLine && lineNo <= targetEndLine) {
+          const remaining = maxResponseBytes - collectedBytes;
+          if (remaining <= 0) {
+            truncated = true;
+            stoppedEarly = true;
+            return false;
+          }
+          const lineBytes = Buffer.byteLength(line, 'utf8') + (collected.length > 0 ? 1 : 0);
+          if (lineBytes > remaining) {
+            const sliceBuf = Buffer.from(line, 'utf8').subarray(0, Math.max(0, remaining - (collected.length > 0 ? 1 : 0)));
+            collected.push(sliceBuf.toString('utf8'));
+            collectedBytes = maxResponseBytes;
+            truncated = true;
+            stoppedEarly = true;
+            return false;
+          }
+          collected.push(line);
+          collectedBytes += lineBytes;
+        }
+        return true;
+      };
+
+      stream.on('data', (chunk: Buffer | string) => {
+        if (settled) return;
+        const text = typeof chunk === 'string' ? chunk : decoder.write(chunk);
+        let cursor = 0;
+        while (cursor < text.length) {
+          const nlIdx = text.indexOf('\n', cursor);
+          if (nlIdx === -1) {
+            if (lineNo >= startLine && lineNo <= targetEndLine) {
+              const tail = text.slice(cursor);
+              if (pending.length + tail.length > maxResponseBytes) {
+                pending += tail.slice(0, Math.max(0, maxResponseBytes - pending.length));
+                truncated = true;
+                stoppedEarly = true;
+                pushLine(pending);
+                pending = '';
+                stream.destroy();
+                finish();
+                return;
+              }
+              pending += tail;
+            }
+            break;
+          }
+          const segment = text.slice(cursor, nlIdx);
+          const fullLine = lineNo >= startLine && lineNo <= targetEndLine ? pending + segment : '';
+          pending = '';
+          const ok = pushLine(fullLine.endsWith('\r') ? fullLine.slice(0, -1) : fullLine);
+          lineNo += 1;
+          cursor = nlIdx + 1;
+          if (!ok || lineNo > targetEndLine) {
+            stoppedEarly = true;
+            stream.destroy();
+            finish();
+            return;
+          }
+        }
+      });
+
+      stream.on('end', () => {
+        if (settled) return;
+        // Match splitLines() used by source adapters and structure/target
+        // coordinates. A final LF opens an empty logical line at EOF.
+        pushLine(pending + decoder.end());
+        reachedEof = true;
+        finish();
+      });
+
+      stream.on('close', () => {
+        if (!settled) finish();
+      });
+
+      stream.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      });
+    });
+  }
+
+  private async streamCsvRangeFromBlob(
+    blobPath: string,
+    totalBytes: number,
+    filename: string,
+    range: Record<string, unknown>
+  ): Promise<Record<string, unknown>> {
+    const MAX_RESPONSE_BYTES = 512 * 1024;
+    const delimiter = filename.toLowerCase().endsWith('.tsv') ? '\t' : ',';
+    const rawStartRow = Number(range.startRow ?? 0);
+    const startRow = Number.isFinite(rawStartRow) ? Math.max(0, Math.floor(rawStartRow)) : 0;
+    const rawEndRow = Number(range.endRow ?? startRow + 99);
+    const targetEndRow = Number.isFinite(rawEndRow) ? Math.max(startRow, Math.floor(rawEndRow)) : startRow + 99;
+    const rawStartCol = Number(range.startCol ?? 0);
+    const startCol = Number.isFinite(rawStartCol) ? Math.max(0, Math.floor(rawStartCol)) : 0;
+    const hasEndCol = range.endCol !== undefined && range.endCol !== null;
+    const requestedEndCol = hasEndCol && Number.isFinite(Number(range.endCol))
+      ? Math.max(startCol, Math.floor(Number(range.endCol)))
+      : undefined;
+
+    return new Promise((resolve, reject) => {
+      const stream = fs.createReadStream(blobPath, { highWaterMark: 64 * 1024 });
+      const decoder = new StringDecoder('utf8');
+      let rowIndex = 0;
+      let observedMaxCols = 0;
+      let inQuotes = false;
+      let pendingQuote = false;
+      let pendingCr = false;
+      let field = '';
+      let currentRow: string[] = [];
+      let fieldCountInRow = 0;
+      let isFirstChar = true;
+      const rows: string[][] = [];
+      let collectedBytes = 0;
+      let truncated = false;
+      let stoppedEarly = false;
+      let reachedEof = false;
+      let settled = false;
+
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        const maxColIndex = Math.max(0, observedMaxCols - 1);
+        const actualEndCol = requestedEndCol !== undefined ? Math.min(maxColIndex, requestedEndCol) : maxColIndex;
+        const sliced = rows.map((r) => r.slice(startCol, actualEndCol + 1));
+        const actualEndRow = sliced.length > 0 ? startRow + sliced.length - 1 : Math.min(startRow, Math.max(0, rowIndex - 1));
+        resolve({
+          startRow,
+          endRow: actualEndRow,
+          startCol,
+          endCol: actualEndCol,
+          ...(reachedEof ? { totalRows: rowIndex } : {}),
+          totalCols: observedMaxCols,
+          totalBytes,
+          hasMore: stoppedEarly || !reachedEof,
+          truncated,
+          rows: sliced,
+          valuesHash: crypto.createHash('sha256').update(JSON.stringify(sliced)).digest('hex'),
+        });
+      };
+
+      const commitField = () => {
+        if (rowIndex >= startRow && rowIndex <= targetEndRow) {
+          currentRow.push(field);
+        }
+        fieldCountInRow += 1;
+        field = '';
+      };
+
+      const commitRow = (): boolean => {
+        commitField();
+        if (fieldCountInRow > observedMaxCols) observedMaxCols = fieldCountInRow;
+        let keepGoing = true;
+        if (rowIndex >= startRow && rowIndex <= targetEndRow) {
+          const rowBytes = Buffer.byteLength(JSON.stringify(currentRow), 'utf8');
+          if (collectedBytes + rowBytes > MAX_RESPONSE_BYTES && rows.length > 0) {
+            truncated = true;
+            stoppedEarly = true;
+            keepGoing = false;
+          } else {
+            rows.push(currentRow);
+            collectedBytes += rowBytes;
+          }
+        }
+        currentRow = [];
+        fieldCountInRow = 0;
+        rowIndex += 1;
+        if (rowIndex > targetEndRow) {
+          stoppedEarly = true;
+          keepGoing = false;
+        }
+        return keepGoing;
+      };
+
+      const processText = (text: string): boolean => {
+        for (let i = 0; i < text.length; i++) {
+          const ch = text[i];
+          if (isFirstChar) {
+            isFirstChar = false;
+            if (ch === '\uFEFF') continue;
+          }
+          if (pendingCr) {
+            pendingCr = false;
+            if (ch === '\n') continue;
+          }
+          if (pendingQuote) {
+            pendingQuote = false;
+            if (ch === '"') {
+              if (rowIndex >= startRow && rowIndex <= targetEndRow && field.length < MAX_RESPONSE_BYTES) {
+                field += '"';
+              }
+              continue;
+            }
+            inQuotes = false;
+          }
+          if (inQuotes) {
+            if (ch === '"') {
+              pendingQuote = true;
+            } else if (rowIndex >= startRow && rowIndex <= targetEndRow && field.length < MAX_RESPONSE_BYTES) {
+              field += ch;
+            }
+            continue;
+          }
+          if (ch === '"' && field.length === 0) {
+            inQuotes = true;
+          } else if (ch === delimiter) {
+            commitField();
+          } else if (ch === '\r') {
+            pendingCr = true;
+            if (!commitRow()) return false;
+          } else if (ch === '\n') {
+            if (!commitRow()) return false;
+          } else if (rowIndex >= startRow && rowIndex <= targetEndRow && field.length < MAX_RESPONSE_BYTES) {
+            field += ch;
+          }
+        }
+        return true;
+      };
+
+      stream.on('data', (chunk: Buffer | string) => {
+        if (settled) return;
+        const text = typeof chunk === 'string' ? chunk : decoder.write(chunk);
+        if (!processText(text)) {
+          stream.destroy();
+          finish();
+        }
+      });
+
+      stream.on('end', () => {
+        if (settled) return;
+        const rem = decoder.end();
+        if (rem && !processText(rem)) {
+          finish();
+          return;
+        }
+        if (pendingQuote) {
+          pendingQuote = false;
+          inQuotes = false;
+        }
+        if (field.length > 0 || fieldCountInRow > 0) {
+          commitRow();
+        }
+        reachedEof = true;
+        finish();
+      });
+
+      stream.on('close', () => {
+        if (!settled) finish();
+      });
+
+      stream.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      });
+    });
+  }
+
+  async readRange(userId: string, artifactId: string, range: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const pinned = this.openPinnedBlobMeta(userId, artifactId);
+    try {
+      const { artifact, revision, blobPath, sizeBytes } = pinned;
+      const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
+      const format = adapter.format;
+
+      if (isDocumentFormat(format) && ['xlsx', 'docx', 'pptx', 'pdf'].includes(format)) {
+        if (this.documentWorker.available) {
+          if (sizeBytes > DOCUMENT_WORKER_MAX_INPUT_BYTES) {
+            throw new ArtifactError('DOC_WORKER_INPUT_TOO_LARGE', 'Document input exceeds the worker size limit.', 413);
+          }
+          const data = JSON.parse(
+            (await this.documentWorker.run(format, artifact.filename, { path: blobPath, sizeBytes }, { action: 'range', range })).toString('utf8')
+          ) as Record<string, unknown>;
+          return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+        }
+        const fallback = adapter.readRange(Buffer.alloc(0), range, artifact);
+        return { ...fallback, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+      }
+
+      if (format === 'csv') {
+        const data = await this.streamCsvRangeFromBlob(blobPath, sizeBytes, artifact.filename, range);
+        return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+      }
+
+      if (['code', 'markdown', 'html', 'svg', 'mermaid', 'diff'].includes(format)) {
+        const data = range.offsetBytes !== undefined
+          ? this.readByteRangeFromBlob(blobPath, sizeBytes, range)
+          : await this.streamLineRangeFromBlob(blobPath, sizeBytes, range);
+        return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+      }
+
+      const fallback = adapter.readRange(Buffer.alloc(0), range, artifact);
+      return { ...fallback, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+    } finally {
+      pinned.releasePin();
+    }
+  }
+
+  async renderPng(
+    userId: string,
+    artifactId: string,
+    options: { pageIndex?: number; timeSeconds?: number; variant?: 'background' | 'sprite'; shapeId?: number; region?: { x: number; y: number; width: number; height: number; unit?: 'norm' | 'px' | 'pt' } } = {}
+  ): Promise<{ png: Buffer; revision: number; sha256: string }> {
+    const artifact = this.db.getArtifact(userId, artifactId);
+    if (!artifact) throw new ArtifactError('NOT_FOUND', 'Artifact not found.', 404);
+    const format = this.registry.resolve(artifact.filename, artifact.previewKind).format;
+    if (options.variant && (format !== 'pptx' || (options.variant === 'sprite' && options.shapeId === undefined))) {
+      throw new ArtifactError('INVALID_RENDER_VARIANT', 'Choose a PPTX slide and shape for the requested rendition.', 422);
+    }
+    if (options.region) {
+      const { x, y, width, height, unit = 'norm' } = options.region;
+      if (![x, y, width, height].every(Number.isFinite) || width <= 0 || height <= 0 || x < 0 || y < 0) {
+        throw new ArtifactError('INVALID_RENDER_REGION', 'Render region requires finite non-negative x, y and positive width, height.', 400);
+      }
+      if (unit === 'norm' && (x >= 1 || y >= 1 || x + width > 1.001 || y + height > 1.001)) {
+        throw new ArtifactError('INVALID_RENDER_REGION', 'Normalized render region must fall within [0, 1].', 400);
+      }
+    }
+    if (!isDocumentFormat(format) && !isWebRenderFormat(format) && format !== 'svg' && format !== 'csv') {
+      throw unsupportedOperationError('render_png', 'unsupported_by_format', 'PNG rendering is unavailable for this format.');
+    }
+    const constraint = documentFormatConstraint(format, artifact.filename, 'render_png', artifact.previewKind);
+    if (constraint) throw unsupportedOperationError('render_png', 'unsupported_by_format', constraint);
+    const snapshot = this.readCurrentRevision(userId, artifactId, DOCUMENT_WORKER_MAX_INPUT_BYTES);
+    const source = snapshot.bytes;
+    const dependencies = isWebRenderFormat(format) || format === 'svg'
+      ? this.readRenderDependencies(snapshot.artifact, snapshot.revision.revision, DOCUMENT_WORKER_MAX_INPUT_BYTES - source.length)
+      : [];
+    const png = artifact.mimeType === 'image/png' && !this.documentWorker.available && !options.region
+      ? source
+      : await this.documentWorker.run(format, artifact.filename, source, { action: 'render', ...options }, [], { entry: artifact.relPath, dependencies });
+    if (png.length < 24 || png.length > 16 * 1024 * 1024 ||
+      !png.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex')) ||
+      png.toString('ascii', 12, 16) !== 'IHDR' ||
+      png.readUInt32BE(16) < 1 || png.readUInt32BE(16) > 8192 ||
+      png.readUInt32BE(20) < 1 || png.readUInt32BE(20) > 8192) {
+      throw new ArtifactError('INVALID_RENDER_IMAGE', 'Invalid or oversized PNG.', 422);
+    }
+    return { png, revision: snapshot.revision.revision, sha256: snapshot.revision.sha256 };
+  }
+
+  async verifyArtifact(
+    userId: string,
+    artifactId: string,
+    options?: DocumentVerifyOptions
+  ): Promise<AdapterVerifyResult> {
+    const artifact = this.db.getArtifact(userId, artifactId);
+    if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
+    const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
+    const format = adapter.format;
+    const snapshot = this.getCurrentRevisionSnapshot(userId, artifactId);
+    const { revision } = snapshot;
+    const identity = { revision: revision.revision, sha256: revision.sha256 };
+    const browser = (format === 'html' || format === 'svg') && this.documentWorker.browserVerificationAvailable;
+    const textLimit = browser ? WEB_VERIFY_MAX_INPUT_BYTES : MAX_TEXT_VERIFY_BYTES;
+    const checkIds = format === 'code' ? codeVerificationChecks(artifact.filename)
+      : format === 'html' ? HTML_VERIFICATION_CHECKS
+        : format === 'svg' ? SVG_VERIFICATION_CHECKS : undefined;
+    if (checkIds && snapshot.sizeBytes > textLimit) {
+      return {
+        ...skippedTextVerification(checkIds, `Source exceeds the ${textLimit}-byte verification budget.`),
+        ...identity,
+      };
+    }
+    const maxBytes = checkIds ? textLimit : isDocumentFormat(format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
+    const { bytes: buf } = this.readRevisionSnapshot(snapshot, maxBytes);
+    if (this.documentWorker.available && isDocumentFormat(format)) {
+      let compareDocument: Buffer | undefined;
+      if (format === 'pdf' && revision.revision > 1) {
+        const previousRev = this.db.db
+          .prepare('SELECT blob_sha256 FROM artifact_revisions WHERE artifact_id = ? AND revision = ?')
+          .get(artifactId, revision.revision - 1) as { blob_sha256: string | null } | undefined;
+        if (previousRev?.blob_sha256) {
+          const prevBytes = this.blobManager.readBlob(userId, previousRev.blob_sha256);
+          if (prevBytes && prevBytes.length <= DOCUMENT_WORKER_MAX_INPUT_BYTES - buf.length) {
+            compareDocument = prevBytes;
+          }
+        }
+      }
+      try {
+        return {
+          ...JSON.parse((await this.documentWorker.run(
+            format, artifact.filename, buf, { action: 'verify', ...(options ? { options } : {}) }, [],
+            compareDocument ? { entry: artifact.relPath, dependencies: [], compareDocument } : undefined
+          )).toString('utf8')),
+          ...identity,
+        };
+      } catch (error) {
+        if (!(error instanceof ArtifactError) || error.code !== 'DOCUMENT_WORKER_REJECTED') throw error;
+        return { ...identity, ok: false, issues: [{ severity: 'error', code: error.code, message: error.message }] };
+      }
+    }
+    if (format === 'mermaid' && this.documentWorker.fullWebRuntimeAvailable) {
+      try {
+        const parsedReport = JSON.parse(
+          (await this.documentWorker.run('mermaid', artifact.filename, buf, { action: 'verify' })).toString('utf8')
+        ) as AdapterVerifyResult;
+        return { ...parsedReport, ...identity };
+      } catch (error) {
+        if (!(error instanceof ArtifactError) || error.code !== 'DOCUMENT_WORKER_REJECTED') throw error;
+      }
+    }
+    let verifyMeta: Parameters<typeof adapter.verify>[1] = artifact;
+    if (format === 'html') {
+      const depRows = this.db.db
+        .prepare(
+          `SELECT rel_path, status
+           FROM artifact_revision_deps
+           WHERE user_id = ? AND artifact_id = ? AND revision = ?
+           LIMIT ?`
+        )
+        .all(userId, artifactId, revision.revision, MAX_VERIFY_NODES + 1) as Array<{
+        rel_path: string;
+        status: 'present' | 'missing' | 'outside_root';
+      }>;
+      verifyMeta = {
+        ...artifact,
+        dependencyManifestTruncated: depRows.length > MAX_VERIFY_NODES,
+        dependencies: depRows.slice(0, MAX_VERIFY_NODES).map((row) => ({ relPath: row.rel_path, status: row.status })),
+      };
+    }
+    const staticReport = adapter.verify(buf, verifyMeta);
+    if (browser && (format === 'html' || format === 'svg')) {
+      try {
+        const dependencies = this.readRenderDependencies(snapshot.artifact, revision.revision, WEB_VERIFY_ASSET_BUDGET);
+        const browserReport = JSON.parse((await this.documentWorker.run(
+          format, artifact.filename, buf, { action: 'verify', options }, [],
+          { entry: artifact.relPath, dependencies },
+        )).toString('utf8')) as AdapterVerifyResult;
+        const confirmed = format === 'svg' ? ['svg_overlap', 'svg_bounds'] : ['html_relative_refs', 'html_csp'];
+        const runtime = browserReport.checks ?? [];
+        const staticChecks = (staticReport.checks ?? []).filter(({ id, status }) =>
+          status !== 'unverified' || !confirmed.includes(id) || browserReport.coverage !== 'complete');
+        return {
+          ...textVerificationReport([...staticChecks, ...runtime], [...staticReport.issues, ...browserReport.issues],
+            { ...staticReport.metrics, ...browserReport.metrics }),
+          ...identity,
+        };
+      } catch (error) {
+        if (!(error instanceof ArtifactError) ||
+          !['DOCUMENT_WORKER_REJECTED', 'DOC_WORKER_INPUT_TOO_LARGE', 'DOC_WORKER_TIMEOUT', 'DOC_WORKER_RSS_EXCEEDED'].includes(error.code)) throw error;
+        return {
+          ...textVerificationReport([...(staticReport.checks ?? []), { id: `${format}_browser`, status: 'unverified', evidence: error.message }],
+            staticReport.issues, staticReport.metrics),
+          ...identity,
+        };
+      }
+    }
+    if (options && (options.selector !== undefined || options.elementOffset !== undefined || options.maxElements !== undefined) &&
+        (format === 'html' || format === 'svg')) {
+      return {
+        ...textVerificationReport([...(staticReport.checks ?? []),
+          { id: `${format}_browser`, status: 'unverified', evidence: 'Targeted browser verification requires Full Runtime with bwrap.' }],
+          staticReport.issues, staticReport.metrics),
+        ...identity,
+      };
+    }
+    return { ...staticReport, ...identity };
   }
 
   async exportArtifact(params: {
@@ -3996,21 +4671,47 @@ export class ArtifactService {
     if (params.actorKind === 'ai' && src.scopeKind === 'project') {
       throw new ArtifactError('FORBIDDEN', 'AI/内蔵MCPからプロジェクト原本スコープへのエクスポートは禁止されています。', 403);
     }
-    const buf = this.readActiveArtifactBytes(src);
-    if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
     const adapter = this.registry.resolve(src.filename, src.previewKind);
-    if (!adapter.exportAs) {
+    const fmt = adapter.format;
+    const target = params.targetFormat.toLowerCase();
+    const maxBytes = isDocumentFormat(fmt) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
+    const snapshot = this.readCurrentRevision(params.userId, params.artifactId, maxBytes);
+    const buf = snapshot.bytes;
+    let exported: AdapterExportResult;
+    const workerMarkdownExport = fmt === 'markdown' && (target === 'pdf' || target === 'docx' || target === 'png');
+    const workerMermaidExport = fmt === 'mermaid' && (target === 'svg' || target === 'png');
+    const workerSvgOrHtmlPng = (fmt === 'svg' || fmt === 'html') && target === 'png';
+    if (adapter.exportAs && !workerMarkdownExport) {
+      exported = adapter.exportAs(buf, target, src);
+    } else if (workerMarkdownExport || workerMermaidExport || workerSvgOrHtmlPng) {
+      const filename = `${path.parse(src.filename).name}.${target}`;
+      const dependencies = isWebRenderFormat(fmt) || fmt === 'svg'
+        ? this.readRenderDependencies(snapshot.artifact, snapshot.revision.revision, DOCUMENT_WORKER_MAX_INPUT_BYTES - buf.length)
+        : [];
+      const buffer = fmt === 'svg' && target === 'png'
+        ? await this.documentWorker.run('svg', src.filename, buf, { action: 'render' }, [], { entry: src.relPath, dependencies })
+        : await this.documentWorker.run(fmt, src.filename, buf, { action: 'export', targetFormat: target }, [], { entry: src.relPath, dependencies });
+      exported = {
+        filename,
+        mimeType: detectMimeAndPreviewKind(filename, null).mimeType,
+        buffer,
+      };
+    } else if (isDocumentFormat(fmt) &&
+      DOCUMENT_ACTIONS[fmt].includes(`export:${target}`)) {
+      const filename = `${path.parse(src.filename).name}.${target}`;
+      exported = {
+        filename,
+        mimeType: detectMimeAndPreviewKind(filename, null).mimeType,
+        buffer: await this.documentWorker.run(fmt, src.filename, buf, {
+          action: 'export', targetFormat: target,
+        }),
+      };
+    } else {
       throw unsupportedOperationError(
-        `export:${params.targetFormat}`,
-        adapter.requiresExternalWorker ? 'disabled_by_resource_tier' : 'unsupported_by_format',
-        `形式 '${adapter.format}' から '${params.targetFormat}' への変換はサポートされていません。`
+        `export:${target}`, 'unsupported_by_format',
+        `Cannot export '${fmt}' as '${target}'.`
       );
     }
-    const exported = adapter.exportAs(buf, params.targetFormat, {
-      filename: src.filename,
-      relPath: src.relPath,
-      mimeType: src.mimeType,
-    });
     const outRelPath = params.outputRelPath ? normalizeRelPath(params.outputRelPath) : normalizeRelPath(exported.filename);
     const created = await this.createArtifact({
       userId: params.userId,
@@ -4024,7 +4725,7 @@ export class ArtifactService {
       actorKind: params.actorKind,
       actorId: params.actorId ?? null,
       idempotencyKey: params.idempotencyKey,
-      operationSummary: `Exported ${src.filename} to ${params.targetFormat}`,
+      operationSummary: `Exported ${src.filename} to ${target}`,
       assertAuthorized: params.assertAuthorized,
     });
     return { artifact: created.artifact, exported };

@@ -6,7 +6,7 @@ import { convertPresentationToPdfCached } from '../files/artifacts.js';
 import { computeStrongEtag, formatHttpDate, isFreshRequest } from '../files/http-cache.js';
 import { resolveArtifactFile, resolveAuthorizedChatFileReference } from '../files/link-resolver.js';
 import { listWorkspaceFiles, resolveContainedExistingPath } from '../files/workspace.js';
-import { injectSandboxZoomBridge } from '../files/sandbox-bridge.js';
+import { HTML_SANDBOX_CSP, injectSandboxZoomBridge } from '../files/sandbox-bridge.js';
 import type { ArtifactRecord } from '../types.js';
 import { buildLiveSessionAuthVerifier, requireAuth, type RouteDeps } from './auth-routes.js';
 
@@ -483,10 +483,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
       'Cache-Control',
       hasMatchingVersion ? 'private, max-age=300, stale-while-revalidate=3600' : 'private, max-age=0, must-revalidate'
     );
-    reply.header(
-      'Content-Security-Policy',
-      "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; form-action 'none'; frame-ancestors 'self';"
-    );
+    reply.header('Content-Security-Policy', HTML_SANDBOX_CSP);
     reply.header('Content-Type', 'text/html; charset=utf-8');
 
     if (isFreshRequest(req.headers, etag, stat.mtimeMs)) {
@@ -545,7 +542,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     if (!session) return;
     const { artifactId } = req.params as { artifactId: string };
     try {
-      return artifactService.getStructure(session.user.id, artifactId);
+      return await artifactService.getStructure(session.user.id, artifactId);
     } catch (err) {
       return sendArtifactError(reply, err);
     }
@@ -557,9 +554,46 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const { artifactId } = req.params as { artifactId: string };
     const query = (req.query ?? {}) as Record<string, unknown>;
     try {
-      return artifactService.readRange(session.user.id, artifactId, query);
+      return await artifactService.readRange(session.user.id, artifactId, {
+        ...query, ...(query.evaluate === 'true' ? { evaluate: true } : {}),
+      });
     } catch (err) {
       return sendArtifactError(reply, err);
+    }
+  });
+
+  const renderQuerySchema = z.object({
+    pageIndex: z.coerce.number().int().min(0).optional(),
+    timeSeconds: z.coerce.number().finite().min(0).optional(),
+    variant: z.enum(['background', 'sprite']).optional(),
+    shapeId: z.coerce.number().int().positive().optional(),
+    regionX: z.coerce.number().finite().min(0).optional(),
+    regionY: z.coerce.number().finite().min(0).optional(),
+    regionWidth: z.coerce.number().finite().positive().optional(),
+    regionHeight: z.coerce.number().finite().positive().optional(),
+    regionUnit: z.enum(['norm', 'px', 'pt']).optional(),
+  });
+
+  app.get('/api/files/:artifactId/render', async (req, reply) => {
+    const session = requireAuth(req, reply, db);
+    if (!session) return;
+    const query = renderQuerySchema.safeParse(req.query);
+    if (!query.success) return reply.code(400).send({ error: 'INVALID_RENDER_OPTIONS' });
+    const { regionX, regionY, regionWidth, regionHeight, regionUnit, ...baseOptions } = query.data;
+    const hasAnyRegion = [regionX, regionY, regionWidth, regionHeight].some((v) => v !== undefined);
+    if (hasAnyRegion && [regionX, regionY, regionWidth, regionHeight].some((v) => v === undefined)) {
+      return reply.code(400).send({ error: 'INVALID_RENDER_REGION' });
+    }
+    const region = hasAnyRegion
+      ? { x: regionX!, y: regionY!, width: regionWidth!, height: regionHeight!, unit: regionUnit }
+      : undefined;
+    const { artifactId } = req.params as { artifactId: string };
+    try {
+      const { png, revision, sha256 } = await artifactService.renderPng(session.user.id, artifactId, { ...baseOptions, region });
+      return reply.type('image/png').header('Cache-Control', 'private, no-store')
+        .header('X-Artifact-Revision', revision).header('X-Artifact-Sha256', sha256).send(png);
+    } catch (error) {
+      return sendArtifactError(reply, error);
     }
   });
 
@@ -622,8 +656,22 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const session = requireAuth(req, reply, db);
     if (!session) return;
     const { artifactId } = req.params as { artifactId: string };
+    const parsed = z
+      .object({
+        slideIndices: z.array(z.number().int().min(0).max(500)).max(50).optional(),
+        maxSlides: z.number().int().min(1).max(50).optional(),
+        maxShapesPerSlide: z.number().int().min(1).max(100).optional(),
+        selector: z.string().min(1).max(512).optional(),
+        elementOffset: z.number().int().min(0).max(100_000).optional(),
+        maxElements: z.number().int().min(1).max(250).optional(),
+      })
+      .optional()
+      .safeParse(req.body ?? undefined);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'verify options が不正です。' });
+    }
     try {
-      return artifactService.verifyArtifact(session.user.id, artifactId);
+      return await artifactService.verifyArtifact(session.user.id, artifactId, parsed.data);
     } catch (err) {
       return sendArtifactError(reply, err);
     }
