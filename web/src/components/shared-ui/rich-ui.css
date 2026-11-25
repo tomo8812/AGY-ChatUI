@@ -70,3 +70,5 @@
  .rich-hide-pc{display:block}.rich-hide-mobile{display:none}
  .rich-document .btn{min-height:36px}
 }
+
+.rich-virtual-table{overflow-wrap:anywhere}.rich-table-scroll .rich-table-spacer{padding:0;border:0;line-height:0;min-width:0}.rich-table-scroll:focus-visible{outline:2px solid var(--border-strong);outline-offset:2px}

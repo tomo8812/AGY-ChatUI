@@ -18,9 +18,13 @@ const children:RichNode[]=[
   {id:'description',type:'text',content:{expr:'concat("Load: ", $computed.total)'}},
   {id:'svg',type:'svg_scene',viewBox:'0 0 120 60',title:'Light coverage',elements:[{tag:'circle',id:'lamp',attrs:{cx:60,cy:30,r:{expr:'$state.power * 2'},fill:'#f0b450'}}]},
   ...charts,
+  {id:'readings',type:'data_table',columns:[{key:'label',label:'Exhibit'},{key:'reading',label:'Lux',missingLabel:'Missing'}],
+    rows:Array.from({length:160},(_,i)=>({label:'Exhibit '+String(i+1).padStart(3,'0'),reading:i===0?{value:null,missingReason:'Sensor offline',sourceId:'meter-a',asOf:'2026-01-01',fetchedAt:'2026-01-02T12:00:00Z'}:{value:i,sourceId:'meter-b',asOf:'2026-01-03',fetchedAt:'2026-01-04T12:00:00Z'}})),searchable:true,sortable:true,pageSize:160,selectedRowBind:'selected'},
+  {id:'selected',type:'text',content:{expr:'coalesce($state.selected.label, "None")'}},
+  {id:'sources',type:'source_attribution',sourceIds:['meter-a','meter-b']},
   {id:'reset',type:'button',label:'Reset lighting',onClick:[{type:'reset_state'}]}
 ];
-const doc:RichDocumentV1={schemaVersion:1,title:'Museum light planning',state:{power:2,point:null},computed:{total:'$state.power * 4'},root:{id:'root',type:'stack',direction:'col',children}};
+const doc:RichDocumentV1={schemaVersion:1,title:'Museum light planning',sources:[{id:'meter-a',name:'Meter A'},{id:'meter-b',name:'Meter B'}],state:{power:2,point:null,selected:{label:'None'}},computed:{total:'$state.power * 4'},root:{id:'root',type:'stack',direction:'col',children}};
 for(const vp of [{width:1280,height:720,project:'pc-chromium'},{width:1440,height:900,project:'pc-chromium'},{width:1920,height:1080,project:'pc-chromium'},{width:375,height:812,project:'iphone-webkit'},{width:430,height:932,project:'iphone-webkit'}]){
   test('schema-only novel rich UI '+vp.width+'x'+vp.height,async({page},info)=>{
     test.skip(info.project.name!==vp.project);
@@ -42,6 +46,18 @@ for(const vp of [{width:1280,height:720,project:'pc-chromium'},{width:1440,heigh
       await expect(chart.locator('summary')).toContainText('欠損値 1 件');
     }
     await expect(page.locator('figure[aria-label="combo"] svg text').filter({hasText:'Temperature'})).toHaveCount(1);
+    const table=page.locator('.rich-data-table');
+    await expect(table.getByText('Sensor offline',{exact:false})).toBeVisible();
+    await expect.poll(()=>table.locator('tbody tr[data-index]').count()).toBeLessThan(60);
+    const scroll=table.locator('.rich-table-scroll');
+    await scroll.evaluate(el=>el.scrollTop=el.scrollHeight);
+    await expect(table.getByText('Exhibit 160',{exact:true})).toBeVisible();
+    await table.getByText('Exhibit 160',{exact:true}).click();
+    await expect(page.locator('.rich-data-table + *').getByText('Exhibit 160',{exact:true})).toBeVisible().catch(async()=>{await expect(page.getByText('Exhibit 160',{exact:true})).toHaveCount(2)});
+    await table.getByRole('searchbox').fill('Exhibit 001');
+    await expect(table.getByText('Exhibit 001',{exact:true})).toBeVisible();
+    await expect(table.getByText('Sensor offline',{exact:false})).toBeVisible();
+    await table.getByRole('searchbox').fill('');
     await page.screenshot({path:info.outputPath('novel-rich.png'),fullPage:true});
     await page.getByRole('button',{name:'Reset lighting'}).click();
     await expect(slider).toHaveValue('2');
