@@ -691,7 +691,7 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       actorKind: 'user',
       actorId: userId,
     });
-    const svgStruct = srv.ctx.artifactService.getStructure(userId, svgArt.artifact.id) as {
+    const svgStruct = await srv.ctx.artifactService.getStructure(userId, svgArt.artifact.id) as {
       elements: Array<{ id: string; tag: string; fingerprint: string }>;
     };
     const heroEl = svgStruct.elements.find((e) => e.id === 'hero')!;

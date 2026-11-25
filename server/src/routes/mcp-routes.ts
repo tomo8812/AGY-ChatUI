@@ -358,6 +358,38 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
     }
   };
 
+  const builtinTarget = z.object({ scope: z.enum(['shared', 'profile', 'project', 'chat']), id: z.string().max(128).optional() });
+
+  app.get('/api/mcp/builtin-artifact', async (req, reply) => {
+    const session = requireAdmin(req, reply, db);
+    if (!session) return;
+    const query = builtinTarget.safeParse(req.query);
+    if (!query.success) return reply.code(400).send({ error: 'INVALID_INPUT' });
+    try {
+      return mcpService.getBuiltinSettings(session.user.id, query.data.scope, query.data.id);
+    } catch (error) {
+      return handleMcpError(reply, error);
+    }
+  });
+
+  app.put('/api/mcp/builtin-artifact', async (req, reply) => {
+    const session = requireAdmin(req, reply, db);
+    if (!session) return;
+    const body = builtinTarget.extend({
+      enabled: z.boolean().nullable(),
+      disabledTools: z.array(z.string().max(100)).max(22).nullable(),
+    }).safeParse(req.body);
+    if (!body.success) return reply.code(400).send({ error: 'INVALID_INPUT' });
+    const { scope, id, ...settings } = body.data;
+    try {
+      const target = mcpService.updateBuiltinSettings(session.user.id, scope, id, settings);
+      await refreshWorkersForScope(target);
+      return mcpService.getBuiltinSettings(session.user.id, scope, id);
+    } catch (error) {
+      return handleMcpError(reply, error);
+    }
+  });
+
   app.get('/api/mcp/servers', async (req, reply) => {
     const session = requireAdmin(req, reply, db);
     if (!session) return;

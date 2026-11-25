@@ -29,7 +29,8 @@ import type {
   ProjectFileRecord,
   SyncEventEnvelope,
 } from '../types.js';
-import { detectArtifactFormat, FormatAdapterRegistry } from './adapters/registry.js';
+import { DOCUMENT_WORKER_MAX_INPUT_BYTES, DocumentWorker, isDocumentFormat, isWebRenderFormat } from './document-worker.js';
+import { detectArtifactFormat, DOCUMENT_ACTIONS, FormatAdapterRegistry } from './adapters/registry.js';
 import { executeRestoreBundle, getRestoreBatchRecord, recoverPendingRestoreBatches } from './batch-restore.js';
 import { PerUserBlobManager, type BlobLease } from './blob-store.js';
 import { recoverPendingCommits, type DeleteTargetInspection, type RecoveryReport } from './commit-recovery.js';
@@ -161,6 +162,7 @@ export class ArtifactService {
   public readonly undoService: ArtifactUndoService;
 
   private stagingIsolationOverride?: StagingIsolationKind;
+  private readonly documentWorker: DocumentWorker;
   private sameFsCheckOverride?: (pathA: string, pathB: string) => boolean;
   public commitFaultHook?: CommitFaultHook;
   private readonly updateListeners = new Set<(artifact: ArtifactRecord) => void>();
@@ -181,6 +183,7 @@ export class ArtifactService {
     this.registry = new FormatAdapterRegistry();
     this.governor = new ResourceGovernor(config);
     this.sandboxWorker = new DocWorkerSandbox(config, this.governor);
+    this.documentWorker = new DocumentWorker(config, this.governor, this.sandboxWorker);
     this.renderCache = new RenderCacheManager(config);
     this.undoService = new ArtifactUndoService(db);
     this.stagingIsolationOverride = opts.stagingIsolationOverride;
@@ -293,11 +296,11 @@ export class ArtifactService {
     });
   }
 
-  readActiveArtifactBytes(artifact: ArtifactRecord): Buffer | null {
+  readActiveArtifactBytes(artifact: ArtifactRecord, maxBytes?: number): Buffer | null {
     const rootDir = this.resolveScopeRootDir(artifact.userId, artifact.scopeKind, artifact.chatId, artifact.projectId);
     if (!rootDir) return null;
     try {
-      const res = readContainedRegularFileNoFollowStable(rootDir, artifact.relPath);
+      const res = readContainedRegularFileNoFollowStable(rootDir, artifact.relPath, { maxBytes });
       return res.buffer;
     } catch {
       return null;
@@ -1442,31 +1445,23 @@ export class ArtifactService {
       await params.assertAuthorized?.();
     };
 
-    const contentBuf =
-      params.content !== undefined
-        ? params.content
-        : (() => {
-            const adapter = this.registry.resolve(filename, detected.previewKind);
-            if (!adapter.create) {
-              throw unsupportedOperationError(
-                'create',
-                adapter.requiresExternalWorker ? 'disabled_by_resource_tier' : 'unsupported_by_format',
-                `形式 '${adapter.format}' の新規作成はこの環境ではサポートされていません。`
-              );
-            }
-            return adapter.create(params.createParams ?? {}, {
-              filename,
-              relPath,
-              mimeType: detected.mimeType,
-            });
-          })();
+    const adapter = this.registry.resolve(filename, detected.previewKind);
+    const workerCreateFormat = isDocumentFormat(adapter.format) && adapter.format !== 'media' ? adapter.format : null;
+    const createParams = params.createParams ?? {};
+    const fileMeta = { filename, relPath, mimeType: detected.mimeType };
+    const contentBuf = params.content ?? (!workerCreateFormat ? adapter.create?.(createParams, fileMeta) : undefined);
+    if (!contentBuf && !workerCreateFormat) {
+      throw unsupportedOperationError('create', 'unsupported_by_format', `Cannot create '${adapter.format}'.`);
+    }
 
     const fingerprint = computeRequestFingerprint({
       actorKind: params.actorKind,
       actorId: params.actorId ?? null,
       operationType: 'create',
       target: { scopeKind: params.scopeKind, scopeId, relPath },
-      operations: { sha256: crypto.createHash('sha256').update(contentBuf).digest('hex') },
+      operations: contentBuf
+        ? { sha256: crypto.createHash('sha256').update(contentBuf).digest('hex') }
+        : { filename, mimeType: detected.mimeType, createParams },
       baseRevision: 0,
     });
 
@@ -1502,6 +1497,9 @@ export class ArtifactService {
             });
           }
 
+          const buffer = workerCreateFormat && !contentBuf
+            ? await this.documentWorker.run(workerCreateFormat, filename, undefined, { action: 'create', params: createParams })
+            : contentBuf!;
           const artifactId = crypto.randomUUID();
           return this.commitFileMutation({
             userId: params.userId,
@@ -1528,7 +1526,7 @@ export class ArtifactService {
             expectedPrevFingerprint: null,
             prevBuffer: null,
             prevDepHash: null,
-            newBuffer: contentBuf,
+            newBuffer: buffer,
             actorKind: params.actorKind,
             actorId: params.actorId ?? null,
             operationType: 'create',
@@ -3834,7 +3832,9 @@ export class ArtifactService {
           const rootDir = this.resolveScopeRootDir(current.userId, current.scopeKind, current.chatId, current.projectId);
           if (!rootDir) throw new ArtifactError('NOT_FOUND', '作業ディレクトリが見つかりません。', 404);
 
-          const prevRead = readContainedRegularFileNoFollowStable(rootDir, current.relPath);
+          const adapter = this.registry.resolve(current.filename, current.previewKind);
+          const maxBytes = isDocumentFormat(adapter.format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
+          const prevRead = readContainedRegularFileNoFollowStable(rootDir, current.relPath, { maxBytes });
           if (prevRead.sha256 !== current.sha256) {
             this.recordExternalSyncOnRecovery({
               userId: params.userId,
@@ -3857,12 +3857,22 @@ export class ArtifactService {
             );
           }
 
-          const adapter = this.registry.resolve(current.filename, current.previewKind);
-          const editResult = adapter.applyOperations(prevRead.buffer, params.operations, {
-            filename: current.filename,
-            relPath: current.relPath,
-            mimeType: current.mimeType,
-          });
+          if (isDocumentFormat(adapter.format)) {
+            const supported = DOCUMENT_ACTIONS[adapter.format];
+            const unsupported = params.operations.find(({ op }) => !supported.includes(op) || !op.includes('.') || op.endsWith('.get_structure'));
+            if (unsupported) {
+              throw unsupportedOperationError(unsupported.op, 'unsupported_by_format', `Cannot apply '${unsupported.op}' to '${adapter.format}'.`);
+            }
+          }
+          const editResult = isDocumentFormat(adapter.format)
+            ? {
+                buffer: await this.documentWorker.run(adapter.format, current.filename, prevRead.buffer, {
+                  action: 'edit',
+                  operations: params.operations,
+                }),
+                summary: 'Updated document',
+              }
+            : adapter.applyOperations(prevRead.buffer, params.operations, current);
 
           const committed = await this.commitFileMutation({
             userId: params.userId,
@@ -3932,47 +3942,75 @@ export class ArtifactService {
     });
   }
 
-  getStructure(userId: string, artifactId: string): Record<string, unknown> {
+  async getStructure(userId: string, artifactId: string): Promise<Record<string, unknown>> {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
-    const buf = this.readActiveArtifactBytes(artifact);
+    const buf = this.readActiveArtifactBytes(artifact, DOCUMENT_WORKER_MAX_INPUT_BYTES);
     if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
     const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
+    const format = adapter.format;
+    const structure = this.documentWorker.available && isDocumentFormat(format)
+      ? JSON.parse((await this.documentWorker.run(format, artifact.filename, buf, { action: 'structure' })).toString('utf8'))
+      : adapter.getStructure(buf, artifact);
     return {
       artifactId: artifact.id,
       revision: artifact.revision,
       sha256: artifact.sha256,
-      ...adapter.getStructure(buf, {
-        filename: artifact.filename,
-        relPath: artifact.relPath,
-        mimeType: artifact.mimeType,
-      }),
+      ...structure,
     };
   }
 
-  readRange(userId: string, artifactId: string, range: Record<string, unknown>): Record<string, unknown> {
+  async readRange(userId: string, artifactId: string, range: Record<string, unknown>): Promise<Record<string, unknown>> {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
-    const buf = this.readActiveArtifactBytes(artifact);
+    const buf = this.readActiveArtifactBytes(artifact, DOCUMENT_WORKER_MAX_INPUT_BYTES);
     if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
     const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
-    return {
-      artifactId: artifact.id,
-      revision: artifact.revision,
-      ...adapter.readRange(buf, range, {
-        filename: artifact.filename,
-        relPath: artifact.relPath,
-        mimeType: artifact.mimeType,
-      }),
-    };
+    const data = isDocumentFormat(adapter.format) && ['xlsx', 'docx', 'pptx', 'pdf'].includes(adapter.format)
+      ? JSON.parse((await this.documentWorker.run(adapter.format, artifact.filename, buf, { action: 'range', range })).toString('utf8'))
+      : adapter.readRange(buf, range, artifact);
+    return { artifactId: artifact.id, revision: artifact.revision, ...data };
   }
 
-  verifyArtifact(userId: string, artifactId: string): AdapterVerifyResult {
+  async renderPng(userId: string, artifactId: string, options: { pageIndex?: number; timeSeconds?: number } = {}): Promise<Buffer> {
+    const artifact = this.db.getArtifact(userId, artifactId);
+    if (!artifact) throw new ArtifactError('NOT_FOUND', 'Artifact not found.', 404);
+    const format = this.registry.resolve(artifact.filename, artifact.previewKind).format;
+    const source = this.readActiveArtifactBytes(artifact, DOCUMENT_WORKER_MAX_INPUT_BYTES);
+    if (!source) throw new ArtifactError('FILE_MISSING', 'Artifact bytes not found.', 404);
+    const png = artifact.mimeType === 'image/png' && !this.documentWorker.available
+      ? source
+      : isDocumentFormat(format) || isWebRenderFormat(format) || format === 'svg'
+        ? await this.documentWorker.run(format, artifact.filename, source, { action: 'render', ...options })
+        : null;
+    if (!png) {
+      throw unsupportedOperationError('render_png', 'unsupported_by_format', 'PNG rendering is unavailable for this format.');
+    }
+    if (png.length < 24 || png.length > 16 * 1024 * 1024 ||
+      !png.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex')) ||
+      png.toString('ascii', 12, 16) !== 'IHDR' ||
+      png.readUInt32BE(16) < 1 || png.readUInt32BE(16) > 8192 ||
+      png.readUInt32BE(20) < 1 || png.readUInt32BE(20) > 8192) {
+      throw new ArtifactError('INVALID_RENDER_IMAGE', 'Invalid or oversized PNG.', 422);
+    }
+    return png;
+  }
+
+  async verifyArtifact(userId: string, artifactId: string): Promise<AdapterVerifyResult> {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
-    const buf = this.readActiveArtifactBytes(artifact);
+    const buf = this.readActiveArtifactBytes(artifact, DOCUMENT_WORKER_MAX_INPUT_BYTES);
     if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
     const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
+    const format = adapter.format;
+    if (this.documentWorker.available && isDocumentFormat(format)) {
+      try {
+        return JSON.parse((await this.documentWorker.run(format, artifact.filename, buf, { action: 'verify' })).toString('utf8'));
+      } catch (error) {
+        if (!(error instanceof ArtifactError) || error.code !== 'DOCUMENT_WORKER_REJECTED') throw error;
+        return { ok: false, issues: [{ severity: 'error', code: error.code, message: error.message }] };
+      }
+    }
     return adapter.verify(buf, {
       filename: artifact.filename,
       relPath: artifact.relPath,
@@ -3996,21 +4034,32 @@ export class ArtifactService {
     if (params.actorKind === 'ai' && src.scopeKind === 'project') {
       throw new ArtifactError('FORBIDDEN', 'AI/内蔵MCPからプロジェクト原本スコープへのエクスポートは禁止されています。', 403);
     }
-    const buf = this.readActiveArtifactBytes(src);
+    const buf = this.readActiveArtifactBytes(src, DOCUMENT_WORKER_MAX_INPUT_BYTES);
     if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
     const adapter = this.registry.resolve(src.filename, src.previewKind);
-    if (!adapter.exportAs) {
+    let exported: AdapterExportResult;
+    if (adapter.exportAs) {
+      exported = adapter.exportAs(buf, params.targetFormat, src);
+    } else if (
+      (['docx', 'pptx', 'xlsx'].some((format) => format === adapter.format) && params.targetFormat === 'pdf' &&
+        isDocumentFormat(adapter.format)) ||
+      (adapter.format === 'pdf' && ['png', 'txt'].includes(params.targetFormat)) ||
+      (adapter.format === 'image' && ['png', 'jpg', 'jpeg', 'webp'].includes(params.targetFormat))
+    ) {
+      const filename = `${path.parse(src.filename).name}.${params.targetFormat}`;
+      exported = {
+        filename,
+        mimeType: detectMimeAndPreviewKind(filename, null).mimeType,
+        buffer: await this.documentWorker.run(adapter.format, src.filename, buf, {
+          action: 'export', targetFormat: params.targetFormat,
+        }),
+      };
+    } else {
       throw unsupportedOperationError(
-        `export:${params.targetFormat}`,
-        adapter.requiresExternalWorker ? 'disabled_by_resource_tier' : 'unsupported_by_format',
-        `形式 '${adapter.format}' から '${params.targetFormat}' への変換はサポートされていません。`
+        `export:${params.targetFormat}`, 'unsupported_by_format',
+        `Cannot export '${adapter.format}' as '${params.targetFormat}'.`
       );
     }
-    const exported = adapter.exportAs(buf, params.targetFormat, {
-      filename: src.filename,
-      relPath: src.relPath,
-      mimeType: src.mimeType,
-    });
     const outRelPath = params.outputRelPath ? normalizeRelPath(params.outputRelPath) : normalizeRelPath(exported.filename);
     const created = await this.createArtifact({
       userId: params.userId,

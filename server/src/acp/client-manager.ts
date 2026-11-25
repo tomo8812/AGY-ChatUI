@@ -512,6 +512,7 @@ interface WorkerInstance {
   stderrTail: string[];
   needsConfigReload: boolean;
   mcpConfigEpoch: number;
+  builtinMcp?: Awaited<ReturnType<McpService['bindBuiltinArtifactServer']>>;
   detachedElicitationResolvers: Map<string, (resp: CreateElicitationResponse) => void>;
   idleWaiters: Set<() => void>;
 }
@@ -2104,6 +2105,30 @@ export class AcpClientManager {
         )
       : [];
 
+    const builtinMcp = init.agentCapabilities?.mcpCapabilities?.http === false
+      ? undefined
+      : await this.mcpService?.bindBuiltinArtifactServer({
+          userId,
+          chatId,
+          tentativeTurn: () => {
+            if (!workerRef) return null;
+            const turn = this.resolveBridgeForElicitation(workerRef);
+            if (!turn || !turn.assistantMessageId || turn.initialPromptDone || this.getBridgesNewestFirst(workerRef).some((bridge) =>
+              this.db.getRun(userId, bridge.runId)?.status === 'cancelled' ||
+              [...bridge.subagents.values()].some(({ state }) =>
+                state === 'running' || state === 'requires_action' || state === 'unknown'))) return null;
+            return { messageId: turn.assistantMessageId, runId: turn.runId };
+          },
+        }, mcpServers).catch((error) => {
+          console.warn('[acp] Built-in MCP listener could not start:', error);
+          return undefined;
+        });
+    if (builtinMcp) {
+      if (child.exitCode !== null || child.signalCode !== null) builtinMcp.revoke();
+      else child.once('exit', builtinMcp.revoke);
+      mcpServers.push(builtinMcp.server);
+    }
+
     // Try load / resume existing ACP session seamlessly
     if (chat.acpSessionId) {
       isRestoringSession = true;
@@ -2248,6 +2273,7 @@ export class AcpClientManager {
 
     workerRef = {
       key: workerKey,
+      builtinMcp,
       userId,
       chatId,
       profileDir: profile.profileDir,
@@ -3502,6 +3528,14 @@ export class AcpClientManager {
         ...(contentText ? { contentText } : {}),
         ...(diffStats ? { diffStats } : {}),
       };
+      if (update.status === 'completed' && rawName && update.rawOutput !== undefined &&
+        this.resolveBridgeForElicitation(worker, update.toolCallId, params.sessionId) === turn) {
+        try {
+          worker.builtinMcp?.confirm(rawName, update.rawOutput, turn.assistantMessageId, turn.runId, update.toolCallId);
+        } catch (error) {
+          console.warn('[acp] Rich block binding failed:', error);
+        }
+      }
       const merged = mergedRaw;
       const nextIdx = turn.toolCalls.findIndex((t) => t.toolCallId === update.toolCallId);
       if (nextIdx >= 0) turn.toolCalls[nextIdx] = merged;

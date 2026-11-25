@@ -545,7 +545,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     if (!session) return;
     const { artifactId } = req.params as { artifactId: string };
     try {
-      return artifactService.getStructure(session.user.id, artifactId);
+      return await artifactService.getStructure(session.user.id, artifactId);
     } catch (err) {
       return sendArtifactError(reply, err);
     }
@@ -557,7 +557,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const { artifactId } = req.params as { artifactId: string };
     const query = (req.query ?? {}) as Record<string, unknown>;
     try {
-      return artifactService.readRange(session.user.id, artifactId, query);
+      return await artifactService.readRange(session.user.id, artifactId, query);
     } catch (err) {
       return sendArtifactError(reply, err);
     }
@@ -623,7 +623,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     if (!session) return;
     const { artifactId } = req.params as { artifactId: string };
     try {
-      return artifactService.verifyArtifact(session.user.id, artifactId);
+      return await artifactService.verifyArtifact(session.user.id, artifactId);
     } catch (err) {
       return sendArtifactError(reply, err);
     }

@@ -253,7 +253,17 @@ export class DocWorkerSandbox {
               cwd: tmpDir,
               env,
               stdio: ['ignore', 'pipe', 'pipe'],
+              detached: isolation !== 'bwrap',
             });
+
+            const killWorker = () => {
+              try {
+                if (isolation === 'bwrap') child.kill('SIGKILL');
+                else if (child.pid) process.kill(-child.pid, 'SIGKILL');
+              } catch {
+                // The process may have already exited.
+              }
+            };
 
             let stdout = '';
             let stderr = '';
@@ -273,11 +283,7 @@ export class DocWorkerSandbox {
                 `ドキュメント処理が制限時間（${timeoutMs}ms）を超過しました。`,
                 504
               );
-              try {
-                child.kill('SIGKILL');
-              } catch {
-                // ignore
-              }
+              killWorker();
             }, timeoutMs);
 
             const rssWatchdog = setInterval(() => {
@@ -289,11 +295,7 @@ export class DocWorkerSandbox {
                   `ドキュメント処理がメモリ上限（${rssLimitMb}MB）を超過しました（${rssMb}MB）。`,
                   503
                 );
-                try {
-                  child.kill('SIGKILL');
-                } catch {
-                  // ignore
-                }
+                killWorker();
               }
             }, 250);
             rssWatchdog.unref();

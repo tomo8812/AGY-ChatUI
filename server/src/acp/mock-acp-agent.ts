@@ -9,6 +9,8 @@
  *            tool calls, `session/request_permission`, `session/cancel`, and file creation inside `cwd`.
  */
 
+import { Client as McpClient } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -521,6 +523,40 @@ function runAcpServer(): void {
         return { stopReason: 'cancelled' as const };
       }
 
+      if (promptText.includes('[MCP_RICH_CREATE]')) {
+        const servers = state.mcpServers as Array<{
+          name?: string; url?: string; headers?: Array<{ name: string; value: string }>;
+        }>;
+        const server = servers.find((entry) => entry.name === 'agy_artifact');
+        if (!server?.url) throw new Error('Built-in Artifact MCP was not provided');
+        const mcp = new McpClient({ name: 'mock-agy', version: '1.0.0' });
+        await mcp.connect(new StreamableHTTPClientTransport(new URL(server.url), {
+          requestInit: { headers: Object.fromEntries((server.headers ?? []).map(({ name, value }) => [name, value])) },
+        }));
+        try {
+          const { tools } = await mcp.listTools();
+          if (tools.length !== 22) throw new Error('The built-in server did not advertise 22 tools');
+          const toolCallId = randomUUID();
+          const title = 'Create a rich document';
+          const name = 'mcp(agy_artifact/rich_create)';
+          await sendUpdate({
+            sessionId: state.id,
+            update: { sessionUpdate: 'tool_call', toolCallId, name, title, status: 'in_progress' },
+          });
+          const result = await mcp.callTool({ name: 'rich_create', arguments: {
+            document: { schemaVersion: 1, root: { type: 'markdown', id: 'sample', content: 'MCP fixture' } },
+          } });
+          if (result.isError) throw new Error(JSON.stringify(result.content));
+          await sendUpdate({
+            sessionId: state.id,
+            update: { sessionUpdate: 'tool_call_update', toolCallId, name, status: 'completed', rawOutput: result },
+          });
+        } finally {
+          await mcp.close();
+        }
+        return { stopReason: 'end_turn' as const };
+      }
+
       if (promptText.includes('[MCP_INSPECT]')) {
         await sendUpdate({
           sessionId: state.id,
@@ -528,7 +564,11 @@ function runAcpServer(): void {
             sessionUpdate: 'agent_message_chunk',
             content: {
               type: 'text',
-              text: `MCP_SERVERS:${JSON.stringify(state.mcpServers)}`,
+              text: `MCP_SERVERS:${JSON.stringify(state.mcpServers.filter((server) => {
+                const entry = server as { url?: string; name?: string };
+                return !/^agy_artifact(?:_builtin(?:_[0-9]+)?)?$/.test(entry.name ?? '') ||
+                  !/^http:\/\/127\.0\.0\.1:[0-9]+\/mcp$/.test(entry.url ?? '');
+              }))}`,
             },
           },
         });

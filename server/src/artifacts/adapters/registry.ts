@@ -24,11 +24,20 @@ import { MarkdownAdapter } from './markdown-adapter.js';
 import { MermaidAdapter } from './mermaid-adapter.js';
 import { SvgAdapter } from './svg-adapter.js';
 
-/**
- * Capability + baseline fingerprint target-resolution adapter for Rich 6 formats
- * (full external worker edit/render implementations are added in PR 2).
- */
-class DeferredRichFormatAdapter implements FormatAdapter {
+export const DOCUMENT_ACTIONS = {
+  pptx: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:pdf',
+    'pptx.set_shape_text', 'pptx.move_shape', 'pptx.smartart.get_structure'],
+  docx: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:pdf',
+    'docx.set_paragraph_text', 'docx.set_page_size'],
+  xlsx: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:pdf', 'xlsx.set_cell', 'xlsx.set_formula'],
+  pdf: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:png', 'export:txt',
+    'pdf.rotate_page', 'pdf.reorder_pages', 'pdf.remove_page', 'pdf.add_note', 'pdf.add_overlay'],
+  image: ['create', 'structure', 'verify', 'render_png', 'export:png', 'export:jpeg', 'export:webp',
+    'image.crop', 'image.resize', 'image.rotate', 'image.brightness', 'image.annotate'],
+  media: ['structure', 'verify', 'render_png', 'media.trim'],
+} satisfies Partial<Record<ArtifactFormat, string[]>>;
+
+class DocumentFormatAdapter implements FormatAdapter {
   readonly requiresExternalWorker = true;
   readonly targetPinSupported = true;
 
@@ -39,37 +48,26 @@ class DeferredRichFormatAdapter implements FormatAdapter {
   ) {}
 
   getOperations(ctx: AdapterCapabilityContext): OperationCapability[] {
-    const workerAvail = ctx.runtimeProfile === 'base_chatui' ? 'disabled_by_resource_tier' : 'partial';
-    const remediation =
-      ctx.runtimeProfile === 'base_chatui'
-        ? 'ドキュメントランタイムを有効化するには deploy/setup-doc-runtime.sh を実行してください。'
-        : undefined;
-
-    if (this.format === 'pdf') {
-      return [
-        { operation: 'view', availability: 'supported', scope: 'ui_view_only' },
-        { operation: 'target_pin', availability: 'supported', scope: 'mcp_and_ui' },
-        {
-          operation: 'edit_body_reflow',
-          availability: 'unsupported_by_format',
-          scope: 'mcp_only',
-          notes: 'PDF direct body text reflow/deletion is unsupported; use annotations or overlays.',
-        },
-        { operation: 'mcp_edit', availability: workerAvail, scope: 'mcp_only', remediation },
-      ];
-    }
-
-    return [
+    const workerReady = ctx.runtimeProfile !== 'base_chatui' && ctx.sandboxAvailable;
+    const operations: OperationCapability[] = [
       { operation: 'view', availability: 'supported', scope: 'ui_view_only' },
       { operation: 'target_pin', availability: 'supported', scope: 'mcp_and_ui' },
-      {
-        operation: 'edit',
-        availability: workerAvail,
-        scope: this.directEditUiSupported ? 'mcp_and_ui' : 'mcp_only',
-        remediation,
-      },
-      { operation: 'render_png', availability: workerAvail, scope: 'mcp_only', remediation },
+      ...DOCUMENT_ACTIONS[this.format].map((operation): OperationCapability => ({
+        operation,
+        availability: workerReady ? 'supported' : 'disabled_by_resource_tier',
+        scope: 'mcp_only',
+        ...(!workerReady ? {
+          remediation: ctx.runtimeProfile === 'base_chatui'
+            ? 'ドキュメントランタイムをインストールしてください。'
+            : 'bubblewrap サンドボックスを有効化してください。',
+        } : {}),
+      })),
     ];
+    if (this.format === 'pdf') operations.push({
+      operation: 'edit_body_reflow', availability: 'unsupported_by_format', scope: 'mcp_only',
+      notes: 'PDF の既存本文は変更できません。注釈を追加できます。',
+    });
+    return operations;
   }
 
   getStructure(buffer: Buffer, meta: AdapterFileMeta): Record<string, unknown> {
@@ -135,7 +133,7 @@ class DeferredRichFormatAdapter implements FormatAdapter {
 
     if (this.format === 'pdf') {
       const expectedPageContentHash = selector.expectedPageContentHash ? String(selector.expectedPageContentHash) : null;
-      const currentPageHash = selector._currentPageContentHash ? String(selector._currentPageContentHash) : currentSha;
+      const currentPageHash = currentSha;
       if (!expectedPageContentHash || expectedPageContentHash !== currentPageHash) {
         return { status: 'needs_review', reason: 'pdf_page_content_changed' };
       }
@@ -144,7 +142,7 @@ class DeferredRichFormatAdapter implements FormatAdapter {
 
     if (this.format === 'xlsx') {
       const expectedValuesHash = selector.expectedRangeValuesHash ? String(selector.expectedRangeValuesHash) : null;
-      const currentValuesHash = selector._currentRangeValuesHash ? String(selector._currentRangeValuesHash) : currentSha;
+      const currentValuesHash = currentSha;
       if (!expectedValuesHash || expectedValuesHash !== currentValuesHash) {
         return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
       }
@@ -157,7 +155,7 @@ class DeferredRichFormatAdapter implements FormatAdapter {
         selector.expectedBlockHash ??
         selector.expectedSlideHash ??
         selector.expectedCellHash;
-      const currentFp = selector._currentFingerprint ? String(selector._currentFingerprint) : currentSha;
+      const currentFp = currentSha;
       if (!expectedFp || String(expectedFp) !== currentFp) {
         return { status: 'needs_review', reason: 'element_fingerprint_changed' };
       }
@@ -201,13 +199,12 @@ export class FormatAdapterRegistry {
       new DiffAdapter(),
       new MermaidAdapter(),
       new BinaryAdapter(),
-      // Deferred Rich 6 format capability & fingerprint resolvers (full workers added in PR 2)
-      new DeferredRichFormatAdapter('pptx', 'pptx', true),
-      new DeferredRichFormatAdapter('docx', 'docx', true),
-      new DeferredRichFormatAdapter('xlsx', 'table', true),
-      new DeferredRichFormatAdapter('pdf', 'pdf', false),
-      new DeferredRichFormatAdapter('image', 'image', true),
-      new DeferredRichFormatAdapter('media', 'video', true),
+      new DocumentFormatAdapter('pptx', 'pptx', true),
+      new DocumentFormatAdapter('docx', 'docx', true),
+      new DocumentFormatAdapter('xlsx', 'table', true),
+      new DocumentFormatAdapter('pdf', 'pdf', false),
+      new DocumentFormatAdapter('image', 'image', true),
+      new DocumentFormatAdapter('media', 'video', true),
     ];
     for (const adapter of coreAdapters) {
       this.adapters.set(adapter.format, adapter);
@@ -237,7 +234,7 @@ export class FormatAdapterRegistry {
     const adapter = this.resolve(params.filename, params.previewKind);
     const directEditSupported =
       adapter.directEditUiSupported &&
-      (!adapter.requiresExternalWorker || params.runtimeProfile !== 'base_chatui');
+      (!adapter.requiresExternalWorker || (params.runtimeProfile !== 'base_chatui' && params.sandboxIsolation !== 'sandbox_required_blocked'));
     return {
       format: adapter.format,
       previewKind: params.previewKind,
@@ -248,7 +245,7 @@ export class FormatAdapterRegistry {
       targetPinSupported: adapter.targetPinSupported,
       operations: adapter.getOperations({
         runtimeProfile: params.runtimeProfile,
-        sandboxAvailable: params.sandboxIsolation === 'bwrap',
+        sandboxAvailable: params.sandboxIsolation !== 'sandbox_required_blocked',
       }),
     };
   }

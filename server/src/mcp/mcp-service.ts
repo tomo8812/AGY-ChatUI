@@ -6,6 +6,7 @@ import https from 'node:https';
 import net from 'node:net';
 import zlib from 'node:zlib';
 import type { McpCapabilities, McpServer } from '@agentclientprotocol/sdk';
+import { BUILTIN_ARTIFACT_TOOLS, effectiveBuiltinMcpPolicy, type BuiltinArtifactMcpServer, type BuiltinMcpBinding } from './builtin-artifact-mcp.js';
 import { resolveHostExecutable } from '../acp/env-isolation.js';
 import {
   formatMcpPermissionRule,
@@ -1044,11 +1045,17 @@ export class McpService {
   constructor(
     private readonly config: AppConfig,
     private readonly db: AppDatabase,
-    private readonly hub: SyncHub
+    private readonly hub: SyncHub,
+    private readonly builtin?: BuiltinArtifactMcpServer
   ) {}
 
   async shutdown(): Promise<void> {
     await this.httpsForwarder.shutdown();
+    await this.builtin?.shutdown();
+  }
+
+  async bindBuiltinArtifactServer(binding: BuiltinMcpBinding, servers: readonly McpServer[]) {
+    return this.builtin?.bind(binding, new Set(servers.map(({ name }) => name)));
   }
 
   private decryptRecord(encrypted: string | null): Record<string, string> {
@@ -1497,6 +1504,32 @@ export class McpService {
       throw new McpValidationError('CHAT_NOT_FOUND', '対象チャットが見つかりません。', 404);
     }
     return { ownerUserId: adminUserId, projectId: null, chatId: cid };
+  }
+
+  getBuiltinSettings(adminUserId: string, scope: McpScope, id?: string) {
+    const target = this.resolveScopeTarget(adminUserId, scope, scope === 'project' ? id : null, scope === 'chat' ? id : null);
+    const key = scope === 'shared' ? 'shared' : `${scope}:${target.projectId ?? target.chatId ?? adminUserId}`;
+    const chat = target.chatId ? this.db.getChat(adminUserId, target.chatId) : null;
+    const effective = effectiveBuiltinMcpPolicy(this.db, adminUserId, target.projectId ?? chat?.projectId, target.chatId);
+    return {
+      ...this.db.getBuiltinMcpSettings(key),
+      effective,
+      tools: Object.entries(BUILTIN_ARTIFACT_TOOLS).map(([name, label]) => ({ name, label })),
+    };
+  }
+
+  updateBuiltinSettings(
+    adminUserId: string, scope: McpScope, id: string | undefined,
+    settings: { enabled: boolean | null; disabledTools: string[] | null }
+  ) {
+    const target = this.resolveScopeTarget(adminUserId, scope, scope === 'project' ? id : null, scope === 'chat' ? id : null);
+    if (settings.disabledTools?.some((name) => !Object.hasOwn(BUILTIN_ARTIFACT_TOOLS, name))) {
+      throw new McpValidationError('INVALID_INPUT', '不明な操作が指定されました。');
+    }
+    const key = scope === 'shared' ? 'shared' : `${scope}:${target.projectId ?? target.chatId ?? adminUserId}`;
+    this.db.setBuiltinMcpSettings(key, settings);
+    this.emitUpdated(scope, target.ownerUserId, 'builtin-artifact');
+    return { scope, ...target };
   }
 
   listServersForAdmin(

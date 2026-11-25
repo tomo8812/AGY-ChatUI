@@ -7,6 +7,7 @@ on:
   pull_request:
     branches:
       - main
+      - feat/artifact-platform-pr1
   workflow_dispatch:
     inputs:
       bump:
@@ -88,6 +89,12 @@ jobs:
 
       - name: Run automated test suite
         run: npm test
+
+      - name: Round-trip real document fixtures
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/artifact-doc-tests"
+          "${RUNNER_TEMP}/artifact-doc-tests/bin/pip" install lxml openpyxl python-docx python-pptx pillow pypdf reportlab
+          "${RUNNER_TEMP}/artifact-doc-tests/bin/python" -m unittest discover -s server/tests -p artifact_doc_worker_test.py
 
       - name: Package self-contained runtime bundle
         run: |
