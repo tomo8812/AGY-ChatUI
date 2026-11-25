@@ -48,8 +48,10 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
     if(busyRef.current||baseRevision!==currentArtifact.current.revision)return;
     setDraft(old=>{
       if(old&&old.baseRevision!==baseRevision)return old;
-      const entries=(old?.entries??[]).filter(item=>item.key!==key);
-      if(entry)entries.push(entry);
+      const entries=[...(old?.entries??[])];
+      const index=entries.findIndex(item=>item.key===key);
+      if(index>=0){if(entry)entries[index]=entry;else entries.splice(index,1);}
+      else if(entry)entries.push(entry);
       return entries.length?{baseRevision,entries}:null;
     });
   },[]);

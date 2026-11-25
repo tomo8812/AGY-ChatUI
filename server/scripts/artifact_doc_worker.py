@@ -2195,9 +2195,9 @@ def pptx_basic_geometry(shape):
             "strokeWidthPt": int(line.get("w", "0")) / 12700 if stroke != "none" else 0}
 
 
-def pptx_shape_order(node, depth=0):
-    if depth > 20:
-        raise ValueError("Presentation group nesting is too deep")
+def pptx_shape_order(node):
+    # XML parsing already enforces bounded depth; the worker's memory/output
+    # budgets apply to the full tree, not an independent shape count.
     children = []
     for shape in node:
         if not isinstance(shape.tag, str) or XML.QName(shape).localname not in {
@@ -2209,9 +2209,7 @@ def pptx_shape_order(node, depth=0):
             continue
         children.append({"id": props.get("id"), "name": props.get("name"), "type": XML.QName(shape).localname,
                          "text": text_content(shape, DRAWING), "zOrder": len(children),
-                         "transform": shape_transform(shape), "basicGeometry": pptx_basic_geometry(shape), "children": pptx_shape_order(shape, depth + 1)})
-        if len(children) > 1000:
-            raise ValueError("Presentation shape limit exceeded")
+                         "transform": shape_transform(shape), "basicGeometry": pptx_basic_geometry(shape), "children": pptx_shape_order(shape)})
     return children
 
 
