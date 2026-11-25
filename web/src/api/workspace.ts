@@ -45,6 +45,7 @@ export const workspaceApi={
     selectedContentSnapshot:target.selectedContentSnapshot,surroundingContext:target.surroundingContext,instruction,
   }}),
   updateRequest:(chatId:string,id:string,instruction:string)=>apiFetch<{request:EditRequestRecord}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests/'+encodeURIComponent(id),{method:'PATCH',body:{instruction}}),
+  resolveRequest:(chatId:string,id:string)=>apiFetch<{request:EditRequestRecord}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests/'+encodeURIComponent(id)+'/resolve',{method:'POST',body:{}}),
   deleteRequest:(chatId:string,id:string)=>apiFetch<{ok:boolean}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests/'+encodeURIComponent(id),{method:'DELETE'}),
   verify:(id:string)=>apiFetch<{ok:boolean;revision?:number;checks?:Array<{id:string;status:string;evidence:string}>;issues:Array<{severity:string;message:string}>}>(path(id,'verify'),{method:'POST',body:{}}),
 };

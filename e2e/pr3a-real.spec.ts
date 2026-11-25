@@ -244,6 +244,25 @@ for(const vp of targets){
           record.pin=requests[0].selector;
           await page.screenshot({path:info.outputPath('real-'+item.kind+'-pin.png')});
           evidence.push(record);
+          if(item.kind==='csv'&&(vp.width===1280||vp.width===375)){
+            // A second, independent native cell target; edit one draft and
+            // remove the other. Do not pretend a saved draft has been sent.
+            await page.getByRole('gridcell',{name:'B1',exact:true}).click();
+            await page.getByRole('button',{name:'セルを対象にする'}).click();
+            await page.getByRole('textbox',{name:'変更内容'}).fill('Change column label');
+            await page.getByRole('button',{name:'依頼を追加'}).click();
+            const items=page.locator('.workspace-request-item');
+            await expect(items).toHaveCount(2);
+            const first=items.filter({hasText:'Change this selected target'});
+            await first.getByRole('button',{name:'指示を修正'}).click();
+            await first.getByRole('textbox',{name:'依頼の修正'}).fill('Revised cell instruction');
+            await first.getByRole('button',{name:'修正を保存'}).click();
+            await expect(items.filter({hasText:'Revised cell instruction'})).toBeVisible();
+            await items.filter({hasText:'Change column label'}).getByRole('button',{name:'削除',exact:true}).click();
+            await expect(items).toHaveCount(1);
+            expect(srv.ctx.editRequestService.listRequests(userId,chatId,{artifactId:artifact.id})).toMatchObject([{instruction:'Revised cell instruction',status:'draft'}]);
+            evidence.push({kind:'multiple-target-drafts',count:2,edited:true,deleted:true});
+          }
           if(item.kind==='pptx'){
             await page.getByRole('button',{name:'編集',exact:true}).click();
             const select=page.getByRole('combobox',{name:'スライド編集操作'});
