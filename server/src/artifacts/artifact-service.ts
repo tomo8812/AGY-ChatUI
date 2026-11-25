@@ -38,6 +38,10 @@ import {
   type DocumentVerifyOptions,
 } from './document-worker.js';
 import { detectArtifactFormat, documentFormatConstraint, DOCUMENT_ACTIONS, FormatAdapterRegistry } from './adapters/registry.js';
+import { codeVerificationChecks } from './adapters/code-adapter.js';
+import { HTML_VERIFICATION_CHECKS } from './adapters/html-validator.js';
+import { SVG_VERIFICATION_CHECKS } from './adapters/svg-verifier.js';
+import { MAX_TEXT_VERIFY_BYTES, MAX_VERIFY_NODES, skippedTextVerification } from './adapters/text-verification.js';
 import { executeRestoreBundle, getRestoreBatchRecord, recoverPendingRestoreBatches } from './batch-restore.js';
 import { PerUserBlobManager, type BlobLease } from './blob-store.js';
 import { recoverPendingCommits, type DeleteTargetInspection, type RecoveryReport } from './commit-recovery.js';
@@ -3972,11 +3976,18 @@ export class ArtifactService {
     });
   }
 
-  private readCurrentRevision(userId: string, artifactId: string, maxBytes?: number) {
+  private getCurrentRevisionSnapshot(userId: string, artifactId: string) {
     const current = this.db.getArtifact(userId, artifactId);
     if (!current) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
     const artifact = this.ensureLegacyHistoryMigrated(current);
-    const snapshot = this.getRevisionContentBlob(userId, artifactId, artifact.revision);
+    return this.getRevisionContentBlob(userId, artifactId, artifact.revision);
+  }
+
+  private readCurrentRevision(userId: string, artifactId: string, maxBytes?: number) {
+    return this.readRevisionSnapshot(this.getCurrentRevisionSnapshot(userId, artifactId), maxBytes);
+  }
+
+  private readRevisionSnapshot(snapshot: ReturnType<ArtifactService['getRevisionContentBlob']>, maxBytes?: number) {
     if (maxBytes !== undefined && snapshot.sizeBytes > maxBytes) {
       throw new ArtifactError('DOC_WORKER_INPUT_TOO_LARGE', 'Document input exceeds the worker size limit.', 413);
     }
@@ -3984,7 +3995,7 @@ export class ArtifactService {
     if (crypto.createHash('sha256').update(bytes).digest('hex') !== snapshot.revision.sha256) {
       throw new ArtifactError('REVISION_SNAPSHOT_UNAVAILABLE', 'Revision snapshot failed integrity verification.', 422);
     }
-    return { artifact, bytes, revision: snapshot.revision };
+    return { artifact: snapshot.artifact, bytes, revision: snapshot.revision };
   }
 
   private readRenderDependencies(artifact: ArtifactRecord, revision: number, byteBudget: number) {
@@ -4494,10 +4505,21 @@ export class ArtifactService {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
     const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
-    const maxBytes = isDocumentFormat(adapter.format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
-    const { bytes: buf, revision } = this.readCurrentRevision(userId, artifactId, maxBytes);
-    const identity = { revision: revision.revision, sha256: revision.sha256 };
     const format = adapter.format;
+    const snapshot = this.getCurrentRevisionSnapshot(userId, artifactId);
+    const { revision } = snapshot;
+    const identity = { revision: revision.revision, sha256: revision.sha256 };
+    const checkIds = format === 'code' ? codeVerificationChecks(artifact.filename)
+      : format === 'html' ? HTML_VERIFICATION_CHECKS
+        : format === 'svg' ? SVG_VERIFICATION_CHECKS : undefined;
+    if (checkIds && snapshot.sizeBytes > MAX_TEXT_VERIFY_BYTES) {
+      return {
+        ...skippedTextVerification(checkIds, `Source exceeds the ${MAX_TEXT_VERIFY_BYTES}-byte verification budget.`),
+        ...identity,
+      };
+    }
+    const maxBytes = checkIds ? MAX_TEXT_VERIFY_BYTES : isDocumentFormat(format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
+    const { bytes: buf } = this.readRevisionSnapshot(snapshot, maxBytes);
     if (this.documentWorker.available && isDocumentFormat(format)) {
       let compareDocument: Buffer | undefined;
       if (format === 'pdf' && revision.revision > 1) {
@@ -4535,20 +4557,22 @@ export class ArtifactService {
       }
     }
     let verifyMeta: Parameters<typeof adapter.verify>[1] = artifact;
-    if (format === 'html' || format === 'svg') {
+    if (format === 'html') {
       const depRows = this.db.db
         .prepare(
           `SELECT rel_path, status
            FROM artifact_revision_deps
-           WHERE user_id = ? AND artifact_id = ? AND revision = ?`
+           WHERE user_id = ? AND artifact_id = ? AND revision = ?
+           LIMIT ?`
         )
-        .all(userId, artifactId, revision.revision) as Array<{
+        .all(userId, artifactId, revision.revision, MAX_VERIFY_NODES + 1) as Array<{
         rel_path: string;
         status: 'present' | 'missing' | 'outside_root';
       }>;
       verifyMeta = {
         ...artifact,
-        dependencies: depRows.map((row) => ({ relPath: row.rel_path, status: row.status })),
+        dependencyManifestTruncated: depRows.length > MAX_VERIFY_NODES,
+        dependencies: depRows.slice(0, MAX_VERIFY_NODES).map((row) => ({ relPath: row.rel_path, status: row.status })),
       };
     }
     return { ...adapter.verify(buf, verifyMeta), ...identity };

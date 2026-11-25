@@ -16,6 +16,7 @@ export interface AdapterFileMeta {
   filename: string;
   relPath: string;
   mimeType: string;
+  dependencyManifestTruncated?: boolean;
   dependencies?: Array<{ relPath: string; status: 'present' | 'missing' | 'outside_root' }>;
 }
 

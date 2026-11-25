@@ -6,7 +6,7 @@ import { convertPresentationToPdfCached } from '../files/artifacts.js';
 import { computeStrongEtag, formatHttpDate, isFreshRequest } from '../files/http-cache.js';
 import { resolveArtifactFile, resolveAuthorizedChatFileReference } from '../files/link-resolver.js';
 import { listWorkspaceFiles, resolveContainedExistingPath } from '../files/workspace.js';
-import { injectSandboxZoomBridge } from '../files/sandbox-bridge.js';
+import { HTML_SANDBOX_CSP, injectSandboxZoomBridge } from '../files/sandbox-bridge.js';
 import type { ArtifactRecord } from '../types.js';
 import { buildLiveSessionAuthVerifier, requireAuth, type RouteDeps } from './auth-routes.js';
 
@@ -483,10 +483,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
       'Cache-Control',
       hasMatchingVersion ? 'private, max-age=300, stale-while-revalidate=3600' : 'private, max-age=0, must-revalidate'
     );
-    reply.header(
-      'Content-Security-Policy',
-      "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; form-action 'none'; frame-ancestors 'self';"
-    );
+    reply.header('Content-Security-Policy', HTML_SANDBOX_CSP);
     reply.header('Content-Type', 'text/html; charset=utf-8');
 
     if (isFreshRequest(req.headers, etag, stat.mtimeMs)) {
