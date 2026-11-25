@@ -4480,6 +4480,26 @@ export class ArtifactService {
       }
 
       if (['code', 'markdown', 'html', 'svg', 'mermaid', 'diff'].includes(format)) {
+        if (range.targetHashes === true || range.targetHashes === 'true') {
+          const start = Number(range.startLine), end = Number(range.endLine);
+          if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start || end > Number.MAX_SAFE_INTEGER-2) {
+            throw new ArtifactError('INVALID_INPUT', 'Invalid source target range.', 400);
+          }
+          // Compute target identity from the same pinned server bytes, including
+          // context, rather than depending on the client's secure-context API.
+          const first = Math.max(1, start-2);
+          const data = await this.streamLineRangeFromBlob(blobPath,sizeBytes,{startLine:first,endLine:end+2});
+          if (data.truncated || Number(data.endLine)<end) {
+            throw new ArtifactError('INVALID_INPUT', '選択範囲が大きすぎるか、存在しません。', 400);
+          }
+          const lines = String(data.text).split('\n');
+          const offset = start-first, length = end-start+1;
+          if(offset+length>lines.length)throw new ArtifactError('INVALID_INPUT','選択範囲が存在しません。',400);
+          const text=lines.slice(offset,offset+length).join('\n');
+          const before=lines.slice(0,offset).join('\n'), after=lines.slice(offset+length).join('\n');
+          const hash=(value:string)=>crypto.createHash('sha256').update(value,'utf8').digest('hex');
+          return {artifactId:artifact.id,revision:revision.revision,sha256:revision.sha256,startLine:start,endLine:end,text,before,after,expectedSnippetHash:hash(text),contextBeforeHash:hash(before),contextAfterHash:hash(after)};
+        }
         const data = range.offsetBytes !== undefined
           ? this.readByteRangeFromBlob(blobPath, sizeBytes, range)
           : await this.streamLineRangeFromBlob(blobPath, sizeBytes, range);

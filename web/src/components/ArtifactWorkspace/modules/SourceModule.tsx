@@ -4,7 +4,8 @@ import { MarkdownContent,CodeBlock } from '../../MarkdownContent';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
 import { useRevisionResource } from '../useRevisionResource';
 import type { WorkspaceModuleProps } from '../types';
-import { sha256Text } from '../targetHash';
+import { workspaceApi } from '../../../api/workspace';
+import { assertRevision } from '../useRevisionResource';
 import {SourceEditor,type SourceEditorHandle} from '../../shared-ui/editor/SourceEditor';
 
 export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget}:WorkspaceModuleProps){
@@ -25,13 +26,10 @@ export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget
   async function selectLines(){
     if(!resource.ready||artifact.revision===undefined||!editor.current)return;
     const {startLine:start,endLine:end}=editor.current.getSelection();
-    const lines=text.replace(/\r\n/g,'\n').split('\n');
-    const snippet=lines.slice(start-1,end).join('\n');
-    const before=lines.slice(Math.max(0,start-3),start-1).join('\n');
-    const after=lines.slice(end,end+2).join('\n');
     try{
-      const [expectedSnippetHash,contextBeforeHash,contextAfterHash]=await Promise.all([sha256Text(snippet),sha256Text(before),sha256Text(after)]);
-      onTarget({baseRevision:artifact.revision,label:start+'–'+end+' 行',selector:{kind:markdown?'md_text_range':'code_line_range',startLine:start,endLine:end,expectedSnippetHash,contextBeforeHash,contextAfterHash},range:{startLine:start,endLine:end},selectedContentSnapshot:snippet,surroundingContext:before+'\n---\n'+after});
+      const result=await workspaceApi.range<{text:string;before:string;after:string;expectedSnippetHash:string;contextBeforeHash:string;contextAfterHash:string}>(artifact.id,{startLine:start,endLine:end,targetHashes:true});
+      assertRevision(artifact,result);
+      onTarget({baseRevision:artifact.revision,label:start+'–'+end+' 行',selector:{kind:markdown?'md_text_range':'code_line_range',startLine:start,endLine:end,expectedSnippetHash:result.expectedSnippetHash,contextBeforeHash:result.contextBeforeHash,contextAfterHash:result.contextAfterHash},range:{startLine:start,endLine:end},selectedContentSnapshot:result.text,surroundingContext:result.before+'\n---\n'+result.after});
       setPinError('');
     }catch{setPinError('選択対象の識別情報を作成できませんでした。')}
   }
