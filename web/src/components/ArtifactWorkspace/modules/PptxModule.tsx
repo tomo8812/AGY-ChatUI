@@ -39,6 +39,8 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   const fileGeneration=useRef(0);
   const pendingNavigation=useRef<{revision:number;index:number}|null>(null);
   const [drag,setDrag]=useState<{id:string;dx:number;dy:number}|null>(null);
+  const [resize,setResize]=useState<{id:string;bounds:Bounds}|null>(null);
+  const resizePointer=useRef<{id:string;x:number;y:number;bounds:Bounds;revision:number;part:string;pointerId:number}|null>(null);
   const stage=useRef<HTMLDivElement>(null);
   const pointer=useRef<{id:string;x:number;y:number;bounds:Bounds;revision:number;part:string}|null>(null);
   const structure=useRevisionResource(artifact,'pptx-structure',async signal=>{const r=await workspaceApi.structure<Presentation>(artifact.id,signal);assertRevision(artifact,r);return r});
@@ -123,6 +125,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   const previewReady=(changes.length>0||!!currentStructural)&&currentPreview?.status==='ready';
   const key=(id:string,kind:string)=>String(slide?.part)+':'+id+':'+kind;
   const bounds=(s:Shape):Bounds|undefined=>{const b=s.transform?.geomBoundsPt;if(!b)return;const next=draft?.entries.find(e=>e.key===key(s.id,'bounds'))?.operation.boundsPt;if(Array.isArray(next)&&next.length===4)return {x:Number(next[0]),y:Number(next[1]),width:Number(next[2]),height:Number(next[3])};return b};
+  const displayBounds=(s:Shape)=>resize?.id===s.id?resize.bounds:bounds(s);
   function writeBounds(s:Shape,b:Bounds){
     if(!slide||artifact.revision===undefined||lock||!scene.ready||!supportsOperation(capabilities,'pptx.set_shape_bounds'))return;
     const original=s.transform?.geomBoundsPt,k=key(s.id,'bounds');
@@ -166,7 +169,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     if(['pptx.add_slide','pptx.remove_slide','pptx.reorder_slide'].includes(operation.op))pendingNavigation.current={revision:artifact.revision,index:operation.op==='pptx.add_slide'?index+1:operation.op==='pptx.remove_slide'?Math.min(index,slides.length-2):destination-1};
     onDraft(artifact.revision,{key:'pptx-structure',label:availableActions.find(a=>a.id===operationKind)!.label,operation},'pptx-structure');chooseOperation('');
   }
-  const choose=(id:string)=>{setSelected(id);setDrag(null)};
+  const choose=(id:string)=>{setSelected(id);setDrag(null);setResize(null);resizePointer.current=null};
   const pin=()=>{if(shape&&slide&&artifact.revision!==undefined)onTarget({baseRevision:artifact.revision,label:'スライド '+(index+1)+' / '+shape.name,selector:{kind:'pptx_shape',slideId:slide.id,slidePart:slide.part,shapeId:Number(shape.id),expectedElementFingerprint:artifact.sha256},selectedContentSnapshot:shape.text,contentCoords:shape.transform?.geomBoundsPt?{...shape.transform.geomBoundsPt}:undefined})};
   const primary=<><span className="workspace-slide-counter" title="スライド番号">{index+1} / {slides.length}</span>
     {mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!shape||!scene.ready} onClick={pin}>要素を対象にする</button>}
@@ -180,7 +183,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     </>}
     {<select aria-label="スライド編集操作" disabled={!structureEnabled} value={operationKind} onChange={e=>chooseOperation(e.target.value)}><option value="">スライド操作…</option>{availableActions.map(a=><option key={a.id} value={a.id}>{a.label}</option>)}</select>}
   </>:null;
-  const toolbar=<ResponsiveCommandBar primary={primary} secondary={secondary} minInlineWidth={1100}/>;
+  const toolbar=<ResponsiveCommandBar primary={primary} secondary={secondary} minInlineWidth={1400} closeOnButton closeOnSelect/>;
   const operationForm=mode==='edit'&&operationKind&&!structural?<div className="workspace-pptx-operation" role="group" aria-label="追加・構造変更">
     {addingElement&&<div className="workspace-toolbar">{['X','Y','幅','高さ'].map((label,i)=><label key={label} className="workspace-bound">{label}<input aria-label={'追加要素 '+label} type="number" value={Number.isFinite(newBounds[i])?newBounds[i]:''} onChange={e=>setNewBounds(v=>v.map((n,j)=>i===j?e.target.valueAsNumber:n) as [number,number,number,number])}/></label>)}</div>}
     {operationKind==='pptx.add_shape'&&<div className="workspace-toolbar"><select aria-label="追加図形" value={shapeKind} onChange={e=>setShapeKind(e.target.value as typeof shapeKind)}><option value="rectangle">四角形</option><option value="ellipse">楕円</option><option value="textbox">テキストボックス</option></select><input aria-label="追加図形テキスト" value={shapeText} maxLength={20000} onChange={e=>setShapeText(e.target.value)}/></div>}
@@ -200,19 +203,25 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
         <Layer blob={data.background} alt="スライド背景"/>
         {data.layers.map(({shape:s,image})=>{
           const exact=previewReady?currentPreview?.images.get(Number(s.id)):undefined;
-          const b=bounds(s),orig=exact?b:s.transform?.geomBoundsPt;
+          const b=displayBounds(s),orig=exact?bounds(s):s.transform?.geomBoundsPt;
           const dx=(b&&orig?b.x-orig.x:0)+(drag?.id===s.id?drag.dx:0),dy=(b&&orig?b.y-orig.y:0)+(drag?.id===s.id?drag.dy:0);
           // One full-slide transparent sprite per element. Scale around the original
           // geometry origin, then translate; never retain a second original layer.
           const sx=orig&&b&&orig.width>0?b.width/orig.width:1,sy=orig&&b&&orig.height>0?b.height/orig.height:1;
           return <Layer key={s.id} blob={exact??image} style={{transformOrigin:orig?(orig.x/size.widthPt*100+'% '+orig.y/size.heightPt*100+'%'):undefined,
             transform:'translate('+dx/size.widthPt*100+'%,'+dy/size.heightPt*100+'%) scale('+sx+','+sy+')'}}/>})}
-        {!currentStructural&&data.shapes.map(s=>{const b=bounds(s);if(!b||b.width<=0||b.height<=0)return null;const active=selected===s.id||target?.selector.shapeId===Number(s.id);return <button key={s.id} type="button" aria-label={s.name||'図形 '+s.id} className={'workspace-shape-hit '+(active?'selected':'')} style={{left:(b.x+(drag?.id===s.id?drag.dx:0))/size.widthPt*100+'%',top:(b.y+(drag?.id===s.id?drag.dy:0))/size.heightPt*100+'%',width:b.width/size.widthPt*100+'%',height:b.height/size.heightPt*100+'%'}} onClick={()=>choose(s.id)}
+        {!currentStructural&&data.shapes.map(s=>{const b=displayBounds(s);if(!b||b.width<=0||b.height<=0)return null;const active=selected===s.id||target?.selector.shapeId===Number(s.id);return <button key={s.id} type="button" aria-label={s.name||'図形 '+s.id} className={'workspace-shape-hit '+(active?'selected':'')} style={{left:(b.x+(drag?.id===s.id?drag.dx:0))/size.widthPt*100+'%',top:(b.y+(drag?.id===s.id?drag.dy:0))/size.heightPt*100+'%',width:b.width/size.widthPt*100+'%',height:b.height/size.heightPt*100+'%'}} onClick={()=>choose(s.id)}
           onPointerDown={e=>{choose(s.id);if(mode!=='edit'||lock||!scene.ready||!slide||artifact.revision===undefined||!supportsOperation(capabilities,'pptx.set_shape_bounds'))return;pointer.current={id:s.id,x:e.clientX,y:e.clientY,bounds:b,revision:artifact.revision,part:slide.part};e.currentTarget.setPointerCapture(e.pointerId)}}
           onPointerMove={e=>{const p=pointer.current,rect=stage.current?.getBoundingClientRect();if(p?.id===s.id&&rect?.width&&rect.height)setDrag({id:s.id,dx:(e.clientX-p.x)/rect.width*size.widthPt,dy:(e.clientY-p.y)/rect.height*size.heightPt})}}
           onPointerCancel={()=>{pointer.current=null;setDrag(null)}}
           onPointerUp={e=>{const p=pointer.current,rect=stage.current?.getBoundingClientRect();pointer.current=null;setDrag(null);if(p?.id===s.id&&p.revision===artifact.revision&&p.part===slide?.part&&rect?.width&&rect.height){const dx=(e.clientX-p.x)/rect.width*size.widthPt,dy=(e.clientY-p.y)/rect.height*size.heightPt;if(Math.abs(dx)+Math.abs(dy)>0.5)writeBounds(s,{...p.bounds,x:p.bounds.x+dx,y:p.bounds.y+dy})}}}/>}
         )}
+        {!currentStructural&&mode==='edit'&&shape&&displayBounds(shape)&&!shape.transform?.rotationDegrees&&can('pptx.set_shape_bounds')&&<button type="button" className="workspace-shape-hit workspace-resize-handle" aria-label="選択要素をリサイズ" style={{left:(displayBounds(shape)!.x+displayBounds(shape)!.width)/size.widthPt*100+'%',top:(displayBounds(shape)!.y+displayBounds(shape)!.height)/size.heightPt*100+'%'}}
+          onPointerDown={e=>{if(!slide||artifact.revision===undefined)return;e.stopPropagation();const b=bounds(shape)!;resizePointer.current={id:shape.id,x:e.clientX,y:e.clientY,bounds:b,revision:artifact.revision,part:slide.part,pointerId:e.pointerId};e.currentTarget.setPointerCapture(e.pointerId)}}
+          onPointerMove={e=>{const p=resizePointer.current,rect=stage.current?.getBoundingClientRect();if(p?.id===shape.id&&p.pointerId===e.pointerId&&rect?.width&&rect.height)setResize({id:p.id,bounds:{...p.bounds,width:Math.min(14400,Math.max(1,p.bounds.width+(e.clientX-p.x)/rect.width*size.widthPt)),height:Math.min(14400,Math.max(1,p.bounds.height+(e.clientY-p.y)/rect.height*size.heightPt))}})}}
+          onPointerUp={e=>{const p=resizePointer.current,rect=stage.current?.getBoundingClientRect();resizePointer.current=null;setResize(null);if(p?.id===shape.id&&p.revision===artifact.revision&&p.part===slide?.part&&p.pointerId===e.pointerId&&rect?.width&&rect.height){writeBounds(shape,{...p.bounds,width:Math.min(14400,Math.max(1,p.bounds.width+(e.clientX-p.x)/rect.width*size.widthPt)),height:Math.min(14400,Math.max(1,p.bounds.height+(e.clientY-p.y)/rect.height*size.heightPt))})}}}
+          onPointerCancel={()=>{resizePointer.current=null;setResize(null)}} onLostPointerCapture={()=>{resizePointer.current=null;setResize(null)}}
+          onKeyDown={e=>{const b=bounds(shape);if(!b)return;const step=e.shiftKey?10:1;const delta:Record<string,[number,number]>={ArrowRight:[step,0],ArrowLeft:[-step,0],ArrowDown:[0,step],ArrowUp:[0,-step]};if(delta[e.key]){e.preventDefault();writeBounds(shape,{...b,width:Math.min(14400,Math.max(1,b.width+delta[e.key][0])),height:Math.min(14400,Math.max(1,b.height+delta[e.key][1]))})}}}/>} 
         </>}
       </div>}
       {currentStructural&&<div className="workspace-toolbar" role="status">{currentStructural.label}（保存前プレビュー）<button type="button" className="btn btn-secondary btn-xs" disabled={editingLocked} onClick={()=>{pendingNavigation.current=null;if(artifact.revision!==undefined)onDraft(artifact.revision,null,'pptx-structure')}}>取消</button></div>}

@@ -161,7 +161,12 @@ for(const vp of targets){
               const before=await svc.renderPng(userId,artifact.id,{pageIndex:0});
               record.beforeVisual=await capturePptx(page,info,before.png,'pptx-before');
               await page.getByRole('button',{name:'Title',exact:true}).click();
-              await page.getByRole('textbox',{name:'図形テキスト'}).fill(item.updated);
+              const textInput=page.getByRole('textbox',{name:'図形テキスト'});
+              await textInput.fill(item.updated);
+              expect((await textInput.boundingBox())!.width).toBeGreaterThanOrEqual(90);
+              const handle=page.getByRole('button',{name:'選択要素をリサイズ',exact:true});
+              await expect(handle).toBeVisible();
+              await handle.press('ArrowRight');
               await openCommand(page,page.getByRole('button',{name:'太字',exact:true}));
               await page.getByRole('button',{name:'太字',exact:true}).click();
               // Await actual worker output for the unsaved text; no document mutation yet.

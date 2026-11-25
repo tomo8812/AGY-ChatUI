@@ -72,7 +72,7 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
       }}/>
     </>}
   </>:null;
-  const toolbar=<ResponsiveCommandBar primary={primary} secondary={secondary} minInlineWidth={1100}/>;
+  const toolbar=<ResponsiveCommandBar primary={primary} secondary={secondary} minInlineWidth={1450}/>;
   if(mode==='view'&&reading==='page'&&canRender)return <div className="workspace-page-view">
     <div className="workspace-toolbar"><button className="btn btn-secondary btn-xs" type="button" onClick={()=>setReading('text')}>読取表示</button></div>
     <PdfCanvasViewer enhancedNavigation documentKey={artifact.id} url={buildArtifactContentUrl(artifact,{convertedPdf:true})}/>
