@@ -163,18 +163,33 @@
 | 形式 | 操作 | ステータス | 実装箇所 | 検証結果・区分 |
 | --- | --- | --- | --- | --- |
 | **画像（`FUNC-06`）** | `create` / `structure` / `verify` / `render_png`（領域指定対応） / `export:png\|jpg\|jpeg\|webp` / `image.crop\|resize\|rotate\|brightness\|annotate\|composite` | **対応済み** | `server/scripts/artifact_doc_worker.py` (`handle_image`, `crop_png_region`), `server/src/artifacts/adapters/registry.ts` | `VERIFIED (REAL RUNTIME)` (`artifact_doc_worker_test.py`) |
-| **SVG（`FUNC-07`）** | `create` / `get_structure` / `read_range` / `edit` / `verify`（名前空間付き XML の整形式・`viewBox`・静的なアクティブコンテンツ指標・矩形と凸多角形の重なり／範囲外） / `export:png` / `render_png`（領域指定対応） | **検証は部分実装**（下表の範囲） | `server/src/artifacts/adapters/svg-adapter.ts`, `server/src/artifacts/adapters/xml-validator.ts`, `server/scripts/artifact_doc_worker.py` (`render_svg`), `server/src/artifacts/artifact-service.ts` | `VERIFIED (REAL RUNTIME)` (`adapter-verification.test.ts`, `test_svg_renders_styles_and_images_supplied_by_the_snapshot`, `artifact-capabilities.test.ts`) |
-| **HTML（`FUNC-08`）** | `create` / `get_structure` / `read_range` / `edit` / `verify`（HTML5 パーサー診断・必須終了タグ・重複 ID・版の依存マニフェストに対する静的参照・既存サンドボックスの静的 CSP 照合） / `render_png`（領域指定対応） / `export:png`（Full Runtime） | **検証は部分実装**（下表の範囲） | `server/src/artifacts/adapters/html-adapter.ts`, `server/src/artifacts/artifact-service.ts` (`verifyArtifact`), `server/scripts/artifact_web_renderer.mjs`, `server/src/files/sandbox-bridge.ts` | `VERIFIED (REAL RUNTIME)` (`adapter-verification.test.ts`, `artifact-capabilities.test.ts`, `layout-mode-and-sandbox.test.ts`) |
-| **Markdown（`FUNC-09`）** | `create` / `get_structure` / `read_range` / `edit` / `verify`（見出し段跳び・重複スラッグ・空リンク・アンカー切れ・フェンス閉鎖） | **対応済み** | `server/src/artifacts/adapters/markdown-adapter.ts` (`MarkdownAdapter`) | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts`) |
+| **SVG（`FUNC-07`）** | 制作・構造・範囲・ソース／要素編集、XML・静的検証、Chromium の図形／テキスト検証、PNG | **対応済み**（検査領域・予算は下表） | `svg-adapter.ts`、`markup-edit.ts`、`svg-verifier.ts`、`artifact_web_verify.mjs` | `artifact-structure-edits.test.ts`、`builtin-artifact-mcp.test.ts`（strict bwrap） |
+| **HTML（`FUNC-08`）** | ソース・パッチ・DOM 編集、永続依存、CSS セレクターによる対象再解決、構文検証・実ブラウザ CSP／依存検証、PNG | **対応済み**（実ブラウザは Full Runtime） | `html-adapter.ts`、`html-select.ts`、`markup-edit.ts`、`artifact_web_verify.mjs` | `artifact-structure-edits.test.ts`、`builtin-artifact-mcp.test.ts`（strict bwrap） |
+| **Markdown（`FUNC-09`）** | `create` / `get_structure` / `read_range` / 全文・範囲・セクション・構文木編集 / `verify`（見出し段跳び・重複スラッグ・空リンク・アンカー切れ・フェンス閉鎖） | **対応済み** | `server/src/artifacts/adapters/markdown-adapter.ts` (`MarkdownAdapter`) | `VERIFIED (REAL RUNTIME)` (`artifact-structure-edits.test.ts`、`builtin-artifact-mcp.test.ts`) |
 | **Markdown（`FUNC-09`）** | `export:html`（実 CommonMark/GFM レンダリング・`<pre>` スタブ撤去・Pure-JS） / `export:txt` | **対応済み** | `server/src/artifacts/adapters/markdown-adapter.ts` (`renderMarkdownToHtmlDocument`) | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts`) |
 | **Markdown（`FUNC-09`）** | `export:pdf`（Full: Chromium `page.pdf` / Compact: Pandoc+LibreOffice） / `export:docx`（Pandoc＋`python-docx` フォールバック） / `render_png`（領域指定対応） | **対応済み** | `server/scripts/artifact_web_renderer.mjs`, `server/scripts/artifact_doc_worker.py` (`export_markdown`), `server/src/artifacts/document-worker.ts`, `server/src/artifacts/artifact-service.ts` | `VERIFIED (REAL RUNTIME)` (`test_markdown_export_to_docx_and_pdf`, `builtin-artifact-mcp.test.ts` Full Runtime テスト) |
 | **コード/テキスト（`FUNC-10`）** | `create` / `get_structure` / `read_range` / `edit`（範囲置換・検索置換・パッチ） / `verify`（UTF-8/NUL・JSON・YAML の構文・名前空間付き XML の整形式。DTD 依存 XML は未検証） | **検証は部分実装**（下表の範囲） | `server/src/artifacts/adapters/code-adapter.ts` (`CodeAdapter`), `server/src/artifacts/adapters/xml-validator.ts` | `VERIFIED (REAL RUNTIME)` (`adapter-verification.test.ts`, `artifact-core-durability.test.ts`) |
-| **Diff（`FUNC-11`）** | `create` / `get_structure` / `read_range` / `edit` / `verify`（パッチ構文検査） | **対応済み** | `server/src/artifacts/adapters/diff-adapter.ts` (`DiffAdapter`) | `VERIFIED (REAL RUNTIME)` (`artifact-core-durability.test.ts`) |
-| **Mermaid（`FUNC-12`）** | `create` / `get_structure` / `read_range` / `edit` / `verify`（Base: 行番号付静的検査＋Full: 実 `mermaid.parse()` 構文エラー行番号検証） | **対応済み** | `server/src/artifacts/adapters/mermaid-adapter.ts` (`MermaidAdapter`), `server/scripts/artifact_web_renderer.mjs` (`action: 'verify'`), `server/src/artifacts/artifact-service.ts` (`verifyArtifact`) | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts`: Base 静的検査＋Full Runtime 実 `mermaid.parse()` テスト) |
+| **Diff（`FUNC-11`）** | `create` / `get_structure` / `read_range` / ソース・ハンク置換／削除 / `verify`（パッチ構文検査） | **対応済み** | `server/src/artifacts/adapters/diff-adapter.ts` (`DiffAdapter`) | `VERIFIED (REAL RUNTIME)` (`artifact-structure-edits.test.ts`、`artifact-core-durability.test.ts`) |
+| **Mermaid（`FUNC-12`）** | `create` / `get_structure` / `read_range` / ソース・フローチャート構造編集 / `verify`（Base: 行番号付静的検査＋Full: 実 `mermaid.parse()` 構文エラー行番号検証） | **対応済み**（構造操作は `flowchart` / `graph`） | `server/src/artifacts/adapters/mermaid-adapter.ts` (`MermaidAdapter`), `server/scripts/artifact_web_renderer.mjs` (`action: 'verify'`), `server/src/artifacts/artifact-service.ts` (`verifyArtifact`) | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts`: Base 静的検査＋Full Runtime 実 `mermaid.parse()` テスト) |
 | **Mermaid（`FUNC-12`）** | `export:svg`（実 `mermaid.render()` SVG 出力） / `export:png` / `render_png`（領域指定対応、Full Runtime） | **対応済み** | `server/scripts/artifact_web_renderer.mjs`, `server/src/artifacts/artifact-service.ts` (`exportArtifact`, `renderPng`) | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts` Full Runtime テスト) |
 | **動画/音声（`FUNC-13`）** | `structure` / `verify` / `render_png`（映像フレーム＋領域指定対応；音声のみは `unsupported_by_format`） / `media.trim`（1 連続区間） | **部分実装**（音声の映像フレーム抽出・非対応コンテナは設計上 `unsupported_by_format`） | `server/scripts/artifact_doc_worker.py` (`handle_media`), `server/src/artifacts/adapters/registry.ts` | `VERIFIED (REAL RUNTIME)` (`artifact_doc_worker_test.py`, `artifact-capabilities.test.ts`) |
 | **Binary（`FUNC-14`）** | `get_structure`（メタ・SHA-256 のみ）；`create` / `edit` / `target_pin` は非対応明示 | **設計上許容された非対応**（閲覧・DL・履歴復元のみ） | `server/src/artifacts/adapters/binary-adapter.ts` (`BinaryAdapter`) | `VERIFIED (REAL RUNTIME)` (`artifact-capabilities.test.ts`) |
 | **軽量リッチ回答（`FUNC-15`）** | サーバー・MCP 6 ツール・静的/動的上限・循環検出・SQLite 版管理・Artifact 保存（Pure-JS） | **対応済み**（UI 共通描画コンポーネントは PR 3A 計画対象） | `server/src/rich/rich-content-service.ts`, `server/src/rich/rich-validator.ts`, `server/src/rich/rich-expr-evaluator.ts`, `server/src/routes/rich-routes.ts` | `VERIFIED (REAL RUNTIME)` (`rich-security-negative.test.ts`, `builtin-artifact-mcp.test.ts`) |
+
+### 構造編集の操作契約
+
+編集前の `artifact_get_structure` が返す要素・ブロック・ハンクに対し、`artifact_edit` の既存 Revision、冪等性、依存伝播、履歴の各検査を適用する。選択が不一致の場合は競合を返す。
+
+| 設計書の操作 | API と選択条件 | 検証の根拠 |
+| --- | --- | --- |
+| SVG 図形・文字 | `svg.add_shape`、`svg.add_text`、`svg.set_text`。親 ID／構造インデックスを使う | SVG の名前空間、入れ子の同名タグ、属性値のエスケープを実ファイルの文字列と構造の両方で照合 |
+| SVG 属性・スタイル・座標・階層 | `svg.set_attr`、`svg.set_style`、`svg.set_geometry`、`svg.insert_element`、`svg.replace_element`、`svg.remove_element`、`svg.move_element`。ID／インデックスと任意の期待 fingerprint を使う | 元の無関係な要素とコメントの保持、移動後の親要素、自己配下への移動拒否 |
+| HTML ソース・パッチ・DOM | `replace_source`、`replace_range`、`html.apply_patch`、`html.set_attr`、`html.set_text`、`html.insert_element`、`html.replace_element`、`html.remove_element`、`html.move_element`。ブラウザに対応した CSS セレクターで対象を再解決 | `parse5` の位置に基づく部分更新、void 要素、入れ子、追加依存、期待 Revision 競合 |
+| Markdown セクション・範囲・全文・構造 | `replace_source`、`replace_range`、`markdown.replace_section`、`markdown.insert_block`、`markdown.replace_block`、`markdown.remove_block`、`markdown.move_block`、`markdown.set_heading`、`markdown.set_code_block`、`markdown.set_table_cell` | CommonMark/GFM 構文木の位置を使用。フェンス内の見出しを対象外とし、Setext 見出しと表セルの区切りを検証 |
+| Diff ハンク・ソース | `replace_source`、`diff.replace_hunk`、`diff.remove_hunk`。ファイル／ハンクインデックスまたは既存ヘッダー・ハッシュ | `diff` パーサーで前後を解析し、追加／削除行数と後続ハンクの新側座標を検証 |
+| Mermaid ソース・ノード・エッジ・グループ | `replace_source`、`replace_range`、`mermaid.add_node`、`set_node`、`remove_node`、`move_node`、`add_edge`、`set_edge`、`remove_edge`、`add_group`、`set_group`、`remove_group`、`move_group`。構造編集はフローチャートのノード・エッジ・subgraph を対象にする | 構造、既存コメント、入れ子、連結エッジを Pure-JS テストで確認。保存後のソースを strict bwrap 実行の Mermaid パーサーで再解析 |
+
+実行入口は `artifact-structure-edits.test.ts` と `builtin-artifact-mcp.test.ts`。構造編集の内容は既存の保存トランザクションを経由するため、PR 1 の Revision 管理、依存伝播、IPC／ACP 境界に専用の変更はない。
 
 ### YAML・XML・SVG・HTML の検証範囲
 
@@ -188,6 +203,16 @@
 | `svg_security` | パース済み属性のイベントハンドラ、危険なリンクスキーム、スクリプト・`foreignObject` | CSS、アニメーション、リンク先や埋め込みの内容は未検証。 `svg-verifier.ts` |
 | `html_syntax` | `parse5` の HTML5 診断と明示された要素の必須終了タグ。省略可能なタグや断片入力を許容 | 要素のコンテンツモデルとブラウザが診断なしに修復する全ケースの適合性は判定対象外。 `html-validator.ts` |
 | `html_relative_refs`、`html_csp` | パース後の静的 URL と一部 CSS の `url()`・`@import`・フォントを、版の依存マニフェストと既存ビューアの応答ヘッダーに照合。相対画像は版に存在していてもビューアの CSP で遮断される | JavaScript の実行、追加の meta CSP と適用順序、`srcset` の候補選択、`base` の解決、未対応 CSS などは `unverified`。この検査のためのネットワーク読込は行わない。 `html-validator.ts`、`sandbox-bridge.ts`、`file-routes.ts` |
+
+Full Runtime と strict bwrap の構成では、静的検査に次のチェックを追加する。
+
+| チェック | 確認する範囲 | 検証根拠 |
+| --- | --- | --- |
+| `svg_browser_overlap`、`svg_browser_bounds` | Chromium の計算済み CSS、座標変換、曲線と図形の塗り／ストローク、文字ごとの配置を使う。見えている領域をサンプリングし、画面上の重なりと viewBox 外を報告 | 曲線と文字の重なり、装飾された楕円の範囲外、CSS で非表示にした図形、対象セレクターを strict bwrap 内で検証 |
+| `html_browser_dom`、`html_browser_execution`、`html_browser_csp` | 既存 CSP とズームブリッジを配信し、同じ `allow-scripts` iframe で実行。初期ロードと 350 ms 間の動的 DOM、スクリプトエラー、CSP 違反を観測 | スクリプトによる重複 ID と接続遮断を実 Chromium で確認 |
+| `html_browser_dependencies` | 同じ Revision の依存マニフェストをオフラインで再生し、Chromium が選ぶ HTML・CSS 資源を照合 | CSS の `@import` を通じた欠落を実 Chromium で確認 |
+
+`artifact_verify.options` の `selector`、`elementOffset`、`maxElements` は検査対象を制限する。SVG は `metrics.browser.next` が次のウィンドウの開始位置を返す。ブラウザ検証はソース最大 1,000,000 バイト、依存 24 MiB、SVG 参照比較候補 1,200、比較上限 25,000 組、HTML 依存再生最大 1,500 リクエスト。対象外のウィンドウ、枚数や予算の超過、フィルター／クリップ／マーカー等のピクセル単位判定を網羅できない場合は `partial` とする。結果は検査した描画条件と初期ロードの観測に適用する。
 
 検証専用の予算は 512 KiB、深さ 128、12,000 ノード（HTML は要素とコメント、XML は要素）。YAML のマップ・フローコレクションは 1,024 項目、SVG の交差判定は 400 図形と 200 万回の射影、HTML の CSS 検査は 1 ブロック 32,768 UTF-16 コード単位まで。診断は最大 25 件に抑え、検出数は可能な範囲で維持する。入力サイズは Revision のブロブを読み込む前に確認する。この予算は `artifact_verify` の検査に適用する。
 
@@ -284,7 +309,8 @@ Node.js 24 の単発計測では、上限付近の YAML（511 KiB）で CPU 10 m
 | **`VERIFIED (REAL RUNTIME)`** | `npm run typecheck && npm run build && npm test`（`8122eeb` 時点の記録。`AGY_TEST_FULL_RUNTIME_DIR` 未設定の Base ChatUI モード） | **全 23 スイート合格（154 passed / Full Runtime 等 3 テストは明示的に `SKIPPED`）** | `adapter-verification.test.ts`（Code JSON/YAML/XML・SVG XML/viewBox/XSS/重なり・HTML 構文/相対参照/CSP の正常・異常テスト 9 件）および `architecture-conformance.test.ts`（0 違反）を含む全 23 スイート合格。`it.skipIf(...)` により、未実行の Full Runtime / strict `bwrap` テストが誤って `passed` として計上されないことを保証。 |
 | **`VERIFIED (REAL RUNTIME)`** | 修正後の型チェック・ビルド、`adapter-verification.test.ts`、`artifact-capabilities.test.ts`、`layout-mode-and-sandbox.test.ts`、`architecture-conformance.test.ts` | **77 / 77 passed** | 既存 HTML ビューアを Chromium 156 で実行。構文の正常・異常、SVG の変換と除外、CSP と依存の区別、検証予算を確認。 |
 | **`VERIFIED (REAL RUNTIME)`** | 修正後の `server.tests.artifact_doc_worker_test` | **34 / 34 passed** | ポータブル LibreOffice 26.2.7 と PowerPoint 生成の SmartArt フィクスチャを用いた Python ワーカーの実ファイル検証。 |
-| **`UNVERIFIED`** | 修正後の Full Runtime MCP の PPTX 視覚検証、strict `bwrap` | **PPTX テスト 1 件失敗、strict 1 件スキップ** | ワーカーの固定 PATH に LibreOffice がなく、PPTX の視覚検証は `scope: none` だった。この環境の `bwrap` は UID マップ設定で起動に失敗した。 |
+| **`UNVERIFIED`** | 旧環境での Full Runtime MCP の PPTX 視覚検証、strict `bwrap` | **PPTX テスト 1 件失敗、strict 1 件スキップ** | ワーカーの固定 PATH に LibreOffice がなく、PPTX の視覚検証は `scope: none` だった。入れ子実行環境の `bwrap` は UID マップ設定で起動に失敗した。 |
+| **`VERIFIED (REAL RUNTIME)`** | `AGY_TEST_FULL_RUNTIME_DIR=/tmp/agy-pr2-strict-runtime AGY_REQUIRE_STRICT_ARTIFACT_RUNTIME=1 npm --workspace=server run test -- tests/builtin-artifact-mcp.test.ts -t 'Full Runtime\|strict bwrap'` | **3 / 3 passed** | Python 3.13、LibreOffice 26.2.7、qpdf 12.2、Pandoc、Chromium を read-only 配備。strict bwrap を必須にして、PPTX 対象スライドの SSIM、PDF、Markdown、Mermaid、および HTML/SVG のブラウザ検証を確認。 |
 | **`VERIFIED (MOCK / EMULATION)`** | `acp-transparency.test.ts`, `builtin-artifact-mcp.test.ts`（ACP ターン帰属・`session/load`・`session/resume` 経路） | **passed** | `agyMode: 'mock'` の拡張モック ACP クライアントによる検証。 |
 | **`UNVERIFIED`** | 実 `agy` バイナリ / 実 Microsoft PowerPoint・Word・Excel デスクトップアプリ / 物理 iPhone（iOS Safari・PWA） | **未検証（環境非搭載）** | LibreOffice やモック検証をもって検証済みと混同しない。実 `agy` 検証は `AGY_REAL_TEST=1 node scripts/verify-real-agy-artifact-mcp.mjs` を実機環境で実行すること。 |
 
@@ -297,4 +323,3 @@ PR #37 に過去に記録された全 6 件の PR Lens 指摘について最新�
 - `#4688517338`（`artifact-service.ts` `readRange` における `this.documentWorker.available` 事前チェック欠落）: **本修正で解消**（`artifact-service.ts` に `this.documentWorker.available &&` ガードを追加し、`builtin-artifact-mcp.test.ts` で Base ChatUI 時の 422 `UNSUPPORTED_OPERATION` 返却をテスト化）。
 - `#4689345173`（`MarkdownAdapter.verify` の `decodeURIComponent` 例外保護）: 修正済み確認（`bc6f405` 以降継続維持）。
 - `#4689533352`（`MarkdownAdapter` `sanitizeHref` の二重 HTML エスケープ防止）: 修正済み確認（`88fe84e` 以降 `unescapeBasicHtmlEntities` により継続維持）。
-

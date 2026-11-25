@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { HTML_SANDBOX_CSP, injectSandboxZoomBridge } from '../files/sandbox-bridge.js';
 import type { AppConfig } from '../config.js';
 import { documentFormatConstraint } from './adapters/registry.js';
 import { ArtifactError, unsupportedOperationError } from './errors.js';
@@ -19,12 +20,18 @@ export function isWebRenderFormat(format: ArtifactFormat): format is 'html' | 'm
   return format === 'html' || format === 'markdown' || format === 'mermaid';
 }
 
+export const WEB_VERIFY_MAX_INPUT_BYTES = 1_000_000;
+export const WEB_VERIFY_ASSET_BUDGET = 24 * 1024 * 1024;
+
 export const DOCUMENT_WORKER_MAX_INPUT_BYTES = 100 * 1024 * 1024;
 
 export interface DocumentVerifyOptions {
   slideIndices?: number[];
   maxSlides?: number;
   maxShapesPerSlide?: number;
+  selector?: string;
+  elementOffset?: number;
+  maxElements?: number;
 }
 
 type WorkerAction =
@@ -40,6 +47,7 @@ export type DocumentInputSource = Buffer | { path: string; sizeBytes: number };
 
 const docWorkerScript = fileURLToPath(new URL('../../scripts/artifact_doc_worker.py', import.meta.url));
 
+const webVerifyScript = fileURLToPath(new URL('../../scripts/artifact_web_verify.mjs', import.meta.url));
 const webWorkerScript = fileURLToPath(new URL('../../scripts/artifact_web_renderer.mjs', import.meta.url));
 
 export class DocumentWorker {
@@ -57,6 +65,10 @@ export class DocumentWorker {
   get fullWebRuntimeAvailable(): boolean {
     return this.governor.getRuntimeProfile() === 'full_runtime' &&
       this.sandbox.getIsolationStatus() !== 'sandbox_required_blocked';
+  }
+
+  get browserVerificationAvailable(): boolean {
+    return this.fullWebRuntimeAvailable && this.sandbox.getIsolationStatus() === 'bwrap';
   }
 
   async run(
@@ -77,7 +89,11 @@ export class DocumentWorker {
     const profile = this.governor.getRuntimeProfile();
     const markdownDocExport = format === 'markdown' && request.action === 'export' &&
       (request.targetFormat === 'docx' || (request.targetFormat === 'pdf' && profile !== 'full_runtime'));
-    const web = isWebRenderFormat(format) && !markdownDocExport;
+    const browserVerification = request.action === 'verify' && (format === 'html' || format === 'svg');
+    if (browserVerification && !this.browserVerificationAvailable) {
+      throw unsupportedOperationError(operation, 'disabled_by_resource_tier', 'Browser verification requires Full Runtime with bwrap.');
+    }
+    const web = browserVerification || (isWebRenderFormat(format) && !markdownDocExport);
     if (profile === 'base_chatui' || (web && profile !== 'full_runtime')) {
       throw unsupportedOperationError(operation, 'disabled_by_resource_tier', 'Document runtime is unavailable.');
     }
@@ -126,10 +142,15 @@ export class DocumentWorker {
         fs.writeFileSync(hostPath, bytes, { mode: 0o600 });
         return { relPath, mimeType, sandboxName, hostPath };
       });
+      const browserViewerInput = browserVerification && format === 'html' && Buffer.isBuffer(document) ? path.join(directory, 'viewer') : undefined;
+      if (browserViewerInput && Buffer.isBuffer(document)) {
+        fs.writeFileSync(browserViewerInput, injectSandboxZoomBridge(document.toString('utf8')), { mode: 0o600 });
+      }
       fs.writeFileSync(manifest, JSON.stringify({
         ...request, format, filename, mergeSourceCount: sourceInputs.length,
         hasCompareDocument: Boolean(compareInput),
         entry: renderSnapshot?.entry,
+        ...(browserViewerInput ? { viewerPolicy: HTML_SANDBOX_CSP } : {}),
         assets: assets.map(({ relPath, mimeType, sandboxName }) => ({ relPath, mimeType, sandboxName })),
       }), { mode: 0o600 });
       const webEnv: Record<string, string> = {
@@ -139,11 +160,15 @@ export class DocumentWorker {
       if (!sandboxed && process.env.PLAYWRIGHT_EXECUTABLE_PATH) {
         webEnv.PLAYWRIGHT_EXECUTABLE_PATH = process.env.PLAYWRIGHT_EXECUTABLE_PATH;
       }
+      // The configured runtime is trusted deployment content, mounted read-only.
+      const portableBin = path.join(this.config.docRuntimeDir, 'bin');
+      const workerPath = fs.existsSync(portableBin) ? `${runtimeDir}/bin:/usr/local/bin:/usr/bin:/bin` : undefined;
+      const portableNode = fs.existsSync(path.join(portableBin, 'node')) ? `${runtimeDir}/bin/node` : '/usr/bin/node';
       const result = await this.sandbox.run({
         kind: web ? 'chromium' : officeConversion ? 'libreoffice' : format === 'media' ? 'ffmpeg' : 'python',
-        command: web ? (sandboxed ? '/usr/bin/node' : process.execPath) : path.join(runtimeDir, 'venv/bin/python3'),
+        command: web ? (sandboxed ? portableNode : process.execPath) : path.join(runtimeDir, 'venv/bin/python3'),
         args: [sandboxed ? `/work/in/${scriptName}` : workerScript],
-        env: web ? webEnv : undefined,
+        env: { ...(web ? webEnv : {}), ...(workerPath ? { PATH: workerPath } : {}) },
         inputFiles: [
           ...(inputHostPath ? [{ hostPath: inputHostPath, sandboxName: 'document' }] : []),
           ...(compareInput ? [{ hostPath: compareInput, sandboxName: 'compare' }] : []),
@@ -151,6 +176,8 @@ export class DocumentWorker {
           ...assets.map(({ hostPath, sandboxName }) => ({ hostPath, sandboxName })),
           { hostPath: manifest, sandboxName: 'request.json' },
           { hostPath: workerScript, sandboxName: scriptName },
+          ...(web ? [{ hostPath: webVerifyScript, sandboxName: path.basename(webVerifyScript) }] : []),
+          ...(browserViewerInput ? [{ hostPath: browserViewerInput, sandboxName: 'viewer' }] : []),
         ],
         expectedOutputRelPath: 'result',
         timeoutMs: request.action === 'export' || smartartRecalc || (officeConversion && request.action === 'verify')

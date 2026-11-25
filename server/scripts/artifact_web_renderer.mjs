@@ -1,7 +1,9 @@
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
+import { verifyHtmlBrowser, verifySvgBrowser } from './artifact_web_verify.mjs';
 
 const inputDir = process.env.AGY_WORKER_IN_DIR;
 const outputDir = process.env.AGY_WORKER_OUT_DIR;
@@ -17,6 +19,8 @@ const {
   region,
   entry = 'index.html',
   assets = [],
+  options = {},
+  viewerPolicy,
 } = request;
 const source = await fs.readFile(path.join(inputDir, 'document'), 'utf8');
 if (source.length > 1_000_000) throw new Error('Source exceeds the rendering limit');
@@ -115,7 +119,7 @@ try {
   const viewportHeight = 960;
   const page = await browser.newPage({
     viewport: { width: viewportWidth, height: viewportHeight },
-    javaScriptEnabled: format === 'mermaid',
+    javaScriptEnabled: format === 'mermaid' || (action === 'verify' && ['html', 'svg'].includes(format)),
     serviceWorkers: 'block',
     acceptDownloads: false,
   });
@@ -125,17 +129,74 @@ try {
   const localAssets = new Map(assets.map((asset) => [resourceUrl(asset.relPath), asset]));
   const policy = "default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none'";
   const { marked } = format === 'markdown' ? await import(pathToFileURL(require.resolve('marked'))) : {};
+  const verifyHtml = format === 'html' && action === 'verify';
+  const verifySvg = format === 'svg' && action === 'verify';
+  const browserEntryUrl = origin + '/.agy-verify-shell';
+  const authoringUrl = entryUrl + '?__agy_verify_manifest=1';
+  const viewer = verifyHtml ? await fs.readFile(path.join(inputDir, 'viewer'), 'utf8') : undefined;
+  const observations = {
+    missing: new Set(), external: new Set(), served: 0, limited: false, requests: 0,
+    violations: [], errors: [], ready: false,
+  };
   let servedEntry = false;
-  await page.route('**/*', async (route) => {
+  let servedViewer = false;
+  let servedAuthoring = false;
+  if (verifyHtml) {
+    if (!viewerPolicy) throw new Error('A viewer CSP is required for HTML verification.');
+    const nonce = randomUUID();
+    await page.context().exposeBinding('__agyReportVerification', ({ frame }, supplied, kind, detail) => {
+      if (supplied !== nonce || frame.parentFrame() !== page.mainFrame() || servedAuthoring) return;
+      if (kind === 'ready') observations.ready = true;
+      else if (kind === 'csp' && observations.violations.length < 50) observations.violations.push(detail);
+      else if (kind === 'error' && observations.errors.length < 25) observations.errors.push(detail);
+    });
+    await page.context().addInitScript((token) => {
+      const send = globalThis.__agyReportVerification;
+      send(token, 'ready');
+      addEventListener('securitypolicyviolation', (event) => {
+        if (event.isTrusted) send(token, 'csp', { directive: event.effectiveDirective, blocked: event.blockedURI.slice(0, 150) });
+      });
+      addEventListener('error', (event) => {
+        if (event.isTrusted && event.message) send(token, 'error', event.message.slice(0, 200));
+      });
+      addEventListener('unhandledrejection', (event) => {
+        if (event.isTrusted) send(token, 'error', String(event.reason).slice(0, 200));
+      });
+    }, nonce);
+  }
+  await page.context().route('**/*', async (route) => {
     const req = route.request();
     const url = new URL(req.url());
+    const query = url.search;
     url.search = '';
     url.hash = '';
-    if (req.method() !== 'GET' || url.origin !== origin) return route.abort();
+    if (++observations.requests > 1_500) {
+      observations.limited = true;
+      return route.abort();
+    }
+    if (req.method() !== 'GET' || url.origin !== origin) {
+      if (verifyHtml && observations.external.size < 100) observations.external.add(url.href.slice(0, 200));
+      return route.abort();
+    }
+    if (verifyHtml && req.isNavigationRequest()) {
+      if (url.href === browserEntryUrl && req.frame() === page.mainFrame() && !servedViewer) {
+        const src = entryUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+        return route.fulfill({ contentType: 'text/html', body: `<!doctype html><iframe sandbox="allow-scripts" src="${src}"></iframe>` });
+      }
+      if (url.href === entryUrl && req.frame() !== page.mainFrame() && !servedViewer) {
+        servedViewer = true;
+        return route.fulfill({ contentType: 'text/html; charset=utf-8', headers: { 'content-security-policy': viewerPolicy }, body: viewer });
+      }
+      if (url.href === entryUrl && query === '?__agy_verify_manifest=1' && req.frame() === page.mainFrame() && !servedAuthoring) {
+        servedAuthoring = true;
+        return route.fulfill({ contentType: 'text/html; charset=utf-8', headers: { 'content-security-policy': policy }, body: source });
+      }
+      return route.abort();
+    }
     if (!servedEntry && url.href === entryUrl && req.isNavigationRequest() && req.frame() === page.mainFrame()) {
       servedEntry = true;
       return route.fulfill({
-        contentType: 'text/html; charset=utf-8',
+        contentType: verifySvg ? 'image/svg+xml; charset=utf-8' : 'text/html; charset=utf-8',
         headers: { 'content-security-policy': policy },
         body: marked ? wrapMarkdownHtml(marked.parse(source), path.basename(entry)) : source,
       });
@@ -147,8 +208,12 @@ try {
       !['stylesheet', 'image', 'font'].includes(req.resourceType()) ||
       (req.resourceType() === 'stylesheet' && !/\.css$/i.test(asset.relPath))
     ) {
+      if (verifyHtml && servedAuthoring && ['stylesheet', 'image', 'font'].includes(req.resourceType()) && observations.missing.size < 100) {
+        observations.missing.add(url.pathname.slice(0, 200));
+      }
       return route.abort();
     }
+    observations.served++;
     return route.fulfill({
       contentType: req.resourceType() === 'stylesheet' ? 'text/css' : asset.mimeType,
       headers: { 'x-content-type-options': 'nosniff', 'content-security-policy': policy },
@@ -156,7 +221,12 @@ try {
     });
   });
 
-  if (format === 'mermaid') {
+  if (verifyHtml || verifySvg) {
+    const report = verifyHtml
+      ? await verifyHtmlBrowser(page, { entryUrl, browserEntryUrl, authoringUrl, scope: options, observations })
+      : await verifySvgBrowser(page, entryUrl, options);
+    await fs.writeFile(path.join(outputDir, 'result'), JSON.stringify(report));
+  } else if (format === 'mermaid') {
     await page.setContent('<!DOCTYPE html><html><body style="margin:0;padding:16px;background:#ffffff;"><div id="diagram"></div></body></html>');
     await page.addScriptTag({ path: require.resolve('mermaid/dist/mermaid.min.js') });
 

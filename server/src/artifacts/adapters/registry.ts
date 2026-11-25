@@ -322,6 +322,7 @@ export class FormatAdapterRegistry {
         filename: params.filename,
         previewKind: params.previewKind,
         sandboxAvailable: params.sandboxIsolation !== 'sandbox_required_blocked',
+        strictSandbox: params.sandboxIsolation === 'bwrap',
       }),
     };
   }

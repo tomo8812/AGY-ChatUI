@@ -23,6 +23,7 @@ export interface AdapterFileMeta {
 export interface AdapterCapabilityContext {
   runtimeProfile: RuntimeProfile;
   sandboxAvailable: boolean;
+  strictSandbox?: boolean;
   filename?: string;
   previewKind?: PreviewKind;
 }
@@ -42,6 +43,21 @@ export interface FormatAdapter {
   verify(buffer: Buffer, meta: AdapterFileMeta): AdapterVerifyResult;
   exportAs?(buffer: Buffer, targetFormat: string, meta: AdapterFileMeta): AdapterExportResult;
   resolveTarget(buffer: Buffer, selector: TargetSelector, meta: AdapterFileMeta): TargetResolutionResult;
+}
+
+export function browserVerifyCapability(ctx: AdapterCapabilityContext): OperationCapability {
+  const supported = ctx.runtimeProfile === 'full_runtime' && ctx.strictSandbox === true;
+  return {
+    operation: 'verify:browser',
+    availability: supported ? 'supported' : 'disabled_by_resource_tier',
+    scope: 'mcp_only',
+    notes: 'Pass selector, elementOffset and maxElements to artifact_verify.',
+    ...(supported ? {} : { remediation: 'Enable Full Runtime with bubblewrap.' }),
+  };
+}
+
+export function editCapabilities(format: string, operations: readonly string[]): OperationCapability[] {
+  return operations.map((operation) => ({ operation: `${format}.${operation}`, availability: 'supported', scope: 'mcp_and_ui' }));
 }
 
 export function sha256Text(text: string): string {

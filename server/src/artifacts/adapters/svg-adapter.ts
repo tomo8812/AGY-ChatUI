@@ -7,39 +7,10 @@ import type {
   TargetResolutionResult,
   TargetSelector,
 } from '../types.js';
-import { sha256Buffer, sha256Text, splitLines, type AdapterCapabilityContext, type AdapterFileMeta, type FormatAdapter } from './base.js';
+import { browserVerifyCapability, sha256Buffer, splitLines, type AdapterCapabilityContext, type AdapterFileMeta, type FormatAdapter } from './base.js';
 import { verifySvg } from './svg-verifier.js';
 
-interface ParsedSvgElement {
-  tag: string;
-  id: string | null;
-  rawMatch: string;
-  fingerprint: string;
-}
-
-function extractSvgElements(svg: string): ParsedSvgElement[] {
-  const results: ParsedSvgElement[] = [];
-  const walk = (fragment: string) => {
-    const tagRe = /<([a-zA-Z][a-zA-Z0-9:_-]*)(\s[^>]*?)?(?:\/>|>([\s\S]*?)<\/\1>)/g;
-    for (const m of fragment.matchAll(tagRe)) {
-      const tag = m[1];
-      const attrs = m[2] ?? '';
-      const inner = m[3] ?? '';
-      const idMatch = /\bid\s*=\s*["']([^"']+)["']/.exec(attrs);
-      results.push({
-        tag,
-        id: idMatch ? idMatch[1] : null,
-        rawMatch: m[0],
-        fingerprint: sha256Text(`${tag}|${m[0].trim()}`),
-      });
-      if (inner) {
-        walk(inner);
-      }
-    }
-  };
-  walk(svg);
-  return results;
-}
+import { editMarkup, elementMetadata, markupCapabilities, markupElements } from './markup-edit.js';
 
 export class SvgAdapter implements FormatAdapter {
   readonly format = 'svg' as const;
@@ -50,6 +21,8 @@ export class SvgAdapter implements FormatAdapter {
 
   getOperations(ctx: AdapterCapabilityContext): OperationCapability[] {
     return [
+      ...markupCapabilities('svg'),
+      browserVerifyCapability(ctx),
       { operation: 'create', availability: 'supported', scope: 'mcp_and_ui' },
       { operation: 'get_structure', availability: 'supported', scope: 'mcp_and_ui' },
       { operation: 'read_range', availability: 'supported', scope: 'mcp_and_ui' },
@@ -83,19 +56,18 @@ export class SvgAdapter implements FormatAdapter {
 
   getStructure(buffer: Buffer, _meta: AdapterFileMeta): Record<string, unknown> {
     const text = buffer.toString('utf8');
-    const vbMatch = /viewBox\s*=\s*["']([^"']+)["']/i.exec(text);
-    const elements = extractSvgElements(text).map((el, index) => ({
-      index,
-      tag: el.tag,
-      id: el.id,
-      fingerprint: el.fingerprint,
-    }));
+    let elements: ReturnType<typeof markupElements> = [];
+    try {
+      elements = markupElements(text, 'svg');
+    } catch (error) {
+      if (!(error instanceof ArtifactError)) throw error;
+    }
     return {
       format: 'svg',
-      viewBox: vbMatch ? vbMatch[1] : null,
+      viewBox: elements[0]?.attrs.viewBox ?? null,
       lineCount: splitLines(text).length,
       svgSha256: sha256Buffer(buffer),
-      elements,
+      elements: elementMetadata(elements),
     };
   }
 
@@ -121,34 +93,12 @@ export class SvgAdapter implements FormatAdapter {
           throw new ArtifactError('SEARCH_NOT_FOUND', 'SVG search target not found.', 409);
         }
         text = text.replace(op.search, op.replace);
-      } else if (op.op === 'set_attr' && typeof op.elementId === 'string' && typeof op.attr === 'string') {
-        const attrName = op.attr.trim();
-        if (!/^[a-zA-Z_:][a-zA-Z0-9:._-]*$/.test(attrName) || /^on/i.test(attrName)) {
-          throw new ArtifactError('INVALID_SVG_ATTRIBUTE', `Invalid or forbidden SVG attribute '${op.attr}'.`, 400);
-        }
-        const rawVal = String(op.value ?? '');
-        if (/^(?:href|xlink:href)$/i.test(attrName) && /^\s*(?:javascript|vbscript):/i.test(rawVal)) {
-          throw new ArtifactError('INVALID_SVG_ATTRIBUTE', `Forbidden URI scheme for SVG attribute '${attrName}'.`, 400);
-        }
-        const escapedId = op.elementId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const re = new RegExp(`(<[a-zA-Z][^>]*\\bid=["']${escapedId}["'][^>]*?)(\\/?>)`);
-        if (!re.test(text)) {
-          throw new ArtifactError('ELEMENT_NOT_FOUND', `SVG element '${op.elementId}' not found.`, 404);
-        }
-        const escapedAttr = attrName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const attrVal = rawVal
-          .replace(/&/g, '&amp;')
-          .replace(/"/g, '&quot;')
-          .replace(/</g, '&lt;')
-          .replace(/>/g, '&gt;');
-        text = text.replace(re, (_full, openTag: string, close: string) => {
-          const attrRe = new RegExp(`(\\s)${escapedAttr}\\s*=\\s*["'][^"']*["']`);
-          if (attrRe.test(openTag)) {
-            return `${openTag.replace(attrRe, (_m, ws: string) => `${ws}${attrName}="${attrVal}"`)}${close}`;
-          }
-          return `${openTag} ${attrName}="${attrVal}"${close}`;
-        });
       } else {
+        const edited = editMarkup(text, op, 'svg');
+        if (edited !== undefined) {
+          text = edited;
+          continue;
+        }
         throw unsupportedOperationError(op.op, 'unsupported_by_format', `SVG adapter does not support op '${op.op}'.`);
       }
     }
@@ -171,7 +121,13 @@ export class SvgAdapter implements FormatAdapter {
       if (!elementId || !expectedFp) {
         return { status: 'needs_review', reason: 'missing_element_fingerprint' };
       }
-      const matches = extractSvgElements(text).filter((el) => el.id === elementId);
+      let matches: ReturnType<typeof markupElements>;
+      try {
+        matches = markupElements(text, 'svg').filter((el) => el.id === elementId);
+      } catch (error) {
+        if (!(error instanceof ArtifactError)) throw error;
+        return { status: 'needs_review', reason: 'invalid_svg_structure' };
+      }
       if (matches.length === 0) {
         return { status: 'stale', reason: 'element_not_found' };
       }
@@ -183,7 +139,7 @@ export class SvgAdapter implements FormatAdapter {
       if ((expectedTag && el.tag !== expectedTag) || el.fingerprint !== expectedFp) {
         return { status: 'needs_review', reason: 'element_replaced_or_modified' };
       }
-      return { status: 'resolved', resolvedSnippet: el.rawMatch };
+      return { status: 'resolved', resolvedSnippet: text.slice(el.start, el.end) };
     }
 
     if (selector.kind === 'svg_region') {

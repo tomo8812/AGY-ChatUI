@@ -12,6 +12,7 @@ import type {
   TargetSelector,
 } from '../types.js';
 import {
+  editCapabilities,
   resolveTextSnippetByContext,
   sha256Text,
   splitLines,
@@ -19,6 +20,7 @@ import {
   type AdapterFileMeta,
   type FormatAdapter,
 } from './base.js';
+import { editMarkdownStructure, markdownStructure, MARKDOWN_STRUCTURE_OPS } from './markdown-structure.js';
 import { textVerificationReport } from './text-verification.js';
 
 function slugifyHeading(text: string): string {
@@ -315,6 +317,7 @@ export class MarkdownAdapter implements FormatAdapter {
         ? 'deploy/setup-doc-runtime.sh を実行してください。'
         : 'bubblewrap サンドボックスを有効化してください。';
     return [
+      ...editCapabilities('markdown', MARKDOWN_STRUCTURE_OPS),
       { operation: 'create', availability: 'supported', scope: 'mcp_and_ui' },
       { operation: 'get_structure', availability: 'supported', scope: 'mcp_and_ui' },
       { operation: 'read_range', availability: 'supported', scope: 'mcp_and_ui' },
@@ -351,7 +354,8 @@ export class MarkdownAdapter implements FormatAdapter {
   }
 
   getStructure(buffer: Buffer, _meta: AdapterFileMeta): Record<string, unknown> {
-    const lines = splitLines(buffer.toString('utf8'));
+    const text = buffer.toString('utf8');
+    const lines = splitLines(text);
     const headings: Array<{ level: number; text: string; slug: string; line: number; hash: string }> = [];
     const codeFences: Array<{ fenceIndex: number; lang: string; startLine: number; endLine: number; hash: string }> = [];
 
@@ -402,6 +406,13 @@ export class MarkdownAdapter implements FormatAdapter {
       lineCount: lines.length,
       headings,
       codeFences,
+      blocks: markdownStructure(text, slugifyHeading).map(({ node, ...block }) => ({
+        ...block, ...(node.type === 'table' ? {
+          rows: node.children.map((row) => row.children.map(({ position }) => sha256Text(
+            text.slice(position?.start.offset ?? 0, position?.end.offset ?? 0)
+          ))),
+        } : {}),
+      })),
     };
   }
 
@@ -434,32 +445,12 @@ export class MarkdownAdapter implements FormatAdapter {
           throw new ArtifactError('SEARCH_NOT_FOUND', 'Markdown search target not found.', 409);
         }
         text = text.replace(op.search, op.replace);
-      } else if (op.op === 'replace_section' && typeof op.headingSlug === 'string' && typeof op.content === 'string') {
-        const lines = splitLines(text);
-        let startIdx = -1;
-        let level = 0;
-        for (let i = 0; i < lines.length; i++) {
-          const m = /^(#{1,6})\s+(.+)$/.exec(lines[i]);
-          if (m && slugifyHeading(m[2]) === op.headingSlug) {
-            startIdx = i;
-            level = m[1].length;
-            break;
-          }
-        }
-        if (startIdx < 0) {
-          throw new ArtifactError('SECTION_NOT_FOUND', `Heading '${op.headingSlug}' not found.`, 404);
-        }
-        let endIdx = lines.length;
-        for (let i = startIdx + 1; i < lines.length; i++) {
-          const m = /^(#{1,6})\s+(.+)$/.exec(lines[i]);
-          if (m && m[1].length <= level) {
-            endIdx = i;
-            break;
-          }
-        }
-        lines.splice(startIdx + 1, endIdx - startIdx - 1, ...splitLines(op.content));
-        text = lines.join('\n');
       } else {
+        const edited = editMarkdownStructure(text, op, slugifyHeading);
+        if (edited !== undefined) {
+          text = edited;
+          continue;
+        }
         throw unsupportedOperationError(op.op, 'unsupported_by_format', `Markdown adapter does not support op '${op.op}'.`);
       }
     }
@@ -605,21 +596,32 @@ export class MarkdownAdapter implements FormatAdapter {
 
   resolveTarget(buffer: Buffer, selector: TargetSelector, _meta: AdapterFileMeta): TargetResolutionResult {
     const text = buffer.toString('utf8');
-    const lines = splitLines(text);
-
     if (selector.kind === 'md_heading') {
-      const slug = String(selector.headingSlug ?? '');
-      const expectedHash = selector.expectedHeadingHash ? String(selector.expectedHeadingHash) : '';
-      const matches: Array<{ line: number; text: string }> = [];
-      for (let i = 0; i < lines.length; i++) {
-        const m = /^(#{1,6})\s+(.+)$/.exec(lines[i]);
-        if (m && slugifyHeading(m[2]) === slug && (!expectedHash || sha256Text(lines[i].trim()) === expectedHash)) {
-          matches.push({ line: i + 1, text: lines[i] });
-        }
+      const blocks = markdownStructure(text, slugifyHeading).filter((block) => block.node.type === 'heading' &&
+        block.slug === selector.headingSlug && (!selector.headingLevel || block.node.depth === selector.headingLevel));
+      if (blocks.length === 0) return { status: 'stale', reason: 'heading_not_found' };
+      const matches = blocks.filter(({ start, end }) =>
+        Boolean(selector.expectedHeadingHash) && sha256Text(text.slice(start, end).trim()) === selector.expectedHeadingHash);
+      if (matches.length !== 1) return { status: 'needs_review', reason: 'heading_changed_or_ambiguous' };
+      const { start, end, startLine, endLine } = matches[0];
+      return { status: 'resolved', resolvedSnippet: text.slice(start, end), resolvedRange: { startLine, endLine } };
+    }
+
+    if (selector.kind === 'md_table') {
+      const tables = markdownStructure(text, slugifyHeading).filter((block) => block.node.type === 'table');
+      const matches = tables.filter((entry) => entry.hash === selector.expectedTableHash);
+      if (matches.length !== 1) return { status: 'needs_review', reason: 'table_changed_or_ambiguous' };
+      const table = matches[0].node;
+      if (table.type === 'table' && typeof selector.row === 'number' && typeof selector.col === 'number') {
+        const cell = table.children[selector.row]?.children[selector.col];
+        const start = cell?.position?.start.offset;
+        const end = cell?.position?.end.offset;
+        if (start === undefined || end === undefined) return { status: 'stale', reason: 'cell_not_found' };
+        const snippet = text.slice(start, end);
+        if (sha256Text(snippet) !== selector.expectedCellHash) return { status: 'needs_review', reason: 'cell_changed' };
+        return { status: 'resolved', resolvedSnippet: snippet };
       }
-      if (matches.length === 0) return { status: 'stale', reason: 'heading_not_found' };
-      if (matches.length > 1) return { status: 'needs_review', reason: 'ambiguous_multiple_headings' };
-      return { status: 'resolved', resolvedSnippet: matches[0].text, resolvedRange: { startLine: matches[0].line, endLine: matches[0].line } };
+      return { status: 'resolved', resolvedSnippet: text.slice(matches[0].start, matches[0].end) };
     }
 
     if (selector.kind === 'md_text_range' || selector.kind === 'md_block' || selector.kind === 'md_code_block') {

@@ -10,6 +10,7 @@ import type {
   TargetSelector,
 } from '../types.js';
 import {
+  editCapabilities,
   resolveTextSnippetByContext,
   sha256Text,
   splitLines,
@@ -17,6 +18,7 @@ import {
   type AdapterFileMeta,
   type FormatAdapter,
 } from './base.js';
+import { editMermaidStructure, flowchartStructure, MERMAID_STRUCTURE_OPS } from './mermaid-structure.js';
 
 const MERMAID_HEADER_RE =
   /^\s*(graph|flowchart|sequenceDiagram|classDiagram|stateDiagram(?:-v2)?|erDiagram|gantt|pie|gitGraph|journey|mindmap|timeline|quadrantChart|sankey-beta|xychart-beta|block-beta)\b/;
@@ -66,6 +68,7 @@ export class MermaidAdapter implements FormatAdapter {
         ? 'bubblewrap サンドボックスを有効化してください。'
         : 'Full Runtime（deploy/setup-doc-runtime.sh, INSTALL_DOC_RUNTIME=full）を有効化してください。';
     return [
+      ...editCapabilities('mermaid', MERMAID_STRUCTURE_OPS),
       { operation: 'create', availability: 'supported', scope: 'mcp_and_ui' },
       { operation: 'get_structure', availability: 'supported', scope: 'mcp_and_ui' },
       { operation: 'read_range', availability: 'supported', scope: 'mcp_and_ui' },
@@ -101,12 +104,17 @@ export class MermaidAdapter implements FormatAdapter {
     const lines = splitLines(text);
     const firstNonComment = lines.find((l) => l.trim() && !l.trim().startsWith('%%')) ?? '';
     const hdr = MERMAID_HEADER_RE.exec(firstNonComment);
-    const nodes = parseMermaidNodes(text);
+    const model = flowchartStructure(text);
+    const nodes = model ? model.nodes.map(({ id, kind, label, statement }) => ({
+      id, kind, label, labelHash: sha256Text(label), groupId: statement.groupId, line: text.slice(0, statement.start).split('\n').length,
+    })) : parseMermaidNodes(text);
     return {
       format: 'mermaid',
       diagramType: hdr ? hdr[1] : 'unknown',
       lineCount: lines.length,
       nodes,
+      edges: model?.edges.map(({ fromId, toId, operator, label, fingerprint }) => ({ fromId, toId, operator, label, fingerprint })) ?? [],
+      groups: model?.groups ?? [],
     };
   }
 
@@ -139,6 +147,11 @@ export class MermaidAdapter implements FormatAdapter {
         }
         text = text.replace(op.search, op.replace);
       } else {
+        const edited = editMermaidStructure(text, op);
+        if (edited !== undefined) {
+          text = edited;
+          continue;
+        }
         throw unsupportedOperationError(op.op, 'unsupported_by_format', `Mermaid adapter does not support op '${op.op}'.`);
       }
     }
@@ -280,6 +293,23 @@ export class MermaidAdapter implements FormatAdapter {
 
   resolveTarget(buffer: Buffer, selector: TargetSelector, _meta: AdapterFileMeta): TargetResolutionResult {
     const text = buffer.toString('utf8');
+    if (selector.kind === 'mermaid_edge' || selector.kind === 'mermaid_group') {
+      const model = flowchartStructure(text);
+      if (selector.kind === 'mermaid_group') {
+        const found = model?.groups.filter(({ id }) => id === selector.groupId) ?? [];
+        if (!found.length) return { status: 'stale', reason: 'group_not_found' };
+        if (found.length !== 1 || selector.expectedGroupFingerprint !== found[0].fingerprint) {
+          return { status: 'needs_review', reason: 'group_changed' };
+        }
+        return { status: 'resolved', resolvedSnippet: text.slice(found[0].start, found[0].end) };
+      }
+      const found = model?.edges.filter(({ fromId, toId }) => fromId === selector.fromId && toId === selector.toId) ?? [];
+      const edge = typeof selector.edgeIndex === 'number' ? found[selector.edgeIndex] : found.length === 1 ? found[0] : undefined;
+      if (!found.length) return { status: 'stale', reason: 'edge_not_found' };
+      if (!edge || edge.fingerprint !== selector.expectedEdgeFingerprint) return { status: 'needs_review', reason: 'edge_changed' };
+      return { status: 'resolved', resolvedSnippet: text.slice(edge.statement.start, edge.statement.end) };
+    }
+
     if (selector.kind === 'mermaid_node') {
       const nodeId = String(selector.nodeId ?? '');
       const expectedKind = selector.expectedNodeKind ? String(selector.expectedNodeKind) : null;

@@ -4,6 +4,11 @@ import { MAX_VERIFY_DEPTH, MAX_VERIFY_NODES, VerificationLimit, verificationMess
 
 export interface XmlParsedElement {
   name: string;
+  qualifiedName: string;
+  start: number;
+  openEnd: number;
+  closeStart: number;
+  end: number;
   namespace: string;
   line: number;
   attrs: Record<string, string>;
@@ -29,6 +34,7 @@ export function validateXmlWellFormedness(text: string, collectElements = false)
   let root: XmlParsedElement | undefined;
   let elementCount = 0;
   let line = 1;
+  let start = 0;
   let hasStylesheet = false;
 
   parser.on('error', (error) => { throw new XmlParseFailure(error.message); });
@@ -44,6 +50,7 @@ export function validateXmlWellFormedness(text: string, collectElements = false)
   });
   parser.on('processinginstruction', ({ target }) => { hasStylesheet ||= target === 'xml-stylesheet'; });
   parser.on('opentagstart', () => {
+    start = text.lastIndexOf('<', parser.position - 1);
     line = parser.line;
     if (parents.length >= MAX_VERIFY_DEPTH) throw new VerificationLimit(`XML nesting exceeds ${MAX_VERIFY_DEPTH}.`);
     if (++elementCount > MAX_VERIFY_NODES) throw new VerificationLimit(`XML element count exceeds ${MAX_VERIFY_NODES}.`);
@@ -54,6 +61,11 @@ export function validateXmlWellFormedness(text: string, collectElements = false)
       for (const attr of Object.values(tag.attributes)) attrs[attr.name] = attr.value;
       const element = {
         name: tag.local,
+        qualifiedName: tag.name,
+        start,
+        openEnd: parser.position,
+        closeStart: parser.position,
+        end: parser.position,
         namespace: tag.uri,
         line,
         attrs,
@@ -64,7 +76,14 @@ export function validateXmlWellFormedness(text: string, collectElements = false)
     }
     parents.push(elementCount - 1);
   });
-  parser.on('closetag', () => { parents.pop(); });
+  parser.on('closetag', (tag) => {
+    const index = parents.pop()!;
+    const element = collectElements ? elements[index] : index === 0 ? root : undefined;
+    if (element) {
+      element.end = parser.position;
+      if (!tag.isSelfClosing) element.closeStart = text.lastIndexOf('</', parser.position - 1);
+    }
+  });
 
   let status: XmlValidationResult['status'] = 'passed';
   let evidence: string;

@@ -1,4 +1,4 @@
-import path from 'node:path';
+import { applyPatch } from 'diff';
 import { ArtifactError, unsupportedOperationError } from '../errors.js';
 import type {
   AdapterEditResult,
@@ -9,6 +9,7 @@ import type {
   TargetSelector,
 } from '../types.js';
 import {
+  browserVerifyCapability,
   resolveTextSnippetByContext,
   sha256Buffer,
   sha256Text,
@@ -18,18 +19,10 @@ import {
   type FormatAdapter,
 } from './base.js';
 
+import { selectHtmlElements } from './html-select.js';
 import { verifyHtml } from './html-validator.js';
 
-function findHtmlElementsById(html: string, id: string): Array<{ tag: string; raw: string; fingerprint: string }> {
-  const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp(`<([a-zA-Z][a-zA-Z0-9-]*)([^>]*\\bid\\s*=\\s*["']${escaped}["'][^>]*)(?:\\/>|>([\\s\\S]*?)<\\/\\1>)`, 'gi');
-  const out: Array<{ tag: string; raw: string; fingerprint: string }> = [];
-  for (const m of html.matchAll(re)) {
-    const tag = m[1].toLowerCase();
-    out.push({ tag, raw: m[0], fingerprint: sha256Text(`${tag}|${m[0].trim()}`) });
-  }
-  return out;
-}
+import { editMarkup, elementMetadata, markupCapabilities, markupElements } from './markup-edit.js';
 
 export class HtmlAdapter implements FormatAdapter {
   readonly format = 'html' as const;
@@ -40,6 +33,8 @@ export class HtmlAdapter implements FormatAdapter {
 
   getOperations(ctx: AdapterCapabilityContext): OperationCapability[] {
     return [
+      ...markupCapabilities('html'),
+      browserVerifyCapability(ctx),
       { operation: 'create', availability: 'supported', scope: 'mcp_and_ui' },
       { operation: 'get_structure', availability: 'supported', scope: 'mcp_and_ui' },
       { operation: 'read_range', availability: 'supported', scope: 'mcp_and_ui' },
@@ -75,17 +70,14 @@ export class HtmlAdapter implements FormatAdapter {
   getStructure(buffer: Buffer, _meta: AdapterFileMeta): Record<string, unknown> {
     const text = buffer.toString('utf8');
     const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(text);
-    const ids: Array<{ id: string; tag: string; fingerprint: string }> = [];
-    for (const m of text.matchAll(/<([a-zA-Z][a-zA-Z0-9-]*)([^>]*\bid\s*=\s*["']([^"']+)["'][^>]*)(?:\/>|>([\s\S]*?)<\/\1>)/gi)) {
-      const tag = m[1].toLowerCase();
-      ids.push({ id: m[3], tag, fingerprint: sha256Text(`${tag}|${m[0].trim()}`) });
-    }
+    const elements = elementMetadata(markupElements(text, 'html'));
     return {
       format: 'html',
       title: titleMatch ? titleMatch[1].trim() : null,
       lineCount: splitLines(text).length,
       docSha256: sha256Buffer(buffer),
-      identifiedElements: ids,
+      identifiedElements: elements.filter(({ id }) => id !== null),
+      elements,
     };
   }
 
@@ -118,7 +110,16 @@ export class HtmlAdapter implements FormatAdapter {
           throw new ArtifactError('SEARCH_NOT_FOUND', 'HTML search target not found.', 409);
         }
         text = text.replace(op.search, op.replace);
+      } else if ((op.op === 'apply_patch' || op.op === 'html.apply_patch') && typeof op.patch === 'string') {
+        const edited = applyPatch(text, op.patch);
+        if (edited === false) throw new ArtifactError('PATCH_CONFLICT', 'HTML patch does not match the current revision.', 409);
+        text = edited;
       } else {
+        const edited = editMarkup(text, op, 'html');
+        if (edited !== undefined) {
+          text = edited;
+          continue;
+        }
         throw unsupportedOperationError(op.op, 'unsupported_by_format', `HTML adapter does not support op '${op.op}'.`);
       }
     }
@@ -134,25 +135,36 @@ export class HtmlAdapter implements FormatAdapter {
 
   resolveTarget(buffer: Buffer, selector: TargetSelector, _meta: AdapterFileMeta): TargetResolutionResult {
     const text = buffer.toString('utf8');
-    if (selector.kind === 'html_dom_element') {
+    if (selector.kind === 'html_dom_element' ||
+        (selector.kind === 'html_text_range' && typeof selector.cssSelector === 'string')) {
       const cssSelector = String(selector.cssSelector ?? '').trim();
       const expectedTag = selector.expectedTag ? String(selector.expectedTag).toLowerCase() : null;
-      const expectedFp = selector.expectedElementFingerprint ? String(selector.expectedElementFingerprint) : null;
-      if (!cssSelector || !expectedFp) {
-        return { status: 'needs_review', reason: 'missing_dom_fingerprint' };
+      let found: ReturnType<typeof selectHtmlElements>;
+      try {
+        found = selectHtmlElements(text, cssSelector);
+      } catch (error) {
+        if (!(error instanceof ArtifactError)) throw error;
+        return { status: 'needs_review', reason: 'invalid_dom_selector' };
       }
-      const idMatch = /^#([a-zA-Z0-9_-]+)$/.exec(cssSelector);
-      if (idMatch) {
-        const found = findHtmlElementsById(text, idMatch[1]);
-        if (found.length === 0) return { status: 'stale', reason: 'element_not_found' };
-        if (found.length > 1) return { status: 'needs_review', reason: 'ambiguous_multiple_elements' };
-        const el = found[0];
-        if ((expectedTag && el.tag !== expectedTag) || el.fingerprint !== expectedFp) {
-          return { status: 'needs_review', reason: 'element_replaced_or_modified' };
+      if (found.length === 0) return { status: 'stale', reason: 'element_not_found' };
+      if (found.length !== 1 || (selector.matchCountInDoc !== undefined && found.length !== selector.matchCountInDoc)) {
+        return { status: 'needs_review', reason: 'ambiguous_multiple_elements' };
+      }
+      const el = found[0];
+      if (selector.kind === 'html_text_range') {
+        const { charStart, charEnd } = selector;
+        if (typeof charStart !== 'number' || typeof charEnd !== 'number' || !Number.isInteger(charStart) ||
+            !Number.isInteger(charEnd) || charStart < 0 || charEnd <= charStart || charEnd > el.textContent.length) {
+          return { status: 'needs_review', reason: 'invalid_text_range' };
         }
-        return { status: 'resolved', resolvedSnippet: el.raw };
+        const content = el.textContent.slice(charStart, charEnd);
+        if (sha256Text(content) !== selector.expectedSnippetHash || el.textContent.indexOf(content) !== el.textContent.lastIndexOf(content)) return { status: 'needs_review', reason: 'text_range_changed' };
+        return { status: 'resolved', resolvedSnippet: content, resolvedRange: { charStart, charEnd } };
       }
-      return { status: 'needs_review', reason: 'complex_css_selector_requires_review' };
+      if ((expectedTag && el.tag.toLowerCase() !== expectedTag) || el.fingerprint !== selector.expectedElementFingerprint) {
+        return { status: 'needs_review', reason: 'element_replaced_or_modified' };
+      }
+      return { status: 'resolved', resolvedSnippet: text.slice(el.start, el.end) };
     }
 
     if (selector.kind === 'html_source_range' || selector.kind === 'html_text_range') {

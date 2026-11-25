@@ -1,9 +1,11 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { expect, it, vi } from 'vitest';
 import { deriveAgyPermissionRule } from '../src/acp/client-manager.js';
-import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
+import { createTestServer, registerAndBindAgy, TestApiClient } from './helpers/test-harness.js';
 
 const fullRuntimeDir = process.env.AGY_TEST_FULL_RUNTIME_DIR?.trim() || '';
 const canRunRealBwrap = Boolean(
@@ -14,6 +16,27 @@ const canRunRealBwrap = Boolean(
       { stdio: 'ignore', timeout: 5000 },
     ).status === 0,
 );
+
+if (process.env.AGY_REQUIRE_STRICT_ARTIFACT_RUNTIME === '1' && !canRunRealBwrap) {
+  throw new Error('Full Runtime with strict bubblewrap is required for this verification run.');
+}
+
+async function createStrictRuntimeChat(srv: Awaited<ReturnType<typeof createTestServer>>) {
+  const client = new TestApiClient(srv.baseUrl);
+  const reg = await client.request<{ user: { id: string } }>('POST', '/api/auth/register', {
+    username: 'runtimecheck', displayName: 'Full Runtime', password: 'password123',
+  });
+  expect(reg.status).toBe(201);
+  const userId = reg.data.user.id;
+  // Seed a workspace for real document-worker tests. Official ACP login has
+  // its own integration suite and is not part of this workbook/deck probe.
+  const workspaceDir = fs.mkdtempSync(path.join(srv.dataRoot, 'strict-chat-'));
+  const chat = srv.ctx.db.createChat({
+    id: 'strict-runtime-chat', userId, projectId: null, title: 'Strict Runtime Verification',
+    workspaceDir, modelId: '', effortValue: '', projectContextVersion: 0,
+  });
+  return { userId, chat };
+}
 
 it('uses the native ACP HTTP transport and attaches only a completed rich_create receipt', async () => {
   const srv = await createTestServer({ INSTALL_DOC_RUNTIME: '0' });
@@ -424,16 +447,16 @@ it('streams bounded ranges for large text/CSV artifacts without full-file reads 
   }
 });
 
-it.skipIf(!fullRuntimeDir)('supports Full Runtime Mermaid SVG export, parser syntax line errors, CSV PNG + region render, Markdown PDF/DOCX, and targeted PPTX verify via MCP', async () => {
+it.skipIf(!canRunRealBwrap)('supports Full Runtime Mermaid SVG export, parser syntax line errors, CSV PNG + region render, Markdown PDF/DOCX, and targeted PPTX verify via MCP', async () => {
   const srv = await createTestServer({
+    agyMode: 'real',
     docRuntimeDir: fullRuntimeDir,
     installDocRuntime: 'full',
-    allowUnsandboxedDocWorkers: true,
-    sandboxMode: 'off',
+    allowUnsandboxedDocWorkers: false,
+    sandboxMode: 'strict',
   });
   try {
-    const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'fullrt', 'user:fullrt');
-    const { data: { chat } } = await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Full Runtime MCP' });
+    const { userId, chat } = await createStrictRuntimeChat(srv);
     const binding = await srv.ctx.mcpService.bindBuiltinArtifactServer({ userId, chatId: chat.id, tentativeTurn: () => null }, []);
     const auth = Object.fromEntries(binding!.server.headers.map(({ name, value }) => [name, value]));
     const mcp = new Client({ name: 'full-rt-test', version: '1.0.0' });
@@ -447,6 +470,17 @@ it.skipIf(!fullRuntimeDir)('supports Full Runtime Mermaid SVG export, parser syn
       const goodCheck = await srv.ctx.artifactService.verifyArtifact(userId, goodMmd.id);
       expect(goodCheck.ok).toBe(true);
       expect(goodCheck.checks).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'mermaid_parser_syntax', status: 'passed' })]));
+
+      await srv.ctx.artifactService.editArtifact({
+        userId, artifactId: goodMmd.id, expectedRevision: goodMmd.revision, actorKind: 'ai',
+        operations: [
+          { op: 'mermaid.add_group', groupId: 'service', title: 'Service' },
+          { op: 'mermaid.add_node', nodeId: 'C', label: 'Cache', parentId: 'service', kind: 'circle' },
+          { op: 'mermaid.add_edge', fromId: 'B', toId: 'C', label: 'read' },
+        ],
+      });
+      const editedCheck = await srv.ctx.artifactService.verifyArtifact(userId, goodMmd.id);
+      expect(editedCheck.checks).toContainEqual(expect.objectContaining({ id: 'mermaid_parser_syntax', status: 'passed' }));
 
       const { exported: svgExp } = await srv.ctx.artifactService.exportArtifact({
         userId, artifactId: goodMmd.id, targetFormat: 'svg', actorKind: 'ai',
@@ -579,7 +613,7 @@ it.skipIf(!canRunRealBwrap)('executes real Python, LibreOffice, qpdf, and pandoc
     sandboxMode: 'strict',
   });
   try {
-    const client = new (await import('./helpers/test-harness.js')).TestApiClient(srv.baseUrl);
+    const client = new TestApiClient(srv.baseUrl);
     const reg = await client.request<{ user: { id: string } }>('POST', '/api/auth/register', {
       username: 'bwraprt',
       displayName: 'bwraprt',
@@ -636,3 +670,55 @@ it.skipIf(!canRunRealBwrap)('executes real Python, LibreOffice, qpdf, and pandoc
   }
 }, 90_000);
 
+
+
+it.skipIf(!canRunRealBwrap)('verifies complex SVG geometry and HTML browser behavior inside strict bwrap', async () => {
+  const srv = await createTestServer({
+    agyMode: 'real', docRuntimeDir: fullRuntimeDir, installDocRuntime: 'full',
+    allowUnsandboxedDocWorkers: false, sandboxMode: 'strict',
+  });
+  try {
+    const { userId, chat } = await createStrictRuntimeChat(srv);
+    const create = (relPath: string, content: string) => srv.ctx.artifactService.createArtifact({
+      userId, scopeKind: 'chat', chatId: chat.id, relPath, content: Buffer.from(content), actorKind: 'user',
+    });
+    const { artifact: svg } = await create('geometry.svg', `<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 200 100">
+      <style>.heavy { stroke: #48a; fill: #bbb; stroke-width: 8px; }</style>
+      <path id="curve" class="heavy" d="M 10 70 Q 50 15 90 65 L 90 80 L 10 80 Z"/>
+      <text id="label" x="30" y="72" font-size="28">Label</text>
+      <ellipse id="outside" class="heavy" cx="190" cy="40" rx="15" ry="10"/>
+      <circle id="hidden" cx="50" cy="50" r="25" style="display:none"/>
+    </svg>`);
+    const geometry = await srv.ctx.artifactService.verifyArtifact(userId, svg.id);
+    expect(geometry.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'svg_browser_overlap', status: 'failed' }),
+      expect.objectContaining({ id: 'svg_browser_bounds', status: 'failed' }),
+    ]));
+    expect(geometry.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'SVG_BROWSER_OVERLAP', message: expect.stringMatching(/curve.*label/) }),
+      expect.objectContaining({ code: 'SVG_BROWSER_OUT_OF_BOUNDS', message: expect.stringContaining('outside') }),
+    ]));
+    const scoped = await srv.ctx.artifactService.verifyArtifact(userId, svg.id, { selector: '#label', maxElements: 1 });
+    expect(scoped.coverage).toBe('partial');
+    expect(scoped.metrics).toMatchObject({ browser: { inspected: 1 } });
+
+    await create('theme.css', '@import "missing.css";');
+    const { artifact: html } = await create('browser.html', `<!doctype html><html><head><title>Browser check</title>
+      <link rel="stylesheet" href="theme.css"></head><body><p id="present">Hello</p>
+      <script>document.body.appendChild(document.querySelector('p').cloneNode(true)); fetch('/blocked').catch(() => {});</script>
+      </body></html>`);
+    const browser = await srv.ctx.artifactService.verifyArtifact(userId, html.id);
+    expect(browser.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'html_browser_dom', status: 'failed' }),
+      expect.objectContaining({ id: 'html_browser_csp', status: 'failed' }),
+      expect.objectContaining({ id: 'html_browser_dependencies', status: 'failed' }),
+    ]));
+    expect(browser.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'HTML_BROWSER_DUPLICATE_ID' }),
+      expect.objectContaining({ code: 'HTML_BROWSER_CSP_VIOLATION' }),
+      expect.objectContaining({ code: 'HTML_BROWSER_MISSING_DEPENDENCY', message: expect.stringContaining('missing.css') }),
+    ]));
+  } finally {
+    await srv.cleanup();
+  }
+}, 90_000);

@@ -322,12 +322,15 @@ export class BuiltinArtifactMcpServer {
         { type: 'text', text: JSON.stringify({ artifactId, revision, sha256 }) },
       ]);
     });
-    tool('artifact_verify', 'Verify the current artifact revision. PPTX accepts optional options.slideIndices, maxSlides, and maxShapesPerSlide for server-side layer visual consistency verification.', {
+    tool('artifact_verify', 'Verify the current artifact revision. PPTX accepts optional options.slideIndices, maxSlides, and maxShapesPerSlide for server-side layer visual consistency verification. Full Runtime SVG and HTML support options.selector and bounded element windows.', {
       ...artifactId,
       options: z.object({
         slideIndices: z.array(z.number().int().min(0).max(500)).max(50).optional(),
         maxSlides: z.number().int().min(1).max(50).optional(),
         maxShapesPerSlide: z.number().int().min(1).max(100).optional(),
+        selector: z.string().min(1).max(512).optional(),
+        elementOffset: z.number().int().min(0).max(100_000).optional(),
+        maxElements: z.number().int().min(1).max(250).optional(),
       }).optional(),
     }, ({ artifactId, options }) => {
       assertArtifact(artifactId);

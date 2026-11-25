@@ -661,6 +661,9 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
         slideIndices: z.array(z.number().int().min(0).max(500)).max(50).optional(),
         maxSlides: z.number().int().min(1).max(50).optional(),
         maxShapesPerSlide: z.number().int().min(1).max(100).optional(),
+        selector: z.string().min(1).max(512).optional(),
+        elementOffset: z.number().int().min(0).max(100_000).optional(),
+        maxElements: z.number().int().min(1).max(250).optional(),
       })
       .optional()
       .safeParse(req.body ?? undefined);

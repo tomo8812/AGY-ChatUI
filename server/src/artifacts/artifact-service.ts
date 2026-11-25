@@ -32,6 +32,8 @@ import type {
 } from '../types.js';
 import {
   DOCUMENT_WORKER_MAX_INPUT_BYTES,
+  WEB_VERIFY_MAX_INPUT_BYTES,
+  WEB_VERIFY_ASSET_BUDGET,
   DocumentWorker,
   isDocumentFormat,
   isWebRenderFormat,
@@ -41,7 +43,7 @@ import { detectArtifactFormat, documentFormatConstraint, DOCUMENT_ACTIONS, Forma
 import { codeVerificationChecks } from './adapters/code-adapter.js';
 import { HTML_VERIFICATION_CHECKS } from './adapters/html-validator.js';
 import { SVG_VERIFICATION_CHECKS } from './adapters/svg-verifier.js';
-import { MAX_TEXT_VERIFY_BYTES, MAX_VERIFY_NODES, skippedTextVerification } from './adapters/text-verification.js';
+import { MAX_TEXT_VERIFY_BYTES, MAX_VERIFY_NODES, skippedTextVerification, textVerificationReport } from './adapters/text-verification.js';
 import { executeRestoreBundle, getRestoreBatchRecord, recoverPendingRestoreBatches } from './batch-restore.js';
 import { PerUserBlobManager, type BlobLease } from './blob-store.js';
 import { recoverPendingCommits, type DeleteTargetInspection, type RecoveryReport } from './commit-recovery.js';
@@ -4504,16 +4506,18 @@ export class ArtifactService {
     const snapshot = this.getCurrentRevisionSnapshot(userId, artifactId);
     const { revision } = snapshot;
     const identity = { revision: revision.revision, sha256: revision.sha256 };
+    const browser = (format === 'html' || format === 'svg') && this.documentWorker.browserVerificationAvailable;
+    const textLimit = browser ? WEB_VERIFY_MAX_INPUT_BYTES : MAX_TEXT_VERIFY_BYTES;
     const checkIds = format === 'code' ? codeVerificationChecks(artifact.filename)
       : format === 'html' ? HTML_VERIFICATION_CHECKS
         : format === 'svg' ? SVG_VERIFICATION_CHECKS : undefined;
-    if (checkIds && snapshot.sizeBytes > MAX_TEXT_VERIFY_BYTES) {
+    if (checkIds && snapshot.sizeBytes > textLimit) {
       return {
-        ...skippedTextVerification(checkIds, `Source exceeds the ${MAX_TEXT_VERIFY_BYTES}-byte verification budget.`),
+        ...skippedTextVerification(checkIds, `Source exceeds the ${textLimit}-byte verification budget.`),
         ...identity,
       };
     }
-    const maxBytes = checkIds ? MAX_TEXT_VERIFY_BYTES : isDocumentFormat(format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
+    const maxBytes = checkIds ? textLimit : isDocumentFormat(format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
     const { bytes: buf } = this.readRevisionSnapshot(snapshot, maxBytes);
     if (this.documentWorker.available && isDocumentFormat(format)) {
       let compareDocument: Buffer | undefined;
@@ -4570,7 +4574,43 @@ export class ArtifactService {
         dependencies: depRows.slice(0, MAX_VERIFY_NODES).map((row) => ({ relPath: row.rel_path, status: row.status })),
       };
     }
-    return { ...adapter.verify(buf, verifyMeta), ...identity };
+    const staticReport = adapter.verify(buf, verifyMeta);
+    if (browser && (format === 'html' || format === 'svg')) {
+      try {
+        const dependencies = this.readRenderDependencies(snapshot.artifact, revision.revision, WEB_VERIFY_ASSET_BUDGET);
+        const browserReport = JSON.parse((await this.documentWorker.run(
+          format, artifact.filename, buf, { action: 'verify', options }, [],
+          { entry: artifact.relPath, dependencies },
+        )).toString('utf8')) as AdapterVerifyResult;
+        const confirmed = format === 'svg' ? ['svg_overlap', 'svg_bounds'] : ['html_relative_refs', 'html_csp'];
+        const runtime = browserReport.checks ?? [];
+        const staticChecks = (staticReport.checks ?? []).filter(({ id, status }) =>
+          status !== 'unverified' || !confirmed.includes(id) || browserReport.coverage !== 'complete');
+        return {
+          ...textVerificationReport([...staticChecks, ...runtime], [...staticReport.issues, ...browserReport.issues],
+            { ...staticReport.metrics, ...browserReport.metrics }),
+          ...identity,
+        };
+      } catch (error) {
+        if (!(error instanceof ArtifactError) ||
+          !['DOCUMENT_WORKER_REJECTED', 'DOC_WORKER_INPUT_TOO_LARGE', 'DOC_WORKER_TIMEOUT', 'DOC_WORKER_RSS_EXCEEDED'].includes(error.code)) throw error;
+        return {
+          ...textVerificationReport([...(staticReport.checks ?? []), { id: `${format}_browser`, status: 'unverified', evidence: error.message }],
+            staticReport.issues, staticReport.metrics),
+          ...identity,
+        };
+      }
+    }
+    if (options && (options.selector !== undefined || options.elementOffset !== undefined || options.maxElements !== undefined) &&
+        (format === 'html' || format === 'svg')) {
+      return {
+        ...textVerificationReport([...(staticReport.checks ?? []),
+          { id: `${format}_browser`, status: 'unverified', evidence: 'Targeted browser verification requires Full Runtime with bwrap.' }],
+          staticReport.issues, staticReport.metrics),
+        ...identity,
+      };
+    }
+    return { ...staticReport, ...identity };
   }
 
   async exportArtifact(params: {
