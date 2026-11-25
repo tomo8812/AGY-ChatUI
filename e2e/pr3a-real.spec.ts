@@ -107,7 +107,8 @@ for(const vp of targets){
             if(item.kind==='markdown'||item.kind==='code'){
               const editor=page.getByRole('textbox',{name:'ソース'});
               await expect(editor).toBeEditable({timeout:30000});
-              await editor.focus();await editor.press('Control+a');await page.keyboard.insertText(item.updated);
+              await editor.focus();await page.getByRole('button',{name:'全選択',exact:true}).click();await page.keyboard.insertText(item.updated);
+              await expect.poll(()=>page.locator('.cm-line').allTextContents()).toEqual(item.updated.split('\n'));
             }else if(item.kind==='xlsx'||item.kind==='csv'){
               await page.getByRole('gridcell',{name:'A1',exact:true}).click({timeout:30000});
               await page.getByRole('textbox',{name:'数式・セル値'}).fill(item.updated);
@@ -115,7 +116,7 @@ for(const vp of targets){
             }else if(item.kind==='docx'){
               const word=page.getByRole('textbox',{name:'段落 1',exact:true});
               await word.fill(item.updated,{timeout:30000});
-              await word.press('Control+a');
+              await page.getByRole('button',{name:'段落全選択',exact:true}).click();
               await page.getByRole('button',{name:'太字',exact:true}).click();
               await expect(word.locator('strong')).toHaveText(item.updated);
               await expect(page.getByText('書式・埋め込み要素を保持')).toBeVisible();
@@ -171,7 +172,7 @@ for(const vp of targets){
             if(item.kind==='markdown'||item.kind==='code'){
               const editor=page.getByRole('textbox',{name:'ソース'});
               await expect.poll(()=>page.locator('.cm-line').allTextContents()).toEqual(item.updated.split('\n'));
-              await editor.focus();await editor.press('Control+Home');await editor.press('Shift+End');
+              await page.getByRole('button',{name:'全選択',exact:true}).click();
               await page.getByRole('button',{name:'選択行を対象にする'}).click();
             }else if(item.kind==='xlsx'||item.kind==='csv'){
               await page.getByRole('gridcell',{name:'A1',exact:true}).click({timeout:30000});

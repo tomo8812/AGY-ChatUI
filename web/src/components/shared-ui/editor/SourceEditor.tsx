@@ -1,5 +1,5 @@
 import React,{useLayoutEffect,useRef} from 'react';
-import {Annotation,EditorState} from '@codemirror/state';
+import {Annotation,EditorState,Transaction} from '@codemirror/state';
 import {EditorView,keymap,lineNumbers,highlightActiveLine,highlightActiveLineGutter} from '@codemirror/view';
 import {defaultKeymap,history,historyKeymap,indentWithTab} from '@codemirror/commands';
 import {syntaxHighlighting,defaultHighlightStyle} from '@codemirror/language';
@@ -10,6 +10,7 @@ import {Compartment} from '@codemirror/state';
 
 const externalUpdate=Annotation.define<boolean>();
 export interface SourceEditorHandle {
+  selectAll:()=>void;
   getSelection:()=>{startLine:number;endLine:number};
   wrapSelection:(before:string,after:string)=>void;
 }
@@ -36,6 +37,7 @@ export function SourceEditor({value,readOnly,language,onChange,editorRef}:Props)
     ]})});
     view.current=instance;
     editorRef.current={
+      selectAll:()=>{instance.focus();instance.dispatch({selection:{anchor:0,head:instance.state.doc.length},scrollIntoView:true})},
       getSelection:()=>{
         const {from,to}=instance.state.selection.main;
         return {startLine:instance.state.doc.lineAt(from).number,endLine:instance.state.doc.lineAt(Math.max(from,to-1)).number};
@@ -62,7 +64,7 @@ export function SourceEditor({value,readOnly,language,onChange,editorRef}:Props)
         let from=0,end=0;
         while(from<old.length&&from<next.length&&old[from]===next[from])from++;
         while(end<old.length-from&&end<next.length-from&&old[old.length-1-end]===next[next.length-1-end])end++;
-        instance.dispatch({changes:{from,to:old.length-end,insert:next.slice(from,next.length-end).replace(/\n/g,separator.current)},annotations:externalUpdate.of(true)});
+        instance.dispatch({changes:{from,to:old.length-end,insert:next.slice(from,next.length-end).replace(/\n/g,separator.current)},annotations:[externalUpdate.of(true),Transaction.addToHistory.of(false)]});
       }
     }
   },[value,readOnly]);
