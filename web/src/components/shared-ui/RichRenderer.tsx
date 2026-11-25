@@ -73,7 +73,8 @@ function RichRendererInner({document:doc,userId,chatId,artifacts=noArtifacts,act
   const authorized=useMemo(()=>new Map(artifacts.filter(a=>a.userId===userId&&a.chatId===chatId).map(a=>[a.id,a])),[artifacts,userId,chatId]);
   // Revision changes to an authorized file must not reset unrelated local control state.
   const authKey=JSON.stringify([...authorized.keys()].sort());
-  const store=useMemo(()=>new RichStateStore(doc,JSON.parse(authKey) as string[],theme),[doc,authKey,userId,chatId]);
+  const docKey=JSON.stringify(doc);
+  const store=useMemo(()=>new RichStateStore(JSON.parse(docKey) as RichDocumentV1,JSON.parse(authKey) as string[],theme),[docKey,authKey,userId,chatId]);
   const snapshot=useSyncExternalStore(store.subscribe,store.getSnapshot,store.getSnapshot);
   const [error,setError]=useState<string|null>(null);
   useEffect(()=>{try{store.setTheme(theme)}catch{setError('テーマ変更を適用できませんでした。')}},[theme,store]);
@@ -98,7 +99,7 @@ function RichRendererInner({document:doc,userId,chatId,artifacts=noArtifacts,act
     const read=(key:string)=>snapshot.state[key];
     const change=(bind:string,value:unknown,a?:RichStateAction[])=>select(bind,value,a,c);
     const children=(nodes:RichNode[]|undefined,suffix='children')=>nodes?.map((n,i)=><React.Fragment key={n.id}>{renderNode(n,c,path+'-'+suffix+'-'+i)}</React.Fragment>);
-    const unique=prefix+'-'+path.replace(/[^a-zA-Z0-9_-]/g,'_');
+    const unique=prefix+'-'+Array.from(path,c=>c.codePointAt(0)!.toString(16)).join('-');
     let body:ReactNode;
     switch(node.type){
       case 'stack':{

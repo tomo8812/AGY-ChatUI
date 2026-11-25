@@ -421,6 +421,7 @@ export function validateRichDocument(
   let staticSvgElements = 0;
   let expandedNodes = 0;
   let expandedSvgElements = 0;
+  let expandedDataPoints = 0;
   let computedOrder: string[] = [];
   const budget = createRichEvalBudget(RICH_LIMITS.maxAstSteps);
 
@@ -1109,6 +1110,22 @@ export function validateRichDocument(
       return val;
     };
 
+    // Count evaluated arrays per rendered occurrence, not just their original
+    // declaration. A repeat of charts/tables must not multiply a small state
+    // array into millions of rendered data points.
+    const countExpanded = (count: number, p: string) => {
+      expandedDataPoints += count;
+      if (expandedDataPoints > RICH_LIMITS.maxArrayPoints) {
+        throw new RichExprError('RICH_EXPANDED_ARRAY_LIMIT_EXCEEDED', 'Expanded data point limit exceeded at ' + p, 422);
+      }
+    };
+    const checkExpandedArray = (value: unknown, p: string, ctx: RichEvalContext, multiplier = 1) => {
+      const result = evalRichVal(value, ctx);
+      if (!Array.isArray(result)) throw new RichExprError('RICH_INVALID_SCHEMA', 'Expected evaluated array at ' + p);
+      countExpanded(result.length * multiplier, p);
+      return result;
+    };
+
     const evalSvgElementPost = (el: RichSvgElement, p: string, ctx: RichEvalContext) => {
       if (el.repeat) {
         const arr = evaluateRichAst(parseRichExpr(el.repeat.itemsExpr), ctx, budget);
@@ -1225,7 +1242,20 @@ export function validateRichDocument(
         );
       }
 
-      if (node.type === 'markdown') {
+      if (node.type === 'chart') {
+        if (node.categories !== undefined) checkExpandedArray(node.categories, p + '.categories', ctx);
+        for (const series of node.series) checkExpandedArray(series.data, p + '.series.data', ctx);
+      } else if (node.type === 'data_table') {
+        checkExpandedArray(node.rows, p + '.rows', ctx, Math.max(1, node.columns?.length ?? 1));
+      } else if (node.type === 'node_edge_diagram') {
+        const vertices = checkExpandedArray(node.nodes, p + '.nodes', ctx);
+        const edges = checkExpandedArray(node.edges, p + '.edges', ctx);
+        if (vertices.length > 500 || edges.length > 1000) throw new RichExprError('RICH_EXPANDED_ARRAY_LIMIT_EXCEEDED', 'Diagram exceeds vertex/edge limits.', 422);
+      } else if (node.type === 'list' || node.type === 'checklist' || node.type === 'steps' || node.type === 'timeline') {
+        if (node.items !== undefined) checkExpandedArray(node.items, p + '.items', ctx);
+      } else if (node.type === 'radio_group' || node.type === 'select' || node.type === 'segmented') {
+        checkExpandedArray(node.options, p + '.options', ctx);
+      } else if (node.type === 'markdown') {
         const evaluated = String(evalRichVal(node.content, ctx) ?? '');
         const err = validateRichMarkdownContent(evaluated);
         if (err) {

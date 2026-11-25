@@ -10,6 +10,10 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@dagrejs/dagre": "3.1.4",
+    "d3-array": "3.2.5",
+    "d3-scale": "4.0.3",
+    "d3-shape": "3.2.1",
     "diff": "^8.0.2",
     "dompurify": "^3.2.5",
     "highlight.js": "^11.11.1",
@@ -27,6 +31,9 @@
     "remark-math": "^6.0.0"
   },
   "devDependencies": {
+    "@types/d3-array": "3.2.2",
+    "@types/d3-scale": "4.0.9",
+    "@types/d3-shape": "3.2.0",
     "@types/diff": "^8.0.0",
     "@types/dompurify": "^3.2.0",
     "@types/papaparse": "^5.3.16",

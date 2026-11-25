@@ -1,4 +1,5 @@
 import React from 'react';
+import * as dagre from '@dagrejs/dagre';
 import type { RichDiagramNode } from '../../../../../shared/rich-schema';
 import type { RichEvalContext } from '../RichExprEvaluator';
 import { color, evaluate, safeArray, text, type RenderCycle, type SelectValue } from '../runtime';
@@ -11,23 +12,26 @@ export function renderNodeEdgeDiagram(node:Node,context:RichEvalContext,cycle:Re
   if(vertices.length>500||edges.length>1000)throw Error('図の項目数が上限を超えました。');
   const ids=new Set<string>();for(const v of vertices){if(ids.has(v.id))throw Error('図の項目が重複しています。');ids.add(v.id)}
   const valid=edges.filter(e=>ids.has(e.from)&&ids.has(e.to));
-  const depth=new Map(vertices.map(v=>[v.id,0]));
-  const remaining=new Map(vertices.map(v=>[v.id,0]));
-  const outgoing=new Map<string,Edge[]>();
-  for(const e of valid){if(e.from===e.to)continue;remaining.set(e.to,(remaining.get(e.to)??0)+1);const list=outgoing.get(e.from)??[];list.push(e);outgoing.set(e.from,list)}
-  const queue=vertices.filter(v=>remaining.get(v.id)===0).map(v=>v.id);
-  for(let i=0;i<queue.length;i++){const id=queue[i];for(const e of outgoing.get(id)??[]){depth.set(e.to,Math.max(depth.get(e.to)??0,(depth.get(id)??0)+1));const n=(remaining.get(e.to)??0)-1;remaining.set(e.to,n);if(n===0)queue.push(e.to)}}
-  const lanes=new Map<number,Vertex[]>();for(const v of vertices){const d=depth.get(v.id)??0;const row=lanes.get(d)??[];row.push(v);lanes.set(d,row)}
   const pos=new Map<string,{x:number;y:number}>();
-  const horizontal=node.diagramLayout==='dag_lr';
-  for(const [d,row]of lanes){row.forEach((v,i)=>{
-    const x=horizontal?d*180+86:i*180+86;
-    const y=horizontal?i*90+50:d*115+50;
-    pos.set(v.id,{x,y});
-  })}
+  const routes=new Map<number,{x:number;y:number}[]>();
+  if(node.diagramLayout==='dag_lr'||node.diagramLayout==='dag_tb'){
+    // Use internal numeric IDs: the user-controlled labels and identifiers never
+    // become keys in the graph library's internal object maps.
+    const safeIds=new Map(vertices.map((v,i)=>[v.id,'n'+i]));
+    const graph=new dagre.graphlib.Graph({multigraph:true});
+    graph.setGraph({rankdir:node.diagramLayout==='dag_lr'?'LR':'TB',ranksep:60,nodesep:36,marginx:12,marginy:12});
+    graph.setDefaultEdgeLabel(()=>({}));
+    for(const v of vertices)graph.setNode(safeIds.get(v.id)!,{width:144,height:54});
+    valid.forEach((e,i)=>graph.setEdge(safeIds.get(e.from)!,safeIds.get(e.to)!,{width:e.label?Math.min(160,e.label.length*7):0,height:e.label?16:0},'e'+i));
+    dagre.layout(graph);
+    for(const v of vertices){const p=graph.node(safeIds.get(v.id)!);pos.set(v.id,{x:p.x,y:p.y})}
+    valid.forEach((e,i)=>{const edge=graph.edge({v:safeIds.get(e.from)!,w:safeIds.get(e.to)!,name:'e'+i});if(edge?.points)routes.set(i,edge.points)});
+  }else{
+    vertices.forEach((v,i)=>pos.set(v.id,{x:86+(i%4)*180,y:50+Math.floor(i/4)*90}));
+  }
   if(node.diagramLayout==='radial')vertices.forEach((v,i)=>{const radius=Math.max(110,vertices.length*28);const angle=i/Math.max(1,vertices.length)*Math.PI*2;pos.set(v.id,{x:radius+90+radius*Math.cos(angle),y:radius+50+radius*Math.sin(angle)})});
   if(node.diagramLayout==='manual')for(const v of vertices){if(Number.isFinite(v.x)&&Number.isFinite(v.y))pos.set(v.id,{x:v.x!,y:v.y!})}
-  const all=[...pos.values()];
+  const all=[...pos.values(),...Array.from(routes.values()).flat()];
   const minX=Math.min(0,...all.map(p=>p.x-85)),minY=Math.min(0,...all.map(p=>p.y-42));
   const maxX=Math.max(160,...all.map(p=>p.x+85)),maxY=Math.max(100,...all.map(p=>p.y+42));
   const interactive=Boolean(node.selectedNodeBind||node.onNodeSelect?.length);
@@ -37,6 +41,11 @@ export function renderNodeEdgeDiagram(node:Node,context:RichEvalContext,cycle:Re
     <defs><marker id={arrow} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill={lineColor}/></marker></defs>
     {valid.map((e,i)=>{
       const a=pos.get(e.from)!,b=pos.get(e.to)!;
+      const route=routes.get(i);
+      if(route&&route.length>1){
+        const mid=route[Math.floor(route.length/2)];
+        return <g key={e.id??i}><path d={route.map((p,j)=>(j?'L ':'M ')+p.x+' '+p.y).join(' ')} fill="none" stroke={lineColor} strokeWidth="1.5" strokeDasharray={e.style==='dashed'?'4 3':undefined} markerEnd={e.directed===false?undefined:'url(#'+arrow+')'}/>{e.label&&<text x={mid.x} y={mid.y-4} textAnchor="middle" fill="currentColor" fontSize="12">{e.label}</text>}</g>;
+      }
       if(e.from===e.to)return <path key={i} d={'M '+(a.x+60)+' '+(a.y-23)+' q 40 -52 5 0'} fill="none" stroke={lineColor} markerEnd={e.directed===false?undefined:'url(#'+arrow+')'}/>;
       const dx=b.x-a.x,dy=b.y-a.y;
       const f=1/Math.max(Math.abs(dx)/72,Math.abs(dy)/27,1);

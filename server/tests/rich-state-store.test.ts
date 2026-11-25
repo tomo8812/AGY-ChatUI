@@ -47,6 +47,18 @@ describe('RichStateStore', () => {
     expect(() => store.set('payload', '![remote](https://example.com/image.png)')).toThrow();
     expect(store.getSnapshot()).toBe(before);
   });
+  it('rejects repeated evaluated chart arrays before publishing an oversized render', () => {
+    const store = new RichStateStore({
+      schemaVersion: 1, state: { data: [] },
+      root: { id:'root', type:'stack', direction:'col', children:[
+        { id:'first', type:'chart', chartType:'line', series:[{key:'s',label:'S',data:{expr:'$state.data'}}] },
+        { id:'second', type:'chart', chartType:'bar', series:[{key:'s',label:'S',data:{expr:'$state.data'}}] },
+      ] },
+    });
+    const before=store.getSnapshot();
+    expect(() => store.set('data',Array(6000).fill(1))).toThrow('Expanded data point limit');
+    expect(store.getSnapshot()).toBe(before);
+  });
   it('rejects repeat expansion beyond the dynamic node limit', () => {
     const store = new RichStateStore({
       schemaVersion: 1,

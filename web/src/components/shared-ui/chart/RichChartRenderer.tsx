@@ -1,4 +1,7 @@
 import React from 'react';
+import { extent, sum } from 'd3-array';
+import { scaleLinear, scaleBand } from 'd3-scale';
+import { arc as d3Arc, line as d3Line, area as d3Area } from 'd3-shape';
 import type { RichChartNode, RichChartDatum } from '../../../../../shared/rich-schema';
 import type { RichEvalContext } from '../RichExprEvaluator';
 import { color, evaluate, num, safeArray, text, type RenderCycle, type SelectValue } from '../runtime';
@@ -25,24 +28,10 @@ export function parseChartTime(value: string | number): number {
 export function formatChartTime(value: number): string {
   return Number.isFinite(new Date(value).getTime()) ? timeFormat.format(value) : '—';
 }
-function pathSegments(points: Array<{ x: number; y: number; base: number } | null>, connect: boolean) {
-  const segments: Array<Array<{ x: number; y: number; base: number }>> = [];
-  let segment: Array<{ x: number; y: number; base: number }> = [];
-  for (const point of points) {
-    if (point) segment.push(point);
-    else if (!connect && segment.length) { segments.push(segment); segment = []; }
-  }
-  if (segment.length) segments.push(segment);
-  return segments;
-}
-function arc(cx: number, cy: number, outer: number, inner: number, start: number, end: number) {
-  const point = (r: number, a: number) => [cx + r * Math.cos(a), cy + r * Math.sin(a)].join(' ');
-  const span = Math.min(end - start, 2 * Math.PI - 0.00001);
-  end = start + span;
-  const flag = span > Math.PI ? 1 : 0;
-  return 'M ' + point(outer, start) + ' A ' + outer + ' ' + outer + ' 0 ' + flag + ' 1 ' + point(outer, end) +
-    (inner > 0 ? ' L ' + point(inner, end) + ' A ' + inner + ' ' + inner + ' 0 ' + flag + ' 0 ' + point(inner, start) : ' L ' + cx + ' ' + cy) + ' Z';
-}
+interface PlotPoint { x:number; y:number; base:number }
+const linePath=d3Line<PlotPoint|null>().defined(p=>p!==null).x(p=>p!.x).y(p=>p!.y);
+const areaPath=d3Area<PlotPoint|null>().defined(p=>p!==null).x(p=>p!.x).y0(p=>p!.base).y1(p=>p!.y);
+const slicePath=d3Arc();
 export function renderRichChart({ node, context, cycle, select, clipId }: {
   node: RichChartNode; context: RichEvalContext; cycle: RenderCycle; select: SelectValue; clipId: string;
 }) {
@@ -78,13 +67,13 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
   let legend: React.ReactNode = series.map(s => <span key={s.key}><i style={{ background: s.color }} />{s.label}{s.sourceId && <small> · {s.sourceId}</small>}</span>);
   if (node.chartType === 'pie' || node.chartType === 'donut') {
     const slices = series.flatMap(s => s.points.map((p, i) => ({ s, p, i })));
-    const sum = slices.reduce((total, { p }) => total + Math.max(0, p.y ?? 0), 0);
-    let angle = -Math.PI / 2;
-    figure = sum > 0 ? slices.map(({ s, p, i }, j) => {
+    const total = sum(slices, ({p}) => Math.max(0,p.y??0));
+    let angle = 0;
+    figure = finite(total) && total > 0 ? slices.map(({ s, p, i }, j) => {
       if (p.y === null || p.y <= 0) return null;
       const start = angle;
-      angle += p.y / sum * Math.PI * 2;
-      return <path key={s.key + ':' + i} d={arc(W / 2, H / 2, 128, node.chartType === 'donut' ? 78 : 0, start, angle)}
+      angle += p.y / total * Math.PI * 2;
+      return <path key={s.key + ':' + i} d={slicePath({outerRadius:128,innerRadius:node.chartType==='donut'?78:0,startAngle:start,endAngle:angle})??undefined} transform={'translate('+W/2+' '+H/2+')'}
         fill={color(undefined, j)} stroke="var(--bg-surface)" strokeWidth="1" {...activate(s, p, i)}><title>{details(s, p)}</title></path>;
     }) : <text x={W/2} y={H/2} textAnchor="middle" fill="currentColor">表示できる値がありません</text>;
     legend = slices.map(({s,p,i},j) => <span key={s.key+':'+i}><i style={{background: color(undefined,j)}} />{p.label ?? p.x} · {p.y === null ? '—' : fmt(p.y)}</span>);
@@ -96,9 +85,10 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
     const numericX = !horizontal && !stacked && !series.some(s => s.type === 'bar') && node.xAxis?.type !== undefined && node.xAxis.type !== 'category';
     const xn = (x: string | number) => node.xAxis?.type === 'time' ? parseChartTime(x) : Number(x);
     const xvals = numericX ? series.flatMap(s => s.points.map(p => xn(p.x))).filter(finite) : [];
-    const xmin = xvals.length ? Math.min(...xvals) : 0;
-    const xmax = xvals.length ? Math.max(...xvals) : 1;
-    const sx = (p: Point, i: number) => numericX && finite(xn(p.x)) ? L + (xn(p.x)-xmin)/(xmax-xmin || 1)*pw : L + (i+0.5)/count*pw;
+    const [xmin = 0,xmax = 1] = extent(xvals);
+    const xScale = scaleLinear().domain([xmin,xmax===xmin?xmin+1:xmax]).range([L,L+pw]);
+    const slots=scaleBand<number>().domain(Array.from({length:count},(_,i)=>i)).range(horizontal?[T,T+ph]:[L,L+pw]);
+    const sx = (p: Point, i: number) => numericX ? xScale(xn(p.x)) : (slots(i)??L)+slots.bandwidth()/2;
     const groups = { left: { pos: Array(count).fill(0) as number[], neg: Array(count).fill(0) as number[] },
       right: { pos: Array(count).fill(0) as number[], neg: Array(count).fill(0) as number[] } };
     const values = { left: [0], right: [0] };
@@ -121,12 +111,14 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
     const bounds = (right: boolean) => {
       const axis = right ? node.yAxisRight : node.yAxis;
       const a = values[right ? 'right' : 'left'];
-      const min = num(val(axis?.min), Math.min(...a));
-      const max = num(val(axis?.max), Math.max(...a));
+      const [dataMin=0,dataMax=1]=extent(a.filter(finite));
+      const min = num(val(axis?.min), dataMin);
+      const max = num(val(axis?.max), dataMax);
       return max > min ? [min,max] : [min,min+1];
     };
     const left = bounds(false), right = bounds(true);
-    const scale = (v:number, r:boolean) => { const [a,b] = r ? right : left; return (v-a)/(b-a); };
+    const leftScale=scaleLinear().domain(left).range([0,1]),rightScale=scaleLinear().domain(right).range([0,1]);
+    const scale = (v:number, r:boolean) => (r?rightScale:leftScale)(v);
     const sy = (v:number,r:boolean) => T + ph*(1-scale(v,r));
     const hx = (v:number,r:boolean) => L+pw*scale(v,r);
     const barSeries = series.filter(s => s.type === 'bar');
@@ -156,11 +148,11 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
         });
       }
       const mapped = pts.map((p,i) => p && (!numericX || finite(xn(s.points[i].x))) ? { x:sx(s.points[i],i), y:sy(p.top,s.right), base:sy(p.base,s.right) } : null);
-      return <g key={s.key}>{s.type !== 'scatter' && pathSegments(mapped,Boolean(node.connectNulls)).map((seg,i) => {
-        const line = seg.map((p,k)=>(k?' L ':'M ')+p.x+' '+p.y).join('');
-        const area = line+seg.slice().reverse().map(p=>' L '+p.x+' '+p.base).join('')+' Z';
-        return <g key={i}>{s.type === 'area' && <path d={area} fill={s.color} opacity={0.22}/>}<path d={line} stroke={s.color} strokeWidth="2.5" fill="none"/></g>;
-      })}{mapped.map((p,i)=>p && <circle key={i} cx={p.x} cy={p.y} r={s.type==='scatter'?4:3} fill={s.color} {...activate(s,s.points[i],i)}><title>{details(s,s.points[i])}</title></circle>)}</g>;
+      const pathData=node.connectNulls?mapped.filter(p=>p!==null):mapped;
+      return <g key={s.key}>{s.type !== 'scatter' && <>
+        {s.type==='area'&&<path d={areaPath(pathData)??undefined} fill={s.color} opacity={0.22}/>}
+        <path d={linePath(pathData)??undefined} stroke={s.color} strokeWidth="2.5" fill="none"/>
+      </>}{mapped.map((p,i)=>p && <circle key={i} cx={p.x} cy={p.y} r={s.type==='scatter'?4:3} fill={s.color} {...activate(s,s.points[i],i)}><title>{details(s,s.points[i])}</title></circle>)}</g>;
     });
     const labelStep=Math.max(1,Math.ceil(count/8));
     figure = <g className="rich-chart-axes" fill="currentColor" fontSize="12">
@@ -171,7 +163,7 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
       <g clipPath={'url(#'+clipId+')'}>{marks}
       {(node.referenceLines??[]).map((r,i)=>{
         const v=val(r.value); const idx=cat.findIndex(x=>x===v);
-        const x = numericX ? L+(xn(v as string|number)-xmin)/(xmax-xmin||1)*pw : L+(idx+0.5)/count*pw;
+        const x = numericX ? xScale(xn(v as string|number)) : L+(idx+0.5)/count*pw;
         const y = sy(num(v,0),false);
         const vertical = horizontal ? r.axis==='y' : r.axis==='x';
         const pos = horizontal ? (r.axis==='y'?hx(num(v,0),false):T+(idx+0.5)/count*ph) : r.axis==='y'?y:x;
