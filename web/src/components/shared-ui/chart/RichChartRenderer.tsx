@@ -33,10 +33,9 @@ function arc(cx: number, cy: number, outer: number, inner: number, start: number
   return 'M ' + point(outer, start) + ' A ' + outer + ' ' + outer + ' 0 ' + flag + ' 1 ' + point(outer, end) +
     (inner > 0 ? ' L ' + point(inner, end) + ' A ' + inner + ' ' + inner + ' 0 ' + flag + ' 0 ' + point(inner, start) : ' L ' + cx + ' ' + cy) + ' Z';
 }
-export function RichChartRenderer({ node, context, cycle, select }: {
-  node: RichChartNode; context: RichEvalContext; cycle: RenderCycle; select: SelectValue;
+export function renderRichChart({ node, context, cycle, select, clipId }: {
+  node: RichChartNode; context: RichEvalContext; cycle: RenderCycle; select: SelectValue; clipId: string;
 }) {
-  const clipId = React.useId().replace(/[^a-zA-Z0-9_-]/g,'');
   const val = <T,>(v: T | { expr: string } | undefined) => evaluate<T>(v, context, cycle);
   const categories = safeArray<string | number>(val(node.categories));
   const series: Series[] = node.series.map((s, index) => ({
