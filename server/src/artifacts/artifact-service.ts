@@ -4478,7 +4478,7 @@ export class ArtifactService {
    * transaction remains the sole path for committing bytes or emitting events.
    */
   async renderPptxDraftSprite(userId: string, artifactId: string, draft: {
-    expectedRevision: number; pageIndex: number; shapeId: number; text?: string;
+    expectedRevision: number; pageIndex: number; shapeId: number; cropSprite?: boolean; text?: string;
     boundsPt?: [number, number, number, number];
     style?: {bold?:boolean;italic?:boolean;fontSizePt?:number;fontColor?:string;fill?:string};
   }, assertAuthorized?: () => void | Promise<void>): Promise<{png: Buffer; revision: number; sha256: string}> {
@@ -4521,7 +4521,7 @@ export class ArtifactService {
     await assertAuthorized?.();
     const edited = await this.documentWorker.run('pptx', artifact.filename, bytes, {action:'edit',operations});
     await assertAuthorized?.();
-    const png = await this.documentWorker.run('pptx', artifact.filename, edited, {action:'render',pageIndex:draft.pageIndex,variant:'sprite',shapeId:draft.shapeId});
+    const png = await this.documentWorker.run('pptx', artifact.filename, edited, {action:'render',pageIndex:draft.pageIndex,variant:'sprite',shapeId:draft.shapeId,cropSprite:draft.cropSprite});
     await assertAuthorized?.();
     this.assertRenderPng(png);
     return {png,revision:revision.revision,sha256:revision.sha256};
@@ -4582,13 +4582,16 @@ export class ArtifactService {
   async renderPng(
     userId: string,
     artifactId: string,
-    options: { pageIndex?: number; timeSeconds?: number; variant?: 'background' | 'sprite'; shapeId?: number; region?: { x: number; y: number; width: number; height: number; unit?: 'norm' | 'px' | 'pt' } } = {}
+    options: { pageIndex?: number; timeSeconds?: number; variant?: 'background' | 'sprite'; shapeId?: number; cropSprite?: boolean; region?: { x: number; y: number; width: number; height: number; unit?: 'norm' | 'px' | 'pt' } } = {}
   ): Promise<{ png: Buffer; revision: number; sha256: string }> {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', 'Artifact not found.', 404);
     const format = this.registry.resolve(artifact.filename, artifact.previewKind).format;
     if (options.variant && (format !== 'pptx' || (options.variant === 'sprite' && options.shapeId === undefined))) {
       throw new ArtifactError('INVALID_RENDER_VARIANT', 'Choose a PPTX slide and shape for the requested rendition.', 422);
+    }
+    if (options.cropSprite && (options.variant !== 'sprite' || options.region)) {
+      throw new ArtifactError('INVALID_RENDER_VARIANT', 'Crop-to-ink requires a sprite without a region.', 422);
     }
     if (options.region) {
       const { x, y, width, height, unit = 'norm' } = options.region;

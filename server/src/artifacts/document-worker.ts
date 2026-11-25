@@ -40,7 +40,7 @@ type WorkerAction =
   | { action: 'range'; range: Record<string, unknown> }
   | { action: 'edit'; operations: AdapterOperation[] }
   | { action: 'create'; params: Record<string, unknown> }
-  | { action: 'render'; pageIndex?: number; timeSeconds?: number; variant?: 'background' | 'sprite'; shapeId?: number; region?: RenderRegion }
+  | { action: 'render'; pageIndex?: number; timeSeconds?: number; variant?: 'background' | 'sprite'; shapeId?: number; cropSprite?: boolean; region?: RenderRegion }
   | { action: 'export'; targetFormat: string; region?: RenderRegion };
 
 export type DocumentInputSource = Buffer | { path: string; sizeBytes: number };

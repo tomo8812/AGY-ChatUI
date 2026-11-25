@@ -568,6 +568,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     pageIndex: z.coerce.number().int().min(0).optional(),
     timeSeconds: z.coerce.number().finite().min(0).optional(),
     variant: z.enum(['background', 'sprite']).optional(),
+    cropSprite: z.enum(['true', 'false']).transform(v=>v==='true').optional(),
     shapeId: z.coerce.number().int().positive().optional(),
     regionX: z.coerce.number().finite().min(0).optional(),
     regionY: z.coerce.number().finite().min(0).optional(),
@@ -605,6 +606,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const parsed = z.object({
       expectedRevision:z.number().int().min(1), pageIndex:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
       shapeId:z.number().int().positive().max(2147483647),
+      cropSprite:z.boolean().optional(),
       text:z.string().max(20000).optional(),
       boundsPt:z.tuple([z.number().finite().min(-14400).max(14400),z.number().finite().min(-14400).max(14400),z.number().finite().min(1).max(14400),z.number().finite().min(1).max(14400)]).optional(),
       style:z.object({bold:z.boolean().optional(),italic:z.boolean().optional(),fontSizePt:z.number().finite().min(6).max(200).optional(),fontColor:z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),fill:z.string().regex(/^#[0-9a-fA-F]{6}$/).optional()}).strict().optional(),

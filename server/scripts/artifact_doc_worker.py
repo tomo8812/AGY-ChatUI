@@ -2153,6 +2153,48 @@ def shape_transform(shape):
     return coordinates
 
 
+def pptx_basic_geometry(shape):
+    """Only classify geometry whose complete paint is explicit and reproducible.
+    Inherited theme, text, effects, placeholders and groups stay native sprites."""
+    if shape.tag != tag(PRESENTATION, "sp") or text_content(shape, DRAWING).strip():
+        return None
+    if shape.find(".//" + tag(PRESENTATION, "ph")) is not None:
+        return None
+    if shape.find(tag(PRESENTATION, "style")) is not None:
+        return None
+    props = shape.find(tag(PRESENTATION, "spPr"))
+    transform = shape_transform(shape)
+    if props is None or not transform or not transform.get("geomBoundsPt"):
+        return None
+    if transform["rotationDegrees"] or transform["flipH"] or transform["flipV"]:
+        return None
+    if any(child.tag not in {tag(DRAWING, n) for n in ("xfrm", "prstGeom", "solidFill", "noFill", "ln")} for child in props):
+        return None
+    geom = props.find(tag(DRAWING, "prstGeom"))
+    if geom is None or geom.get("prst") not in ("rect", "ellipse"):
+        return None
+    if any(len(child) or child.tag != tag(DRAWING, "avLst") for child in geom):
+        return None
+    def paint(parent):
+        if parent.find(tag(DRAWING, "noFill")) is not None:
+            return "none"
+        solid = parent.find(tag(DRAWING, "solidFill"))
+        if solid is not None and len(solid) == 1:
+            color = solid[0]
+            if color.tag == tag(DRAWING, "srgbClr") and not len(color) and re.fullmatch(r"[0-9A-Fa-f]{6}", color.get("val", "")):
+                return "#" + color.get("val")
+        return None
+    fill = paint(props)
+    line = props.find(tag(DRAWING, "ln"))
+    if fill is None or line is None or any(child.tag not in {tag(DRAWING, "solidFill"), tag(DRAWING, "noFill")} for child in line):
+        return None
+    stroke = paint(line)
+    if stroke is None or (stroke != "none" and (set(line.attrib) != {"w"} or not line.get("w", "").isdigit())):
+        return None
+    return {"kind": geom.get("prst"), "fill": fill, "stroke": stroke,
+            "strokeWidthPt": int(line.get("w", "0")) / 12700 if stroke != "none" else 0}
+
+
 def pptx_shape_order(node, depth=0):
     if depth > 20:
         raise ValueError("Presentation group nesting is too deep")
@@ -2167,7 +2209,7 @@ def pptx_shape_order(node, depth=0):
             continue
         children.append({"id": props.get("id"), "name": props.get("name"), "type": XML.QName(shape).localname,
                          "text": text_content(shape, DRAWING), "zOrder": len(children),
-                         "transform": shape_transform(shape), "children": pptx_shape_order(shape, depth + 1)})
+                         "transform": shape_transform(shape), "basicGeometry": pptx_basic_geometry(shape), "children": pptx_shape_order(shape, depth + 1)})
         if len(children) > 1000:
             raise ValueError("Presentation shape limit exceeded")
     return children
@@ -5852,7 +5894,7 @@ def export_presentation_image(package, replacements, name, dimensions):
     return slide.with_suffix(".png")
 
 
-def alpha_from_black_white(black_path, white_path, output, dimensions, allow_empty=False):
+def alpha_from_black_white(black_path, white_path, output, dimensions, allow_empty=False, crop_to_ink=False):
     from PIL import Image, ImageChops, ImageMath, PngImagePlugin
 
     with Image.open(black_path) as black, Image.open(white_path) as white:
@@ -5868,7 +5910,9 @@ def alpha_from_black_white(black_path, white_path, output, dimensions, allow_emp
         raise ValueError("LibreOffice did not produce an isolatable sprite")
     if alpha.getbbox() is None:
         if allow_empty:
-            Image.new("RGBA", alpha.size, (0, 0, 0, 0)).save(output, format="PNG")
+            metadata = PngImagePlugin.PngInfo()
+            metadata.add_text("inkBoundsPt", json.dumps({"x": 0, "y": 0, "width": 0, "height": 0}))
+            Image.new("RGBA", (1, 1) if crop_to_ink else alpha.size, (0, 0, 0, 0)).save(output, format="PNG", pnginfo=metadata)
             return
         raise ValueError("LibreOffice did not produce an isolatable sprite")
 
@@ -5888,9 +5932,10 @@ def alpha_from_black_white(black_path, white_path, output, dimensions, allow_emp
         "width": (right - left) * page_width / width,
         "height": (bottom - top) * page_height / height,
     }))
-    Image.merge("RGBA", (*[straight(channel) for channel in black_channels], alpha)).save(
-        output, format="PNG", pnginfo=metadata
-    )
+    sprite = Image.merge("RGBA", (*[straight(channel) for channel in black_channels], alpha))
+    if crop_to_ink:
+        sprite = sprite.crop((left, top, right, bottom))
+    sprite.save(output, format="PNG", pnginfo=metadata)
 
 
 def render_presentation_layer(package, request, output):
@@ -5926,7 +5971,7 @@ def render_presentation_layer(package, request, output):
     black = export_presentation_image(package, replacements, "sprite-black", dimensions)
     solid_slide_background(slide, "FFFFFF")
     white = export_presentation_image(package, replacements, "sprite-white", dimensions)
-    alpha_from_black_white(black, white, output, dimensions, allow_empty=bool(request.get("allowEmpty")))
+    alpha_from_black_white(black, white, output, dimensions, allow_empty=bool(request.get("allowEmpty") or request.get("cropSprite")), crop_to_ink=bool(request.get("cropSprite")))
     crop_png_region(output, request.get("region"), page_size_pt=page_size_pt)
 
 
