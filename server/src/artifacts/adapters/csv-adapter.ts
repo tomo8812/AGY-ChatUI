@@ -477,7 +477,8 @@ export class CsvAdapter implements FormatAdapter {
         message: 'Invalid UTF-8 byte sequence detected.',
       });
     }
-    if (buffer.includes(0x00)) {
+    const hasNullByte = buffer.includes(0x00);
+    if (hasNullByte) {
       issues.push({
         severity: 'error',
         code: 'CSV_NULL_BYTE',
@@ -491,14 +492,18 @@ export class CsvAdapter implements FormatAdapter {
         message: 'UTF-8 BOM prefix detected.',
       });
     }
+    const encodingProblems: string[] = [];
+    if (!validUtf8) encodingProblems.push('invalid UTF-8 byte sequences');
+    if (hasNullByte) encodingProblems.push('NUL byte(s)');
     checks.push({
       id: 'csv_encoding',
-      status: validUtf8 && !buffer.includes(0x00) ? 'passed' : 'failed',
-      evidence: validUtf8
-        ? hasBom
-          ? 'Valid UTF-8 (with BOM).'
-          : 'Valid UTF-8.'
-        : 'Invalid UTF-8 byte sequences detected.',
+      status: encodingProblems.length === 0 ? 'passed' : 'failed',
+      evidence:
+        encodingProblems.length === 0
+          ? hasBom
+            ? 'Valid UTF-8 (with BOM).'
+            : 'Valid UTF-8.'
+          : `Detected ${encodingProblems.join(' and ')}.`,
     });
 
     // Detect unbalanced quotes
