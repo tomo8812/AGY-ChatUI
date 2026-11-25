@@ -5,6 +5,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
+import type { RichNode, RichStateValue } from '../../../shared/rich-schema.js';
 import type { ArtifactService } from '../artifacts/artifact-service.js';
 import { ArtifactError } from '../artifacts/errors.js';
 import type { AppDatabase } from '../db/database.js';
@@ -292,8 +293,9 @@ export class BuiltinArtifactMcpServer {
         assertAuthorized: () => { authorize(); assertArtifact(input.artifactId); },
       });
     });
-    tool('artifact_render', 'Get a PNG rendition of an artifact.', {
+    tool('artifact_render', 'Get a PNG rendition. PPTX can render a background plate or an isolated transparent sprite for shapeId.', {
       ...artifactId, pageIndex: z.number().int().min(0).optional(), timeSeconds: z.number().min(0).optional(),
+      variant: z.enum(['background', 'sprite']).optional(), shapeId: z.number().int().positive().optional(),
     }, async ({ artifactId, ...options }) => {
       assertArtifact(artifactId);
       const png = await this.artifacts.renderPng(userId, artifactId, options);
@@ -337,7 +339,7 @@ export class BuiltinArtifactMcpServer {
     });
 
     tool('edit_request_list', 'List submitted editing requests in this chat.', {}, () =>
-      this.editRequests.listRequests(userId, chatId, { status: 'sent' }));
+      this.editRequests.listRequests(userId, chatId).filter(({ status }) => status !== 'draft'));
     tool('edit_request_get', 'Read a submitted editing request and its target.', requestId, ({ requestId }) => {
       const { regionImagePngBase64, ...payload } = this.editRequests.getForAgent(userId, chatId, requestId);
       if (payload.status === 'draft') throw new ArtifactError('NOT_FOUND', 'Editing request was not submitted.', 404);
@@ -376,9 +378,18 @@ export class BuiltinArtifactMcpServer {
       if (!block) throw new ArtifactError('NOT_FOUND', 'Rich block was not found in this chat.', 404);
       return block;
     });
-    tool('rich_update', 'Replace a rich document at its expected revision.', {
-      ...blockId, expectedRevision: revision, document: z.unknown(), title: z.string().max(256).optional(),
-    }, (input) => this.rich.updateBlock({ ...context, ...actor, ...input }));
+    tool('rich_update', 'Replace a rich document or patch its nodes and state at the expected revision.', {
+      ...blockId,
+      expectedRevision: revision,
+      document: z.unknown().optional(),
+      patchNodes: z.array(z.object({ nodeId: identifier, replacement: object })).max(100).optional(),
+      patchState: object.optional(),
+      title: z.string().max(256).optional(),
+    }, ({ patchNodes, patchState, ...input }) => this.rich.updateBlock({
+      ...context, ...actor, ...input,
+      patchNodes: patchNodes?.map(({ nodeId, replacement }) => ({ nodeId, replacement: replacement as unknown as RichNode })),
+      patchState: patchState as Record<string, RichStateValue> | undefined,
+    }));
     tool('rich_save_as_artifact', 'Save a rich block as an artifact in this chat.', {
       ...blockId, ...idempotencyKey, filename: z.string().min(1).max(255),
       format: z.enum(['svg', 'md', 'txt', 'csv', 'json', 'code']), content: z.string().optional(),

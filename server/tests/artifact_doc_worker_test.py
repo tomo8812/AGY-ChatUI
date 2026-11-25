@@ -19,10 +19,13 @@ from docx import Document
 from lxml import etree as XML
 from openpyxl import Workbook, load_workbook
 from openpyxl.chart import BarChart, Reference
-from PIL import Image
+from openpyxl.worksheet.formula import ArrayFormula
+from PIL import Image, ImageChops, ImageStat
 from pptx import Presentation
 from pptx.chart.data import CategoryChartData
 from pptx.enum.chart import XL_CHART_TYPE
+from pptx.enum.shapes import MSO_SHAPE
+from pptx.dml.color import RGBColor
 from pptx.util import Inches
 from pypdf import PdfReader
 
@@ -92,6 +95,37 @@ class DocumentWorkerTest(unittest.TestCase):
         cached = load_workbook(io.BytesIO(edited), data_only=True)
         self.assertIsNone(cached.active["A2"].value)
 
+    def test_spreadsheet_mutation_moves_cross_sheet_references(self):
+        workbook = Workbook()
+        detail = workbook.active
+        detail.title = "Raw Data"
+        detail["A1"], detail["A2"], detail["A3"] = 2, 5, 8
+        detail["B3"] = "=SUM(A1:A3)"
+        summary = workbook.create_sheet("Summary")
+        summary["A1"] = "='Raw Data'!$A$2"
+        summary["A2"] = "=SUM('Raw Data'!A1:A3)"
+        workbook.save(self.source)
+        result = self.run_worker("xlsx", "edit", operations=[
+            {"op": "xlsx.mutate_rows", "sheetId": "1", "mode": "insert", "index": 2, "count": 2},
+            {"op": "xlsx.mutate_columns", "sheetId": "1", "mode": "insert", "index": 1},
+        ])
+        reopened = load_workbook(io.BytesIO(result))
+        self.assertEqual(reopened["Raw Data"]["B4"].value, 5)
+        self.assertEqual(reopened["Raw Data"]["C5"].value, "=SUM(B1:B5)")
+        self.assertEqual(reopened["Summary"]["A1"].value, "='Raw Data'!$B$4")
+        self.assertEqual(reopened["Summary"]["A2"].value, "=SUM('Raw Data'!B1:B5)")
+
+    def test_spreadsheet_mutation_refuses_array_formulas(self):
+        workbook = Workbook()
+        workbook.active["A1"] = ArrayFormula("A1:A3", "=ROW(A1:A3)")
+        workbook.save(self.source)
+        with self.assertRaises(subprocess.CalledProcessError) as failure:
+            self.run_worker("xlsx", "edit", operations=[
+                {"op": "xlsx.mutate_rows", "sheetId": "1", "mode": "delete", "index": 2},
+            ])
+        self.assertEqual(failure.exception.returncode, 3)
+        self.assertFalse(self.result.exists())
+
     def test_docx_preserves_header_and_changes_paragraph_and_page_size(self):
         document = Document()
         document.add_paragraph("Before")
@@ -123,6 +157,34 @@ class DocumentWorkerTest(unittest.TestCase):
         self.assertEqual(reopened.slides[0].shapes[1].shape_id, title_id)
         self.assertEqual(reopened.slides[0].shapes[1].text, "After")
 
+    @unittest.skipUnless(shutil.which("libreoffice"), "LibreOffice runtime not installed")
+    def test_pptx_sprites_composite_over_the_background(self):
+        presentation = Presentation()
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        ids = []
+        for offset, color in ((1, (0, 80, 150)), (2, (200, 60, 80))):
+            shape = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(offset), Inches(1), Inches(3), Inches(2))
+            shape.fill.solid()
+            shape.fill.fore_color.rgb = RGBColor(*color)
+            shape.rotation = 12
+            ids.append(shape.shape_id)
+        presentation.save(self.source)
+        result = json.loads(self.run_worker("pptx", "range", range={"part": "ppt/slides/slide1.xml"}))
+        self.assertEqual([layer["kind"] for layer in result["layers"]], ["master", "layout", "slide"])
+        self.assertEqual([int(shape["id"]) for shape in result["shapes"]], ids)
+        self.assertEqual(result["shapes"][0]["transform"]["geomBoundsPt"]["x"], 72)
+        reference = Image.open(io.BytesIO(self.run_worker("pptx", "render"))).convert("RGB")
+        composite = Image.open(io.BytesIO(self.run_worker("pptx", "render", variant="background"))).convert("RGBA")
+        for shape_id in ids:
+            sprite = Image.open(io.BytesIO(self.run_worker("pptx", "render", variant="sprite", shapeId=shape_id)))
+            self.assertEqual(sprite.size, reference.size)
+            self.assertEqual(sprite.mode, "RGBA")
+            self.assertEqual(sprite.getpixel((0, 0))[3], 0)
+            self.assertGreater(json.loads(sprite.info["inkBoundsPt"])["width"], 200)
+            composite.alpha_composite(sprite)
+        delta = ImageChops.difference(reference, composite.convert("RGB"))
+        self.assertLess(max(ImageStat.Stat(delta).mean), 2.0)
+
     @unittest.skipUnless(os.environ.get("AGY_TEST_SMARTART_FILE"), "External SmartArt fixture not supplied")
     def test_real_smartart_updates_data_and_cached_drawing(self):
         # Apache POI test-data/slideshow/smartart-simple.pptx.
@@ -132,12 +194,16 @@ class DocumentWorkerTest(unittest.TestCase):
             "slidePart": "ppt/slides/slide1.xml",
             "dataPart": "ppt/diagrams/data1.xml",
             "nodeId": "{63986E3B-5608-7F48-A1F2-C2D1F88EED58}",
-            "text": "Updated SmartArt Label",
+            "text": "Juno",
         }])
         with zipfile.ZipFile(io.BytesIO(result)) as package:
             for part in ("ppt/diagrams/data1.xml", "ppt/diagrams/drawing1.xml"):
-                self.assertIn(b"Updated SmartArt Label", package.read(part))
+                self.assertIn(b"Juno", package.read(part))
         self.assertTrue(Presentation(io.BytesIO(result)).slides)
+        if shutil.which("libreoffice"):
+            self.source.write_bytes(result)
+            pdf = self.run_worker("pptx", "export", targetFormat="pdf")
+            self.assertIn("Juno", "".join(page.extract_text() for page in PdfReader(io.BytesIO(pdf)).pages))
 
     @unittest.skipUnless(shutil.which("libreoffice"), "LibreOffice runtime not installed")
     def test_calc_evaluates_only_a_copy(self):
@@ -150,6 +216,32 @@ class DocumentWorkerTest(unittest.TestCase):
         self.assertEqual(result["cells"][0]["formulaStatus"], "evaluated_lo")
         self.assertEqual(float(result["cells"][0]["value"]), 7.0)
         self.assertEqual(self.source.read_bytes(), original)
+
+    def test_creates_combination_charts_with_a_secondary_axis(self):
+        workbook = Workbook()
+        workbook.active.append(["Category", "Price", "Count"])
+        workbook.active.append(["One", 20, 5])
+        workbook.active.append(["Two", 25, 1])
+        workbook.save(self.source)
+        sheet_chart = self.run_worker("xlsx", "edit", operations=[{
+            "op": "chart.create", "kind": "combo", "sheetName": "Sheet", "dataRange": "B1:C3",
+            "anchor": "E4", "categoryColumn": 1,
+        }])
+        self.assertEqual(len(load_workbook(io.BytesIO(sheet_chart)).active._charts), 1)
+        presentation = Presentation()
+        presentation.slides.add_slide(presentation.slide_layouts[6])
+        presentation.save(self.source)
+        slide_chart = self.run_worker("pptx", "edit", operations=[{
+            "op": "chart.create", "kind": "combo", "pageIndex": 0, "categories": ["One", "Two"],
+            "series": [{"name": "Price", "values": [20, 25]}, {"name": "Count", "values": [5, 1]}],
+        }])
+        self.assertTrue(Presentation(io.BytesIO(slide_chart)).slides[0].shapes[0].has_chart)
+        for data, part in ((sheet_chart, "xl/charts/chart1.xml"), (slide_chart, "ppt/charts/chart1.xml")):
+            with zipfile.ZipFile(io.BytesIO(data)) as package:
+                root = XML.fromstring(package.read(part))
+                self.assertEqual(len(root.xpath('//*[local-name()="valAx"]')), 2)
+                self.assertEqual(len(root.xpath('//*[local-name()="lineChart"]')), 1)
+                self.assertEqual(len(root.xpath('//*[local-name()="barChart"]')), 1)
 
     def test_xlsx_chart_updates_match_sheet_cells(self):
         workbook = Workbook()

@@ -25,7 +25,7 @@ type WorkerAction =
   | { action: 'range'; range: Record<string, unknown> }
   | { action: 'edit'; operations: AdapterOperation[] }
   | { action: 'create'; params: Record<string, unknown> }
-  | { action: 'render'; pageIndex?: number; timeSeconds?: number }
+  | { action: 'render'; pageIndex?: number; timeSeconds?: number; variant?: 'background' | 'sprite'; shapeId?: number }
   | { action: 'export'; targetFormat: string };
 
 const docWorkerScript = fileURLToPath(new URL('../../scripts/artifact_doc_worker.py', import.meta.url));
@@ -95,6 +95,9 @@ export class DocumentWorker {
         expectedOutputRelPath: 'result',
         timeoutMs: request.action === 'export' ? this.config.docWorkerExportTimeoutMs : undefined,
       });
+      if (result.exitCode === 3) {
+        throw new ArtifactError('UNSUPPORTED_STRUCTURAL_MUTATION', 'The workbook contains protected structures or references.', 422);
+      }
       if (result.exitCode !== 0 || !result.outputBuffer) {
         throw new ArtifactError('DOCUMENT_WORKER_REJECTED', 'Document processing rejected the input or operation.', 422);
       }

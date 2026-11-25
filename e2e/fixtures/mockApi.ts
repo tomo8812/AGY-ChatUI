@@ -623,6 +623,19 @@ export async function installMockApi(page: Page, options: MockApiOptions = {}): 
       });
     }
 
+    if (pathname === '/api/mcp/builtin-artifact') {
+      return json({
+        enabled: null,
+        disabledTools: null,
+        effective: { enabled: true, disabledTools: [] },
+        tools: [
+          { name: 'artifact_list', label: '成果物の一覧' },
+          { name: 'artifact_restore_bundle', label: '関連ファイルを含む一括復元' },
+          { name: 'rich_save_as_artifact', label: 'リッチ回答を成果物として保存' },
+        ],
+      });
+    }
+
     if (pathname === '/api/mcp/servers') {
       return json({
         callbackUrl: 'http://127.0.0.1:4173/api/mcp/oauth/callback',

@@ -37,7 +37,10 @@ case "${INSTALL_DOC_RUNTIME,,}" in
   1|true|yes|on|compact|compact_doc_runtime) PROFILE=compact ;;
   full|full_runtime) PROFILE=full ;;
   *)
-    TOTAL_RAM_KB="$(awk '/^MemTotal:/ {print $2}' "${MEMINFO_FILE:-/proc/meminfo}")"
+    TOTAL_RAM_KB="$(awk '/^MemTotal:/ {print $2; exit}' "${MEMINFO_FILE:-/proc/meminfo}" 2>/dev/null || true)"
+    if [[ ! "${TOTAL_RAM_KB}" =~ ^[0-9]+$ ]]; then
+      TOTAL_RAM_KB=0
+    fi
     if (( TOTAL_RAM_KB >= 3670016 )); then
       PROFILE=full
     elif (( TOTAL_RAM_KB >= 2306868 )); then
@@ -119,6 +122,8 @@ STAMP_FILE="${DOC_RUNTIME_DIR}/.runtime-spec-sha256"
 
 if [[ -f "${STAMP_FILE}" ]] && [[ "$(cat "${STAMP_FILE}" 2>/dev/null || true)" == "${SPEC_SHA}" ]]; then
   if [[ -x "${DOC_RUNTIME_DIR}/venv/bin/python3" ]] \
+    && command -v ffmpeg >/dev/null 2>&1 \
+    && command -v rsvg-convert >/dev/null 2>&1 \
     && [[ -d "${DOC_RUNTIME_DIR}/node/node_modules/pptxgenjs" ]] \
     && [[ -d "${DOC_RUNTIME_DIR}/node/node_modules/docx" ]] \
     && [[ -d "${DOC_RUNTIME_DIR}/node/node_modules/sharp" ]] \

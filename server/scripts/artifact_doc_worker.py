@@ -2,7 +2,7 @@
 
 import json
 import io
-from copy import deepcopy
+from copy import copy, deepcopy
 import math
 import os
 from pathlib import Path, PurePosixPath
@@ -151,7 +151,9 @@ def validate_workbook_indices(package, names):
 def invalidate_calculation(package, replacements):
     """Clear stale cached formula values and remove all calcChain registrations."""
     workbook_name = MAIN_PART["xlsx"]
-    workbook = parse_xml(package.read(workbook_name))
+    workbook = replacements.get(workbook_name)
+    if workbook is None:
+        workbook = parse_xml(package.read(workbook_name))
     calculation = workbook.find(tag(SPREADSHEET, "calcPr"))
     if calculation is None:
         calculation = XML.Element(tag(SPREADSHEET, "calcPr"))
@@ -200,7 +202,10 @@ def edit_workbook(package, operations, output):
             changes_cells |= edit_chart(package, "xlsx", operation, replacements)
             continue
         changes_cells = True
-        update_workbook_cell(package, operation, replacements)
+        if op in {"xlsx.mutate_rows", "xlsx.mutate_columns"}:
+            mutate_workbook_grid(package, operation, replacements)
+        else:
+            update_workbook_cell(package, operation, replacements)
     removed = invalidate_calculation(package, replacements) if changes_cells else ()
     write_package(package, replacements, output, "xlsx", removed)
 
@@ -257,7 +262,7 @@ def update_workbook_cell(package, operation, replacements):
     replacements[sheet_name] = sheet
 
 
-def write_package(package, replacements, output, fmt, removed=()):
+def write_package(package, replacements, output, fmt, removed=(), additions=None):
     with zipfile.ZipFile(output, "w") as edited:
         for entry in package.infolist():
             if entry.filename in removed:
@@ -268,7 +273,9 @@ def write_package(package, replacements, output, fmt, removed=()):
                 data = root
             elif root is not None:
                 data = XML.tostring(root, encoding="UTF-8", xml_declaration=True)
-            edited.writestr(entry, data)
+            edited.writestr(copy(entry), data)
+        for name, data in (additions or {}).items():
+            edited.writestr(name, data, zipfile.ZIP_DEFLATED)
     with zipfile.ZipFile(output) as edited:
         validate_package(edited, fmt)
 
@@ -535,6 +542,30 @@ def text_content(node, namespace):
     return "".join(text.text or "" for text in node.iter(tag(namespace, "t")))[:10_000]
 
 
+def shape_transform(shape):
+    transform = next((node for node in (
+        shape.find("./" + tag(PRESENTATION, "spPr") + "/" + tag(DRAWING, "xfrm")),
+        shape.find("./" + tag(PRESENTATION, "grpSpPr") + "/" + tag(DRAWING, "xfrm")),
+        shape.find(tag(PRESENTATION, "xfrm")),
+    ) if node is not None), None)
+    if transform is None:
+        return None
+    coordinates = {}
+    for element_name, attributes in (("off", ("x", "y")), ("ext", ("cx", "cy")),
+                                     ("chOff", ("x", "y")), ("chExt", ("cx", "cy"))):
+        element = transform.find(tag(DRAWING, element_name))
+        if element is not None:
+            coordinates[element_name] = [int(element.get(attribute, "0")) / 12700 for attribute in attributes]
+    if "off" in coordinates and "ext" in coordinates:
+        x, y = coordinates["off"]
+        width, height = coordinates["ext"]
+        coordinates["geomBoundsPt"] = {"x": x, "y": y, "width": width, "height": height}
+    coordinates["rotationDegrees"] = int(transform.get("rot", "0")) / 60000
+    coordinates["flipH"] = transform.get("flipH") in ("1", "true")
+    coordinates["flipV"] = transform.get("flipV") in ("1", "true")
+    return coordinates
+
+
 def pptx_shape_order(node, depth=0):
     if depth > 20:
         raise ValueError("Presentation group nesting is too deep")
@@ -549,7 +580,7 @@ def pptx_shape_order(node, depth=0):
             continue
         children.append({"id": props.get("id"), "name": props.get("name"), "type": XML.QName(shape).localname,
                          "text": text_content(shape, DRAWING), "zOrder": len(children),
-                         "children": pptx_shape_order(shape, depth + 1)})
+                         "transform": shape_transform(shape), "children": pptx_shape_order(shape, depth + 1)})
         if len(children) > 1000:
             raise ValueError("Presentation shape limit exceeded")
     return children
@@ -576,6 +607,175 @@ def cell_coordinates(address):
     for letter in match.group(1):
         column = column * 26 + ord(letter) - ord("A") + 1
     return bounded_integer(match.group(2), 1, 1048576), bounded_integer(column, 1, 16384)
+
+
+MUTATION_ADDRESS = re.compile(r"(\$?)([A-Z]{1,3})(\$?)([1-9][0-9]{0,6})", re.IGNORECASE)
+
+
+class UnsupportedStructuralMutation(ValueError):
+    pass
+
+
+class GridMutation:
+    def __init__(self, operation):
+        self.axis = 0 if operation["op"] == "xlsx.mutate_rows" else 1
+        self.limit = 1048576 if self.axis == 0 else 16384
+        self.index = bounded_integer(operation["index"], 1, self.limit)
+        self.count = bounded_integer(operation.get("count", 1), 1, min(1000, self.limit - self.index + 1))
+        self.mode = operation["mode"]
+        if self.mode not in {"insert", "delete"}:
+            raise ValueError("Unknown grid mutation mode")
+
+    def interval(self, start, end):
+        if self.mode == "insert":
+            if self.index <= start:
+                start += self.count
+            if self.index <= end:
+                end += self.count
+        else:
+            stop = self.index + self.count - 1
+            if start >= self.index and end <= stop:
+                return None
+            start = start - self.count if start > stop else min(start, self.index)
+            end = end - self.count if end > stop else min(end, self.index - 1)
+        if start > end or end > self.limit:
+            raise UnsupportedStructuralMutation("Grid mutation would move a reference outside the worksheet")
+        return start, end
+
+    def reference(self, value):
+        endpoints = value.split(":")
+        if len(endpoints) > 2 or any(not MUTATION_ADDRESS.fullmatch(point) for point in endpoints):
+            raise UnsupportedStructuralMutation("Workbook contains a reference form that cannot be shifted")
+        coordinates = [list(cell_coordinates(point.replace("$", "").upper())) for point in endpoints]
+        shifted = self.interval(coordinates[0][self.axis], coordinates[-1][self.axis])
+        if shifted is None:
+            return None
+        changed = []
+        for index, point in enumerate(endpoints):
+            coords = coordinates[index]
+            coords[self.axis] = shifted[0] if index == 0 else shifted[1]
+            column_prefix, _, row_prefix, _ = MUTATION_ADDRESS.fullmatch(point).groups()
+            column = ""
+            col = coords[1]
+            while col:
+                col, digit = divmod(col - 1, 26)
+                column = chr(ord("A") + digit) + column
+            changed.append(f"{column_prefix}{column}{row_prefix}{coords[0]}")
+        return ":".join(changed)
+
+
+def rewrite_workbook_formula(expression, current_sheet, target_sheet, mutation):
+    from openpyxl.formula import Tokenizer
+    from openpyxl.formula.tokenizer import TokenizerError
+
+    if not expression:
+        return expression
+    try:
+        tokens = Tokenizer("=" + expression).items
+    except TokenizerError as error:
+        raise UnsupportedStructuralMutation("Workbook contains an unsupported formula") from error
+    rewritten = []
+    for token in tokens:
+        value = token.value
+        if token.type == "FUNC" and token.subtype == "OPEN" and value[:-1].upper().rsplit(".", 1)[-1] in {"INDIRECT", "OFFSET"}:
+            raise UnsupportedStructuralMutation("Dynamic references cannot be shifted safely")
+        if token.type == "OPERAND" and token.subtype == "RANGE":
+            prefix, delimiter, reference = value.rpartition("!")
+            qualifier = prefix.removeprefix("'").removesuffix("'").replace("''", "'") if delimiter else current_sheet
+            if delimiter and ("[" in qualifier or "]" in qualifier or ":" in qualifier):
+                raise UnsupportedStructuralMutation("External and three-dimensional references cannot be shifted safely")
+            if qualifier and qualifier.casefold() == target_sheet.casefold():
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", reference) or MUTATION_ADDRESS.fullmatch(reference):
+                    relocated = mutation.reference(reference)
+                    value = prefix + delimiter + relocated if relocated else "#REF!"
+        rewritten.append(value)
+    return "".join(rewritten)
+
+
+def mutate_workbook_grid(package, operation, replacements):
+    mutation = GridMutation(operation)
+    if any(name.startswith(("xl/pivot", "xl/tables/", "xl/drawings/", "xl/externalLinks/", "xl/comments"))
+           for name in package.namelist()):
+        raise UnsupportedStructuralMutation("Pivot tables, structured tables, drawings, comments and external links are protected")
+    sheets = workbook_sheets(package)
+    target = next((sheet for sheet in sheets if sheet["id"] == str(operation["sheetId"])), None)
+    if target is None:
+        raise ValueError("Unknown worksheet")
+    for sheet in sheets:
+        part = sheet["part"]
+        root = replacements.get(part)
+        if root is None:
+            root = parse_xml(package.read(part))
+        for formula in root.iter(tag(SPREADSHEET, "f")):
+            if formula.get("t") not in (None, "normal"):
+                raise UnsupportedStructuralMutation("Shared, table, and array formulas are protected")
+            formula.text = rewrite_workbook_formula(formula.text, sheet["name"], target["name"], mutation)
+        if sheet == target:
+            shift_worksheet_grid(root, mutation)
+        replacements[part] = root
+
+    workbook_part = MAIN_PART["xlsx"]
+    workbook = replacements.get(workbook_part)
+    if workbook is None:
+        workbook = parse_xml(package.read(workbook_part))
+    for name in workbook.iter(tag(SPREADSHEET, "definedName")):
+        local_id = name.get("localSheetId")
+        sheet_name = sheets[bounded_integer(local_id, 0, len(sheets) - 1)]["name"] if local_id is not None else None
+        if not sheet_name and name.text and "!" not in name.text and re.search(r"[A-Z][0-9]", name.text):
+            raise UnsupportedStructuralMutation("Unqualified workbook-level defined name cannot be shifted safely")
+        name.text = rewrite_workbook_formula(name.text, sheet_name, target["name"], mutation)
+    replacements[workbook_part] = workbook
+
+
+def shift_worksheet_grid(root, mutation):
+    unsupported = ("conditionalFormatting", "dataValidations", "hyperlinks", "pane", "autoFilter", "extLst")
+    if any(root.find(".//" + tag(SPREADSHEET, name)) is not None for name in unsupported):
+        raise UnsupportedStructuralMutation("Worksheet contains protected ranges or view settings")
+    for row in list(root.iter(tag(SPREADSHEET, "row"))):
+        if mutation.axis == 0:
+            index = bounded_integer(row.get("r"), 1, 1048576)
+            updated = mutation.interval(index, index)
+            if updated is None:
+                row.getparent().remove(row)
+                continue
+            row.set("r", str(updated[0]))
+        row.attrib.pop("spans", None)
+        for cell in list(row.findall(tag(SPREADSHEET, "c"))):
+            changed = mutation.reference(cell.attrib["r"])
+            if changed is None:
+                row.remove(cell)
+            else:
+                cell.set("r", changed)
+    if mutation.axis == 1:
+        for column in list(root.iter(tag(SPREADSHEET, "col"))):
+            updated = mutation.interval(bounded_integer(column.get("min"), 1, 16384),
+                                        bounded_integer(column.get("max"), 1, 16384))
+            if updated is None:
+                column.getparent().remove(column)
+            else:
+                column.set("min", str(updated[0]))
+                column.set("max", str(updated[1]))
+    for node in root.iter(tag(SPREADSHEET, "dimension")):
+        node.set("ref", mutation.reference(node.attrib["ref"]) or "A1")
+    merge_lists = list(root.iter(tag(SPREADSHEET, "mergeCells")))
+    for merge_list in merge_lists:
+        for merged in list(merge_list.findall(tag(SPREADSHEET, "mergeCell"))):
+            updated = mutation.reference(merged.attrib["ref"])
+            if updated is None or ":" not in updated or len(set(updated.split(":"))) == 1:
+                merge_list.remove(merged)
+            else:
+                merged.set("ref", updated)
+        if len(merge_list):
+            merge_list.set("count", str(len(merge_list)))
+        else:
+            merge_list.getparent().remove(merge_list)
+    for selection in root.iter(tag(SPREADSHEET, "selection")):
+        for attribute in ("activeCell", "sqref"):
+            if selection.get(attribute):
+                selection.set(attribute, " ".join(
+                    changed for ref in selection.get(attribute).split()
+                    if (changed := mutation.reference(ref))
+                ) or "A1")
 
 
 def read_workbook_range(package, options):
@@ -695,6 +895,45 @@ def evaluate_workbook_range(package, source, options, result):
     return result
 
 
+def update_word_page_layout(body, operation):
+    section = body.find(tag(WORD, "sectPr"))
+    if section is None:
+        raise ValueError("Document has no terminal section")
+    size = section.find(tag(WORD, "pgSz"))
+    if size is None:
+        raise ValueError("Document has no terminal page size entry")
+    width = bounded_integer(operation.get("widthTwips", size.get(tag(WORD, "w"))), 1440, 31680)
+    height = bounded_integer(operation.get("heightTwips", size.get(tag(WORD, "h"))), 1440, 31680)
+    size.set(tag(WORD, "w"), str(width))
+    size.set(tag(WORD, "h"), str(height))
+    size.set(tag(WORD, "orient"), "landscape" if width > height else "portrait")
+
+    if "marginsTwips" in operation:
+        requested = operation["marginsTwips"]
+        margins = section.find(tag(WORD, "pgMar"))
+        if margins is None:
+            margins = XML.Element(tag(WORD, "pgMar"))
+            section.insert(section.index(size) + 1, margins)
+        defaults = {"top": 1440, "right": 1440, "bottom": 1440, "left": 1440,
+                    "header": 720, "footer": 720, "gutter": 0}
+        if set(requested) - set(defaults):
+            raise ValueError("Unknown page margin option")
+        values = {key: bounded_integer(requested.get(key, margins.get(tag(WORD, key), default)), 0, 15840)
+                  for key, default in defaults.items()}
+        if values["left"] + values["right"] + values["gutter"] >= width or values["top"] + values["bottom"] >= height:
+            raise ValueError("Page margins leave no content area")
+        for key, value in values.items():
+            margins.set(tag(WORD, key), str(value))
+
+    if "columns" in operation:
+        columns = section.find(tag(WORD, "cols"))
+        if columns is None or len(columns):
+            raise ValueError("Document has custom or missing column definitions")
+        columns.set(tag(WORD, "num"), str(bounded_integer(operation["columns"], 1, 12)))
+        if "columnGapTwips" in operation:
+            columns.set(tag(WORD, "space"), str(bounded_integer(operation["columnGapTwips"], 0, 14400)))
+
+
 def edit_word(package, operations, output):
     main_part = MAIN_PART["docx"]
     document = parse_xml(package.read(main_part))
@@ -717,16 +956,8 @@ def edit_word(package, operations, output):
                 raise ValueError("Use one bounded line of text")
             contents[0].set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
             contents[0].text = text
-        elif op == "docx.set_page_size":
-            section = body.find(tag(WORD, "sectPr"))
-            size = None if section is None else section.find(tag(WORD, "pgSz"))
-            if size is None:
-                raise ValueError("Document has no terminal page size entry")
-            width = bounded_integer(operation["widthTwips"], 1440, 31680)
-            height = bounded_integer(operation["heightTwips"], 1440, 31680)
-            size.set(tag(WORD, "w"), str(width))
-            size.set(tag(WORD, "h"), str(height))
-            size.set(tag(WORD, "orient"), "landscape" if width > height else "portrait")
+        elif op in {"docx.set_page_size", "docx.set_page_layout"}:
+            update_word_page_layout(body, operation)
         else:
             raise ValueError("Unsupported Word operation")
     write_package(package, {main_part: document}, output, "docx")
@@ -799,7 +1030,8 @@ def update_chart_title_and_legend(root, operation):
 
 
 def chart_value_cache(series):
-    refs = series.findall("./" + tag(CHART, "val") + "/" + tag(CHART, "numRef"))
+    refs = [ref for key in ("val", "yVal")
+            for ref in series.findall("./" + tag(CHART, key) + "/" + tag(CHART, "numRef"))]
     if len(refs) != 1:
         raise ValueError("Expected one numeric worksheet-backed series")
     ref = refs[0]
@@ -1014,6 +1246,42 @@ def edit_smartart_text(package, operation, slide_root, replacements):
     replacements[drawing_part] = drawing
 
 
+def presentation_slides(package, root):
+    relationships = package_relationships(package, MAIN_PART["pptx"])
+    slides = root.find(tag(PRESENTATION, "sldIdLst"))
+    result = []
+    for slide in slides if slides is not None else ():
+        rel_type, part = relationships.get(slide.get(tag(OFFICE_REL, "id")), ("", ""))
+        if not rel_type.endswith("/slide"):
+            raise ValueError("Presentation references a missing slide")
+        result.append({"id": slide.get("id"), "part": part})
+    if len({slide["id"] for slide in result}) != len(result):
+        raise ValueError("Duplicate slide ID")
+    return result
+
+
+def presentation_layer(package, part, next_relation, depth=0):
+    if depth > 2:
+        raise ValueError("Invalid presentation layer relationship")
+    root = parse_xml(package.read(part))
+    common = root.find(tag(PRESENTATION, "cSld"))
+    tree = common.find(tag(PRESENTATION, "spTree"))
+    layers = []
+    if next_relation:
+        relations = [target for kind, target in package_relationships(package, part).values()
+                     if kind.endswith("/" + next_relation)]
+        if len(relations) > 1:
+            raise ValueError("Presentation layer relationship is ambiguous")
+        if relations:
+            layers = presentation_layer(package, relations[0], "slideMaster" if depth == 0 else None, depth + 1)
+    kind = ("slide", "layout", "master")[depth]
+    if root.get("showMasterSp") in ("0", "false"):
+        layers = [layer for layer in layers if layer["kind"] != "master"]
+    return layers + [{"kind": kind, "part": part,
+                      "hasBackground": common.find(tag(PRESENTATION, "bg")) is not None,
+                      "shapes": pptx_shape_order(tree)}]
+
+
 def edit_presentation(package, operations, output):
     replacements = {}
     for operation in operations:
@@ -1043,6 +1311,8 @@ def edit_presentation(package, operations, output):
             if len(run) != 1 or len(shape.findall(".//" + tag(DRAWING, "p"))) != 1:
                 raise ValueError("Shape contains multiple paragraphs or runs")
             text = run[0].find(tag(DRAWING, "t"))
+            if text is None:
+                raise ValueError("Shape has no editable text")
             text.text = operation["text"][:20_000]
         elif operation["op"] == "pptx.move_shape":
             index = bounded_integer(operation["zOrder"], 0, len(pptx_shape_order(tree)) - 1)
@@ -1058,6 +1328,235 @@ def edit_presentation(package, operations, output):
             raise ValueError("Unsupported presentation operation")
         replacements[slide] = root
     write_package(package, replacements, output, "pptx")
+
+
+def create_chart_document(source, fmt, operation, destination):
+    generated_source = io.BytesIO()
+    if fmt == "xlsx":
+        part = create_sheet_chart(source, operation, generated_source)
+    else:
+        part = create_slide_chart(source, operation, generated_source)
+    with zipfile.ZipFile(source) as original, zipfile.ZipFile(generated_source) as generated:
+        old_names = checked_members(original)
+        new_names = checked_members(generated) - old_names
+        additions = {name: generated.read(name) for name in new_names}
+        old_part = parse_xml(original.read(part))
+        new_part = parse_xml(generated.read(part))
+        if fmt == "xlsx":
+            old_drawing = old_part.find(tag(SPREADSHEET, "drawing"))
+            drawing = new_part.find(tag(SPREADSHEET, "drawing"))
+            if old_drawing is not None or drawing is None:
+                raise ValueError("Chart creation requires a worksheet without an existing drawing")
+            trailing = {"legacyDrawing", "legacyDrawingHF", "picture", "oleObjects", "controls",
+                        "webPublishItems", "tableParts", "extLst"}
+            offset = next((index for index, node in enumerate(old_part)
+                           if isinstance(node.tag, str) and XML.QName(node).localname in trailing), len(old_part))
+            old_part.insert(offset, drawing)
+            relation_id = drawing.attrib[tag(OFFICE_REL, "id")]
+        else:
+            old_tree = old_part.find(".//" + tag(PRESENTATION, "spTree"))
+            new_tree = new_part.find(".//" + tag(PRESENTATION, "spTree"))
+            known = {entry["id"] for entry in pptx_shape_order(old_tree)}
+            added = [shape for shape in new_tree.findall(tag(PRESENTATION, "graphicFrame"))
+                     if shape.find("./*/" + tag(PRESENTATION, "cNvPr")).get("id") not in known]
+            if len(added) != 1:
+                raise ValueError("Cannot isolate the new chart from the original slide")
+            extension = old_tree.find(tag(PRESENTATION, "extLst"))
+            old_tree.insert(old_tree.index(extension) if extension is not None else len(old_tree), added[0])
+            chart = added[0].find(".//" + tag(CHART, "chart"))
+            relation_id = chart.attrib[tag(OFFICE_REL, "id")]
+
+        name = PurePosixPath(part)
+        relation_part = str(name.parent / "_rels" / (name.name + ".rels"))
+        new_rels = parse_xml(generated.read(relation_part))
+        relation = next(element for element in new_rels if element.get("Id") == relation_id)
+        related = resolve_relationship(str(name.parent), relation.attrib["Target"])
+        if related not in new_names:
+            raise ValueError("The new chart references an existing package part")
+        if relation_part in old_names:
+            merged_rels = parse_xml(original.read(relation_part))
+        else:
+            merged_rels = XML.Element(tag(RELATIONSHIPS, "Relationships"), nsmap={None: RELATIONSHIPS})
+            additions.pop(relation_part, None)
+        if any(element.get("Id") == relation_id for element in merged_rels):
+            raise ValueError("The new chart relationship would replace an existing relationship")
+        merged_rels.append(relation)
+
+        type_part = "[Content_Types].xml"
+        content_types = parse_xml(original.read(type_part))
+        new_types = parse_xml(generated.read(type_part))
+        extensions = {PurePosixPath(name).suffix.lstrip(".") for name in new_names}
+        original_extensions = {element.get("Extension") for element in content_types}
+        for element in list(new_types):
+            if element.tag == tag(CONTENT_TYPES, "Override") and element.attrib["PartName"].lstrip("/") in new_names:
+                content_types.append(element)
+            if element.tag == tag(CONTENT_TYPES, "Default") and element.get("Extension") in extensions - original_extensions:
+                content_types.append(element)
+        replacements = {part: old_part, type_part: content_types}
+        if relation_part in old_names:
+            replacements[relation_part] = merged_rels
+        else:
+            additions[relation_part] = XML.tostring(merged_rels, encoding="UTF-8", xml_declaration=True)
+        write_package(original, replacements, destination, fmt, additions=additions)
+
+
+def create_sheet_chart(source, operation, destination):
+    from openpyxl import load_workbook
+    from openpyxl.chart import AreaChart, BarChart, DoughnutChart, LineChart, PieChart, ScatterChart, Reference, Series
+
+    kind = operation["kind"]
+    classes = {"bar": BarChart, "column": BarChart, "line": LineChart, "pie": PieChart,
+               "doughnut": DoughnutChart, "area": AreaChart, "scatter": ScatterChart, "combo": BarChart}
+    chart = classes[kind]()
+    book = load_workbook(source)
+    worksheet = book[operation["sheetName"]]
+    if kind in {"bar", "column", "combo"}:
+        chart.type = "bar" if kind == "bar" else "col"
+    chart.title = operation.get("title", "")[:2000]
+    first, last = operation["dataRange"].split(":")
+    min_row, min_col = cell_coordinates(first)
+    max_row, max_col = cell_coordinates(last)
+    category_column = bounded_integer(operation["categoryColumn"], 1, 16384)
+    if not 1 <= max_row - min_row <= 1000 or not 0 <= max_col - min_col < 16:
+        raise ValueError("Chart source exceeds the allowed table range")
+    categories = Reference(worksheet, min_col=category_column, min_row=min_row + 1, max_row=max_row)
+    if kind == "scatter":
+        for column in range(min_col, max_col + 1):
+            values = Reference(worksheet, min_col=column, min_row=min_row, max_row=max_row)
+            chart.series.append(Series(values, categories, title_from_data=True))
+    elif kind == "combo":
+        if max_col != min_col + 1:
+            raise ValueError("A combination chart requires exactly two value columns")
+        chart.add_data(Reference(worksheet, min_col=min_col, min_row=min_row, max_row=max_row), titles_from_data=True)
+        chart.set_categories(categories)
+        line = LineChart()
+        line.add_data(Reference(worksheet, min_col=max_col, min_row=min_row, max_row=max_row), titles_from_data=True)
+        line.set_categories(categories)
+        line.y_axis.axId = 200
+        chart.y_axis.crosses = "max"
+        chart += line
+    else:
+        chart.add_data(Reference(worksheet, min_col=min_col, max_col=max_col, min_row=min_row, max_row=max_row),
+                       titles_from_data=True)
+        chart.set_categories(categories)
+    anchor = operation["anchor"]
+    cell_coordinates(anchor)
+    worksheet.add_chart(chart, anchor)
+    with zipfile.ZipFile(source) as package:
+        part = next(sheet["part"] for sheet in workbook_sheets(package) if sheet["name"] == worksheet.title)
+    book.save(destination)
+    return part
+
+
+def add_secondary_line_axis(chart):
+    plot_area = chart._chartSpace.find(".//" + tag(CHART, "plotArea"))
+    bar = plot_area.find(tag(CHART, "barChart"))
+    category_axis = plot_area.find(tag(CHART, "catAx"))
+    value_axis = plot_area.find(tag(CHART, "valAx"))
+    series = bar.findall(tag(CHART, "ser"))
+    if len(series) != 2 or category_axis is None or value_axis is None:
+        raise ValueError("A combination chart requires two series and a category axis")
+    existing_ids = {node.get("val") for node in plot_area.iter(tag(CHART, "axId"))}
+    secondary_id = next(str(index) for index in range(200, 300) if str(index) not in existing_ids)
+    category_id = category_axis.find(tag(CHART, "axId")).get("val")
+    line = XML.Element(tag(CHART, "lineChart"))
+    XML.SubElement(line, tag(CHART, "grouping"), val="standard")
+    secondary_series = series[1]
+    for name in ("invertIfNegative", "pictureOptions", "shape"):
+        element = secondary_series.find(tag(CHART, name))
+        if element is not None:
+            secondary_series.remove(element)
+    line.append(secondary_series)
+    XML.SubElement(line, tag(CHART, "axId"), val=category_id)
+    XML.SubElement(line, tag(CHART, "axId"), val=secondary_id)
+    plot_area.insert(plot_area.index(bar) + 1, line)
+
+    new_axis = deepcopy(value_axis)
+    new_axis.find(tag(CHART, "axId")).set("val", secondary_id)
+    new_axis.find(tag(CHART, "axPos")).set("val", "r")
+    new_axis.find(tag(CHART, "crossAx")).set("val", category_id)
+    crosses = new_axis.find(tag(CHART, "crosses"))
+    if crosses is not None:
+        crosses.set("val", "max")
+    plot_area.insert(plot_area.index(value_axis) + 1, new_axis)
+
+
+def create_slide_chart(source, operation, destination):
+    from pptx import Presentation
+    from pptx.chart.data import CategoryChartData, XyChartData
+    from pptx.enum.chart import XL_CHART_TYPE
+    from pptx.util import Pt
+
+    kind = operation["kind"]
+    types = {"bar": XL_CHART_TYPE.BAR_CLUSTERED, "column": XL_CHART_TYPE.COLUMN_CLUSTERED,
+             "line": XL_CHART_TYPE.LINE, "pie": XL_CHART_TYPE.PIE, "doughnut": XL_CHART_TYPE.DOUGHNUT,
+             "area": XL_CHART_TYPE.AREA, "scatter": XL_CHART_TYPE.XY_SCATTER,
+             "combo": XL_CHART_TYPE.COLUMN_CLUSTERED}
+    presentation = Presentation(source)
+    index = bounded_integer(operation["pageIndex"], 0, len(presentation.slides) - 1)
+    slide = presentation.slides[index]
+    categories = operation["categories"]
+    requested_series = operation["series"]
+    if not isinstance(categories, list) or not 1 <= len(categories) <= 1000 or \
+            not isinstance(requested_series, list) or not 1 <= len(requested_series) <= 16:
+        raise ValueError("Chart source exceeds the allowed table range")
+    data = XyChartData() if kind == "scatter" else CategoryChartData()
+    if kind != "scatter":
+        data.categories = [str(value)[:2000] for value in categories]
+    for requested in requested_series:
+        values = requested["values"]
+        if not isinstance(values, list) or len(values) != len(categories) or any(
+                type(value) not in (float, int) or not math.isfinite(value) for value in values):
+            raise ValueError("Chart series must match the category count and use finite numbers")
+        title = requested["name"][:255]
+        if kind == "scatter":
+            series = data.add_series(title)
+            for category, value in zip(categories, values):
+                series.add_data_point(float(category), value)
+        else:
+            data.add_series(title, values)
+    position = operation.get("boundsPt", [72, 72, 360, 216])
+    if len(position) != 4 or any(type(value) not in (int, float) or not 0 <= value <= 14400 for value in position) \
+            or min(position[2:]) <= 0:
+        raise ValueError("Invalid chart geometry")
+    chart = slide.shapes.add_chart(types[kind], *(Pt(value) for value in position), data).chart
+    if kind == "combo":
+        add_secondary_line_axis(chart)
+    if operation.get("title"):
+        chart.has_title = True
+        chart.chart_title.text_frame.text = operation["title"][:2000]
+    presentation.save(destination)
+    return str(slide.part.partname).lstrip("/")
+
+
+def edit_office_document(package, fmt, operations, output):
+    editors = {"xlsx": edit_workbook, "docx": edit_word, "pptx": edit_presentation}
+    editor = editors[fmt]
+    if not any(operation["op"] == "chart.create" for operation in operations):
+        editor(package, operations, output)
+        return
+    document = io.BytesIO()
+    write_package(package, {}, document, fmt)
+    pending = []
+    for operation in operations:
+        if operation["op"] != "chart.create":
+            pending.append(operation)
+            continue
+        if pending:
+            edited = io.BytesIO()
+            with zipfile.ZipFile(document) as current:
+                editor(current, pending, edited)
+            document = edited
+            pending.clear()
+        chart_output = io.BytesIO()
+        document.seek(0)
+        create_chart_document(document, fmt, operation, chart_output)
+        document = chart_output
+    if pending:
+        with zipfile.ZipFile(document) as current:
+            editor(current, pending, output)
+    else:
+        output.write_bytes(document.getvalue())
 
 
 def create_office(request, output):
@@ -1082,6 +1581,126 @@ def create_office(request, output):
     document.save(output)
     with zipfile.ZipFile(output) as package:
         validate_package(package, fmt)
+
+
+def _keep_shape_in_tree(tree, target_id):
+    matched = False
+    for shape in list(tree):
+        properties = shape.find("./*/" + tag(PRESENTATION, "cNvPr"))
+        if properties is None:
+            continue
+        matches = properties.get("id") == target_id
+        if not matches and shape.tag == tag(PRESENTATION, "grpSp"):
+            matches = _keep_shape_in_tree(shape, target_id)
+        if matches:
+            if matched:
+                raise ValueError("Duplicate presentation shape ID")
+            matched = True
+        else:
+            tree.remove(shape)
+    return matched
+
+
+def solid_slide_background(slide_root, rgb):
+    slide_root.set("showMasterSp", "0")
+    common = slide_root.find(tag(PRESENTATION, "cSld"))
+    old_background = common.find(tag(PRESENTATION, "bg"))
+    if old_background is not None:
+        common.remove(old_background)
+    background = XML.Element(tag(PRESENTATION, "bg"))
+    props = XML.SubElement(background, tag(PRESENTATION, "bgPr"))
+    fill = XML.SubElement(props, tag(DRAWING, "solidFill"))
+    XML.SubElement(fill, tag(DRAWING, "srgbClr"), val=rgb)
+    XML.SubElement(props, tag(DRAWING, "effectLst"))
+    common.insert(0, background)
+
+
+def export_presentation_image(package, replacements, name, dimensions):
+    root = Path.cwd()
+    slide = root / (name + ".pptx")
+    write_package(package, replacements, slide, "pptx")
+    page_width, page_height = dimensions
+    scale = 1280 / max(page_width, page_height)
+    options = json.dumps({
+        "PageNumber": {"type": "long", "value": "1"},
+        "Translucent": {"type": "boolean", "value": "false"},
+        "PixelWidth": {"type": "long", "value": str(max(1, round(page_width * scale)))},
+        "PixelHeight": {"type": "long", "value": str(max(1, round(page_height * scale)))},
+    }, separators=(",", ":"))
+    subprocess.run(["libreoffice", "-env:UserInstallation=" + (root / "office-profile").as_uri(),
+                    "--headless", "--convert-to", "png:impress_png_Export:" + options,
+                    "--outdir", str(root), str(slide)], check=True)
+    return slide.with_suffix(".png")
+
+
+def alpha_from_black_white(black_path, white_path, output, dimensions):
+    from PIL import Image, ImageChops, ImageMath, PngImagePlugin
+
+    with Image.open(black_path) as black, Image.open(white_path) as white:
+        if black.size != white.size:
+            raise ValueError("Sprite geometry differs between matte renders")
+        image_size(black.size)
+        black_channels = black.convert("RGB").split()
+        white_channels = white.convert("RGB").split()
+    deltas = [ImageChops.subtract(light, dark) for light, dark in zip(white_channels, black_channels)]
+    delta = ImageChops.lighter(deltas[0], ImageChops.lighter(deltas[1], deltas[2]))
+    alpha = ImageChops.invert(delta)
+    if alpha.getextrema() == (255, 255) or alpha.getbbox() is None:
+        raise ValueError("LibreOffice did not produce an isolatable sprite")
+
+    def straight(channel):
+        return ImageMath.lambda_eval(
+            lambda operands: (operands["pixel"] * 255 / (operands["alpha"] + (operands["alpha"] == 0))),
+            pixel=channel, alpha=alpha,
+        ).convert("L")
+
+    width, height = alpha.size
+    page_width, page_height = (coordinate / 12700 for coordinate in dimensions)
+    left, top, right, bottom = alpha.getbbox()
+    metadata = PngImagePlugin.PngInfo()
+    metadata.add_text("inkBoundsPt", json.dumps({
+        "x": left * page_width / width,
+        "y": top * page_height / height,
+        "width": (right - left) * page_width / width,
+        "height": (bottom - top) * page_height / height,
+    }))
+    Image.merge("RGBA", (*[straight(channel) for channel in black_channels], alpha)).save(
+        output, format="PNG", pnginfo=metadata
+    )
+
+
+def render_presentation_layer(package, request, output):
+    presentation_part = MAIN_PART["pptx"]
+    presentation = parse_xml(package.read(presentation_part))
+    slides = presentation_slides(package, presentation)
+    index = bounded_integer(request.get("pageIndex", 0), 0, len(slides) - 1)
+    slide_part = slides[index]["part"]
+    size = presentation.find(tag(PRESENTATION, "sldSz"))
+    if size is None:
+        raise ValueError("Missing presentation dimensions")
+    dimensions = (bounded_integer(size.get("cx"), 1, 182880000), bounded_integer(size.get("cy"), 1, 182880000))
+    slide_ids = presentation.find(tag(PRESENTATION, "sldIdLst"))
+    for offset, slide_id in enumerate(list(slide_ids)):
+        if offset != index:
+            slide_ids.remove(slide_id)
+
+    slide = parse_xml(package.read(slide_part))
+    tree = slide.find(".//" + tag(PRESENTATION, "spTree"))
+    replacements = {presentation_part: presentation, slide_part: slide}
+    variant = request.get("variant")
+    if variant != "sprite":
+        if variant == "background":
+            _keep_shape_in_tree(tree, None)
+        export_presentation_image(package, replacements, "slide", dimensions).replace(output)
+        return
+    target_id = str(request["shapeId"])
+    if not _keep_shape_in_tree(tree, target_id):
+        raise ValueError("Presentation shape was not found")
+    solid_slide_background(slide, "000000")
+    black = export_presentation_image(package, replacements, "sprite-black", dimensions)
+    solid_slide_background(slide, "FFFFFF")
+    white = export_presentation_image(package, replacements, "sprite-white", dimensions)
+    alpha_from_black_white(black, white, output, dimensions)
 
 
 def render_office(source, output, request):
@@ -1121,11 +1740,13 @@ def process_document(request, source, output):
     with zipfile.ZipFile(source) as package:
         names = validate_package(package, fmt)
         if action == "render" or (action == "export" and request["targetFormat"] == "pdf"):
-            render_office(source, output, request)
+            if fmt == "pptx" and action == "render":
+                render_presentation_layer(package, request, output)
+            else:
+                render_office(source, output, request)
             return None
         if action == "edit":
-            editors = {"xlsx": edit_workbook, "docx": edit_word, "pptx": edit_presentation}
-            editors[fmt](package, request["operations"], output)
+            edit_office_document(package, fmt, request["operations"], output)
             return None
         if action == "verify":
             return {"ok": True, "issues": [], "metrics": {"packageParts": len(names)}}
@@ -1151,12 +1772,18 @@ def process_document(request, source, output):
                 if start <= index < start + count and isinstance(node.tag, str)
             ]}
         if fmt == "pptx" and action in {"structure", "range"}:
-            slides = sorted(name for name in names if re.fullmatch(r"ppt/slides/[^/]+\.xml", name))
+            slides = presentation_slides(package, main)
+            slide_parts = [slide["part"] for slide in slides]
             diagrams = sorted(name for name in names if re.fullmatch(r"ppt/diagrams/data[^/]+\.xml", name))
             if action == "structure":
-                return {**result, "slideParts": slides, "smartArtParts": diagrams}
+                size = main.find(tag(PRESENTATION, "sldSz"))
+                dimensions = None if size is None else {
+                    "widthPt": int(size.get("cx")) / 12700, "heightPt": int(size.get("cy")) / 12700,
+                }
+                return {**result, "slides": slides, "slideParts": slide_parts, "slideSize": dimensions,
+                        "smartArtParts": diagrams}
             part = request["range"]["part"]
-            if part not in slides and part not in diagrams:
+            if part not in slide_parts and part not in diagrams:
                 raise ValueError("Unknown slide or SmartArt part")
             root = parse_xml(package.read(part))
             if part in diagrams:
@@ -1166,7 +1793,8 @@ def process_document(request, source, output):
                         "nodes": [{"id": node.get("modelId"), "type": node.get("type"), "text": text_content(node, DRAWING)}
                                   for node in root.iter(tag(DIAGRAM, "pt"))][:1000],
                         "connections": [dict(node.attrib) for node in root.iter(tag(DIAGRAM, "cxn"))][:1000]}
-            return {**result, "part": part, "shapes": pptx_shape_order(root.find(".//" + tag(PRESENTATION, "spTree")))}
+            layers = presentation_layer(package, part, "slideLayout")
+            return {**result, "part": part, "shapes": layers[-1]["shapes"], "layers": layers}
     raise ValueError("Unsupported document worker action")
 
 
@@ -1182,6 +1810,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except UnsupportedStructuralMutation as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(3)
     except (ValueError, KeyError, TypeError, OSError, zipfile.BadZipFile, XML.LxmlError, subprocess.CalledProcessError) as error:
         print(str(error), file=sys.stderr)
         sys.exit(2)

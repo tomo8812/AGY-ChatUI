@@ -3968,9 +3968,10 @@ export class ArtifactService {
   async getStructure(userId: string, artifactId: string): Promise<Record<string, unknown>> {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
-    const buf = this.readActiveArtifactBytes(artifact, DOCUMENT_WORKER_MAX_INPUT_BYTES);
-    if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
     const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
+    const maxBytes = isDocumentFormat(adapter.format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
+    const buf = this.readActiveArtifactBytes(artifact, maxBytes);
+    if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
     const format = adapter.format;
     const structure = this.documentWorker.available && isDocumentFormat(format)
       ? JSON.parse((await this.documentWorker.run(format, artifact.filename, buf, { action: 'structure' })).toString('utf8'))
@@ -3986,29 +3987,31 @@ export class ArtifactService {
   async readRange(userId: string, artifactId: string, range: Record<string, unknown>): Promise<Record<string, unknown>> {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
-    const buf = this.readActiveArtifactBytes(artifact, DOCUMENT_WORKER_MAX_INPUT_BYTES);
-    if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
     const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
+    const maxBytes = isDocumentFormat(adapter.format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
+    const buf = this.readActiveArtifactBytes(artifact, maxBytes);
+    if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
     const data = isDocumentFormat(adapter.format) && ['xlsx', 'docx', 'pptx', 'pdf'].includes(adapter.format)
       ? JSON.parse((await this.documentWorker.run(adapter.format, artifact.filename, buf, { action: 'range', range })).toString('utf8'))
       : adapter.readRange(buf, range, artifact);
     return { artifactId: artifact.id, revision: artifact.revision, ...data };
   }
 
-  async renderPng(userId: string, artifactId: string, options: { pageIndex?: number; timeSeconds?: number } = {}): Promise<Buffer> {
+  async renderPng(userId: string, artifactId: string, options: { pageIndex?: number; timeSeconds?: number; variant?: 'background' | 'sprite'; shapeId?: number } = {}): Promise<Buffer> {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', 'Artifact not found.', 404);
     const format = this.registry.resolve(artifact.filename, artifact.previewKind).format;
+    if (options.variant && (format !== 'pptx' || (options.variant === 'sprite' && options.shapeId === undefined))) {
+      throw new ArtifactError('INVALID_RENDER_VARIANT', 'Choose a PPTX slide and shape for the requested rendition.', 422);
+    }
+    if (!isDocumentFormat(format) && !isWebRenderFormat(format) && format !== 'svg') {
+      throw unsupportedOperationError('render_png', 'unsupported_by_format', 'PNG rendering is unavailable for this format.');
+    }
     const source = this.readActiveArtifactBytes(artifact, DOCUMENT_WORKER_MAX_INPUT_BYTES);
     if (!source) throw new ArtifactError('FILE_MISSING', 'Artifact bytes not found.', 404);
     const png = artifact.mimeType === 'image/png' && !this.documentWorker.available
       ? source
-      : isDocumentFormat(format) || isWebRenderFormat(format) || format === 'svg'
-        ? await this.documentWorker.run(format, artifact.filename, source, { action: 'render', ...options })
-        : null;
-    if (!png) {
-      throw unsupportedOperationError('render_png', 'unsupported_by_format', 'PNG rendering is unavailable for this format.');
-    }
+      : await this.documentWorker.run(format, artifact.filename, source, { action: 'render', ...options });
     if (png.length < 24 || png.length > 16 * 1024 * 1024 ||
       !png.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex')) ||
       png.toString('ascii', 12, 16) !== 'IHDR' ||
@@ -4022,9 +4025,10 @@ export class ArtifactService {
   async verifyArtifact(userId: string, artifactId: string): Promise<AdapterVerifyResult> {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
-    const buf = this.readActiveArtifactBytes(artifact, DOCUMENT_WORKER_MAX_INPUT_BYTES);
-    if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
     const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
+    const maxBytes = isDocumentFormat(adapter.format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
+    const buf = this.readActiveArtifactBytes(artifact, maxBytes);
+    if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
     const format = adapter.format;
     if (this.documentWorker.available && isDocumentFormat(format)) {
       try {
@@ -4057,9 +4061,10 @@ export class ArtifactService {
     if (params.actorKind === 'ai' && src.scopeKind === 'project') {
       throw new ArtifactError('FORBIDDEN', 'AI/内蔵MCPからプロジェクト原本スコープへのエクスポートは禁止されています。', 403);
     }
-    const buf = this.readActiveArtifactBytes(src, DOCUMENT_WORKER_MAX_INPUT_BYTES);
-    if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
     const adapter = this.registry.resolve(src.filename, src.previewKind);
+    const maxBytes = isDocumentFormat(adapter.format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
+    const buf = this.readActiveArtifactBytes(src, maxBytes);
+    if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
     let exported: AdapterExportResult;
     if (adapter.exportAs) {
       exported = adapter.exportAs(buf, params.targetFormat, src);

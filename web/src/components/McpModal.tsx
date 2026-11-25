@@ -85,6 +85,10 @@ function BuiltinArtifactSettings({ scope, id }: { scope: McpScope; id?: string }
     let active = true;
     api.getBuiltinMcpSettings(scope, id).then((result) => {
       if (active) {
+        if (!result?.effective || !Array.isArray(result.tools)) {
+          setError('内蔵ツールの設定を読み込めませんでした。');
+          return;
+        }
         setSettings(result);
         setEnabled(result.enabled);
         setDisabledTools(result.disabledTools);

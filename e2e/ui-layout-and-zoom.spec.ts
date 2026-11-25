@@ -669,6 +669,9 @@ test.describe('Mechanical UI Layout & Content-Only Zoom Audit', () => {
         // Chat MCP modal
         await page.locator('button[aria-label="このチャットのMCP（管理者）"]').click();
         await page.locator('.modal-card').waitFor({ state: 'visible' });
+        await page.locator('summary').filter({ hasText: '内蔵の成果物ツール' }).click();
+        await page.getByLabel('操作ごとの許可を設定').check();
+        await expect(page.getByLabel('リッチ回答を成果物として保存')).toBeVisible();
         await assertNoLayoutViolations(page, {
           screen: 'mcp-modal',
           viewport: vpLabel,
