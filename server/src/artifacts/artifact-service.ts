@@ -4340,9 +4340,9 @@ export class ArtifactService {
       if (inQuotes) {
         if (ch === '"') pendingQuote = true;
         else append(ch);
-      } else if (ch === '"') inQuotes = true;
+      } else if (ch === '"') { inQuotes = true; fieldHasValue = true; }
       else if (ch === delimiter) commitField();
-      else if (ch === '\n') return commitRow();
+      else if (ch === '\n' || ch === '\r') return commitRow();
       else append(ch);
       return true;
     }

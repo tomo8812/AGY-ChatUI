@@ -73,6 +73,16 @@ for(const vp of targets){
       const dir=fs.mkdtempSync(path.join(srv.dataRoot,'browser-workspace-'));
       srv.ctx.db.createChat({id:chatId,userId,projectId:null,title:'PR3A Real Files',workspaceDir:dir,modelId:'',effortValue:'',projectContextVersion:0});
       const svc=srv.ctx.artifactService;
+      if(vp.width===1280){
+        // Range streaming and the edit/verification adapter must agree on CR,
+        // CRLF, quoted CR, and a quoted empty final row (without final newline).
+        const csv=Buffer.from('\uFEFFa,b\r"c\rd",e\r\nf,g\n""');
+        const regression=(await svc.createArtifact({userId,scopeKind:'chat',chatId,relPath:'line-endings.csv',content:csv,actorKind:'user',actorId:userId})).artifact;
+        expect(await svc.readRange(userId,regression.id,{gridDimensions:true})).toMatchObject({totalRows:4,totalCols:2});
+        expect(await svc.readRange(userId,regression.id,{startRow:0,endRow:3,startCol:0,endCol:1})).toMatchObject({rows:[['a','b'],['c\rd','e'],['f','g'],['']]});
+        const {parseCsvRows}=await import('../server/src/artifacts/adapters/csv-adapter.js');
+        expect(parseCsvRows(csv.toString('utf8'),',')).toEqual([['a','b'],['c\rd','e'],['f','g'],['']]);
+      }
       await page.setViewportSize({width:vp.width,height:vp.height});
       await page.route(url=>url.origin==='http://127.0.0.1:4174'&&url.pathname.startsWith('/api/'),async route=>{
         const request=route.request(),url=new URL(request.url());

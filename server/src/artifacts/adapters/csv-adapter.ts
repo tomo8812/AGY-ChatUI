@@ -247,6 +247,7 @@ export function parseCsvRows(text: string, delimiter: string): string[][] {
   const rows: string[][] = [];
   let row: string[] = [];
   let field = '';
+  let fieldStarted = false;
   let inQuotes = false;
   const s = text.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
 
@@ -265,19 +266,22 @@ export function parseCsvRows(text: string, delimiter: string): string[][] {
       }
     } else if (ch === '"') {
       inQuotes = true;
+      fieldStarted = true;
     } else if (ch === delimiter) {
       row.push(field);
       field = '';
-    } else if (ch === '\n') {
+      fieldStarted = false;
+    } else if (ch === '\n' || ch === '\r') {
       row.push(field);
       rows.push(row);
       row = [];
       field = '';
+      fieldStarted = false;
     } else {
       field += ch;
     }
   }
-  if (field.length > 0 || row.length > 0) {
+  if (fieldStarted || field.length > 0 || row.length > 0) {
     row.push(field);
     rows.push(row);
   }
