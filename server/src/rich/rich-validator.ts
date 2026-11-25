@@ -407,6 +407,7 @@ export function topologicalSortComputed(
 export interface ValidateRichDocumentOptions {
   authorizedArtifactIds?: Set<string>;
   locale?: string;
+  theme?: 'light' | 'dark';
 }
 
 export function validateRichDocument(
@@ -448,7 +449,7 @@ export function validateRichDocument(
   }
 
   const serialized = JSON.stringify(rawDoc);
-  jsonBytes = Buffer.byteLength(serialized, 'utf8');
+  jsonBytes = new TextEncoder().encode(serialized).byteLength;
   if (jsonBytes > RICH_LIMITS.maxJsonBytes) {
     return fail(
       'RICH_DOC_TOO_LARGE',
@@ -468,7 +469,7 @@ export function validateRichDocument(
 
   const declaredStateKeys = new Set<string>(Object.keys(doc.state ?? {}));
   const initialState: Record<string, unknown> = { ...(doc.state ?? {}) };
-  const stateBytes = Buffer.byteLength(JSON.stringify(initialState), 'utf8');
+  const stateBytes = new TextEncoder().encode(JSON.stringify(initialState)).byteLength;
   if (stateBytes > RICH_LIMITS.maxStateBytes) {
     return fail(
       'RICH_STATE_TOO_LARGE',
@@ -1090,7 +1091,7 @@ export function validateRichDocument(
   const rootCtx: RichEvalContext = {
     state: initialState,
     computed: computedValues,
-    theme: 'light',
+    theme: opts.theme ?? 'light',
     locale: opts.locale,
   };
 
