@@ -4552,6 +4552,7 @@ export class ArtifactService {
   async renderPptxDraftSprite(userId: string, artifactId: string, draft: {
     expectedRevision: number; pageIndex: number; shapeId: number; text?: string;
     boundsPt?: [number, number, number, number];
+    style?: {bold?:boolean;italic?:boolean;fontSizePt?:number;fontColor?:string;fill?:string};
   }, assertAuthorized?: () => void | Promise<void>): Promise<{png: Buffer; revision: number; sha256: string}> {
     await assertAuthorized?.();
     const snapshot = this.readCurrentRevision(userId, artifactId, DOCUMENT_WORKER_MAX_INPUT_BYTES);
@@ -4570,7 +4571,7 @@ export class ArtifactService {
     if (!Number.isInteger(draft.pageIndex) || draft.pageIndex < 0 ||
         !Number.isSafeInteger(draft.shapeId) || draft.shapeId < 1 || !validBounds ||
         (draft.text !== undefined && (typeof draft.text !== 'string' || draft.text.length > 20000)) ||
-        (draft.text === undefined && draft.boundsPt === undefined)) {
+        (draft.text === undefined && draft.boundsPt === undefined && draft.style === undefined)) {
       throw new ArtifactError('INVALID_INPUT', 'Invalid draft sprite request.', 400);
     }
     const structure = JSON.parse((await this.documentWorker.run('pptx', artifact.filename, bytes, {action:'structure'})).toString('utf8')) as {slides?:Array<{part:string}>};
@@ -4579,12 +4580,74 @@ export class ArtifactService {
     const operations: AdapterOperation[] = [];
     if (draft.text !== undefined) operations.push({op:'pptx.set_shape_text', slidePart, shapeId:draft.shapeId, text:draft.text});
     if (draft.boundsPt !== undefined) operations.push({op:'pptx.set_shape_bounds', slidePart, shapeId:draft.shapeId, boundsPt:draft.boundsPt});
+    if(draft.style!==undefined){
+      const {bold,italic,fontSizePt,fontColor,fill}=draft.style;
+      if(Object.keys(draft.style).some(k=>!['bold','italic','fontSizePt','fontColor','fill'].includes(k))||
+        (bold!==undefined&&typeof bold!=='boolean')||(italic!==undefined&&typeof italic!=='boolean')||
+        (fontSizePt!==undefined&&(!Number.isFinite(fontSizePt)||fontSizePt<6||fontSizePt>200))||
+        [fontColor,fill].some(v=>v!==undefined&&!/^#[0-9a-fA-F]{6}$/.test(v))){
+        throw new ArtifactError('INVALID_INPUT','Invalid draft style.',400);
+      }
+      operations.push({op:'pptx.set_shape_style',slidePart,shapeId:draft.shapeId,...draft.style});
+    }
     await assertAuthorized?.();
     const edited = await this.documentWorker.run('pptx', artifact.filename, bytes, {action:'edit',operations});
     await assertAuthorized?.();
     const png = await this.documentWorker.run('pptx', artifact.filename, edited, {action:'render',pageIndex:draft.pageIndex,variant:'sprite',shapeId:draft.shapeId});
     await assertAuthorized?.();
     this.assertRenderPng(png);
+    return {png,revision:revision.revision,sha256:revision.sha256};
+  }
+
+  /** One structural edit on an isolated copy. Render the actual resulting
+   * slide, never invent a stand-in element or publish draft bytes. */
+  async renderPptxDraftSlide(userId:string,artifactId:string,draft:{
+    expectedRevision:number;pageIndex:number;operation:AdapterOperation;
+  },assertAuthorized?:()=>void|Promise<void>):Promise<{png:Buffer;revision:number;sha256:string}>{
+    await assertAuthorized?.();
+    const {artifact,revision,bytes}=this.readCurrentRevision(userId,artifactId,DOCUMENT_WORKER_MAX_INPUT_BYTES);
+    if(this.registry.resolve(artifact.filename,artifact.previewKind).format!=='pptx'||
+      documentFormatConstraint('pptx',artifact.filename,'edit',artifact.previewKind)){
+      throw unsupportedOperationError('render_png','unsupported_by_format','Editable PPTX required.');
+    }
+    if(revision.revision!==draft.expectedRevision)throw new ArtifactError('ARTIFACT_CONFLICT','ファイルが更新されました。',409);
+    if(!Number.isSafeInteger(draft.pageIndex)||draft.pageIndex<0||draft.pageIndex>500)throw new ArtifactError('INVALID_INPUT','Invalid slide index.',400);
+    const structure=JSON.parse((await this.documentWorker.run('pptx',artifact.filename,bytes,{action:'structure'})).toString('utf8')) as {slides?:Array<{part:string}>;layouts?:Array<{part:string}>};
+    const slides=structure.slides??[],slidePart=slides[draft.pageIndex]?.part;
+    if(!slidePart)throw new ArtifactError('INVALID_INPUT','Selected slide is unavailable.',400);
+    const input=draft.operation;
+    let operation:AdapterOperation,outputIndex=draft.pageIndex;
+    switch(input.op){
+      case 'pptx.add_shape':case 'pptx.add_image':case 'pptx.add_table':{
+        // Route schema bounds the payload. Rebind target identity server-side.
+        if(input.slidePart!==slidePart)throw new ArtifactError('INVALID_INPUT','Slide identity mismatch.',400);
+        operation=input;break;
+      }
+      case 'pptx.remove_shape':{
+        if(input.slidePart!==slidePart||!Number.isSafeInteger(input.shapeId)||Number(input.shapeId)<1)throw new ArtifactError('INVALID_INPUT','Invalid shape selection.',400);
+        operation={op:input.op,slidePart,shapeId:input.shapeId};break;
+      }
+      case 'pptx.add_slide':{
+        if(input.index!==draft.pageIndex+1||!structure.layouts?.some(layout=>layout.part===input.layoutPart))throw new ArtifactError('INVALID_INPUT','Invalid slide layout or insertion index.',400);
+        outputIndex=draft.pageIndex+1;
+        operation={op:input.op,index:outputIndex,layoutPart:input.layoutPart};break;
+      }
+      case 'pptx.remove_slide':{
+        if(input.index!==draft.pageIndex||slides.length<2)throw new ArtifactError('INVALID_INPUT','Cannot remove this slide.',400);
+        outputIndex=Math.min(draft.pageIndex,slides.length-2);operation={op:input.op,index:draft.pageIndex};break;
+      }
+      case 'pptx.reorder_slide':{
+        const to=Number(input.toIndex);
+        if(input.index!==draft.pageIndex||!Number.isInteger(to)||to<0||to>=slides.length)throw new ArtifactError('INVALID_INPUT','Invalid destination slide.',400);
+        outputIndex=to;operation={op:input.op,index:draft.pageIndex,toIndex:to};break;
+      }
+      default:throw new ArtifactError('INVALID_INPUT','Unsupported preview operation.',400);
+    }
+    await assertAuthorized?.();
+    const edited=await this.documentWorker.run('pptx',artifact.filename,bytes,{action:'edit',operations:[operation]});
+    await assertAuthorized?.();
+    const png=await this.documentWorker.run('pptx',artifact.filename,edited,{action:'render',pageIndex:outputIndex});
+    await assertAuthorized?.();this.assertRenderPng(png);
     return {png,revision:revision.revision,sha256:revision.sha256};
   }
 

@@ -607,7 +607,8 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
       shapeId:z.number().int().positive().max(2147483647),
       text:z.string().max(20000).optional(),
       boundsPt:z.tuple([z.number().finite().min(-14400).max(14400),z.number().finite().min(-14400).max(14400),z.number().finite().min(1).max(14400),z.number().finite().min(1).max(14400)]).optional(),
-    }).strict().refine(body=>body.text!==undefined||body.boundsPt!==undefined).safeParse(req.body);
+      style:z.object({bold:z.boolean().optional(),italic:z.boolean().optional(),fontSizePt:z.number().finite().min(6).max(200).optional(),fontColor:z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),fill:z.string().regex(/^#[0-9a-fA-F]{6}$/).optional()}).strict().optional(),
+    }).strict().refine(body=>body.text!==undefined||body.boundsPt!==undefined||body.style!==undefined).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({error:'INVALID_INPUT'});
     const {artifactId}=req.params as {artifactId:string};
     try {
@@ -619,6 +620,29 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     } catch (error) { return sendArtifactError(reply,error); }
   });
 
+  const draftBoundsSchema=z.tuple([z.number().finite().min(-14400).max(14400),z.number().finite().min(-14400).max(14400),z.number().finite().min(1).max(14400),z.number().finite().min(1).max(14400)]);
+  const draftSlidePartSchema=z.string().regex(/^ppt\/slides\/[^/]+\.xml$/).max(200);
+  const draftSlideOperation=z.discriminatedUnion('op',[
+    z.object({op:z.literal('pptx.add_shape'),slidePart:draftSlidePartSchema,kind:z.enum(['rectangle','ellipse','textbox']),boundsPt:draftBoundsSchema,text:z.string().max(20000)}).strict(),
+    z.object({op:z.literal('pptx.add_image'),slidePart:draftSlidePartSchema,boundsPt:draftBoundsSchema,imageBase64:z.string().min(1).max(2800000)}).strict(),
+    z.object({op:z.literal('pptx.add_table'),slidePart:draftSlidePartSchema,boundsPt:draftBoundsSchema,rows:z.array(z.array(z.string().max(2000)).min(1).max(10)).min(1).max(20)}).strict(),
+    z.object({op:z.literal('pptx.remove_shape'),slidePart:draftSlidePartSchema,shapeId:z.number().int().positive().max(2147483647)}).strict(),
+    z.object({op:z.literal('pptx.add_slide'),index:z.number().int().min(0).max(501),layoutPart:z.string().regex(/^ppt\/slideLayouts\/slideLayout[0-9]+\.xml$/)}).strict(),
+    z.object({op:z.literal('pptx.remove_slide'),index:z.number().int().min(0).max(500)}).strict(),
+    z.object({op:z.literal('pptx.reorder_slide'),index:z.number().int().min(0).max(500),toIndex:z.number().int().min(0).max(500)}).strict(),
+  ]);
+  app.post('/api/files/:artifactId/render-draft-slide',async(req,reply)=>{
+    const session=requireAuth(req,reply,db);if(!session)return;
+    const parsed=z.object({expectedRevision:z.number().int().positive(),pageIndex:z.number().int().min(0).max(500),operation:draftSlideOperation}).strict().safeParse(req.body);
+    if(!parsed.success)return reply.code(400).send({error:'INVALID_INPUT'});
+    const {artifactId}=req.params as {artifactId:string};
+    try{
+      const assertAuthorized=buildLiveSessionAuthVerifier(req,db,session.user.id);
+      const result=await artifactService.renderPptxDraftSlide(session.user.id,artifactId,parsed.data,assertAuthorized);
+      await assertAuthorized();
+      return reply.type('image/png').header('Cache-Control','private, no-store').header('X-Artifact-Revision',result.revision).header('X-Artifact-Sha256',result.sha256).send(result.png);
+    }catch(error){return sendArtifactError(reply,error)}
+  });
   const editBodySchema = z.object({
     expectedRevision: z.number().int().min(1),
     operations: z.array(z.object({ op: z.string().min(1) }).passthrough()).min(1),

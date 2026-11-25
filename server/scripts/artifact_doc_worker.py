@@ -6968,8 +6968,14 @@ def process_document(request, source, output):
                 dimensions = None if size is None else {
                     "widthPt": int(size.get("cx")) / 12700, "heightPt": int(size.get("cy")) / 12700,
                 }
+                layouts = []
+                for part in sorted(name for name in names if re.fullmatch(r"ppt/slideLayouts/slideLayout[0-9]+\.xml", name))[:500]:
+                    layout = parse_xml(package.read(part))
+                    common = layout.find(tag(PRESENTATION, "cSld"))
+                    layouts.append({"part": part, "name": common.get("name", "") if common is not None else "",
+                                    "type": layout.get("type", "")})
                 return {**result, "slides": slides, "slideParts": slide_parts, "slideSize": dimensions,
-                        "smartArtParts": diagrams}
+                        "layouts": layouts, "smartArtParts": diagrams}
             part = request["range"]["part"]
             if part not in slide_parts and part not in diagrams:
                 raise ValueError("Unknown slide or SmartArt part")
