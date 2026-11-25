@@ -29,7 +29,7 @@ export function SourceEditor({value,readOnly,language,onChange,editorRef}:Props)
       EditorState.lineSeparator.of(separator.current),lineNumbers(),highlightActiveLineGutter(),highlightActiveLine(),history(),search({top:true}),
       keymap.of([...searchKeymap,...defaultKeymap,...historyKeymap,indentWithTab]),syntaxHighlighting(defaultHighlightStyle,{fallback:true}),lang,
       EditorView.lineWrapping,EditorView.contentAttributes.of({'aria-label':'ソース','aria-multiline':'true',spellcheck:'false'}),
-      ro.current.of([EditorState.readOnly.of(readOnly),EditorView.editable.of(!readOnly)]),
+      ro.current.of([EditorState.readOnly.of(readOnly),EditorView.editable.of(true)]),
       EditorView.updateListener.of(update=>{
         if(update.docChanged&&!update.transactions.some(tr=>tr.annotation(externalUpdate)))callback.current(update.state.sliceDoc());
       }),
@@ -44,7 +44,7 @@ export function SourceEditor({value,readOnly,language,onChange,editorRef}:Props)
         if(instance.state.readOnly)return;
         const {from,to}=instance.state.selection.main;
         const insert=before+instance.state.sliceDoc(from,to)+after;
-        instance.dispatch({changes:{from,to,insert},selection:{anchor:from+before.length,head:from+insert.length-after.length}});
+        instance.dispatch({changes:{from,to,insert},selection:{anchor:from+before.length,head:to+before.length}});
         instance.focus();
       }
     };
@@ -53,7 +53,7 @@ export function SourceEditor({value,readOnly,language,onChange,editorRef}:Props)
   useLayoutEffect(()=>{
     const instance=view.current;
     if(!instance)return;
-    if(instance.state.readOnly!==readOnly)instance.dispatch({effects:ro.current.reconfigure([EditorState.readOnly.of(readOnly),EditorView.editable.of(!readOnly)])});
+    if(instance.state.readOnly!==readOnly)instance.dispatch({effects:ro.current.reconfigure([EditorState.readOnly.of(readOnly),EditorView.editable.of(true)])});
     if(instance.state.sliceDoc()!==value){
       // Update only the changed interval so that the mapped caret/selection and
       // scroll remain stable across save acknowledgements or live refresh.
@@ -62,7 +62,7 @@ export function SourceEditor({value,readOnly,language,onChange,editorRef}:Props)
         let from=0,end=0;
         while(from<old.length&&from<next.length&&old[from]===next[from])from++;
         while(end<old.length-from&&end<next.length-from&&old[old.length-1-end]===next[next.length-1-end])end++;
-        instance.dispatch({changes:{from,to:old.length-end,insert:next.slice(from,next.length-end)},annotations:externalUpdate.of(true)});
+        instance.dispatch({changes:{from,to:old.length-end,insert:next.slice(from,next.length-end).replace(/\n/g,separator.current)},annotations:externalUpdate.of(true)});
       }
     }
   },[value,readOnly]);

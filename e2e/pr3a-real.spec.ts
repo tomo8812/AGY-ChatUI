@@ -111,6 +111,7 @@ for(const vp of targets){
             }else if(item.kind==='xlsx'||item.kind==='csv'){
               await page.getByRole('gridcell',{name:'A1',exact:true}).click({timeout:30000});
               await page.getByRole('textbox',{name:'数式・セル値'}).fill(item.updated);
+              if(item.kind==='xlsx')await expect(page.getByRole('gridcell',{name:'B1',exact:true})).toHaveText('84');
             }else if(item.kind==='docx'){
               await page.getByRole('textbox',{name:'段落 1',exact:true}).fill(item.updated,{timeout:30000});
               await expect(page.getByText('書式・埋め込み要素を保持')).toBeVisible();

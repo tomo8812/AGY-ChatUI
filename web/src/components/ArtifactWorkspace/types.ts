@@ -3,7 +3,7 @@ import type { ArtifactRecord } from '../../types';
 import type { EditOperation, WorkspaceCapabilities, WorkspaceTarget } from '../../api/workspace';
 
 export type WorkspaceMode='view'|'edit'|'pin';
-export interface DraftEntry {key:string;operation:EditOperation;label:string}
+export interface DraftEntry {key:string;operation:EditOperation;label:string;displayValue?:string}
 export interface WorkspaceDraft {baseRevision:number;entries:DraftEntry[]}
 export interface WorkspaceModuleProps {
   artifact:ArtifactRecord;

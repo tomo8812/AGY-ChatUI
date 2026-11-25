@@ -1,4 +1,6 @@
-import React,{useState} from 'react';
+import React,{useMemo,useRef,useState} from 'react';
+import {useVirtualizer} from '@tanstack/react-virtual';
+import {previewFormulas} from '../formulaPreview';
 import { workspaceApi,supportsOperation } from '../../../api/workspace';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
 import { assertRevision,useRevisionResource } from '../useRevisionResource';
@@ -6,9 +8,9 @@ import type { WorkspaceModuleProps } from '../types';
 import { sha256Text } from '../targetHash';
 
 type Sheet={id:string;name:string;part:string};
-type Cell={address:string;value:unknown;formula?:string;formulaStatus?:string};
+type Cell={address:string;value:unknown;type?:string;formula?:string;formulaStatus?:string};
 type GridData={cells:Cell[];rows?:string[][];totalRows?:number;totalCols?:number;hasMore?:boolean};
-const ROWS=25,COLS=10;
+const ROWS=50,COLS=20,CELL_WIDTH=112,CELL_HEIGHT=28,HEADER=44;
 function colName(n:number){let s='';for(n++;n>0;n=Math.floor((n-1)/26))s=String.fromCharCode(65+(n-1)%26)+s;return s}
 function address(row:number,col:number){return colName(col)+(row+1)}
 export function GridModule(props:WorkspaceModuleProps){
@@ -29,7 +31,7 @@ export function GridModule(props:WorkspaceModuleProps){
   const range=useRevisionResource<GridData>(artifact,'grid:'+String(sheet?.id)+':'+page+':'+colPage,async signal=>{
     if(!sheet)return {cells:[]};
     if(xlsx){
-      const result=await workspaceApi.range<{cells:Cell[]}>(artifact.id,{sheetId:sheet.id,rangeA1:address(row0,col0)+':'+address(row0+ROWS-1,col0+COLS-1)},signal);
+      const result=await workspaceApi.range<{cells:Cell[]}>(artifact.id,{sheetId:sheet.id,rangeA1:address(row0,col0)+':'+address(Math.min(1048575,row0+ROWS-1),Math.min(16383,col0+COLS-1))},signal);
       assertRevision(artifact,result);return result;
     }
     const result=await workspaceApi.range<{rows:string[][];totalRows?:number;totalCols?:number;hasMore?:boolean}>(artifact.id,{startRow:row0,endRow:row0+ROWS-1,startCol:col0,endCol:col0+COLS-1},signal);
@@ -37,10 +39,12 @@ export function GridModule(props:WorkspaceModuleProps){
   });
   const ready=structure.ready&&range.ready&&!!sheet;
   const data=range.data;
-  const raw=(r:number,c:number)=>xlsx?data?.cells.find(cell=>cell.address===address(r,c)):undefined;
+  const cells=useMemo(()=>new Map(data?.cells.map(cell=>[cell.address,cell])),[data]);
+  const raw=(r:number,c:number)=>xlsx?cells.get(address(r,c)):undefined;
   const key=(r:number,c:number)=>String(sheet?.id)+':'+address(r,c);
   function original(r:number,c:number){const cell=raw(r,c);return xlsx?cell?.formula?'='+cell.formula.replace(/^=/,''):String(cell?.value??''):String(data?.rows?.[r-row0]?.[c-col0]??'')}
-  function value(r:number,c:number){return String(draft?.entries.find(e=>e.key===key(r,c))?.operation.value??original(r,c))}
+  const entries=useMemo(()=>new Map(draft?.entries.map(e=>[e.key,e])),[draft]);
+  function value(r:number,c:number){const e=entries.get(key(r,c));return e?.displayValue??String(e?.operation.value??original(r,c))}
   function change(v:string){
     if(!ready||editingLocked||artifact.revision===undefined||!sheet)return;
     const {row,col}=selected;
@@ -49,11 +53,27 @@ export function GridModule(props:WorkspaceModuleProps){
     const op=xlsx?(formula?'xlsx.set_formula':'xlsx.set_cell'):'set_cell';
     if(!supportsOperation(capabilities,xlsx?op:'edit'))return;
     const k=key(row,col);
-    onDraft(artifact.revision,v===original(row,col)?null:{key:k,label:sheet.name+' '+address(row,col),operation:xlsx?{op,sheetPart:sheet.part,address:address(row,col),value:formula?v:(v.trim()!==''&&Number.isFinite(Number(v))?Number(v):v)}:{op,row,col,value:v}},k);
+    onDraft(artifact.revision,v===original(row,col)?null:{key:k,displayValue:v,label:sheet.name+' '+address(row,col),operation:xlsx?{op,sheetPart:sheet.part,address:address(row,col),value:formula?v:(/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(v)&&Number.isFinite(Number(v))?Number(v):v)}:{op,row,col,value:v}},k);
   }
+  const scroll=useRef<HTMLDivElement>(null);
+  const rowCount=Math.min(ROWS,1048576-row0),colCount=Math.min(COLS,16384-col0);
+  const rows=useVirtualizer({count:rowCount,getScrollElement:()=>scroll.current,estimateSize:()=>CELL_HEIGHT,overscan:4,scrollMargin:CELL_HEIGHT});
+  const cols=useVirtualizer({horizontal:true,count:colCount,getScrollElement:()=>scroll.current,estimateSize:()=>CELL_WIDTH,overscan:2,scrollMargin:HEADER});
+  const previews=useMemo(()=>{
+    if(!xlsx||!sheet||!data||!draft||!ready)return new Map<string,string>();
+    const values=new Map(data.cells.map(c=>[c.address,{value:c.value,type:c.type,formula:c.formula}]));
+    for(const e of draft.entries){
+      const op=e.operation;
+      if(op.sheetPart!==sheet.part||typeof op.address!=='string')continue;
+      const v=op.value;
+      values.set(op.address,{value:v,type:typeof v==='number'?'n':'inlineStr',formula:op.op==='xlsx.set_formula'?String(v).replace(/^=/,''):undefined});
+    }
+    return previewFormulas(values,sheet.name,{row0,col0,rows:rowCount,cols:colCount});
+  },[xlsx,sheet,data,draft,ready,row0,col0,rowCount,colCount]);
   function move(row:number,col:number){
     row=Math.max(0,Math.min(1048575,row));col=Math.max(0,Math.min(16383,col));
     setSelected({row,col});setPage(Math.floor(row/ROWS));setColPage(Math.floor(col/COLS));
+    if(Math.floor(row/ROWS)===page&&Math.floor(col/COLS)===colPage){rows.scrollToIndex(row-row0,{align:'auto'});cols.scrollToIndex(col-col0,{align:'auto'})}else scroll.current?.scrollTo(0,0);
   }
   async function pin(){
     if(!ready||artifact.revision===undefined||!sheet)return;
@@ -73,6 +93,14 @@ export function GridModule(props:WorkspaceModuleProps){
   return <UnifiedViewerZoomShell resetKey={artifact.id+':grid'} controlsTop={toolbar} controlsBottom={tabs}>
     {(structure.error||range.error||pinError)&&<div role="alert" className="error-box">{structure.error||range.error||pinError}<button type="button" onClick={()=>{structure.retry();range.retry()}}>再試行</button></div>}
     {range.loading&&data&&<p className="workspace-refresh muted-xs" role="status">最新の内容を読み込み中…</p>}
-    {!data||!sheet?<div className="workspace-loading">{structure.error||range.error?'表を表示できません。':'読み込み中…'}</div>:<table className="workspace-grid" role="grid" aria-label="表データ" tabIndex={0} onKeyDown={e=>{const delta:Record<string,[number,number]>={ArrowUp:[-1,0],ArrowDown:[1,0],ArrowLeft:[0,-1],ArrowRight:[0,1]};if(delta[e.key]){e.preventDefault();move(selected.row+delta[e.key][0],selected.col+delta[e.key][1])}}}><thead><tr><th> </th>{Array.from({length:COLS},(_,c)=><th key={c}>{colName(col0+c)}</th>)}</tr></thead><tbody>{Array.from({length:ROWS},(_,r)=><tr key={r}><th>{row0+r+1}</th>{Array.from({length:COLS},(_,c)=>{const row=row0+r,col=col0+c,cell=raw(row,col),pending=draft?.entries.some(e=>e.key===key(row,col)),active=selected.row===row&&selected.col===col;return <td key={c} role="gridcell" aria-selected={active} aria-label={address(row,col)} onClick={()=>setSelected({row,col})} title={cell?.formulaStatus} className={pending?'pending':''}>{pending?value(row,col):xlsx?String(cell?.value??''):original(row,col)}</td>})}</tr>)}</tbody></table>}
+    {!data||!sheet?<div className="workspace-loading">{structure.error||range.error?'表を表示できません。':'読み込み中…'}</div>:<div className="workspace-virtual-grid" ref={scroll} role="grid" aria-label="表データ" aria-rowcount={rowCount+1} aria-colcount={colCount+1} tabIndex={0} onKeyDown={e=>{const delta:Record<string,[number,number]>={ArrowUp:[-1,0],ArrowDown:[1,0],ArrowLeft:[0,-1],ArrowRight:[0,1]};if(delta[e.key]){e.preventDefault();move(selected.row+delta[e.key][0],selected.col+delta[e.key][1])}else if(e.key==='Enter'&&mode==='edit'){e.preventDefault();scroll.current?.closest('.viewer-zoom-wrap')?.querySelector<HTMLInputElement>('.workspace-formula')?.focus()}}}>
+      <div className="workspace-grid-plane" style={{width:HEADER+cols.getTotalSize(),height:CELL_HEIGHT+rows.getTotalSize()}}>
+        <div role="row" className="workspace-grid-header" style={{height:CELL_HEIGHT}}><div role="columnheader" className="workspace-grid-corner" style={{width:HEADER}}/>{cols.getVirtualItems().map(c=><div key={c.key} role="columnheader" className="workspace-grid-col" style={{left:c.start,width:c.size}}>{colName(col0+c.index)}</div>)}</div>
+        {rows.getVirtualItems().map(r=><div key={r.key} role="row" aria-rowindex={r.index+2} className="workspace-grid-row" style={{top:r.start,height:r.size}}>
+          <div role="rowheader" className="workspace-grid-rowhead" style={{width:HEADER}}>{row0+r.index+1}</div>
+          {cols.getVirtualItems().map(c=>{const row=row0+r.index,col=col0+c.index,addr=address(row,col),cell=raw(row,col),pending=entries.has(key(row,col)),active=selected.row===row&&selected.col===col,preview=previews.get(addr);return <div key={c.key} role="gridcell" aria-colindex={c.index+2} aria-selected={active} aria-label={addr} onClick={()=>{setSelected({row,col});scroll.current?.focus({preventScroll:true})}} title={preview!==undefined?'未保存の数式プレビュー':cell?.formulaStatus} data-formula-preview={preview!==undefined?'true':undefined} className={'workspace-grid-cell'+(pending?' pending':'')} style={{left:c.start,width:c.size}}>{preview??(pending?value(row,col):xlsx?String(cell?.value??''):original(row,col))}</div>})}
+        </div>)}
+      </div>
+    </div>}
   </UnifiedViewerZoomShell>
 }
