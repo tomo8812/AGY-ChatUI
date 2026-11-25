@@ -1,4 +1,4 @@
-import React, { useEffect, useId, useMemo, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react';
+import React, { useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react';
 import type { RichDocumentV1, RichNode, RichLayoutProps, RichAction, RichStateAction, RichSourceEntry, RichCellObject, RichPrimitive } from '../../../../shared/rich-schema';
 import type { ArtifactRecord } from '../../types';
 import { buildArtifactContentUrl } from '../../utils/viewerCache';
@@ -77,15 +77,22 @@ function RichRendererInner({document:doc,userId,chatId,artifacts=noArtifacts,act
   const store=useMemo(()=>new RichStateStore(JSON.parse(docKey) as RichDocumentV1,JSON.parse(authKey) as string[],theme),[docKey,authKey,userId,chatId]);
   const snapshot=useSyncExternalStore(store.subscribe,store.getSnapshot,store.getSnapshot);
   const [error,setError]=useState<string|null>(null);
+  const activeAction=useRef<AbortController|null>(null);
+  const latestAuthorization=useRef(authorized);latestAuthorization.current=authorized;
+  useEffect(()=>()=>{activeAction.current?.abort();activeAction.current=null},[store]);
   useEffect(()=>{try{store.setTheme(theme)}catch{setError('テーマ変更を適用できませんでした。')}},[theme,store]);
   const prefix=useId().replace(/[^a-zA-Z0-9_-]/g,'');
   const cycle:RenderCycle={budget:createRichEvalBudget(),nodes:0,svgElements:0};
   const root=store.context();
-  const host:RichActionHost={...actions,authorizeArtifact:id=>authorized.has(id)};
+  const host:RichActionHost={...actions,authorizeArtifact:id=>latestAuthorization.current.has(id)};
   const fail=()=>setError('操作を適用できませんでした。');
   const dispatch=(a:RichStateAction[],c:RichEvalContext)=>{try{store.dispatch(a,c);setError(null)}catch{fail()}};
   const select:SelectValue=(bind,value,a,c)=>{try{if(bind)store.set(bind,value,a,c);else if(a?.length)store.dispatch(a,c);setError(null)}catch{fail()}};
-  const explicit=(a:readonly RichAction[],c:RichEvalContext)=>{setError(null);void runExplicitRichActions(a,store,c,host).catch(fail)};
+  const explicit=(a:readonly RichAction[],c:RichEvalContext)=>{
+    if(activeAction.current)return;
+    const controller=new AbortController();activeAction.current=controller;setError(null);
+    void runExplicitRichActions(a,store,c,host,controller.signal).catch(()=>{if(!controller.signal.aborted)fail()}).finally(()=>{if(activeAction.current===controller)activeAction.current=null});
+  };
   const source=(id:string|undefined,asOf?:string,fetchedAt?:string)=>{
     const s=doc.sources?.find(x=>x.id===id);
     return [s?.name??id,asOf??s?.asOf,fetchedAt??s?.fetchedAt].filter(Boolean).join(' · ');
