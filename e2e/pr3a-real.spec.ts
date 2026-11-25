@@ -87,6 +87,11 @@ for(const vp of targets){
         expect(await svc.readRange(userId,large.id,{gridSearch:'needle',afterRow:0,afterCol:0})).toMatchObject({match:{row:20001,col:1}});
         expect(await svc.readRange(userId,large.id,{gridSearch:'MATCH',afterRow:20001,afterCol:1})).toMatchObject({match:{row:0,col:1}});
         expect(await svc.readRange(userId,large.id,{gridSearch:'absent'})).toMatchObject({match:null});
+        const hugeCsv=Buffer.from('small,"'+('漢'.repeat(180000))+'"\n');
+        const huge=(await svc.createArtifact({userId,scopeKind:'chat',chatId,relPath:'oversize-cell.csv',content:hugeCsv,actorKind:'user',actorId:userId})).artifact;
+        expect(await svc.readRange(userId,huge.id,{startRow:0,endRow:0,startCol:0,endCol:1})).toMatchObject({rows:[],truncated:true});
+        expect(await svc.readRange(userId,huge.id,{startRow:0,endRow:0,startCol:0,endCol:0})).toMatchObject({rows:[['small']],truncated:false});
+        expect(await svc.readRange(userId,huge.id,{gridDimensions:true})).toMatchObject({totalRows:1,totalCols:2});
       }
       await page.setViewportSize({width:vp.width,height:vp.height});
       await page.route(url=>url.origin==='http://127.0.0.1:4174'&&url.pathname.startsWith('/api/'),async route=>{

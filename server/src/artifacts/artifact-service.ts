@@ -4312,7 +4312,11 @@ export class ArtifactService {
     let field = '', fieldHasValue = false, inQuotes = false, pendingQuote = false, pendingCr = false;
     let currentRow: string[] = [];
     const rows: string[][] = [];
-    let collectedBytes = 0, truncated = false, stoppedEarly = false, firstChar = true;
+    // Count actual JSON bytes, including escaping, before retaining values.
+    // Never emit a partial cell/row as if it were the persisted value.
+    let collectedBytes = 2, rowBytes = 2, fieldBytes = 0, rowTruncated = false;
+    let truncated = false, stoppedEarly = false, firstChar = true;
+    const fitsField = (bytes:number) => collectedBytes + (rows.length?1:0) + rowBytes + (currentRow.length?1:0) + 2 + bytes <= MAX_RESPONSE_BYTES;
     let matchLength=0, fieldMatched=false;
     let firstMatch:{row:number;col:number}|null=null, nextMatch:{row:number;col:number}|null=null;
     const collectRow = () => !dimensionsOnly && !needle.length && rowIndex >= startRow && rowIndex <= targetEndRow;
@@ -4326,9 +4330,11 @@ export class ArtifactService {
           if(matchLength===needle.length){fieldMatched=true;break;}
         }
       }
-      if (collectField()) {
-        if (field.length < MAX_RESPONSE_BYTES) field += ch;
-        else truncated = true;
+      if (collectField()&&!rowTruncated) {
+        const cp=ch.codePointAt(0)!;
+        const bytes=cp===34||cp===92||[8,9,10,12,13].includes(cp)?2:cp<32?6:cp<128?1:cp<2048?2:cp<65536?3:4;
+        if(fitsField(fieldBytes+bytes)){field+=ch;fieldBytes+=bytes;}
+        else {rowTruncated=true;field='';}
       }
     }
     function commitField() {
@@ -4340,22 +4346,21 @@ export class ArtifactService {
         }
       }
       matchLength=0;fieldMatched=false;
-      if (collectField()) currentRow.push(field);
+      if (collectField()&&!rowTruncated) {
+        if(fitsField(fieldBytes)){rowBytes+=(currentRow.length?1:0)+2+fieldBytes;currentRow.push(field);}
+        else rowTruncated=true;
+      }
       fieldCount++;
-      field = ''; fieldHasValue = false;
+      field = ''; fieldBytes=0; fieldHasValue = false;
     }
     function commitRow(): boolean {
       commitField();
       observedMaxCols = Math.max(observedMaxCols, fieldCount);
       if (collectRow()) {
-        const rowBytes = Buffer.byteLength(JSON.stringify(currentRow), 'utf8');
-        if (collectedBytes + rowBytes > MAX_RESPONSE_BYTES && rows.length > 0) {
-          truncated = true; stoppedEarly = true;
-        } else {
-          rows.push(currentRow); collectedBytes += rowBytes;
-        }
+        if (rowTruncated) {truncated = true; stoppedEarly = true;}
+        else {collectedBytes += rowBytes+(rows.length?1:0);rows.push(currentRow);}
       }
-      currentRow = []; fieldCount = 0; rowIndex++;
+      currentRow = []; rowBytes=2; rowTruncated=false; fieldCount = 0; rowIndex++;
       if (rowIndex > targetEndRow) stoppedEarly = true;
       return !stoppedEarly;
     }
