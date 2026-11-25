@@ -107,7 +107,7 @@ for(const vp of targets){
             if(item.kind==='markdown'||item.kind==='code'){
               const editor=page.getByRole('textbox',{name:'ソース'});
               await expect(editor).toBeEditable({timeout:30000});
-              await editor.fill(item.updated);
+              await editor.focus();await editor.press('Control+a');await page.keyboard.insertText(item.updated);
             }else if(item.kind==='xlsx'||item.kind==='csv'){
               await page.getByRole('gridcell',{name:'A1',exact:true}).click({timeout:30000});
               await page.getByRole('textbox',{name:'数式・セル値'}).fill(item.updated);
@@ -142,7 +142,7 @@ for(const vp of targets){
             if(item.kind==='markdown'||item.kind==='code'){
               const pinned=svc.getRevisionContentBlob(userId,artifact.id,2);
               expect(fs.readFileSync(pinned.blobPath,'utf8')).toBe(item.updated);
-              await expect(page.getByRole('textbox',{name:'ソース'})).toHaveValue(item.updated);
+              await expect.poll(()=>page.locator('.cm-line').allTextContents()).toEqual(item.updated.split('\n'));
             }else if(item.kind==='xlsx'){
               expect(await svc.readRange(userId,artifact.id,{sheetId:'1',rangeA1:'A1:B1'})).toMatchObject({cells:[{address:'A1',value:'42'},{address:'B1',formula:'A1*2'}]});
             }else if(item.kind==='csv'){
@@ -165,8 +165,8 @@ for(const vp of targets){
             await page.getByRole('button',{name:'依頼',exact:true}).click({timeout:30000});
             if(item.kind==='markdown'||item.kind==='code'){
               const editor=page.getByRole('textbox',{name:'ソース'});
-              await expect(editor).toHaveValue(item.updated);
-              await editor.evaluate((el:HTMLTextAreaElement)=>{el.focus();el.setSelectionRange(0,el.value.indexOf('\n')>0?el.value.indexOf('\n'):el.value.length)});
+              await expect.poll(()=>page.locator('.cm-line').allTextContents()).toEqual(item.updated.split('\n'));
+              await editor.focus();await editor.press('Control+Home');await editor.press('Shift+End');
               await page.getByRole('button',{name:'選択行を対象にする'}).click();
             }else if(item.kind==='xlsx'||item.kind==='csv'){
               await page.getByRole('gridcell',{name:'A1',exact:true}).click({timeout:30000});

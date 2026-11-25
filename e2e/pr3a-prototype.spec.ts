@@ -50,7 +50,7 @@ for(const size of sizes){
       }
       await page.getByRole('button',{name:'編集',exact:true}).click();
       if(kind==='markdown'||kind==='code'){
-        await page.getByRole('textbox',{name:'ソース'}).fill('Updated text');
+        const editor=page.getByRole('textbox',{name:'ソース'});await editor.focus();await editor.press('Control+a');await page.keyboard.insertText('Updated text');
       }else if(kind==='xlsx'||kind==='csv'){
         await page.getByRole('gridcell',{name:'A1',exact:true}).click();
         await page.getByRole('textbox',{name:'数式・セル値'}).fill('42');
