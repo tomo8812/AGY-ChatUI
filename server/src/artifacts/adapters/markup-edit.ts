@@ -41,7 +41,9 @@ export function markupElements(source: string, format: MarkupFormat): MarkupElem
   };
   if (format === 'svg') {
     const xml = validateXmlWellFormedness(source, true);
-    if (xml.status !== 'passed' || xml.root?.namespace !== SVG_NS || xml.root.name !== 'svg') {
+    // Historical artifacts may omit xmlns. Their source remains editable;
+    // standalone SVG namespace conformance is checked by the verifier.
+    if (xml.status !== 'passed' || xml.root?.name !== 'svg' || (xml.root.namespace && xml.root.namespace !== SVG_NS)) {
       throw new ArtifactError('INVALID_SVG_STRUCTURE', xml.status === 'passed' ? 'Expected an SVG root.' : xml.evidence, 422);
     }
     for (const node of xml.elements) add({
@@ -90,7 +92,7 @@ function attribute(name: string, value: unknown, format: MarkupFormat): string {
   if (!xmlName.test(name) || /^on/i.test(name) || /^xmlns(?::|$)/i.test(name) ||
       (format === 'svg' && /^(?:href|xlink:href)$/i.test(name) &&
       /^\s*(?:javascript|vbscript):/i.test(String(value).replace(/[\r\n\t]/g, '')))) {
-    throw new ArtifactError('INVALID_MARKUP_ATTRIBUTE', `Invalid or protected attribute: ${name}.`, 422);
+    throw new ArtifactError(format === 'svg' ? 'INVALID_SVG_ATTRIBUTE' : 'INVALID_MARKUP_ATTRIBUTE', `Invalid or protected attribute: ${name}.`, 400);
   }
   if (value !== null && typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') {
     throw new ArtifactError('INVALID_MARKUP_ATTRIBUTE', `Expected a scalar value for ${name}.`, 400);
@@ -163,7 +165,7 @@ export function editMarkup(source: string, op: AdapterOperation, format: MarkupF
       result = element.selfClosing ? insertMarkup(source, element, escapeText(op.text), format)
         : source.slice(0, openEnd) + escapeText(op.text) + source.slice(closeStart);
     } else {
-      const attrs = action === 'set_attr' ? op.attributes === undefined ? { [String(op.attr ?? '')]: op.value ?? null } : objectChanges(op.attributes)
+      const attrs = action === 'set_attr' ? op.attributes === undefined ? { [String(op.attr ?? '')]: op.value ?? (op.op === 'set_attr' && format === 'svg' ? '' : null) } : objectChanges(op.attributes)
         : action === 'set_style' ? { style: op.style }
         : objectChanges(op.geometry);
       result = source.slice(0, start) + editAttributes(source.slice(start, openEnd), attrs, format) + source.slice(openEnd);

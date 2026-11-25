@@ -170,7 +170,7 @@ try {
     const query = url.search;
     url.search = '';
     url.hash = '';
-    if (++observations.requests > 1_500) {
+    if ((verifyHtml || verifySvg) && ++observations.requests > 1_500) {
       observations.limited = true;
       return route.abort();
     }
