@@ -62,6 +62,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   const [baseShape,setBaseShape]=useState('');
   const [canvasText,setCanvasText]=useState(false);
   const sequence=useRef(0);
+  const pinRequest=useRef(0);
   const latestPin=useRef({revision:artifact.revision,slideId,mode});
   latestPin.current={revision:artifact.revision,slideId,mode};
   const [operationKind,setOperationKind]=useState('');
@@ -218,23 +219,37 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   const choose=(id:string)=>{setSelected(id);setCanvasText(false);setDrag(null);setResize(null);resizePointer.current=null};
   async function pin(targetSlide:Slide,shapeId?:string,contentCoords?:Record<string,unknown>){
     if(artifact.revision===undefined)return;
-    const previous=latestPin.current;
+    const previous=latestPin.current,request=++pinRequest.current;
+    const isCurrent=()=>pinRequest.current===request&&latestPin.current.revision===previous.revision&&
+      latestPin.current.slideId===previous.slideId&&latestPin.current.mode==='pin';
     setOperationError('');
     try {
       const metadata=await workspaceApi.range<TargetSlide>(artifact.id,{part:targetSlide.part,targetMetadata:true});
       assertRevision(artifact,metadata);
-      if(latestPin.current.revision!==previous.revision||latestPin.current.slideId!==previous.slideId||latestPin.current.mode!=='pin')return;
+      if(!isCurrent())return;
       const element=shapeId?metadata.shapes.find(item=>item.id===shapeId):undefined;
       if(shapeId&&!element)throw Error('選択した要素を識別できません。');
-      const label='スライド '+(slides.indexOf(targetSlide)+1);
+      const pageIndex=slides.indexOf(targetSlide),label='スライド '+(pageIndex+1);
+      let regionImagePngBase64:string|undefined;
+      const boundsFromScene=shapeId&&data?.shapes.find(item=>item.id===shapeId)?.transform?.geomBoundsPt;
+      if(workerReady&&boundsFromScene&&size){
+        const x=Math.max(0,boundsFromScene.x),y=Math.max(0,boundsFromScene.y);
+        const width=Math.min(size.widthPt,boundsFromScene.x+boundsFromScene.width)-x;
+        const height=Math.min(size.heightPt,boundsFromScene.y+boundsFromScene.height)-y;
+        if(width>0&&height>0){
+          try{regionImagePngBase64=await workspaceApi.renderRegion(artifact,pageIndex,{x,y,width,height},'pt')}
+          catch{/* The selected structure remains available when cropping fails. */}
+        }
+      }
+      if(!isCurrent())return;
       onTarget({baseRevision:artifact.revision,label:element?label+' / '+element.name:label,
         selector:element?{kind:'pptx_element',slideId:targetSlide.id,shapeId:Number(element.id),groupPath:element.groupPath,expectedElementFingerprint:element.fingerprint}
           :{kind:'pptx_slide',slideId:targetSlide.id,expectedSlideHash:metadata.slideHash},
-        selectedContentSnapshot:element?.text.slice(0,50_000),contentCoords});
-    }catch(e){setOperationError(e instanceof Error?e.message:'対象を識別できません。')}
+        selectedContentSnapshot:element?.text.slice(0,50_000),contentCoords,regionImagePngBase64});
+    }catch(e){if(isCurrent())setOperationError(e instanceof Error?e.message:'対象を識別できません。')}
   }
   const primary=<><span className="workspace-slide-counter" title="スライド番号">{index+1} / {slides.length}</span>
-    {mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!shape||!scene.ready} onClick={()=>{if(slide&&shape)void pin(slide,shape.id,shape.transform?.geomBoundsPt?{...shape.transform.geomBoundsPt}:undefined)}}>要素を対象にする</button>}
+    {mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!shape||!scene.ready} onClick={()=>{if(slide&&shape)void pin(slide,shape.id,shape.transform?.geomBoundsPt?{...shape.transform.geomBoundsPt,pageIndex:index,unit:'pt'}:undefined)}}>要素を対象にする</button>}
     {mode==='edit'&&shape?.type==='sp'&&<input className="workspace-command-text" aria-label="図形テキスト" value={String(draft?.entries.find(e=>e.key===key(shape.id,'text'))?.operation.text??shape.text)} readOnly={lock||!scene.ready||!supportsOperation(capabilities,'pptx.set_shape_text')} onChange={e=>editText(e.target.value)}/>}
   </>;
   const secondary=mode==='edit'?<>

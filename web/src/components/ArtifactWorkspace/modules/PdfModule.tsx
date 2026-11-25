@@ -42,12 +42,7 @@ export function PdfModule({artifact,mode,capabilities,onTarget}:WorkspaceModuleP
         Object.assign(selector,contentCoords,{expectedRegionDigest:await digest(JSON.stringify([pageHash,rectPt]))});
         if(workerReady&&!pin){
           try{
-            const png=await workspaceApi.render(artifact,{pageIndex,regionX:x,regionY:y,regionWidth:width,regionHeight:height,regionUnit:'norm'});
-            regionImagePngBase64=await new Promise<string>((resolve,reject)=>{
-              const reader=new FileReader();
-              reader.onload=()=>resolve(String(reader.result).split(',')[1]);
-              reader.onerror=reject;reader.readAsDataURL(png);
-            });
+            regionImagePngBase64=await workspaceApi.renderRegion(artifact,pageIndex,{x,y,width,height},'norm');
           }catch{/* A pinned document and its coordinates remain sufficient to create a request. */}
         }
       }

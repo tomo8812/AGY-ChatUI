@@ -345,6 +345,7 @@ for(const vp of targets){
           const requests=srv.ctx.editRequestService.listRequests(userId,chatId,{artifactId:artifact.id});
           expect(requests).toHaveLength(1);
           expect(srv.ctx.editRequestService.resolveRequestTarget(requests[0]).status).toBe('resolved');
+          if(item.kind==='pptx')expect(requests[0].regionImageBlobSha256).toMatch(/^[0-9a-f]{64}$/);
           record.pin=requests[0].selector;
           await page.screenshot({path:info.outputPath('real-'+item.kind+'-pin.png')});
           evidence.push(record);

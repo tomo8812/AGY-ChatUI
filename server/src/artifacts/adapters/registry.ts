@@ -321,6 +321,11 @@ class DocumentFormatAdapter implements FormatAdapter {
           !coords.every(value => typeof value === 'number' && Number.isFinite(value) && value >= 0)) {
           return { status: 'stale', reason: 'invalid_page_selection' };
         }
+        const rectangle = selector.kind === 'pdf_pin' ? [...coords, 0, 0] : coords;
+        if (selector.kind === 'pdf_region' && (rectangle[2] <= 0 || rectangle[3] <= 0) ||
+          sha256Buffer(Buffer.from(JSON.stringify([selector.expectedPageContentHash, rectangle]))) !== selector.expectedRegionDigest) {
+          return { status: 'needs_review', reason: 'pdf_region_digest_changed' };
+        }
         return selector.expectedArtifactSha256 === currentSha
           ? { status: 'resolved', resolvedCoords: { pageIndex, selector } }
           : { status: 'needs_review', reason: 'pdf_page_content_changed' };

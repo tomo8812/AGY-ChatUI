@@ -31,6 +31,17 @@ export const workspaceApi={
     if(!res.headers.get('content-type')?.includes('image/png'))throw new Error('画像形式が無効です。');
     return res.blob();
   },
+  async renderRegion(artifact:ArtifactRecord,pageIndex:number,rect:{x:number;y:number;width:number;height:number},unit:'norm'|'pt'){
+    const blob=await workspaceApi.render(artifact,{
+      pageIndex,regionX:rect.x,regionY:rect.y,regionWidth:rect.width,regionHeight:rect.height,regionUnit:unit,
+    });
+    return new Promise<string>((resolve,reject)=>{
+      const reader=new FileReader();
+      reader.onload=()=>resolve(String(reader.result).split(',')[1]);
+      reader.onerror=reject;
+      reader.readAsDataURL(blob);
+    });
+  },
   async renderDraftSprite(artifact:ArtifactRecord,query:{pageIndex:number;shapeId:number;cropSprite?:boolean;text?:string;boundsPt?:[number,number,number,number];style?:{bold?:boolean;italic?:boolean;fontSizePt?:number;fontColor?:string;fill?:string}},signal?:AbortSignal):Promise<Blob>{
     const res=await fetch(path(artifact.id,'render-draft-sprite'),{method:'POST',credentials:'include',signal,
       headers:{'Content-Type':'application/json','x-csrf-token':getCsrfToken()},
