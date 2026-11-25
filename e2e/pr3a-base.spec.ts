@@ -77,6 +77,11 @@ test('Base ChatUI edits source and tables and targets PPTX through its existing 
       const grid=page.getByRole('grid',{name:'表データ'});
       await expect(grid).toHaveAttribute('aria-rowcount','2');
       await expect(grid.getByRole('gridcell',{name:'A2',exact:true})).toHaveText('Apple');
+      await page.getByRole('textbox',{name:'表全体を検索'}).fill('Pear');
+      await page.getByRole('button',{name:'次の一致',exact:true}).click();
+      await expect(page.locator('.workspace-cell-address')).toHaveText('A3');
+      await page.getByRole('textbox',{name:'行を絞り込む'}).fill('Apple');
+      await page.getByRole('button',{name:'絞り込む',exact:true}).click();
       await grid.getByRole('gridcell',{name:'B2',exact:true}).click();
       await page.getByRole('textbox',{name:'数式・セル値'}).fill('8');
       const select=page.getByRole('combobox',{name:'表の編集操作'});

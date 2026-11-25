@@ -110,7 +110,9 @@ export function GridModule(props:WorkspaceModuleProps){
   const items=(a:ReturnType<typeof axis>)=>Array.from({length:a.length},(_,index)=>({index,start:a.margin+index*a.cell,size:a.cell}));
   const rows=items(rowAxis),cols=items(colAxis);
   const current={row:Math.min(rowCount-1,selected.row),col:Math.min(colCount-1,selected.col)};
-  useEffect(()=>{if(current.row!==selected.row||current.col!==selected.col){setSelected(current);setAnchor(current)}},[rowCount,colCount]);
+  useEffect(()=>{
+    if(structure.ready&&(current.row!==selected.row||current.col!==selected.col)){setSelected(current);setAnchor(current)}
+  },[structure.ready,rowCount,colCount]);
   const bounds={row0:Math.min(anchor.row,current.row),row1:Math.max(anchor.row,current.row),col0:Math.min(anchor.col,current.col),col1:Math.max(anchor.col,current.col)};
   const selectedRange=address(bounds.row0,bounds.col0)+(bounds.row0===bounds.row1&&bounds.col0===bounds.col1?'':':'+address(bounds.row1,bounds.col1));
   const visibleKeys:string[]=[];
@@ -324,7 +326,7 @@ export function GridModule(props:WorkspaceModuleProps){
         const result=await workspaceApi.range<{match:Coordinate|null}>(artifact.id,{gridSearch:search.trim(),afterRow:cursor.row,afterCol:cursor.col,...(xlsx?{sheetId:sheet.id}:{})},controller.signal);
         assertRevision(artifact,result);
         const next=result.match;if(!next)break;
-        const addressKey=key(next.row,next.col);if(seen.has(addressKey))break;seen.add(addressKey);
+        const addressKey=sheet.id+':'+address(next.row,next.col);if(seen.has(addressKey))break;seen.add(addressKey);
         const staged=entries.get(addressKey);
         if(!staged||fold(String(staged.operation.value??'')).includes(q)){hit=next;break;}
         cursor=next;

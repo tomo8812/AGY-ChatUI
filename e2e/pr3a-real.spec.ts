@@ -455,6 +455,7 @@ for(const vp of targets){
               await page.getByRole('button',{name:'保存',exact:true}).click();revision++;
               await expect(page.locator('.workspace-status')).toContainText('バージョン '+revision,{timeout:90000});
               await expect(page.locator('.workspace-status')).toContainText('保存済み');
+              await readySlide(page);
               const rendered=await svc.renderPng(userId,artifact.id,{pageIndex:renderIndex});
               const expectedPath=info.outputPath(op.replace('.','-')+'-saved-'+revision+'.png');
               fs.writeFileSync(expectedPath,rendered.png);
