@@ -16,6 +16,7 @@ import {
   subscribeArtifactUpdates,
 } from '../utils/viewerCache';
 import { CheckIcon, CopyIcon, DownloadIcon } from './Icons';
+import { isValidHttpUrl, validateRichMermaidCode } from './shared-ui/RichExprEvaluator';
 
 interface HastNode {
   type?: string;
@@ -74,6 +75,14 @@ const REMARK_PLUGINS = [remarkGfm, remarkMath];
 const REHYPE_PLUGINS = [rehypeKatex, rehypeUniqueHeadingIds];
 
 let mermaidRenderSeq = 0;
+let mermaidRenderQueue: Promise<unknown> = Promise.resolve();
+
+/** Strict rich rendering must not share a cached result with ordinary chat diagrams. */
+function enqueueMermaid<T>(task: () => Promise<T>): Promise<T> {
+  const result = mermaidRenderQueue.then(task, task);
+  mermaidRenderQueue = result.catch(() => {});
+  return result;
+}
 
 const markdownUrlTransform = (url: string): string => {
   if (/^file:\/\//i.test(url.trim())) {
@@ -129,12 +138,12 @@ function extractReactText(node: React.ReactNode): string {
   return '';
 }
 
-export const MermaidBlock: React.FC<{ code: string; streaming?: boolean }> = React.memo(
-  ({ code, streaming = false }) => {
+export const MermaidBlock: React.FC<{ code: string; streaming?: boolean; strictRich?: boolean }> = React.memo(
+  ({ code, streaming = false, strictRich = false }) => {
     const uid = useId().replace(/:/g, '_');
     const trimmed = code.trim();
     const theme = useSyncExternalStore(subscribeTheme, getEffectiveTheme);
-    const cacheKey = `${theme}:${fastTextHash(trimmed)}`;
+    const cacheKey = `${strictRich ? 'strict-rich' : 'normal'}:${theme}:${fastTextHash(trimmed)}`;
 
     const [svgHtml, setSvgHtml] = useState<string | null>(() => mermaidSvgCache.get(cacheKey) ?? null);
     const [showSource, setShowSource] = useState(false);
@@ -158,17 +167,33 @@ export const MermaidBlock: React.FC<{ code: string; streaming?: boolean }> = Rea
       const timer = window.setTimeout(() => {
         const render = async () => {
           try {
-            const mermaid = (await import('mermaid')).default;
-            mermaid.initialize({
-              startOnLoad: false,
-              securityLevel: 'strict',
-              theme: theme === 'dark' ? 'dark' : 'default',
+            const result = await enqueueMermaid(async () => {
+              if (strictRich) {
+                // Block directives, front matter, node image/icon syntax and links before
+                // Mermaid sees the source; sanitizing only the final SVG is insufficient.
+                const invalid = validateRichMermaidCode(trimmed) ||
+                  (/^---|%%\s*\{|@\s*\{|\b(?:click|link|links|image|icon|url|href)\s*[:(\s]|<|@import|https?:|data:|\/\//im.test(trimmed)
+                    ? '図に外部参照または設定変更が含まれています。' : null);
+                if (invalid) throw new Error(invalid);
+              }
+              const mermaid = (await import('mermaid')).default;
+              if (!active) return null;
+              mermaid.initialize({
+                startOnLoad: false,
+                securityLevel: 'strict',
+                theme: theme === 'dark' ? 'dark' : 'default',
+                ...(strictRich ? { htmlLabels: false, flowchart: { htmlLabels: false } } : {}),
+              });
+              mermaidRenderSeq += 1;
+              return mermaid.render(`mmd_${uid}_${mermaidRenderSeq}`, trimmed);
             });
-            mermaidRenderSeq += 1;
-            const result = await mermaid.render(`mmd_${uid}_${mermaidRenderSeq}`, trimmed);
-            if (!active) return;
+            if (!active || !result) return;
             const safeSvg = DOMPurify.sanitize(result.svg, {
               USE_PROFILES: { svg: true, svgFilters: true },
+              ...(strictRich ? {
+                FORBID_TAGS: ['image', 'foreignObject', 'use', 'style', 'a', 'script', 'feImage'],
+                FORBID_ATTR: ['style', 'href', 'xlink:href', 'src'],
+              } : {}),
             });
             mermaidSvgCache.set(cacheKey, safeSvg);
             setSvgHtml(safeSvg);
@@ -187,7 +212,7 @@ export const MermaidBlock: React.FC<{ code: string; streaming?: boolean }> = Rea
         active = false;
         window.clearTimeout(timer);
       };
-    }, [trimmed, cacheKey, theme, streaming, uid]);
+    }, [trimmed, cacheKey, theme, streaming, uid, strictRich]);
 
     const handleCopy = useCallback(async () => {
       await navigator.clipboard.writeText(code);
@@ -531,6 +556,7 @@ const WorkspaceImage: React.FC<{
 });
 
 interface MarkdownRenderContextValue {
+  strictRich?: boolean;
   chatId?: string;
   messageStatus?: MessageRecord['status'];
   onOpenArtifact?: (artifact: ArtifactRecord) => void;
@@ -542,7 +568,7 @@ const MarkdownRenderContext = React.createContext<MarkdownRenderContextValue>({
 });
 
 const MarkdownPre: React.FC<{ children?: React.ReactNode }> = React.memo(({ children }) => {
-  const { messageStatus } = useContext(MarkdownRenderContext);
+  const { messageStatus, strictRich } = useContext(MarkdownRenderContext);
   const first = Array.isArray(children) ? children[0] : children;
   if (React.isValidElement<{ className?: string; children?: React.ReactNode }>(first)) {
     const className = first.props.className ?? '';
@@ -551,7 +577,7 @@ const MarkdownPre: React.FC<{ children?: React.ReactNode }> = React.memo(({ chil
     const rawCode = extractReactText(first.props.children);
     const isStreaming = messageStatus === 'streaming';
     if (lang.toLowerCase() === 'mermaid') {
-      return <MermaidBlock code={rawCode} streaming={isStreaming} />;
+      return <MermaidBlock code={rawCode} streaming={isStreaming} strictRich={strictRich} />;
     }
     return <CodeBlock language={lang} code={rawCode} streaming={isStreaming} />;
   }
@@ -582,8 +608,9 @@ const FileLinkButton: React.FC<{
 );
 
 const MarkdownLink: React.FC<{ href?: string; children?: React.ReactNode }> = React.memo(({ href, children }) => {
-  const { onWorkspaceHref } = useContext(MarkdownRenderContext);
+  const { onWorkspaceHref, strictRich } = useContext(MarkdownRenderContext);
   const rawHref = (href ?? '').trim();
+  if (strictRich && !isValidHttpUrl(rawHref)) return <span>{children}</span>;
   if (rawHref.startsWith('#')) {
     const rawTarget = rawHref.slice(1);
     let decodedTarget = rawTarget;
@@ -637,7 +664,9 @@ const MarkdownLink: React.FC<{ href?: string; children?: React.ReactNode }> = Re
 });
 
 const MarkdownImage: React.FC<{ src?: string; alt?: string }> = React.memo(({ src, alt }) => {
-  const { chatId, messageStatus, onOpenArtifact } = useContext(MarkdownRenderContext);
+  const { chatId, messageStatus, onOpenArtifact, strictRich } = useContext(MarkdownRenderContext);
+  // Rich documents load authorized media only through the explicit media_asset node.
+  if (strictRich) return <span className="muted-xs">{alt || '画像'}</span>;
   return (
     <WorkspaceImage
       chatId={chatId}
@@ -660,6 +689,7 @@ const MARKDOWN_COMPONENTS: Components = {
 };
 
 export interface MarkdownContentProps {
+  strictRich?: boolean;
   content: string;
   chatId?: string;
   messageStatus?: MessageRecord['status'];
@@ -699,7 +729,7 @@ export const FileReferenceLink: React.FC<FileLinkProps & { reference: string }> 
 };
 
 export const MarkdownContent: React.FC<MarkdownContentProps> = React.memo(
-  ({ content, chatId, messageStatus, onOpenArtifact, onResolveError }) => {
+  ({ content, chatId, messageStatus, onOpenArtifact, onResolveError, strictRich = false }) => {
     const handleWorkspaceHref = useOpenFileReference({ chatId, onOpenArtifact, onResolveError });
 
     const contextValue = useMemo<MarkdownRenderContextValue>(
@@ -708,15 +738,17 @@ export const MarkdownContent: React.FC<MarkdownContentProps> = React.memo(
         messageStatus,
         onOpenArtifact,
         onWorkspaceHref: handleWorkspaceHref,
+        strictRich,
       }),
-      [chatId, messageStatus, onOpenArtifact, handleWorkspaceHref]
+      [chatId, messageStatus, onOpenArtifact, handleWorkspaceHref, strictRich]
     );
 
     return (
       <div className="md-body">
         <MarkdownRenderContext.Provider value={contextValue}>
           <ReactMarkdown
-            urlTransform={markdownUrlTransform}
+            skipHtml={strictRich}
+            urlTransform={strictRich ? (url, key) => key === 'href' && isValidHttpUrl(url) ? url : '' : markdownUrlTransform}
             remarkPlugins={REMARK_PLUGINS}
             rehypePlugins={REHYPE_PLUGINS}
             components={MARKDOWN_COMPONENTS}
