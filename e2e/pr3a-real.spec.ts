@@ -35,6 +35,12 @@ async function capturePptx(page:Page,info:TestInfo,reference:Buffer,name:string)
   // Wait for all transparent shape layers rather than comparing a background-only intermediate.
   await expect(scene.locator('img')).toHaveCount(3,{timeout:60000});
   await expect.poll(async()=>scene.locator('img').evaluateAll(imgs=>imgs.every(img=>(img as HTMLImageElement).complete&&(img as HTMLImageElement).naturalWidth>0)),{timeout:60000}).toBe(true);
+  await expect.poll(()=>scene.evaluate(el=>{
+    const viewport=el.closest('.workspace-pptx-scroll');
+    if(!viewport)return false;
+    const a=el.getBoundingClientRect(),b=viewport.getBoundingClientRect();
+    return a.top>=b.top-2&&a.bottom<=b.bottom+2&&a.left>=b.left-2&&a.right<=b.right+2;
+  }),{timeout:10000}).toBe(true);
   const actual=info.outputPath(name+'-canvas.png'),expected=info.outputPath(name+'-reference.png');
   fs.writeFileSync(expected,reference);
   // The active selection outline is chrome, not document pixels. Temporarily hide

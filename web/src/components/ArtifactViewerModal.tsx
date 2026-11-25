@@ -828,7 +828,7 @@ export const PdfCanvasViewer: React.FC<{
         const targetRect = targetEl.getBoundingClientRect();
         const paddingTop = parseFloat(window.getComputedStyle(container).paddingTop) || 0;
         const nextTop = container.scrollTop + (targetRect.top - containerRect.top) - paddingTop;
-        container.scrollTo({ top: Math.max(0, nextTop), behavior: 'smooth' });
+        container.scrollTo({ top: Math.max(0, nextTop), behavior: 'instant' });
       }
       if (!isZoomInteractingRef.current) {
         scheduleRenderRef.current();
@@ -897,17 +897,10 @@ export const PdfCanvasViewer: React.FC<{
 
       const lock = programmaticScrollRef.current;
       if (lock) {
-        const targetEl = pageElementsRef.current.get(lock.targetPage);
-        const containerRect = container.getBoundingClientRect();
-        const paddingTop = parseFloat(window.getComputedStyle(container).paddingTop) || 0;
-        const reached =
-          targetEl !== undefined &&
-          Math.abs(targetEl.getBoundingClientRect().top - (containerRect.top + paddingTop)) <= 4;
-        if (reached || performance.now() >= lock.expiresAt) {
-          programmaticScrollRef.current = null;
-        } else {
-          return;
-        }
+        // Keep the explicitly selected page through layout and scroll events.
+        // A short last page may not be able to align its top to the viewport.
+        if (performance.now() < lock.expiresAt) return;
+        programmaticScrollRef.current = null;
       }
 
       const containerRect = container.getBoundingClientRect();
@@ -921,7 +914,10 @@ export const PdfCanvasViewer: React.FC<{
         rects.push({ pageNum: p, top: r.top, bottom: r.bottom });
       }
       if (rects.length === 0) return;
-      const nextActive = findActivePdfPage(containerRect.top, container.clientHeight, paddingTop, rects);
+      const atBottom = container.scrollHeight > container.clientHeight + 2 &&
+        container.scrollHeight - container.clientHeight - container.scrollTop <= 2;
+      const nextActive = atBottom && rects.some(r => r.pageNum === numPages && r.bottom > containerRect.top)
+        ? numPages : findActivePdfPage(containerRect.top, container.clientHeight, paddingTop, rects);
       if (nextActive !== pageNumRef.current) {
         pageNumRef.current = nextActive;
         setPageNum(nextActive);
@@ -976,6 +972,7 @@ export const PdfCanvasViewer: React.FC<{
         if (afterRect.width <= 0 || afterRect.height <= 0) return;
         const targetClientX = afterRect.left + anchor.relX * afterRect.width;
         const targetClientY = afterRect.top + anchor.relY * afterRect.height;
+        programmaticScrollRef.current = { targetPage: anchor.pageNum, expiresAt: performance.now() + 700 };
         const deltaX = targetClientX - clientX;
         const deltaY = targetClientY - clientY;
         if (Math.abs(deltaX) > 0.5) {
@@ -1017,7 +1014,20 @@ export const PdfCanvasViewer: React.FC<{
 
   const applyStepZoom = useCallback(
     (direction: 'in' | 'out') => {
-      commitDiscreteScale((cur) => computeStepZoomScale(cur, direction, manualMinScale, PDF_MANUAL_MAX_SCALE));
+      const sc = scrollRef.current;
+      const slot = pageElementsRef.current.get(pageNumRef.current);
+      let x: number | undefined;
+      let y: number | undefined;
+      if (sc && slot) {
+        const viewport = sc.getBoundingClientRect(), page = slot.getBoundingClientRect();
+        const left = Math.max(viewport.left, page.left), right = Math.min(viewport.right, page.right);
+        const top = Math.max(viewport.top, page.top), bottom = Math.min(viewport.bottom, page.bottom);
+        if (right > left && bottom > top) {
+          x = (left + right) / 2;
+          y = (top + bottom) / 2;
+        }
+      }
+      commitDiscreteScale((cur) => computeStepZoomScale(cur, direction, manualMinScale, PDF_MANUAL_MAX_SCALE), x, y);
     },
     [manualMinScale, commitDiscreteScale]
   );
@@ -1067,7 +1077,7 @@ export const PdfCanvasViewer: React.FC<{
             次 <ChevronIcon size={14} dir="right" />
           </button>
           {onSelectPage && <button type="button" className="btn btn-secondary btn-xs" disabled={!numPages}
-            onClick={() => onSelectPage(pageNum - 1, numPages)}>ページを対象にする</button>}
+            onClick={() => onSelectPage(pageNumRef.current - 1, numPages)}>ページを対象にする</button>}
         </div>
         <div className="pdf-toolbar-group pdf-zoom-group">
           <button

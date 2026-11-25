@@ -109,10 +109,10 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   </div>;
   if(mode==='view'&&!workerReady)return <PdfCanvasViewer documentKey={artifact.id} url={buildArtifactContentUrl(artifact,{convertedPdf:true})}/>;
   return <div className="workspace-presentation"><nav className="workspace-slide-nav" aria-label="スライド一覧">{slides.slice(Math.max(0,index-4),index+5).map(s=><MiniSlide key={s.id} artifact={artifact} index={slides.indexOf(s)} active={s.id===slide?.id} onClick={()=>{setSlideId(s.id);choose('')}}/>)}<button type="button" className="btn btn-secondary btn-xs" disabled={index===0} onClick={()=>{setSlideId(slides[index-1].id);choose('')}}>前へ</button><button type="button" className="btn btn-secondary btn-xs" disabled={index+1>=slides.length} onClick={()=>{setSlideId(slides[index+1].id);choose('')}}>次へ</button></nav>
-    <UnifiedViewerZoomShell resetKey={artifact.id+':pptx'} controlsTop={toolbar}>
+    <UnifiedViewerZoomShell resetKey={artifact.id+':pptx'} controlsTop={toolbar} scrollClassName="workspace-pptx-scroll">
       {(structure.error||scene.error)&&<div className="error-box" role="alert">{structure.error||scene.error}<button type="button" onClick={()=>{structure.retry();scene.retry()}}>再試行</button></div>}
       {scene.loading&&data&&<p className="workspace-refresh muted-xs" role="status">最新の内容を読み込み中…</p>}
-      {!data||!size?.widthPt||!size.heightPt?<div className="workspace-loading">{scene.error||structure.error?'スライドを表示できません。':'読み込み中…'}</div>:<div className="workspace-slide" ref={stage} style={{aspectRatio:size.widthPt+'/'+size.heightPt}} data-slide-canvas="true" data-preview-ready={previewReady?'true':'false'}>
+      {!data||!size?.widthPt||!size.heightPt?<div className="workspace-loading">{scene.error||structure.error?'スライドを表示できません。':'読み込み中…'}</div>:<div className="workspace-slide" ref={stage} style={{aspectRatio:size.widthPt+'/'+size.heightPt,'--slide-ratio':size.widthPt/size.heightPt} as React.CSSProperties} data-slide-canvas="true" data-preview-ready={previewReady?'true':'false'}>
         <Layer blob={data.background} alt="スライド背景"/>
         {data.layers.map(({shape:s,image})=>{
           const exact=previewReady?currentPreview?.images.get(Number(s.id)):undefined;
