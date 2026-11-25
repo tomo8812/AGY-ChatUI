@@ -191,6 +191,10 @@ export interface AdapterVerifyIssue {
 }
 
 export interface AdapterVerifyResult {
+  revision?: number;
+  sha256?: string;
+  coverage?: 'complete' | 'partial';
+  checks?: Array<{ id: string; status: 'passed' | 'failed' | 'unverified'; evidence: string }>;
   ok: boolean;
   issues: AdapterVerifyIssue[];
   metrics?: Record<string, unknown>;

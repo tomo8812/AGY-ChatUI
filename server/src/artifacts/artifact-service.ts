@@ -30,7 +30,7 @@ import type {
   SyncEventEnvelope,
 } from '../types.js';
 import { DOCUMENT_WORKER_MAX_INPUT_BYTES, DocumentWorker, isDocumentFormat, isWebRenderFormat } from './document-worker.js';
-import { detectArtifactFormat, DOCUMENT_ACTIONS, FormatAdapterRegistry } from './adapters/registry.js';
+import { detectArtifactFormat, documentFormatConstraint, DOCUMENT_ACTIONS, FormatAdapterRegistry } from './adapters/registry.js';
 import { executeRestoreBundle, getRestoreBatchRecord, recoverPendingRestoreBatches } from './batch-restore.js';
 import { PerUserBlobManager, type BlobLease } from './blob-store.js';
 import { recoverPendingCommits, type DeleteTargetInspection, type RecoveryReport } from './commit-recovery.js';
@@ -3965,22 +3965,61 @@ export class ArtifactService {
     });
   }
 
+  private readCurrentRevision(userId: string, artifactId: string, maxBytes?: number) {
+    const current = this.db.getArtifact(userId, artifactId);
+    if (!current) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
+    const artifact = this.ensureLegacyHistoryMigrated(current);
+    const snapshot = this.getRevisionContentBlob(userId, artifactId, artifact.revision);
+    if (maxBytes !== undefined && snapshot.sizeBytes > maxBytes) {
+      throw new ArtifactError('DOC_WORKER_INPUT_TOO_LARGE', 'Document input exceeds the worker size limit.', 413);
+    }
+    const bytes = fs.readFileSync(snapshot.blobPath);
+    if (crypto.createHash('sha256').update(bytes).digest('hex') !== snapshot.revision.sha256) {
+      throw new ArtifactError('REVISION_SNAPSHOT_UNAVAILABLE', 'Revision snapshot failed integrity verification.', 422);
+    }
+    return { artifact, bytes, revision: snapshot.revision };
+  }
+
+  private readRenderDependencies(artifact: ArtifactRecord, revision: number, byteBudget: number) {
+    const rows = this.db.db.prepare(
+      `SELECT rel_path, blob_sha256, size_bytes, mime_type
+       FROM artifact_revision_deps WHERE user_id = ? AND artifact_id = ? AND revision = ? AND status = 'present'`
+    ).all(artifact.userId, artifact.id, revision) as Array<{
+      rel_path: string; blob_sha256: string | null; size_bytes: number; mime_type: string;
+    }>;
+    if (rows.length > 2000) {
+      throw new ArtifactError('DOC_WORKER_INPUT_TOO_LARGE', 'Too many render dependencies.', 413);
+    }
+    return rows.map((row) => {
+      byteBudget -= row.size_bytes;
+      if (byteBudget < 0) {
+        throw new ArtifactError('DOC_WORKER_INPUT_TOO_LARGE', 'Render dependencies exceed the worker size limit.', 413);
+      }
+      const bytes = row.blob_sha256 && this.blobManager.readBlob(artifact.userId, row.blob_sha256);
+      if (!bytes || bytes.length !== row.size_bytes ||
+          crypto.createHash('sha256').update(bytes).digest('hex') !== row.blob_sha256) {
+        throw new ArtifactError('REVISION_SNAPSHOT_UNAVAILABLE', 'A render dependency snapshot is unavailable.', 422);
+      }
+      return { relPath: row.rel_path, mimeType: row.mime_type, bytes };
+    });
+  }
+
   async getStructure(userId: string, artifactId: string): Promise<Record<string, unknown>> {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
     const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
     const maxBytes = isDocumentFormat(adapter.format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
-    const buf = this.readActiveArtifactBytes(artifact, maxBytes);
-    if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
+    const { bytes: buf, revision } = this.readCurrentRevision(userId, artifactId, maxBytes);
     const format = adapter.format;
-    const structure = this.documentWorker.available && isDocumentFormat(format)
+    const structure = this.documentWorker.available && isDocumentFormat(format) &&
+      !documentFormatConstraint(format, artifact.filename, 'input')
       ? JSON.parse((await this.documentWorker.run(format, artifact.filename, buf, { action: 'structure' })).toString('utf8'))
       : adapter.getStructure(buf, artifact);
     return {
-      artifactId: artifact.id,
-      revision: artifact.revision,
-      sha256: artifact.sha256,
       ...structure,
+      artifactId: artifact.id,
+      revision: revision.revision,
+      sha256: revision.sha256,
     };
   }
 
@@ -3989,15 +4028,14 @@ export class ArtifactService {
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
     const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
     const maxBytes = isDocumentFormat(adapter.format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
-    const buf = this.readActiveArtifactBytes(artifact, maxBytes);
-    if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
+    const { bytes: buf, revision } = this.readCurrentRevision(userId, artifactId, maxBytes);
     const data = isDocumentFormat(adapter.format) && ['xlsx', 'docx', 'pptx', 'pdf'].includes(adapter.format)
       ? JSON.parse((await this.documentWorker.run(adapter.format, artifact.filename, buf, { action: 'range', range })).toString('utf8'))
       : adapter.readRange(buf, range, artifact);
-    return { artifactId: artifact.id, revision: artifact.revision, ...data };
+    return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
   }
 
-  async renderPng(userId: string, artifactId: string, options: { pageIndex?: number; timeSeconds?: number; variant?: 'background' | 'sprite'; shapeId?: number } = {}): Promise<Buffer> {
+  async renderPng(userId: string, artifactId: string, options: { pageIndex?: number; timeSeconds?: number; variant?: 'background' | 'sprite'; shapeId?: number } = {}): Promise<{ png: Buffer; revision: number; sha256: string }> {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', 'Artifact not found.', 404);
     const format = this.registry.resolve(artifact.filename, artifact.previewKind).format;
@@ -4007,11 +4045,16 @@ export class ArtifactService {
     if (!isDocumentFormat(format) && !isWebRenderFormat(format) && format !== 'svg') {
       throw unsupportedOperationError('render_png', 'unsupported_by_format', 'PNG rendering is unavailable for this format.');
     }
-    const source = this.readActiveArtifactBytes(artifact, DOCUMENT_WORKER_MAX_INPUT_BYTES);
-    if (!source) throw new ArtifactError('FILE_MISSING', 'Artifact bytes not found.', 404);
+    const constraint = documentFormatConstraint(format, artifact.filename, 'render_png', artifact.previewKind);
+    if (constraint) throw unsupportedOperationError('render_png', 'unsupported_by_format', constraint);
+    const snapshot = this.readCurrentRevision(userId, artifactId, DOCUMENT_WORKER_MAX_INPUT_BYTES);
+    const source = snapshot.bytes;
+    const dependencies = isWebRenderFormat(format) || format === 'svg'
+      ? this.readRenderDependencies(snapshot.artifact, snapshot.revision.revision, DOCUMENT_WORKER_MAX_INPUT_BYTES - source.length)
+      : [];
     const png = artifact.mimeType === 'image/png' && !this.documentWorker.available
       ? source
-      : await this.documentWorker.run(format, artifact.filename, source, { action: 'render', ...options });
+      : await this.documentWorker.run(format, artifact.filename, source, { action: 'render', ...options }, [], { entry: artifact.relPath, dependencies });
     if (png.length < 24 || png.length > 16 * 1024 * 1024 ||
       !png.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex')) ||
       png.toString('ascii', 12, 16) !== 'IHDR' ||
@@ -4019,7 +4062,7 @@ export class ArtifactService {
       png.readUInt32BE(20) < 1 || png.readUInt32BE(20) > 8192) {
       throw new ArtifactError('INVALID_RENDER_IMAGE', 'Invalid or oversized PNG.', 422);
     }
-    return png;
+    return { png, revision: snapshot.revision.revision, sha256: snapshot.revision.sha256 };
   }
 
   async verifyArtifact(userId: string, artifactId: string): Promise<AdapterVerifyResult> {
@@ -4027,22 +4070,18 @@ export class ArtifactService {
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
     const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
     const maxBytes = isDocumentFormat(adapter.format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
-    const buf = this.readActiveArtifactBytes(artifact, maxBytes);
-    if (!buf) throw new ArtifactError('FILE_MISSING', 'ファイル実体が見つかりません。', 404);
+    const { bytes: buf, revision } = this.readCurrentRevision(userId, artifactId, maxBytes);
+    const identity = { revision: revision.revision, sha256: revision.sha256 };
     const format = adapter.format;
     if (this.documentWorker.available && isDocumentFormat(format)) {
       try {
-        return JSON.parse((await this.documentWorker.run(format, artifact.filename, buf, { action: 'verify' })).toString('utf8'));
+        return { ...JSON.parse((await this.documentWorker.run(format, artifact.filename, buf, { action: 'verify' })).toString('utf8')), ...identity };
       } catch (error) {
         if (!(error instanceof ArtifactError) || error.code !== 'DOCUMENT_WORKER_REJECTED') throw error;
-        return { ok: false, issues: [{ severity: 'error', code: error.code, message: error.message }] };
+        return { ...identity, ok: false, issues: [{ severity: 'error', code: error.code, message: error.message }] };
       }
     }
-    return adapter.verify(buf, {
-      filename: artifact.filename,
-      relPath: artifact.relPath,
-      mimeType: artifact.mimeType,
-    });
+    return { ...adapter.verify(buf, artifact), ...identity };
   }
 
   async exportArtifact(params: {

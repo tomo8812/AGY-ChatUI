@@ -139,6 +139,7 @@ interface SessionState {
   mcpServers: unknown[];
   history: string[];
   cancelled: boolean;
+  restoreMethod?: 'load' | 'resume';
   pendingMcpReceipt?: { toolCallId: string; name: string; rawOutput: unknown };
 }
 
@@ -299,7 +300,7 @@ function runAcpServer(): void {
       return {
         protocolVersion: Math.min(params.protocolVersion, PROTOCOL_VERSION),
         agentCapabilities: {
-          loadSession: true,
+          loadSession: process.env.MOCK_ACP_RESTORE_METHOD !== 'resume',
           mcpCapabilities: {
             http: true,
             sse: true,
@@ -391,6 +392,7 @@ function runAcpServer(): void {
       } else {
         state.mcpServers = Array.isArray(params.mcpServers) ? params.mcpServers : [];
       }
+      state.restoreMethod = 'load';
       await client.notify(methods.client.session.update, {
         sessionId: state.id,
         update: {
@@ -424,6 +426,7 @@ function runAcpServer(): void {
       } else {
         state.mcpServers = Array.isArray(params.mcpServers) ? params.mcpServers : [];
       }
+      state.restoreMethod = 'resume';
       await client.notify(methods.client.session.update, {
         sessionId: state.id,
         update: {
@@ -535,7 +538,8 @@ function runAcpServer(): void {
       }
 
       const richMode = /\[MCP_RICH_(CREATE|UNATTACHED|DEFER|CHILD|UNTRACKED|CANCEL_WAIT)\]/.exec(promptText)?.[1];
-      if (richMode) {
+      const richReference = /\[MCP_RICH_REFERENCE:([a-f0-9-]{36})\]/.exec(promptText)?.[1];
+      if (richMode || richReference) {
         const servers = state.mcpServers as Array<{
           name?: string; url?: string; headers?: Array<{ name: string; value: string }>;
         }>;
@@ -548,6 +552,18 @@ function runAcpServer(): void {
         try {
           const { tools } = await mcp.listTools();
           if (tools.length !== 22) throw new Error('The built-in server did not advertise 22 tools');
+          if (richReference) {
+            const result = await mcp.callTool({ name: 'rich_get', arguments: { blockId: richReference } });
+            const content = result.content as Array<{ text?: string }>;
+            const block = !result.isError && JSON.parse(content[0].text ?? '{}');
+            const text = block && block.id === richReference
+              ? `${state.restoreMethod ?? 'initial'}: agy-rich://${richReference}`
+              : 'Rich reference denied';
+            await sendUpdate({ sessionId: state.id, update: {
+              sessionUpdate: 'agent_message_chunk', content: { type: 'text', text },
+            } });
+            return { stopReason: 'end_turn' as const };
+          }
           const toolCallId = randomUUID();
           const title = 'Create a rich document';
           const name = 'mcp(agy_artifact/rich_create)';

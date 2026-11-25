@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AppConfig } from '../config.js';
+import { documentFormatConstraint } from './adapters/registry.js';
 import { ArtifactError, unsupportedOperationError } from './errors.js';
 import type { ResourceGovernor } from './resource-governor.js';
 import type { DocWorkerSandbox } from './sandbox-worker.js';
@@ -49,8 +50,12 @@ export class DocumentWorker {
     filename: string,
     document: Buffer | undefined,
     request: WorkerAction,
-    mergeSources: readonly Buffer[] = []
+    mergeSources: readonly Buffer[] = [],
+    renderSnapshot?: { entry: string; dependencies: ReadonlyArray<{ relPath: string; mimeType: string; bytes: Buffer }> }
   ): Promise<Buffer> {
+    const operation = request.action === 'export' ? `export:${request.targetFormat}` : request.action;
+    const constraint = documentFormatConstraint(format, filename, operation);
+    if (constraint) throw unsupportedOperationError(operation, 'unsupported_by_format', constraint);
     const profile = this.governor.getRuntimeProfile();
     const web = isWebRenderFormat(format);
     if (profile === 'base_chatui' || (web && profile !== 'full_runtime')) {
@@ -66,7 +71,8 @@ export class DocumentWorker {
     const officeConversion = ((format === 'docx' || format === 'pptx' || format === 'xlsx') &&
       (request.action === 'render' ||
         (request.action === 'export' && ['png', 'pdf'].includes(request.targetFormat)))) ||
-      (format === 'xlsx' && request.action === 'range' && request.range.evaluate === true);
+      (format === 'xlsx' && request.action === 'range' && request.range.evaluate === true) ||
+      ((format === 'pptx' || format === 'docx') && request.action === 'verify');
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-document-'));
     try {
       const input = path.join(directory, 'document');
@@ -78,7 +84,17 @@ export class DocumentWorker {
         fs.writeFileSync(hostPath, bytes, { mode: 0o600 });
         return { hostPath, sandboxName };
       });
-      fs.writeFileSync(manifest, JSON.stringify({ ...request, format, filename, mergeSourceCount: sourceInputs.length }), { mode: 0o600 });
+      const assets = (renderSnapshot?.dependencies ?? []).map(({ relPath, mimeType, bytes }, index) => {
+        const sandboxName = `asset-${index}`;
+        const hostPath = path.join(directory, sandboxName);
+        fs.writeFileSync(hostPath, bytes, { mode: 0o600 });
+        return { relPath, mimeType, sandboxName, hostPath };
+      });
+      fs.writeFileSync(manifest, JSON.stringify({
+        ...request, format, filename, mergeSourceCount: sourceInputs.length,
+        entry: renderSnapshot?.entry,
+        assets: assets.map(({ relPath, mimeType, sandboxName }) => ({ relPath, mimeType, sandboxName })),
+      }), { mode: 0o600 });
       const result = await this.sandbox.run({
         kind: web ? 'chromium' : officeConversion ? 'libreoffice' : format === 'media' ? 'ffmpeg' : 'python',
         command: web ? (sandboxed ? '/usr/bin/node' : process.execPath) : path.join(runtimeDir, 'venv/bin/python3'),
@@ -90,6 +106,7 @@ export class DocumentWorker {
         inputFiles: [
           ...(document ? [{ hostPath: input, sandboxName: 'document' }] : []),
           ...sourceInputs,
+          ...assets.map(({ hostPath, sandboxName }) => ({ hostPath, sandboxName })),
           { hostPath: manifest, sandboxName: 'request.json' },
           { hostPath: workerScript, sandboxName: scriptName },
         ],

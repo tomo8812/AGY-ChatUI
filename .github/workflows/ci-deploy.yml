@@ -93,7 +93,7 @@ jobs:
       - name: Round-trip real document fixtures
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libreoffice-calc libreoffice-impress poppler-utils ffmpeg
+          sudo apt-get install -y --no-install-recommends libreoffice-calc libreoffice-impress poppler-utils ffmpeg librsvg2-bin
           python3 -m venv "${RUNNER_TEMP}/artifact-doc-tests"
           "${RUNNER_TEMP}/artifact-doc-tests/bin/pip" install lxml openpyxl python-docx python-pptx pillow pypdf reportlab
           curl --fail --silent --show-error --retry 3 \

@@ -579,8 +579,9 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     if (!query.success) return reply.code(400).send({ error: 'INVALID_RENDER_OPTIONS' });
     const { artifactId } = req.params as { artifactId: string };
     try {
-      const png = await artifactService.renderPng(session.user.id, artifactId, query.data);
-      return reply.type('image/png').header('Cache-Control', 'private, no-store').send(png);
+      const { png, revision, sha256 } = await artifactService.renderPng(session.user.id, artifactId, query.data);
+      return reply.type('image/png').header('Cache-Control', 'private, no-store')
+        .header('X-Artifact-Revision', revision).header('X-Artifact-Sha256', sha256).send(png);
     } catch (error) {
       return sendArtifactError(reply, error);
     }

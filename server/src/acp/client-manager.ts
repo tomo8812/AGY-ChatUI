@@ -94,6 +94,7 @@ import {
 export interface KnownMcpServerPermissionTarget {
   name: string;
   discoveredTools?: string[];
+  strictTools?: boolean;
 }
 
 export function deriveAgyPermissionRule(params: {
@@ -115,7 +116,7 @@ export function deriveAgyPermissionRule(params: {
       typeof entry === 'object' && Array.isArray(entry.discoveredTools)
         ? entry.discoveredTools.map((t) => t.trim()).filter(Boolean)
         : [];
-    serverMap.set(cleanName, tools.length > 0 ? new Set(tools) : null);
+    serverMap.set(cleanName, tools.length > 0 || (typeof entry === 'object' && entry.strictTools) ? new Set(tools) : null);
   };
   for (const s of params.knownMcpServers ?? []) addKnown(s);
   for (const s of params.knownMcpServerNames ?? []) addKnown(s);
@@ -159,6 +160,9 @@ export function deriveAgyPermissionRule(params: {
   if (mcpServerFromInput && mcpToolFromInput) {
     return matchKnownServerTool(mcpServerFromInput, mcpToolFromInput);
   }
+
+  const explicit = /^(?:mcp\(([^/]+)\/([^/]+)\)|([^/]+)\/([^/]+))$/.exec(name);
+  if (explicit) return matchKnownServerTool(explicit[1] ?? explicit[3], explicit[2] ?? explicit[4]);
 
   // 2) Prefixed eager MCP tool name matching an unambiguous known MCP server
   for (const [prefix, sep] of [
@@ -513,6 +517,7 @@ interface WorkerInstance {
   needsConfigReload: boolean;
   mcpConfigEpoch: number;
   builtinMcp?: Awaited<ReturnType<McpService['bindBuiltinArtifactServer']>>;
+  externalMcpNames: ReadonlySet<string>;
   detachedElicitationResolvers: Map<string, (resp: CreateElicitationResponse) => void>;
   idleWaiters: Set<() => void>;
 }
@@ -1138,7 +1143,8 @@ export class AcpClientManager {
             addAgyAllowPermissionRule(profile.profileDir, existing.alwaysAllowRule!);
           });
           const mcpMatch = /^mcp\(([^/]+)\/(.+)\)$/.exec(existing.alwaysAllowRule);
-          if (mcpMatch) {
+          const builtinName = this.workers.get(`${params.userId}:${params.chatId}`)?.builtinMcp?.server.name;
+          if (mcpMatch && mcpMatch[1] !== builtinName) {
             this.mcpService?.recordToolAlwaysAllowFromChat(params.userId, mcpMatch[1], mcpMatch[2]);
           }
         } catch (err) {
@@ -1817,7 +1823,11 @@ export class AcpClientManager {
         const knownMcpServers: KnownMcpServerPermissionTarget[] = (() => {
           if (!isToolApproval) return [];
           const byName = new Map<string, KnownMcpServerPermissionTarget>();
-          for (const s of this.db.listEffectiveMcpServersForUser(turn.userId)) {
+          const chat = this.db.getChat(turn.userId, workerRef!.chatId);
+          for (const s of this.db.listEffectiveMcpServersForUser(turn.userId, {
+            projectId: chat?.projectId, chatId: chat?.id,
+          })) {
+            if (!workerRef!.externalMcpNames.has(s.name)) continue;
             let discoveredTools: string[] = [];
             try {
               const parsed = JSON.parse(s.discoveredToolsJson);
@@ -1835,6 +1845,8 @@ export class AcpClientManager {
             }
             byName.set(s.name, { name: s.name, discoveredTools });
           }
+          const builtin = workerRef!.builtinMcp?.permissionTarget();
+          if (builtin) byName.set(builtin.name, builtin);
           return [...byName.values()];
         })();
         const alwaysAllowRule = isToolApproval
@@ -2105,6 +2117,7 @@ export class AcpClientManager {
         )
       : [];
 
+    const externalMcpNames = new Set(mcpServers.map(({ name }) => name));
     const builtinMcp = init.agentCapabilities?.mcpCapabilities?.http === false
       ? undefined
       : await this.mcpService?.bindBuiltinArtifactServer({
@@ -2274,6 +2287,7 @@ export class AcpClientManager {
     workerRef = {
       key: workerKey,
       builtinMcp,
+      externalMcpNames,
       userId,
       chatId,
       profileDir: profile.profileDir,

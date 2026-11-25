@@ -54,6 +54,160 @@ class DocumentWorkerTest(unittest.TestCase):
         subprocess.run([sys.executable, str(WORKER)], env=env, check=True, cwd=self.directory)
         return self.result.read_bytes()
 
+    @unittest.skipUnless(shutil.which("rsvg-convert"), "SVG runtime not installed")
+    def test_svg_renders_styles_and_images_supplied_by_the_snapshot(self):
+        self.source.write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20">'
+            '<style>@import "style/site.css";</style><rect width="20" height="20"/>'
+            '<image x="0" y="0" width="2" height="2" href="assets/pixel.png"/></svg>',
+            encoding="utf-8",
+        )
+        (self.inputs / "asset-0").write_text("rect{fill:#152b41}", encoding="utf-8")
+        Image.new("RGB", (2, 2), (5, 6, 7)).save(self.inputs / "asset-1", "PNG")
+        result = self.run_worker("svg", "render", entry="site/drawing.svg", assets=[
+            {"relPath": "site/style/site.css", "mimeType": "text/css", "sandboxName": "asset-0"},
+            {"relPath": "site/assets/pixel.png", "mimeType": "image/png", "sandboxName": "asset-1"},
+        ])
+        with Image.open(io.BytesIO(result)) as image:
+            pixels = image.convert("RGB")
+            self.assertEqual(pixels.getpixel((0, 0)), (5, 6, 7))
+            self.assertEqual(pixels.getpixel((pixels.width // 2, pixels.height // 2)), (21, 43, 65))
+
+    def test_pptx_edits_shapes_tables_and_slide_list(self):
+        presentation = Presentation()
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        slide.notes_slide.notes_text_frame.text = "Original notes"
+        layout = str(slide.slide_layout.part.partname).lstrip("/")
+        presentation.save(self.source)
+        part = "ppt/slides/slide1.xml"
+        result = self.run_worker("pptx", "edit", operations=[
+            {"op": "pptx.add_shape", "slidePart": part, "kind": "rectangle", "boundsPt": [10, 20, 80, 60], "text": "A"},
+            {"op": "pptx.set_shape_style", "slidePart": part, "shapeId": 2, "fill": "405060", "bold": True, "shadow": True},
+            {"op": "pptx.set_shape_bounds", "slidePart": part, "shapeId": 2, "boundsPt": [20, 20, 80, 60]},
+            {"op": "pptx.add_shape", "slidePart": part, "kind": "ellipse", "boundsPt": [100, 20, 80, 60], "text": "B"},
+            {"op": "pptx.group_shapes", "slidePart": part, "shapeIds": [2, 3]},
+            {"op": "pptx.add_table", "slidePart": part, "boundsPt": [20, 150, 200, 80], "rows": [["Before", "Value"]]},
+            {"op": "pptx.set_table_cell", "slidePart": part, "shapeId": 5, "row": 0, "column": 0, "text": "After"},
+            {"op": "pptx.set_notes", "slidePart": part, "text": "Updated notes"},
+            {"op": "pptx.add_slide", "layoutPart": layout},
+            {"op": "pptx.set_notes", "slidePart": "ppt/slides/slide2.xml", "text": "New notes"},
+            {"op": "pptx.reorder_slide", "index": 1, "toIndex": 0},
+        ])
+        reopened = Presentation(io.BytesIO(result))
+        self.assertEqual(len(reopened.slides), 2)
+        self.assertEqual(len(reopened.slides[0].shapes), 0)
+        self.assertEqual(reopened.slides[0].notes_slide.notes_text_frame.text, "New notes")
+        self.assertEqual(len(reopened.slides[1].shapes[0].shapes), 2)
+        self.assertEqual(reopened.slides[1].shapes[0].shapes[0].left.pt, 20)
+        self.assertEqual(reopened.slides[1].shapes[1].table.cell(0, 0).text, "After")
+        self.assertEqual(reopened.slides[1].notes_slide.notes_text_frame.text, "Updated notes")
+
+    def test_pptx_creates_notes_master_when_presentation_has_none(self):
+        presentation = Presentation()
+        presentation.slides.add_slide(presentation.slide_layouts[6])
+        presentation.save(self.source)
+        result = self.run_worker("pptx", "edit", operations=[
+            {"op": "pptx.set_notes", "slidePart": "ppt/slides/slide1.xml", "text": "Created"},
+        ])
+        self.assertEqual(Presentation(io.BytesIO(result)).slides[0].notes_slide.notes_text_frame.text, "Created")
+
+    def test_docx_edits_word_parts_and_preserves_unrelated_xml(self):
+        document = Document()
+        document.add_paragraph("Initial")
+        document.save(self.source)
+        picture = io.BytesIO()
+        Image.new("RGB", (2, 2), (0, 128, 0)).save(picture, "PNG")
+        result = self.run_worker("docx", "edit", operations=[
+            {"op": "docx.patch_xml_text", "blockIndex": 0, "textIndex": 0, "expectedText": "Initial", "text": "Edited"},
+            {"op": "docx.add_paragraph", "headingLevel": 2, "text": "Section"},
+            {"op": "docx.set_list", "blockIndex": 0, "numberingId": 1},
+            {"op": "docx.set_run_style", "blockIndex": 0, "runIndex": 0, "fontSizePt": 14, "bold": True},
+            {"op": "docx.add_image", "blockIndex": 0, "imageBase64": base64.b64encode(picture.getvalue()).decode("ascii")},
+            {"op": "docx.add_table", "rows": [["First", "Second"]]},
+            {"op": "docx.set_table_cell", "blockIndex": 2, "row": 0, "column": 0, "text": "After"},
+            {"op": "docx.add_header_footer", "kind": "header", "text": "New header"},
+            {"op": "docx.edit_header_footer", "part": "word/header1.xml", "textIndex": 0, "text": "Edited header"},
+            {"op": "docx.add_footnote", "blockIndex": 0, "text": "New footnote"},
+            {"op": "docx.edit_footnote", "part": "word/footnotes.xml", "footnoteId": 1, "textIndex": 0, "text": "Edited footnote"},
+        ])
+        reopened = Document(io.BytesIO(result))
+        self.assertEqual(reopened.paragraphs[0].text, "Edited")
+        self.assertEqual(reopened.paragraphs[0].runs[0].font.size.pt, 14)
+        self.assertTrue(reopened.paragraphs[0].runs[0].bold)
+        self.assertEqual(reopened.paragraphs[1].style.style_id, "Heading2")
+        self.assertEqual(reopened.tables[0].cell(0, 0).text, "After")
+        self.assertEqual(reopened.sections[0].header.paragraphs[0].text, "Edited header")
+        self.assertEqual(len(reopened.inline_shapes), 1)
+        with zipfile.ZipFile(self.source) as original, zipfile.ZipFile(io.BytesIO(result)) as package:
+            self.assertEqual(package.read("word/styles.xml"), original.read("word/styles.xml"))
+            self.assertIn(b"Edited footnote", package.read("word/footnotes.xml"))
+        self.source.write_bytes(result)
+        report = json.loads(self.run_worker("docx", "verify"))
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["coverage"], "partial")
+
+    def test_xlsx_edits_sheet_options_and_preserves_other_cells(self):
+        book = Workbook()
+        book.active["A1"] = "keep"
+        book.save(self.source)
+        part = "xl/worksheets/sheet1.xml"
+        result = self.run_worker("xlsx", "edit", operations=[
+            {"op": "xlsx.set_merge", "sheetPart": part, "range": "A1:B1"},
+            {"op": "xlsx.add_conditional_format", "sheetPart": part, "range": "A2:A4", "minColor": "FF0000", "maxColor": "00FF00"},
+            {"op": "xlsx.set_data_validation", "sheetPart": part, "range": "B2:B4", "kind": "list", "values": ["Yes", "No"]},
+            {"op": "xlsx.set_auto_filter", "sheetPart": part, "range": "A2:B4", "column": 1, "values": ["Yes"]},
+            {"op": "xlsx.set_page_setup", "sheetPart": part, "orientation": "landscape", "fitToWidth": 1},
+            {"op": "xlsx.add_sheet", "name": "New worksheet"},
+            {"op": "xlsx.set_cell", "sheetPart": "xl/worksheets/sheet2.xml", "address": "A1", "value": 4},
+            {"op": "xlsx.set_defined_name", "sheetId": 2, "name": "ReportRange", "range": "A1:A2"},
+            {"op": "xlsx.reorder_sheet", "sheetId": 2, "toIndex": 0},
+        ])
+        reopened = load_workbook(io.BytesIO(result))
+        self.assertEqual(reopened.sheetnames, ["New worksheet", "Sheet"])
+        self.assertEqual(reopened["New worksheet"]["A1"].value, 4)
+        self.assertEqual(reopened["Sheet"]["A1"].value, "keep")
+        self.assertIn("A1:B1", reopened["Sheet"].merged_cells)
+        self.assertEqual(len(reopened["Sheet"].conditional_formatting), 1)
+        self.assertEqual(reopened["Sheet"].data_validations.dataValidation[0].formula1, '"Yes,No"')
+        self.assertEqual(reopened["Sheet"].auto_filter.filterColumn[0].filters.filter, ["Yes"])
+        self.assertEqual(reopened["Sheet"].page_setup.orientation, "landscape")
+        self.assertEqual(list(reopened.defined_names["ReportRange"].destinations), [("New worksheet", "$A$1:$A$2")])
+
+    def test_xlsx_renames_references_and_removes_an_empty_sheet(self):
+        book = Workbook()
+        book.active.title = "Old Data"
+        book.active["A1"] = 4
+        book.create_sheet("Summary")["A1"] = "='Old Data'!A1"
+        book.create_sheet("Unused")
+        book.save(self.source)
+        result = self.run_worker("xlsx", "edit", operations=[
+            {"op": "xlsx.rename_sheet", "sheetId": 1, "name": "New Data"},
+            {"op": "xlsx.remove_empty_sheet", "sheetId": 3},
+        ])
+        reopened = load_workbook(io.BytesIO(result))
+        self.assertEqual(reopened.sheetnames, ["New Data", "Summary"])
+        self.assertEqual(reopened["Summary"]["A1"].value, "='New Data'!A1")
+
+    def test_verification_reports_structural_findings_and_unverified_checks(self):
+        book = Workbook()
+        book.active["A1"] = "=Missing!A2"
+        book.active["B1"] = "=1+2"
+        book.save(self.source)
+        report = json.loads(self.run_worker("xlsx", "verify"))
+        self.assertFalse(report["ok"])
+        self.assertIn("invalid_formula_reference", [issue["code"] for issue in report["issues"]])
+        self.assertIn(("formula_values", "unverified"), [(c["id"], c["status"]) for c in report["checks"]])
+        presentation = Presentation()
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(-1), Inches(1), Inches(3), Inches(2))
+        slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(1), Inches(1), Inches(3), Inches(2))
+        presentation.save(self.source)
+        report = json.loads(self.run_worker("pptx", "verify"))
+        self.assertFalse(report["ok"])
+        self.assertIn("shape_outside_slide", [issue["code"] for issue in report["issues"]])
+        self.assertIn("shape_bounds_overlap", [issue["code"] for issue in report["issues"]])
+        self.assertIn(("visual_fidelity", "unverified"), [(c["id"], c["status"]) for c in report["checks"]])
+
     def test_xlsx_clears_formula_cache_and_all_chain_registrations(self):
         book = Workbook()
         book.active["A1"] = 1

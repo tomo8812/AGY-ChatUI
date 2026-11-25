@@ -102,6 +102,9 @@ export function buildIsolatedAgyEnv(opts: IsolatedEnvOptions): NodeJS.ProcessEnv
   if (opts.includeMockVars && process.env.MOCK_ALLOW_UNAUTH !== undefined) {
     env.MOCK_ALLOW_UNAUTH = process.env.MOCK_ALLOW_UNAUTH;
   }
+  if (opts.includeMockVars && process.env.MOCK_ACP_RESTORE_METHOD === 'resume') {
+    env.MOCK_ACP_RESTORE_METHOD = 'resume';
+  }
   if (opts.includeMockVars && process.env.MOCK_CLIENT_INFO_PATH !== undefined) {
     env.MOCK_CLIENT_INFO_PATH = process.env.MOCK_CLIENT_INFO_PATH;
   }

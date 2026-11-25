@@ -10,6 +10,7 @@ import os
 from pathlib import Path, PurePosixPath
 import posixpath
 import re
+import shutil
 import sys
 import subprocess
 import tempfile
@@ -172,14 +173,14 @@ def invalidate_calculation(package, replacements):
 
     removed = set()
     rel_name = "xl/_rels/workbook.xml.rels"
-    relations = parse_xml(package.read(rel_name))
+    relations = load_edit_part(package, replacements, {}, rel_name)
     for relation in list(relations):
         if relation.get("Type", "").endswith("/calcChain") and relation.get("TargetMode") != "External":
             removed.add(resolve_relationship("xl", relation.attrib["Target"]))
             relations.remove(relation)
     if removed:
         replacements[rel_name] = relations
-        types = parse_xml(package.read("[Content_Types].xml"))
+        types = load_edit_part(package, replacements, {}, "[Content_Types].xml")
         for item in list(types):
             if item.tag == tag(CONTENT_TYPES, "Override") and resolve_relationship("", item.attrib["PartName"]) in removed:
                 types.remove(item)
@@ -199,21 +200,339 @@ def invalidate_calculation(package, replacements):
     return removed
 
 
+SHEET_CHILDREN = (
+    "sheetPr", "dimension", "sheetViews", "sheetFormatPr", "cols", "sheetData", "sheetCalcPr",
+    "sheetProtection", "protectedRanges", "scenarios", "autoFilter", "sortState", "dataConsolidate",
+    "customSheetViews", "mergeCells", "phoneticPr", "conditionalFormatting", "dataValidations", "hyperlinks",
+    "printOptions", "pageMargins", "pageSetup", "headerFooter", "rowBreaks", "colBreaks", "customProperties",
+    "cellWatches", "ignoredErrors", "smartTags", "drawing", "legacyDrawing", "legacyDrawingHF", "picture",
+    "oleObjects", "controls", "webPublishItems", "tableParts", "extLst",
+)
+
+
+def sheet_node(sheet, name, **attributes):
+    later = SHEET_CHILDREN[SHEET_CHILDREN.index(name) + 1:]
+    return xml_child(sheet, SPREADSHEET, name, later, **attributes)
+
+
+def bounded_sheet_range(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Z]{1,3}[1-9][0-9]*(?::[A-Z]{1,3}[1-9][0-9]*)?", value):
+        raise ValueError("Use an A1 cell or rectangle")
+    ends = value.split(":")
+    first = cell_coordinates(ends[0])
+    last = cell_coordinates(ends[-1])
+    if any(first[i] > last[i] for i in (0, 1)):
+        raise ValueError("Invalid range order")
+    return first, last
+
+
+def overlaps_rect(first, second):
+    return all(first[0][i] <= second[1][i] and second[0][i] <= first[1][i] for i in (0, 1))
+
+
+def validate_sheet_name(sheets, name, current=None):
+    if not isinstance(name, str) or not name or len(name) > 31 or re.search(r"[:\\/?*\[\]]", name) or name.startswith("'") or name.endswith("'"):
+        raise ValueError("Invalid worksheet name")
+    if any(sheet is not current and sheet.get("name", "").casefold() == name.casefold() for sheet in sheets):
+        raise ValueError("Worksheet name is already used")
+
+
+def rewrite_sheet_name(expression, old_name, new_name):
+    from openpyxl.formula import Tokenizer
+    from openpyxl.formula.tokenizer import TokenizerError
+    if not expression:
+        return expression
+    prefix = "=" if expression.startswith("=") else ""
+    try:
+        tokens = Tokenizer("=" + expression.lstrip("=")).items
+    except TokenizerError as error:
+        raise UnsupportedStructuralMutation("A formula could not be checked for worksheet references") from error
+    rewritten = []
+    for token in tokens:
+        value = token.value
+        if token.type == "FUNC" and token.subtype == "OPEN" and value[:-1].upper().rsplit(".", 1)[-1] in {"INDIRECT", "OFFSET"}:
+            raise UnsupportedStructuralMutation("Dynamic references cannot be updated")
+        if token.type == "OPERAND" and token.subtype == "RANGE" and "!" in value:
+            qualifier, address = value.rsplit("!", 1)
+            normalized = qualifier.strip("'").replace("''", "'")
+            if ":" in normalized:
+                raise UnsupportedStructuralMutation("Multi-sheet references cannot be safely updated")
+            if normalized.casefold() == old_name.casefold():
+                if new_name is None:
+                    raise UnsupportedStructuralMutation("The worksheet is referenced")
+                value = "'" + new_name.replace("'", "''") + "'!" + address
+        rewritten.append(value)
+    return prefix + "".join(rewritten)
+
+
+def update_sheet_references(package, replacements, additions, old_name, new_name, ignored_part=None):
+    names = set(package.namelist()) | additions.keys()
+    if any(name.startswith(("xl/pivot", "xl/tables/", "xl/externalLinks/", "xl/slicers/")) or name.lower().endswith("vbaproject.bin")
+           for name in names):
+        raise UnsupportedStructuralMutation("The workbook has protected references or embedded code")
+    parts = [name for name in names if name != ignored_part and re.fullmatch(
+        r"xl/(?:workbook\.xml|worksheets/[^/]+\.xml|charts/[^/]+\.xml)", name
+    )]
+    formula_tags = {tag(SPREADSHEET, element) for element in ("f", "formula", "formula1", "formula2", "definedName")}
+    formula_tags.add(tag(CHART, "f"))
+    for part in parts:
+        root = load_edit_part(package, replacements, additions, part)
+        if any(isinstance(node.tag, str) and XML.QName(node).localname == "extLst" for node in root.iter()):
+            raise UnsupportedStructuralMutation("The workbook contains protected extensions")
+        for node in root.iter():
+            if node.tag in formula_tags:
+                node.text = rewrite_sheet_name(node.text, old_name, new_name)
+
+
+def remap_sheet_indices(workbook, old_order, sheets, removed=None):
+    visible = next(index for index, node in enumerate(sheets) if node.get("state", "visible") == "visible")
+    defined = workbook.find(tag(SPREADSHEET, "definedNames"))
+    if defined is not None:
+        for entry in list(defined):
+            if entry.get("localSheetId") is None:
+                continue
+            index = bounded_integer(entry.get("localSheetId"), 0, len(old_order) - 1)
+            if old_order[index] is removed:
+                defined.remove(entry)
+            else:
+                entry.set("localSheetId", str(sheets.index(old_order[index])))
+    for view in workbook.iter(tag(SPREADSHEET, "workbookView")):
+        for key in ("activeTab", "firstSheet"):
+            index = bounded_integer(view.get(key, "0"), 0, len(old_order) - 1)
+            view.set(key, str(visible if old_order[index] is removed else sheets.index(old_order[index])))
+
+
+def update_sheet_metadata(package, replacements, additions, removed, operation):
+    workbook_part = MAIN_PART["xlsx"]
+    workbook = load_edit_part(package, replacements, additions, workbook_part)
+    sheets = workbook.find(tag(SPREADSHEET, "sheets"))
+    op = operation["op"]
+    if op == "xlsx.add_sheet":
+        name = operation["name"]
+        validate_sheet_name(sheets, name)
+        target = allocate_part(package, additions, "xl/worksheets/sheet", ".xml")
+        worksheet = XML.Element(tag(SPREADSHEET, "worksheet"), nsmap={None: SPREADSHEET})
+        XML.SubElement(worksheet, tag(SPREADSHEET, "sheetData"))
+        rid = add_package_part(package, replacements, additions, workbook_part, target, "worksheet",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+                               XML.tostring(worksheet))
+        sheet_id = max([0] + [int(sheet.attrib["sheetId"]) for sheet in sheets]) + 1
+        node = XML.SubElement(sheets, tag(SPREADSHEET, "sheet"), name=name, sheetId=str(sheet_id))
+        node.set(tag(OFFICE_REL, "id"), rid)
+        return
+    if op == "xlsx.set_defined_name":
+        name = operation["name"]
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,254}", name) or re.fullmatch(r"[A-Za-z]{1,3}[0-9]+|R|C|R[0-9]+C[0-9]+", name, re.I):
+            raise ValueError("Invalid defined name")
+        names = xml_child(workbook, SPREADSHEET, "definedNames", ("calcPr", "oleSize", "customWorkbookViews", "pivotCaches", "extLst"))
+        found = next((node for node in names if node.get("localSheetId") is None and node.get("name", "").casefold() == name.casefold()), None)
+        if operation.get("range") is None:
+            if found is not None:
+                names.remove(found)
+            return
+        reference = operation["range"]
+        bounded_sheet_range(reference)
+        sheet = next((sheet for sheet in sheets if sheet.get("sheetId") == str(operation["sheetId"])), None)
+        if sheet is None:
+            raise ValueError("Unknown worksheet")
+        if found is None:
+            found = XML.SubElement(names, tag(SPREADSHEET, "definedName"), name=name)
+        absolute = re.sub(r"([A-Z]+)([0-9]+)", r"$\1$\2", reference)
+        found.text = "'" + sheet.attrib["name"].replace("'", "''") + "'!" + absolute
+        return
+    current = next((i for i, sheet in enumerate(sheets) if sheet.get("sheetId") == str(operation["sheetId"])), None)
+    if current is None:
+        raise ValueError("Unknown worksheet")
+    sheet = sheets[current]
+    if op == "xlsx.set_sheet_visibility":
+        state = operation["state"]
+        if state not in {"visible", "hidden", "veryHidden"}:
+            raise ValueError("Invalid worksheet visibility")
+        if state != "visible" and not any(node is not sheet and node.get("state", "visible") == "visible" for node in sheets):
+            raise ValueError("One worksheet must remain visible")
+        sheet.set("state", state)
+        if state != "visible":
+            first_visible = next(i for i, node in enumerate(sheets) if node.get("state", "visible") == "visible")
+            for view in workbook.iter(tag(SPREADSHEET, "workbookView")):
+                if int(view.get("activeTab", "0")) == current:
+                    view.set("activeTab", str(first_visible))
+        return
+    order = list(sheets)
+    if op == "xlsx.rename_sheet":
+        name = operation["name"]
+        validate_sheet_name(sheets, name, sheet)
+        update_sheet_references(package, replacements, additions, sheet.attrib["name"], name)
+        sheet.set("name", name)
+        return
+    if op == "xlsx.remove_empty_sheet":
+        if len(sheets) == 1 or not any(node is not sheet and node.get("state", "visible") == "visible" for node in sheets):
+            raise ValueError("One worksheet must remain visible")
+        rels = load_edit_part(package, replacements, additions, "xl/_rels/workbook.xml.rels")
+        relationship = next(node for node in rels if node.get("Id") == sheet.attrib[tag(OFFICE_REL, "id")])
+        target = resolve_relationship("xl", relationship.attrib["Target"])
+        sheet_part = load_edit_part(package, replacements, additions, target)
+        if any(node.tag in {tag(SPREADSHEET, name) for name in (
+            "c", "drawing", "conditionalFormatting", "tableParts", "dataValidations", "hyperlinks", "extLst"
+        )} for node in sheet_part.iter()):
+            raise UnsupportedStructuralMutation("Only an empty worksheet without dependent parts can be removed")
+        update_sheet_references(package, replacements, additions, sheet.attrib["name"], None, target)
+        sheets.remove(sheet)
+        rels.remove(relationship)
+        types = load_edit_part(package, replacements, additions, "[Content_Types].xml")
+        for entry in list(types):
+            if entry.get("PartName") == "/" + target:
+                types.remove(entry)
+        if target in additions:
+            additions.pop(target)
+        else:
+            removed.add(target)
+        remap_sheet_indices(workbook, order, sheets, sheet)
+        return
+    if op != "xlsx.reorder_sheet":
+        raise ValueError("Unsupported worksheet operation")
+    target_index = bounded_integer(operation["toIndex"], 0, len(order) - 1)
+    sheets.remove(sheet)
+    sheets.insert(target_index, sheet)
+    remap_sheet_indices(workbook, order, sheets)
+
+
+def excel_string_formula(text):
+    if type(text) in (int, float) and math.isfinite(text):
+        return str(text)
+    if not isinstance(text, str) or len(text) > 240 or any(c in text for c in "\r\n"):
+        raise ValueError("Use a bounded literal")
+    return '"' + text.replace('"', '""') + '"'
+
+
+def update_sheet_options(package, replacements, additions, operation):
+    part = operation["sheetPart"]
+    if not re.fullmatch(r"xl/worksheets/[^/]+\.xml", part):
+        raise ValueError("Invalid worksheet part")
+    sheet = load_edit_part(package, replacements, additions, part)
+    op = operation["op"]
+    if op == "xlsx.set_page_setup":
+        setup = sheet_node(sheet, "pageSetup")
+        orientation = operation.get("orientation", "portrait")
+        if orientation not in {"portrait", "landscape"}:
+            raise ValueError("Invalid worksheet orientation")
+        setup.set("orientation", orientation)
+        for key, limit in (("paperSize", 118), ("fitToWidth", 1000), ("fitToHeight", 1000), ("scale", 400)):
+            if key in operation:
+                setup.set(key, str(bounded_integer(operation[key], 10 if key == "scale" else 0, limit)))
+        if "fitToWidth" in operation or "fitToHeight" in operation:
+            props = sheet_node(sheet, "sheetPr")
+            xml_child(props, SPREADSHEET, "pageSetUpPr").set("fitToPage", "1")
+        return
+    reference = operation["range"]
+    bounds = bounded_sheet_range(reference)
+    if op == "xlsx.set_merge":
+        merges = sheet_node(sheet, "mergeCells")
+        existing = next((node for node in merges if node.get("ref") == reference), None)
+        if operation.get("merged", True):
+            if existing is not None:
+                return
+            if bounds[0] == bounds[1] or any(overlaps_rect(bounds, bounded_sheet_range(node.attrib["ref"])) for node in merges):
+                raise ValueError("Merge overlaps another region or contains one cell")
+            for cell in sheet.iter(tag(SPREADSHEET, "c")):
+                row, column = cell_coordinates(cell.attrib["r"])
+                if (row, column) != bounds[0] and bounds[0][0] <= row <= bounds[1][0] and bounds[0][1] <= column <= bounds[1][1]:
+                    if any(child.tag in {tag(SPREADSHEET, field) for field in ("v", "is", "f")} for child in cell):
+                        raise ValueError("Merge would hide cell content")
+            XML.SubElement(merges, tag(SPREADSHEET, "mergeCell"), ref=reference)
+        elif existing is not None:
+            merges.remove(existing)
+        if len(merges):
+            merges.set("count", str(len(merges)))
+        else:
+            sheet.remove(merges)
+    elif op == "xlsx.set_auto_filter":
+        auto_filter = sheet_node(sheet, "autoFilter")
+        if operation.get("enabled", True) is False:
+            sheet.remove(auto_filter)
+            return
+        auto_filter.set("ref", reference)
+        if "values" in operation:
+            index = str(bounded_integer(operation["column"], 0, bounds[1][1] - bounds[0][1]))
+            if not isinstance(operation["values"], list) or len(operation["values"]) > 500:
+                raise ValueError("Filter has too many values")
+            for entry in list(auto_filter):
+                if entry.get("colId") == index:
+                    auto_filter.remove(entry)
+            column = XML.Element(tag(SPREADSHEET, "filterColumn"), colId=index)
+            auto_filter.insert(0, column)
+            filters = XML.SubElement(column, tag(SPREADSHEET, "filters"))
+            for value in operation["values"]:
+                XML.SubElement(filters, tag(SPREADSHEET, "filter"), val=str(value)[:255])
+    elif op == "xlsx.set_data_validation":
+        validations = sheet_node(sheet, "dataValidations")
+        for existing in list(validations):
+            if existing.get("sqref") == reference:
+                validations.remove(existing)
+        if operation.get("enabled", True):
+            kind = operation["kind"]
+            validation = XML.SubElement(validations, tag(SPREADSHEET, "dataValidation"), type=kind, sqref=reference,
+                                        allowBlank="1", showErrorMessage="1")
+            if kind == "list":
+                values = operation["values"]
+                if not isinstance(values, list) or not values or any(not isinstance(v, str) or "," in v or '"' in v for v in values):
+                    raise ValueError("Expected a literal list without delimiters")
+                XML.SubElement(validation, tag(SPREADSHEET, "formula1")).text = excel_string_formula(",".join(values))
+            elif kind in {"whole", "decimal", "textLength"}:
+                lower, upper = operation["min"], operation["max"]
+                if any(type(n) not in (int, float) or not math.isfinite(n) for n in (lower, upper)) or lower > upper:
+                    raise ValueError("Invalid validation limits")
+                validation.set("operator", "between")
+                XML.SubElement(validation, tag(SPREADSHEET, "formula1")).text = str(lower)
+                XML.SubElement(validation, tag(SPREADSHEET, "formula2")).text = str(upper)
+            else:
+                raise ValueError("Unsupported validation rule")
+        if len(validations):
+            validations.set("count", str(len(validations)))
+        else:
+            sheet.remove(validations)
+    elif op == "xlsx.add_conditional_format":
+        priority = max([0] + [int(rule.attrib["priority"]) for rule in sheet.iter(tag(SPREADSHEET, "cfRule"))]) + 1
+        container = XML.Element(tag(SPREADSHEET, "conditionalFormatting"), sqref=reference)
+        next_tags = {tag(SPREADSHEET, name) for name in SHEET_CHILDREN[SHEET_CHILDREN.index("conditionalFormatting") + 1:]}
+        sheet.insert(next((i for i, child in enumerate(sheet) if child.tag in next_tags), len(sheet)), container)
+        rule = XML.SubElement(container, tag(SPREADSHEET, "cfRule"), type="colorScale", priority=str(priority))
+        scale = XML.SubElement(rule, tag(SPREADSHEET, "colorScale"))
+        for bound in ("min", "max"):
+            XML.SubElement(scale, tag(SPREADSHEET, "cfvo"), type=bound)
+        for color in (operation["minColor"], operation["maxColor"]):
+            if not re.fullmatch(r"[0-9A-Fa-f]{6}", color):
+                raise ValueError("Use a six-digit RGB color")
+            XML.SubElement(scale, tag(SPREADSHEET, "color"), rgb="FF" + color.upper())
+    else:
+        raise ValueError("Unsupported worksheet operation")
+
+
 def edit_workbook(package, operations, output):
     replacements = {}
+    additions = {}
+    removed = set()
     changes_cells = False
     for operation in operations:
         op = operation["op"]
         if op.startswith("chart."):
             changes_cells |= edit_chart(package, "xlsx", operation, replacements)
             continue
+        if op in {"xlsx.add_sheet", "xlsx.reorder_sheet", "xlsx.rename_sheet", "xlsx.remove_empty_sheet",
+                  "xlsx.set_sheet_visibility", "xlsx.set_defined_name"}:
+            update_sheet_metadata(package, replacements, additions, removed, operation)
+            changes_cells = True
+            continue
+        if op in {"xlsx.set_merge", "xlsx.add_conditional_format", "xlsx.set_data_validation", "xlsx.set_auto_filter", "xlsx.set_page_setup"}:
+            update_sheet_options(package, replacements, additions, operation)
+            continue
         changes_cells |= op != "xlsx.set_cell_style"
         if op in {"xlsx.mutate_rows", "xlsx.mutate_columns"}:
             mutate_workbook_grid(package, operation, replacements)
         else:
-            update_workbook_cell(package, operation, replacements)
-    removed = invalidate_calculation(package, replacements) if changes_cells else ()
-    write_package(package, replacements, output, "xlsx", removed)
+            update_workbook_cell(package, operation, replacements, additions)
+    if changes_cells:
+        removed.update(invalidate_calculation(package, replacements))
+    serialize_additions(package, replacements, additions, output, "xlsx", removed)
 
 
 def locate_or_insert_cell(sheet, address):
@@ -279,7 +598,7 @@ def assert_editable_cell(sheet, address):
             raise ValueError("Shared, table, and array formulas are protected")
 
 
-def update_workbook_cell(package, operation, replacements):
+def update_workbook_cell(package, operation, replacements, additions=None):
     op = operation["op"]
     if op not in {"xlsx.set_cell", "xlsx.set_formula", "xlsx.set_cell_style"}:
         raise ValueError("Unsupported XLSX operation")
@@ -291,9 +610,7 @@ def update_workbook_cell(package, operation, replacements):
     cell_coordinates(address)
     if type(value) not in (str, bool, int, float, type(None)):
         raise ValueError("Expected a scalar cell value")
-    sheet = replacements.get(sheet_name)
-    if sheet is None:
-        sheet = parse_xml(package.read(sheet_name))
+    sheet = load_edit_part(package, replacements, additions or {}, sheet_name)
     assert_editable_cell(sheet, address)
     cell = locate_or_insert_cell(sheet, address)
     if op == "xlsx.set_cell_style":
@@ -1025,10 +1342,278 @@ def update_word_page_layout(body, operation):
             columns.set(tag(WORD, "space"), str(bounded_integer(operation["columnGapTwips"], 0, 14400)))
 
 
+def xml_child(parent, namespace, name, before=(), **attributes):
+    node = parent.find(tag(namespace, name))
+    if node is None:
+        node = XML.Element(tag(namespace, name), **attributes)
+        later = {tag(namespace, sibling) for sibling in before}
+        offset = next((i for i, child in enumerate(parent) if child.tag in later), len(parent))
+        parent.insert(offset, node)
+    return node
+
+
+def load_edit_part(package, replacements, additions, part):
+    content = replacements.get(part)
+    if content is None:
+        content = parse_xml(additions[part] if part in additions else package.read(part))
+        replacements[part] = content
+    return content
+
+
+def add_package_part(package, replacements, additions, source, destination, relationship_type, content_type, data):
+    source_path = PurePosixPath(source)
+    relationship_path = str(source_path.parent / "_rels" / (source_path.name + ".rels"))
+    if relationship_path not in package.namelist() and relationship_path not in additions:
+        additions[relationship_path] = XML.tostring(XML.Element(tag(RELATIONSHIPS, "Relationships")))
+    relationships = load_edit_part(package, replacements, additions, relationship_path)
+    used = {node.get("Id") for node in relationships}
+    identifier = next(f"rId{i}" for i in range(1, len(used) + 2) if f"rId{i}" not in used)
+    XML.SubElement(relationships, tag(RELATIONSHIPS, "Relationship"), Id=identifier,
+                   Type=OFFICE_REL + "/" + relationship_type,
+                   Target=posixpath.relpath(destination, str(source_path.parent)))
+    types = load_edit_part(package, replacements, additions, "[Content_Types].xml")
+    XML.SubElement(types, tag(CONTENT_TYPES, "Override"), PartName="/" + destination, ContentType=content_type)
+    additions[destination] = data
+    return identifier
+
+
+def allocate_part(package, additions, prefix, suffix):
+    used = set(package.namelist()) | additions.keys()
+    return next(f"{prefix}{i}{suffix}" for i in range(1, len(used) + 2) if f"{prefix}{i}{suffix}" not in used)
+
+
+def serialize_additions(package, replacements, additions, output, fmt, removed=()):
+    prepared = {part: XML.tostring(replacements[part], encoding="UTF-8", xml_declaration=True)
+                if part in replacements else data for part, data in additions.items()}
+    write_package(package, replacements, output, fmt, removed, prepared)
+
+
+def safe_image(encoded):
+    from PIL import Image
+    if not isinstance(encoded, str) or len(encoded) > 8_000_000:
+        raise ValueError("Embedded image exceeds the input limit")
+    value = base64.b64decode(encoded, validate=True)
+    with Image.open(io.BytesIO(value)) as image:
+        image_size(image.size)
+        if image.format not in {"PNG", "JPEG"}:
+            raise ValueError("Use a PNG or JPEG image")
+        fmt = image.format.lower()
+        image.verify()
+    return value, fmt
+
+
+def word_text(node, text):
+    if not isinstance(text, str) or len(text) > 20_000 or "\n" in text or "\r" in text:
+        raise ValueError("Use one bounded line of text")
+    node.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    node.text = text
+
+
+def word_paragraph(text):
+    paragraph = XML.Element(tag(WORD, "p"))
+    run = XML.SubElement(paragraph, tag(WORD, "r"))
+    word_text(XML.SubElement(run, tag(WORD, "t")), text)
+    return paragraph
+
+
+def set_word_style(package, paragraph, style_id):
+    styles = parse_xml(package.read("word/styles.xml"))
+    if not any(style.get(tag(WORD, "styleId")) == style_id and style.get(tag(WORD, "type")) == "paragraph"
+               for style in styles.findall(tag(WORD, "style"))):
+        raise ValueError("Unknown paragraph style")
+    props = xml_child(paragraph, WORD, "pPr", ("r", "hyperlink", "sdt"))
+    style = xml_child(props, WORD, "pStyle", tuple(XML.QName(node).localname for node in props if isinstance(node.tag, str)))
+    style.set(tag(WORD, "val"), style_id)
+
+
+def word_block(body, operation, kind):
+    block = body[bounded_integer(operation["blockIndex"], 0, len(body) - 1)]
+    if block.tag != tag(WORD, kind):
+        raise ValueError(f"Selected block is not a {kind}")
+    return block
+
+
+def add_word_media(package, replacements, additions, source, paragraph, operation):
+    from docx import Document
+    from docx.shared import Pt
+
+    image, fmt = safe_image(operation["imageBase64"])
+    width = bounded_integer(operation.get("widthPt", 144), 1, 1000)
+    temporary = Document()
+    run = temporary.add_paragraph().add_run()
+    run.add_picture(io.BytesIO(image), width=Pt(width))
+    drawing = deepcopy(run._element)
+    rel = next(drawing.iter(tag(DRAWING, "blip")))
+    destination = allocate_part(package, additions, "word/media/artifact-image", "." + fmt)
+    rid = add_package_part(package, replacements, additions, source, destination, "image", f"image/{fmt}", image)
+    rel.set(tag(OFFICE_REL, "embed"), rid)
+    document = replacements[source]
+    used = {node.get("id") for node in document.iter() if isinstance(node.tag, str) and XML.QName(node).localname == "docPr"}
+    docpr = next(node for node in drawing.iter() if isinstance(node.tag, str) and XML.QName(node).localname == "docPr")
+    docpr.set("id", next(str(i) for i in range(1, len(used) + 2) if str(i) not in used))
+    paragraph.append(drawing)
+
+
+def add_word_header_footer(package, replacements, additions, body, operation):
+    kind = operation["kind"]
+    variant = operation.get("variant", "default")
+    if kind not in {"header", "footer"} or variant not in {"default", "first", "even"}:
+        raise ValueError("Invalid header or footer type")
+    section = body.find(tag(WORD, "sectPr"))
+    if section is None:
+        raise ValueError("Document has no terminal section")
+    ref_tag = tag(WORD, kind + "Reference")
+    if any(node.get(tag(WORD, "type")) == variant for node in section.findall(ref_tag)):
+        raise ValueError("The selected header or footer already exists")
+    root = XML.Element(tag(WORD, "hdr" if kind == "header" else "ftr"), nsmap={"w": WORD})
+    root.append(word_paragraph(operation["text"]))
+    name = allocate_part(package, additions, "word/" + kind, ".xml")
+    rid = add_package_part(package, replacements, additions, MAIN_PART["docx"], name, kind,
+                           f"application/vnd.openxmlformats-officedocument.wordprocessingml.{kind}+xml",
+                           XML.tostring(root))
+    reference = XML.Element(ref_tag)
+    reference.set(tag(WORD, "type"), variant)
+    reference.set(tag(OFFICE_REL, "id"), rid)
+    offset = sum(node.tag == tag(WORD, "headerReference") for node in section) if kind == "footer" else 0
+    section.insert(offset, reference)
+    if variant == "first":
+        xml_child(section, WORD, "titlePg", ("textDirection", "bidi", "rtlGutter", "docGrid", "sectPrChange"))
+    if variant == "even":
+        settings = load_edit_part(package, replacements, additions, "word/settings.xml")
+        xml_child(settings, WORD, "evenAndOddHeaders", ("bookFoldRevPrinting", "bookFoldPrinting", "defaultTableStyle",
+                                                       "characterSpacingControl", "compat", "docVars", "rsids"))
+
+
+def add_word_footnote(package, replacements, additions, body, operation):
+    paragraph = word_block(body, operation, "p")
+    part = "word/footnotes.xml"
+    if part not in package.namelist() and part not in additions:
+        root = XML.Element(tag(WORD, "footnotes"), nsmap={"w": WORD})
+        add_package_part(package, replacements, additions, MAIN_PART["docx"], part, "footnotes",
+                         "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml",
+                         XML.tostring(root))
+    root = load_edit_part(package, replacements, additions, part)
+    identifier = str(max([0] + [int(node.get(tag(WORD, "id"), "0")) for node in root]) + 1)
+    note = XML.SubElement(root, tag(WORD, "footnote"))
+    note.set(tag(WORD, "id"), identifier)
+    contents = word_paragraph(operation["text"])
+    mark = XML.Element(tag(WORD, "r"))
+    XML.SubElement(mark, tag(WORD, "footnoteRef"))
+    contents.insert(0, mark)
+    note.append(contents)
+    mark = XML.SubElement(XML.SubElement(paragraph, tag(WORD, "r")), tag(WORD, "footnoteReference"))
+    mark.set(tag(WORD, "id"), identifier)
+
+
+def word_edit_extra(package, replacements, additions, body, operation):
+    source = MAIN_PART["docx"]
+    op = operation["op"]
+    if op == "docx.add_paragraph":
+        paragraph = word_paragraph(operation["text"])
+        if "styleId" in operation:
+            set_word_style(package, paragraph, operation["styleId"])
+        if "headingLevel" in operation:
+            set_word_style(package, paragraph, f"Heading{bounded_integer(operation['headingLevel'], 1, 9)}")
+        section = body.find(tag(WORD, "sectPr"))
+        body.insert(body.index(section) if section is not None else len(body), paragraph)
+    elif op == "docx.set_paragraph_style":
+        set_word_style(package, word_block(body, operation, "p"), operation["styleId"])
+    elif op == "docx.set_run_style":
+        block = word_block(body, operation, "p")
+        runs = block.findall(tag(WORD, "r"))
+        run = runs[bounded_integer(operation["runIndex"], 0, len(runs) - 1)]
+        if not run.findall(tag(WORD, "t")) or any(node.tag not in {tag(WORD, "t"), tag(WORD, "rPr")} for node in run):
+            raise ValueError("Select an unprotected text run")
+        props = xml_child(run, WORD, "rPr", ("t",))
+        trailing = ("color", "spacing", "w", "kern", "position", "sz", "szCs", "highlight", "u", "shd", "vertAlign", "lang", "rPrChange")
+        for option, element in (("bold", "b"), ("italic", "i")):
+            if option in operation:
+                xml_child(props, WORD, element, (("i", "iCs") if option == "bold" else ("iCs",)) + trailing).set(
+                    tag(WORD, "val"), "1" if operation[option] is True else "0")
+        if "fontSizePt" in operation:
+            xml_child(props, WORD, "sz", ("szCs", "highlight", "u", "shd", "vertAlign", "lang", "rPrChange")).set(
+                tag(WORD, "val"), str(bounded_integer(operation["fontSizePt"], 1, 400) * 2))
+        if "color" in operation:
+            color = operation["color"]
+            if not re.fullmatch(r"[0-9A-Fa-f]{6}", color):
+                raise ValueError("Use a six-digit RGB color")
+            node = xml_child(props, WORD, "color", trailing[1:])
+            node.attrib.clear()
+            node.set(tag(WORD, "val"), color.upper())
+        if "fontFamily" in operation:
+            font = operation["fontFamily"][:128]
+            fonts = xml_child(props, WORD, "rFonts", ("b", "bCs", "i", "iCs") + trailing)
+            for field in ("ascii", "hAnsi", "eastAsia", "cs"):
+                fonts.set(tag(WORD, field), font)
+    elif op == "docx.set_list":
+        paragraph = word_block(body, operation, "p")
+        numbering = parse_xml(package.read("word/numbering.xml"))
+        number = str(bounded_integer(operation["numberingId"], 1, 65535))
+        if not any(node.get(tag(WORD, "numId")) == number for node in numbering.findall(tag(WORD, "num"))):
+            raise ValueError("Unknown numbering definition")
+        props = xml_child(paragraph, WORD, "pPr", ("r", "hyperlink", "sdt"))
+        num = xml_child(props, WORD, "numPr", ("suppressLineNumbers", "pBdr", "shd", "tabs", "spacing", "ind", "jc"))
+        xml_child(num, WORD, "ilvl", ("numId",)).set(tag(WORD, "val"), str(bounded_integer(operation.get("level", 0), 0, 8)))
+        xml_child(num, WORD, "numId").set(tag(WORD, "val"), number)
+    elif op == "docx.add_table":
+        from docx import Document
+        rows = operation["rows"]
+        columns = len(rows[0]) if rows else 0
+        if not 1 <= len(rows) <= 100 or not 1 <= columns <= 30 or any(len(row) != columns for row in rows):
+            raise ValueError("Expected a bounded rectangular table")
+        temporary = Document()
+        table = temporary.add_table(rows=len(rows), cols=columns)
+        for i, row in enumerate(rows):
+            for j, value in enumerate(row):
+                word_text(XML.SubElement(XML.SubElement(table.cell(i, j).paragraphs[0]._p, tag(WORD, "r")), tag(WORD, "t")), value)
+        section = body.find(tag(WORD, "sectPr"))
+        body.insert(body.index(section) if section is not None else len(body), deepcopy(table._tbl))
+    elif op == "docx.set_table_cell":
+        table = word_block(body, operation, "tbl")
+        rows = table.findall(tag(WORD, "tr"))
+        row = rows[bounded_integer(operation["row"], 0, len(rows) - 1)]
+        cells = row.findall(tag(WORD, "tc"))
+        cell = cells[bounded_integer(operation["column"], 0, len(cells) - 1)]
+        texts = cell.findall("./" + tag(WORD, "p") + "/" + tag(WORD, "r") + "/" + tag(WORD, "t"))
+        if len(texts) != 1:
+            raise ValueError("The cell needs one editable text node")
+        word_text(texts[0], operation["text"])
+    elif op == "docx.add_image":
+        add_word_media(package, replacements, additions, source, word_block(body, operation, "p"), operation)
+    elif op == "docx.add_header_footer":
+        add_word_header_footer(package, replacements, additions, body, operation)
+    elif op == "docx.add_footnote":
+        add_word_footnote(package, replacements, additions, body, operation)
+    elif op == "docx.patch_xml_text":
+        paragraph = word_block(body, operation, "p")
+        texts = paragraph.findall("./" + tag(WORD, "r") + "/" + tag(WORD, "t"))
+        text = texts[bounded_integer(operation["textIndex"], 0, len(texts) - 1)]
+        if (text.text or "") != operation["expectedText"]:
+            raise ValueError("Selected XML text no longer matches")
+        word_text(text, operation["text"])
+    elif op in {"docx.edit_header_footer", "docx.edit_footnote"}:
+        part = operation["part"]
+        pattern = r"word/(?:header|footer)[0-9]+\.xml" if op == "docx.edit_header_footer" else r"word/footnotes\.xml"
+        if not re.fullmatch(pattern, part):
+            raise ValueError("Invalid Word related part")
+        root = load_edit_part(package, replacements, additions, part)
+        if op == "docx.edit_footnote":
+            identifier = str(bounded_integer(operation["footnoteId"], 1, 65535))
+            root = next((note for note in root if note.get(tag(WORD, "id")) == identifier), None)
+            if root is None:
+                raise ValueError("Unknown footnote")
+        texts = root.findall("./" + tag(WORD, "p") + "/" + tag(WORD, "r") + "/" + tag(WORD, "t"))
+        word_text(texts[bounded_integer(operation["textIndex"], 0, len(texts) - 1)], operation["text"])
+    else:
+        raise ValueError("Unsupported Word operation")
+
+
 def edit_word(package, operations, output):
     main_part = MAIN_PART["docx"]
     document = parse_xml(package.read(main_part))
     body = document.find(tag(WORD, "body"))
+    replacements = {main_part: document}
+    additions = {}
     for operation in operations:
         op = operation["op"]
         if op == "docx.set_paragraph_text":
@@ -1050,8 +1635,8 @@ def edit_word(package, operations, output):
         elif op in {"docx.set_page_size", "docx.set_page_layout"}:
             update_word_page_layout(body, operation)
         else:
-            raise ValueError("Unsupported Word operation")
-    write_package(package, {main_part: document}, output, "docx")
+            word_edit_extra(package, replacements, additions, body, operation)
+    serialize_additions(package, replacements, additions, output, "docx")
 
 
 CHART = "http://schemas.openxmlformats.org/drawingml/2006/chart"
@@ -1419,22 +2004,262 @@ def presentation_layer(package, part, next_relation, depth=0):
                       "shapes": pptx_shape_order(tree)}]
 
 
+def pptx_append_shape(package, slide, tree, replacements, additions, operation):
+    from pptx import Presentation as SlideDocument
+    from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
+    from pptx.util import Pt
+
+    bounds = operation["boundsPt"]
+    if not isinstance(bounds, list) or len(bounds) != 4:
+        raise ValueError("Expected x, y, width, height in points")
+    x, y, width, height = [Pt(bounded_integer(v, -14400 if i < 2 else 1, 14400))
+                           for i, v in enumerate(bounds)]
+    temporary = SlideDocument()
+    shapes = temporary.slides.add_slide(temporary.slide_layouts[6]).shapes
+    op = operation["op"]
+    if op == "pptx.add_shape":
+        kind = {"rectangle": MSO_AUTO_SHAPE_TYPE.RECTANGLE, "ellipse": MSO_AUTO_SHAPE_TYPE.OVAL,
+                "rounded_rectangle": MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE}[operation["kind"]]
+        shape = shapes.add_shape(kind, x, y, width, height)
+        shape.text = operation.get("text", "")[:20_000]
+    elif op == "pptx.add_image":
+        image, fmt = safe_image(operation["imageBase64"])
+        shape = shapes.add_picture(io.BytesIO(image), x, y, width, height)
+    else:
+        rows = operation["rows"]
+        count = len(rows[0]) if rows else 0
+        if not 1 <= len(rows) <= 100 or not 1 <= count <= 30 or any(len(row) != count for row in rows):
+            raise ValueError("Expected a bounded rectangular table")
+        shape = shapes.add_table(len(rows), count, x, y, width, height)
+        for i, row in enumerate(rows):
+            for j, text in enumerate(row):
+                shape.table.cell(i, j).text = text[:20_000]
+    element = deepcopy(shape.element)
+    used = {node.get("id") for node in tree.iter(tag(PRESENTATION, "cNvPr"))}
+    properties = next(element.iter(tag(PRESENTATION, "cNvPr")))
+    properties.set("id", next(str(i) for i in range(1, len(used) + 2) if str(i) not in used))
+    if op == "pptx.add_image":
+        target = allocate_part(package, additions, "ppt/media/artifact-image", "." + fmt)
+        rid = add_package_part(package, replacements, additions, slide, target, "image", f"image/{fmt}", image)
+        next(element.iter(tag(DRAWING, "blip"))).set(tag(OFFICE_REL, "embed"), rid)
+    extension = tree.find(tag(PRESENTATION, "extLst"))
+    tree.insert(tree.index(extension) if extension is not None else len(tree), element)
+
+
+def pptx_edit_slide_list(package, replacements, additions, operation):
+    source = MAIN_PART["pptx"]
+    root = load_edit_part(package, replacements, additions, source)
+    slides = xml_child(root, PRESENTATION, "sldIdLst", ("sldSz", "notesSz", "defaultTextStyle", "extLst"))
+    if operation["op"] == "pptx.add_slide":
+        layout = operation["layoutPart"]
+        if not re.fullmatch(r"ppt/slideLayouts/slideLayout[0-9]+\.xml", layout) or layout not in package.namelist():
+            raise ValueError("Unknown slide layout")
+        target = allocate_part(package, additions, "ppt/slides/slide", ".xml")
+        root = XML.Element(tag(PRESENTATION, "sld"), nsmap={"p": PRESENTATION, "a": DRAWING, "r": OFFICE_REL})
+        tree = XML.SubElement(XML.SubElement(root, tag(PRESENTATION, "cSld")), tag(PRESENTATION, "spTree"))
+        nonvisual = XML.SubElement(tree, tag(PRESENTATION, "nvGrpSpPr"))
+        XML.SubElement(nonvisual, tag(PRESENTATION, "cNvPr"), id="1", name="")
+        XML.SubElement(nonvisual, tag(PRESENTATION, "cNvGrpSpPr"))
+        XML.SubElement(nonvisual, tag(PRESENTATION, "nvPr"))
+        XML.SubElement(tree, tag(PRESENTATION, "grpSpPr"))
+        rid = add_package_part(package, replacements, additions, source, target, "slide",
+                               "application/vnd.openxmlformats-officedocument.presentationml.slide+xml",
+                               XML.tostring(root))
+        rels = XML.Element(tag(RELATIONSHIPS, "Relationships"))
+        XML.SubElement(rels, tag(RELATIONSHIPS, "Relationship"), Id="rId1", Type=OFFICE_REL + "/slideLayout",
+                       Target=posixpath.relpath(layout, "ppt/slides"))
+        additions[f"ppt/slides/_rels/{PurePosixPath(target).name}.rels"] = XML.tostring(rels)
+        slide_id = max([255] + [int(slide.attrib["id"]) for slide in slides]) + 1
+        slide = XML.Element(tag(PRESENTATION, "sldId"), id=str(slide_id))
+        slide.set(tag(OFFICE_REL, "id"), rid)
+        slides.insert(bounded_integer(operation.get("index", len(slides)), 0, len(slides)), slide)
+    else:
+        current = bounded_integer(operation["index"], 0, len(slides) - 1)
+        slide = slides[current]
+        if operation["op"] == "pptx.remove_slide":
+            if len(slides) == 1:
+                raise ValueError("A presentation must retain at least one slide")
+            slides.remove(slide)
+        else:
+            index = bounded_integer(operation["toIndex"], 0, len(slides) - 1)
+            slides.remove(slide)
+            slides.insert(index, slide)
+
+
+def pptx_group(tree, operation):
+    identifiers = {str(identifier) for identifier in operation["shapeIds"]}
+    shapes = []
+    for shape in tree:
+        node = shape.find("./*/" + tag(PRESENTATION, "cNvPr"))
+        if node is not None and node.get("id") in identifiers:
+            if shape.tag not in {tag(PRESENTATION, name) for name in ("sp", "pic", "cxnSp", "grpSp")}:
+                raise ValueError("The selected shape cannot be grouped")
+            shapes.append(shape)
+    if len(shapes) != len(identifiers) or len(shapes) < 2:
+        raise ValueError("Select at least two distinct top-level shapes")
+    offsets = [tree.index(shape) for shape in shapes]
+    if offsets != list(range(offsets[0], offsets[0] + len(shapes))):
+        raise ValueError("Group a contiguous range to preserve stacking order")
+    used = {node.get("id") for node in tree.iter(tag(PRESENTATION, "cNvPr"))}
+    group = XML.Element(tag(PRESENTATION, "grpSp"))
+    nv = XML.SubElement(group, tag(PRESENTATION, "nvGrpSpPr"))
+    XML.SubElement(nv, tag(PRESENTATION, "cNvPr"), id=next(str(i) for i in range(1, len(used) + 2) if str(i) not in used), name="Group")
+    XML.SubElement(nv, tag(PRESENTATION, "cNvGrpSpPr"))
+    XML.SubElement(nv, tag(PRESENTATION, "nvPr"))
+    rectangles = []
+    for shape in shapes:
+        coordinates = shape_transform(shape)
+        if not coordinates or not coordinates.get("geomBoundsPt"):
+            raise ValueError("Every grouped shape needs explicit geometry")
+        rectangles.append(coordinates["geomBoundsPt"])
+    transform = XML.SubElement(XML.SubElement(group, tag(PRESENTATION, "grpSpPr")), tag(DRAWING, "xfrm"))
+    x = min(box["x"] for box in rectangles)
+    y = min(box["y"] for box in rectangles)
+    width = max(box["x"] + box["width"] for box in rectangles) - x
+    height = max(box["y"] + box["height"] for box in rectangles) - y
+    for name in ("off", "chOff"):
+        XML.SubElement(transform, tag(DRAWING, name), x=str(round(x * 12700)), y=str(round(y * 12700)))
+    for name in ("ext", "chExt"):
+        XML.SubElement(transform, tag(DRAWING, name), cx=str(max(1, round(width * 12700))),
+                       cy=str(max(1, round(height * 12700))))
+    tree.insert(offsets[0], group)
+    for shape in shapes:
+        group.append(shape)
+
+
+def pptx_style(shape, operation):
+    if shape.tag != tag(PRESENTATION, "sp"):
+        raise ValueError("Style editing requires a basic shape")
+    properties = shape.find(tag(PRESENTATION, "spPr"))
+    if "fill" in operation:
+        color = operation["fill"]
+        if not re.fullmatch(r"[0-9A-Fa-f]{6}", color):
+            raise ValueError("Use a six-digit RGB color")
+        fills = {"noFill", "solidFill", "gradFill", "blipFill", "pattFill", "grpFill"}
+        for child in list(properties):
+            if isinstance(child.tag, str) and XML.QName(child).localname in fills:
+                properties.remove(child)
+        fill = xml_child(properties, DRAWING, "solidFill", ("ln", "effectLst", "effectDag", "scene3d", "sp3d", "extLst"))
+        rgb = XML.SubElement(fill, tag(DRAWING, "srgbClr"), val=color.upper())
+        if "opacityPercent" in operation:
+            XML.SubElement(rgb, tag(DRAWING, "alpha"), val=str(bounded_integer(operation["opacityPercent"], 0, 100) * 1000))
+    if "rotationDegrees" in operation:
+        transform = xml_child(properties, DRAWING, "xfrm", tuple(XML.QName(node).localname for node in properties if isinstance(node.tag, str)))
+        transform.set("rot", str((bounded_integer(operation["rotationDegrees"], -360, 360) % 360) * 60000))
+    if "shadow" in operation:
+        if properties.find(tag(DRAWING, "effectDag")) is not None:
+            raise ValueError("The shape has a protected effect graph")
+        effects = xml_child(properties, DRAWING, "effectLst", ("scene3d", "sp3d", "extLst"))
+        current = effects.find(tag(DRAWING, "outerShdw"))
+        if current is not None:
+            effects.remove(current)
+        if operation["shadow"] is True:
+            shadow = XML.SubElement(effects, tag(DRAWING, "outerShdw"), blurRad="38100", dist="25400", dir="2700000")
+            shade = XML.SubElement(shadow, tag(DRAWING, "srgbClr"), val="000000")
+            XML.SubElement(shade, tag(DRAWING, "alpha"), val="35000")
+    if "fontSizePt" in operation or "bold" in operation or "italic" in operation or "fontFamily" in operation:
+        for run in shape.iter(tag(DRAWING, "r")):
+            props = xml_child(run, DRAWING, "rPr", ("t",))
+            if "fontSizePt" in operation:
+                props.set("sz", str(bounded_integer(operation["fontSizePt"], 1, 400) * 100))
+            for key, attr in (("bold", "b"), ("italic", "i")):
+                if key in operation:
+                    props.set(attr, "1" if operation[key] is True else "0")
+            if "fontFamily" in operation:
+                xml_child(props, DRAWING, "latin", ("ea", "cs", "sym", "hlinkClick", "hlinkMouseOver", "extLst")).set(
+                    "typeface", operation["fontFamily"][:128])
+
+
+def ensure_pptx_notes(package, slide, replacements, additions):
+    from pptx import Presentation as SlideDocument
+    relation_path = f"ppt/slides/_rels/{PurePosixPath(slide).name}.rels"
+    relationships = load_edit_part(package, replacements, additions, relation_path)
+    notes = [resolve_relationship("ppt/slides", node.attrib["Target"]) for node in relationships
+             if node.get("Type", "").endswith("/notesSlide")]
+    if len(notes) == 1:
+        return load_edit_part(package, replacements, additions, notes[0])
+    if notes:
+        raise ValueError("Ambiguous notes part")
+    temporary = SlideDocument()
+    factory_slide = temporary.slides.add_slide(temporary.slide_layouts[6])
+    factory_slide.notes_slide.notes_text_frame.text = ""
+    template_bytes = io.BytesIO()
+    temporary.save(template_bytes)
+    with zipfile.ZipFile(template_bytes) as template:
+        document = load_edit_part(package, replacements, additions, MAIN_PART["pptx"])
+        relationship_part = "ppt/_rels/presentation.xml.rels"
+        pres_rels = load_edit_part(package, replacements, additions, relationship_part)
+        masters = [resolve_relationship("ppt", node.attrib["Target"]) for node in pres_rels
+                   if node.get("Type", "").endswith("/notesMaster")]
+        if len(masters) > 1:
+            raise ValueError("Ambiguous notes master")
+        if masters:
+            master = masters[0]
+        else:
+            original_master = "ppt/notesMasters/notesMaster1.xml"
+            theme = next(target for kind, target in package_relationships(template, original_master).values()
+                         if kind.endswith("/theme"))
+            master = allocate_part(package, additions, "ppt/notesMasters/notesMaster", ".xml")
+            master_rid = add_package_part(package, replacements, additions, MAIN_PART["pptx"], master,
+                "notesMaster", "application/vnd.openxmlformats-officedocument.presentationml.notesMaster+xml",
+                template.read(original_master))
+            master_list = xml_child(document, PRESENTATION, "notesMasterIdLst",
+                                    ("handoutMasterIdLst", "sldIdLst", "sldSz", "notesSz", "defaultTextStyle", "extLst"))
+            XML.SubElement(master_list, tag(PRESENTATION, "notesMasterId")).set(tag(OFFICE_REL, "id"), master_rid)
+            target_theme = allocate_part(package, additions, "ppt/theme/theme", ".xml")
+            add_package_part(package, replacements, additions, master, target_theme,
+                             "theme", "application/vnd.openxmlformats-officedocument.theme+xml", template.read(theme))
+
+        part = allocate_part(package, additions, "ppt/notesSlides/notesSlide", ".xml")
+        add_package_part(package, replacements, additions, slide, part, "notesSlide",
+                         "application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml",
+                         template.read("ppt/notesSlides/notesSlide1.xml"))
+        rels = XML.Element(tag(RELATIONSHIPS, "Relationships"))
+        for index, kind, destination in ((1, "notesMaster", master), (2, "slide", slide)):
+            XML.SubElement(rels, tag(RELATIONSHIPS, "Relationship"), Id=f"rId{index}", Type=OFFICE_REL + "/" + kind,
+                           Target=posixpath.relpath(destination, "ppt/notesSlides"))
+        additions[f"ppt/notesSlides/_rels/{PurePosixPath(part).name}.rels"] = XML.tostring(rels)
+        return load_edit_part(package, replacements, additions, part)
+
+
 def edit_presentation(package, operations, output):
     replacements = {}
+    additions = {}
     for operation in operations:
-        if operation["op"].startswith("chart."):
+        op = operation["op"]
+        if op in {"pptx.add_slide", "pptx.reorder_slide", "pptx.remove_slide"}:
+            pptx_edit_slide_list(package, replacements, additions, operation)
+            continue
+        if op.startswith("chart."):
             edit_chart(package, "pptx", operation, replacements)
             continue
         slide = operation["slidePart"]
         if not re.fullmatch(r"ppt/slides/[^/]+\.xml", slide):
             raise ValueError("Invalid slide part")
-        root = replacements.get(slide)
-        if root is None:
-            root = parse_xml(package.read(slide))
-        if operation["op"] == "pptx.smartart.update_node_text":
+        root = load_edit_part(package, replacements, additions, slide)
+        if op == "pptx.smartart.update_node_text":
             edit_smartart_text(package, operation, root, replacements)
             continue
         tree = root.find(".//" + tag(PRESENTATION, "spTree"))
+        if op in {"pptx.add_shape", "pptx.add_image", "pptx.add_table"}:
+            pptx_append_shape(package, slide, tree, replacements, additions, operation)
+            continue
+        if op == "pptx.group_shapes":
+            pptx_group(tree, operation)
+            continue
+        if op == "pptx.set_notes":
+            notes = ensure_pptx_notes(package, slide, replacements, additions)
+            body = next((shape for shape in notes.iter(tag(PRESENTATION, "sp"))
+                         if any(ph.get("type") == "body" for ph in shape.iter(tag(PRESENTATION, "ph")))), None)
+            if body is None:
+                raise ValueError("The slide has no editable notes placeholder")
+            tx = body.find(tag(PRESENTATION, "txBody"))
+            for para in list(tx.findall(tag(DRAWING, "p"))):
+                tx.remove(para)
+            for line in (operation["text"][:20_000].splitlines() or [""]):
+                para = XML.SubElement(tx, tag(DRAWING, "p"))
+                XML.SubElement(XML.SubElement(para, tag(DRAWING, "r")), tag(DRAWING, "t")).text = line
+            continue
         shapes = []
         for shape in tree:
             properties = shape.find("./*/" + tag(PRESENTATION, "cNvPr"))
@@ -1451,7 +2276,47 @@ def edit_presentation(package, operations, output):
             if text is None:
                 raise ValueError("Shape has no editable text")
             text.text = operation["text"][:20_000]
-        elif operation["op"] == "pptx.move_shape":
+        elif op == "pptx.set_shape_style":
+            pptx_style(shape, operation)
+        elif op == "pptx.ungroup_shapes":
+            coordinates = shape_transform(shape)
+            if shape.tag != tag(PRESENTATION, "grpSp") or not coordinates or \
+                    coordinates.get("off") != coordinates.get("chOff") or coordinates.get("ext") != coordinates.get("chExt") or \
+                    coordinates["rotationDegrees"] or coordinates["flipH"] or coordinates["flipV"]:
+                raise ValueError("Ungrouping requires an identity group transform")
+            offset = tree.index(shape)
+            children = [node for node in shape if node.find("./*/" + tag(PRESENTATION, "cNvPr")) is not None]
+            for child in children:
+                tree.insert(offset, child)
+                offset += 1
+            tree.remove(shape)
+        elif op == "pptx.set_shape_bounds":
+            box = operation["boundsPt"]
+            if not isinstance(box, list) or len(box) != 4:
+                raise ValueError("Expected x, y, width, and height in points")
+            x, y, width, height = [bounded_integer(value, -14400 if i < 2 else 1, 14400) * 12700
+                                   for i, value in enumerate(box)]
+            transform = next((node for node in (
+                shape.find("./" + tag(PRESENTATION, "spPr") + "/" + tag(DRAWING, "xfrm")),
+                shape.find("./" + tag(PRESENTATION, "grpSpPr") + "/" + tag(DRAWING, "xfrm")),
+                shape.find(tag(PRESENTATION, "xfrm")),
+            ) if node is not None), None)
+            if transform is None:
+                raise ValueError("Shape has no explicit transform")
+            xml_child(transform, DRAWING, "off", ("ext", "chOff", "chExt")).attrib.update({"x": str(x), "y": str(y)})
+            xml_child(transform, DRAWING, "ext", ("chOff", "chExt")).attrib.update({"cx": str(width), "cy": str(height)})
+        elif op == "pptx.set_table_cell":
+            table = shape.find(".//" + tag(DRAWING, "tbl"))
+            if table is None:
+                raise ValueError("The shape is not a table")
+            rows = table.findall(tag(DRAWING, "tr"))
+            cells = rows[bounded_integer(operation["row"], 0, len(rows) - 1)].findall(tag(DRAWING, "tc"))
+            target = cells[bounded_integer(operation["column"], 0, len(cells) - 1)]
+            texts = list(target.iter(tag(DRAWING, "t")))
+            if len(texts) != 1:
+                raise ValueError("The cell needs one editable text node")
+            texts[0].text = operation["text"][:20_000]
+        elif op == "pptx.move_shape":
             index = bounded_integer(operation["zOrder"], 0, len(pptx_shape_order(tree)) - 1)
             peers = [node for node in tree if node.find("./*/" + tag(PRESENTATION, "cNvPr")) is not None]
             tree.remove(shape)
@@ -1464,7 +2329,7 @@ def edit_presentation(package, operations, output):
         else:
             raise ValueError("Unsupported presentation operation")
         replacements[slide] = root
-    write_package(package, replacements, output, "pptx")
+    serialize_additions(package, replacements, additions, output, "pptx")
 
 
 SPREADSHEET_DRAWING = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
@@ -1925,6 +2790,308 @@ def export_docx(source, output, target):
                     "--output", str(output), str(source)], check=True)
 
 
+def verify_office_render(source, fmt, result, finding):
+    if not shutil.which("libreoffice") or not shutil.which("pdftotext"):
+        result("rendered_page_bounds", "unverified", "LibreOffice or pdftotext is unavailable.")
+        return
+    output = Path.cwd() / "verification.pdf"
+    bbox = Path.cwd() / "verification-bounds.xhtml"
+    try:
+        render_office(source, output, {"format": fmt, "action": "export", "targetFormat": "pdf"})
+        subprocess.run(["pdftotext", "-f", "1", "-l", "20", "-bbox", str(output), str(bbox)], check=True)
+        root = XML.parse(str(bbox), XML.XMLParser(no_network=True, resolve_entities=False, load_dtd=False))
+        pages = root.findall(".//{*}page")
+        if not pages:
+            result("rendered_page_bounds", "unverified", "The rendered PDF has no measurable pages.")
+            return
+    except (OSError, XML.XMLSyntaxError, subprocess.CalledProcessError):
+        result("rendered_page_bounds", "unverified", "The document could not be converted to a measurable PDF.")
+        return
+    outside = 0
+    word_count = 0
+    for index, page in enumerate(pages):
+        width, height = float(page.attrib["width"]), float(page.attrib["height"])
+        for word in page.findall(".//{*}word"):
+            word_count += 1
+            x_min, y_min, x_max, y_max = (float(word.attrib[key]) for key in ("xMin", "yMin", "xMax", "yMax"))
+            if x_min < -1 or y_min < -1 or x_max > width + 1 or y_max > height + 1:
+                outside += 1
+                finding("warning", "rendered_text_outside_page", f"page:{index + 1}", "A rendered glyph box extends past the page.")
+    result("rendered_page_bounds", "failed" if outside else ("passed" if word_count else "unverified"),
+           f"Sampled {len(pages)} pages (limit 20), {word_count} word boxes, {outside} outside page bounds.")
+
+
+def verify_office(package, source, fmt, names):
+    issues = []
+    checks = []
+
+    def result(identifier, status, evidence):
+        checks.append({"id": identifier, "status": status, "evidence": evidence})
+
+    def finding(severity, code, location, message):
+        if len(issues) < 200:
+            issues.append({"severity": severity, "code": code, "location": location, "message": message})
+
+    result("package_structure", "passed", f"Validated {len(names)} archive entries, content types and internal relationship targets.")
+    result("archive_security", "passed", "Checked archive limits, entry paths, encryption and XML document types.")
+    # A bounded structural check. External links are reported without following them.
+    external = 0
+    active = 0
+    missing_refs = 0
+    main = parse_xml(package.read(MAIN_PART[fmt]))
+    for part in sorted(names):
+        if re.search(r"(^|/)(vbaproject\.bin|activex|embeddings)(/|$)", part, re.I):
+            active += 1
+        if part.endswith(".rels"):
+            external += sum(node.get("TargetMode") == "External" for node in parse_xml(package.read(part)))
+        if not part.endswith(".xml"):
+            continue
+        root = parse_xml(package.read(part))
+        refs = {value for node in root.iter() for key, value in node.attrib.items()
+                if key.startswith("{" + OFFICE_REL + "}") and value}
+        if refs:
+            rels = package_relationships(package, part)
+            parent = PurePosixPath(part).parent
+            rel_path = str(parent / "_rels" / (PurePosixPath(part).name + ".rels"))
+            identifiers = set(rels)
+            if rel_path in names:
+                identifiers.update(node.get("Id") for node in parse_xml(package.read(rel_path)))
+            for invalid in sorted(refs - identifiers):
+                missing_refs += 1
+                finding("error", "missing_xml_relationship", part, f"Relationship {invalid} is not defined for this part.")
+    result("relationship_ids", "failed" if missing_refs else "passed", f"Unresolved XML relationship IDs: {missing_refs}.")
+    if external or active:
+        finding("warning", "active_or_external_content", MAIN_PART[fmt],
+                f"External relationships: {external}. Macro, ActiveX or embedded entries: {active}.")
+    result("active_content_scan", "passed",
+           f"Counted {external} external relationships and {active} potentially active or embedded entries.")
+    result("active_content_behavior", "unverified", "Executable behavior and embedded document contents were not evaluated.")
+
+    if fmt == "pptx":
+        size = main.find(tag(PRESENTATION, "sldSz"))
+        dimensions = (int(size.attrib["cx"]) / 12700, int(size.attrib["cy"]) / 12700)
+        outside, overlaps, omitted = verify_slide_geometry(package, main, dimensions, finding)
+        result("slide_bounds", "failed" if outside else ("unverified" if omitted else "passed"),
+               f"Out-of-bounds top-level shapes: {outside}. Shapes without measurable bounds or inherited/group transforms: {omitted}.")
+        result("shape_overlap", "failed" if overlaps else ("unverified" if omitted else "passed"),
+               f"Top-level bounding boxes overlap in {overlaps} pairs. Intentional layering requires inspection.")
+        result("text_overflow", "unverified", "Office text fitting and clipping require visual evaluation of content within each shape.")
+        result("visual_fidelity", "unverified", "No reference rendering was supplied for comparison.")
+    elif fmt == "docx":
+        body = main.find(tag(WORD, "body"))
+        sections = list(body.iter(tag(WORD, "sectPr"))) if body is not None else []
+        bad = 0
+        for index, section in enumerate(sections):
+            size = section.find(tag(WORD, "pgSz"))
+            margins = section.find(tag(WORD, "pgMar"))
+            if size is None or margins is None:
+                continue
+            width, height = (int(size.get(tag(WORD, attr), "0")) for attr in ("w", "h"))
+            left, right, top, bottom, gutter = (int(margins.get(tag(WORD, attr), "0")) for attr in
+                                                ("left", "right", "top", "bottom", "gutter"))
+            if width <= left + right + gutter or height <= abs(top) + abs(bottom):
+                bad += 1
+                finding("error", "invalid_page_area", f"section:{index + 1}", "Margins leave no positive area for body text.")
+        result("section_dimensions", "failed" if bad else ("passed" if sections else "unverified"),
+               f"Inspected geometry of {len(sections)} sections where page size and margins were specified.")
+        verify_word_references(package, names, main, result, finding)
+        result("pagination_and_visual_quality", "unverified", "Pagination, line wrapping and visual overflow require a rendered comparison.")
+    elif fmt == "xlsx":
+        verify_workbook_formulas(package, main, result, finding)
+        result("visual_clipping", "unverified", "Cell and print clipping require font metrics and a rendered comparison.")
+    if fmt in {"pptx", "docx"}:
+        if external or any(re.search(r"(^|/)(vbaproject\.bin|activex)(/|$)", part, re.I) for part in names):
+            result("rendered_page_bounds", "unverified", "Rendering was skipped because the package has external links or active content.")
+        else:
+            verify_office_render(source, fmt, result, finding)
+    return {"ok": not any(check["status"] == "failed" for check in checks),
+            "coverage": "partial" if any(check["status"] == "unverified" for check in checks) else "complete",
+            "checks": checks, "issues": issues, "metrics": {"packageParts": len(names)}}
+
+
+def verify_slide_geometry(package, root, size, finding):
+    outside = overlaps = omitted = 0
+    for slide in presentation_slides(package, root):
+        content = parse_xml(package.read(slide["part"]))
+        tree = content.find(".//" + tag(PRESENTATION, "spTree"))
+        boxes = []
+        for shape in pptx_shape_order(tree):
+            transform = shape["transform"]
+            if not transform or "geomBoundsPt" not in transform or shape["children"]:
+                omitted += 1
+                continue
+            geom = transform["geomBoundsPt"]
+            x, y, width, height = (geom[key] for key in ("x", "y", "width", "height"))
+            radians = math.radians(transform["rotationDegrees"])
+            half_width = (abs(math.cos(radians)) * width + abs(math.sin(radians)) * height) / 2
+            half_height = (abs(math.sin(radians)) * width + abs(math.cos(radians)) * height) / 2
+            box = ((x + width / 2 - half_width, y + height / 2 - half_height),
+                   (x + width / 2 + half_width, y + height / 2 + half_height))
+            if any(box[0][i] < -0.01 or box[1][i] > size[i] + 0.01 for i in (0, 1)):
+                outside += 1
+                finding("warning", "shape_outside_slide", f"{slide['part']}#{shape['id']}", "Shape bounds extend past the slide.")
+            for other, other_box in boxes:
+                if all(min(box[1][i], other_box[1][i]) - max(box[0][i], other_box[0][i]) > 0.5 for i in (0, 1)):
+                    overlaps += 1
+                    finding("warning", "shape_bounds_overlap", f"{slide['part']}#{other},{shape['id']}",
+                            "Shape bounding rectangles intersect.")
+            boxes.append((shape["id"], box))
+    return outside, overlaps, omitted
+
+
+def verify_word_references(package, names, root, result, finding):
+    missing = 0
+    for ref, part, element, attribute in (
+        ("footnoteReference", "word/footnotes.xml", "footnote", "id"),
+        ("endnoteReference", "word/endnotes.xml", "endnote", "id"),
+        ("commentReference", "word/comments.xml", "comment", "id"),
+    ):
+        references = {child.get(tag(WORD, attribute)) for child in root.iter(tag(WORD, ref))}
+        targets = {child.get(tag(WORD, attribute)) for child in
+                   parse_xml(package.read(part)).iter(tag(WORD, element))} if part in names else set()
+        for identifier in references - targets:
+            missing += 1
+            finding("error", "dangling_word_reference", part, f"Referenced {element} {identifier} is missing.")
+    result("document_references", "failed" if missing else "passed",
+           f"Missing footnote, endnote or comment targets referenced by the document body: {missing}.")
+
+
+def verify_workbook_formulas(package, workbook, result, finding):
+    from openpyxl.formula import Tokenizer
+    from openpyxl.formula.tokenizer import TokenizerError
+    sheets = workbook_sheets(package)
+    sheet_names = {entry["name"].casefold() for entry in sheets}
+    count = cached = errors = missing = unresolved = 0
+
+    def inspect_formula(expression, location):
+        nonlocal missing, unresolved
+        if not expression:
+            unresolved += 1
+            return
+        try:
+            tokens = Tokenizer("=" + expression.lstrip("=")).items
+        except TokenizerError:
+            unresolved += 1
+            return
+        for token in tokens:
+            if token.value == "#REF!":
+                reference = "#REF!"
+            elif token.type == "OPERAND" and token.subtype == "RANGE" and "!" in token.value:
+                reference = token.value.rsplit("!", 1)[0].strip("'").replace("''", "'")
+                if "[" in reference or ":" in reference:
+                    unresolved += 1
+                    continue
+                if reference.casefold() in sheet_names:
+                    continue
+            else:
+                continue
+            missing += 1
+            finding("error", "invalid_formula_reference", location, f"Missing sheet or invalid reference: {reference}.")
+
+    for sheet in sheets:
+        root = parse_xml(package.read(sheet["part"]))
+        for cell in root.iter(tag(SPREADSHEET, "c")):
+            formula = cell.find(tag(SPREADSHEET, "f"))
+            if formula is None:
+                continue
+            count += 1
+            location = f"{sheet['name']}!{cell.get('r')}"
+            value = cell.findtext(tag(SPREADSHEET, "v"))
+            if cell.get("t") == "e":
+                errors += 1
+                finding("error", "cached_formula_error", location, f"Cached formula error: {value or 'unknown'}.")
+            elif value not in (None, ""):
+                cached += 1
+            inspect_formula(formula.text, location)
+    for node in workbook.iter(tag(SPREADSHEET, "definedName")):
+        inspect_formula(node.text, f"definedName:{node.get('name')}")
+    result("formula_references", "failed" if missing else ("unverified" if unresolved else "passed"),
+           f"Checked {count} cell formulas and defined names. Invalid references: {missing}. Unresolved expressions: {unresolved}.")
+    result("formula_cache", "failed" if errors else "passed",
+           f"Existing cached values: {cached}. Cached errors: {errors}. Formulas with no cached value: {count - cached - errors}.")
+    result("formula_values", "unverified", "The workbook was not recalculated by this check; cached results were only inspected.")
+
+
+CSS_URL = re.compile(r"""url\(\s*(?:"([^"]+)"|'([^']+)'|([^'")\s]+))\s*\)""", re.I)
+CSS_IMPORT = re.compile(r"""@import\s+(?:url\(\s*)?(?:"([^"]+)"|'([^']+)'|([^'")\s;]+))\s*\)?\s*([^;]*);""", re.I)
+
+
+def render_svg(request, source, output):
+    if source.stat().st_size > 1_000_000:
+        raise ValueError("SVG source exceeds the rendering limit")
+    root = parse_xml(source.read_bytes())
+    namespace = "http://www.w3.org/2000/svg"
+    if root.tag != tag(namespace, "svg"):
+        raise ValueError("Expected an SVG image")
+    assets = {asset["relPath"]: asset for asset in request.get("assets", [])}
+    entry = request.get("entry", "image.svg")
+    expansion_budget = 64 * 1024 * 1024
+    if len(assets) > 2000:
+        raise ValueError("Too many SVG dependencies")
+
+    def account_expansion(length):
+        nonlocal expansion_budget
+        expansion_budget -= length
+        if expansion_budget < 0:
+            raise ValueError("SVG dependencies exceed the expansion limit")
+
+    def asset_at(parent, reference):
+        parsed = urlsplit(reference)
+        if parsed.scheme or parsed.netloc or not parsed.path or parsed.path.startswith("/"):
+            return None
+        relpath = posixpath.normpath(posixpath.join(posixpath.dirname(parent), unquote(parsed.path)))
+        return assets.get(relpath)
+
+    def read_asset(asset):
+        sandbox_name = asset["sandboxName"]
+        if not re.fullmatch(r"asset-[0-9]+", sandbox_name):
+            raise ValueError("Invalid render attachment")
+        return (source.parent / sandbox_name).read_bytes()
+
+    def inline_url(parent, reference):
+        if reference.startswith("#") or reference.lower().startswith(("data:image/", "data:font/")):
+            return reference
+        asset = asset_at(parent, reference)
+        if not asset or not re.fullmatch(r"(?:image/(?:png|jpeg|gif|webp|bmp)|font/(?:woff2?|ttf|otf))", asset["mimeType"]):
+            return ""
+        raw = read_asset(asset)
+        account_expansion((len(raw) + 2) // 3 * 4)
+        data = base64.b64encode(raw).decode("ascii")
+        return f"data:{asset['mimeType']};base64,{data}"
+
+    def substitute_urls(parent, css):
+        return CSS_URL.sub(lambda match: 'url("' + inline_url(parent, next(value for value in match.groups() if value)) + '")', css)
+
+    def inline_styles(parent, css, ancestors):
+        def import_css(match):
+            reference = next(value for value in match.groups()[:3] if value)
+            asset = asset_at(parent, reference)
+            if not asset or not asset["relPath"].endswith(".css") or asset["relPath"] in ancestors or len(ancestors) >= 6:
+                return ""
+            raw = read_asset(asset)
+            account_expansion(len(raw))
+            imported = inline_styles(asset["relPath"], raw.decode("utf8"), ancestors | {asset["relPath"]})
+            media = match[4].strip()
+            return f"@media {media} {{ {imported} }}" if media else imported
+        return substitute_urls(parent, CSS_IMPORT.sub(import_css, css))
+
+    for node in root.iter():
+        if node.tag in {tag(namespace, "image"), tag(namespace, "feImage")}:
+            for key in ("href", "{http://www.w3.org/1999/xlink}href"):
+                if key in node.attrib:
+                    node.set(key, inline_url(entry, node.attrib[key]))
+        if node.tag == tag(namespace, "style") and node.text:
+            node.text = inline_styles(entry, node.text, {entry})
+        for key, value in list(node.attrib.items()):
+            if "url(" in value.lower():
+                node.set(key, substitute_urls(entry, value))
+    data = XML.tostring(root)
+    if len(data) > 100 * 1024 * 1024:
+        raise ValueError("SVG render payload exceeds the worker limit")
+    subprocess.run(["rsvg-convert", "--keep-aspect-ratio", "-w", "2048", "-h", "2048", "-o", str(output)],
+                   input=data, check=True)
+
+
 def process_document(request, source, output):
     fmt = request["format"]
     if fmt == "image":
@@ -1934,11 +3101,7 @@ def process_document(request, source, output):
     if fmt == "media":
         return process_media(request, source, output)
     if fmt == "svg" and request["action"] == "render":
-        root = parse_xml(source.read_bytes())
-        if root.tag != "{http://www.w3.org/2000/svg}svg":
-            raise ValueError("Expected an SVG image")
-        subprocess.run(["rsvg-convert", "--keep-aspect-ratio", "-w", "2048", "-h", "2048",
-                        "-o", str(output)], input=XML.tostring(root), check=True)
+        render_svg(request, source, output)
         return None
     action = request["action"]
     if action == "create":
@@ -1971,7 +3134,7 @@ def process_document(request, source, output):
             edit_office_document(package, fmt, request["operations"], output)
             return None
         if action == "verify":
-            return {"ok": True, "issues": [], "metrics": {"packageParts": len(names)}}
+            return verify_office(package, source, fmt, names)
         if action == "range" and fmt == "xlsx":
             options = request["range"]
             result = read_workbook_range(package, options)
@@ -1988,7 +3151,18 @@ def process_document(request, source, output):
             options = request.get("range", {})
             start = bounded_integer(options.get("start", 0), 0, len(body))
             count = bounded_integer(options.get("count", 50), 1, 100)
-            return {**result, "blockCount": len(body), "blocks": [
+            related = {}
+            for family, filename, element, key in (
+                ("styles", "word/styles.xml", "style", "styleId"),
+                ("numbering", "word/numbering.xml", "num", "numId"),
+                ("footnotes", "word/footnotes.xml", "footnote", "id"),
+            ):
+                if filename in names:
+                    entries = parse_xml(package.read(filename)).findall(tag(WORD, element))
+                    related[family] = [entry.get(tag(WORD, key)) for entry in entries
+                                       if family != "styles" or entry.get(tag(WORD, "type")) == "paragraph"][:1000]
+            related["headersAndFooters"] = sorted(part for part in names if re.fullmatch(r"word/(?:header|footer)[0-9]+\.xml", part))
+            return {**result, **related, "blockCount": len(body), "blocks": [
                 {"blockIndex": index, "type": XML.QName(node).localname, "text": text_content(node, WORD)}
                 for index, node in enumerate(body, start=0)
                 if start <= index < start + count and isinstance(node.tag, str)

@@ -21,6 +21,8 @@ export interface AdapterFileMeta {
 export interface AdapterCapabilityContext {
   runtimeProfile: RuntimeProfile;
   sandboxAvailable: boolean;
+  filename?: string;
+  previewKind?: PreviewKind;
 }
 
 export interface FormatAdapter {

@@ -120,6 +120,17 @@ export class BuiltinArtifactMcpServer {
         url: `http://127.0.0.1:${port}/mcp`,
         headers: [{ name: 'Authorization', value: `Bearer ${token}` }],
       },
+      permissionTarget: () => {
+        const current = this.db.getChat(binding.userId, binding.chatId);
+        const policy = current && effectiveBuiltinMcpPolicy(this.db, binding.userId, current.projectId, current.id);
+        return {
+          name,
+          discoveredTools: this.tokens.has(token) && policy?.enabled
+            ? Object.keys(BUILTIN_ARTIFACT_TOOLS).filter((tool) => !policy.disabledTools.includes(tool))
+            : [],
+          strictTools: true,
+        };
+      },
       revoke: () => this.tokens.delete(token),
       confirm: (toolName: string, output: unknown, messageId: string, runId: string, toolCallId: string) => {
         if (!this.tokens.has(token) || ![
@@ -298,8 +309,11 @@ export class BuiltinArtifactMcpServer {
       variant: z.enum(['background', 'sprite']).optional(), shapeId: z.number().int().positive().optional(),
     }, async ({ artifactId, ...options }) => {
       assertArtifact(artifactId);
-      const png = await this.artifacts.renderPng(userId, artifactId, options);
-      return new ToolOutput([{ type: 'image', mimeType: 'image/png', data: png.toString('base64') }]);
+      const { png, revision, sha256 } = await this.artifacts.renderPng(userId, artifactId, options);
+      return new ToolOutput([
+        { type: 'image', mimeType: 'image/png', data: png.toString('base64') },
+        { type: 'text', text: JSON.stringify({ artifactId, revision, sha256 }) },
+      ]);
     });
     tool('artifact_verify', 'Verify the current artifact revision.', artifactId, ({ artifactId }) => {
       assertArtifact(artifactId);
