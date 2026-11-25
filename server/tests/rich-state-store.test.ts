@@ -6,7 +6,7 @@ const document: RichDocumentV1 = {
   schemaVersion: 1,
   state: { amount: 2, enabled: false, other: 'stable' },
   computed: { double: '$state.amount * 2' },
-  root: { id: 'text', type: 'text', text: { expr: '$computed.double' } },
+  root: { id: 'text', type: 'text', content: { expr: 'concat("Amount ", $computed.double)' } },
 };
 
 describe('RichStateStore', () => {
@@ -36,5 +36,29 @@ describe('RichStateStore', () => {
     expect(() => store.set('other', 'x'.repeat(140000))).toThrow();
     expect(store.getStateValue('other')).toBe('stable');
     expect(() => new RichStateStore({ ...document, computed: { x: '$computed.y', y: '$computed.x' } })).toThrow();
+  });
+  it('rejects a dynamic external image URL after state evaluation', () => {
+    const store = new RichStateStore({
+      schemaVersion: 1,
+      state: { payload: 'safe' },
+      root: { id: 'markdown', type: 'markdown', content: { expr: '$state.payload' } },
+    });
+    const before = store.getSnapshot();
+    expect(() => store.set('payload', '![remote](https://example.com/image.png)')).toThrow();
+    expect(store.getSnapshot()).toBe(before);
+  });
+  it('rejects repeat expansion beyond the dynamic node limit', () => {
+    const store = new RichStateStore({
+      schemaVersion: 1,
+      state: { rows: [] },
+      root: {
+        id: 'list', type: 'stack', direction: 'col', children: [
+          { id: 'row', type: 'text', content: { expr: 'concat("", $item)' },
+            repeat: { itemsExpr: '$state.rows', as: 'row' } },
+        ],
+      },
+    });
+    expect(() => store.set('rows', Array(2001).fill('x'))).toThrow();
+    expect(store.getStateValue('rows')).toEqual([]);
   });
 });
