@@ -27,7 +27,7 @@ for(const vp of [{width:1280,height:720,project:'pc-chromium'},{width:1440,heigh
     await page.setViewportSize({width:vp.width,height:vp.height});
     await page.addInitScript(d=>{(window as Window&{__pr3aFixtureRichDocument?:RichDocumentV1}).__pr3aFixtureRichDocument=d},doc);
     const apiRequests:string[]=[];
-    await page.route('**/api/**',r=>{apiRequests.push(r.request().url());return r.abort()});
+    await page.route(url=>url.origin==='http://127.0.0.1:4174'&&url.pathname.startsWith('/api/'),r=>{apiRequests.push(r.request().url());return r.abort()});
     await page.goto('http://127.0.0.1:4174/?kind=rich');
     await expect(page.locator('.rich-chart')).toHaveCount(10);
     const slider=page.getByRole('slider');

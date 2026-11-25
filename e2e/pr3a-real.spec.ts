@@ -62,7 +62,7 @@ for(const vp of targets){
       srv.ctx.db.createChat({id:chatId,userId,projectId:null,title:'PR3A Real Files',workspaceDir:dir,modelId:'',effortValue:'',projectContextVersion:0});
       const svc=srv.ctx.artifactService;
       await page.setViewportSize({width:vp.width,height:vp.height});
-      await page.route('**/api/**',async route=>{
+      await page.route(url=>url.origin==='http://127.0.0.1:4174'&&url.pathname.startsWith('/api/'),async route=>{
         const request=route.request(),url=new URL(request.url());
         // Transport actual authenticated requests to the isolated Fastify server.
         // No API payload or response is mocked; test authentication is scoped to this server.
