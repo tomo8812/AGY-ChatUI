@@ -252,6 +252,15 @@ jobs:
       - name: Run mechanical UI layout & zoom tests
         run: npm run test:ui
 
+      - name: Upload PR3A browser captures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr3a-browser-captures
+          path: test-results/**/*.png
+          retention-days: 7
+          if-no-files-found: ignore
+
       - name: Upload Playwright report on failure
         if: failure()
         uses: actions/upload-artifact@v4
