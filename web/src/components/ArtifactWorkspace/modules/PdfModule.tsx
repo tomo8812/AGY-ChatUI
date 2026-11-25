@@ -1,5 +1,5 @@
 import React from 'react';
-import { PdfCanvasViewer } from '../../ArtifactViewerModal';
+import { PdfCanvasViewer } from '../../shared-ui/document/PdfCanvasCore';
 import { buildArtifactContentUrl } from '../../../utils/viewerCache';
 import type { WorkspaceModuleProps } from '../types';
 

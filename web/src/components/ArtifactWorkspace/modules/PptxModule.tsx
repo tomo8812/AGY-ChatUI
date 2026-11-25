@@ -1,7 +1,7 @@
 import React,{useEffect,useRef,useState} from 'react';
 import { workspaceApi,supportsOperation,type EditOperation } from '../../../api/workspace';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
-import { PdfCanvasViewer } from '../../ArtifactViewerModal';
+import { PdfCanvasViewer } from '../../shared-ui/document/PdfCanvasCore';
 import { artifactVersionKey, buildArtifactContentUrl } from '../../../utils/viewerCache';
 import { assertRevision,useRevisionResource } from '../useRevisionResource';
 import type { WorkspaceModuleProps } from '../types';

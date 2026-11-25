@@ -3,7 +3,7 @@ import type {Editor} from '@tiptap/react';
 import {WordParagraphEditor,type WordRun,type WordMark} from '../../shared-ui/editor/WordParagraphEditor';
 import { workspaceApi,supportsOperation } from '../../../api/workspace';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
-import { PdfCanvasViewer } from '../../ArtifactViewerModal';
+import { PdfCanvasViewer } from '../../shared-ui/document/PdfCanvasCore';
 import { buildArtifactContentUrl } from '../../../utils/viewerCache';
 import { assertRevision,useRevisionResource } from '../useRevisionResource';
 import type { WorkspaceModuleProps } from '../types';
