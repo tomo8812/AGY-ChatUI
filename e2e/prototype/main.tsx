@@ -24,13 +24,16 @@ const doc:RichDocumentV1={schemaVersion:1,title:'円形散水器の面積設計'
     {tag:'circle',id:'coverage',attrs:{cx:100,cy:80,r:{expr:'$state.radius * 8'},fill:'#c7e4fa',stroke:'#397ac4',strokeWidth:2}},
     {tag:'line',attrs:{x1:100,y1:80,x2:{expr:'100 + $state.radius * 8'},y2:80,stroke:'#397ac4'}},
   ]},
-  {id:'chart',type:'chart',chartType:'bar',categories:['基準','現在'],series:[{key:'area',label:'面積',data:[12,48]}]},
+  {id:'chart',type:'chart',chartType:'bar',categories:['基準','現在'],series:[{key:'area',label:'面積',data:{expr:'[12, $computed.area]'}}]},
   {id:'reset',type:'button',label:'リセット',onClick:[{type:'reset_state'}]},
 ]}};
+declare global { interface Window { __pr3aFixtureArtifact?: ArtifactRecord; __pr3aApplyArtifactUpdate?: (artifact:ArtifactRecord)=>void } }
 function Harness(){
   const f=formats[kind]??formats.markdown;
-  const [artifact,setArtifact]=useState<ArtifactRecord>({id:'fixture',userId:'fixture-user',chatId:'fixture-chat',messageId:null,runId:null,relPath:f.filename,...f,sizeBytes:100,sha256:'a'.repeat(64),revision:1,source:'generated',diffPatch:null,createdAt:1,updatedAt:1});
+  const [artifact,setArtifact]=useState<ArtifactRecord>(window.__pr3aFixtureArtifact??{id:'fixture',userId:'fixture-user',chatId:'fixture-chat',messageId:null,runId:null,relPath:f.filename,...f,sizeBytes:100,sha256:'a'.repeat(64),revision:1,source:'generated',diffPatch:null,createdAt:1,updatedAt:1});
   const [open,setOpen]=useState(true);
+  // Only the test harness exposes revision replacement to exercise live updates.
+  window.__pr3aApplyArtifactUpdate=setArtifact;
   return kind==='rich'?<main style={{padding:16,maxWidth:950,margin:'0 auto'}}><RichRenderer document={doc} userId="fixture-user" chatId="fixture-chat"/></main>:open?<ArtifactWorkspace artifact={artifact} onArtifactChanged={setArtifact} onClose={()=>setOpen(false)}/>:<button onClick={()=>setOpen(true)}>開く</button>;
 }
 createRoot(document.getElementById('root')!).render(<Harness/>);
