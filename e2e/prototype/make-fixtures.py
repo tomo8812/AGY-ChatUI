@@ -26,6 +26,7 @@ protected = doc.add_paragraph()
 protected.add_run("Keep ").bold = True
 protected.add_run("formatting").italic = True
 doc.add_table(rows=1, cols=1).cell(0, 0).text = "Keep table"
+doc.add_paragraph("Protected\ttext")
 doc.save(out / "sample.docx")
 deck = Presentation()
 deck.slide_width = Inches(10)

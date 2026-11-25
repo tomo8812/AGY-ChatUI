@@ -65,6 +65,9 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
     if(expectedRevision!==artifact.revision){setConflict(true);return}
     busyRef.current=true;setBusy(true);setError(null);
     const ops=draft.entries.map(item=>item.operation);
+    // Native paragraph text edits precede insertion of protected image runs.
+    // Append-only operations never shift the existing block indices.
+    if(/\.docx$/i.test(artifact.filename))ops.sort((a,b)=>Number(a.op==='docx.add_image')-Number(b.op==='docx.add_image'));
     const signature=JSON.stringify([expectedRevision,ops]);
     if(pendingAttempt.current?.signature!==signature)pendingAttempt.current={signature,key:newId()};
     try{

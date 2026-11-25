@@ -1,21 +1,35 @@
 import React,{useEffect,useRef} from 'react';
 import {useEditor,EditorContent,type Editor, type JSONContent} from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
-import {Extension} from '@tiptap/core';
+import {Extension,Mark} from '@tiptap/core';
+import {Plugin} from '@tiptap/pm/state';
 import {Fragment,Slice,type Node as ProseMirrorNode} from '@tiptap/pm/model';
 
 export type WordMark='bold'|'italic'|'underline';
-export type WordRun={text:string}&Partial<Record<WordMark,boolean>>;
+export type WordRun={text:string;originIndex?:number}&Partial<Record<WordMark,boolean>>;
 const MARKS:WordMark[]=['bold','italic','underline'];
+const WordOrigin=Mark.create({
+  name:'wordOrigin',inclusive:true,keepOnSplit:true,
+  addAttributes(){return {originIndex:{default:0}}},
+  // Internal identity: never import a run index from pasted HTML.
+  renderHTML(){return ['span',{},0]},
+});
 const SingleParagraph=Extension.create({
-  name:'singleParagraph',
+  name:'singleParagraph',priority:1000,
   addKeyboardShortcuts(){return {Enter:()=>this.editor.commands.setHardBreak()}},
+  addProseMirrorPlugins(){return [new Plugin({filterTransaction:tr=>{
+    if(!tr.docChanged)return true;
+    if(tr.doc.childCount!==1||tr.doc.firstChild?.type.name!=='paragraph')return false;
+    let length=0,segments=0;
+    tr.doc.descendants(n=>{if(n.isText||n.type.name==='hardBreak'){length+=n.isText?n.text?.length??0:1;segments++}});
+    return length<=20000&&segments<=400;
+  }})]},
 });
 function content(runs:WordRun[]):JSONContent {
   const nodes:JSONContent[]=[];
   for(const run of runs){
-    const marks=MARKS.filter(m=>run[m]).map(type=>({type}));
-    run.text.split('\n').forEach((text,i)=>{if(i)nodes.push({type:'hardBreak'});if(text)nodes.push({type:'text',text,marks})});
+    const marks:NonNullable<JSONContent['marks']>=[{type:'wordOrigin',attrs:{originIndex:run.originIndex??0}},...MARKS.filter(m=>run[m]).map(type=>({type}))];
+    run.text.split('\n').forEach((text,i)=>{if(i)nodes.push({type:'hardBreak',marks});if(text)nodes.push({type:'text',text,marks})});
   }
   return {type:'doc',content:[{type:'paragraph',content:nodes}]};
 }
@@ -26,17 +40,18 @@ function read(editor:Editor):WordRun[]{
     const text=node.isText?node.text??'':'\n';
     const marks=Object.fromEntries(MARKS.map(m=>[m,node.marks.some(mark=>mark.type.name===m)])) as Record<WordMark,boolean>;
     const previous=runs.at(-1);
-    if(previous&&MARKS.every(m=>Boolean(previous[m])===marks[m]))previous.text+=text;
-    else runs.push({text,...marks});
+    const originIndex=Number(node.marks.find(mark=>mark.type.name==='wordOrigin')?.attrs.originIndex??previous?.originIndex??0);
+    if(previous&&previous.originIndex===originIndex&&MARKS.every(m=>Boolean(previous[m])===marks[m]))previous.text+=text;
+    else runs.push({text,originIndex,...marks});
   });
-  return runs.length?runs:[{text:''}];
+  return runs.length?runs:[{text:'',originIndex:0}];
 }
 interface Props {label:string;runs:WordRun[];readOnly:boolean;onChange:(runs:WordRun[])=>void;onFocus:(editor:Editor)=>void}
 export function WordParagraphEditor({label,runs,readOnly,onChange,onFocus}:Props){
   const props=useRef({onChange,onFocus,readOnly});props.current={onChange,onFocus,readOnly};
   const incoming=JSON.stringify(content(runs));
   const editor=useEditor({
-    extensions:[StarterKit.configure({heading:false,bulletList:false,orderedList:false,listItem:false,blockquote:false,code:false,codeBlock:false,horizontalRule:false,strike:false,link:false,gapcursor:false,dropcursor:false}),SingleParagraph],
+    extensions:[StarterKit.configure({heading:false,bulletList:false,orderedList:false,listItem:false,blockquote:false,code:false,codeBlock:false,horizontalRule:false,strike:false,link:false,gapcursor:false,dropcursor:false}),WordOrigin,SingleParagraph],
     content:JSON.parse(incoming),editable:!readOnly,immediatelyRender:false,
     editorProps:{
       attributes:{role:'textbox','aria-label':label,'aria-multiline':'true','class':'workspace-word-editor'},
@@ -47,7 +62,8 @@ export function WordParagraphEditor({label,runs,readOnly,onChange,onFocus}:Props
         event.preventDefault();
         const limited=text.slice(0,20000).replace(/\r\n?/g,'\n');
         const nodes:ProseMirrorNode[]=[];
-        limited.split('\n').forEach((line,i)=>{if(i)nodes.push(view.state.schema.nodes.hardBreak.create());if(line)nodes.push(view.state.schema.text(line))});
+        const marks=view.state.storedMarks??view.state.selection.$from.marks();
+        limited.split('\n').forEach((line,i)=>{if(i)nodes.push(view.state.schema.nodes.hardBreak.create(null,null,marks));if(line)nodes.push(view.state.schema.text(line,marks))});
         if(nodes.length)view.dispatch(view.state.tr.replaceSelection(new Slice(Fragment.fromArray(nodes),0,0)));
         return true;
       },

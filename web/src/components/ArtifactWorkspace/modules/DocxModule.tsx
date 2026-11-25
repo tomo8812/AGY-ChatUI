@@ -8,7 +8,7 @@ import { buildArtifactContentUrl } from '../../../utils/viewerCache';
 import { assertRevision,useRevisionResource } from '../useRevisionResource';
 import type { WorkspaceModuleProps } from '../types';
 
-interface WordBlock {blockIndex:number;type:string;text:string;editableText?:boolean;marks?:Partial<Record<WordMark,boolean>>}
+interface WordBlock {blockIndex:number;type:string;text:string;editableText?:boolean;marks?:Partial<Record<WordMark,boolean>>;uiRuns?:WordRun[]}
 interface WordRange {blocks:WordBlock[];blockCount:number;hasMore:boolean}
 const PAGE=40;
 export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDraft,onTarget,target}:WorkspaceModuleProps){
@@ -76,9 +76,9 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     {!resource.data?<div className="workspace-loading">{resource.error?'文書を表示できません。':'読み込み中…'}</div>:<article className="workspace-word" aria-label="文書">
     {blocks.map(b=>{
       const k='paragraph:'+b.blockIndex,entry=draft?.entries.find(e=>e.key===k);
-      const original:WordRun={text:b.text,...b.marks};
+      const original=b.uiRuns??[{text:b.text,originIndex:0,...b.marks}];
       const specs=entry?.operation.runs as WordRun[]|undefined;
-      const runs=specs?.map(r=>({...b.marks,...r}))??[{...original,text:String(entry?.operation.text??b.text)}];
+      const runs=specs?.map(r=>({...original[r.originIndex??0],...r}))??original;
       const v=runs.map(r=>r.text).join('');
       const active=selected===b.blockIndex||target?.selector.blockIndex===b.blockIndex;
       const editable=mode==='edit'&&b.editableText===true&&supportsOperation(capabilities,'docx.set_paragraph_text');
@@ -87,18 +87,16 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
       return <div key={b.blockIndex} className={'workspace-word-block '+(active?'selected ':'')+(heading?'word-heading ':'')+(list?'word-list':'')} onClick={()=>{if(selected!==b.blockIndex)activeEditor.current=null;setSelected(b.blockIndex)}}>
         {b.type==='p'?editable?<WordParagraphEditor label={'段落 '+(b.blockIndex+1)} runs={runs} readOnly={locked} onFocus={ed=>{activeEditor.current=ed;setSelected(b.blockIndex)}} onChange={next=>{
           if(artifact.revision===undefined||locked)return;
-          const text=next.map(r=>r.text).join('');
-          const sameMarks=next.every(r=>(['bold','italic','underline'] as const).every(m=>Boolean(r[m])===Boolean(b.marks?.[m])));
-          if(sameMarks){onDraft(artifact.revision,text===b.text?null:{key:k,label:'段落 '+(b.blockIndex+1),operation:{op:'docx.set_paragraph_text',blockIndex:b.blockIndex,text}},k)}
-          else{
-            const specs=next.map(r=>{const out:WordRun={text:r.text};for(const m of ['bold','italic','underline'] as const)if(Boolean(r[m])!==Boolean(b.marks?.[m]))out[m]=Boolean(r[m]);return out});
-            onDraft(artifact.revision,{key:k,label:'段落 '+(b.blockIndex+1),operation:{op:'docx.set_paragraph_text',blockIndex:b.blockIndex,runs:specs,preserveRunProperties:true}},k);
-          }
+          const normalize=(list:WordRun[])=>list.map(r=>({text:r.text,originIndex:r.originIndex??0,bold:!!r.bold,italic:!!r.italic,underline:!!r.underline}));
+          const same=JSON.stringify(normalize(next))===JSON.stringify(normalize(original));
+          const specs=next.map(r=>{const originIndex=r.originIndex??0,base=original[originIndex]??original[0];const out:WordRun={text:r.text,originIndex};for(const m of ['bold','italic','underline'] as const)if(Boolean(r[m])!==Boolean(base[m]))out[m]=Boolean(r[m]);return out});
+          onDraft(artifact.revision,same?null:{key:k,label:'段落 '+(b.blockIndex+1),operation:{op:'docx.set_paragraph_text',blockIndex:b.blockIndex,runs:specs,preserveRunProperties:true}},k);
+
         }}/>:<p>{v||'\u00a0'}{mode==='edit'&&b.editableText!==true&&<small className="workspace-protected">書式・埋め込み要素を保持</small>}</p>:<div className="workspace-protected">{b.type==='tbl'?'表':'保護された文書要素'} {b.text}</div>}
         {image&&<small className="workspace-protected">追加画像: {image.label}</small>}
       </div>;
     })}
-    {mode==='edit'&&addParagraph&&<WordParagraphEditor label="追加段落" runs={[{text:String(addParagraph.operation.text??'')}]} readOnly={locked} onFocus={()=>{activeEditor.current=null;setSelected(null)}} onChange={runs=>stage('new-paragraph',{op:'docx.add_paragraph',text:runs.map(r=>r.text).join('')},'段落を追加')}/>}
+    {mode==='edit'&&addParagraph&&<WordParagraphEditor label="追加段落" runs={(addParagraph.operation.runs as WordRun[]|undefined)??[{text:String(addParagraph.operation.text??'')}]} readOnly={locked} onFocus={()=>{activeEditor.current=null;setSelected(null)}} onChange={runs=>stage('new-paragraph',{op:'docx.add_paragraph',runs:runs.map(({originIndex,...r})=>r)},'段落を追加')}/>}
     {mode==='edit'&&tableRows&&<table className="workspace-word-table"><tbody>{tableRows.map((row,r)=><tr key={r}>{row.map((cell,c)=><td key={c}><input aria-label={'追加表 '+(r+1)+'行 '+(c+1)+'列'} value={cell} readOnly={locked} onChange={e=>stage('new-table',{op:'docx.add_table',rows:tableRows.map((line,i)=>line.map((value,j)=>i===r&&j===c?e.target.value:value))},'表を追加')}/></td>)}</tr>)}</tbody></table>}
     </article>}
   </UnifiedViewerZoomShell>

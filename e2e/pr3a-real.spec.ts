@@ -123,6 +123,12 @@ for(const vp of targets){
               await page.getByRole('button',{name:'段落全選択',exact:true}).click();
               await page.getByRole('button',{name:'太字',exact:true}).click();
               await expect(word.locator('strong')).toHaveText(item.updated);
+              const mixed=page.getByRole('textbox',{name:'段落 2',exact:true});
+              await mixed.click();
+              await page.getByRole('button',{name:'段落全選択',exact:true}).click();
+              await page.getByRole('button',{name:'下線',exact:true}).click();
+              await expect(mixed.locator('strong')).toHaveText('Keep ');
+              await expect(mixed.locator('em')).toHaveText('formatting');
               await expect(page.getByText('書式・埋め込み要素を保持')).toBeVisible();
             }else{
               const before=await svc.renderPng(userId,artifact.id,{pageIndex:0});
@@ -159,7 +165,7 @@ for(const vp of targets){
               expect(await svc.readRange(userId,artifact.id,{startRow:0,endRow:1,startCol:0,endCol:1})).toMatchObject({rows:[['Updated item','Quantity'],['Apple','7']]});
             }else if(item.kind==='docx'){
               const result=await svc.readRange(userId,artifact.id,{start:0,count:3});
-              expect(result).toMatchObject({blocks:[{text:item.updated,marks:{bold:true}},{text:'Keep formatting'},{text:'Keep table'}]});
+              expect(result).toMatchObject({blocks:[{text:item.updated,marks:{bold:true}},{text:'Keep formatting',uiRuns:[{text:'Keep ',bold:true,underline:true},{text:'formatting',italic:true,underline:true}]},{text:'Keep table'}]});
             }else{
               const r=await svc.readRange(userId,artifact.id,{part:'ppt/slides/slide1.xml'});
               expect(r).toMatchObject({shapes:[{text:item.updated},{name:'Overlap'}]});

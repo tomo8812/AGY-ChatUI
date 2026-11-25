@@ -2702,21 +2702,23 @@ PROTECTED_WORD_PARA_CHILDREN = {
 
 
 def _word_ui_simple_paragraph(block):
-    # UI rich editing only applies to one ordinary text run. Unknown XML,
+    # UI rich editing applies only to ordinary text runs. Unknown XML,
     # hyperlinks, tabs, fields, bookmarks, tracked changes and drawings are
-    # never rebuilt by the browser editor.
+    # never rebuilt by the browser editor. Run identity is carried separately
+    # so native formatting of mixed-style paragraphs survives edits.
     if block.tag != tag(WORD, "p") or any(child.tag not in {tag(WORD, "pPr"), tag(WORD, "r")} for child in block):
         return False
     runs = block.findall(tag(WORD, "r"))
-    return len(runs) <= 1 and all(
+    return len(runs) <= 200 and len(_word_ui_text(block)) <= 20000 and all(
         child.tag in {tag(WORD, "rPr"), tag(WORD, "t"), tag(WORD, "br")}
-        and (child.tag != tag(WORD, "br") or child.get(tag(WORD, "type")) in (None, "textWrapping"))
+        and (child.tag != tag(WORD, "br") or (child.get(tag(WORD, "type")) in (None, "textWrapping") and child.get(tag(WORD, "clear")) is None))
+        and not any(node.tag == tag(WORD, "rPrChange") for node in child.iter())
         for r in runs for child in r
     )
 
 
-def _word_ui_marks(block):
-    props = block.find("./" + tag(WORD, "r") + "/" + tag(WORD, "rPr"))
+def _word_ui_marks(run):
+    props = run.find(tag(WORD, "rPr"))
     result = {}
     if props is not None:
         for name, element in (("bold", "b"), ("italic", "i"), ("underline", "u")):
@@ -2726,10 +2728,18 @@ def _word_ui_marks(block):
     return result
 
 
-def _word_ui_text(block):
+def _word_ui_run_text(run):
     return "".join((node.text or "") if node.tag == tag(WORD, "t") else "\n"
-                   for run in block.findall(tag(WORD, "r")) for node in run
-                   if node.tag in (tag(WORD, "t"), tag(WORD, "br")))
+                   for node in run if node.tag in (tag(WORD, "t"), tag(WORD, "br")))
+
+
+def _word_ui_text(block):
+    return "".join(_word_ui_run_text(run) for run in block.findall(tag(WORD, "r")))
+
+
+def _word_ui_runs(block):
+    return [{"originIndex": i, "text": _word_ui_run_text(run), **_word_ui_marks(run)}
+            for i, run in enumerate(block.findall(tag(WORD, "r")))] or [{"originIndex": 0, "text": ""}]
 
 
 def _apply_word_run_props(run, spec):
@@ -3219,24 +3229,28 @@ def edit_word(package, operations, output):
                 # This is an opt-in guarded UI operation, not a general
                 # replacement of arbitrary rich Word paragraphs.
                 if not _word_ui_simple_paragraph(block):
-                    raise ValueError("Paragraph has protected or multiple existing runs")
+                    raise ValueError("Paragraph has protected content or exceeds UI editing bounds")
                 specs = operation.get("runs")
                 if not isinstance(specs, list) or not 1 <= len(specs) <= 200 or any(
                     not isinstance(spec, dict) or not isinstance(spec.get("text"), str)
-                    or set(spec) - {"text", "bold", "italic", "underline"}
+                    or set(spec) - {"text", "originIndex", "bold", "italic", "underline"}
+                    or type(spec.get("originIndex", 0)) is not int
+                    or not 0 <= spec.get("originIndex", 0) < max(1, len(runs))
                     or any(not isinstance(spec[k], bool) for k in ("bold", "italic", "underline") if k in spec)
                     for spec in specs
                 ) or sum(len(spec["text"]) for spec in specs) > 20000:
                     raise ValueError("Invalid simple paragraph runs")
-                original_rpr = runs[0].find(tag(WORD, "rPr")) if runs else None
                 for old_r in runs:
                     block.remove(old_r)
                 for spec in specs:
-                    new_r = XML.SubElement(block, tag(WORD, "r"))
-                    if original_rpr is not None:
-                        new_r.append(deepcopy(original_rpr))
-                    _apply_word_run_props(new_r, {k: v for k, v in spec.items() if k != "text"})
-                    _set_run_multiline_text(new_r, spec["text"])
+                    origin = runs[spec.get("originIndex", 0)] if runs else None
+                    new_r = deepcopy(origin) if origin is not None else XML.Element(tag(WORD, "r"))
+                    block.append(new_r)
+                    changes = {k: v for k, v in spec.items() if k not in ("text", "originIndex")}
+                    if changes:
+                        _apply_word_run_props(new_r, changes)
+                    if origin is None or spec["text"] != _word_ui_run_text(origin):
+                        _set_run_multiline_text(new_r, spec["text"])
             elif isinstance(operation.get("runs"), list) and operation["runs"]:
                 for old_r in runs:
                     block.remove(old_r)
@@ -6911,7 +6925,9 @@ def process_document(request, source, output):
                                         "type": XML.QName(elem).localname,
                                         "text": text_content(elem, WORD),
                                         "editableText": _word_ui_simple_paragraph(elem),
-                                        **({"text": _word_ui_text(elem), "marks": _word_ui_marks(elem)} if _word_ui_simple_paragraph(elem) else {}),
+                                        **({"text": _word_ui_text(elem), "uiRuns": _word_ui_runs(elem),
+                                            "marks": _word_ui_marks(elem.find(tag(WORD, "r"))) if elem.find(tag(WORD, "r")) is not None else {}}
+                                           if _word_ui_simple_paragraph(elem) else {}),
                                     })
                                 block_count += 1
                             elem.clear()
