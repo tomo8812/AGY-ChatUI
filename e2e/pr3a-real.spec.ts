@@ -150,6 +150,7 @@ for(const vp of targets){
               record.beforeVisual=await capturePptx(page,info,before.png,'pptx-before');
               await page.getByRole('button',{name:'Title',exact:true}).click();
               await page.getByRole('textbox',{name:'図形テキスト'}).fill(item.updated);
+              await page.getByRole('button',{name:'太字',exact:true}).click();
               // Await actual worker output for the unsaved text; no document mutation yet.
               await expect(page.locator('[data-slide-canvas]')).toHaveAttribute('data-preview-ready','true',{timeout:90000});
               expect(srv.ctx.db.getArtifact(userId,artifact.id)?.revision).toBe(1);
@@ -219,6 +220,51 @@ for(const vp of targets){
           record.pin=requests[0].selector;
           await page.screenshot({path:info.outputPath('real-'+item.kind+'-pin.png')});
           evidence.push(record);
+          if(item.kind==='pptx'){
+            await page.getByRole('button',{name:'編集',exact:true}).click();
+            const select=page.getByRole('combobox',{name:'スライド編集操作'});
+            let revision=2;
+            const saveStructural=async(op:string,configure:()=>Promise<void>,renderIndex:number)=>{
+              await expect(select).toBeEnabled({timeout:90000});
+              await select.selectOption(op);await configure();
+              await page.getByRole('button',{name:'適用',exact:true}).click();
+              await expect(page.locator('[data-slide-canvas]')).toHaveAttribute('data-preview-ready','true',{timeout:90000});
+              const image=page.getByRole('img',{name:'変更後のスライド'});
+              await expect.poll(()=>image.evaluate(el=>(el as HTMLImageElement).complete&&(el as HTMLImageElement).naturalWidth>0),{timeout:30000}).toBe(true);
+              expect(srv.ctx.db.getArtifact(userId,artifact.id)?.revision).toBe(revision);
+              const previewPath=info.outputPath(op.replace('.','-')+'-draft-'+revision+'.png');
+              const data=await image.evaluate(async el=>Array.from(new Uint8Array(await (await fetch((el as HTMLImageElement).src)).arrayBuffer())));
+              fs.writeFileSync(previewPath,Buffer.from(data));
+              await page.getByRole('button',{name:'保存',exact:true}).click();revision++;
+              await expect(page.locator('.workspace-status')).toContainText('バージョン '+revision,{timeout:90000});
+              await expect(page.locator('.workspace-status')).toContainText('保存済み');
+              const rendered=await svc.renderPng(userId,artifact.id,{pageIndex:renderIndex});
+              const expectedPath=info.outputPath(op.replace('.','-')+'-saved-'+revision+'.png');
+              fs.writeFileSync(expectedPath,rendered.png);
+              const visual=comparePng(previewPath,expectedPath);
+              expect(visual.ssim).toBeGreaterThanOrEqual(.95);expect(visual.mae).toBeLessThanOrEqual(5);
+              evidence.push({kind:'pptx-structural',op,revision,visual});
+            };
+            await saveStructural('pptx.add_shape',async()=>{
+              await page.getByRole('textbox',{name:'追加図形テキスト'}).fill('Added by editor');
+            },0);
+            expect(await svc.readRange(userId,artifact.id,{part:'ppt/slides/slide1.xml'})).toMatchObject({shapes:expect.arrayContaining([expect.objectContaining({text:'Added by editor'})])});
+            // The extended native structure operations are covered on both
+            // Chromium and WebKit; the basic addition runs at all five sizes.
+            if(vp.width===1280||vp.width===375){
+              await saveStructural('pptx.add_table',async()=>{await page.getByRole('textbox',{name:'追加表 1行 1列'}).fill('Table cell')},0);
+              await saveStructural('pptx.add_image',async()=>{await page.getByLabel('スライド画像ファイル').setInputFiles({name:'sample.png',mimeType:'image/png',buffer:Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l2QAAAAASUVORK5CYII=','base64')})},0);
+              await saveStructural('pptx.add_slide',async()=>{},1);
+              const structure=await svc.getStructure(userId,artifact.id);
+              expect(structure.slides).toHaveLength(2);
+              await expect(page.getByRole('button',{name:'スライド 2',exact:true})).toHaveAttribute('aria-pressed','true');
+              await saveStructural('pptx.reorder_slide',async()=>{await page.getByRole('spinbutton',{name:'移動先スライド'}).fill('1')},0);
+              await expect(page.getByRole('button',{name:'スライド 1',exact:true})).toHaveAttribute('aria-pressed','true');
+              page.once('dialog',d=>void d.accept());
+              await saveStructural('pptx.remove_slide',async()=>{},0);
+              expect((await svc.getStructure(userId,artifact.id)).slides).toHaveLength(1);
+            }
+          }
         });
       }
     }finally{

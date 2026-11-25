@@ -68,6 +68,8 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
     // Native paragraph text edits precede insertion of protected image runs.
     // Append-only operations never shift the existing block indices.
     if(/\.docx$/i.test(artifact.filename))ops.sort((a,b)=>Number(a.op==='docx.add_image')-Number(b.op==='docx.add_image'));
+    // Match the draft sprite worker: apply text/bounds before styling.
+    if(/\.pptx$/i.test(artifact.filename))ops.sort((a,b)=>Number(a.op==='pptx.set_shape_style')-Number(b.op==='pptx.set_shape_style'));
     const signature=JSON.stringify([expectedRevision,ops]);
     if(pendingAttempt.current?.signature!==signature)pendingAttempt.current={signature,key:newId()};
     try{

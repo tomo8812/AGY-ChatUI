@@ -36,7 +36,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   const [fileData,setFileData]=useState<{name:string;base64:string}|null>(null);
   const [operationError,setOperationError]=useState('');
   const fileGeneration=useRef(0);
-  const pendingNavigation=useRef<{revision:number;index:number;existingIds:Set<string>}|null>(null);
+  const pendingNavigation=useRef<{revision:number;index:number}|null>(null);
   const [drag,setDrag]=useState<{id:string;dx:number;dy:number}|null>(null);
   const stage=useRef<HTMLDivElement>(null);
   const pointer=useRef<{id:string;x:number;y:number;bounds:Bounds;revision:number;part:string}|null>(null);
@@ -162,7 +162,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
       case 'pptx.reorder_slide':operation={op:operationKind,index,toIndex:destination-1};break;
       default:return;
     }
-    if(['pptx.add_slide','pptx.remove_slide','pptx.reorder_slide'].includes(operation.op))pendingNavigation.current={revision:artifact.revision,index:operation.op==='pptx.add_slide'?index+1:operation.op==='pptx.remove_slide'?Math.min(index,slides.length-2):destination-1,existingIds:new Set(slides.map(s=>s.id))};
+    if(['pptx.add_slide','pptx.remove_slide','pptx.reorder_slide'].includes(operation.op))pendingNavigation.current={revision:artifact.revision,index:operation.op==='pptx.add_slide'?index+1:operation.op==='pptx.remove_slide'?Math.min(index,slides.length-2):destination-1};
     onDraft(artifact.revision,{key:'pptx-structure',label:availableActions.find(a=>a.id===operationKind)!.label,operation},'pptx-structure');chooseOperation('');
   }
   const choose=(id:string)=>{setSelected(id);setDrag(null)};
