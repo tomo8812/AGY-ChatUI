@@ -26,7 +26,8 @@ async function openCommand(page:Page,control:ReturnType<Page['getByRole']>){
 }
 async function readySlide(page:Page){
   const scene=page.locator('[data-slide-canvas="true"]');
-  await expect(scene).toBeVisible({timeout:60000});
+  await expect(scene).toBeVisible({timeout:90000});
+  await expect(scene).toHaveAttribute('data-scene-ready','true',{timeout:90000});
   await expect.poll(async()=>scene.locator('img').evaluateAll(images=>images.length>0&&images.every(img=>(img as HTMLImageElement).complete&&(img as HTMLImageElement).naturalWidth>0)),{timeout:60000}).toBe(true);
   return scene;
 }
@@ -353,6 +354,10 @@ for(const vp of targets){
             return rect.left>=-1&&rect.right<=window.innerWidth+1;
           });
           expect(viewportFits).toBe(true);
+          const clipped=await page.locator('.workspace-header,.workspace-commandbar').evaluateAll(bars=>bars.flatMap(bar=>
+            Array.from(bar.querySelectorAll('button')).filter(button=>button.clientWidth>0&&button.scrollWidth>button.clientWidth+2)
+              .map(button=>button.textContent?.trim()??'')));
+          expect(clipped).toEqual([]);
           await page.screenshot({path:info.outputPath('real-'+item.kind+'-dark.png')});
           await page.evaluate(()=>{document.documentElement.dataset.theme='light'});
 

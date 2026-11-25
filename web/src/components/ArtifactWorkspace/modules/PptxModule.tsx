@@ -278,7 +278,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     <UnifiedViewerZoomShell resetKey={artifact.id+':pptx'} controlsTop={<>{toolbar}{operationForm}</>} scrollClassName="workspace-pptx-scroll">
       {(structure.error||scene.error)&&<div className="error-box" role="alert">{structure.error||scene.error}<button type="button" onClick={()=>{structure.retry();scene.retry()}}>再試行</button></div>}
       {scene.loading&&data&&<p className="workspace-refresh muted-xs" role="status">最新の内容を読み込み中…</p>}
-      {!data||!size?.widthPt||!size.heightPt?<div className="workspace-loading">{scene.error||structure.error?'スライドを表示できません。':'読み込み中…'}</div>:<div className="workspace-slide" ref={stage} style={{aspectRatio:size.widthPt+'/'+size.heightPt,'--slide-ratio':size.widthPt/size.heightPt} as React.CSSProperties} data-slide-canvas="true" data-preview-ready={previewReady?'true':'false'}>
+      {!data||!size?.widthPt||!size.heightPt?<div className="workspace-loading">{scene.error||structure.error?'スライドを表示できません。':'読み込み中…'}</div>:<div className="workspace-slide" ref={stage} style={{aspectRatio:size.widthPt+'/'+size.heightPt,'--slide-ratio':size.widthPt/size.heightPt} as React.CSSProperties} data-slide-canvas="true" data-scene-ready={scene.ready} data-preview-ready={previewReady?'true':'false'}>
         {currentStructural&&previewReady&&currentPreview?.fullSlide?<Layer blob={currentPreview.fullSlide} alt="変更後のスライド"/>:<>
         <Layer blob={data.background} alt="スライド背景"/>
         {data.layers.map(({shape:s,sprite})=>{

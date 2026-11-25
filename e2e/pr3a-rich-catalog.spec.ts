@@ -89,8 +89,10 @@ test('browser renders the rich UI node catalog and runs each explicit action',as
   await page.getByRole('textbox',{name:'Short text'}).fill('Reference text');
   await page.getByRole('textbox',{name:'Long text'}).fill('Review all readings');
   await page.getByRole('spinbutton',{name:'Quantity'}).fill('7');
-  await expect(page.locator('[data-rich-node-id="svg"] circle')).toHaveAttribute('r','14');
   await expect(page.getByRole('progressbar')).toHaveAttribute('value','7');
+  const ring=page.locator('[data-rich-node-id="svg"] circle');
+  await ring.scrollIntoViewIfNeeded();
+  await expect(ring).toHaveAttribute('r','14');
   await page.getByRole('button',{name:'Increase',exact:true}).press('Enter');
   await expect(page.getByRole('slider')).toHaveValue('8');
   await page.getByRole('button',{name:'Select card'}).click();
