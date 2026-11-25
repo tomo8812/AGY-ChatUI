@@ -63,6 +63,7 @@ for(const vp of targets){
     test.setTimeout(600000);
     const srv=await createTestServer({docRuntimeDir:runtime!,installDocRuntime:'compact',sandboxMode:'off',allowUnsandboxedDocWorkers:true,docWorkerBudget:2});
     const evidence:unknown[]=[];
+    const failures:string[]=[];
     try{
       const client=new TestApiClient(srv.baseUrl);
       const reg=await client.request<{user:{id:string}}>('POST','/api/auth/register',{username:'pr3a-real',displayName:'PR3A Real',password:'password123'});
@@ -91,7 +92,7 @@ for(const vp of targets){
         (window as Window&{__pr3aFixtureArtifact?:unknown}).__pr3aFixtureArtifact=records[kind];
       },artifacts);
       for(const item of cases){
-        await test.step(item.kind,async()=>{
+        try{await test.step(item.kind,async()=>{
           const artifact=artifacts[item.kind];
           await page.goto(base+'?kind='+item.kind);
           await expect(page.getByRole('dialog',{name:item.filename})).toBeVisible({timeout:30000});
@@ -158,6 +159,11 @@ for(const vp of targets){
               await expect(mixed.locator('em')).toHaveText('formatting');
               await expect(page.getByText('書式・埋め込み要素を保持')).toBeVisible();
             }else{
+              const invalid=await client.request('POST','/api/files/'+artifact.id+'/render-draft-slide',{expectedRevision:1,pageIndex:0,operation:{op:'replace_source',content:'invalid'}});
+              expect(invalid.status).toBe(400);
+              const stale=await client.request('POST','/api/files/'+artifact.id+'/render-draft-slide',{expectedRevision:999,pageIndex:0,operation:{op:'pptx.add_shape',slidePart:'ppt/slides/slide1.xml',kind:'rectangle',text:'Never saved',boundsPt:[10,10,100,50]}});
+              expect(stale.status).toBe(409);
+              expect(srv.ctx.db.getArtifact(userId,artifact.id)?.revision).toBe(1);
               const before=await svc.renderPng(userId,artifact.id,{pageIndex:0});
               record.beforeVisual=await capturePptx(page,info,before.png,'pptx-before');
               await page.getByRole('button',{name:'Title',exact:true}).click();
@@ -284,10 +290,14 @@ for(const vp of targets){
               expect((await svc.getStructure(userId,artifact.id)).slides).toHaveLength(1);
             }
           }
-        });
+        })}catch(error){
+          failures.push(item.kind+': '+(error instanceof Error?error.message:String(error)));
+          await page.screenshot({path:info.outputPath('failed-'+item.kind+'.png')}).catch(()=>{});
+        }
       }
+      expect(failures,'Independent actual-file failures').toEqual([]);
     }finally{
-      fs.writeFileSync(info.outputPath('pr3a-evidence.json'),JSON.stringify({viewport:vp,results:evidence},null,2));
+      fs.writeFileSync(info.outputPath('pr3a-evidence.json'),JSON.stringify({viewport:vp,results:evidence,failures},null,2));
       await page.unrouteAll({behavior:'wait'});
       await srv.cleanup();
     }

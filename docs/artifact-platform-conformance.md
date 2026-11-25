@@ -280,7 +280,7 @@ Node.js 24 の単発計測では、上限付近の YAML（511 KiB）で CPU 10 m
 | 区分 / ID | ステータス | 計画 PR | 主実装箇所 | 検証結果・区分 |
 | --- | --- | --- | --- | --- |
 | `RICH-ARCH-02`, `03`, `05`, `06`, `07`（サーバー側） | **対応済み** | PR 1 / 2 | `server/src/rich/*`, `server/src/routes/rich-routes.ts`, `server/src/mcp/builtin-artifact-mcp.ts` | `VERIFIED (REAL RUNTIME)` (`rich-security-negative.test.ts`, `architecture-conformance.test.ts` `NEG-05`) |
-| `RICH-ARCH-01`, `04` および `RICH-01`〜`08`（ブラウザ側描画・操作 UI） | **未実装**（PR 3A/3B 計画対象） | PR 3A / 3B | `web/src/components/shared-ui/*`（PR 3A） | PR 3A / 3B ゲート対象 |
+| `RICH-ARCH-01`, `04` および `RICH-01`〜`08`（ブラウザ側描画・操作 UI） | **部分実装**（PR 3A 共通レンダラー実装、PR 3B チャット統合未実装） | PR 3A / 3B | `web/src/components/shared-ui/*`（PR 3A） | PR 3A / 3B ゲート対象 |
 | `PIN-01`〜`PIN-06`（サーバー/MCP/再解決コア） | **部分実装**（サーバー・MCP 実装済み、UI パネルは PR 3A/3B） | PR 1 / 2 / 3A / 3B | `server/src/edit-requests/*`, `server/src/artifacts/adapters/*`, `server/src/mcp/builtin-artifact-mcp.ts` | `VERIFIED (REAL RUNTIME)` (`artifact-core-durability.test.ts`, `builtin-artifact-mcp.test.ts`) |
 | `ACP-01`, `ACP-02` | **対応済み**（拡張モック検証済・実 `agy` 再現スクリプト提供済） | PR 2 | `server/src/acp/client-manager.ts`, `server/src/rich/rich-content-service.ts`, `scripts/verify-real-agy-artifact-mcp.mjs` | `VERIFIED (MOCK / EMULATION)` (`builtin-artifact-mcp.test.ts`, `acp-transparency.test.ts`)＋`UNVERIFIED`（実 `agy` バイナリ） |
 
@@ -288,7 +288,7 @@ Node.js 24 の単発計測では、上限付近の YAML（511 KiB）で CPU 10 m
 
 | 区分 / ID | ステータス | 計画 PR | 主実装箇所 | 検証結果・区分 |
 | --- | --- | --- | --- | --- |
-| `UX-01`〜`UX-10` | **未実装**（PR 3A/3B/4 UI 計画対象；既存 UI 非退行は維持） | PR 3A / 3B / 4 | `web/src/components/ArtifactWorkspace/*`, `web/src/components/shared-ui/*` | PR 3A / 3B / 4 ゲート対象（実機 iPhone 項目は `UNVERIFIED`） |
+| `UX-01`〜`UX-10` | **部分実装**（PR 3A プロトタイプ、5 解像度実測中；PR 3B/4 全体統合・監査対象） | PR 3A / 3B / 4 | `web/src/components/ArtifactWorkspace/*`, `web/src/components/shared-ui/*` | PR 3A / 3B / 4 ゲート対象（実機 iPhone 項目は `UNVERIFIED`） |
 | `PERF-01`, `PERF-02`, `PERF-05` | **対応済み**（`artifact_read_range` ストリーミング/部分読取・ゼロコピー入力・不変 Revision 整合・リソース予算制御） | PR 1 / 2 | `server/src/artifacts/artifact-service.ts`, `server/src/artifacts/document-worker.ts`, `server/src/artifacts/resource-governor.ts`, `server/src/artifacts/sandbox-worker.ts`, `server/src/artifacts/blob-store.ts`, `server/scripts/artifact_doc_worker.py` | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts`, `artifact_doc_worker_test.py`, `artifact-core-durability.test.ts`, `sandbox-and-drafts.test.ts`) |
 | `PERF-03`, `PERF-04`, `PERF-06` | **未実装**（PR 3A/4 フロントエンド性能計画対象） | PR 3A / 4 | `web/src/components/shared-ui/*`, `web/src/utils/viewerCache.ts` | PR 3A / 4 ゲート対象 |
 | `SEC-01`〜`SEC-06`, `SEC-09`（サーバー側）, `SEC-10` | **対応済み** | PR 1 / 2 | `server/src/artifacts/*`, `server/src/files/workspace.ts`, `server/src/mcp/builtin-artifact-mcp.ts`, `server/src/rich/rich-validator.ts`, `server/scripts/artifact_doc_worker.py` | `VERIFIED (REAL RUNTIME)` (`auth-and-rbac.test.ts`, `sandbox-and-drafts.test.ts`, `adapter-verification.test.ts`, `builtin-artifact-mcp.test.ts`, `rich-security-negative.test.ts`, `artifact_doc_worker_test.py`) |
@@ -323,3 +323,30 @@ PR #37 に過去に記録された全 6 件の PR Lens 指摘について最新�
 - `#4688517338`（`artifact-service.ts` `readRange` における `this.documentWorker.available` 事前チェック欠落）: **本修正で解消**（`artifact-service.ts` に `this.documentWorker.available &&` ガードを追加し、`builtin-artifact-mcp.test.ts` で Base ChatUI 時の 422 `UNSUPPORTED_OPERATION` 返却をテスト化）。
 - `#4689345173`（`MarkdownAdapter.verify` の `decodeURIComponent` 例外保護）: 修正済み確認（`bc6f405` 以降継続維持）。
 - `#4689533352`（`MarkdownAdapter` `sanitizeHref` の二重 HTML エスケープ防止）: 修正済み確認（`88fe84e` 以降 `unescapeBasicHtmlEntities` により継続維持）。
+
+
+## 8. PR #38 (PR 3A) のゲート証拠と残余
+
+対象基準は設計書第10章の PR 3A 行。PR #37 HEAD `5c49b3a4914fd26073d66dc510e3f2acc0fb89f9` を固定ベースとする。以下の合格は該当コミットとテスト内容に限る。旧ビューアー全移行・全形式・全8状態・主体別Undo/Redoは PR 3B、旧実装撤去・全解像度/実機/低リソース最終監査は PR 4。
+
+| 項目 | 証拠 | 状態 |
+|---|---|---|
+| 共通 UI・RichStateStore・動的上限 | 共有ASTと評価後バリデーション、サーバーの陰性テスト、実ブラウザの10種チャート・SVG/KPI連動・仮想データ表・複数出典 | `5616772` の該当試験合格。全ノード/副作用・長時間性能の網羅検証は残る |
+| ArtifactWorkspace・共通PDF描画・形式モジュール独立 | 共通シェル、単一PdfCanvasCore、modules/registry.ts、frontend-architecture-conformance.test.ts、Vite実バンドルモジュール検査 | 実装・陰性自己テスト追加、最新CI未確定 |
+| viewerCache・WS連続sequence/snapshot | 固定Revision/sha/依存hash、ユーザー分離、再同期テスト、単一SQL取得と優先順位 | `22c84f1` 型チェック・ビルド・サーバーテスト合格。実アプリ全状態はPR3B |
+| 実ファイル保存・対象指定 | `e2e/pr3a-real.spec.ts` / `5616772` [CI](https://github.com/tomo8812/AGY-ChatUI/actions/runs/45608847601) の pr3a-browser-captures | Markdown/Code/XLSX/CSV/DOCX/PPTX 各5/5、PDF 3/5。WebKitパネル閉鎖/依頼モードでページが戻る不具合を検出し修正、再試験中 |
+| PPTX 視覚一致 | 同ランの実際のDOM画像、隔離コピー変更前後のLibreOffice PNG、SSIM≥0.95・MAE≤5 | 5/5。新規書式/リサイズ/図形/表/画像/スライド操作は新しいCIで再検証 |
+| レスポンシブ | 同ラン375×812キャプチャでPPTXの入力幅不足・DOCXコマンド欠けを確認 | 共通のレスポンシブコマンド開示で修正、最新キャプチャ未確認 |
+| CI＋PR Lens | `5616772` PR Lens 0件、サーバー/ビルド成功、ブラウザ26成功・2失敗・26スキップ。`22c84f1` [CI](https://github.com/tomo8812/AGY-ChatUI/actions/runs/45611838993) サーバー/ビルド成功 | 最新HEAD全件合格とレビュー0件までゲート未完了 |
+
+### PR3A 実ファイルPPTX実測（5616772）
+
+| CSS viewport | 保存後 SSIM | 未保存プレビュー SSIM |
+|---|---:|---:|
+| 1280×720 | 0.980536 | 0.980333 |
+| 1440×900 | 0.995116 | 0.995116 |
+| 1920×1080 | 0.986338 | 0.999192 |
+| 375×812 | 0.984374 | 0.994897 |
+| 430×932 | 0.975110 | 0.995512 |
+
+ブラウザーはPC ChromiumとiPhone設定WebKit（物理iPhoneではない）。テストは認証済み実 Fastify/ArtifactService と実ファイル、Compactワーカーを使用するが、CIテスト用の `sandboxMode: off` でありstrict bwrapの証拠ではない。未保存の構造変更は1操作ずつ隔離コピーで正確に描画し、保存は通常のArtifactServiceトランザクションへ戻す。画像追加は現状PNG/JPEG 512KiB以下。PDF本文指定はページIDと抽出選択本文のスナップショットで直接編集ではない。XLSX未保存数式評価・検索はロード済み範囲に限定し、未評価を保存値と混同しない。保護されたWordノードは無条件再構築しない。
