@@ -72,15 +72,18 @@ for(const vp of targets){
         },timeout:90000});
         await route.fulfill({response});
       });
+      const artifacts:Record<string,Awaited<ReturnType<typeof svc.createArtifact>>['artifact']>={};
+      for(const item of cases){
+        artifacts[item.kind]=(await svc.createArtifact({userId,scopeKind:'chat',chatId,relPath:item.filename,content:fs.readFileSync(path.join(fixtureDir!,item.filename)),actorKind:'user',actorId:userId})).artifact;
+      }
+      await page.addInitScript(records=>{
+        const kind=new URLSearchParams(location.search).get('kind')??'';
+        (window as Window&{__pr3aFixtureArtifact?:unknown}).__pr3aFixtureArtifact=records[kind];
+      },artifacts);
       for(const item of cases){
         await test.step(item.kind,async()=>{
-          const {artifact}=await svc.createArtifact({userId,scopeKind:'chat',chatId,relPath:item.filename,content:fs.readFileSync(path.join(fixtureDir!,item.filename)),actorKind:'user',actorId:userId});
-          await page.addInitScript((a)=>{(window as Window&{__pr3aFixtureArtifact?:unknown}).__pr3aFixtureArtifact=a},artifact);
-          // Use a fresh injected record on each navigation; older init scripts are
-          // not relied upon for ordering. A test-only query identifies the current file.
+          const artifact=artifacts[item.kind];
           await page.goto(base+'?kind='+item.kind);
-          // Older init scripts may run in any order. Always assert actual identity.
-          await page.evaluate(a=>{(window as Window&{__pr3aApplyArtifactUpdate?:(a:unknown)=>void}).__pr3aApplyArtifactUpdate?.(a)},artifact);
           await expect(page.getByRole('dialog',{name:item.filename})).toBeVisible({timeout:30000});
           const record:Record<string,unknown>={kind:item.kind,artifactId:artifact.id,beforeRevision:artifact.revision};
           if(item.kind==='pdf'){
@@ -122,7 +125,7 @@ for(const vp of targets){
             expect(next.revision).toBe(2);
             expect(next.sha256).not.toBe(artifact.sha256);
             expect(await page.locator('[data-viewer-zoom-surface]').getAttribute('data-zoom-scale')).toBe(zoom);
-            expect(await page.getByRole('button',{name:'編集',exact:true}).getAttribute('aria-pressed')).toBe('true');
+            await expect(page.getByRole('button',{name:'編集',exact:true})).toHaveAttribute('aria-pressed','true');
             record.afterRevision=next.revision;record.zoom=zoom;
             if(item.kind==='markdown'||item.kind==='code'){
               const pinned=svc.getRevisionContentBlob(userId,artifact.id,2);

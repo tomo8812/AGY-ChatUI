@@ -30,7 +30,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   const stage=useRef<HTMLDivElement>(null);
   const pointer=useRef<{id:string;x:number;y:number;bounds:Bounds;revision:number;part:string}|null>(null);
   const structure=useRevisionResource(artifact,'pptx-structure',async signal=>{const r=await workspaceApi.structure<Presentation>(artifact.id,signal);assertRevision(artifact,r);return r});
-  const slides=structure.ready?structure.data?.slides??[]:[];
+  const slides=structure.data?.slides??[];
   const index=Math.max(0,slides.findIndex(s=>s.id===slideId));
   const slide=slides[index];
   const size=structure.data?.slideSize;
@@ -50,7 +50,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     }
     return {slideId:slide.id,shapes:r.shapes,background,layers};
   });
-  const data=scene.ready?scene.data:null;
+  const data=scene.data;
   const shape=data?.shapes.find(s=>s.id===selected);
   const key=(id:string,kind:string)=>String(slide?.part)+':'+id+':'+kind;
   const bounds=(s:Shape):Bounds|undefined=>{const b=s.transform?.geomBoundsPt;if(!b)return;const next=draft?.entries.find(e=>e.key===key(s.id,'bounds'))?.operation.boundsPt;if(Array.isArray(next)&&next.length===4)return {x:Number(next[0]),y:Number(next[1]),width:Number(next[2]),height:Number(next[3])};return b};
@@ -67,20 +67,24 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   const pin=()=>{if(shape&&slide&&artifact.revision!==undefined)onTarget({baseRevision:artifact.revision,label:'スライド '+(index+1)+' / '+shape.name,selector:{kind:'pptx_shape',slideId:slide.id,slidePart:slide.part,shapeId:Number(shape.id),expectedElementFingerprint:artifact.sha256},selectedContentSnapshot:shape.text,contentCoords:shape.transform?.geomBoundsPt?{...shape.transform.geomBoundsPt}:undefined})};
   const toolbar=<div className="workspace-toolbar"><span>スライド {index+1} / {slides.length}</span>
     {mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!shape||!scene.ready} onClick={pin}>要素を対象にする</button>}
-    {mode==='edit'&&shape?.type==='sp'&&<input aria-label="図形テキスト" value={String(draft?.entries.find(e=>e.key===key(shape.id,'text'))?.operation.text??shape.text)} readOnly={editingLocked||!supportsOperation(capabilities,'pptx.set_shape_text')} onChange={e=>editText(e.target.value)}/>}
-    {mode==='edit'&&shape&&bounds(shape)&&['x','y','width','height'].map(field=><label key={field} className="workspace-bound">{field}<input aria-label={field} type="number" value={bounds(shape)![field as keyof Bounds]} disabled={editingLocked||!supportsOperation(capabilities,'pptx.set_shape_bounds')} onChange={e=>{const value=e.target.valueAsNumber;if(Number.isFinite(value)&&((field==='x'||field==='y')?Math.abs(value)<=14400:value>=1&&value<=14400))writeBounds(shape,{...bounds(shape)!,[field]:value})}}/></label>)}
+    {mode==='edit'&&shape?.type==='sp'&&<input aria-label="図形テキスト" value={String(draft?.entries.find(e=>e.key===key(shape.id,'text'))?.operation.text??shape.text)} readOnly={editingLocked||!scene.ready||!supportsOperation(capabilities,'pptx.set_shape_text')} onChange={e=>editText(e.target.value)}/>}
+    {mode==='edit'&&shape&&bounds(shape)&&['x','y','width','height'].map(field=><label key={field} className="workspace-bound">{field}<input aria-label={field} type="number" value={bounds(shape)![field as keyof Bounds]} disabled={editingLocked||!scene.ready||!supportsOperation(capabilities,'pptx.set_shape_bounds')} onChange={e=>{const value=e.target.valueAsNumber;if(Number.isFinite(value)&&((field==='x'||field==='y')?Math.abs(value)<=14400:value>=1&&value<=14400))writeBounds(shape,{...bounds(shape)!,[field]:value})}}/></label>)}
   </div>;
   if(mode==='view'&&!workerReady)return <PdfCanvasViewer documentKey={artifact.id} url={buildArtifactContentUrl(artifact,{convertedPdf:true})}/>;
   return <div className="workspace-presentation"><nav className="workspace-slide-nav" aria-label="スライド一覧">{slides.slice(Math.max(0,index-4),index+5).map(s=><MiniSlide key={s.id} artifact={artifact} index={slides.indexOf(s)} active={s.id===slide?.id} onClick={()=>{setSlideId(s.id);choose('')}}/>)}<button type="button" className="btn btn-secondary btn-xs" disabled={index===0} onClick={()=>{setSlideId(slides[index-1].id);choose('')}}>前へ</button><button type="button" className="btn btn-secondary btn-xs" disabled={index+1>=slides.length} onClick={()=>{setSlideId(slides[index+1].id);choose('')}}>次へ</button></nav>
     <UnifiedViewerZoomShell resetKey={artifact.id+':pptx'} controlsTop={toolbar}>
       {(structure.error||scene.error)&&<div className="error-box" role="alert">{structure.error||scene.error}<button type="button" onClick={()=>{structure.retry();scene.retry()}}>再試行</button></div>}
-      {!data||!size?.widthPt||!size.heightPt?<div className="workspace-loading">読み込み中…</div>:<div className="workspace-slide" ref={stage} style={{aspectRatio:size.widthPt+'/'+size.heightPt}} data-slide-canvas="true">
+      {scene.loading&&data&&<p className="workspace-refresh muted-xs" role="status">最新の内容を読み込み中…</p>}
+      {!data||!size?.widthPt||!size.heightPt?<div className="workspace-loading">{scene.error||structure.error?'スライドを表示できません。':'読み込み中…'}</div>:<div className="workspace-slide" ref={stage} style={{aspectRatio:size.widthPt+'/'+size.heightPt}} data-slide-canvas="true">
         <Layer blob={data.background} alt="スライド背景"/>
         {data.layers.map(({shape:s,image})=>{const orig=s.transform?.geomBoundsPt,b=bounds(s);const dx=(b&&orig?b.x-orig.x:0)+(drag?.id===s.id?drag.dx:0),dy=(b&&orig?b.y-orig.y:0)+(drag?.id===s.id?drag.dy:0);
-          // Server sprites use full-slide coordinates. Translation does not duplicate the original shape.
-          return <Layer key={s.id} blob={image} style={{transform:'translate('+dx/size.widthPt*100+'%,'+dy/size.heightPt*100+'%)'}}/>})}
+          // One full-slide transparent sprite per element. Scale around the original
+          // geometry origin, then translate; never retain a second original layer.
+          const sx=orig&&b&&orig.width>0?b.width/orig.width:1,sy=orig&&b&&orig.height>0?b.height/orig.height:1;
+          return <Layer key={s.id} blob={image} style={{transformOrigin:orig?(orig.x/size.widthPt*100+'% '+orig.y/size.heightPt*100+'%'):undefined,
+            transform:'translate('+dx/size.widthPt*100+'%,'+dy/size.heightPt*100+'%) scale('+sx+','+sy+')'}}/>})}
         {data.shapes.map(s=>{const b=bounds(s);if(!b||b.width<=0||b.height<=0)return null;const active=selected===s.id||target?.selector.shapeId===Number(s.id);return <button key={s.id} type="button" aria-label={s.name||'図形 '+s.id} className={'workspace-shape-hit '+(active?'selected':'')} style={{left:(b.x+(drag?.id===s.id?drag.dx:0))/size.widthPt*100+'%',top:(b.y+(drag?.id===s.id?drag.dy:0))/size.heightPt*100+'%',width:b.width/size.widthPt*100+'%',height:b.height/size.heightPt*100+'%'}} onClick={()=>choose(s.id)}
-          onPointerDown={e=>{choose(s.id);if(mode!=='edit'||editingLocked||!slide||artifact.revision===undefined||!supportsOperation(capabilities,'pptx.set_shape_bounds'))return;pointer.current={id:s.id,x:e.clientX,y:e.clientY,bounds:b,revision:artifact.revision,part:slide.part};e.currentTarget.setPointerCapture(e.pointerId)}}
+          onPointerDown={e=>{choose(s.id);if(mode!=='edit'||editingLocked||!scene.ready||!slide||artifact.revision===undefined||!supportsOperation(capabilities,'pptx.set_shape_bounds'))return;pointer.current={id:s.id,x:e.clientX,y:e.clientY,bounds:b,revision:artifact.revision,part:slide.part};e.currentTarget.setPointerCapture(e.pointerId)}}
           onPointerMove={e=>{const p=pointer.current,rect=stage.current?.getBoundingClientRect();if(p?.id===s.id&&rect?.width&&rect.height)setDrag({id:s.id,dx:(e.clientX-p.x)/rect.width*size.widthPt,dy:(e.clientY-p.y)/rect.height*size.heightPt})}}
           onPointerCancel={()=>{pointer.current=null;setDrag(null)}}
           onPointerUp={e=>{const p=pointer.current,rect=stage.current?.getBoundingClientRect();pointer.current=null;setDrag(null);if(p?.id===s.id&&p.revision===artifact.revision&&p.part===slide?.part&&rect?.width&&rect.height){const dx=(e.clientX-p.x)/rect.width*size.widthPt,dy=(e.clientY-p.y)/rect.height*size.heightPt;if(Math.abs(dx)+Math.abs(dy)>0.5)writeBounds(s,{...p.bounds,x:p.bounds.x+dx,y:p.bounds.y+dy})}}}/>}
