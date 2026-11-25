@@ -6844,6 +6844,7 @@ def process_document(request, source, output):
                                         "blockIndex": block_count,
                                         "type": XML.QName(elem).localname,
                                         "text": text_content(elem, WORD),
+                                        "editableText": elem.tag == tag(WORD, "p") and not any(child.tag in PROTECTED_WORD_PARA_CHILDREN for child in elem) and not any(node.tag in PROTECTED_WORD_RUN_CHILDREN for r in elem.findall(tag(WORD, "r")) for node in r) and len(elem.findall(tag(WORD, "r"))) <= 1,
                                     })
                                 block_count += 1
                             elem.clear()

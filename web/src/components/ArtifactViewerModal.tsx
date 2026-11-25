@@ -243,7 +243,7 @@ interface PdfPageFocalAnchor {
   relY: number;
 }
 
-const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
+export const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
   const pagesListRef = useRef<HTMLDivElement | null>(null);

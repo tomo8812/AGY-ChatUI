@@ -32,7 +32,7 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
   const currentArtifact=useRef(artifact);currentArtifact.current=artifact;
   useEffect(()=>{if(!isStaleArtifactVersion(local,incoming))setLocal(incoming)},[incoming]);
   useEffect(()=>{
-    const controller=new AbortController();setCapError(null);
+    const controller=new AbortController();setCapError(null);setCaps(null);
     void workspaceApi.capabilities(artifact.id,controller.signal).then(value=>{if(!controller.signal.aborted)setCaps(value)},()=>{if(!controller.signal.aborted){setCaps(null);setCapError('編集機能を確認できませんでした。')}});
     return()=>controller.abort();
   },[artifact.id,artifact.previewKind,revisionKey]);
