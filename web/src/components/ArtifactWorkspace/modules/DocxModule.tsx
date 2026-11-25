@@ -1,7 +1,7 @@
 import React,{useRef,useState} from 'react';
 import type {Editor} from '@tiptap/react';
 import {WordParagraphEditor,type WordRun,type WordMark} from '../../shared-ui/editor/WordParagraphEditor';
-import { workspaceApi,supportsOperation } from '../../../api/workspace';
+import { workspaceApi,supportsOperation,type EditOperation } from '../../../api/workspace';
 import {ResponsiveCommandBar} from '../../shared-ui/layout/ResponsiveCommandBar';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
 import { PdfCanvasViewer } from '../../shared-ui/document/PdfCanvasCore';
@@ -12,6 +12,10 @@ import type { WorkspaceModuleProps } from '../types';
 interface WordBlock {blockIndex:number;type:string;text:string;editableText?:boolean;marks?:Partial<Record<WordMark,boolean>>;uiRuns?:WordRun[]}
 interface WordRange {blocks:WordBlock[];blockCount:number;hasMore:boolean}
 const PAGE=40;
+/** Text edits precede insertion of protected image runs. */
+export function prepareDocxOperations(operations:readonly EditOperation[]):EditOperation[]{
+  return [...operations].sort((a,b)=>Number(a.op==='docx.add_image')-Number(b.op==='docx.add_image'));
+}
 export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDraft,onTarget,target}:WorkspaceModuleProps){
   const [page,setPage]=useState(0);
   const [reading,setReading]=useState<'page'|'text'>('page');

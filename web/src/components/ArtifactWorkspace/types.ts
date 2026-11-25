@@ -19,4 +19,6 @@ export interface WorkspaceModule {
   Component:ComponentType<WorkspaceModuleProps>;
   editOperations:readonly string[];
   canPin:boolean;
+  /** Prepare a fresh, ordered operation list without mutating the draft. */
+  prepareOperations?:(operations:readonly EditOperation[])=>EditOperation[];
 }

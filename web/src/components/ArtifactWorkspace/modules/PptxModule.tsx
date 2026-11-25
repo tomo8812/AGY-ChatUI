@@ -24,6 +24,10 @@ function MiniSlide({artifact,index,active,onClick,disabled}:{artifact:WorkspaceM
   const url=useImage(r.ready?r.data??undefined:undefined);
   return <button type="button" className={'workspace-slide-nav-item '+(active?'active':'')} aria-label={'スライド '+(index+1)} aria-pressed={active} disabled={disabled} onClick={onClick}>{url?<img src={url} alt=""/>:<span> {index+1} </span>}<small>{index+1}</small></button>;
 }
+/** Match the native draft renderer: text and geometry precede styling. */
+export function preparePptxOperations(operations:readonly EditOperation[]):EditOperation[]{
+  return [...operations].sort((a,b)=>Number(a.op==='pptx.set_shape_style')-Number(b.op==='pptx.set_shape_style'));
+}
 export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDraft,onTarget,target}:WorkspaceModuleProps){
   const [slideId,setSlideId]=useState('');
   const [selected,setSelected]=useState('');
