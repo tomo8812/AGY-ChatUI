@@ -263,6 +263,39 @@ for(const vp of targets){
             expect(srv.ctx.editRequestService.listRequests(userId,chatId,{artifactId:artifact.id})).toMatchObject([{instruction:'Revised cell instruction',status:'draft'}]);
             evidence.push({kind:'multiple-target-drafts',count:2,edited:true,deleted:true});
           }
+          if(item.kind==='code'&&(vp.width===1280||vp.width===375)){
+            // Actual server revision change delivered through the harness's
+            // same prop update as the workspace would receive from App.
+            // The PR3B launch-path/WebSocket integration remains a separate gate.
+            await page.getByRole('button',{name:'編集',exact:true}).click();
+            const editor=page.getByRole('textbox',{name:'ソース'});
+            await page.getByRole('button',{name:'全選択',exact:true}).click();
+            const local='export const localDraft = 123;';
+            await page.keyboard.insertText(local);
+            await expect.poll(()=>page.locator('.cm-line').allTextContents()).toEqual([local]);
+            const zoomBefore=await page.locator('[data-viewer-zoom-surface]').getAttribute('data-zoom-scale');
+            const remoteText='export const remoteUpdate = 456;\n';
+            const remote=await svc.editArtifact({userId,artifactId:artifact.id,expectedRevision:2,operations:[{op:'replace_source',content:remoteText}],actorKind:'ai',actorId:'pr3a-test-agent'});
+            expect(remote.artifact.revision).toBe(3);
+            await page.evaluate(next=>(window as Window&{__pr3aApplyArtifactUpdate?:(a:ArtifactRecord)=>void}).__pr3aApplyArtifactUpdate?.(next),remote.artifact as unknown as ArtifactRecord);
+            await expect(page.locator('.workspace-status')).toContainText('バージョン 3');
+            await expect(page.locator('.workspace-conflict-banner')).toBeVisible();
+            await expect.poll(()=>page.locator('.cm-line').allTextContents()).toEqual([local]);
+            expect(await page.locator('[data-viewer-zoom-surface]').getAttribute('data-zoom-scale')).toBe(zoomBefore);
+            await expect(page.getByRole('button',{name:'編集',exact:true})).toHaveAttribute('aria-pressed','true');
+            await page.getByRole('button',{name:'保存',exact:true}).click();
+            const conflict=page.getByRole('alertdialog',{name:'編集の競合'});
+            await expect(conflict).toBeVisible();
+            expect(fs.readFileSync(svc.getRevisionContentBlob(userId,artifact.id,3).blobPath,'utf8')).toBe(remoteText);
+            await conflict.getByRole('button',{name:'変更を保持'}).click();
+            await expect.poll(()=>page.locator('.cm-line').allTextContents()).toEqual([local]);
+            await page.getByRole('button',{name:'保存',exact:true}).click();
+            page.once('dialog',dialog=>void dialog.accept());
+            await conflict.getByRole('button',{name:'最新を読み直す'}).click();
+            await expect.poll(()=>page.locator('.cm-line').allTextContents()).toEqual(remoteText.split('\n'));
+            expect(srv.ctx.db.getArtifact(userId,artifact.id)?.revision).toBe(3);
+            evidence.push({kind:'live-revision-conflict',revision:3,draftPreserved:true,zoomPreserved:true,remotePreserved:true});
+          }
           if(item.kind==='pptx'){
             await page.getByRole('button',{name:'編集',exact:true}).click();
             const select=page.getByRole('combobox',{name:'スライド編集操作'});
