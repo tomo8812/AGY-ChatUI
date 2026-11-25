@@ -27,15 +27,15 @@ import { SvgAdapter } from './svg-adapter.js';
 const CHART_EDITS = ['chart.create', 'chart.update_title_and_legend', 'chart.update_series_data', 'chart.update_series_style', 'chart.add_or_remove_series'];
 
 export const DOCUMENT_ACTIONS = {
-  pptx: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:pdf',
+  pptx: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:pdf', 'export:png',
     'pptx.set_shape_text', 'pptx.move_shape', 'pptx.smartart.get_structure', 'pptx.smartart.update_node_text', ...CHART_EDITS],
-  docx: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:pdf',
+  docx: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:pdf', 'export:md', 'export:html',
     'docx.set_paragraph_text', 'docx.set_page_size', 'docx.set_page_layout'],
-  xlsx: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:pdf', 'xlsx.set_cell', 'xlsx.set_formula', 'xlsx.mutate_rows', 'xlsx.mutate_columns', ...CHART_EDITS],
+  xlsx: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:pdf', 'export:png', 'export:csv', 'xlsx.set_cell', 'xlsx.set_cell_style', 'xlsx.set_formula', 'xlsx.mutate_rows', 'xlsx.mutate_columns', ...CHART_EDITS],
   pdf: ['create', 'structure', 'read_range', 'verify', 'render_png', 'export:png', 'export:txt',
     'pdf.rotate_page', 'pdf.reorder_pages', 'pdf.remove_page', 'pdf.add_note', 'pdf.add_overlay'],
-  image: ['create', 'structure', 'verify', 'render_png', 'export:png', 'export:jpeg', 'export:webp',
-    'image.crop', 'image.resize', 'image.rotate', 'image.brightness', 'image.annotate'],
+  image: ['create', 'structure', 'verify', 'render_png', 'export:png', 'export:jpg', 'export:jpeg', 'export:webp',
+    'image.crop', 'image.resize', 'image.rotate', 'image.brightness', 'image.annotate', 'image.composite'],
   media: ['structure', 'verify', 'render_png', 'media.trim'],
 } satisfies Partial<Record<ArtifactFormat, string[]>>;
 

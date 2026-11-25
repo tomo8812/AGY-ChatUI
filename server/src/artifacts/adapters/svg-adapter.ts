@@ -57,7 +57,7 @@ export class SvgAdapter implements FormatAdapter {
       { operation: 'verify', availability: 'supported', scope: 'mcp_and_ui' },
       {
         operation: 'export_png',
-        availability: ctx.runtimeProfile === 'base_chatui' ? 'disabled_by_resource_tier' : 'supported',
+        availability: ctx.runtimeProfile !== 'base_chatui' && ctx.sandboxAvailable ? 'supported' : 'disabled_by_resource_tier',
         scope: 'mcp_and_ui',
       },
     ];

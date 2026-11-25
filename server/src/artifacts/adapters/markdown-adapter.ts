@@ -44,7 +44,7 @@ export class MarkdownAdapter implements FormatAdapter {
       { operation: 'export', availability: 'supported', scope: 'mcp_and_ui', notes: 'html, txt' },
       {
         operation: 'render_png',
-        availability: ctx.runtimeProfile === 'full_runtime' ? 'supported' : 'disabled_by_resource_tier',
+        availability: ctx.runtimeProfile === 'full_runtime' && ctx.sandboxAvailable ? 'supported' : 'disabled_by_resource_tier',
         scope: 'mcp_only',
       },
     ];

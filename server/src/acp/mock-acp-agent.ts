@@ -139,6 +139,7 @@ interface SessionState {
   mcpServers: unknown[];
   history: string[];
   cancelled: boolean;
+  pendingMcpReceipt?: { toolCallId: string; name: string; rawOutput: unknown };
 }
 
 function buildConfigOptions({ modelId, effortValue, mode }: SessionState): SessionConfigOption[] {
@@ -523,7 +524,18 @@ function runAcpServer(): void {
         return { stopReason: 'cancelled' as const };
       }
 
-      if (promptText.includes('[MCP_RICH_CREATE]') || promptText.includes('[MCP_RICH_UNATTACHED]')) {
+      if (promptText.includes('[MCP_RICH_FLUSH]') && state.pendingMcpReceipt) {
+        const receipt = state.pendingMcpReceipt;
+        state.pendingMcpReceipt = undefined;
+        await sendUpdate({
+          sessionId: state.id,
+          update: { sessionUpdate: 'tool_call_update', status: 'completed', ...receipt },
+        });
+        return { stopReason: 'end_turn' as const };
+      }
+
+      const richMode = /\[MCP_RICH_(CREATE|UNATTACHED|DEFER|CHILD|UNTRACKED|CANCEL_WAIT)\]/.exec(promptText)?.[1];
+      if (richMode) {
         const servers = state.mcpServers as Array<{
           name?: string; url?: string; headers?: Array<{ name: string; value: string }>;
         }>;
@@ -539,18 +551,39 @@ function runAcpServer(): void {
           const toolCallId = randomUUID();
           const title = 'Create a rich document';
           const name = 'mcp(agy_artifact/rich_create)';
-          await sendUpdate({
-            sessionId: state.id,
-            update: { sessionUpdate: 'tool_call', toolCallId, name, title, status: 'in_progress' },
-          });
+          const childId = richMode === 'CHILD' || richMode === 'UNTRACKED' ? `${state.id}-mcp-child` : null;
+          if (richMode === 'CHILD' && childId) {
+            await sendUpdate({
+              sessionId: state.id,
+              update: { sessionUpdate: 'subagent_update', sessionId: childId, title: 'MCP worker', state: { state: 'running' } },
+            });
+          }
+          if (richMode !== 'UNTRACKED') {
+            await sendUpdate({
+              sessionId: childId ?? state.id,
+              update: { sessionUpdate: 'tool_call', toolCallId, name, title, status: 'in_progress' },
+            });
+          }
           const result = await mcp.callTool({ name: 'rich_create', arguments: {
             document: { schemaVersion: 1, root: { type: 'markdown', id: 'sample', content: 'MCP fixture' } },
           } });
           if (result.isError) throw new Error(JSON.stringify(result.content));
-          if (!promptText.includes('[MCP_RICH_UNATTACHED]')) {
+          const receipt = { toolCallId, name, rawOutput: result };
+          if (richMode === 'DEFER') {
+            state.pendingMcpReceipt = receipt;
+          } else if (richMode === 'CANCEL_WAIT') {
+            for (let tick = 0; tick < 120 && !state.cancelled; tick++) await delay(40);
+            return { stopReason: state.cancelled ? 'cancelled' as const : 'end_turn' as const };
+          } else if (richMode !== 'UNATTACHED') {
+            await sendUpdate({
+              sessionId: childId ?? state.id,
+              update: { sessionUpdate: 'tool_call_update', status: 'completed', ...receipt },
+            });
+          }
+          if (richMode === 'CHILD' && childId) {
             await sendUpdate({
               sessionId: state.id,
-              update: { sessionUpdate: 'tool_call_update', toolCallId, name, status: 'completed', rawOutput: result },
+              update: { sessionUpdate: 'subagent_update', sessionId: childId, state: { state: 'idle' } },
             });
           }
         } finally {

@@ -4068,12 +4068,8 @@ export class ArtifactService {
     let exported: AdapterExportResult;
     if (adapter.exportAs) {
       exported = adapter.exportAs(buf, params.targetFormat, src);
-    } else if (
-      (['docx', 'pptx', 'xlsx'].some((format) => format === adapter.format) && params.targetFormat === 'pdf' &&
-        isDocumentFormat(adapter.format)) ||
-      (adapter.format === 'pdf' && ['png', 'txt'].includes(params.targetFormat)) ||
-      (adapter.format === 'image' && ['png', 'jpg', 'jpeg', 'webp'].includes(params.targetFormat))
-    ) {
+    } else if (isDocumentFormat(adapter.format) &&
+      DOCUMENT_ACTIONS[adapter.format].includes(`export:${params.targetFormat}`)) {
       const filename = `${path.parse(src.filename).name}.${params.targetFormat}`;
       exported = {
         filename,

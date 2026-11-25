@@ -96,3 +96,72 @@ it('enforces loopback headers, token revocation and boundaries over HTTP', async
     await srv.cleanup();
   }
 });
+
+it.each([
+  ['CHILD', 'confirmed_by_tool_call'],
+  ['UNTRACKED', 'tentative_sole_turn'],
+] as const)('uses ACP child-session provenance for %s notifications', async (mode, bindingState) => {
+  const srv = await createTestServer({ INSTALL_DOC_RUNTIME: '0' });
+  try {
+    const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'richchild', 'user:richchild');
+    const { data: { chat } } = await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Child session' });
+    await client.connectWs({ clientId: 'child-mcp-test' });
+    const { data: { run } } = await client.request<{ run: { id: string } }>(
+      'POST', `/api/chats/${chat.id}/messages`, { text: `[MCP_RICH_${mode}]` }
+    );
+    await client.waitForFrame((frame) => frame.kind === 'event' &&
+      frame.event?.type === 'run.finished' && frame.event.runId === run.id, 8000, false);
+    const blocks = srv.ctx.richContentService.listBlocksForChat(userId, chat.id);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].bindingState).toBe(bindingState);
+  } finally {
+    await srv.cleanup();
+  }
+});
+
+it('binds a delayed completion to the turn that owns its tool call during a subsequent turn', async () => {
+  const srv = await createTestServer({ INSTALL_DOC_RUNTIME: '0' });
+  try {
+    const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'richdelay', 'user:richdelay');
+    const { data: { chat } } = await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Delayed receipt' });
+    await client.connectWs({ clientId: 'delayed-mcp-test' });
+    const send = async (text: string) => {
+      const { data: { run } } = await client.request<{ run: { id: string } }>(
+        'POST', `/api/chats/${chat.id}/messages`, { text }
+      );
+      await client.waitForFrame((frame) => frame.kind === 'event' && frame.event?.type === 'run.finished' &&
+        frame.event.runId === run.id, 8000, false);
+      return run.id;
+    };
+    const firstRun = await send('[MCP_RICH_DEFER]');
+    expect(srv.ctx.richContentService.listBlocksForChat(userId, chat.id)[0]?.confirmedMessageId).toBeNull();
+    const secondRun = await send('[MCP_RICH_FLUSH]');
+    const assistantMessages = srv.ctx.db.listMessages(userId, chat.id).filter(({ role }) => role === 'assistant');
+    const block = srv.ctx.richContentService.listBlocksForChat(userId, chat.id)[0];
+    expect(block.confirmedMessageId).toBe(assistantMessages.find(({ runId }) => runId === firstRun)?.id);
+    expect(block.runId).toBe(firstRun);
+    expect(assistantMessages.find(({ runId }) => runId === secondRun)?.richBlockIds).toEqual([]);
+  } finally {
+    await srv.cleanup();
+  }
+});
+
+it('keeps a created block provisional when the turn is cancelled before the ACP completion', async () => {
+  const srv = await createTestServer({ INSTALL_DOC_RUNTIME: '0' });
+  try {
+    const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'richcancel', 'user:richcancel');
+    const { data: { chat } } = await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Cancelled receipt' });
+    await client.connectWs({ clientId: 'cancelled-mcp-test' });
+    const { data: { run } } = await client.request<{ run: { id: string } }>(
+      'POST', `/api/chats/${chat.id}/messages`, { text: '[MCP_RICH_CANCEL_WAIT]' }
+    );
+    await client.waitForFrame((frame) => frame.kind === 'event' && frame.event?.type === 'rich_block.created', 8000, false);
+    const cancelled = await client.request('POST', `/api/chats/${chat.id}/runs/${run.id}/cancel`);
+    expect(cancelled.status).toBe(200);
+    const block = srv.ctx.richContentService.listBlocksForChat(userId, chat.id)[0];
+    expect(block.confirmedMessageId).toBeNull();
+    expect(srv.ctx.db.listMessages(userId, chat.id).find(({ role }) => role === 'assistant')?.richBlockIds).toEqual([]);
+  } finally {
+    await srv.cleanup();
+  }
+});

@@ -1,5 +1,7 @@
 """Bounded document processing entry point for DocWorkerSandbox."""
 
+import base64
+import csv
 import json
 import io
 from copy import copy, deepcopy
@@ -79,6 +81,8 @@ def validate_package(package, fmt):
         raise ValueError("Invalid content types manifest")
     defaults, overrides = {}, {}
     for child in types:
+        if not isinstance(child.tag, str):
+            continue
         if child.tag == tag(CONTENT_TYPES, "Default"):
             key = child.get("Extension", "").lower()
             mapping = defaults
@@ -106,6 +110,8 @@ def validate_package(package, fmt):
                     raise ValueError("Invalid relationships part")
                 seen_ids = set()
                 for relationship in part:
+                    if not isinstance(relationship.tag, str):
+                        continue
                     identifier = relationship.get("Id")
                     if relationship.tag != tag(RELATIONSHIPS, "Relationship") or not identifier or identifier in seen_ids:
                         raise ValueError("Invalid or duplicate relationship identifier")
@@ -201,7 +207,7 @@ def edit_workbook(package, operations, output):
         if op.startswith("chart."):
             changes_cells |= edit_chart(package, "xlsx", operation, replacements)
             continue
-        changes_cells = True
+        changes_cells |= op != "xlsx.set_cell_style"
         if op in {"xlsx.mutate_rows", "xlsx.mutate_columns"}:
             mutate_workbook_grid(package, operation, replacements)
         else:
@@ -210,13 +216,76 @@ def edit_workbook(package, operations, output):
     write_package(package, replacements, output, "xlsx", removed)
 
 
+def locate_or_insert_cell(sheet, address):
+    row_number, column_number = cell_coordinates(address)
+    grid = sheet.find(tag(SPREADSHEET, "sheetData"))
+    if grid is None:
+        raise ValueError("Worksheet has no cell data")
+    row = None
+    offset = len(grid)
+    for index, candidate in enumerate(grid):
+        if candidate.tag != tag(SPREADSHEET, "row"):
+            continue
+        number = bounded_integer(candidate.get("r"), 1, 1048576)
+        if number == row_number:
+            row = candidate
+            break
+        if number > row_number:
+            offset = index
+            break
+    if row is None:
+        row = XML.Element(tag(SPREADSHEET, "row"), r=str(row_number))
+        grid.insert(offset, row)
+    offset = len(row)
+    for index, previous in enumerate(row):
+        if previous.tag != tag(SPREADSHEET, "c"):
+            offset = index
+            break
+        column = cell_coordinates(previous.attrib["r"])[1]
+        if column == column_number:
+            return previous
+        if column > column_number:
+            offset = index
+            break
+    cell = XML.Element(tag(SPREADSHEET, "c"), r=address)
+    row.insert(offset, cell)
+    dimension = sheet.find(tag(SPREADSHEET, "dimension"))
+    if dimension is not None and dimension.get("ref"):
+        corners = dimension.attrib["ref"].split(":")
+        first_row, first_column = cell_coordinates(corners[0])
+        last_row, last_column = cell_coordinates(corners[-1])
+        start = f"{column_name(min(first_column, column_number))}{min(first_row, row_number)}"
+        end = f"{column_name(max(last_column, column_number))}{max(last_row, row_number)}"
+        dimension.set("ref", start if start == end else f"{start}:{end}")
+    row.attrib.pop("spans", None)
+    return cell
+
+
+def assert_editable_cell(sheet, address):
+    row, column = cell_coordinates(address)
+    for merged in sheet.iter(tag(SPREADSHEET, "mergeCell")):
+        start, end = merged.attrib["ref"].split(":")
+        first_row, first_column = cell_coordinates(start)
+        last_row, last_column = cell_coordinates(end)
+        if address != start and first_row <= row <= last_row and first_column <= column <= last_column:
+            raise ValueError("Select the anchor of a merged cell")
+    for formula in sheet.iter(tag(SPREADSHEET, "f")):
+        if formula.get("t") not in {"shared", "array", "dataTable"} or not formula.get("ref"):
+            continue
+        bounds = formula.attrib["ref"].split(":")
+        first_row, first_column = cell_coordinates(bounds[0])
+        last_row, last_column = cell_coordinates(bounds[-1])
+        if first_row <= row <= last_row and first_column <= column <= last_column:
+            raise ValueError("Shared, table, and array formulas are protected")
+
+
 def update_workbook_cell(package, operation, replacements):
     op = operation["op"]
-    if op not in {"xlsx.set_cell", "xlsx.set_formula"}:
+    if op not in {"xlsx.set_cell", "xlsx.set_formula", "xlsx.set_cell_style"}:
         raise ValueError("Unsupported XLSX operation")
     sheet_name = operation["sheetPart"]
     address = operation["address"]
-    value = operation["value"]
+    value = operation.get("value")
     if not re.fullmatch(r"xl/worksheets/[^/]+\.xml", sheet_name):
         raise ValueError("Invalid worksheet part")
     cell_coordinates(address)
@@ -225,10 +294,18 @@ def update_workbook_cell(package, operation, replacements):
     sheet = replacements.get(sheet_name)
     if sheet is None:
         sheet = parse_xml(package.read(sheet_name))
-    cells = [cell for cell in sheet.iter(tag(SPREADSHEET, "c")) if cell.get("r") == address]
-    if len(cells) != 1:
-        raise ValueError("The operation requires an existing, unique cell")
-    cell = cells[0]
+    assert_editable_cell(sheet, address)
+    cell = locate_or_insert_cell(sheet, address)
+    if op == "xlsx.set_cell_style":
+        cell.set("s", str(bounded_integer(operation["styleIndex"], 0, 65535)))
+        replacements[sheet_name] = sheet
+        return
+    if cell.get("t") == "s" and "xl/sharedStrings.xml" in package.namelist():
+        strings = replacements.get("xl/sharedStrings.xml")
+        if strings is None:
+            strings = parse_xml(package.read("xl/sharedStrings.xml"))
+        strings.attrib.pop("count", None)
+        replacements["xl/sharedStrings.xml"] = strings
     formula = cell.find(tag(SPREADSHEET, "f"))
     if formula is not None and formula.get("t") not in (None, "normal"):
         raise ValueError("Shared, table, and array formulas are protected")
@@ -333,6 +410,17 @@ def process_image(request, source, output):
                 if not 0 <= factor <= 4:
                     raise ValueError("Brightness factor is out of bounds")
                 image = ImageEnhance.Brightness(image).enhance(factor)
+            elif op == "image.composite":
+                encoded = operation["imageBase64"]
+                if not isinstance(encoded, str) or len(encoded) > 2_000_000:
+                    raise ValueError("Overlay image exceeds the input limit")
+                with Image.open(io.BytesIO(base64.b64decode(encoded, validate=True))) as overlay:
+                    overlay_size = image_size(overlay.size)
+                    left = bounded_integer(operation["x"], 0, image.width - 1)
+                    top = bounded_integer(operation["y"], 0, image.height - 1)
+                    if left + overlay_size[0] > image.width or top + overlay_size[1] > image.height:
+                        raise ValueError("Overlay extends beyond the canvas")
+                    image.alpha_composite(overlay.convert("RGBA"), (left, top))
             elif op == "image.annotate":
                 position = (bounded_integer(operation["x"], 0, image.width - 1),
                             bounded_integer(operation["y"], 0, image.height - 1))
@@ -609,6 +697,14 @@ def cell_coordinates(address):
     return bounded_integer(match.group(2), 1, 1048576), bounded_integer(column, 1, 16384)
 
 
+def column_name(column):
+    result = ""
+    while column:
+        column, digit = divmod(column - 1, 26)
+        result = chr(ord("A") + digit) + result
+    return result
+
+
 MUTATION_ADDRESS = re.compile(r"(\$?)([A-Z]{1,3})(\$?)([1-9][0-9]{0,6})", re.IGNORECASE)
 
 
@@ -655,12 +751,7 @@ class GridMutation:
             coords = coordinates[index]
             coords[self.axis] = shifted[0] if index == 0 else shifted[1]
             column_prefix, _, row_prefix, _ = MUTATION_ADDRESS.fullmatch(point).groups()
-            column = ""
-            col = coords[1]
-            while col:
-                col, digit = divmod(col - 1, 26)
-                column = chr(ord("A") + digit) + column
-            changed.append(f"{column_prefix}{column}{row_prefix}{coords[0]}")
+            changed.append(f"{column_prefix}{column_name(coords[1])}{row_prefix}{coords[0]}")
         return ":".join(changed)
 
 
@@ -1711,10 +1802,40 @@ def render_office(source, output, request):
                     "--headless", "--convert-to", "pdf", "--outdir", str(Path.cwd()), str(staging)],
                    check=True)
     pdf = staging.with_suffix(".pdf")
-    if request["action"] == "export":
+    if request["action"] == "export" and request["targetFormat"] == "pdf":
         pdf.replace(output)
     else:
-        process_pdf({**request, "format": "pdf"}, pdf, output)
+        process_pdf({**request, "format": "pdf", "action": "render"}, pdf, output)
+
+
+def export_delimited_workbook(source, output):
+    from openpyxl import load_workbook
+    with source.open("rb") as stream:
+        workbook = load_workbook(stream, read_only=True, data_only=True)
+        try:
+            _write_workbook_csv(workbook, output)
+        finally:
+            workbook.close()
+
+
+def _write_workbook_csv(workbook, output):
+    sheet = workbook.worksheets[0]
+    if (sheet.max_row or 0) * (sheet.max_column or 0) > 1_000_000:
+        raise ValueError("Worksheet exceeds the CSV export limit")
+    with output.open("w", encoding="utf-8", newline="") as destination:
+        writer = csv.writer(destination)
+        count = 0
+        for row in sheet.values:
+            count += len(row)
+            if count > 1_000_000:
+                raise ValueError("Worksheet exceeds the CSV export limit")
+            writer.writerow(row)
+
+
+def export_docx(source, output, target):
+    writer = {"md": "gfm", "html": "html5"}[target]
+    subprocess.run(["pandoc", "--from", "docx", "--to", writer,
+                    "--output", str(output), str(source)], check=True)
 
 
 def process_document(request, source, output):
@@ -1739,8 +1860,22 @@ def process_document(request, source, output):
 
     with zipfile.ZipFile(source) as package:
         names = validate_package(package, fmt)
-        if action == "render" or (action == "export" and request["targetFormat"] == "pdf"):
-            if fmt == "pptx" and action == "render":
+        if action == "export":
+            target = request["targetFormat"]
+            if fmt == "xlsx" and target == "csv":
+                export_delimited_workbook(source, output)
+            elif fmt == "docx" and target in {"md", "html"}:
+                export_docx(source, output, target)
+            elif target in {"png", "pdf"}:
+                if fmt == "pptx" and target == "png":
+                    render_presentation_layer(package, request, output)
+                else:
+                    render_office(source, output, request)
+            else:
+                raise ValueError("Unsupported document export")
+            return None
+        if action == "render":
+            if fmt == "pptx":
                 render_presentation_layer(package, request, output)
             else:
                 render_office(source, output, request)

@@ -2773,6 +2773,21 @@ export class AcpClientManager {
     this.publishToolActivity(worker, turn, targetToolCallId);
   }
 
+  private confirmRichToolReceipt(
+    worker: WorkerInstance,
+    turn: ActiveTurnBridge,
+    name: string | undefined,
+    update: SessionUpdate
+  ): void {
+    if (update.sessionUpdate !== 'tool_call_update' || update.status !== 'completed' ||
+        update.rawOutput === undefined || !name || !turn.assistantMessageId) return;
+    try {
+      worker.builtinMcp?.confirm(name, update.rawOutput, turn.assistantMessageId, turn.runId, update.toolCallId);
+    } catch (error) {
+      console.warn('[acp] Rich block binding failed:', error);
+    }
+  }
+
   private handleChildSessionNotification(
     worker: WorkerInstance,
     turn: ActiveTurnBridge,
@@ -2809,6 +2824,7 @@ export class AcpClientManager {
         (c) => c.toolCallId === update.toolCallId
       );
       const rawName = (update as { name?: string }).name ?? prevChildTool?.name;
+      if (prevChildTool) this.confirmRichToolReceipt(worker, turn, rawName, update);
       const childTool: SubagentActivityItem = {
         toolCallId: update.toolCallId,
         title:
@@ -3528,13 +3544,8 @@ export class AcpClientManager {
         ...(contentText ? { contentText } : {}),
         ...(diffStats ? { diffStats } : {}),
       };
-      if (update.status === 'completed' && rawName && update.rawOutput !== undefined &&
-        this.resolveBridgeForElicitation(worker, update.toolCallId, params.sessionId) === turn) {
-        try {
-          worker.builtinMcp?.confirm(rawName, update.rawOutput, turn.assistantMessageId, turn.runId, update.toolCallId);
-        } catch (error) {
-          console.warn('[acp] Rich block binding failed:', error);
-        }
+      if (this.resolveBridgeForElicitation(worker, update.toolCallId, params.sessionId) === turn) {
+        this.confirmRichToolReceipt(worker, turn, rawName, update);
       }
       const merged = mergedRaw;
       const nextIdx = turn.toolCalls.findIndex((t) => t.toolCallId === update.toolCallId);

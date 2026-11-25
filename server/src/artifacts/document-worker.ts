@@ -64,7 +64,8 @@ export class DocumentWorker {
     const workerScript = web ? webWorkerScript : docWorkerScript;
     const scriptName = path.basename(workerScript);
     const officeConversion = ((format === 'docx' || format === 'pptx' || format === 'xlsx') &&
-      (request.action === 'render' || request.action === 'export')) ||
+      (request.action === 'render' ||
+        (request.action === 'export' && ['png', 'pdf'].includes(request.targetFormat)))) ||
       (format === 'xlsx' && request.action === 'range' && request.range.evaluate === true);
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-document-'));
     try {

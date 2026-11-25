@@ -45,7 +45,7 @@ export class HtmlAdapter implements FormatAdapter {
       { operation: 'verify', availability: 'supported', scope: 'mcp_and_ui' },
       {
         operation: 'render_png',
-        availability: ctx.runtimeProfile === 'full_runtime' ? 'supported' : 'disabled_by_resource_tier',
+        availability: ctx.runtimeProfile === 'full_runtime' && ctx.sandboxAvailable ? 'supported' : 'disabled_by_resource_tier',
         scope: 'mcp_only',
       },
     ];

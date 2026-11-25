@@ -4,6 +4,7 @@ Run using the Compact or Full runtime:
   /opt/agy-doc-runtime/venv/bin/python3 -m unittest discover -s server/tests -p artifact_doc_worker_test.py
 """
 
+import base64
 import io
 import json
 import os
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import wave
 import zipfile
 
 from docx import Document
@@ -48,6 +50,7 @@ class DocumentWorkerTest(unittest.TestCase):
         request = {"format": format_name, "filename": f"test.{format_name}", "action": action, **arguments}
         (self.inputs / "request.json").write_text(json.dumps(request), encoding="utf-8")
         env = dict(os.environ, AGY_WORKER_IN_DIR=str(self.inputs), AGY_WORKER_OUT_DIR=str(self.outputs))
+        self.result.unlink(missing_ok=True)
         subprocess.run([sys.executable, str(WORKER)], env=env, check=True, cwd=self.directory)
         return self.result.read_bytes()
 
@@ -94,6 +97,18 @@ class DocumentWorkerTest(unittest.TestCase):
         self.assertTrue(reopened.calculation.fullCalcOnLoad)
         cached = load_workbook(io.BytesIO(edited), data_only=True)
         self.assertIsNone(cached.active["A2"].value)
+
+    def test_spreadsheet_blank_cells_and_csv_export(self):
+        book = Workbook()
+        book.active["A1"] = "Value"
+        book.save(self.source)
+        result = self.run_worker("xlsx", "edit", operations=[
+            {"op": "xlsx.set_cell", "sheetPart": "xl/worksheets/sheet1.xml", "address": "A2", "value": 4},
+            {"op": "xlsx.set_cell", "sheetPart": "xl/worksheets/sheet1.xml", "address": "B2", "value": "new"},
+        ])
+        self.source.write_bytes(result)
+        exported = self.run_worker("xlsx", "export", targetFormat="csv")
+        self.assertEqual(exported.decode("utf-8").splitlines(), ["Value,", "4,new"])
 
     def test_spreadsheet_mutation_moves_cross_sheet_references(self):
         workbook = Workbook()
@@ -319,6 +334,32 @@ class DocumentWorkerTest(unittest.TestCase):
         self.assertEqual([page.extract_text().strip() for page in pages], ["One", "Two", "Three"])
         self.assertEqual((self.inputs / "merge-0.pdf").read_bytes(), first)
         self.assertEqual((self.inputs / "merge-1.pdf").read_bytes(), second)
+
+    @unittest.skipUnless(shutil.which("ffprobe") and shutil.which("ffmpeg"), "FFmpeg runtime not installed")
+    def test_media_trim_reports_the_new_audio_duration(self):
+        with wave.open(str(self.source), "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(8000)
+            audio.writeframes(b"\x00\x00" * 8000)
+        source = json.loads(self.run_worker("media", "structure", filename="sample.wav"))
+        self.assertAlmostEqual(source["durationSeconds"], 1.0)
+        result = self.run_worker("media", "edit", filename="sample.wav", operations=[
+            {"op": "media.trim", "startSeconds": 0.2, "endSeconds": 0.6},
+        ])
+        with wave.open(io.BytesIO(result)) as audio:
+            self.assertAlmostEqual(audio.getnframes() / audio.getframerate(), 0.4, places=2)
+
+    def test_image_composites_an_overlay_at_its_selected_position(self):
+        Image.new("RGBA", (7, 5), (255, 0, 0, 255)).save(self.source, format="PNG")
+        overlay = io.BytesIO()
+        Image.new("RGBA", (2, 2), (0, 0, 255, 255)).save(overlay, format="PNG")
+        edited = self.run_worker("image", "edit", operations=[{
+            "op": "image.composite", "x": 3, "y": 2, "imageBase64": base64.b64encode(overlay.getvalue()).decode("ascii"),
+        }])
+        with Image.open(io.BytesIO(edited)) as image:
+            self.assertEqual(image.getpixel((3, 2)), (0, 0, 255, 255))
+            self.assertEqual(image.getpixel((0, 0)), (255, 0, 0, 255))
 
     def test_image_crop_and_convert(self):
         Image.new("RGB", (12, 6), "red").save(self.source, format="PNG")

@@ -557,9 +557,32 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const { artifactId } = req.params as { artifactId: string };
     const query = (req.query ?? {}) as Record<string, unknown>;
     try {
-      return await artifactService.readRange(session.user.id, artifactId, query);
+      return await artifactService.readRange(session.user.id, artifactId, {
+        ...query, ...(query.evaluate === 'true' ? { evaluate: true } : {}),
+      });
     } catch (err) {
       return sendArtifactError(reply, err);
+    }
+  });
+
+  const renderQuerySchema = z.object({
+    pageIndex: z.coerce.number().int().min(0).optional(),
+    timeSeconds: z.coerce.number().finite().min(0).optional(),
+    variant: z.enum(['background', 'sprite']).optional(),
+    shapeId: z.coerce.number().int().positive().optional(),
+  });
+
+  app.get('/api/files/:artifactId/render', async (req, reply) => {
+    const session = requireAuth(req, reply, db);
+    if (!session) return;
+    const query = renderQuerySchema.safeParse(req.query);
+    if (!query.success) return reply.code(400).send({ error: 'INVALID_RENDER_OPTIONS' });
+    const { artifactId } = req.params as { artifactId: string };
+    try {
+      const png = await artifactService.renderPng(session.user.id, artifactId, query.data);
+      return reply.type('image/png').header('Cache-Control', 'private, no-store').send(png);
+    } catch (error) {
+      return sendArtifactError(reply, error);
     }
   });
 
