@@ -128,6 +128,7 @@ for(const vp of targets){
             // Scroll without a pointer or wheel input (as with native
             // scrollbar/accessibility navigation). A settled jump must not
             // pin the page indicator indefinitely.
+            await expect.poll(()=>page.locator('.pdf-canvas-scroll').evaluate(el=>el.scrollTop)).toBeGreaterThan(2);
             await page.locator('.pdf-canvas-scroll').evaluate(el=>{el.scrollTop=0});
             await expect(page.locator('.pdf-page-indicator')).toContainText('1 / 2');
             await page.locator('.pdf-nav-group').getByRole('button',{name:'次',exact:true}).click();

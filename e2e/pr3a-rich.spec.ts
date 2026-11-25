@@ -42,6 +42,9 @@ for(const vp of [{width:1280,height:720,project:'pc-chromium'},{width:1440,heigh
     await expect(page.locator('svg circle').first()).toHaveAttribute('r','10');
     for(const chartType of types){
       const chart=page.locator('figure.rich-chart[aria-label="'+chartType+'"]');
+      // Offscreen charts pause their paint subscriptions. Re-enter the
+      // viewport and prove they catch up to the latest computed value.
+      await chart.scrollIntoViewIfNeeded();
       await expect(chart.locator('svg title').filter({hasText:chartType==='scatter'?'Power · 3 · 20':'Power · Evening · 20'})).toHaveCount(1);
       await expect(chart.locator('summary')).toContainText('欠損値 1 件');
     }

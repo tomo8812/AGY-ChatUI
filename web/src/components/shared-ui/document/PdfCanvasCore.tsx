@@ -218,6 +218,9 @@ export const PdfCanvasViewer: React.FC<{
     const anchor=programmaticScrollRef.current;
     if(anchor)anchor.settled={top:container.scrollTop,width:container.clientWidth,height:container.clientHeight,scrollHeight:container.scrollHeight};
   };
+  // A viewport resize may clamp the previous scroll position, but must not
+  // swallow an independent scroll occurring in the same frame.
+  const movedFromAnchor=(container:HTMLDivElement,settled:{top:number})=>Math.abs(container.scrollTop-Math.min(settled.top,Math.max(0,container.scrollHeight-container.clientHeight)))>2;
   const scrollRafRef = useRef<number | null>(null);
   const scheduleRenderRef = useRef<() => void>(() => {});
   const pageNumRef = useRef(1);
@@ -444,7 +447,7 @@ export const PdfCanvasViewer: React.FC<{
     pendingSizeAnchorRef.current = null;
     const sc = scrollRef.current;
     const slot = pageElementsRef.current.get(anchor.pageNum);
-    if (!sc || !slot) return;
+    if (!sc || !slot || programmaticScrollRef.current) return;
     const afterOffsetTop = slot.getBoundingClientRect().top - sc.getBoundingClientRect().top;
     const delta = afterOffsetTop - anchor.offsetTop;
     if (Math.abs(delta) > 0.5) {
@@ -504,10 +507,8 @@ export const PdfCanvasViewer: React.FC<{
     // A ResizeObserver callback can be queued before an accessibility or
     // scrollbar scroll. Never restore an old page over new input when the
     // actual viewport and document geometry are unchanged.
-    if(settled&&settled.width===sc.clientWidth&&settled.height===sc.clientHeight&&settled.scrollHeight===sc.scrollHeight){
-      if(Math.abs(sc.scrollTop-settled.top)>2){programmaticScrollRef.current=null;return;}
-      if(fitMode==='manual')return;
-    }
+    if(settled&&movedFromAnchor(sc,settled)){programmaticScrollRef.current=null;return;}
+    if(settled&&settled.width===sc.clientWidth&&settled.height===sc.clientHeight&&settled.scrollHeight===sc.scrollHeight&&fitMode==='manual')return;
     const rect=slot.getBoundingClientRect(), viewport=sc.getBoundingClientRect();
     const padding=parseFloat(window.getComputedStyle(sc).paddingTop)||0;
     sc.scrollTo({top:Math.max(0,sc.scrollTop+rect.top-viewport.top-padding+lock.offsetRatio*rect.height),behavior:'instant'});
@@ -871,7 +872,7 @@ export const PdfCanvasViewer: React.FC<{
   const handleScroll = useCallback(() => {
     if (isZoomInteractingRef.current) return;
     const sc=scrollRef.current,lock=programmaticScrollRef.current,settled=lock?.settled;
-    if(sc&&settled&&settled.width===sc.clientWidth&&settled.height===sc.clientHeight&&settled.scrollHeight===sc.scrollHeight&&Math.abs(sc.scrollTop-settled.top)>2){
+    if(sc&&settled&&movedFromAnchor(sc,settled)){
       programmaticScrollRef.current=null;
     }
     if (scrollRafRef.current !== null) return;
@@ -884,13 +885,9 @@ export const PdfCanvasViewer: React.FC<{
       const anchor=programmaticScrollRef.current;
       if(anchor){
         const settled=anchor.settled;
-        // Layout changes can clamp scrollTop before ResizeObserver commits
-        // the new fit geometry. The layout effect restores the anchor.
-        if(!settled||settled.width!==container.clientWidth||settled.height!==container.clientHeight||settled.scrollHeight!==container.scrollHeight)return;
-        // The recorded position is our own last scroll, not an indefinite
-        // input lock. Scrollbar, accessibility or script navigation on the
-        // same geometry releases it even without pointer/wheel events.
-        if(Math.abs(container.scrollTop-settled.top)<=2)return;
+        // A clamped programmatic scroll belongs to the layout effect. Any
+        // other displacement is independent input, even during resize.
+        if(!settled||!movedFromAnchor(container,settled))return;
         programmaticScrollRef.current=null;
       }
 
