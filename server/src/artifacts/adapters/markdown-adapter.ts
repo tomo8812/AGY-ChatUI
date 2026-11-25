@@ -66,26 +66,31 @@ function sanitizeHref(raw: string): string {
 
 function renderInlineMarkdown(raw: string): string {
   const codeSlots: string[] = [];
+  const urlSlots: string[] = [];
   let text = raw.replace(/`([^`]+)`/g, (_match, code: string) => {
     const idx = codeSlots.length;
     codeSlots.push(`<code>${escapeHtml(code)}</code>`);
     return `\u0000CODE${idx}\u0000`;
   });
 
+  // Keep destinations out of the text escaping and emphasis passes.
+  text = text.replace(/(!?\[[^\]]*\]\()([^)\s]+)(?=(?:\s+"[^"&<>]*")?\))/g, (_match, prefix: string, url: string) => {
+    const index = urlSlots.length;
+    urlSlots.push(sanitizeHref(url));
+    return prefix + '\u0000URL' + index + '\u0000';
+  });
   text = escapeHtml(text);
 
   // Images: ![alt](src)
-  text = text.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+&quot;([^&]*)&quot;)?\)/g, (_m, alt: string, src: string, title?: string) => {
-    const safeSrc = sanitizeHref(src);
+  text = text.replace(/!\[([^\]]*)\]\((\u0000URL\d+\u0000)(?:\s+&quot;([^&]*)&quot;)?\)/g, (_m, alt: string, src: string, title?: string) => {
     const titleAttr = title ? ` title="${title}"` : '';
-    return `<img src="${safeSrc}" alt="${alt}"${titleAttr} />`;
+    return `<img src="${src}" alt="${alt}"${titleAttr} />`;
   });
 
   // Links: [label](href)
-  text = text.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+&quot;([^&]*)&quot;)?\)/g, (_m, label: string, href: string, title?: string) => {
-    const safeHref = sanitizeHref(href);
+  text = text.replace(/\[([^\]]+)\]\((\u0000URL\d+\u0000)(?:\s+&quot;([^&]*)&quot;)?\)/g, (_m, label: string, href: string, title?: string) => {
     const titleAttr = title ? ` title="${title}"` : '';
-    return `<a href="${safeHref}"${titleAttr}>${label}</a>`;
+    return `<a href="${href}"${titleAttr}>${label}</a>`;
   });
 
   // Bold + italic, bold, italic, strikethrough
@@ -96,7 +101,9 @@ function renderInlineMarkdown(raw: string): string {
   text = text.replace(/(^|[\s(])_([^_]+)_(?=[\s).,!?:;]|$)/g, '$1<em>$2</em>');
   text = text.replace(/~~([^~]+)~~/g, '<del>$1</del>');
 
-  return text.replace(/\u0000CODE(\d+)\u0000/g, (_m, idx: string) => codeSlots[Number(idx)] ?? '');
+  return text.replace(/\u0000(CODE|URL)(\d+)\u0000/g, (_m, kind: string, index: string) =>
+    (kind === 'CODE' ? codeSlots[Number(index)] : urlSlots[Number(index)]) ?? ''
+  );
 }
 
 function splitTableRow(line: string): string[] {
