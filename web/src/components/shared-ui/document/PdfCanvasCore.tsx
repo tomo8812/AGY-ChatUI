@@ -218,9 +218,12 @@ export const PdfCanvasViewer: React.FC<{
     const anchor=programmaticScrollRef.current;
     if(anchor)anchor.settled={top:container.scrollTop,width:container.clientWidth,height:container.clientHeight,scrollHeight:container.scrollHeight};
   };
-  // A viewport resize may clamp the previous scroll position, but must not
-  // swallow an independent scroll occurring in the same frame.
-  const movedFromAnchor=(container:HTMLDivElement,settled:{top:number})=>Math.abs(container.scrollTop-Math.min(settled.top,Math.max(0,container.scrollHeight-container.clientHeight)))>2;
+  // Layout changes can reset the browser scroll offset before ResizeObserver
+  // reports the new size. Only offsets in the same geometry supersede a jump.
+  const sameScrollGeometry=(container:HTMLDivElement,settled:{width:number;height:number;scrollHeight:number})=>
+    settled.width===container.clientWidth&&settled.height===container.clientHeight&&settled.scrollHeight===container.scrollHeight;
+  const movedFromAnchor=(container:HTMLDivElement,settled:{top:number;width:number;height:number;scrollHeight:number})=>
+    sameScrollGeometry(container,settled)&&Math.abs(container.scrollTop-settled.top)>2;
   const scrollRafRef = useRef<number | null>(null);
   const scheduleRenderRef = useRef<() => void>(() => {});
   const pageNumRef = useRef(1);
@@ -508,14 +511,14 @@ export const PdfCanvasViewer: React.FC<{
     // scrollbar scroll. Never restore an old page over new input when the
     // actual viewport and document geometry are unchanged.
     if(settled&&movedFromAnchor(sc,settled)){programmaticScrollRef.current=null;return;}
-    if(settled&&settled.width===sc.clientWidth&&settled.height===sc.clientHeight&&settled.scrollHeight===sc.scrollHeight&&fitMode==='manual')return;
+    if(settled&&sameScrollGeometry(sc,settled)&&fitMode==='manual')return;
     const rect=slot.getBoundingClientRect(), viewport=sc.getBoundingClientRect();
     const padding=parseFloat(window.getComputedStyle(sc).paddingTop)||0;
     sc.scrollTo({top:Math.max(0,sc.scrollTop+rect.top-viewport.top-padding+lock.offsetRatio*rect.height),behavior:'instant'});
     rememberScrollPosition(sc);
     pageNumRef.current=lock.targetPage;setPageNum(lock.targetPage);
     scheduleRenderRef.current();
-  },[containerSize.width,containerSize.height,pageSizes,pdfDoc,loading,scrollEl,fitMode]);
+  },[containerSize.width,containerSize.height,pageSizes,pdfDoc,loading,scrollEl,fitMode,navigation]);
 
   // Single shared IntersectionObserver for all pages (replaces N observers!)
   useEffect(() => {
@@ -885,8 +888,8 @@ export const PdfCanvasViewer: React.FC<{
       const anchor=programmaticScrollRef.current;
       if(anchor){
         const settled=anchor.settled;
-        // A clamped programmatic scroll belongs to the layout effect. Any
-        // other displacement is independent input, even during resize.
+        // Viewport changes are handled by the layout effect. Scrolling in
+        // unchanged geometry selects the page at the new offset.
         if(!settled||!movedFromAnchor(container,settled))return;
         programmaticScrollRef.current=null;
       }

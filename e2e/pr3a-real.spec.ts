@@ -138,7 +138,15 @@ for(const vp of targets){
             // Scroll without a pointer or wheel input (as with native
             // scrollbar/accessibility navigation). A settled jump must not
             // pin the page indicator indefinitely.
-            await expect.poll(()=>page.locator('.pdf-canvas-scroll').evaluate(el=>el.scrollTop)).toBeGreaterThan(2);
+            const pdfScroll=page.locator('.pdf-canvas-scroll');
+            // Page two can already fit at the top at auto scale. Create real
+            // scroll travel before exercising scrollbar navigation.
+            for(let step=0;step<6&&await pdfScroll.evaluate(el=>el.scrollTop<=2);step++){
+              await page.getByRole('button',{name:'拡大',exact:true}).click();
+              await page.locator('.pdf-nav-group').getByRole('button',{name:'前',exact:true}).click();
+              await page.locator('.pdf-nav-group').getByRole('button',{name:'次',exact:true}).click();
+            }
+            await expect.poll(()=>pdfScroll.evaluate(el=>el.scrollTop)).toBeGreaterThan(2);
             await page.locator('.pdf-canvas-scroll').evaluate(el=>{el.scrollTop=0});
             await expect(page.locator('.pdf-page-indicator')).toContainText('1 / 2');
             await page.locator('.pdf-nav-group').getByRole('button',{name:'次',exact:true}).click();
@@ -180,9 +188,14 @@ for(const vp of targets){
               }
               if(item.kind==='xlsx'){
                 const jump=page.getByRole('textbox',{name:'セル範囲へ移動'});
-                await jump.fill('U51');await jump.press('Enter');
+                const search=page.getByRole('textbox',{name:'シート全体を検索'});
+                await search.fill('Beyond old grid window');
+                await page.getByRole('button',{name:'次の一致',exact:true}).click();
+                await expect(page.locator('.workspace-cell-address')).toHaveText('U51');
+                await search.fill('');
                 await expect(page.getByRole('gridcell',{name:'U51',exact:true})).toHaveText('Beyond old grid window',{timeout:30000});
                 await jump.fill('A1');await jump.press('Enter');
+                await expect(page.locator('.workspace-cell-address')).toHaveText('A1');
               }
               await page.getByRole('gridcell',{name:'A1',exact:true}).click({timeout:30000});
               await page.getByRole('textbox',{name:'数式・セル値'}).fill(item.updated);
@@ -273,11 +286,11 @@ for(const vp of targets){
               expect(result).toMatchObject({blocks:[{text:item.updated,marks:{bold:true}},{text:'Keep formatting',uiRuns:[{text:'Keep ',bold:true,underline:true},{text:'formatting',italic:true,underline:true}]},{text:'Keep table'}]});
               if(vp.width===1280||vp.width===375){
                 const added=await svc.readRange(userId,artifact.id,{start:0,count:40}) as {blocks:Array<{type:string;text:string}>};
-                expect(added.blocks.slice(-3)).toMatchObject([{type:'p',text:'First appended revised'},{type:'tbl',text:expect.stringContaining('Third row and column')},{type:'p',text:'Last appended'}]);
+                expect(added.blocks.filter(block=>block.type!=='sectPr').slice(-3)).toMatchObject([{type:'p',text:'First appended revised'},{type:'tbl',text:expect.stringContaining('Third row and column')},{type:'p',text:'Last appended'}]);
               }
             }else{
               const r=await svc.readRange(userId,artifact.id,{part:'ppt/slides/slide1.xml'});
-              expect(r).toMatchObject({shapes:[{text:item.updated},{name:'Overlap'}]});
+              expect(r).toMatchObject({shapes:expect.arrayContaining([{text:item.updated,name:'Title'},{name:'Overlap'}, {name:'Basic 61'}].map(shape=>expect.objectContaining(shape)))});
               const after=await svc.renderPng(userId,artifact.id,{pageIndex:0});
               // Restore fit for the comparison, without altering the saved file.
               await page.getByRole('button',{name:'画面に合わせる'}).click();

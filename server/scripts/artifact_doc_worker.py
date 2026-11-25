@@ -2408,6 +2408,58 @@ def shift_worksheet_grid(root, mutation):
                 ) or "A1")
 
 
+def search_workbook_sheet(package, options):
+    sheet = next((sheet for sheet in workbook_sheets(package) if sheet["id"] == str(options["sheetId"])), None)
+    if sheet is None:
+        raise ValueError("Unknown worksheet")
+    query = str(options["gridSearch"]).strip().lower()
+    if not query:
+        return {"match": None}
+    cursor = (int(options.get("afterRow", -1)) + 1, int(options.get("afterCol", -1)) + 1)
+    matching_strings = set()
+    if "xl/sharedStrings.xml" in package.namelist():
+        with package.open("xl/sharedStrings.xml") as stream:
+            for index, entry in enumerate(spreadsheet_elements(stream, "si")):
+                if query in text_content(entry, SPREADSHEET).lower():
+                    matching_strings.add(index)
+
+    best = None
+    with package.open(sheet["part"]) as stream:
+        for row in spreadsheet_elements(stream, "row"):
+            for cell in row.findall(tag(SPREADSHEET, "c")):
+                address = cell.get("r")
+                if not address:
+                    continue
+                cell_type = cell.get("t")
+                value = cell.findtext(tag(SPREADSHEET, "v")) or ""
+                formula = cell.findtext(tag(SPREADSHEET, "f")) or ""
+                if cell_type == "s":
+                    matches = value.isdecimal() and int(value) in matching_strings
+                else:
+                    if cell_type == "inlineStr":
+                        value = text_content(cell, SPREADSHEET)
+                    matches = query in value.lower()
+                if matches or (formula and query in ("=" + formula).lower()):
+                    coordinate = cell_coordinates(address)
+                    candidate = (coordinate <= cursor, coordinate)
+                    if best is None or candidate < best:
+                        best = candidate
+    if best is None:
+        return {"match": None}
+    row, col = best[1]
+    return {"match": {"row": row - 1, "col": col - 1}}
+
+
+def spreadsheet_elements(stream, name):
+    for _, element in XML.iterparse(stream, events=("end",), tag=tag(SPREADSHEET, name),
+                                   resolve_entities=False, no_network=True):
+        yield element
+        element.clear()
+        parent = element.getparent()
+        while parent is not None and element.getprevious() is not None:
+            del parent[0]
+
+
 def read_workbook_range(package, options):
     sheet = next((sheet for sheet in workbook_sheets(package) if sheet["id"] == str(options["sheetId"])), None)
     if sheet is None:
@@ -6930,6 +6982,8 @@ def process_document(request, source, output):
             return verify_office(package, source, fmt, names, verify_options=request.get("options"))
         if action == "range" and fmt == "xlsx":
             options = request["range"]
+            if "gridSearch" in options:
+                return search_workbook_sheet(package, options)
             result = read_workbook_range(package, options)
             if options.get("evaluate") is True and any("formulaStatus" in cell for cell in result["cells"]):
                 return evaluate_workbook_range(package, source, options, result)

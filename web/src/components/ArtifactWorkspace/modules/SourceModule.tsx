@@ -1,4 +1,4 @@
-import React,{useLayoutEffect,useRef,useState} from 'react';
+import React,{useDeferredValue,useLayoutEffect,useMemo,useRef,useState} from 'react';
 import { buildArtifactContentUrl } from '../../../utils/viewerCache';
 import { MarkdownContent,CodeBlock } from '../../MarkdownContent';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
@@ -10,7 +10,6 @@ import {SourceEditor,type SourceEditorHandle} from '../../shared-ui/editor/Sourc
 
 export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget}:WorkspaceModuleProps){
   const resource=useRevisionResource(artifact,'source',async signal=>{
-    if(artifact.sizeBytes>4*1024*1024)throw Error('編集表示は4 MBまで対応しています。');
     const response=await fetch(buildArtifactContentUrl(artifact),{credentials:'include',signal});
     if(!response.ok)throw Error('ファイルを取得できませんでした。');
     return response.text();
@@ -24,12 +23,20 @@ export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget
   const editor=useRef<SourceEditorHandle|null>(null);
   const text=resource.data??'';
   const value=String(draft?.entries.find(e=>e.key==='source')?.operation.content??text);
+  const previewValue=useDeferredValue(value);
   const markdown=artifact.previewKind==='markdown';
   const language=artifact.filename.split('.').pop()??'text';
-  const matches=query?value.toLowerCase().split(query.toLowerCase()).length-1:0;
+  const matches=useMemo(()=>{
+    const needle=query.toLowerCase();
+    if(!needle)return 0;
+    const source=value.toLowerCase();
+    let count=0;
+    for(let index=source.indexOf(needle);index>=0;index=source.indexOf(needle,index+needle.length))count++;
+    return count;
+  },[query,value]);
   useLayoutEffect(()=>{
     const root=preview.current;if(!root||!markdown||mode==='pin'){setOutline([]);return}
-    const update=()=>setOutline(Array.from(root.querySelectorAll('h1,h2,h3,h4,h5,h6')).slice(0,300).map(el=>({label:el.textContent??'',level:Number(el.tagName[1])})));
+    const update=()=>setOutline(Array.from(root.querySelectorAll('h1,h2,h3,h4,h5,h6')).map(el=>({label:el.textContent??'',level:Number(el.tagName[1])})));
     update();const observer=new MutationObserver(update);observer.observe(root,{childList:true,subtree:true,characterData:true});return()=>observer.disconnect();
   },[resource.data!==null,markdown,mode]);
   function jumpHeading(index:number){preview.current?.querySelectorAll('h1,h2,h3,h4,h5,h6')[index]?.scrollIntoView({block:'nearest',inline:'nearest'});setOutlineOpen(false)}
@@ -40,7 +47,7 @@ export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget
     // Search visible rendered text, not raw markdown delimiters or hidden controls.
     const walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT,{acceptNode:n=>n.parentElement?.closest('button,script,style,svg,[aria-hidden=true]')?NodeFilter.FILTER_REJECT:NodeFilter.FILTER_ACCEPT});
     const nodes:Text[]=[];let full='',node:Node|null;
-    while((node=walker.nextNode())&&full.length<4*1024*1024){nodes.push(node as Text);full+=node.textContent??''}
+    while((node=walker.nextNode())){nodes.push(node as Text);full+=node.textContent??''}
     const needle=query.toLocaleLowerCase(),hay=full.toLocaleLowerCase();let at=hay.indexOf(needle,searchOffset.current);if(at<0)at=hay.indexOf(needle);if(at<0)return;
     let start:Text|null=null,end:Text|null=null,startOffset=0,endOffset=0,pos=0;
     for(const n of nodes){const len=n.length;if(!start&&at<pos+len){start=n;startOffset=at-pos}if(start&&at+query.length<=pos+len){end=n;endOffset=at+query.length-pos;break}pos+=len}
@@ -63,7 +70,7 @@ export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget
     {resource.loading&&<p className="muted-xs">読み込み中…</p>}
     {resource.data!==null&&<div className={'workspace-source'+(markdown&&mode==='edit'?' split':'')}>
       {mode!=='view'?<SourceEditor editorRef={editor} language={language} value={mode==='pin'?text:value} readOnly={mode!=='edit'||editingLocked||!resource.ready} onChange={content=>{if(artifact.revision!==undefined)onDraft(artifact.revision,content===text?null:{key:'source',label:'ソースの変更',operation:{op:'replace_source',content}},'source')}}/>:null}
-      {(mode==='view'||markdown&&mode==='edit')&&<div className="workspace-source-preview" ref={preview}>{markdown?<MarkdownContent content={value} chatId={artifact.chatId}/>:<CodeBlock code={value} language={language}/>}</div>}
+      {(mode==='view'||markdown&&mode==='edit')&&<div className="workspace-source-preview" ref={preview}>{markdown?<MarkdownContent content={previewValue} chatId={artifact.chatId}/>:<CodeBlock code={value} language={language}/>}</div>}
     </div>}
   </UnifiedViewerZoomShell>
 }

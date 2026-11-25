@@ -1,4 +1,4 @@
-import React,{useEffect,useMemo,useRef,useState} from 'react';
+import React,{useEffect,useLayoutEffect,useMemo,useRef,useState} from 'react';
 import {previewFormulas} from '../formulaPreview';
 import { workspaceApi,supportsOperation } from '../../../api/workspace';
 import {ResponsiveCommandBar} from '../../shared-ui/layout/ResponsiveCommandBar';
@@ -67,11 +67,11 @@ export function GridModule(props:WorkspaceModuleProps){
   const [editAction,setEditAction]=useState('');
   const [sheetName,setSheetName]=useState('');
   const [search,setSearch]=useState('');
-  const [searchAt,setSearchAt]=useState(-1);
   const [searching,setSearching]=useState(false);
   const searchAbort=useRef<AbortController|null>(null);
   const formulaInput=useRef<HTMLInputElement>(null);
   const scroll=useRef<HTMLDivElement>(null);
+  const pendingReveal=useRef<Coordinate|null>(null);
   const [viewport,setViewport]=useState({top:0,left:0,width:800,height:420});
   const structure=useRevisionResource<{sheets:Sheet[];rowCount?:number;colCount?:number}>(artifact,'grid-structure',async signal=>{
     if(xlsx){
@@ -94,8 +94,7 @@ export function GridModule(props:WorkspaceModuleProps){
     return()=>observer.disconnect();
   },[!!sheet]);
   const rowAxis=axis(rowCount,CELL_HEIGHT,CELL_HEIGHT,viewport.height,viewport.top),colAxis=axis(colCount,CELL_WIDTH,HEADER,viewport.width,viewport.left);
-  // TanStack only measures a bounded moving segment. The plane, coordinates and
-  // scrollbar are continuous across the entire logical sheet, not page numbers.
+  // Keep the rendered cell count proportional to the viewport.
   const items=(a:ReturnType<typeof axis>)=>Array.from({length:a.length},(_,index)=>({index,start:a.margin+index*a.cell,size:a.cell}));
   const rows=items(rowAxis),cols=items(colAxis);
   const current={row:Math.min(rowCount-1,selected.row),col:Math.min(colCount-1,selected.col)};
@@ -121,7 +120,7 @@ export function GridModule(props:WorkspaceModuleProps){
         try{
           let tile:GridTile;
           if(xlsx){
-            const result=await workspaceApi.range<{cells:Cell[]}>(artifact.id,{sheetId:sheet.id,rangeA1:address(b.row0,b.col0)+':'+address(b.row1,b.col1)},controller.signal);
+            const result=await workspaceApi.range<{cells:Cell[]}>(artifact.id,{sheetId:sheet.id,rangeA1:address(b.row0,b.col0)+':'+address(b.row1,b.col1),evaluate:true},controller.signal);
             assertRevision(artifact,result);
             tile={cells:new Map(result.cells.map(cell=>[cell.address,cell]))};
           }else tile={cells:new Map(),rows:await csvTile(artifact,b.row0,b.row1,b.col0,b.col1,controller.signal)};
@@ -172,8 +171,16 @@ export function GridModule(props:WorkspaceModuleProps){
   function move(row:number,col:number,extend=false){
     row=Math.max(0,Math.min(rowCount-1,row));col=Math.max(0,Math.min(colCount-1,col));
     setSelected({row,col});if(!extend)setAnchor({row,col});
-    const el=scroll.current;if(el){el.scrollTop=reveal(rowAxis,row);el.scrollLeft=reveal(colAxis,col);updateViewport()}
+    pendingReveal.current={row,col};
   }
+  useLayoutEffect(()=>{
+    const el=scroll.current,target=pendingReveal.current;
+    if(!el||!target||!el.clientHeight||!el.clientWidth)return;
+    pendingReveal.current=null;
+    el.scrollTop=reveal(axis(rowCount,CELL_HEIGHT,CELL_HEIGHT,el.clientHeight,el.scrollTop),target.row);
+    el.scrollLeft=reveal(axis(colCount,CELL_WIDTH,HEADER,el.clientWidth,el.scrollLeft),target.col);
+    updateViewport();
+  });
   function jumpToRange(){
     const parts=jump.split(':'),first=parseAddress(parts[0]),last=parts.length===2?parseAddress(parts[1]):first;
     if(parts.length>2||!first||!last||first.row>=rowCount||last.row>=rowCount||first.col>=colCount||last.col>=colCount){setPinError('有効なセル範囲を入力してください。');return}
@@ -221,16 +228,7 @@ export function GridModule(props:WorkspaceModuleProps){
     onDraft(artifact.revision,{key:'grid-structure',label:action.label,operation:op},'grid-structure');setEditAction('');setSheetName('');
   }
   useEffect(()=>{setSearching(false);return()=>{searchAbort.current?.abort();searchAbort.current=null}},[search,revisionKey,sheet?.id,draft]);
-  const searchMatches=useMemo(()=>{
-    const q=search.trim().toLocaleLowerCase();if(!xlsx||!q||!sheet)return [];
-    const matches:Coordinate[]=[];
-    for(const key of visibleKeys){if(!cache.has(key))continue;const b=tileBounds(key,rowCount,colCount);
-      for(let r=b.row0;r<=b.row1;r++)for(let c=b.col0;c<=b.col1;c++)if(value(r,c).toLocaleLowerCase().includes(q))matches.push({row:r,col:c});
-    }
-    return matches.sort((a,b)=>a.row-b.row||a.col-b.col);
-  },[search,draft,sheet,cache,cacheVersion,visibleKeys.join(',')]);
   async function nextMatch(){
-    if(xlsx){if(!searchMatches.length)return;const n=(searchAt+1)%searchMatches.length;setSearchAt(n);const match=searchMatches[n];move(match.row,match.col);return;}
     if(!search.trim()||!sheet||searching)return;
     searchAbort.current?.abort();const controller=new AbortController();searchAbort.current=controller;setSearching(true);setPinError('');
     const identity=latest.current,origin=current;
@@ -239,14 +237,19 @@ export function GridModule(props:WorkspaceModuleProps){
     const circular=(a:Coordinate,b:Coordinate)=>Number(compare(a,origin)<=0)-Number(compare(b,origin)<=0)||compare(a,b);
     const matchingDrafts=(draft?.entries??[]).flatMap(e=>{
       const op=e.operation;
-      return op.op==='set_cell'&&Number.isSafeInteger(op.row)&&Number.isSafeInteger(op.col)&&fold(String(op.value??'')).includes(q)?[{row:Number(op.row),col:Number(op.col)}]:[];
+      if(!fold(String(op.value??'')).includes(q))return [];
+      if(xlsx&&op.sheetPart===sheet.part&&['xlsx.set_cell','xlsx.set_formula'].includes(op.op)&&typeof op.address==='string'){
+        const coordinate=parseAddress(op.address);
+        return coordinate?[coordinate]:[];
+      }
+      return !xlsx&&op.op==='set_cell'&&Number.isSafeInteger(op.row)&&Number.isSafeInteger(op.col)?[{row:Number(op.row),col:Number(op.col)}]:[];
     }).sort(circular);
     try{
       let cursor=origin,hit:Coordinate|null=null;const seen=new Set<string>();
       // A staged cell may hide a match in the persisted bytes. Skip only
       // those overwritten hits; merge matching staged values in cyclic order.
       while(!controller.signal.aborted){
-        const result=await workspaceApi.range<{match:Coordinate|null}>(artifact.id,{gridSearch:search.trim(),afterRow:cursor.row,afterCol:cursor.col},controller.signal);
+        const result=await workspaceApi.range<{match:Coordinate|null}>(artifact.id,{gridSearch:search.trim(),afterRow:cursor.row,afterCol:cursor.col,...(xlsx?{sheetId:sheet.id}:{})},controller.signal);
         assertRevision(artifact,result);
         const next=result.match;if(!next)break;
         const addressKey=key(next.row,next.col);if(seen.has(addressKey))break;seen.add(addressKey);
@@ -269,9 +272,9 @@ export function GridModule(props:WorkspaceModuleProps){
       {editAction&&<button type="button" className="btn btn-secondary btn-xs" disabled={!structuralEnabled||!validName} onClick={stageStructure}>適用</button>}
     </>:null;
   const toolbar=<ResponsiveCommandBar primary={primary} secondary={secondary} minInlineWidth={850} closeOnButton/>;
-  const tabs=<div className="workspace-toolbar" role="group" aria-label="シート">{sheets.map(s=><button key={s.id} type="button" className={'btn btn-secondary btn-xs '+(s.id===sheet?.id?'active':'')} aria-pressed={s.id===sheet?.id} onClick={()=>{setSheetId(s.id);move(0,0);setSearchAt(-1)}}>{s.name}</button>)}
-    <input aria-label="セル範囲へ移動" placeholder="A1:B2" value={jump} onChange={e=>setJump(e.target.value)} onKeyDown={e=>{if(e.key==='Enter')jumpToRange()}}/><button type="button" className="btn btn-secondary btn-xs" disabled={!jump.trim()} onClick={jumpToRange}>移動</button>
-    <input aria-label={xlsx?'表示範囲を検索':'表全体を検索'} placeholder={xlsx?'範囲内検索':'表全体を検索'} value={search} onChange={e=>{setSearch(e.target.value);setSearchAt(-1)}} onKeyDown={e=>{if(e.key==='Enter')void nextMatch()}}/><button type="button" className="btn btn-secondary btn-xs" disabled={xlsx?!searchMatches.length:!search.trim()||searching||!structure.ready} onClick={()=>void nextMatch()}>{searching?'検索中…':'次の一致'}{xlsx&&search&&' ('+searchMatches.length+')'}</button></div>;
+  const tabs=<div className="workspace-toolbar" role="group" aria-label="シート">{sheets.map(s=><button key={s.id} type="button" className={'btn btn-secondary btn-xs '+(s.id===sheet?.id?'active':'')} aria-pressed={s.id===sheet?.id} onClick={()=>{setSheetId(s.id);move(0,0)}}>{s.name}</button>)}
+    <input aria-label="セル範囲へ移動" placeholder="A1:B2" value={jump} onChange={e=>setJump(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();jumpToRange()}}}/><button type="button" className="btn btn-secondary btn-xs" disabled={!jump.trim()} onClick={jumpToRange}>移動</button>
+    <input aria-label={xlsx?'シート全体を検索':'表全体を検索'} placeholder={xlsx?'シート全体を検索':'表全体を検索'} value={search} onChange={e=>{setSearch(e.target.value)}} onKeyDown={e=>{if(e.key==='Enter')void nextMatch()}}/><button type="button" className="btn btn-secondary btn-xs" disabled={!search.trim()||searching||!structure.ready} onClick={()=>void nextMatch()}>{searching?'検索中…':'次の一致'}</button></div>;
   return <UnifiedViewerZoomShell resetKey={artifact.id+':grid'} controlsTop={toolbar} controlsBottom={tabs}>
     {(structure.error||rangeError||pinError)&&<div role="alert" className="error-box">{structure.error||rangeError||pinError}<button type="button" onClick={()=>{structure.retry();setRetry(v=>v+1);setPinError('')}}>再試行</button></div>}
     {structural&&<div className="workspace-toolbar" role="status">{structural.label}（保存時に反映）<button type="button" className="btn btn-secondary btn-xs" disabled={editingLocked} onClick={()=>artifact.revision!==undefined&&onDraft(artifact.revision,null,'grid-structure')}>取消</button></div>}
