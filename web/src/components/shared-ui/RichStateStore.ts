@@ -53,6 +53,7 @@ export class RichStateStore {
   private readonly authorized: Set<string>;
   private readonly listeners = new Set<Listener>();
   private readonly keyListeners = new Map<string, Set<Listener>>();
+  private readonly projectionListeners = new Map<string, Set<Listener>>();
   private snapshot: RichStateSnapshot;
 
   constructor(document: RichDocumentV1, authorizedArtifactIds: Iterable<string> = [], theme: Theme = 'light') {
@@ -84,6 +85,23 @@ export class RichStateStore {
     return () => {
       listeners.delete(listener);
       if (!listeners.size) this.keyListeners.delete(key);
+    };
+  }
+
+  /** A projection publishes only when one of its referenced values changes.
+   * Wildcards cover computed/dynamic property lookups and whole-record expressions. */
+  subscribeProjection(keys: readonly string[], listener: Listener): () => void {
+    for (const key of keys) {
+      const set = this.projectionListeners.get(key) ?? new Set<Listener>();
+      set.add(listener);
+      this.projectionListeners.set(key, set);
+    }
+    return () => {
+      for (const key of keys) {
+        const set = this.projectionListeners.get(key);
+        set?.delete(listener);
+        if (!set?.size) this.projectionListeners.delete(key);
+      }
     };
   }
 
@@ -184,7 +202,27 @@ export class RichStateStore {
 
   private publish(snapshot: RichStateSnapshot): void {
     const previous = this.snapshot;
-    this.snapshot = snapshot;
+    // The evaluator can return new arrays for unchanged computed values.
+    // Preserve their identity so unrelated state changes do not redraw charts.
+    const computed = Object.assign(Object.create(null), snapshot.computed) as Record<string, unknown>;
+    for (const key of Object.keys(computed)) {
+      const old = previous.computed[key], next = computed[key];
+      if (Object.is(old, next) || (old !== undefined && next !== undefined &&
+        typeof old === 'object' && typeof next === 'object' && JSON.stringify(old) === JSON.stringify(next))) {
+        computed[key] = old;
+      }
+    }
+    this.snapshot = Object.freeze({ ...snapshot, computed: Object.freeze(computed) });
+    const pending = new Set<Listener>();
+    const notify = (key: string) => { for (const listener of this.projectionListeners.get(key) ?? []) pending.add(listener); };
+    for (const key of Object.keys(snapshot.state)) if (!Object.is(previous.state[key], snapshot.state[key])) {
+      notify('state:' + key); notify('state:*');
+    }
+    for (const key of Object.keys(computed)) if (!Object.is(previous.computed[key], computed[key])) {
+      notify('computed:' + key); notify('computed:*');
+    }
+    if (previous.theme !== snapshot.theme) notify('theme');
+    for (const listener of pending) listener();
     for (const [key, listeners] of this.keyListeners) {
       if (!Object.is(previous.state[key], snapshot.state[key])) {
         for (const listener of [...listeners]) listener();

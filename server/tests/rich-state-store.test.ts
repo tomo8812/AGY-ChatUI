@@ -21,6 +21,25 @@ describe('RichStateStore', () => {
     expect(amount).toHaveBeenCalledTimes(1);
     expect(other).not.toHaveBeenCalled();
   });
+  it('notifies only dependent state/computed projections, including dynamic access', () => {
+    const store = new RichStateStore(document);
+    const computed=vi.fn(), unrelated=vi.fn(), wildcard=vi.fn(), both=vi.fn();
+    const unsubscribe=store.subscribeProjection(['computed:double'],computed);
+    store.subscribeProjection(['state:other'],unrelated);
+    store.subscribeProjection(['state:*'],wildcard);
+    store.subscribeProjection(['state:amount','computed:double'],both);
+    store.set('amount',5);
+    expect(computed).toHaveBeenCalledTimes(1);
+    expect(unrelated).not.toHaveBeenCalled();
+    expect(wildcard).toHaveBeenCalledTimes(1);
+    expect(both).toHaveBeenCalledTimes(1);
+    unsubscribe();
+    store.set('amount',6);
+    expect(computed).toHaveBeenCalledTimes(1);
+    store.set('other','changed');
+    expect(unrelated).toHaveBeenCalledTimes(1);
+    expect(both).toHaveBeenCalledTimes(2);
+  });
   it('rejects undeclared state and side effects atomically', () => {
     const store = new RichStateStore(document);
     const before = store.getSnapshot();

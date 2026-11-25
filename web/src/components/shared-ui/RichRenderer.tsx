@@ -4,8 +4,8 @@ import type { ArtifactRecord } from '../../types';
 import { buildArtifactContentUrl } from '../../utils/viewerCache';
 import { MarkdownContent, MermaidBlock, CodeBlock } from '../MarkdownContent';
 import { CheckIcon, CopyIcon, DownloadIcon, ExternalLinkIcon, FileIcon, SearchIcon, SettingsIcon, PlusIcon, CloseIcon, FolderIcon, GaugeIcon, ShieldIcon } from '../Icons';
-import { createRichEvalBudget, isValidHttpUrl, validateRichMarkdownContent, type RichEvalContext } from './RichExprEvaluator';
-import { RichStateStore } from './RichStateStore';
+import { createRichEvalBudget, isValidHttpUrl, validateRichMarkdownContent, parseRichExpr, type ExprAst, type RichEvalContext } from './RichExprEvaluator';
+import { RichStateStore, type RichStateSnapshot } from './RichStateStore';
 import { runExplicitRichActions, type RichActionHost } from './RichActionRunner';
 import { addNode, color, evaluate, expression, num, repeatContexts, safeArray, text, type RenderCycle, type SelectValue } from './runtime';
 import { renderRichChart } from './chart/RichChartRenderer';
@@ -23,6 +23,7 @@ export interface RichRendererProps {
   actions?: ArtifactHost;
 }
 const noArtifacts:readonly ArtifactRecord[]=[];
+const noActions:ArtifactHost={};
 const icons={check:CheckIcon,copy:CopyIcon,download:DownloadIcon,link:ExternalLinkIcon,file:FileIcon,search:SearchIcon,settings:SettingsIcon,plus:PlusIcon,x:CloseIcon,folder:FolderIcon,gauge:GaugeIcon,shield:ShieldIcon};
 const space={none:0,xs:4,sm:8,md:12,lg:20};
 function finiteBound(value:unknown,min:number,max:number,fallback:number){return Math.min(max,Math.max(min,num(value,fallback)))}
@@ -68,22 +69,92 @@ export class BlockErrorBoundary extends React.Component<{children:ReactNode},{fa
   static getDerivedStateFromError(){return {failed:true}}
   render(){return this.state.failed?<div className="error-box" role="alert">このコンテンツを表示できません。</div>:this.props.children}
 }
-function RichRendererInner({document:doc,userId,chatId,artifacts=noArtifacts,actions={}}:RichRendererProps){
+type LocalContext=Pick<RichEvalContext,'item'|'index'|'aliases'>;
+const emptyLocal:LocalContext={};
+type NodeEnvironment={
+  store:RichStateStore;doc:RichDocumentV1;authorized:Map<string,ArtifactRecord>;prefix:string;host:RichActionHost;
+  fail:()=>void;dispatch:(a:RichStateAction[],c:RichEvalContext)=>void;select:SelectValue;
+  explicit:(a:readonly RichAction[],c:RichEvalContext)=>void;
+};
+function expressionKeys(expr:string,keys:Set<string>){
+  function walk(ast:ExprAst){
+    switch(ast.kind){
+      case 'ident':
+        if(ast.name==='$state')keys.add('state:*');
+        else if(ast.name==='$computed')keys.add('computed:*');
+        else if(ast.name==='$theme')keys.add('theme');
+        break;
+      case 'member':
+        if(ast.object.kind==='ident'&&['$state','$computed'].includes(ast.object.name))keys.add(ast.object.name.slice(1)+':'+ast.property);
+        else walk(ast.object);
+        break;
+      case 'index':
+        if(ast.object.kind==='ident'&&['$state','$computed'].includes(ast.object.name)&&ast.index.kind==='literal'&&typeof ast.index.value==='string')keys.add(ast.object.name.slice(1)+':'+ast.index.value);
+        else walk(ast.object);
+        walk(ast.index);break;
+      case 'unary':walk(ast.operand);break;
+      case 'binary':walk(ast.left);walk(ast.right);break;
+      case 'ternary':walk(ast.condition);walk(ast.consequent);walk(ast.alternate);break;
+      case 'call':ast.args.forEach(walk);break;
+      case 'array':ast.items.forEach(walk);break;
+    }
+  }
+  walk(parseRichExpr(expr));
+}
+/** Children subscribe independently; SVG internals and chart series belong to
+ * the node that paints them. Whole-record or dynamic indices stay conservative. */
+export function richNodeProjection(node:RichNode):string[]{
+  const keys=new Set<string>();
+  const visit=(value:unknown,field:string)=>{
+    if(typeof value==='string'){
+      if(field==='expr'||field.endsWith('Expr')||field.endsWith('When'))expressionKeys(value,keys);
+      else if(['bind','bindKey','selectedRowBind','selectedNodeBind','selectedPointBind'].includes(field))keys.add('state:'+value);
+    }else if(Array.isArray(value))value.forEach(v=>visit(v,''));
+    else if(value&&typeof value==='object')Object.entries(value).forEach(([k,v])=>visit(v,k));
+  };
+  for(const [k,v] of Object.entries(node)){
+    if(['children','headerAction','footer','trigger'].includes(k))continue;
+    if((node.type==='popover'||node.type==='tooltip')&&k==='content'&&Array.isArray(v))continue;
+    if(node.type==='tabs'&&k==='items'){for(const item of node.items){visit(item.label,'label');visit(item.badge,'badge')}continue}
+    visit(v,k);
+  }
+  return [...keys].sort();
+}
+function projectionEqual(a:RichStateSnapshot,b:RichStateSnapshot,keys:readonly string[]){
+  return keys.every(key=>{
+    if(key==='theme')return a.theme===b.theme;
+    const split=key.indexOf(':'),group=key.slice(0,split)==='state'?'state':'computed',name=key.slice(split+1);
+    if(name==='*')return Object.keys(a[group]).length===Object.keys(b[group]).length&&Object.keys(a[group]).every(k=>Object.is(a[group][k],b[group][k]));
+    return Object.is(a[group][name],b[group][name]);
+  });
+}
+function useProjection(store:RichStateStore,keys:readonly string[]){
+  const selector=useMemo(()=>{
+    let cached=store.getSnapshot();
+    return {subscribe:(listener:()=>void)=>store.subscribeProjection(keys,listener),
+      get:()=>{const current=store.getSnapshot();if(!projectionEqual(cached,current,keys))cached=current;return cached}};
+  },[store,keys]);
+  return useSyncExternalStore(selector.subscribe,selector.get,selector.get);
+}
+function RichTitle({value,store}:{value:RichDocumentV1['title'];store:RichStateStore}){
+  const keys=useMemo(()=>{const set=new Set<string>();if(value&&typeof value==='object'&&'expr' in value)expressionKeys(String(value.expr),set);return [...set]},[value]);
+  useProjection(store,keys);
+  return value?<div className="rich-document-title">{text(evaluate(value,store.context(),{budget:createRichEvalBudget(),nodes:0,svgElements:0}))}</div>:null;
+}
+function RichRendererInner({document:doc,userId,chatId,artifacts=noArtifacts,actions=noActions}:RichRendererProps){
   const theme=useTheme();
   const authorized=useMemo(()=>new Map(artifacts.filter(a=>a.userId===userId&&a.chatId===chatId).map(a=>[a.id,a])),[artifacts,userId,chatId]);
   // Revision changes to an authorized file must not reset unrelated local control state.
   const authKey=JSON.stringify([...authorized.keys()].sort());
   const docKey=JSON.stringify(doc);
   const store=useMemo(()=>new RichStateStore(JSON.parse(docKey) as RichDocumentV1,JSON.parse(authKey) as string[],theme),[docKey,authKey,userId,chatId]);
-  const snapshot=useSyncExternalStore(store.subscribe,store.getSnapshot,store.getSnapshot);
   const [error,setError]=useState<string|null>(null);
   const activeAction=useRef<AbortController|null>(null);
   const latestAuthorization=useRef(authorized);latestAuthorization.current=authorized;
   useEffect(()=>()=>{activeAction.current?.abort();activeAction.current=null},[store]);
   useEffect(()=>{try{store.setTheme(theme)}catch{setError('テーマ変更を適用できませんでした。')}},[theme,store]);
   const prefix=useId().replace(/[^a-zA-Z0-9_-]/g,'');
-  const cycle:RenderCycle={budget:createRichEvalBudget(),nodes:0,svgElements:0};
-  const root=store.context();
+  const environment=useMemo<NodeEnvironment>(()=>{
   const host:RichActionHost={...actions,authorizeArtifact:id=>latestAuthorization.current.has(id)};
   const fail=()=>setError('操作を適用できませんでした。');
   const dispatch=(a:RichStateAction[],c:RichEvalContext)=>{try{store.dispatch(a,c);setError(null)}catch{fail()}};
@@ -93,17 +164,29 @@ function RichRendererInner({document:doc,userId,chatId,artifacts=noArtifacts,act
     const controller=new AbortController();activeAction.current=controller;setError(null);
     void runExplicitRichActions(a,store,c,host,controller.signal).catch(()=>{if(!controller.signal.aborted)fail()}).finally(()=>{if(activeAction.current===controller)activeAction.current=null});
   };
+  return {store,doc,authorized,prefix,host,fail,dispatch,select,explicit};
+  },[store,doc,authorized,prefix,actions]);
+  return <section className="rich-document"><RichTitle value={doc.title} store={store}/>{error&&<div className="error-box" role="alert">{error}<button className="btn btn-ghost btn-xs" type="button" onClick={()=>setError(null)}>閉じる</button></div>}<RichNodeView node={doc.root} local={emptyLocal} path="root" environment={environment}/></section>;
+}
+const RichNodeView=React.memo(function RichNodeView({node,local,path,environment,repeat=true}:{node:RichNode;local:LocalContext;path:string;environment:NodeEnvironment;repeat?:boolean}){
+  const {store,doc,authorized,prefix,host,fail,dispatch,select,explicit}=environment;
+  const keys=useMemo(()=>richNodeProjection(node),[node]);
+  useProjection(store,keys);
+  // RichStateStore validates the entire expanded document atomically, including
+  // global limits, before publishing. Keep a bounded evaluator for each paint.
+  const cycle:RenderCycle={budget:createRichEvalBudget(),nodes:0,svgElements:0};
+  const c=store.context(local.item,local.index,local.aliases);
   const source=(id:string|undefined,asOf?:string,fetchedAt?:string)=>{
     const s=doc.sources?.find(x=>x.id===id);
     return [s?.name??id,asOf??s?.asOf,fetchedAt??s?.fetchedAt].filter(Boolean).join(' · ');
   };
-  function renderNode(node:RichNode,c:RichEvalContext,path:string,repeat=true):ReactNode{
-    if(repeat&&node.repeat)return repeatContexts(node.repeat,c,cycle).map(r=><React.Fragment key={r.key}>{renderNode(node,r.context,path+'-'+r.key,false)}</React.Fragment>);
+    const renderNode=(child:RichNode,_context:RichEvalContext,childPath:string)=><RichNodeView node={child} local={local} path={childPath} environment={environment}/>;
+    if(repeat&&node.repeat)return <>{repeatContexts(node.repeat,c,cycle).map(r=><RichNodeView key={r.key} node={node} local={{item:r.context.item,index:r.context.index,aliases:r.context.aliases}} path={path+'-'+r.key} environment={environment} repeat={false}/>)}</>;
     if(node.visibleWhen&&!expression(node.visibleWhen,c,cycle))return null;
     addNode(cycle);
     const v=<T,>(x:T|{expr:string}|undefined)=>evaluate<T>(x,c,cycle);
     const label=(x:unknown)=>text(x);
-    const read=(key:string)=>snapshot.state[key];
+    const read=(key:string)=>c.state[key];
     const change=(bind:string,value:unknown,a?:RichStateAction[])=>select(bind,value,a,c);
     const children=(nodes:RichNode[]|undefined,suffix='children')=>nodes?.map((n,i)=><React.Fragment key={n.id}>{renderNode(n,c,path+'-'+suffix+'-'+i)}</React.Fragment>);
     const unique=prefix+'-'+Array.from(path,c=>c.codePointAt(0)!.toString(16)).join('-');
@@ -165,9 +248,8 @@ function RichRendererInner({document:doc,userId,chatId,artifacts=noArtifacts,act
       default:body=<div className="error-box">この項目は表示できません。</div>;
     }
     return <div className={'rich-node'+(node.layout?.hideOn?' rich-hide-'+node.layout.hideOn:'')} style={styleLayout(node.layout)} data-rich-node-id={node.id} aria-label={node.ariaLabel?label(v(node.ariaLabel)):undefined}>{body}</div>;
-  }
-  return <section className="rich-document">{doc.title&&<div className="rich-document-title">{text(evaluate(doc.title,root,cycle))}</div>}{error&&<div className="error-box" role="alert">{error}<button className="btn btn-ghost btn-xs" type="button" onClick={()=>setError(null)}>閉じる</button></div>}{renderNode(doc.root,root,'root')}</section>;
-}
+});
+
 export function RichRenderer(props:RichRendererProps){
   return <BlockErrorBoundary key={props.userId+':'+props.chatId+':'+JSON.stringify(props.document)}><RichRendererInner {...props}/></BlockErrorBoundary>;
 }
