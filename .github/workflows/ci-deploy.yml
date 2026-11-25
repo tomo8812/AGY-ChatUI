@@ -8,6 +8,7 @@ on:
     branches:
       - main
       - feat/artifact-platform-pr1
+      - feat/artifact-platform-pr2
   workflow_dispatch:
     inputs:
       bump:
