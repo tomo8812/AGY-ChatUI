@@ -537,7 +537,14 @@ export class MarkdownAdapter implements FormatAdapter {
           location: `line:${link.line}`,
         });
       } else if (target.startsWith('#')) {
-        const anchor = slugifyHeading(decodeURIComponent(target.slice(1)));
+        const rawAnchor = target.slice(1);
+        let decodedAnchor = rawAnchor;
+        try {
+          decodedAnchor = decodeURIComponent(rawAnchor);
+        } catch {
+          decodedAnchor = rawAnchor;
+        }
+        const anchor = slugifyHeading(decodedAnchor);
         if (anchor && !headingSlugs.has(anchor)) {
           brokenAnchors += 1;
           issues.push({

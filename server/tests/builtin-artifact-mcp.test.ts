@@ -262,7 +262,7 @@ it('exports CSV to valid OOXML XLSX and renders real Markdown HTML in Base ChatU
       '',
       '### Skipped Level',
       '',
-      'See **bold**, `code`, [valid](#release-notes), and [broken](#no-such-anchor).',
+      'See **bold**, `code`, [valid](#release-notes), [broken](#no-such-anchor), and [pct](#100%).',
       '',
       '| Key | Val |',
       '| --- | ---: |',

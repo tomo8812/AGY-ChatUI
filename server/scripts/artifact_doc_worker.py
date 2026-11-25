@@ -1888,7 +1888,7 @@ def process_pdf(request, source, output):
             raise ValueError("PDF must have between 1 and 100 pages")
         size = (bounded_integer(options.get("width", 612), 72, 2880),
                 bounded_integer(options.get("height", 792), 72, 2880))
-        canvas = Canvas(str(output), pagesize=size, invariant=1)
+        canvas = Canvas(str(output), pagesize=size, invariant=1, pdfVersion=(1, 4))
         for text in pages:
             font_name = _register_reportlab_font(text)
             canvas.setFont(font_name, 11)

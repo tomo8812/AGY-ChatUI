@@ -712,7 +712,7 @@ class DocumentWorkerTest(unittest.TestCase):
         self.source.write_bytes(v2)
         (self.inputs / "compare").write_bytes(v1)
         report = json.loads(self.run_worker("pdf", "verify", hasCompareDocument=True))
-        self.assertTrue(report["ok"])
+        self.assertTrue(report["ok"], json.dumps(report))
         check_ids = {c["id"]: c["status"] for c in report["checks"]}
         self.assertEqual(check_ids["pdf_structure"], "passed")
         self.assertEqual(check_ids["pdf_encryption"], "passed")
