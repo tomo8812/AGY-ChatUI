@@ -40,9 +40,9 @@ export function renderSvgScene(node:Scene,context:RichEvalContext,cycle:RenderCy
     const id=prefix+'-'+d.id;
     if(d.kind==='linearGradient'||d.kind==='radialGradient'){
       const tag=d.kind;const position=d.kind==='linearGradient'?{x1:attr('x1',d.x1),y1:attr('y1',d.y1),x2:attr('x2',d.x2),y2:attr('y2',d.y2)}:{cx:attr('cx',d.cx),cy:attr('cy',d.cy),r:attr('r',d.r)};
-      return React.createElement(tag,{key:id,id,...position},d.stops.map((s,i)=><stop key={i} offset={attr('offset',s.offset)} stopColor={attr('stopColor',s.color)} stopOpacity={attr('opacity',s.opacity)}/>));
+      return React.createElement(tag,{key:id,id,...position},d.stops.map((s,i)=><stop key={i} offset={attr('offset',s.offset)} stopColor={attr('stopColor',s.color) as string | undefined} stopOpacity={attr('opacity',s.opacity)}/>));
     }
-    if(d.kind==='marker')return <marker key={id} id={id} viewBox={d.viewBox} refX={d.refX} refY={d.refY} markerWidth={d.markerWidth} markerHeight={d.markerHeight} orient={d.orient}><path d={attr('d',d.pathD) as string} fill={attr('fill',d.fill)}/></marker>;
+    if(d.kind==='marker')return <marker key={id} id={id} viewBox={d.viewBox} refX={d.refX} refY={d.refY} markerWidth={d.markerWidth} markerHeight={d.markerHeight} orient={d.orient}><path d={attr('d',d.pathD) as string} fill={attr('fill',d.fill) as string | undefined}/></marker>;
     if(d.kind==='clipPath'&&['rect','circle','polygon'].includes(d.shape))return <clipPath key={id} id={id}>{React.createElement(d.shape,attributes(d.attrs,context))}</clipPath>;
     throw Error('図形の定義が無効です。');
   }
