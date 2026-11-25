@@ -104,9 +104,16 @@ for(const vp of targets){
             await expect(page.getByRole('textbox',{name:'ページ本文'})).toHaveValue('Wide second page');
             await page.locator('.pdf-navigation-panel').getByRole('button',{name:'閉じる',exact:true}).click();
             await expect(page.locator('.pdf-page-indicator')).toContainText('2 / 2');
+            const secondPageVisible=()=>page.locator('.pdf-page-slot[data-page-number="2"]').evaluate(el=>{
+              const a=el.getBoundingClientRect(),b=el.closest('.pdf-canvas-scroll')!.getBoundingClientRect();
+              return Math.min(a.bottom,b.bottom)-Math.max(a.top,b.top)>Math.min(a.height,b.height)*0.4;
+            });
+            await expect.poll(secondPageVisible).toBe(true);
             await page.getByRole('button',{name:'拡大',exact:true}).click();
             const scale=await page.locator('[data-viewer-zoom-surface]').getAttribute('data-zoom-scale');
             await page.getByRole('button',{name:'依頼',exact:true}).click();
+            await expect(page.locator('.pdf-page-indicator')).toContainText('2 / 2');
+            await expect.poll(secondPageVisible).toBe(true);
             await page.getByRole('button',{name:'ページを対象にする'}).click();
             await expect(page.locator('.workspace-selection')).toContainText('ページ 2');
             record.page=2;record.zoom=scale;

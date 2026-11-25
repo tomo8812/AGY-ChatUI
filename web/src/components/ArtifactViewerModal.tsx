@@ -264,7 +264,9 @@ export const PdfCanvasViewer: React.FC<{
   const renderedKeyByPageRef = useRef<Map<number, string>>(new Map());
   const jobTrackerRef = useRef<PdfRenderJobTracker>(new PdfRenderJobTracker());
   const isZoomInteractingRef = useRef(false);
-  const programmaticScrollRef = useRef<{ targetPage: number; expiresAt: number } | null>(null);
+  // Explicit navigation owns the active page until the user scrolls the document.
+  // Wall-clock timeouts cannot distinguish a delayed layout event from user input.
+  const programmaticScrollRef = useRef<{ targetPage: number; offsetRatio: number } | null>(null);
   const scrollRafRef = useRef<number | null>(null);
   const scheduleRenderRef = useRef<() => void>(() => {});
   const pageNumRef = useRef(1);
@@ -531,12 +533,27 @@ export const PdfCanvasViewer: React.FC<{
     const slot = pageElementsRef.current.get(anchor.page);
     if (!slot) return;
     restoreViewRef.current = null;
-    programmaticScrollRef.current = { targetPage: anchor.page, expiresAt: performance.now() + 700 };
+    programmaticScrollRef.current = { targetPage: anchor.page, offsetRatio: -anchor.offsetY / Math.max(1,slot.getBoundingClientRect().height) };
     sc.scrollTo({ top: Math.max(0, sc.scrollTop + slot.getBoundingClientRect().top - sc.getBoundingClientRect().top - anchor.offsetY),
       left: anchor.scrollLeft, behavior: 'instant' });
     pageNumRef.current = anchor.page;
     setPageNum(anchor.page);
   }, [loading, pdfDoc, pageSizes, containerSize.width, scrollEl]);
+
+  // A panel opening/closing, inspector appearing, or delayed page dimensions
+  // can change auto-fit page heights and clamp scrollTop (especially WebKit).
+  // Re-anchor the explicitly selected page against the NEW slot geometry.
+  useLayoutEffect(() => {
+    const lock=programmaticScrollRef.current, sc=scrollRef.current;
+    if(!lock||!sc||loading||!pdfDoc||isZoomInteractingRef.current||!containerSize.width||!containerSize.height)return;
+    const slot=pageElementsRef.current.get(lock.targetPage);
+    if(!slot)return;
+    const rect=slot.getBoundingClientRect(), viewport=sc.getBoundingClientRect();
+    const padding=parseFloat(window.getComputedStyle(sc).paddingTop)||0;
+    sc.scrollTo({top:Math.max(0,sc.scrollTop+rect.top-viewport.top-padding+lock.offsetRatio*rect.height),behavior:'instant'});
+    pageNumRef.current=lock.targetPage;setPageNum(lock.targetPage);
+    scheduleRenderRef.current();
+  },[containerSize.width,containerSize.height,pageSizes,pdfDoc,loading,scrollEl,fitMode]);
 
   // Single shared IntersectionObserver for all pages (replaces N observers!)
   useEffect(() => {
@@ -823,7 +840,7 @@ export const PdfCanvasViewer: React.FC<{
       const clamped = Math.max(1, Math.min(numPages, targetPage));
       pageNumRef.current = clamped;
       setPageNum(clamped);
-      programmaticScrollRef.current = { targetPage: clamped, expiresAt: performance.now() + 700 };
+      programmaticScrollRef.current = { targetPage: clamped, offsetRatio: 0 };
       const container = scrollRef.current;
       const targetEl = pageElementsRef.current.get(clamped);
       if (container && targetEl) {
@@ -898,13 +915,7 @@ export const PdfCanvasViewer: React.FC<{
       const container = scrollRef.current;
       if (!container || numPages <= 0) return;
 
-      const lock = programmaticScrollRef.current;
-      if (lock) {
-        // Keep the explicitly selected page through layout and scroll events.
-        // A short last page may not be able to align its top to the viewport.
-        if (performance.now() < lock.expiresAt) return;
-        programmaticScrollRef.current = null;
-      }
+      if (programmaticScrollRef.current) return;
 
       const containerRect = container.getBoundingClientRect();
       const paddingTop = parseFloat(window.getComputedStyle(container).paddingTop) || 0;
@@ -975,7 +986,7 @@ export const PdfCanvasViewer: React.FC<{
         if (afterRect.width <= 0 || afterRect.height <= 0) return;
         const targetClientX = afterRect.left + anchor.relX * afterRect.width;
         const targetClientY = afterRect.top + anchor.relY * afterRect.height;
-        programmaticScrollRef.current = { targetPage: anchor.pageNum, expiresAt: performance.now() + 700 };
+        programmaticScrollRef.current = { targetPage: anchor.pageNum, offsetRatio: (container.getBoundingClientRect().top + (parseFloat(window.getComputedStyle(container).paddingTop)||0) - (clientY-anchor.relY*afterRect.height))/Math.max(1,afterRect.height) };
         const deltaX = targetClientX - clientX;
         const deltaY = targetClientY - clientY;
         if (Math.abs(deltaX) > 0.5) {
@@ -1037,6 +1048,7 @@ export const PdfCanvasViewer: React.FC<{
 
   const handleResetFit = useCallback(() => {
     cancelActiveGesture();
+    programmaticScrollRef.current={targetPage:pageNumRef.current,offsetRatio:0};
     setFitMode('auto');
     if (scrollRef.current) {
       scrollRef.current.scrollLeft = 0;
@@ -1129,8 +1141,12 @@ export const PdfCanvasViewer: React.FC<{
         data-zoom-scale={Math.round(committedScale * 100)}
         data-fit-mode={fitMode}
         onScroll={handleScroll}
+        tabIndex={0}
+        aria-label="PDFページ表示"
         onWheel={cancelProgrammaticScrollLock}
+        onPointerDown={cancelProgrammaticScrollLock}
         onTouchStart={cancelProgrammaticScrollLock}
+        onKeyDown={e=>{if(['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' '].includes(e.key))cancelProgrammaticScrollLock()}}
       >
         <div
           ref={setPagesListContainerRef}
