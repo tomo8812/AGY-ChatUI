@@ -127,11 +127,17 @@ interface PdfPageSize {
 
 const DEFAULT_PDF_PAGE_SIZE: PdfPageSize = { width: 595, height: 842 };
 
+export type PdfLocation={pageIndex:number;pageCount:number;x:number;y:number;width:number;height:number;pageWidth:number;pageHeight:number};
+type LocationSelection='pin'|'region';
+type SelectionPoint={x:number;y:number};
+
 interface PdfPageSlotProps {
   pageNum: number;
   naturalWidth: number;
   naturalHeight: number;
   autoScale: number;
+  selectionMode?:LocationSelection;
+  onLocation?: (location:Omit<PdfLocation,'pageCount'>)=>void;
   registerPageEl: (pageNum: number, slot: HTMLDivElement | null, canvas: HTMLCanvasElement | null) => void;
 }
 
@@ -142,9 +148,24 @@ interface PdfPageSlotProps {
  * per-page inline styles.
  */
 const PdfPageSlot: React.FC<PdfPageSlotProps> = React.memo(
-  ({ pageNum, naturalWidth, naturalHeight, autoScale, registerPageEl }) => {
+  ({ pageNum, naturalWidth, naturalHeight, autoScale, registerPageEl, selectionMode, onLocation }) => {
     const slotRef = useRef<HTMLDivElement | null>(null);
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
+    const start=useRef<SelectionPoint|null>(null);
+    const [selection,setSelection]=useState<{start:SelectionPoint;end:SelectionPoint}|null>(null);
+    const point=(event:React.PointerEvent<HTMLElement>)=>{
+      const rect=event.currentTarget.getBoundingClientRect();
+      return {x:Math.max(0,Math.min(1,(event.clientX-rect.left)/rect.width)),
+        y:Math.max(0,Math.min(1,(event.clientY-rect.top)/rect.height))};
+    };
+    const finish=(from:SelectionPoint,to:SelectionPoint)=>{
+      const x=Math.min(from.x,to.x),y=Math.min(from.y,to.y);
+      const width=Math.abs(from.x-to.x),height=Math.abs(from.y-to.y);
+      if(selectionMode==='region'&&(!width||!height))return;
+      setSelection({start:from,end:to});
+      onLocation?.({pageIndex:pageNum-1,x,y,width,height,pageWidth:naturalWidth,pageHeight:naturalHeight});
+    };
+
 
     const setSlotRef = useCallback(
       (el: HTMLDivElement | null) => {
@@ -180,6 +201,43 @@ const PdfPageSlot: React.FC<PdfPageSlotProps> = React.memo(
         style={slotStyle}
       >
         <canvas ref={setCanvasRef} />
+        {selectionMode&&<div
+          className="pdf-location-overlay" role="button" tabIndex={0}
+          aria-label={'ページ '+pageNum+(selectionMode==='pin'?'のピン位置':'の範囲')}
+          onPointerDown={event=>{
+            if(event.button!==0)return;
+            event.stopPropagation();event.currentTarget.focus({preventScroll:true});
+            start.current=point(event);event.currentTarget.setPointerCapture(event.pointerId);
+            setSelection({start:start.current,end:start.current});
+          }}
+          onPointerMove={event=>{if(start.current&&selectionMode==='region')setSelection({start:start.current,end:point(event)})}}
+          onPointerUp={event=>{
+            if(!start.current)return;
+            event.stopPropagation();
+            const from=start.current,to=point(event);
+            start.current=null;
+            if(selectionMode==='pin')finish(to,to);else finish(from,to);
+          }}
+          onPointerCancel={()=>{start.current=null;setSelection(null)}}
+          onKeyDown={event=>{
+            const current=selection?.end??{x:.5,y:.5};
+            if(event.key==='Enter'||event.key===' '){
+              event.preventDefault();
+              if(selectionMode==='pin')finish(current,current);
+              else if(start.current){finish(start.current,current);start.current=null}
+              else start.current=current;
+              return;
+            }
+            const delta:Record<string,[number,number]>={ArrowLeft:[-.01,0],ArrowRight:[.01,0],ArrowUp:[0,-.01],ArrowDown:[0,.01]};
+            const offset=delta[event.key];if(!offset)return;
+            event.preventDefault();event.stopPropagation();
+            const end={x:Math.max(0,Math.min(1,current.x+offset[0])),y:Math.max(0,Math.min(1,current.y+offset[1]))};
+            setSelection({start:start.current??end,end});
+          }}>
+          {selection&&<span aria-hidden="true" className="pdf-location-mark"
+            style={{left:Math.min(selection.start.x,selection.end.x)*100+'%',top:Math.min(selection.start.y,selection.end.y)*100+'%',
+              width:Math.abs(selection.start.x-selection.end.x)*100+'%',height:Math.abs(selection.start.y-selection.end.y)*100+'%'}}/>}
+        </div>}
       </div>
     );
   }
@@ -195,9 +253,11 @@ export const PdfCanvasViewer: React.FC<{
   url: string;
   /** Stable identity enables page/zoom/scroll restoration on a newer revision. */
   documentKey?: string;
-  onSelectPage?: (pageIndex: number, pageCount: number, selectedText?: string) => void;
+  onSelectPage?: (pageIndex: number, pageCount: number, selectedText?: string, readPage?:()=>Promise<string>) => void;
   enhancedNavigation?: boolean;
-}> = React.memo(({ url, documentKey = url, onSelectPage, enhancedNavigation=false }) => {
+  selectionMode?:LocationSelection;
+  onSelectLocation?:(location:PdfLocation,readPage:()=>Promise<string>)=>void;
+}> = React.memo(({ url, documentKey = url, onSelectPage, enhancedNavigation=false, selectionMode, onSelectLocation }) => {
   const [navigation,setNavigation]=useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
@@ -1042,6 +1102,16 @@ export const PdfCanvasViewer: React.FC<{
     };
   }, []);
 
+  const readPageIdentity=async(index:number)=>{
+    if(!pdfDoc)throw Error('PDF が読み込まれていません。');
+    const page=await pdfDoc.getPage(index+1);
+    const [text,operators]=await Promise.all([page.getTextContent(),page.getOperatorList()]);
+    const identity=JSON.stringify([page.view,page.rotate,page.userUnit,text.items,operators.fnArray,operators.argsArray],(_,value)=>
+      ArrayBuffer.isView(value)?Array.from(new Uint8Array(value.buffer,value.byteOffset,value.byteLength)):value);
+    const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(identity));
+    return Array.from(new Uint8Array(bytes),value=>value.toString(16).padStart(2,'0')).join('');
+  };
+
   if (loading) return <div className="viewer-state muted-sm">PDFを読み込み中...</div>;
   if (error) return <div className="error-box" role="alert">{error}</div>;
 
@@ -1072,7 +1142,7 @@ export const PdfCanvasViewer: React.FC<{
           </button>
           {enhancedNavigation&&<button type="button" className="btn btn-secondary btn-xs" aria-expanded={navigation} onClick={()=>setNavigation(v=>!v)}>ナビゲーション</button>}
           {onSelectPage && <button type="button" className="btn btn-secondary btn-xs" disabled={!numPages}
-            onClick={() => onSelectPage(pageNumRef.current - 1, numPages)}>ページを対象にする</button>}
+            onClick={() => onSelectPage(pageNumRef.current - 1, numPages, undefined, ()=>readPageIdentity(pageNumRef.current-1))}>ページを対象にする</button>}
         </div>
         <div className="pdf-toolbar-group pdf-zoom-group">
           <button
@@ -1104,7 +1174,7 @@ export const PdfCanvasViewer: React.FC<{
           </button>
         </div>
       </div>
-      {enhancedNavigation&&navigation&&pdfDoc&&<PdfNavigationPanel doc={pdfDoc} page={pageNum} onJump={scrollToPage} onClose={()=>setNavigation(false)} onSelectText={onSelectPage?text=>onSelectPage(pageNumRef.current-1,numPages,text):undefined}/>}
+      {enhancedNavigation&&navigation&&pdfDoc&&<PdfNavigationPanel doc={pdfDoc} page={pageNum} onJump={scrollToPage} onClose={()=>setNavigation(false)} onSelectText={onSelectPage?text=>onSelectPage(pageNumRef.current-1,numPages,text,()=>readPageIdentity(pageNumRef.current-1)):undefined}/>}
       {pageRenderErrorCount > 0 && (
         <div className="warn-banner pdf-render-error-banner" role="status">
           <span>一部ページの描画に失敗しました（他のページは閲覧を継続できます）。</span>
@@ -1141,6 +1211,8 @@ export const PdfCanvasViewer: React.FC<{
                 naturalWidth={spec.naturalWidth}
                 naturalHeight={spec.naturalHeight}
                 autoScale={spec.autoScale}
+                selectionMode={selectionMode}
+                onLocation={onSelectLocation?location=>onSelectLocation({...location,pageCount:numPages},()=>readPageIdentity(location.pageIndex)):undefined}
                 registerPageEl={registerPageEl}
               />
             ))}

@@ -1,4 +1,4 @@
-import React,{useCallback,useEffect,useRef,useState} from 'react';
+import React,{Suspense,useCallback,useEffect,useRef,useState} from 'react';
 import type { ArtifactRecord } from '../../types';
 import { api,ApiError } from '../../api/client';
 import { supportsOperation,workspaceApi,type WorkspaceCapabilities,type WorkspaceTarget } from '../../api/workspace';
@@ -26,6 +26,7 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
   const [busy,setBusy]=useState(false);
   const [error,setError]=useState<string|null>(null);
   const [conflict,setConflict]=useState(false);
+  const [chooseRequestVersion,setChooseRequestVersion]=useState(false);
   const [menu,setMenu]=useState(false);
   const [inspector,setInspector]=useState<'details'|'verify'|null>(null);
   const [verification,setVerification]=useState<Awaited<ReturnType<typeof workspaceApi.verify>>|null>(null);
@@ -76,6 +77,7 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
       if(result.artifact.id!==artifact.id||result.artifact.userId!==artifact.userId)throw Error('保存結果を確認できませんでした。');
       if(!isStaleArtifactVersion(currentArtifact.current,result.artifact)){setLocal(result.artifact);onArtifactChanged?.(result.artifact);notifyArtifactUpdated(result.artifact)}
       setDraft(null);setConflict(false);pendingAttempt.current=null;
+      return true;
     }catch(e){
       if(!mounted.current)return;
       if(e instanceof ApiError&&e.status===409){setConflict(true);try{await refresh()}catch{}}
@@ -84,7 +86,7 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
   };
   const discard=()=>{if(!draft||window.confirm('未保存の変更を破棄しますか？')){setDraft(null);setConflict(false);pendingAttempt.current=null}};
   const changeMode=(value:WorkspaceMode)=>{
-    if(value==='pin'&&draft){setError('変更を保存するか破棄してから、編集依頼を追加してください。');return}
+    if(value==='pin'&&draft&&mode!=='pin'){setChooseRequestVersion(true);return}
     setError(null);setMode(value);setMenu(false);
   };
   const Module=module.Component;
@@ -109,7 +111,7 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
       {changed&&<div className="warn-banner workspace-conflict-banner">ファイルが別の操作で更新されました。未保存の変更は保持されています。 <button type="button" className="btn btn-secondary btn-xs" onClick={()=>setConflict(true)}>確認</button></div>}
       {error&&<div className="error-box" role="alert">{error}<button type="button" className="btn btn-ghost btn-xs" onClick={()=>setError(null)}>閉じる</button></div>}
       <div className="workspace-main">
-        <div className="workspace-canvas"><Module artifact={artifact} mode={mode} capabilities={caps} draft={draft} editingLocked={busy||changed||!canEdit||!capsReady} onDraft={onDraft} target={target} onTarget={setTarget}/></div>
+        <div className="workspace-canvas"><Suspense fallback={<p role="status">読み込み中…</p>}><Module artifact={artifact} mode={mode} capabilities={caps} draft={mode==='pin'?null:draft} editingLocked={busy||changed||!canEdit||!capsReady} onDraft={onDraft} target={target} onTarget={setTarget}/></Suspense></div>
         {(mode==='pin'||inspector)&&<aside className="workspace-inspector">
           {mode==='pin'?<EditRequestPanel artifact={artifact} target={target} onClear={()=>setTarget(null)}/>:<><div className="row-between"><strong>{inspector==='details'?'ファイル詳細':'品質検証'}</strong><button type="button" className="icon-btn" aria-label="パネルを閉じる" onClick={()=>setInspector(null)}><CloseIcon/></button></div>{inspector==='details'?<dl><dt>名前</dt><dd>{artifact.filename}</dd><dt>種類</dt><dd>{artifact.mimeType}</dd><dt>サイズ</dt><dd>{artifact.sizeBytes.toLocaleString()} B</dd><dt>バージョン</dt><dd>{artifact.revision??'—'}</dd></dl>:verification?<>{verification.revision!==undefined&&verification.revision!==artifact.revision&&<p className="warn-banner">以前のバージョンの検証結果です。</p>}{verification.checks?.map(check=><div key={check.id} className="workspace-check"><strong>{check.status==='passed'?'合格':check.status==='failed'?'不合格':'未確認'}</strong><div>{check.evidence}</div></div>)}{verification.issues.map((issue,i)=><p key={i}>{issue.message}</p>)}</>:<p className="muted-sm">検証中…</p>}</>}
         </aside>}
@@ -119,6 +121,18 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
         <span className="muted-xs" role="status">{busy?'保存中…':draft?'未保存の変更 '+draft.entries.length+' 件':'保存済み'}</span>
         {draft&&<><button type="button" className="btn btn-ghost btn-xs" disabled={busy} onClick={discard}>破棄</button><button type="button" className="btn btn-primary btn-xs" disabled={busy||(!changed&&(!capsReady||!canEdit))} onClick={()=>changed?setConflict(true):void save()}>保存</button></>}
       </footer>
+      {chooseRequestVersion&&<ModalDialog label="依頼するバージョン" size="workspace-request-version" onClose={()=>{if(!busy)setChooseRequestVersion(false)}}>
+        <div><h3>依頼するバージョン</h3><p>保存済みのバージョン {artifact.revision} に依頼する場合も、未保存の変更は保持されます。</p>
+          <div className="row-actions">
+            <button type="button" className="btn btn-primary" disabled={busy||changed||!capsReady||!canEdit} onClick={async()=>{
+              if(await save()){setChooseRequestVersion(false);setTarget(null);setMode('pin')}
+              else setChooseRequestVersion(false);
+            }}>先に保存して依頼</button>
+            <button type="button" className="btn btn-secondary" disabled={busy} onClick={()=>{setChooseRequestVersion(false);setError(null);setTarget(null);setMode('pin')}}>保存済み版へ依頼</button>
+            <button type="button" className="btn btn-ghost" disabled={busy} onClick={()=>setChooseRequestVersion(false)}>取消</button>
+          </div>
+        </div>
+      </ModalDialog>}
       {conflict&&draft&&<div className="workspace-conflict-dialog" role="alertdialog" aria-label="編集の競合"><div><h3>編集内容が競合しました</h3><p>編集中のバージョン: {draft.baseRevision} ／ 現在: {artifact.revision}</p><ul>{draft.entries.map(e=><li key={e.key}>{e.label}</li>)}</ul><p>変更対象が移動・置換された可能性があるため、自動上書きは行いません。</p><div className="row-actions"><button type="button" className="btn btn-secondary" onClick={()=>setConflict(false)}>変更を保持</button><button type="button" className="btn btn-danger-outline" onClick={()=>{if(window.confirm('変更を破棄して最新を読み込みますか？')){setDraft(null);setConflict(false);void refresh().catch(e=>setError(e.message))}}}>最新を読み直す</button></div></div></div>}
     </div>
   </ModalDialog>;

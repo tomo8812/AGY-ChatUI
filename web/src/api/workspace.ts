@@ -1,12 +1,15 @@
 import type { ArtifactRecord } from '../types';
 import { apiFetch, ApiError, getCsrfToken } from './client';
 
+// safe_image and the slide preview schema accept at most 8,000,000 Base64 characters.
+export const MAX_WORKSPACE_IMAGE_BYTES=8_000_000/4*3;
+
 export type WorkspaceFormat='pptx'|'pdf'|'docx'|'xlsx'|'csv'|'markdown'|'code'|'image'|'svg'|'html'|'diff'|'mermaid'|'media'|'binary';
 export interface WorkspaceOperationCapability {operation:string;availability:'supported'|'partial'|'disabled_by_resource_tier'|'unsupported_by_format';scope:'mcp_and_ui'|'mcp_only'|'ui_view_only';notes?:string;remediation?:string}
 export interface WorkspaceCapabilities {format:WorkspaceFormat;directEditUiSupported:boolean;targetPinSupported:boolean;operations:WorkspaceOperationCapability[]}
 export type EditOperation={op:string;[key:string]:unknown};
 export interface RevisionResponse {artifactId:string;revision:number;sha256:string}
-export interface WorkspaceTarget {selector:{kind:string;[key:string]:unknown};baseRevision:number;label:string;selectedContentSnapshot?:string;surroundingContext?:string;range?:Record<string,unknown>;contentCoords?:Record<string,unknown>}
+export interface WorkspaceTarget {selector:{kind:string;[key:string]:unknown};baseRevision:number;label:string;selectedContentSnapshot?:string;surroundingContext?:string;regionImagePngBase64?:string;range?:Record<string,unknown>;contentCoords?:Record<string,unknown>}
 export interface EditRequestRecord {id:string;artifactId:string|null;instruction:string;status:string;selector:WorkspaceTarget['selector'];baseRevision:number;selectedContentSnapshot:string}
 const path=(id:string,suffix:string)=>'/api/files/'+encodeURIComponent(id)+'/'+suffix;
 export const workspaceApi={
@@ -37,7 +40,7 @@ export const workspaceApi={
       !res.headers.get('content-type')?.includes('image/png'))throw new ApiError(409,'ARTIFACT_CHANGED','ファイルが更新されました。');
     return res.blob();
   },
-  async renderDraftSlide(artifact:ArtifactRecord,query:{pageIndex:number;operation:EditOperation},signal?:AbortSignal):Promise<Blob>{
+  async renderDraftSlide(artifact:ArtifactRecord,query:{pageIndex:number;operations:EditOperation[]},signal?:AbortSignal):Promise<Blob>{
     const res=await fetch(path(artifact.id,'render-draft-slide'),{method:'POST',credentials:'include',signal,
       headers:{'Content-Type':'application/json','x-csrf-token':getCsrfToken()},
       body:JSON.stringify({...query,expectedRevision:artifact.revision})});
@@ -58,8 +61,9 @@ export const workspaceApi={
   listRequests:(chatId:string,artifactId:string,signal?:AbortSignal)=>apiFetch<{requests:EditRequestRecord[]}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests?'+new URLSearchParams({artifactId}),{signal}),
   createRequest:(chatId:string,artifactId:string,target:WorkspaceTarget,instruction:string)=>apiFetch<{request:EditRequestRecord}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests',{method:'POST',body:{
     targetKind:'artifact',artifactId,baseRevision:target.baseRevision,selector:target.selector,range:target.range,contentCoords:target.contentCoords,
-    selectedContentSnapshot:target.selectedContentSnapshot,surroundingContext:target.surroundingContext,instruction,
+    selectedContentSnapshot:target.selectedContentSnapshot,surroundingContext:target.surroundingContext,regionImagePngBase64:target.regionImagePngBase64,instruction,
   }}),
+  reorderRequests:(chatId:string,orderedIds:string[])=>apiFetch<{requests:EditRequestRecord[]}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests/reorder',{method:'POST',body:{orderedIds}}),
   updateRequest:(chatId:string,id:string,instruction:string)=>apiFetch<{request:EditRequestRecord}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests/'+encodeURIComponent(id),{method:'PATCH',body:{instruction}}),
   resolveRequest:(chatId:string,id:string)=>apiFetch<{request:EditRequestRecord}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests/'+encodeURIComponent(id)+'/resolve',{method:'POST',body:{}}),
   deleteRequest:(chatId:string,id:string)=>apiFetch<{ok:boolean}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests/'+encodeURIComponent(id),{method:'DELETE'}),

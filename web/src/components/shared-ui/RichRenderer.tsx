@@ -1,4 +1,4 @@
-import React, { useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react';
+import React, { lazy, Suspense, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react';
 import type { RichDocumentV1, RichNode, RichLayoutProps, RichAction, RichStateAction, RichSourceEntry, RichCellObject, RichPrimitive } from '../../../../shared/rich-schema';
 import type { ArtifactRecord } from '../../types';
 import { buildArtifactContentUrl } from '../../utils/viewerCache';
@@ -8,11 +8,16 @@ import { createRichEvalBudget, isValidHttpUrl, validateRichMarkdownContent, pars
 import { RichStateStore, type RichStateSnapshot } from './RichStateStore';
 import { runExplicitRichActions, type RichActionHost } from './RichActionRunner';
 import { addNode, color, evaluate, expression, num, repeatContexts, safeArray, text, type RenderCycle, type SelectValue } from './runtime';
-import { renderRichChart } from './chart/RichChartRenderer';
-import { renderSvgScene } from './diagram/SvgSceneRenderer';
-import { renderNodeEdgeDiagram } from './diagram/NodeEdgeDiagram';
-import { RichDataTable } from './display/RichDataTable';
 import './rich-ui.css';
+
+const RichChart=lazy(()=>import('./chart/RichChartRenderer').then(({renderRichChart})=>({default:renderRichChart})));
+const SvgScene=lazy(()=>import('./diagram/SvgSceneRenderer').then(({renderSvgScene})=>({
+  default: (props:{args:Parameters<typeof renderSvgScene>})=>renderSvgScene(...props.args),
+})));
+const NodeEdgeDiagram=lazy(()=>import('./diagram/NodeEdgeDiagram').then(({renderNodeEdgeDiagram})=>({
+  default: (props:{args:Parameters<typeof renderNodeEdgeDiagram>})=>renderNodeEdgeDiagram(...props.args),
+})));
+const RichDataTable=lazy(()=>import('./display/RichDataTable').then(m=>({default:m.RichDataTable})));
 
 type ArtifactHost = Omit<RichActionHost,'authorizeArtifact'>;
 export interface RichRendererProps {
@@ -237,9 +242,9 @@ const RichNodeView=React.memo(function RichNodePaint({node,local,path,environmen
       case 'data_table':{const rows=safeArray<Record<string,RichPrimitive|RichCellObject>>(v(node.rows));body=<RichDataTable node={node} rows={rows} onSelect={node.selectedRowBind||node.onRowSelect?.length?(row,index)=>select(node.selectedRowBind,index,node.onRowSelect,{...c,item:row,index}):undefined}/>;break}
       case 'source_attribution':body=<SourceAttribution sources={(doc.sources??[]).filter(s=>!node.sourceIds||node.sourceIds.includes(s.id))}/>;break;
       case 'mermaid':body=<MermaidBlock code={label(v(node.code))} strictRich/>;break;
-      case 'svg_scene':body=renderSvgScene(node,c,cycle,unique,dispatch);break;
-      case 'node_edge_diagram':body=renderNodeEdgeDiagram(node,c,cycle,select,unique);break;
-      case 'chart':body=renderRichChart({node,context:c,cycle,select,clipId:unique+'-clip'});break;
+      case 'svg_scene':body=<SvgScene args={[node,c,cycle,unique,dispatch]}/>;break;
+      case 'node_edge_diagram':body=<NodeEdgeDiagram args={[node,c,cycle,select,unique]}/>;break;
+      case 'chart':body=<RichChart node={node} context={c} cycle={cycle} select={select} clipId={unique+'-clip'}/>;break;
       case 'button':body=<button type="button" className={'btn btn-'+(node.variant==='danger'?'danger-outline':node.variant??'secondary')} disabled={Boolean(node.disabledWhen&&expression(node.disabledWhen,c,cycle))} onClick={()=>explicit(node.onClick,c)}>{label(v(node.label))}</button>;break;
       case 'clickable':case 'selectable_card':{const selected=Boolean(node.selectedWhen&&expression(node.selectedWhen,c,cycle));body=<div className={'rich-selectable'+(selected?' selected':'')} role="button" tabIndex={0} aria-pressed={selected} onClick={e=>{if(!(e.target as HTMLElement).closest('button,input,select,textarea,a,[role=button]:not(.rich-selectable)'))dispatch(node.onClick,c)}} onKeyDown={e=>{if(e.target===e.currentTarget&&(e.key==='Enter'||e.key===' ')){e.preventDefault();dispatch(node.onClick,c)}}}>{children(node.children)}</div>;break}
       case 'text_input':case 'textarea':case 'date_input':{const val=label(read(node.bind));const common={value:val,onChange:(e:React.ChangeEvent<HTMLInputElement|HTMLTextAreaElement>)=>change(node.bind,e.target.value,node.onChange)};body=<label className="field">{label(v(node.label))}{node.type==='textarea'?<textarea rows={4} maxLength={node.maxLength??50000} placeholder={node.placeholder} {...common}/>:node.type==='date_input'?<input type="date" min={node.min} max={node.max} {...common}/>:<input type="text" maxLength={node.maxLength??50000} placeholder={node.placeholder} {...common}/>}</label>;break}
@@ -254,10 +259,10 @@ const RichNodeView=React.memo(function RichNodePaint({node,local,path,environmen
       case 'code_block':body=<CodeBlock code={label(v(node.code))} language={node.language??''}/>;break;
       case 'diff_block':body=<div className="rich-diff"><div><span className="muted-sm">変更前</span><CodeBlock code={label(v(node.oldText))} language={node.language??''}/></div><div><span className="muted-sm">変更後</span><CodeBlock code={label(v(node.newText))} language={node.language??''}/></div></div>;break;
       case 'math_block':{const tex=label(v(node.tex));body=<MarkdownContent strictRich content={node.displayMode===false?'$'+tex+'$':'$$\n'+tex+'\n$$'}/>;break}
-      case 'media_asset':{const alt=label(v(node.alt));let media:ReactNode;if(node.sourceKind==='inline_svg'&&node.svgScene)media=renderSvgScene(node.svgScene,c,cycle,unique,dispatch);else{const artifact=authorized.get(label(v(node.artifactId)));if(!artifact)throw Error('ファイルを表示できません。');const src=buildArtifactContentUrl(artifact);media=artifact.previewKind==='image'||artifact.previewKind==='svg'?<img alt={alt} src={src} loading="lazy"/>:artifact.previewKind==='video'?<video controls playsInline preload="metadata" src={src} aria-label={alt}/>:artifact.previewKind==='audio'?<audio controls preload="metadata" src={src} aria-label={alt}/>:<button type="button" className="btn btn-secondary" disabled={!host.openArtifact} onClick={()=>{void Promise.resolve(host.openArtifact?.(artifact.id)).catch(fail)}}>{artifact.filename}</button>}body=<figure className="rich-media">{media}{node.caption&&<figcaption>{label(v(node.caption))}</figcaption>}</figure>;break}
+      case 'media_asset':{const alt=label(v(node.alt));let media:ReactNode;if(node.sourceKind==='inline_svg'&&node.svgScene)media=<SvgScene args={[node.svgScene,c,cycle,unique,dispatch]}/>;else{const artifact=authorized.get(label(v(node.artifactId)));if(!artifact)throw Error('ファイルを表示できません。');const src=buildArtifactContentUrl(artifact);media=artifact.previewKind==='image'||artifact.previewKind==='svg'?<img alt={alt} src={src} loading="lazy"/>:artifact.previewKind==='video'?<video controls playsInline preload="metadata" src={src} aria-label={alt}/>:artifact.previewKind==='audio'?<audio controls preload="metadata" src={src} aria-label={alt}/>:<button type="button" className="btn btn-secondary" disabled={!host.openArtifact} onClick={()=>{void Promise.resolve(host.openArtifact?.(artifact.id)).catch(fail)}}>{artifact.filename}</button>}body=<figure className="rich-media">{media}{node.caption&&<figcaption>{label(v(node.caption))}</figcaption>}</figure>;break}
       default:body=<div className="error-box">この項目は表示できません。</div>;
     }
-    return <div ref={heavy?paintRef:undefined} onFocusCapture={heavy?()=>setVisible(true):undefined} className={'rich-node'+(node.layout?.hideOn?' rich-hide-'+node.layout.hideOn:'')} style={styleLayout(node.layout)} data-rich-node-id={node.id} aria-label={node.ariaLabel?label(v(node.ariaLabel)):undefined}>{body}</div>;
+    return <div ref={heavy?paintRef:undefined} onFocusCapture={heavy?()=>setVisible(true):undefined} className={'rich-node'+(node.layout?.hideOn?' rich-hide-'+node.layout.hideOn:'')} style={styleLayout(node.layout)} data-rich-node-id={node.id} aria-label={node.ariaLabel?label(v(node.ariaLabel)):undefined}><Suspense fallback={<span className="muted-xs" role="status">読み込み中…</span>}>{body}</Suspense></div>;
 });
 
 export function RichRenderer(props:RichRendererProps){

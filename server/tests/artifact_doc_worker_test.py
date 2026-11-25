@@ -111,6 +111,35 @@ class DocumentWorkerTest(unittest.TestCase):
         ])
         self.assertEqual(Presentation(io.BytesIO(result)).slides[0].notes_slide.notes_text_frame.text, "Created")
 
+    def test_docx_basic_edit_preserves_long_paragraphs_and_native_cell_properties(self):
+        document = Document()
+        paragraph = document.add_paragraph()
+        for index in range(220):
+            paragraph.add_run(f"[{index}]").bold = index % 2 == 0
+        cell = document.add_table(rows=1, cols=1).cell(0, 0)
+        cell.paragraphs[0].add_run("Styled cell").italic = True
+        document.save(self.source)
+
+        blocks = json.loads(self.run_worker("docx", "range", range={"start": 0, "count": 2}))["blocks"]
+        self.assertTrue(blocks[0]["editableText"])
+        self.assertEqual(len(blocks[0]["uiRuns"]), 220)
+        self.assertTrue(blocks[1]["tableRows"][0][0]["editable"])
+        long_text = "a" * 21_000 + "\n" + "Last line"
+        specs = [{"originIndex": index, "text": run.text} for index, run in enumerate(paragraph.runs)]
+        specs[0]["text"] = long_text
+        result = self.run_worker("docx", "edit", operations=[
+            {"op": "docx.set_paragraph_text", "blockIndex": 0, "preserveRunProperties": True, "runs": specs},
+            {"op": "docx.set_table_cell", "blockIndex": 1, "row": 0, "column": 0,
+             "text": "Updated styled cell", "preserveCellProperties": True},
+        ])
+        edited = Document(io.BytesIO(result))
+        self.assertEqual(edited.paragraphs[0].runs[0].text, long_text)
+        self.assertEqual(len(edited.paragraphs[0].runs), 220)
+        self.assertTrue(edited.paragraphs[0].runs[0].bold)
+        run = edited.tables[0].cell(0, 0).paragraphs[0].runs[0]
+        self.assertEqual(run.text, "Updated styled cell")
+        self.assertTrue(run.italic)
+
     def test_docx_edits_word_parts_and_preserves_unrelated_xml(self):
         document = Document()
         document.add_paragraph("Initial")

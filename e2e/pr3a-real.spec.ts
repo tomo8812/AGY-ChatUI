@@ -37,7 +37,7 @@ function comparePng(actual:string,expected:string){
 async function capturePptx(page:Page,info:TestInfo,reference:Buffer,name:string){
   const scene=await readySlide(page);
   // Wait for all transparent shape layers rather than comparing a background-only intermediate.
-  await expect(scene.locator('img')).toHaveCount(3,{timeout:60000});
+  await expect(scene.locator('img')).toHaveCount(6,{timeout:60000});
   await expect(scene.locator('[data-basic-geometry]')).toHaveCount(61);
   await expect.poll(async()=>scene.locator('img').evaluateAll(imgs=>imgs.every(img=>(img as HTMLImageElement).complete&&(img as HTMLImageElement).naturalWidth>0)),{timeout:60000}).toBe(true);
   await expect.poll(()=>scene.evaluate(el=>{
@@ -214,10 +214,15 @@ for(const vp of targets){
               await page.getByRole('textbox',{name:'数式・セル値'}).fill(item.updated);
               if(item.kind==='xlsx'){
                 await expect(page.getByRole('gridcell',{name:'B1',exact:true})).toHaveText('84');
+                await expect(page.getByRole('gridcell',{name:'C1',exact:true})).toHaveText('61',{timeout:30000});
                 await page.getByRole('button',{name:'太字',exact:true}).click();
                 await expect(page.getByRole('button',{name:'太字',exact:true})).toHaveAttribute('aria-pressed','true');
               }
             }else if(item.kind==='docx'){
+              await page.getByRole('button',{name:'見出し一覧',exact:true}).click();
+              await page.getByRole('navigation',{name:'文書の見出し'}).getByRole('button',{name:'Editing notes'}).click();
+              await expect(page.locator('[data-word-block="4"]')).toHaveClass(/selected/);
+              await page.getByRole('textbox',{name:'表 3 1行 1列'}).fill('Edited existing table');
               const word=page.getByRole('textbox',{name:'段落 1',exact:true});
               await word.fill(item.updated,{timeout:30000});
               await page.getByRole('button',{name:'段落全選択',exact:true}).click();
@@ -258,8 +263,11 @@ for(const vp of targets){
               const before=await svc.renderPng(userId,artifact.id,{pageIndex:0});
               record.beforeVisual=await capturePptx(page,info,before.png,'pptx-before');
               await page.getByRole('button',{name:'Title',exact:true}).click();
-              const textInput=page.getByRole('textbox',{name:'図形テキスト'});
-              await textInput.fill(item.updated);
+              const textInput=page.getByRole('textbox',{name:'図形テキスト',exact:true});
+              await page.getByRole('button',{name:'Title',exact:true}).press('F2');
+              const canvasText=page.getByRole('textbox',{name:'キャンバス内の図形テキスト'});
+              await canvasText.fill(item.updated);
+              await canvasText.press('Escape');
               expect((await textInput.boundingBox())!.width).toBeGreaterThanOrEqual(90);
               const handle=page.getByRole('button',{name:'選択要素をリサイズ',exact:true});
               await expect(handle).toBeVisible();
@@ -269,7 +277,7 @@ for(const vp of targets){
               // Await actual worker output for the unsaved text; no document mutation yet.
               await expect(page.locator('[data-slide-canvas]')).toHaveAttribute('data-preview-ready','true',{timeout:90000});
               expect(srv.ctx.db.getArtifact(userId,artifact.id)?.revision).toBe(1);
-              await expect.poll(()=>page.locator('[data-slide-canvas] img').evaluateAll(imgs=>imgs.length===3&&imgs.every(img=>(img as HTMLImageElement).complete&&(img as HTMLImageElement).naturalWidth>0))).toBe(true);
+              await expect.poll(()=>page.locator('[data-slide-canvas] img').evaluateAll(imgs=>imgs.length===6&&imgs.every(img=>(img as HTMLImageElement).complete&&(img as HTMLImageElement).naturalWidth>0))).toBe(true);
               const style=await page.addStyleTag({content:'.workspace-shape-hit{visibility:hidden!important}'});
               try{await page.locator('[data-slide-canvas]').screenshot({path:info.outputPath('pptx-draft-canvas.png'),scale:'css'});}finally{await style.evaluate(el=>el.remove())}
             }
@@ -296,14 +304,14 @@ for(const vp of targets){
               expect(await svc.readRange(userId,artifact.id,{startRow:0,endRow:1,startCol:0,endCol:1})).toMatchObject({rows:[['Updated item','Quantity'],['Apple','7']]});
             }else if(item.kind==='docx'){
               const result=await svc.readRange(userId,artifact.id,{start:0,count:3});
-              expect(result).toMatchObject({blocks:[{text:item.updated,marks:{bold:true}},{text:'Keep formatting',uiRuns:[{text:'Keep ',bold:true,underline:true},{text:'formatting',italic:true,underline:true}]},{text:'Keep table'}]});
+              expect(result).toMatchObject({blocks:[{text:item.updated,marks:{bold:true}},{text:'Keep formatting',uiRuns:[{text:'Keep ',bold:true,underline:true},{text:'formatting',italic:true,underline:true}]},{text:'Edited existing table'}]});
               if(vp.width===1280||vp.width===375){
                 const added=await svc.readRange(userId,artifact.id,{start:0,count:40}) as {blocks:Array<{type:string;text:string}>};
                 expect(added.blocks.filter(block=>block.type!=='sectPr').slice(-3)).toMatchObject([{type:'p',text:'First appended revised'},{type:'tbl',text:expect.stringContaining('Third row and column')},{type:'p',text:'Last appended'}]);
               }
             }else{
               const r=await svc.readRange(userId,artifact.id,{part:'ppt/slides/slide1.xml'});
-              expect(r).toMatchObject({shapes:expect.arrayContaining([{text:item.updated,name:'Title'},{name:'Overlap'}, {name:'Basic 61'}].map(shape=>expect.objectContaining(shape)))});
+              expect(r).toMatchObject({shapes:expect.arrayContaining([{text:item.updated,name:'Title'},{name:'Overlap'}, {name:'Basic 61'},{name:'Grouped diagram'},{name:'Attached image'},{name:'Native table'}].map(shape=>expect.objectContaining(shape)))});
               const after=await svc.renderPng(userId,artifact.id,{pageIndex:0});
               // Restore fit for the comparison, without altering the saved file.
               await page.getByRole('button',{name:'画面に合わせる'}).click();
@@ -339,6 +347,30 @@ for(const vp of targets){
           record.pin=requests[0].selector;
           await page.screenshot({path:info.outputPath('real-'+item.kind+'-pin.png')});
           evidence.push(record);
+          await page.evaluate(()=>{document.documentElement.dataset.theme='dark'});
+          const viewportFits=await page.getByRole('dialog',{name:item.filename}).evaluate(dialog=>{
+            const rect=dialog.getBoundingClientRect();
+            return rect.left>=-1&&rect.right<=window.innerWidth+1;
+          });
+          expect(viewportFits).toBe(true);
+          await page.screenshot({path:info.outputPath('real-'+item.kind+'-dark.png')});
+          await page.evaluate(()=>{document.documentElement.dataset.theme='light'});
+
+          if(item.kind==='pdf'){
+            await page.getByRole('combobox',{name:'PDF の選択方法'}).selectOption('region');
+            const region=page.getByRole('button',{name:'ページ 2の範囲',exact:true});
+            await region.focus();await region.press('Enter');await region.press('ArrowRight');await region.press('ArrowDown');await region.press('Enter');
+            await expect(page.locator('.workspace-selection')).toContainText('領域',{timeout:60000});
+            await page.getByRole('textbox',{name:'変更内容'}).fill('Review PDF region');
+            await page.getByRole('button',{name:'依頼を追加'}).click();
+            await expect(page.locator('.workspace-request-item')).toHaveCount(2);
+            const regionRequest=srv.ctx.editRequestService.listRequests(userId,chatId,{artifactId:artifact.id}).find(request=>request.selector.kind==='pdf_region');
+            expect(regionRequest?.selector).toMatchObject({expectedPageContentHash:expect.stringMatching(/^[0-9a-f]{64}$/),expectedRegionDigest:expect.stringMatching(/^[0-9a-f]{64}$/)});
+            expect(srv.ctx.editRequestService.resolveRequestTarget(regionRequest!).status).toBe('resolved');
+            evidence.push({kind:'pdf-region',selector:regionRequest!.selector});
+            await page.screenshot({path:info.outputPath('real-pdf-region.png')});
+          }
+
           if(item.kind==='csv'&&(vp.width===1280||vp.width===375)){
             // A second, independent native cell target; edit one draft and
             // remove the other. Do not pretend a saved draft has been sent.
@@ -348,6 +380,8 @@ for(const vp of targets){
             await page.getByRole('button',{name:'依頼を追加'}).click();
             const items=page.locator('.workspace-request-item');
             await expect(items).toHaveCount(2);
+            await items.filter({hasText:'Change column label'}).getByRole('button',{name:'上へ',exact:true}).click();
+            await expect(items.first()).toContainText('Change column label');
             const first=items.filter({hasText:'Change this selected target'});
             await first.getByRole('button',{name:'指示を修正'}).click();
             await first.getByRole('textbox',{name:'依頼の修正'}).fill('Revised cell instruction');
@@ -357,7 +391,7 @@ for(const vp of targets){
             await items.filter({hasText:'Change column label'}).getByRole('button',{name:'削除',exact:true}).click();
             await expect(items).toHaveCount(1);
             expect(srv.ctx.editRequestService.listRequests(userId,chatId,{artifactId:artifact.id})).toMatchObject([{instruction:'Revised cell instruction',status:'draft'}]);
-            evidence.push({kind:'multiple-target-drafts',count:2,edited:true,deleted:true});
+            evidence.push({kind:'multiple-target-drafts',count:2,edited:true,reordered:true,deleted:true});
           }
           if(item.kind==='code'&&(vp.width===1280||vp.width===375)){
             // Actual server revision change delivered through the harness's
@@ -396,11 +430,15 @@ for(const vp of targets){
             await page.getByRole('button',{name:'編集',exact:true}).click();
             const select=page.getByRole('combobox',{name:'スライド編集操作'});
             let revision=2;
-            const saveStructural=async(op:string,configure:()=>Promise<void>,renderIndex:number)=>{
+            const stageStructural=async(op:string,configure:()=>Promise<void>)=>{
               await openCommand(page,select);
               await expect(select).toBeEnabled({timeout:90000});
               await select.selectOption(op);await configure();
               await page.getByRole('button',{name:'適用',exact:true}).click();
+
+            };
+            const saveStructural=async(op:string,configure:()=>Promise<void>,renderIndex:number)=>{
+              await stageStructural(op,configure);
               await expect(page.locator('[data-slide-canvas]')).toHaveAttribute('data-preview-ready','true',{timeout:90000});
               const image=page.getByRole('img',{name:'変更後のスライド'});
               await expect.poll(()=>image.evaluate(el=>(el as HTMLImageElement).complete&&(el as HTMLImageElement).naturalWidth>0),{timeout:30000}).toBe(true);
@@ -425,7 +463,7 @@ for(const vp of targets){
             // The extended native structure operations are covered on both
             // Chromium and WebKit; the basic addition runs at all five sizes.
             if(vp.width===1280||vp.width===375){
-              await saveStructural('pptx.add_table',async()=>{await page.getByRole('textbox',{name:'追加表 1行 1列'}).fill('Table cell')},0);
+              await stageStructural('pptx.add_table',async()=>{await page.getByRole('textbox',{name:'追加表 1行 1列'}).fill('Table cell')});
               await saveStructural('pptx.add_image',async()=>{await page.getByLabel('スライド画像ファイル').setInputFiles({name:'sample.png',mimeType:'image/png',buffer:Buffer.from('iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAIAAABvFaqvAAAAIklEQVR4nGO8VKHLQA3ARBVTRg0aNWjUoFGDRg0aNYgiAACvzQGn6yar6wAAAABJRU5ErkJggg==','base64')})},0);
               await saveStructural('pptx.add_slide',async()=>{},1);
               const structure=await svc.getStructure(userId,artifact.id);

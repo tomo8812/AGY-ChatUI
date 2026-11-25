@@ -58,6 +58,16 @@ export function EditRequestPanel({artifact,target,onClear}:{artifact:ArtifactRec
     const chatId=artifact.chatId;
     void mutate(async()=>{const result=await workspaceApi.resolveRequest(chatId,id);if(alive.current)setRequests(prev=>prev.map(req=>req.id===id?result.request:req))});
   };
+  const drafts=requests.filter(request=>request.status==='draft');
+  const reorder=(id:string,offset:number)=>{
+    if(!artifact.chatId)return;
+    const orderedIds=drafts.map(request=>request.id);
+    const index=orderedIds.indexOf(id),swap=index+offset;
+    if(index<0||swap<0||swap>=orderedIds.length)return;
+    [orderedIds[index],orderedIds[swap]]=[orderedIds[swap],orderedIds[index]];
+    const chatId=artifact.chatId;
+    void mutate(async()=>{await workspaceApi.reorderRequests(chatId,orderedIds)});
+  };
   const disabled=busy||loading;
   return <div className="workspace-edit-requests">
     <h3>編集依頼</h3>
@@ -70,7 +80,7 @@ export function EditRequestPanel({artifact,target,onClear}:{artifact:ArtifactRec
       <small>{req.status==='draft'?'未送信':req.status==='applied_unverified'?'確認待ち':req.status==='resolved'?'確認済み':req.status==='sent'?'送信済み':'再確認が必要'} · v{req.baseRevision}</small>
       {req.selectedContentSnapshot&&<details className="workspace-request-target"><summary>対象の内容</summary><pre>{req.selectedContentSnapshot}</pre></details>}
       <div className="workspace-request-actions">
-        {req.status==='draft'&&editing!==req.id&&<><button type="button" className="btn btn-ghost btn-xs" disabled={disabled} onClick={()=>{setEditing(req.id);setEditedInstruction(req.instruction)}}>指示を修正</button><button type="button" className="btn btn-ghost btn-xs" disabled={disabled} onClick={()=>remove(req.id)}>削除</button></>}
+        {req.status==='draft'&&editing!==req.id&&<><button type="button" className="btn btn-ghost btn-xs" disabled={disabled} onClick={()=>{setEditing(req.id);setEditedInstruction(req.instruction)}}>指示を修正</button><button type="button" className="btn btn-ghost btn-xs" disabled={disabled||drafts[0]?.id===req.id} onClick={()=>reorder(req.id,-1)}>上へ</button><button type="button" className="btn btn-ghost btn-xs" disabled={disabled||drafts.at(-1)?.id===req.id} onClick={()=>reorder(req.id,1)}>下へ</button><button type="button" className="btn btn-ghost btn-xs" disabled={disabled} onClick={()=>remove(req.id)}>削除</button></>}
         {req.status==='applied_unverified'&&<button type="button" className="btn btn-secondary btn-xs" disabled={disabled} onClick={()=>resolve(req.id)}>変更を確認</button>}
       </div>
     </div>)}

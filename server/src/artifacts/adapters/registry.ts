@@ -23,6 +23,7 @@ import { HtmlAdapter } from './html-adapter.js';
 import { MarkdownAdapter } from './markdown-adapter.js';
 import { MermaidAdapter } from './mermaid-adapter.js';
 import { SvgAdapter } from './svg-adapter.js';
+import { readDocxParagraphTarget, readPptxSlideTargets, readPptxTargets } from './ooxml-target.js';
 
 const CHART_EDITS = ['chart.create', 'chart.update_title_and_legend', 'chart.update_series_data', 'chart.update_series_style', 'chart.add_or_remove_series'];
 
@@ -200,7 +201,8 @@ class DocumentFormatAdapter implements FormatAdapter {
           if (operation === 'structure' || operation === 'verify' ||
               (operation === 'render_png' && this.format === 'image' && /\.png$/i.test(ctx.filename ?? ''))) {
             return { operation, availability: 'partial', scope, notes: operation === 'render_png'
-              ? '既存の PNG を取得できます。' : 'ファイルのメタデータのみ。' };
+              ? '既存の PNG を取得できます。' : operation === 'structure' && this.format === 'pptx'
+                ? 'スライドの構造と編集依頼の対象を取得できます。' : 'ファイルのメタデータのみ。' };
           }
           return {
             operation, availability: 'disabled_by_resource_tier', scope, notes,
@@ -223,6 +225,7 @@ class DocumentFormatAdapter implements FormatAdapter {
   }
 
   getStructure(buffer: Buffer, meta: AdapterFileMeta): Record<string, unknown> {
+    if (this.format === 'pptx' && /\.pptx$/i.test(meta.filename)) return readPptxTargets(buffer);
     return {
       format: this.format,
       filename: meta.filename,
@@ -231,7 +234,14 @@ class DocumentFormatAdapter implements FormatAdapter {
     };
   }
 
-  readRange(_buffer: Buffer, _range: Record<string, unknown>, _meta: AdapterFileMeta): Record<string, unknown> {
+  readRange(buffer: Buffer, range: Record<string, unknown>, _meta: AdapterFileMeta): Record<string, unknown> {
+    if (this.format === 'pptx' && range.targetMetadata === 'true' && typeof range.part === 'string') {
+      return readPptxSlideTargets(buffer, range.part);
+    }
+    if (this.format === 'docx' && range.targetBlockIndex !== undefined) {
+      const index = Number(range.targetBlockIndex);
+      return { target: Number.isSafeInteger(index) && index >= 0 ? readDocxParagraphTarget(buffer, index) : null };
+    }
     throw unsupportedOperationError(
       'read_range',
       'disabled_by_resource_tier',
@@ -301,6 +311,20 @@ class DocumentFormatAdapter implements FormatAdapter {
           ? { status: 'resolved', resolvedCoords: { pageIndex } }
           : { status: 'needs_review', reason: 'pdf_document_changed' };
       }
+      if (['pdf_pin','pdf_region'].includes(selector.kind) && typeof selector.expectedArtifactSha256 === 'string') {
+        const pageIndex = Number(selector.pageIndex), pageCount = Number(selector.expectedPageCount);
+        const coords = selector.kind === 'pdf_pin' ? [selector.xPt, selector.yPt] : selector.rectPt;
+        const hex = (value: unknown) => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+        if (!Number.isInteger(pageIndex) || !Number.isInteger(pageCount) || pageIndex < 0 || pageIndex >= pageCount ||
+          !hex(selector.expectedPageContentHash) || !hex(selector.expectedRegionDigest) ||
+          !Array.isArray(coords) || coords.length !== (selector.kind === 'pdf_pin' ? 2 : 4) ||
+          !coords.every(value => typeof value === 'number' && Number.isFinite(value) && value >= 0)) {
+          return { status: 'stale', reason: 'invalid_page_selection' };
+        }
+        return selector.expectedArtifactSha256 === currentSha
+          ? { status: 'resolved', resolvedCoords: { pageIndex, selector } }
+          : { status: 'needs_review', reason: 'pdf_page_content_changed' };
+      }
       const expectedPageContentHash = selector.expectedPageContentHash ? String(selector.expectedPageContentHash) : null;
       const currentPageHash = currentSha;
       if (!expectedPageContentHash || expectedPageContentHash !== currentPageHash) {
@@ -316,6 +340,37 @@ class DocumentFormatAdapter implements FormatAdapter {
         return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
       }
       return { status: 'resolved', resolvedRange: { sheetId: selector.sheetId, rangeA1: selector.rangeA1 } };
+    }
+
+    if (this.format === 'pptx' && ['pptx_slide', 'pptx_element'].includes(selector.kind)) {
+      try {
+        const slide = readPptxTargets(buffer).slides.find(slide => slide.id === String(selector.slideId));
+        if (!slide) return { status: 'stale', reason: 'slide_not_found' };
+        const metadata = readPptxSlideTargets(buffer, slide.part);
+        const element = selector.kind === 'pptx_element'
+          ? metadata.shapes.filter(shape => shape.id === String(selector.shapeId) &&
+            JSON.stringify(shape.groupPath) === JSON.stringify(selector.groupPath ?? []))
+          : null;
+        const fingerprint = element ? (element.length === 1 ? element[0].fingerprint : null) : metadata.slideHash;
+        const expected = element ? selector.expectedElementFingerprint : selector.expectedSlideHash;
+        return fingerprint && fingerprint === expected
+          ? { status: 'resolved', resolvedRange: { selector } }
+          : { status: 'needs_review', reason: 'element_fingerprint_changed' };
+      } catch {
+        return { status: 'needs_review', reason: 'target_structure_unavailable' };
+      }
+    }
+
+    if (this.format === 'docx' && selector.kind === 'docx_paragraph' && selector.expectedBlockHash !== currentSha) {
+      try {
+        const block = readDocxParagraphTarget(buffer, Number(selector.blockIndex));
+        if (!block) return { status: 'stale', reason: 'word_block_not_found' };
+        return block.fingerprint === selector.expectedBlockHash && (!selector.paraId || selector.paraId === block.paraId)
+          ? { status: 'resolved', resolvedRange: { selector } }
+          : { status: 'needs_review', reason: 'element_fingerprint_changed' };
+      } catch {
+        return { status: 'needs_review', reason: 'target_structure_unavailable' };
+      }
     }
 
     if (this.format === 'pptx' || this.format === 'docx') {

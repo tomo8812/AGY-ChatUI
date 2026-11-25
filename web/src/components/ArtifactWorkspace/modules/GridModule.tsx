@@ -1,5 +1,5 @@
 import React,{useEffect,useLayoutEffect,useMemo,useRef,useState} from 'react';
-import {previewFormulas} from '../formulaPreview';
+import {previewFormulas,type FormulaCell} from '../formulaPreview';
 import { workspaceApi,supportsOperation } from '../../../api/workspace';
 import {ResponsiveCommandBar} from '../../shared-ui/layout/ResponsiveCommandBar';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
@@ -16,8 +16,8 @@ const FORMULA_STATUS:Record<string,string>={
   unevaluated_unsupported:'数式の計算結果を取得できませんでした',
   error_formula:'数式エラー',
 };
-type GridTile={cells:Map<string,Cell>;rows?:string[][]};
-type CsvRange={rows:string[][];truncated?:boolean};
+type GridTile={cells:Map<string,Cell>;rows?:string[][];sourceRows?:number[]};
+type CsvRange={rows:string[][];truncated?:boolean;sourceRows?:number[];truncatedSourceRow?:number};
 const ROWS=50,COLS=20,CELL_WIDTH=112,CELL_HEIGHT=28,HEADER=44;
 // Native scroll ranges have engine-specific limits. Compress only the scroll
 // track of very large axes; the visible cells retain their actual pixel size.
@@ -49,18 +49,20 @@ function tileBounds(key:string,rowCount:number,colCount:number){
   const [r,c]=key.split(':').map(Number),row0=r*ROWS,col0=c*COLS;
   return {row0,col0,row1:Math.min(rowCount-1,row0+ROWS-1),col1:Math.min(colCount-1,col0+COLS-1)};
 }
-async function csvTile(artifact:WorkspaceModuleProps['artifact'],r0:number,r1:number,c0:number,c1:number,signal:AbortSignal):Promise<string[][]>{
-  const result=await workspaceApi.range<CsvRange>(artifact.id,{startRow:r0,endRow:r1,startCol:c0,endCol:c1},signal);
+async function csvTile(artifact:WorkspaceModuleProps['artifact'],r0:number,r1:number,c0:number,c1:number,signal:AbortSignal,filter:string):Promise<CsvRange>{
+  const result=await workspaceApi.range<CsvRange>(artifact.id,{startRow:r0,endRow:r1,startCol:c0,endCol:c1,...(filter?{gridFilter:filter}:{})},signal);
   assertRevision(artifact,result);
-  if(!result.truncated)return result.rows;
-  // A response byte budget is a transport bound, not a spreadsheet limit.
-  // Subdivide only when necessary; never silently treat truncated values as blanks.
-  if(r0<r1){const middle=Math.floor((r0+r1)/2);return [...await csvTile(artifact,r0,middle,c0,c1,signal),...await csvTile(artifact,middle+1,r1,c0,c1,signal)]}
-  if(c0<c1){
-    const middle=Math.floor((c0+c1)/2),left=await csvTile(artifact,r0,r1,c0,middle,signal),right=await csvTile(artifact,r0,r1,middle+1,c1,signal);
-    return left.map((row,i)=>[...row,...(right[i]?.length?Array(Math.max(0,middle-c0+1-row.length)).fill(''):[]),...(right[i]??[])]);
+  if(!result.truncated)return result;
+  if(r0<r1){
+    const middle=Math.floor((r0+r1)/2),left=await csvTile(artifact,r0,middle,c0,c1,signal,filter),right=await csvTile(artifact,middle+1,r1,c0,c1,signal,filter);
+    return {rows:[...left.rows,...right.rows],sourceRows:filter?[...(left.sourceRows??[]),...(right.sourceRows??[])]:undefined};
   }
-  return [[await workspaceApi.csvCell(artifact,r0,c0,signal)]];
+  if(c0<c1){
+    const middle=Math.floor((c0+c1)/2),left=await csvTile(artifact,r0,r1,c0,middle,signal,filter),right=await csvTile(artifact,r0,r1,middle+1,c1,signal,filter);
+    return {sourceRows:left.sourceRows,rows:left.rows.map((row,i)=>[...row,...(right.rows[i]?.length?Array(Math.max(0,middle-c0+1-row.length)).fill(''):[]),...(right.rows[i]??[])])};
+  }
+  const sourceRow=result.truncatedSourceRow??r0;
+  return {rows:[[await workspaceApi.csvCell(artifact,sourceRow,c0,signal)]],sourceRows:filter?[sourceRow]:undefined};
 }
 export function GridModule(props:WorkspaceModuleProps){
   const {artifact,mode,draft,capabilities,editingLocked,onDraft,onTarget}=props;
@@ -72,6 +74,10 @@ export function GridModule(props:WorkspaceModuleProps){
   const [pinError,setPinError]=useState('');
   const [editAction,setEditAction]=useState('');
   const [sheetName,setSheetName]=useState('');
+  const structureSequence=useRef(0);
+  const [filterInput,setFilterInput]=useState('');
+  const [appliedFilter,setAppliedFilter]=useState('');
+  const filter=xlsx||mode==='pin'?'':appliedFilter;
   const [search,setSearch]=useState('');
   const [searching,setSearching]=useState(false);
   const searchAbort=useRef<AbortController|null>(null);
@@ -79,11 +85,11 @@ export function GridModule(props:WorkspaceModuleProps){
   const scroll=useRef<HTMLDivElement>(null);
   const pendingReveal=useRef<Coordinate|null>(null);
   const [viewport,setViewport]=useState({top:0,left:0,width:800,height:420});
-  const structure=useRevisionResource<{sheets:Sheet[];rowCount?:number;colCount?:number}>(artifact,'grid-structure',async signal=>{
+  const structure=useRevisionResource<{sheets:Sheet[];rowCount?:number;colCount?:number}>(artifact,'grid-structure:'+filter,async signal=>{
     if(xlsx){
       const result=await workspaceApi.structure<{sheets:Sheet[]}>(artifact.id,signal);assertRevision(artifact,result);return result;
     }
-    const result=await workspaceApi.range<{totalRows:number;totalCols:number}>(artifact.id,{gridDimensions:true},signal);
+    const result=await workspaceApi.range<{totalRows:number;totalCols:number}>(artifact.id,{gridDimensions:true,...(filter?{gridFilter:filter}:{})},signal);
     assertRevision(artifact,result);
     if(!Number.isSafeInteger(result.totalRows)||result.totalRows<0||!Number.isSafeInteger(result.totalCols)||result.totalCols<0)throw Error('表のサイズを取得できません。');
     return {sheets:[{id:'csv',name:artifact.filename,part:''}],rowCount:result.totalRows,colCount:result.totalCols};
@@ -92,7 +98,7 @@ export function GridModule(props:WorkspaceModuleProps){
   const sheet=sheets.find(s=>s.id===sheetId)??sheets[0];
   const csvRows=structure.data?.rowCount??0,csvCols=structure.data?.colCount??0;
   const rowCount=xlsx?1048576:Math.max(1,csvRows),colCount=xlsx?16384:Math.max(1,csvCols);
-  const csvEmpty=structure.ready&&!xlsx&&csvRows===0;
+  const csvEmpty=structure.ready&&!xlsx&&!filter&&csvRows===0;
   const updateViewport=()=>{const el=scroll.current;if(!el)return;const next={top:el.scrollTop,left:el.scrollLeft,width:el.clientWidth,height:el.clientHeight};setViewport(old=>old.top===next.top&&old.left===next.left&&old.width===next.width&&old.height===next.height?old:next)};
   useEffect(()=>{
     const el=scroll.current;if(!el)return;updateViewport();
@@ -117,7 +123,7 @@ export function GridModule(props:WorkspaceModuleProps){
     sizeOf:tile=>tile.rows
       ?tile.rows.reduce((bytes,row)=>bytes+40+row.reduce((size,value)=>size+16+value.length*2,0),0)
       :JSON.stringify([...tile.cells.values()]).length*2+tile.cells.size*96,
-  }),[artifact.userId,revisionKey,sheet?.id]);
+  }),[artifact.userId,revisionKey,sheet?.id,filter]);
   // Protect visible and selected tiles while other tiles compete for the LRU budget.
   const activeTiles=useMemo(()=>new Map<string,GridTile>(),[cache]);
   const readTile=(key:string)=>activeTiles.get(key)??cache.peek(key);
@@ -139,7 +145,10 @@ export function GridModule(props:WorkspaceModuleProps){
             const result=await workspaceApi.range<{cells:Cell[]}>(artifact.id,{sheetId:sheet.id,rangeA1:address(b.row0,b.col0)+':'+address(b.row1,b.col1),evaluate:true},controller.signal);
             assertRevision(artifact,result);
             tile={cells:new Map(result.cells.map(cell=>[cell.address,cell]))};
-          }else tile={cells:new Map(),rows:await csvTile(artifact,b.row0,b.row1,b.col0,b.col1,controller.signal)};
+          }else {
+            const {rows,sourceRows}=await csvTile(artifact,b.row0,b.row1,b.col0,b.col1,controller.signal,filter);
+            tile={cells:new Map(),rows,sourceRows};
+          }
           if(controller.signal.aborted)return;
           cache.set(key,tile);
           activeTiles.set(key,tile);
@@ -151,7 +160,8 @@ export function GridModule(props:WorkspaceModuleProps){
   },[cache,keySignature,retry,structure.ready,rowCount,colCount]);
   const tile=(r:number,c:number)=>readTile(tileKey(r,c));
   const raw=(r:number,c:number)=>xlsx?tile(r,c)?.cells.get(address(r,c)):undefined;
-  const key=(r:number,c:number)=>String(sheet?.id)+':'+address(r,c);
+  const sourceRow=(r:number,c:number)=>tile(r,c)?.sourceRows?.[r%ROWS]??r;
+  const key=(r:number,c:number)=>String(sheet?.id)+':'+address(sourceRow(r,c),c);
   function original(r:number,c:number){const cell=raw(r,c);return xlsx?cell?.formula?'='+cell.formula.replace(/^=/,''):String(cell?.value??''):String(tile(r,c)?.rows?.[r%ROWS]?.[c%COLS]??'')}
   const ready=structure.ready&&!!sheet&&!!tile(current.row,current.col);
   const inData=xlsx||current.row<csvRows&&current.col<csvCols;
@@ -160,8 +170,8 @@ export function GridModule(props:WorkspaceModuleProps){
   const latest=useRef({revisionKey,sheetId:sheet?.id,selectedRange});latest.current={revisionKey,sheetId:sheet?.id,selectedRange};
   const entries=useMemo(()=>new Map(draft?.entries.map(e=>[e.key,e])),[draft]);
   function value(r:number,c:number){const e=entries.get(key(r,c));return e?.displayValue??String(e?.operation.value??original(r,c))}
-  const structural=entries.get('grid-structure');
-  const cellEditLocked=editingLocked||!!structural;
+  const structural=(draft?.entries??[]).filter(entry=>entry.key.startsWith('grid-structure:'));
+  const cellEditLocked=editingLocked||structural.length>0;
   function change(v:string){
     if(!ready||cellEditLocked||artifact.revision===undefined||!sheet||!editableCoordinate)return;
     const {row,col}=current;
@@ -169,21 +179,53 @@ export function GridModule(props:WorkspaceModuleProps){
     const op=xlsx?(formula?'xlsx.set_formula':'xlsx.set_cell'):'set_cell';
     if(!supportsOperation(capabilities,xlsx?op:'edit'))return;
     const k=key(row,col);
-    onDraft(artifact.revision,v===original(row,col)?null:{key:k,displayValue:v,label:sheet.name+' '+address(row,col),operation:xlsx?{op,sheetPart:sheet.part,address:address(row,col),value:formula?v:(/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(v)&&Number.isFinite(Number(v))?Number(v):v)}:{op,row,col,value:v}},k);
+    onDraft(artifact.revision,v===original(row,col)?null:{key:k,displayValue:v,label:sheet.name+' '+address(row,col),operation:xlsx?{op,sheetPart:sheet.part,address:address(row,col),value:formula?v:(/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(v)&&Number.isFinite(Number(v))?Number(v):v)}:{op,row:sourceRow(row,col),col,value:v}},k);
   }
-  const previews=useMemo(()=>{
-    if(!xlsx||!sheet||!draft||!structure.ready||visibleKeys.some(key=>!readTile(key)))return new Map<string,string>();
-    const first=tileBounds(visibleKeys[0],rowCount,colCount),last=tileBounds(visibleKeys[visibleKeys.length-1],rowCount,colCount);
-    const values=new Map<string,{value:unknown;type?:string;formula?:string}>();
-    for(const key of visibleKeys)for(const cell of readTile(key)!.cells.values())values.set(cell.address,cell);
+  const [formulaPreview,setFormulaPreview]=useState<{draft:NonNullable<typeof draft>;sheetId:string;cells:Map<string,string>}|null>(null);
+  useEffect(()=>{
+    if(!xlsx||!sheet||!draft||draft.baseRevision!==artifact.revision||mode!=='edit'||
+      !structure.ready||visibleKeys.some(key=>!readTile(key)))return;
+    const controller=new AbortController();
+    const staged=new Map<string,FormulaCell>();
+    const formulas=new Set<string>();
+    const sources=new Map<string,Map<string,Cell>>();
+    for(const key of visibleKeys){
+      const tile=readTile(key)!;
+      for(const cell of tile.cells.values())if(cell.formula)formulas.add(cell.address);
+      sources.set(sheet.id+':'+key,tile.cells);
+    }
     for(const e of draft.entries){
       const op=e.operation;
-      if(op.sheetPart!==sheet.part||typeof op.address!=='string'||!['xlsx.set_formula','xlsx.set_cell'].includes(op.op))continue;
-      const v=op.value;
-      values.set(op.address,{value:v,type:typeof v==='number'?'n':'inlineStr',formula:op.op==='xlsx.set_formula'?String(v).replace(/^=/,''):undefined});
+      if(typeof op.sheetPart!=='string'||typeof op.address!=='string'||!['xlsx.set_formula','xlsx.set_cell'].includes(op.op))continue;
+      const v=op.value,formula=op.op==='xlsx.set_formula'?String(v).replace(/^=/,''):undefined;
+      staged.set(op.sheetPart+':'+op.address,{value:v,type:typeof v==='number'?'n':'inlineStr',formula});
+      const c=parseAddress(op.address);
+      if(op.sheetPart===sheet.part&&c&&visibleKeys.includes(tileKey(c.row,c.col))){
+        if(formula)formulas.add(op.address);else formulas.delete(op.address);
+      }
     }
-    return previewFormulas(values,sheet.name,{row0:first.row0,col0:first.col0,rows:last.row1-first.row0+1,cols:last.col1-first.col0+1});
-  },[xlsx,sheet,draft,structure.ready,cache,cacheVersion,visibleKeys.join(',')]);
+    if(!formulas.size)return;
+    void previewFormulas({rootSheet:sheet,sheets,formulas,signal:controller.signal,loadCell:async(refSheet,row,col)=>{
+      const id=address(row,col),override=staged.get(refSheet.part+':'+id);
+      if(override)return override;
+      const tile=tileKey(row,col),source=refSheet.id+':'+tile;
+      let cells=sources.get(source)??(refSheet.id===sheet.id?readTile(tile)?.cells:undefined);
+      if(!cells){
+        const b=tileBounds(tile,rowCount,colCount);
+        const result=await workspaceApi.range<{cells:Cell[]}>(artifact.id,{
+          sheetId:refSheet.id,rangeA1:address(b.row0,b.col0)+':'+address(b.row1,b.col1),
+        },controller.signal);
+        assertRevision(artifact,result);
+        cells=new Map(result.cells.map(cell=>[cell.address,cell]));
+        sources.set(source,cells);
+      }
+      return cells.get(id);
+    }}).then(cells=>{if(!controller.signal.aborted)setFormulaPreview({draft,sheetId:sheet.id,cells})},()=>{
+      if(!controller.signal.aborted)setFormulaPreview(null);
+    });
+    return()=>controller.abort();
+  },[xlsx,sheet,draft,mode,structure.ready,cache,cacheVersion,visibleKeys.join(',')]);
+  const previews=formulaPreview?.draft===draft&&formulaPreview?.sheetId===sheet?.id?formulaPreview.cells:new Map<string,string>();
   function move(row:number,col:number,extend=false){
     row=Math.max(0,Math.min(rowCount-1,row));col=Math.max(0,Math.min(colCount-1,col));
     setSelected({row,col});if(!extend)setAnchor({row,col});
@@ -191,7 +233,7 @@ export function GridModule(props:WorkspaceModuleProps){
   }
   useLayoutEffect(()=>{
     const el=scroll.current,target=pendingReveal.current;
-    if(!el||!target||!el.clientHeight||!el.clientWidth)return;
+    if(!el||!target||!structure.ready||!el.clientHeight||!el.clientWidth)return;
     pendingReveal.current=null;
     el.scrollTop=reveal(axis(rowCount,CELL_HEIGHT,CELL_HEIGHT,el.clientHeight,el.scrollTop),target.row);
     el.scrollLeft=reveal(axis(colCount,CELL_WIDTH,HEADER,el.clientWidth,el.scrollLeft),target.col);
@@ -226,7 +268,7 @@ export function GridModule(props:WorkspaceModuleProps){
     }catch{setPinError('選択対象を識別できませんでした。')}
   }
   const inputEnabled=ready&&editableCoordinate&&mode==='edit'&&!cellEditLocked;
-  const structuralEnabled=ready&&editableCoordinate&&mode==='edit'&&!editingLocked&&(!draft||!!structural)&&artifact.revision!==undefined;
+  const structuralEnabled=ready&&editableCoordinate&&mode==='edit'&&!editingLocked&&artifact.revision!==undefined;
   const styleKey='style:'+key(current.row,current.col);
   const styleEntry=entries.get(styleKey);
   const canStyle=xlsx&&inputEnabled&&supportsOperation(capabilities,'xlsx.set_cell_style');
@@ -235,19 +277,33 @@ export function GridModule(props:WorkspaceModuleProps){
   const needsName=['xlsx.add_sheet','xlsx.rename_sheet'].includes(editAction);
   const validName=!needsName||(sheetName.trim().length>0&&sheetName.trim().length<=31&&!Array.from('[]:*?/\\').some(ch=>sheetName.includes(ch))&&!sheets.some(s=>s.name.toLowerCase()===sheetName.trim().toLowerCase()&&(editAction!=='xlsx.rename_sheet'||s.id!==sheet?.id)));
   function stageStructure(){
-    if(!structuralEnabled||structural||!sheet||artifact.revision===undefined||!validName)return;
+    if(!structuralEnabled||!sheet||artifact.revision===undefined||!validName)return;
     const action=actions.find(a=>a.id===editAction);if(!action)return;
-    const row=editAction.endsWith('row'),idx=row?current.row:current.col;
+    const row=editAction.endsWith('row');
+    let idx=row?sourceRow(current.row,current.col):current.col;
+    const axisOp=row?'xlsx.mutate_rows':'xlsx.mutate_columns';
+    for(const entry of structural){
+      const op=entry.operation;
+      if(xlsx&&op.op==='xlsx.remove_empty_sheet'&&op.sheetId===sheet.id){setPinError('このシートは削除予定です。');return}
+      const matches=xlsx?op.sheetId===sheet.id&&op.op===axisOp:op.op===('insert_'+(row?'row':'col'))||op.op===('delete_'+(row?'row':'col'));
+      if(!matches)continue;
+      const prior=Number(op.index)-(xlsx?1:0);
+      const insertion=xlsx?op.mode==='insert':op.op.startsWith('insert');
+      if(!insertion&&prior===idx){setPinError('この行または列は削除予定です。');return}
+      if(prior<=idx)idx+=insertion?1:-1;
+    }
     if(!xlsx&&editAction.startsWith('delete')&&!inData)return;
     if(editAction.startsWith('delete')||editAction==='xlsx.remove_empty_sheet')if(!window.confirm(action.label+'しますか？'))return;
     const op=editAction.startsWith('xlsx.')?{op:editAction,sheetId:sheet.id,...(needsName?{name:sheetName.trim()}:{})}:xlsx?{op:row?'xlsx.mutate_rows':'xlsx.mutate_columns',sheetId:sheet.id,index:idx+1,count:1,mode:editAction.startsWith('insert')?'insert':'delete'}:{op:editAction,index:idx,...(editAction==='insert_row'?{values:Array.from({length:Math.max(1,csvCols)},()=> '')}:{})};
-    onDraft(artifact.revision,{key:'grid-structure',label:action.label,operation:op},'grid-structure');setEditAction('');setSheetName('');
+    setPinError('');
+    const draftKey='grid-structure:'+(++structureSequence.current);
+    onDraft(artifact.revision,{key:draftKey,label:action.label+' · '+selectedRange,operation:op},draftKey);setEditAction('');setSheetName('');
   }
   useEffect(()=>{setSearching(false);return()=>{searchAbort.current?.abort();searchAbort.current=null}},[search,revisionKey,sheet?.id,draft]);
   async function nextMatch(){
     if(!search.trim()||!sheet||!structure.ready||searchAbort.current)return;
     const controller=new AbortController();searchAbort.current=controller;setSearching(true);setPinError('');
-    const identity=latest.current,origin=current;
+    const identity=latest.current,origin={row:sourceRow(current.row,current.col),col:current.col};
     const fold=(s:string)=>Array.from(s,ch=>ch.toLowerCase()).join('');
     const q=fold(search.trim()),compare=(a:Coordinate,b:Coordinate)=>a.row-b.row||a.col-b.col;
     const circular=(a:Coordinate,b:Coordinate)=>Number(compare(a,origin)<=0)-Number(compare(b,origin)<=0)||compare(a,b);
@@ -275,7 +331,10 @@ export function GridModule(props:WorkspaceModuleProps){
       }
       if(controller.signal.aborted||latest.current!==identity&&latest.current.selectedRange!==identity.selectedRange)return;
       const candidate=matchingDrafts[0];if(candidate&&(!hit||circular(candidate,hit)<0))hit=candidate;
-      if(hit)move(hit.row,hit.col);else setPinError('一致するセルがありません。');
+      if(hit){
+        if(filter){setAppliedFilter('');setFilterInput('');setSelected(hit);setAnchor(hit);pendingReveal.current=hit}
+        else move(hit.row,hit.col);
+      }else setPinError('一致するセルがありません。');
     }catch(e){if(!controller.signal.aborted)setPinError(e instanceof Error?e.message:'検索に失敗しました。')}
     finally{if(searchAbort.current===controller){searchAbort.current=null;setSearching(false)}}
   }
@@ -286,7 +345,7 @@ export function GridModule(props:WorkspaceModuleProps){
       {xlsx&&<button type="button" className="btn btn-secondary btn-xs" aria-pressed={Boolean(styleEntry?.operation.bold??raw(current.row,current.col)?.bold)} disabled={!canStyle} onClick={toggleBold}>太字</button>}
     </>}</>;
   const secondary=mode==='edit'?<>
-      <select aria-label="表の編集操作" disabled={!structuralEnabled||!!structural} value={editAction} onChange={e=>{setEditAction(e.target.value);setSheetName(e.target.value==='xlsx.rename_sheet'?sheet?.name??'':'')}}><option value="">表の操作…</option>{actions.map(a=><option key={a.id} value={a.id}>{a.label}</option>)}</select>
+      <select aria-label="表の編集操作" disabled={!structuralEnabled} value={editAction} onChange={e=>{setEditAction(e.target.value);setSheetName(e.target.value==='xlsx.rename_sheet'?sheet?.name??'':'')}}><option value="">表の操作…</option>{actions.map(a=><option key={a.id} value={a.id}>{a.label}</option>)}</select>
       {needsName&&<input aria-label="シート名" value={sheetName} maxLength={31} onChange={e=>setSheetName(e.target.value)}/>}
       {editAction&&<button type="button" className="btn btn-secondary btn-xs" disabled={!structuralEnabled||!validName} onClick={stageStructure}>適用</button>}
     </>:null;
@@ -294,15 +353,28 @@ export function GridModule(props:WorkspaceModuleProps){
   const tabs=<div className="workspace-toolbar" role="group" aria-label="シート">{sheets.map(s=><button key={s.id} type="button" className={'btn btn-secondary btn-xs '+(s.id===sheet?.id?'active':'')} aria-pressed={s.id===sheet?.id} onClick={()=>{setSheetId(s.id);move(0,0)}}>{s.name}</button>)}
     <input aria-label="セル範囲へ移動" placeholder="A1:B2" value={jump} onChange={e=>setJump(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();jumpToRange()}}}/><button type="button" className="btn btn-secondary btn-xs" disabled={!jump.trim()} onClick={jumpToRange}>移動</button>
     <input aria-label={xlsx?'シート全体を検索':'表全体を検索'} placeholder={xlsx?'シート全体を検索':'表全体を検索'} value={search} onChange={e=>{setSearch(e.target.value)}} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();void nextMatch()}}}/><button type="button" className="btn btn-secondary btn-xs" disabled={!search.trim()||searching||!structure.ready} onClick={()=>void nextMatch()}>{searching?'検索中…':'次の一致'}</button></div>;
-  return <UnifiedViewerZoomShell resetKey={artifact.id+':grid'} controlsTop={toolbar} controlsBottom={tabs}>
+  const filters=!xlsx&&mode!=='pin'&&<form className="workspace-toolbar" onSubmit={event=>{
+    event.preventDefault();setAppliedFilter(filterInput.trim());move(0,0)
+  }}>
+    <input aria-label="行を絞り込む" placeholder="行を絞り込む" value={filterInput} onChange={event=>setFilterInput(event.target.value)}/>
+    <button type="submit" className="btn btn-secondary btn-xs">絞り込む</button>
+    {filter&&<button type="button" className="btn btn-ghost btn-xs" onClick={()=>{setFilterInput('');setAppliedFilter('');move(0,0)}}>絞り込み解除</button>}
+  </form>;
+  return <UnifiedViewerZoomShell resetKey={artifact.id+':grid'} controlsTop={<>{toolbar}{filters}</>} controlsBottom={tabs}>
     {(structure.error||rangeError||pinError)&&<div role="alert" className="error-box">{structure.error||rangeError||pinError}<button type="button" onClick={()=>{structure.retry();setRetry(v=>v+1);setPinError('')}}>再試行</button></div>}
-    {structural&&<div className="workspace-toolbar" role="status">{structural.label}（保存時に反映）<button type="button" className="btn btn-secondary btn-xs" disabled={editingLocked} onClick={()=>artifact.revision!==undefined&&onDraft(artifact.revision,null,'grid-structure')}>取消</button></div>}
+    {structural.length>0&&<div className="workspace-toolbar" role="status">
+      {structural.map(entry=><span key={entry.key}>{entry.label}</span>)}
+      <button type="button" className="btn btn-secondary btn-xs" disabled={editingLocked} onClick={()=>{
+        const entry=structural.at(-1);if(entry&&artifact.revision!==undefined)onDraft(artifact.revision,null,entry.key)
+      }}>最後の構造変更を取消</button>
+    </div>}
+    {filter&&structure.ready&&csvRows===0&&<p role="status">一致する行がありません。</p>}
     {!sheet?<div className="workspace-loading">{structure.error?'表を表示できません。':'読み込み中…'}</div>:<div className="workspace-virtual-grid" ref={scroll} role="grid" aria-label="表データ" aria-busy={loading} aria-rowcount={rowCount+1} aria-colcount={colCount+1} tabIndex={0} onScroll={updateViewport} onKeyDown={e=>{const delta:Record<string,[number,number]>={ArrowUp:[-1,0],ArrowDown:[1,0],ArrowLeft:[0,-1],ArrowRight:[0,1]};if(delta[e.key]){e.preventDefault();move(current.row+delta[e.key][0],current.col+delta[e.key][1],e.shiftKey)}else if(e.key==='Enter'&&mode==='edit'){e.preventDefault();formulaInput.current?.focus()}}}>
       <div className="workspace-grid-plane" style={{width:colAxis.plane,height:rowAxis.plane}}>
         <div role="row" className="workspace-grid-header" style={{height:CELL_HEIGHT}}><div role="columnheader" className="workspace-grid-corner" style={{width:HEADER}}/>{cols.map(c=><div key={colAxis.start+c.index} role="columnheader" className="workspace-grid-col" style={{left:c.start,width:c.size}}>{colName(colAxis.start+c.index)}</div>)}</div>
         {rows.map(r=>{const row=rowAxis.start+r.index;return <div key={row} role="row" aria-rowindex={row+2} className="workspace-grid-row" style={{top:r.start,height:r.size}}>
-          <div role="rowheader" className="workspace-grid-rowhead" style={{width:HEADER}}>{row+1}</div>
-          {cols.map(c=>{const col=colAxis.start+c.index,addr=address(row,col),cell=raw(row,col),pending=entries.has(key(row,col)),active=row>=bounds.row0&&row<=bounds.row1&&col>=bounds.col0&&col<=bounds.col1,preview=previews.get(addr),loaded=!!tile(row,col);return <div key={col} role="gridcell" aria-colindex={col+2} aria-selected={active} aria-label={addr} aria-busy={!loaded} onClick={e=>{move(row,col,e.shiftKey);scroll.current?.focus({preventScroll:true})}} title={preview!==undefined?'未保存の数式プレビュー':cell?.formulaStatus?FORMULA_STATUS[cell.formulaStatus]:undefined} data-formula-preview={preview!==undefined?'true':undefined} className={'workspace-grid-cell'+(pending?' pending':'')} style={{left:c.start,width:c.size,fontWeight:entries.get('style:'+key(row,col))?.operation.bold??cell?.bold?'bold':undefined}}>{preview??(pending?value(row,col):!loaded?'…':xlsx?String(cell?.value??''):original(row,col))}</div>})}
+          <div role="rowheader" className="workspace-grid-rowhead" style={{width:HEADER}}>{sourceRow(row,current.col)+1}</div>
+          {cols.map(c=>{const col=colAxis.start+c.index,addr=address(sourceRow(row,col),col),cell=raw(row,col),pending=entries.has(key(row,col)),active=row>=bounds.row0&&row<=bounds.row1&&col>=bounds.col0&&col<=bounds.col1,preview=previews.get(addr),loaded=!!tile(row,col);return <div key={col} role="gridcell" aria-colindex={col+2} aria-selected={active} aria-label={addr} aria-busy={!loaded} onClick={e=>{move(row,col,e.shiftKey);scroll.current?.focus({preventScroll:true})}} title={preview!==undefined?'未保存の数式プレビュー':cell?.formulaStatus?FORMULA_STATUS[cell.formulaStatus]:undefined} data-formula-preview={preview!==undefined?'true':undefined} className={'workspace-grid-cell'+(pending?' pending':'')} style={{left:c.start,width:c.size,fontWeight:entries.get('style:'+key(row,col))?.operation.bold??cell?.bold?'bold':undefined}}>{preview??(pending?value(row,col):!loaded?'…':xlsx?String(cell?.value??''):original(row,col))}</div>})}
         </div>})}
       </div>
     </div>}

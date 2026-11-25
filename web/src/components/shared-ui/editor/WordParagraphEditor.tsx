@@ -18,18 +18,7 @@ const SingleParagraph=Extension.create({
   name:'singleParagraph',priority:1000,
   addKeyboardShortcuts(){return {Enter:()=>this.editor.commands.setHardBreak()}},
   addProseMirrorPlugins(){return [new Plugin({filterTransaction:tr=>{
-    if(!tr.docChanged)return true;
-    if(tr.doc.childCount!==1||tr.doc.firstChild?.type.name!=='paragraph')return false;
-    let length=0,segments=0,lastKey='',lastOrigin=0;
-    tr.doc.descendants(n=>{
-      if(!n.isText&&n.type.name!=='hardBreak')return;
-      length+=n.isText?n.text?.length??0:1;
-      const origin=Number(n.marks.find(m=>m.type.name==='wordOrigin')?.attrs.originIndex??lastOrigin);
-      const key=JSON.stringify([origin,...MARKS.map(name=>n.marks.some(m=>m.type.name===name))]);
-      if(key!==lastKey){segments++;lastKey=key}
-      lastOrigin=origin;
-    });
-    return length<=20000&&segments<=200;
+    return !tr.docChanged||tr.doc.childCount===1&&tr.doc.firstChild?.type.name==='paragraph';
   }})]},
 });
 function content(runs:WordRun[]):JSONContent {
@@ -67,10 +56,10 @@ export function WordParagraphEditor({label,runs,readOnly,onChange,onFocus}:Props
         const text=event.clipboardData?.getData('text/plain');
         if(text===undefined||props.current.readOnly)return false;
         event.preventDefault();
-        const limited=text.slice(0,20000).replace(/\r\n?/g,'\n');
+        const normalized=text.replace(/\r\n?/g,'\n');
         const nodes:ProseMirrorNode[]=[];
         const marks=view.state.storedMarks??view.state.selection.$from.marks();
-        limited.split('\n').forEach((line,i)=>{if(i)nodes.push(view.state.schema.nodes.hardBreak.create(null,null,marks));if(line)nodes.push(view.state.schema.text(line,marks))});
+        normalized.split('\n').forEach((line,i)=>{if(i)nodes.push(view.state.schema.nodes.hardBreak.create(null,null,marks));if(line)nodes.push(view.state.schema.text(line,marks))});
         if(nodes.length)view.dispatch(view.state.tr.replaceSelection(new Slice(Fragment.fromArray(nodes),0,0)));
         return true;
       },
@@ -78,8 +67,7 @@ export function WordParagraphEditor({label,runs,readOnly,onChange,onFocus}:Props
     },
     onFocus:({editor})=>props.current.onFocus(editor),
     onUpdate:({editor})=>{
-      const next=read(editor);
-      if(next.length<=200&&next.reduce((n,r)=>n+r.text.length,0)<=20000)props.current.onChange(next);
+      props.current.onChange(read(editor));
     },
   },[label]);
   useEffect(()=>{editor?.setEditable(!readOnly,false)},[editor,readOnly]);

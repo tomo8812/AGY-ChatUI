@@ -631,7 +631,13 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
 
   const draftBoundsSchema=z.tuple([z.number().finite().min(-14400).max(14400),z.number().finite().min(-14400).max(14400),z.number().finite().min(1).max(14400),z.number().finite().min(1).max(14400)]);
   const draftSlidePartSchema=z.string().regex(/^ppt\/slides\/[^/]+\.xml$/).max(200);
+  const draftShapeId=z.number().int().positive().max(2147483647);
   const draftSlideOperation=z.discriminatedUnion('op',[
+    z.object({op:z.literal('pptx.set_shape_text'),slidePart:draftSlidePartSchema,shapeId:draftShapeId,text:z.string().max(20000)}).strict(),
+    z.object({op:z.literal('pptx.set_shape_bounds'),slidePart:draftSlidePartSchema,shapeId:draftShapeId,boundsPt:draftBoundsSchema}).strict(),
+    z.object({op:z.literal('pptx.set_shape_style'),slidePart:draftSlidePartSchema,shapeId:draftShapeId,
+      bold:z.boolean().optional(),italic:z.boolean().optional(),fontSizePt:z.number().finite().min(6).max(200).optional(),
+      fontColor:z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),fill:z.string().regex(/^#[0-9a-fA-F]{6}$/).optional()}).strict(),
     z.object({op:z.literal('pptx.add_shape'),slidePart:draftSlidePartSchema,kind:z.enum(['rectangle','ellipse','textbox']),boundsPt:draftBoundsSchema,text:z.string().max(20000)}).strict(),
     z.object({op:z.literal('pptx.add_image'),slidePart:draftSlidePartSchema,boundsPt:draftBoundsSchema,imageBase64:z.string().min(1).max(8_000_000)}).strict(),
     z.object({op:z.literal('pptx.add_table'),slidePart:draftSlidePartSchema,boundsPt:draftBoundsSchema,rows:z.array(z.array(z.string().max(20_000)).min(1).max(30)).min(1).max(100)}).strict(),
@@ -642,7 +648,9 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
   ]);
   app.post('/api/files/:artifactId/render-draft-slide',async(req,reply)=>{
     const session=requireAuth(req,reply,db);if(!session)return;
-    const parsed=z.object({expectedRevision:z.number().int().positive(),pageIndex:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),operation:draftSlideOperation}).strict().safeParse(req.body);
+    const parsed=z.object({expectedRevision:z.number().int().positive(),pageIndex:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+      operation:draftSlideOperation.optional(),operations:z.array(draftSlideOperation).min(1).optional()}).strict()
+      .refine(body=>Boolean(body.operation)!==Boolean(body.operations)).safeParse(req.body);
     if(!parsed.success)return reply.code(400).send({error:'INVALID_INPUT'});
     const {artifactId}=req.params as {artifactId:string};
     try{

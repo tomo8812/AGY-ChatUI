@@ -7,6 +7,14 @@ import {RichRenderer} from '../../web/src/components/shared-ui/RichRenderer';
 import type {ArtifactRecord} from '../../web/src/types';
 import type {RichDocumentV1} from '../../shared/rich-schema';
 
+const actionLog:unknown[][]=[];
+const recordAction=(kind:string,...args:unknown[])=>{actionLog.push([kind,...args])};
+const catalogActions={
+  openArtifact:(id:string)=>recordAction('artifact',id),
+  saveArtifact:(filename:string,format:string,content:string)=>recordAction('save',filename,format,content),
+  submitToChat:(text:string)=>recordAction('submit',text),
+  startPinEdit:(id?:string)=>recordAction('pin',id),
+};
 const kind=new URLSearchParams(location.search).get('kind')??'markdown';
 const formats:Record<string,{filename:string;previewKind:ArtifactRecord['previewKind'];mimeType:string}>={
   markdown:{filename:'notes.md',previewKind:'markdown',mimeType:'text/markdown'},
@@ -27,13 +35,14 @@ const doc:RichDocumentV1={schemaVersion:1,title:'円形散水器の面積設計'
   {id:'chart',type:'chart',chartType:'bar',categories:['基準','現在'],series:[{key:'area',label:'面積',data:{expr:'[12, $computed.area]'}}]},
   {id:'reset',type:'button',label:'リセット',onClick:[{type:'reset_state'}]},
 ]}};
-declare global { interface Window { __pr3aFixtureRichDocument?: RichDocumentV1; __pr3aFixtureArtifact?: ArtifactRecord; __pr3aApplyArtifactUpdate?: (artifact:ArtifactRecord)=>void } }
+declare global { interface Window { __pr3aActionLog?:unknown[][]; __pr3aRichArtifacts?:ArtifactRecord[]; __pr3aFixtureRichDocument?: RichDocumentV1; __pr3aFixtureArtifact?: ArtifactRecord; __pr3aApplyArtifactUpdate?: (artifact:ArtifactRecord)=>void } }
 function Harness(){
   const f=formats[kind]??formats.markdown;
+  if(kind==='rich-catalog')window.__pr3aActionLog=actionLog;
   const [artifact,setArtifact]=useState<ArtifactRecord>(window.__pr3aFixtureArtifact??{id:'fixture',userId:'fixture-user',chatId:'fixture-chat',messageId:null,runId:null,relPath:f.filename,...f,sizeBytes:100,sha256:'a'.repeat(64),revision:1,source:'generated',diffPatch:null,createdAt:1,updatedAt:1});
   const [open,setOpen]=useState(true);
   // Only the test harness exposes revision replacement to exercise live updates.
   window.__pr3aApplyArtifactUpdate=setArtifact;
-  return kind==='rich'?<main style={{padding:16,maxWidth:950,margin:'0 auto'}}><RichRenderer document={window.__pr3aFixtureRichDocument??doc} userId="fixture-user" chatId="fixture-chat"/></main>:open?<ArtifactWorkspace artifact={artifact} onArtifactChanged={setArtifact} onClose={()=>setOpen(false)}/>:<button onClick={()=>setOpen(true)}>開く</button>;
+  return (kind==='rich'||kind==='rich-catalog')?<main style={{padding:16,maxWidth:950,margin:'0 auto'}}><RichRenderer document={window.__pr3aFixtureRichDocument??doc} userId="fixture-user" chatId="fixture-chat" artifacts={window.__pr3aRichArtifacts} actions={kind==='rich-catalog'?catalogActions:undefined}/></main>:open?<ArtifactWorkspace artifact={artifact} onArtifactChanged={setArtifact} onClose={()=>setOpen(false)}/>:<button onClick={()=>setOpen(true)}>開く</button>;
 }
 createRoot(document.getElementById('root')!).render(<Harness/>);

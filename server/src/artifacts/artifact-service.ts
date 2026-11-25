@@ -4286,9 +4286,11 @@ export class ArtifactService {
     const fullCell = range.gridCell === true || range.gridCell === 'true';
     const dimensionsOnly = range.gridDimensions === true || range.gridDimensions === 'true';
     const searchQuery = typeof range.gridSearch === 'string' ? range.gridSearch.trim() : '';
+    const filter = typeof range.gridFilter === 'string' ? range.gridFilter.trim() : '';
+    if (filter && (searchQuery || fullCell)) throw new ArtifactError('INVALID_INPUT', 'Invalid filter request.', 400);
     // Stream a case-insensitive substring matcher independently of the value
     // response budget. A large field never needs to be retained to find a hit.
-    const needle = [...Array.from(searchQuery, ch => ch.toLowerCase()).join('')];
+    const needle = [...Array.from(searchQuery || filter, ch => ch.toLowerCase()).join('')];
     const prefix = new Array<number>(needle.length).fill(0);
     for (let i=1,j=0;i<needle.length;i++) {
       while (j && needle[i]!==needle[j]) j=prefix[j-1];
@@ -4302,7 +4304,7 @@ export class ArtifactService {
     };
     const startRow = safeIndex(range.startRow, 0);
     const afterRow = safeIndex(range.afterRow, -1), afterCol = safeIndex(range.afterCol, -1);
-    const targetEndRow = dimensionsOnly || needle.length ? Number.MAX_SAFE_INTEGER
+    const targetEndRow = dimensionsOnly || searchQuery ? Number.MAX_SAFE_INTEGER
       : Math.max(startRow, safeIndex(range.endRow, startRow + 99));
     const startCol = safeIndex(range.startCol, 0);
     const requestedEndCol = range.endCol == null ? Number.MAX_SAFE_INTEGER
@@ -4319,6 +4321,10 @@ export class ArtifactService {
     const cellChunks: string[] = [];
     let cellText: string | null = null;
     const rows: string[][] = [];
+    const sourceRows: number[] = [];
+    let matchedRows = 0, rowMatches = false;
+    let truncatedSourceRow: number | undefined;
+    const visibleRow = () => filter ? matchedRows : rowIndex;
     // Count actual JSON bytes, including escaping, before retaining values.
     // Never emit a partial cell/row as if it were the persisted value.
     let collectedBytes = 2, rowBytes = 2, fieldBytes = 0, rowTruncated = false;
@@ -4326,7 +4332,7 @@ export class ArtifactService {
     const fitsField = (bytes:number) => collectedBytes + (rows.length?1:0) + rowBytes + (currentRow.length?1:0) + 2 + bytes <= MAX_RESPONSE_BYTES;
     let matchLength=0, fieldMatched=false;
     let firstMatch:{row:number;col:number}|null=null, nextMatch:{row:number;col:number}|null=null;
-    const collectRow = () => !fullCell && !dimensionsOnly && !needle.length && rowIndex >= startRow && rowIndex <= targetEndRow;
+    const collectRow = () => !fullCell && !dimensionsOnly && !searchQuery && visibleRow() >= startRow && visibleRow() <= targetEndRow;
     const collectField = () => collectRow() && fieldCount >= startCol && fieldCount <= requestedEndCol;
     const isRequestedCell = () => fullCell && rowIndex === startRow && fieldCount === startCol;
     function append(ch: string) {
@@ -4355,7 +4361,8 @@ export class ArtifactService {
         cellText = cellChunks.join('');
         stoppedEarly = true;
       }
-      if(fieldMatched){
+      if(filter&&fieldMatched)rowMatches=true;
+      if(searchQuery&&fieldMatched){
         const hit={row:rowIndex,col:fieldCount};
         firstMatch??=hit;
         if(rowIndex>afterRow||(rowIndex===afterRow&&fieldCount>afterCol)){
@@ -4373,12 +4380,17 @@ export class ArtifactService {
     function commitRow(): boolean {
       commitField();
       observedMaxCols = Math.max(observedMaxCols, fieldCount);
-      if (collectRow()) {
-        if (rowTruncated) {truncated = true; stoppedEarly = true;}
-        else {collectedBytes += rowBytes+(rows.length?1:0);rows.push(currentRow);}
+      if (collectRow() && (!filter || rowMatches)) {
+        if (rowTruncated) {truncated = true; stoppedEarly = true; truncatedSourceRow = rowIndex;}
+        else {
+          collectedBytes += rowBytes+(rows.length?1:0);
+          rows.push(currentRow);
+          if (filter) sourceRows.push(rowIndex);
+        }
       }
-      currentRow = []; rowBytes=2; rowTruncated=false; fieldCount = 0; rowIndex++;
-      if (rowIndex > targetEndRow) stoppedEarly = true;
+      if (rowMatches) matchedRows++;
+      currentRow = []; rowBytes=2; rowTruncated=false; rowMatches=false; fieldCount = 0; rowIndex++;
+      if (visibleRow() > targetEndRow) stoppedEarly = true;
       return !stoppedEarly;
     }
     function feed(ch: string): boolean {
@@ -4424,15 +4436,16 @@ export class ArtifactService {
       if (!stoppedEarly && (fieldHasValue || fieldCount > 0)) commitRow();
     }
     if (fullCell) return { cellText };
-    if (needle.length) return {match:nextMatch??firstMatch,totalBytes};
-    if (dimensionsOnly) return { totalRows: rowIndex, totalCols: observedMaxCols, totalBytes };
+    if (searchQuery) return {match:nextMatch??firstMatch,totalBytes};
+    if (dimensionsOnly) return { totalRows: visibleRow(), totalCols: observedMaxCols, totalBytes };
     const actualEndCol = Math.min(Math.max(0, observedMaxCols - 1), requestedEndCol);
     return {
       startRow,
-      endRow: rows.length ? startRow + rows.length - 1 : Math.min(startRow, Math.max(0, rowIndex - 1)),
+      endRow: rows.length ? startRow + rows.length - 1 : Math.min(startRow, Math.max(0, visibleRow() - 1)),
       startCol, endCol: actualEndCol,
-      ...(!stoppedEarly ? { totalRows: rowIndex } : {}),
+      ...(!stoppedEarly ? { totalRows: visibleRow() } : {}),
       totalCols: observedMaxCols, totalBytes, hasMore: stoppedEarly, truncated, rows,
+      ...(filter ? { sourceRows, truncatedSourceRow } : {}),
       valuesHash: crypto.createHash('sha256').update(JSON.stringify(rows)).digest('hex'),
     };
   }
@@ -4443,6 +4456,12 @@ export class ArtifactService {
       const { artifact, revision, blobPath, sizeBytes } = pinned;
       const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
       const format = adapter.format;
+
+      if (format === 'pptx' && range.targetMetadata === 'true' || format === 'docx' && range.targetBlockIndex !== undefined) {
+        const { bytes } = this.readRevisionSnapshot(pinned, DOCUMENT_WORKER_MAX_INPUT_BYTES);
+        const data = adapter.readRange(bytes, range, artifact);
+        return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+      }
 
       if (isDocumentFormat(format) && ['xlsx', 'docx', 'pptx', 'pdf'].includes(format)) {
         if (this.documentWorker.available) {
@@ -4583,10 +4602,9 @@ export class ArtifactService {
     return {png,revision:revision.revision,sha256:revision.sha256};
   }
 
-  /** One structural edit on an isolated copy. Render the actual resulting
-   * slide, never invent a stand-in element or publish draft bytes. */
+  /** Render the selected slide after applying the ordered draft to an isolated copy. */
   async renderPptxDraftSlide(userId:string,artifactId:string,draft:{
-    expectedRevision:number;pageIndex:number;operation:AdapterOperation;
+    expectedRevision:number;pageIndex:number;operation?:AdapterOperation;operations?:AdapterOperation[];
   },assertAuthorized?:()=>void|Promise<void>):Promise<{png:Buffer;revision:number;sha256:string}>{
     await assertAuthorized?.();
     const {artifact,revision,bytes}=this.readCurrentRevision(userId,artifactId,DOCUMENT_WORKER_MAX_INPUT_BYTES);
@@ -4597,9 +4615,39 @@ export class ArtifactService {
     if(revision.revision!==draft.expectedRevision)throw new ArtifactError('ARTIFACT_CONFLICT','ファイルが更新されました。',409);
     if(!Number.isSafeInteger(draft.pageIndex)||draft.pageIndex<0)throw new ArtifactError('INVALID_INPUT','Invalid slide index.',400);
     const structure=JSON.parse((await this.documentWorker.run('pptx',artifact.filename,bytes,{action:'structure'})).toString('utf8')) as {slides?:Array<{part:string}>;layouts?:Array<{part:string}>};
+    if (draft.operations) {
+      const parts = new Set(structure.slides?.map(slide => slide.part));
+      const layouts = new Set(structure.layouts?.map(layout => layout.part));
+      let count = structure.slides?.length ?? 0;
+      for (const op of draft.operations) {
+        switch (op.op) {
+          case 'pptx.add_slide':
+            if (!layouts.has(String(op.layoutPart)) || Number(op.index) > count) throw new ArtifactError('INVALID_INPUT','Invalid slide insertion.',400);
+            count++;
+            break;
+          case 'pptx.remove_slide':
+            if (count <= 1 || Number(op.index) >= count) throw new ArtifactError('INVALID_INPUT','Cannot remove this slide.',400);
+            count--;
+            break;
+          case 'pptx.reorder_slide':
+            if (Number(op.index) >= count || Number(op.toIndex) >= count) throw new ArtifactError('INVALID_INPUT','Invalid destination slide.',400);
+            break;
+          default:
+            if (!parts.has(String(op.slidePart))) throw new ArtifactError('INVALID_INPUT','Slide identity mismatch.',400);
+        }
+      }
+      if (draft.pageIndex >= count) throw new ArtifactError('INVALID_INPUT','Selected slide is unavailable.',400);
+      await assertAuthorized?.();
+      const edited = await this.documentWorker.run('pptx', artifact.filename, bytes, {action:'edit',operations:draft.operations});
+      await assertAuthorized?.();
+      const png = await this.documentWorker.run('pptx', artifact.filename, edited, {action:'render',pageIndex:draft.pageIndex});
+      await assertAuthorized?.(); this.assertRenderPng(png);
+      return {png,revision:revision.revision,sha256:revision.sha256};
+    }
     const slides=structure.slides??[],slidePart=slides[draft.pageIndex]?.part;
     if(!slidePart)throw new ArtifactError('INVALID_INPUT','Selected slide is unavailable.',400);
     const input=draft.operation;
+    if(!input)throw new ArtifactError('INVALID_INPUT','A draft operation is required.',400);
     let operation:AdapterOperation,outputIndex=draft.pageIndex;
     switch(input.op){
       case 'pptx.add_shape':case 'pptx.add_image':case 'pptx.add_table':{

@@ -1500,8 +1500,11 @@ def _pdf_page_content_hash(page):
     height = round(float(page.mediabox.height), 2)
     rot = int(page.rotation or 0)
     annots = len(page.get("/Annots") or [])
-    h = hashlib.sha256(f"{width}x{height}@{rot}|annots={annots}|{text}".encode("utf-8", errors="replace")).hexdigest()
-    return h
+    digest = hashlib.sha256(f"{width}x{height}@{rot}|annots={annots}|{text}".encode("utf-8", errors="replace"))
+    content = page.get_contents()
+    if content is not None:
+        digest.update(content.get_data())
+    return digest.hexdigest()
 
 
 def _pdf_outline_items(reader, items=None, depth=0):
@@ -1990,7 +1993,9 @@ def process_pdf(request, source, output):
         first = bounded_integer(request["range"].get("pageIndex", 0), 0, count - 1)
         last = bounded_integer(request["range"].get("endPageIndex", first), first, min(count - 1, first + 19))
         if last == first:
-            return {"pageIndex": first, "text": (reader.pages[first].extract_text() or "")[:50_000]}
+            page = reader.pages[first]
+            return {"pageIndex": first, "pageCount": count, "pageContentHash": _pdf_page_content_hash(page),
+                    "text": (page.extract_text() or "")[:50_000]}
         pages_text = [
             {"pageIndex": idx, "text": (reader.pages[idx].extract_text() or "")[:25_000]}
             for idx in range(first, last + 1)
@@ -2801,12 +2806,58 @@ def _word_ui_simple_paragraph(block):
     if block.tag != tag(WORD, "p") or any(child.tag not in {tag(WORD, "pPr"), tag(WORD, "r")} for child in block):
         return False
     runs = block.findall(tag(WORD, "r"))
-    return len(runs) <= 200 and len(_word_ui_text(block)) <= 20000 and all(
+    return all(
         child.tag in {tag(WORD, "rPr"), tag(WORD, "t"), tag(WORD, "br")}
         and (child.tag != tag(WORD, "br") or (child.get(tag(WORD, "type")) in (None, "textWrapping") and child.get(tag(WORD, "clear")) is None))
         and not any(node.tag == tag(WORD, "rPrChange") for node in child.iter())
         for r in runs for child in r
     )
+
+
+def _word_ui_cell_paragraph(cell):
+    paragraphs = cell.findall(tag(WORD, "p"))
+    if len(paragraphs) != 1 or any(ch.tag not in {tag(WORD, "tcPr"), tag(WORD, "p")} for ch in cell):
+        return None
+    paragraph = paragraphs[0]
+    properties = cell.find(tag(WORD, "tcPr"))
+    if properties is not None and any(ch.tag in {tag(WORD, "gridSpan"), tag(WORD, "hMerge"), tag(WORD, "vMerge")} for ch in properties):
+        return None
+    return paragraph if _word_ui_simple_paragraph(paragraph) and len(paragraph.findall(tag(WORD, "r"))) <= 1 else None
+
+
+def _word_ui_table_rows(table):
+    rows = []
+    for row in table.findall(tag(WORD, "tr")):
+        cells = []
+        for cell in row.findall(tag(WORD, "tc")):
+            paragraph = _word_ui_cell_paragraph(cell)
+            cells.append({
+                "text": _word_ui_text(paragraph) if paragraph is not None else text_content(cell, WORD),
+                "editable": paragraph is not None,
+            })
+        rows.append(cells)
+    return rows
+
+
+def _word_ui_paragraph_kind(paragraph):
+    if paragraph.tag != tag(WORD, "p"):
+        return {}
+    properties = paragraph.find(tag(WORD, "pPr"))
+    if properties is None:
+        return {}
+    outline = properties.find(tag(WORD, "outlineLvl"))
+    style = properties.find(tag(WORD, "pStyle"))
+    match = re.fullmatch(r"heading([1-9])", style.get(tag(WORD, "val"), ""), re.I) if style is not None else None
+    level = outline.get(tag(WORD, "val"), "") if outline is not None else ""
+    result = {}
+    if level.isdecimal() and int(level) < 9:
+        result["headingLevel"] = int(level) + 1
+    elif match:
+        result["headingLevel"] = int(match[1])
+    number = properties.find(tag(WORD, "numPr"))
+    if number is not None and number.find(tag(WORD, "numId")) is not None:
+        result["listed"] = number.find(tag(WORD, "numId")).get(tag(WORD, "val")) != "0"
+    return result
 
 
 def _word_ui_marks(run):
@@ -2889,7 +2940,7 @@ def _set_run_multiline_text(run, text):
     for child in list(run):
         if child.tag in {tag(WORD, "t"), tag(WORD, "br")}:
             run.remove(child)
-    lines = str(text)[:20_000].split("\n")
+    lines = str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n")
     for idx, segment in enumerate(lines):
         if idx > 0:
             XML.SubElement(run, tag(WORD, "br"))
@@ -3212,7 +3263,15 @@ def word_edit_extra(package, replacements, additions, body, operation):
             raise ValueError("Table cell contains protected content")
         if any(ch.tag in PROTECTED_WORD_RUN_CHILDREN for r in cell.iter(tag(WORD, "r")) for ch in r):
             raise ValueError("Table cell contains protected inline objects")
-        if "text" in operation:
+        if "text" in operation and operation.get("preserveCellProperties") is True:
+            paragraph = _word_ui_cell_paragraph(cell)
+            if paragraph is None or not isinstance(operation["text"], str):
+                raise ValueError("Select a simple text cell")
+            run = paragraph.find(tag(WORD, "r"))
+            if run is None:
+                run = XML.SubElement(paragraph, tag(WORD, "r"))
+            _set_run_multiline_text(run, operation["text"])
+        elif "text" in operation:
             existing_paras = cell.findall(tag(WORD, "p"))
             first_ppr = deepcopy(existing_paras[0].find(tag(WORD, "pPr"))) if existing_paras and existing_paras[0].find(tag(WORD, "pPr")) is not None else None
             first_run = existing_paras[0].find(tag(WORD, "r")) if existing_paras else None
@@ -3321,16 +3380,16 @@ def edit_word(package, operations, output):
                 # This is an opt-in guarded UI operation, not a general
                 # replacement of arbitrary rich Word paragraphs.
                 if not _word_ui_simple_paragraph(block):
-                    raise ValueError("Paragraph has protected content or exceeds UI editing bounds")
+                    raise ValueError("Paragraph has protected content")
                 specs = operation.get("runs")
-                if not isinstance(specs, list) or not 1 <= len(specs) <= 200 or any(
+                if not isinstance(specs, list) or not specs or any(
                     not isinstance(spec, dict) or not isinstance(spec.get("text"), str)
                     or set(spec) - {"text", "originIndex", "bold", "italic", "underline"}
                     or type(spec.get("originIndex", 0)) is not int
                     or not 0 <= spec.get("originIndex", 0) < max(1, len(runs))
                     or any(not isinstance(spec[k], bool) for k in ("bold", "italic", "underline") if k in spec)
                     for spec in specs
-                ) or sum(len(spec["text"]) for spec in specs) > 20000:
+                ):
                     raise ValueError("Invalid simple paragraph runs")
                 for old_r in runs:
                     block.remove(old_r)
@@ -6996,6 +7055,7 @@ def process_document(request, source, output):
             count = bounded_integer(options.get("count", 50), 1, 100)
             body_tag = tag(WORD, "body")
             blocks = []
+            headings = []
             block_count = 0
             in_body = False
             body_depth = 0
@@ -7016,16 +7076,24 @@ def process_document(request, source, output):
                             break
                         if body_depth == 1:
                             if isinstance(elem.tag, str):
+                                kind = _word_ui_paragraph_kind(elem)
+                                if "headingLevel" in kind:
+                                    headings.append({"blockIndex": block_count, "text": text_content(elem, WORD), "level": kind["headingLevel"]})
                                 if start <= block_count < start + count:
-                                    blocks.append({
+                                    simple = _word_ui_simple_paragraph(elem)
+                                    block = {
                                         "blockIndex": block_count,
                                         "type": XML.QName(elem).localname,
-                                        "text": text_content(elem, WORD),
-                                        "editableText": _word_ui_simple_paragraph(elem),
-                                        **({"text": _word_ui_text(elem), "uiRuns": _word_ui_runs(elem),
-                                            "marks": _word_ui_marks(elem.find(tag(WORD, "r"))) if elem.find(tag(WORD, "r")) is not None else {}}
-                                           if _word_ui_simple_paragraph(elem) else {}),
-                                    })
+                                        "text": _word_ui_text(elem) if simple else text_content(elem, WORD),
+                                        "editableText": simple,
+                                        **kind,
+                                    }
+                                    if simple:
+                                        run = elem.find(tag(WORD, "r"))
+                                        block.update(uiRuns=_word_ui_runs(elem), marks=_word_ui_marks(run) if run is not None else {})
+                                    if block["type"] == "tbl":
+                                        block["tableRows"] = _word_ui_table_rows(elem)
+                                    blocks.append(block)
                                 block_count += 1
                             elem.clear()
                             parent = elem.getparent()
@@ -7052,6 +7120,7 @@ def process_document(request, source, output):
                 "blockCount": block_count,
                 "hasMore": start + len(blocks) < block_count,
                 "blocks": blocks,
+                "headings": headings,
             }
         main = parse_xml(package.read(MAIN_PART[fmt]))
         if fmt == "xlsx" and action == "structure":
