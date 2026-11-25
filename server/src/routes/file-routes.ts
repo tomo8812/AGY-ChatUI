@@ -556,9 +556,16 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const { artifactId } = req.params as { artifactId: string };
     const query = (req.query ?? {}) as Record<string, unknown>;
     try {
-      return await artifactService.readRange(session.user.id, artifactId, {
+      const result = await artifactService.readRange(session.user.id, artifactId, {
         ...query, ...(query.evaluate === 'true' ? { evaluate: true } : {}),
       });
+      if (query.gridCell === 'true') {
+        if (typeof result.cellText !== 'string') return reply.code(404).send({ error: 'CELL_NOT_FOUND' });
+        return reply.type('text/plain; charset=utf-8').header('Cache-Control', 'private, no-store')
+          .header('X-Artifact-Revision', result.revision).header('X-Artifact-Sha256', result.sha256)
+          .send(result.cellText);
+      }
+      return result;
     } catch (err) {
       return sendArtifactError(reply, err);
     }

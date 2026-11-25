@@ -145,8 +145,8 @@ function RichRendererInner({document:doc,userId,chatId,artifacts=noArtifacts,act
   const theme=useTheme();
   const authorized=useMemo(()=>new Map(artifacts.filter(a=>a.userId===userId&&a.chatId===chatId).map(a=>[a.id,a])),[artifacts,userId,chatId]);
   // Revision changes to an authorized file must not reset unrelated local control state.
-  const authKey=JSON.stringify([...authorized.keys()].sort());
-  const docKey=JSON.stringify(doc);
+  const authKey=useMemo(()=>JSON.stringify([...authorized.keys()].sort()),[authorized]);
+  const docKey=useMemo(()=>JSON.stringify(doc),[doc]);
   const store=useMemo(()=>new RichStateStore(JSON.parse(docKey) as RichDocumentV1,JSON.parse(authKey) as string[],theme),[docKey,authKey,userId,chatId]);
   const [error,setError]=useState<string|null>(null);
   const activeAction=useRef<AbortController|null>(null);

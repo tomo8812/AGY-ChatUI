@@ -13,6 +13,14 @@ export const workspaceApi={
   capabilities:(id:string,signal?:AbortSignal)=>apiFetch<WorkspaceCapabilities>(path(id,'capabilities'),{signal}),
   structure:<T extends object>(id:string,signal?:AbortSignal)=>apiFetch<T&RevisionResponse>(path(id,'structure'),{signal}),
   range:<T extends object>(id:string,query:Record<string,string|number|boolean>,signal?:AbortSignal)=>apiFetch<T&RevisionResponse>(path(id,'range')+'?'+new URLSearchParams(Object.entries(query).map(([k,v])=>[k,String(v)])),{signal}),
+  async csvCell(artifact:ArtifactRecord,row:number,col:number,signal:AbortSignal):Promise<string>{
+    const query=new URLSearchParams({gridCell:'true',startRow:String(row),endRow:String(row),startCol:String(col),endCol:String(col)});
+    const res=await fetch(path(artifact.id,'range')+'?'+query,{signal,credentials:'include'});
+    if(!res.ok)throw new ApiError(res.status,'CELL_READ_FAILED','セルを読み込めませんでした。');
+    if(Number(res.headers.get('X-Artifact-Revision'))!==artifact.revision||res.headers.get('X-Artifact-Sha256')!==artifact.sha256)throw new ApiError(409,'ARTIFACT_CHANGED','ファイルが更新されました。');
+    // Response.text strips a leading BOM, which can be literal cell content.
+    return new TextDecoder('utf-8',{ignoreBOM:true}).decode(await res.arrayBuffer());
+  },
   async render(artifact:ArtifactRecord,query:Record<string,string|number>,signal?:AbortSignal):Promise<Blob>{
     const res=await fetch(path(artifact.id,'render')+'?'+new URLSearchParams(Object.entries(query).map(([k,v])=>[k,String(v)])),{signal,credentials:'include'});
     if(!res.ok)throw new ApiError(res.status,'RENDER_FAILED','描画できませんでした。');

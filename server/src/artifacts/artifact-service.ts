@@ -4283,6 +4283,7 @@ export class ArtifactService {
     range: Record<string, unknown>
   ): Promise<Record<string, unknown>> {
     const MAX_RESPONSE_BYTES = 512 * 1024;
+    const fullCell = range.gridCell === true || range.gridCell === 'true';
     const dimensionsOnly = range.gridDimensions === true || range.gridDimensions === 'true';
     const searchQuery = typeof range.gridSearch === 'string' ? range.gridSearch.trim() : '';
     // Stream a case-insensitive substring matcher independently of the value
@@ -4306,11 +4307,17 @@ export class ArtifactService {
     const startCol = safeIndex(range.startCol, 0);
     const requestedEndCol = range.endCol == null ? Number.MAX_SAFE_INTEGER
       : Math.max(startCol, safeIndex(range.endCol, startCol));
+    if (fullCell && ([range.startRow, range.endRow, range.startCol, range.endCol].some(value => safeIndex(value, -1) < 0) ||
+        Number(range.endRow) !== startRow || Number(range.endCol) !== startCol || dimensionsOnly || needle.length)) {
+      throw new ArtifactError('INVALID_INPUT', 'Specify one cell to read its complete value.', 400);
+    }
     const stream = fs.createReadStream(blobPath, { highWaterMark: 64 * 1024 });
     const decoder = new StringDecoder('utf8');
     let rowIndex = 0, observedMaxCols = 0, fieldCount = 0;
     let field = '', fieldHasValue = false, inQuotes = false, pendingQuote = false, pendingCr = false;
     let currentRow: string[] = [];
+    const cellChunks: string[] = [];
+    let cellText: string | null = null;
     const rows: string[][] = [];
     // Count actual JSON bytes, including escaping, before retaining values.
     // Never emit a partial cell/row as if it were the persisted value.
@@ -4319,8 +4326,9 @@ export class ArtifactService {
     const fitsField = (bytes:number) => collectedBytes + (rows.length?1:0) + rowBytes + (currentRow.length?1:0) + 2 + bytes <= MAX_RESPONSE_BYTES;
     let matchLength=0, fieldMatched=false;
     let firstMatch:{row:number;col:number}|null=null, nextMatch:{row:number;col:number}|null=null;
-    const collectRow = () => !dimensionsOnly && !needle.length && rowIndex >= startRow && rowIndex <= targetEndRow;
+    const collectRow = () => !fullCell && !dimensionsOnly && !needle.length && rowIndex >= startRow && rowIndex <= targetEndRow;
     const collectField = () => collectRow() && fieldCount >= startCol && fieldCount <= requestedEndCol;
+    const isRequestedCell = () => fullCell && rowIndex === startRow && fieldCount === startCol;
     function append(ch: string) {
       fieldHasValue = true;
       if(needle.length&&!fieldMatched){
@@ -4330,6 +4338,10 @@ export class ArtifactService {
           if(matchLength===needle.length){fieldMatched=true;break;}
         }
       }
+      if (isRequestedCell()) {
+        field += ch;
+        return;
+      }
       if (collectField()&&!rowTruncated) {
         const cp=ch.codePointAt(0)!;
         const bytes=cp===34||cp===92||[8,9,10,12,13].includes(cp)?2:cp<32?6:cp<128?1:cp<2048?2:cp<65536?3:4;
@@ -4338,6 +4350,11 @@ export class ArtifactService {
       }
     }
     function commitField() {
+      if (isRequestedCell()) {
+        cellChunks.push(field);
+        cellText = cellChunks.join('');
+        stoppedEarly = true;
+      }
       if(fieldMatched){
         const hit={row:rowIndex,col:fieldCount};
         firstMatch??=hit;
@@ -4396,12 +4413,17 @@ export class ArtifactService {
     }
     for await (const chunk of stream) {
       if (!processText(decoder.write(chunk as Buffer))) break;
+      if (isRequestedCell() && field) {
+        cellChunks.push(field);
+        field = '';
+      }
     }
     if (!stoppedEarly) {
       processText(decoder.end());
       if (!stoppedEarly && pendingCr) { pendingCr = false; feed('\r'); }
       if (!stoppedEarly && (fieldHasValue || fieldCount > 0)) commitRow();
     }
+    if (fullCell) return { cellText };
     if (needle.length) return {match:nextMatch??firstMatch,totalBytes};
     if (dimensionsOnly) return { totalRows: rowIndex, totalCols: observedMaxCols, totalBytes };
     const actualEndCol = Math.min(Math.max(0, observedMaxCols - 1), requestedEndCol);

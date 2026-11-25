@@ -60,7 +60,7 @@ async function csvTile(artifact:WorkspaceModuleProps['artifact'],r0:number,r1:nu
     const middle=Math.floor((c0+c1)/2),left=await csvTile(artifact,r0,r1,c0,middle,signal),right=await csvTile(artifact,r0,r1,middle+1,c1,signal);
     return left.map((row,i)=>[...row,...(right[i]?.length?Array(Math.max(0,middle-c0+1-row.length)).fill(''):[]),...(right[i]??[])]);
   }
-  throw Error('セルの内容が読み取り上限を超えています。');
+  return [[await workspaceApi.csvCell(artifact,r0,c0,signal)]];
 }
 export function GridModule(props:WorkspaceModuleProps){
   const {artifact,mode,draft,capabilities,editingLocked,onDraft,onTarget}=props;
@@ -112,16 +112,26 @@ export function GridModule(props:WorkspaceModuleProps){
     for(let c=Math.floor(colAxis.start/COLS);c<=Math.floor((colAxis.start+colAxis.length-1)/COLS);c++)visibleKeys.push(r+':'+c);
   const keys=[...new Set([tileKey(current.row,current.col),...visibleKeys])],keySignature=keys.join(',');
   const revisionKey=artifactVersionKey(artifact);
-  const cache=useMemo(()=>new ByteLruCache<string,GridTile>({maxEntries:48,maxBytes:24*1024*1024,maxSingleEntryBytes:20*1024*1024,sizeOf:tile=>JSON.stringify(tile.rows??[...tile.cells.values()]).length*2+tile.cells.size*96}),[artifact.userId,revisionKey,sheet?.id]);
+  const cache=useMemo(()=>new ByteLruCache<string,GridTile>({
+    maxEntries:48,maxBytes:24*1024*1024,maxSingleEntryBytes:20*1024*1024,
+    sizeOf:tile=>tile.rows
+      ?tile.rows.reduce((bytes,row)=>bytes+40+row.reduce((size,value)=>size+16+value.length*2,0),0)
+      :JSON.stringify([...tile.cells.values()]).length*2+tile.cells.size*96,
+  }),[artifact.userId,revisionKey,sheet?.id]);
+  // Protect visible and selected tiles while other tiles compete for the LRU budget.
+  const activeTiles=useMemo(()=>new Map<string,GridTile>(),[cache]);
+  const readTile=(key:string)=>activeTiles.get(key)??cache.peek(key);
   const [cacheVersion,setCacheVersion]=useState(0),[retry,setRetry]=useState(0);
   const [rangeError,setRangeError]=useState('');
   useEffect(()=>{
     if(!sheet||!structure.ready)return;
     const controller=new AbortController();setRangeError('');
+    for(const key of activeTiles.keys())if(!keys.includes(key))activeTiles.delete(key);
     void(async()=>{
       for(const key of keys){
         if(controller.signal.aborted)return;
-        if(cache.get(key))continue;
+        const existing=cache.get(key)??activeTiles.get(key);
+        if(existing){activeTiles.set(key,existing);continue;}
         const b=tileBounds(key,rowCount,colCount);
         try{
           let tile:GridTile;
@@ -132,21 +142,21 @@ export function GridModule(props:WorkspaceModuleProps){
           }else tile={cells:new Map(),rows:await csvTile(artifact,b.row0,b.row1,b.col0,b.col1,controller.signal)};
           if(controller.signal.aborted)return;
           cache.set(key,tile);
-          if(!cache.has(key))throw Error('表示範囲のデータが大きすぎます。');
+          activeTiles.set(key,tile);
           setCacheVersion(v=>v+1);
         }catch(e){if(!controller.signal.aborted)setRangeError(e instanceof Error?e.message:'表を読み込めません。')}
       }
     })();
     return()=>controller.abort();
   },[cache,keySignature,retry,structure.ready,rowCount,colCount]);
-  const tile=(r:number,c:number)=>cache.peek(tileKey(r,c));
+  const tile=(r:number,c:number)=>readTile(tileKey(r,c));
   const raw=(r:number,c:number)=>xlsx?tile(r,c)?.cells.get(address(r,c)):undefined;
   const key=(r:number,c:number)=>String(sheet?.id)+':'+address(r,c);
   function original(r:number,c:number){const cell=raw(r,c);return xlsx?cell?.formula?'='+cell.formula.replace(/^=/,''):String(cell?.value??''):String(tile(r,c)?.rows?.[r%ROWS]?.[c%COLS]??'')}
   const ready=structure.ready&&!!sheet&&!!tile(current.row,current.col);
   const inData=xlsx||current.row<csvRows&&current.col<csvCols;
   const editableCoordinate=inData||csvEmpty&&current.row===0&&current.col===0;
-  const loading=structure.loading||keys.some(key=>!cache.has(key));
+  const loading=structure.loading||keys.some(key=>!readTile(key));
   const latest=useRef({revisionKey,sheetId:sheet?.id,selectedRange});latest.current={revisionKey,sheetId:sheet?.id,selectedRange};
   const entries=useMemo(()=>new Map(draft?.entries.map(e=>[e.key,e])),[draft]);
   function value(r:number,c:number){const e=entries.get(key(r,c));return e?.displayValue??String(e?.operation.value??original(r,c))}
@@ -162,10 +172,10 @@ export function GridModule(props:WorkspaceModuleProps){
     onDraft(artifact.revision,v===original(row,col)?null:{key:k,displayValue:v,label:sheet.name+' '+address(row,col),operation:xlsx?{op,sheetPart:sheet.part,address:address(row,col),value:formula?v:(/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(v)&&Number.isFinite(Number(v))?Number(v):v)}:{op,row,col,value:v}},k);
   }
   const previews=useMemo(()=>{
-    if(!xlsx||!sheet||!draft||!structure.ready||visibleKeys.some(key=>!cache.has(key)))return new Map<string,string>();
+    if(!xlsx||!sheet||!draft||!structure.ready||visibleKeys.some(key=>!readTile(key)))return new Map<string,string>();
     const first=tileBounds(visibleKeys[0],rowCount,colCount),last=tileBounds(visibleKeys[visibleKeys.length-1],rowCount,colCount);
     const values=new Map<string,{value:unknown;type?:string;formula?:string}>();
-    for(const key of visibleKeys)for(const cell of cache.peek(key)!.cells.values())values.set(cell.address,cell);
+    for(const key of visibleKeys)for(const cell of readTile(key)!.cells.values())values.set(cell.address,cell);
     for(const e of draft.entries){
       const op=e.operation;
       if(op.sheetPart!==sheet.part||typeof op.address!=='string'||!['xlsx.set_formula','xlsx.set_cell'].includes(op.op))continue;

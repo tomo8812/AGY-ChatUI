@@ -92,6 +92,10 @@ for(const vp of targets){
         expect(await svc.readRange(userId,huge.id,{startRow:0,endRow:0,startCol:0,endCol:1})).toMatchObject({rows:[],truncated:true});
         expect(await svc.readRange(userId,huge.id,{startRow:0,endRow:0,startCol:0,endCol:0})).toMatchObject({rows:[['small']],truncated:false});
         expect(await svc.readRange(userId,huge.id,{gridDimensions:true})).toMatchObject({totalRows:1,totalCols:2});
+        const fullCell=await client.request<string>('GET','/api/files/'+huge.id+'/range?gridCell=true&startRow=0&endRow=0&startCol=1&endCol=1');
+        expect(fullCell.status).toBe(200);
+        expect(fullCell.data==='漢'.repeat(180000)).toBe(true);
+        expect(fullCell.headers.get('X-Artifact-Sha256')).toBe(huge.sha256);
         const source=(await svc.createArtifact({userId,scopeKind:'chat',chatId,relPath:'large.ts',content:Buffer.from('// Original\n'),actorKind:'user',actorId:userId})).artifact;
         const content='// '+ 'x'.repeat(11*1024*1024)+'\n';
         const sourceEditUrl=srv.baseUrl+'/api/files/'+source.id+'/edit-source?expectedRevision=1&idempotencyKey=large-source';

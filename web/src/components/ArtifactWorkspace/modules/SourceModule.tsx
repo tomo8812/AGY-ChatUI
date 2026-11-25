@@ -12,7 +12,7 @@ export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget
   const resource=useRevisionResource(artifact,'source',async signal=>{
     const response=await fetch(buildArtifactContentUrl(artifact),{credentials:'include',signal});
     if(!response.ok)throw Error('ファイルを取得できませんでした。');
-    return response.text();
+    return new TextDecoder('utf-8',{ignoreBOM:true}).decode(await response.arrayBuffer());
   });
   const [query,setQuery]=useState('');
   const [outlineOpen,setOutlineOpen]=useState(false);
