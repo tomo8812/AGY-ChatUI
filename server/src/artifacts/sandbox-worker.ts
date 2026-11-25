@@ -234,7 +234,7 @@ export class DocWorkerSandbox {
             '--tmpfs', '/tmp',
             '--ro-bind', '/usr', '/usr',
           ];
-          for (const sysDir of ['/bin', '/lib', '/lib64', '/etc/fonts', '/etc/alternatives']) {
+          for (const sysDir of ['/bin', '/lib', '/lib64', '/etc/fonts', '/etc/alternatives', '/etc/libreoffice', '/etc/ld.so.cache']) {
             if (fs.existsSync(sysDir)) {
               bwrapArgs.push('--ro-bind', sysDir, sysDir);
             }

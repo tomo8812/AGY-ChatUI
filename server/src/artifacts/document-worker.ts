@@ -21,13 +21,22 @@ export function isWebRenderFormat(format: ArtifactFormat): format is 'html' | 'm
 
 export const DOCUMENT_WORKER_MAX_INPUT_BYTES = 100 * 1024 * 1024;
 
+export interface DocumentVerifyOptions {
+  slideIndices?: number[];
+  maxSlides?: number;
+  maxShapesPerSlide?: number;
+}
+
 type WorkerAction =
-  | { action: 'structure' | 'verify' }
+  | { action: 'structure' }
+  | { action: 'verify'; options?: DocumentVerifyOptions }
   | { action: 'range'; range: Record<string, unknown> }
   | { action: 'edit'; operations: AdapterOperation[] }
   | { action: 'create'; params: Record<string, unknown> }
   | { action: 'render'; pageIndex?: number; timeSeconds?: number; variant?: 'background' | 'sprite'; shapeId?: number; region?: RenderRegion }
   | { action: 'export'; targetFormat: string; region?: RenderRegion };
+
+export type DocumentInputSource = Buffer | { path: string; sizeBytes: number };
 
 const docWorkerScript = fileURLToPath(new URL('../../scripts/artifact_doc_worker.py', import.meta.url));
 
@@ -53,7 +62,7 @@ export class DocumentWorker {
   async run(
     format: DocumentFormat | 'html' | 'mermaid' | 'markdown' | 'svg' | 'csv',
     filename: string,
-    document: Buffer | undefined,
+    document: DocumentInputSource | undefined,
     request: WorkerAction,
     mergeSources: readonly Buffer[] = [],
     renderSnapshot?: {
@@ -73,7 +82,8 @@ export class DocumentWorker {
       throw unsupportedOperationError(operation, 'disabled_by_resource_tier', 'Document runtime is unavailable.');
     }
     const compareBytes = renderSnapshot?.compareDocument;
-    if ((document?.length ?? 0) + (compareBytes?.length ?? 0) +
+    const docSizeBytes = document ? (Buffer.isBuffer(document) ? document.length : document.sizeBytes) : 0;
+    if (docSizeBytes + (compareBytes?.length ?? 0) +
         mergeSources.reduce((total, bytes) => total + bytes.length, 0) > DOCUMENT_WORKER_MAX_INPUT_BYTES) {
       throw new ArtifactError('DOC_WORKER_INPUT_TOO_LARGE', 'Document input exceeds the worker size limit.', 413);
     }
@@ -81,17 +91,27 @@ export class DocumentWorker {
     const runtimeDir = sandboxed ? '/opt/agy-doc-runtime' : this.config.docRuntimeDir;
     const workerScript = web ? webWorkerScript : docWorkerScript;
     const scriptName = path.basename(workerScript);
+    const smartartRecalc = format === 'pptx' && request.action === 'edit' &&
+      request.operations.some((op) => op.op === 'pptx.smartart.add_or_remove_node');
     const officeConversion = ((format === 'docx' || format === 'pptx' || format === 'xlsx') &&
       (request.action === 'render' ||
         (request.action === 'export' && ['png', 'pdf'].includes(request.targetFormat)))) ||
+      smartartRecalc ||
       (format === 'markdown' && request.action === 'export' && request.targetFormat === 'pdf') ||
       (format === 'xlsx' && request.action === 'range' && request.range.evaluate === true) ||
       ((format === 'pptx' || format === 'docx' || format === 'xlsx') && request.action === 'verify');
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-document-'));
     try {
-      const input = path.join(directory, 'document');
+      let inputHostPath: string | undefined;
+      if (document) {
+        if (Buffer.isBuffer(document)) {
+          inputHostPath = path.join(directory, 'document');
+          fs.writeFileSync(inputHostPath, document, { mode: 0o600 });
+        } else {
+          inputHostPath = document.path;
+        }
+      }
       const manifest = path.join(directory, 'request.json');
-      if (document) fs.writeFileSync(input, document, { mode: 0o600 });
       const compareInput = compareBytes ? path.join(directory, 'compare') : undefined;
       if (compareBytes && compareInput) fs.writeFileSync(compareInput, compareBytes, { mode: 0o600 });
       const sourceInputs = mergeSources.map((bytes, index) => {
@@ -125,7 +145,7 @@ export class DocumentWorker {
         args: [sandboxed ? `/work/in/${scriptName}` : workerScript],
         env: web ? webEnv : undefined,
         inputFiles: [
-          ...(document ? [{ hostPath: input, sandboxName: 'document' }] : []),
+          ...(inputHostPath ? [{ hostPath: inputHostPath, sandboxName: 'document' }] : []),
           ...(compareInput ? [{ hostPath: compareInput, sandboxName: 'compare' }] : []),
           ...sourceInputs,
           ...assets.map(({ hostPath, sandboxName }) => ({ hostPath, sandboxName })),
@@ -133,7 +153,7 @@ export class DocumentWorker {
           { hostPath: workerScript, sandboxName: scriptName },
         ],
         expectedOutputRelPath: 'result',
-        timeoutMs: request.action === 'export' || (officeConversion && request.action === 'verify')
+        timeoutMs: request.action === 'export' || smartartRecalc || (officeConversion && request.action === 'verify')
           ? this.config.docWorkerExportTimeoutMs
           : undefined,
       });

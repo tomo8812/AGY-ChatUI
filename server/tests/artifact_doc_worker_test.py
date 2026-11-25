@@ -947,8 +947,252 @@ class DocumentWorkerTest(unittest.TestCase):
             zout.writestr("ppt/diagrams/colors1.xml", b'<dgm:colorsDef xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram"/>')
         return out.getvalue()
 
-    def test_smartart_add_or_remove_node_supported_linear_and_rejects_venn(self):
-        # 1. Verified linear process (process1 with arrows): add 4th step, then remove 2nd step, render in real LibreOffice
+    def _build_computable_smartart_pptx(self, kind, texts, ch_max=None):
+        """Build a spec-compliant OOXML SmartArt PPTX with real dgm:layoutDef for LibreOffice layout evaluation."""
+        import uuid
+        A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+        DGM = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
+        DSP = "http://schemas.microsoft.com/office/drawing/2008/diagram"
+        P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+        R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+        REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+        CT = "http://schemas.openxmlformats.org/package/2006/content-types"
+
+        prs = Presentation()
+        prs.slide_width = Inches(10)
+        prs.slide_height = Inches(7.5)
+        prs.slides.add_slide(prs.slide_layouts[6])
+        buf = io.BytesIO()
+        prs.save(buf)
+
+        if kind == "cycle4":
+            lo_type_id = "urn:microsoft.com/office/officeart/2005/8/layout/cycle4"
+            node_pres_name = "node"
+            layout_xml = f'''<dgm:layoutDef xmlns:dgm="{DGM}" xmlns:a="{A}" uniqueId="{lo_type_id}">
+              <dgm:layoutNode name="diagram">
+                <dgm:alg type="composite"/>
+                <dgm:layoutNode name="cycle">
+                  <dgm:alg type="cycle"/>
+                  <dgm:forEach name="fe1" axis="ch" ptType="node">
+                    <dgm:layoutNode name="node">
+                      <dgm:alg type="tx"/>
+                      <dgm:shape type="ellipse"/>
+                      <dgm:presOf axis="desOrSelf" ptType="node"/>
+                    </dgm:layoutNode>
+                  </dgm:forEach>
+                </dgm:layoutNode>
+              </dgm:layoutNode>
+            </dgm:layoutDef>'''.encode("utf-8")
+        elif kind == "pyramid1":
+            lo_type_id = "urn:microsoft.com/office/officeart/2005/8/layout/pyramid1"
+            node_pres_name = "node"
+            layout_xml = f'''<dgm:layoutDef xmlns:dgm="{DGM}" xmlns:a="{A}" uniqueId="{lo_type_id}">
+              <dgm:layoutNode name="diagram">
+                <dgm:alg type="pyra"/>
+                <dgm:forEach name="fe1" axis="ch" ptType="node">
+                  <dgm:layoutNode name="node">
+                    <dgm:alg type="tx"/>
+                    <dgm:shape type="trapezoid"/>
+                    <dgm:presOf axis="desOrSelf" ptType="node"/>
+                  </dgm:layoutNode>
+                </dgm:forEach>
+              </dgm:layoutNode>
+            </dgm:layoutDef>'''.encode("utf-8")
+        elif kind == "matrix_snake":
+            lo_type_id = "urn:microsoft.com/office/officeart/2005/8/layout/matrix1"
+            node_pres_name = "node"
+            layout_xml = f'''<dgm:layoutDef xmlns:dgm="{DGM}" xmlns:a="{A}" uniqueId="{lo_type_id}">
+              <dgm:layoutNode name="diagram">
+                <dgm:alg type="snake"/>
+                <dgm:forEach name="fe1" axis="ch" ptType="node">
+                  <dgm:layoutNode name="node">
+                    <dgm:alg type="tx"/>
+                    <dgm:shape type="roundRect"/>
+                    <dgm:presOf axis="desOrSelf" ptType="node"/>
+                  </dgm:layoutNode>
+                </dgm:forEach>
+              </dgm:layoutNode>
+            </dgm:layoutDef>'''.encode("utf-8")
+        elif kind == "hierarchy1":
+            lo_type_id = "urn:microsoft.com/office/officeart/2005/8/layout/hierarchy1"
+            node_pres_name = "childNode"
+            layout_xml = f'''<dgm:layoutDef xmlns:dgm="{DGM}" xmlns:a="{A}" uniqueId="{lo_type_id}">
+              <dgm:layoutNode name="diagram">
+                <dgm:alg type="lin"><dgm:param type="linDir" val="fromT"/></dgm:alg>
+                <dgm:forEach name="feRoot" axis="ch" ptType="node">
+                  <dgm:layoutNode name="branch">
+                    <dgm:alg type="lin"><dgm:param type="linDir" val="fromT"/></dgm:alg>
+                    <dgm:layoutNode name="rootNode">
+                      <dgm:alg type="tx"/><dgm:shape type="rect"/>
+                      <dgm:presOf axis="self" ptType="node"/>
+                    </dgm:layoutNode>
+                    <dgm:layoutNode name="childrenRow">
+                      <dgm:alg type="lin"><dgm:param type="linDir" val="fromL"/></dgm:alg>
+                      <dgm:forEach name="feCh" axis="ch" ptType="node">
+                        <dgm:layoutNode name="childNode">
+                          <dgm:alg type="tx"/><dgm:shape type="roundRect"/>
+                          <dgm:presOf axis="self" ptType="node"/>
+                        </dgm:layoutNode>
+                      </dgm:forEach>
+                    </dgm:layoutNode>
+                  </dgm:layoutNode>
+                </dgm:forEach>
+              </dgm:layoutNode>
+            </dgm:layoutDef>'''.encode("utf-8")
+        elif kind == "venn_stub":
+            lo_type_id = "urn:microsoft.com/office/officeart/2005/8/layout/venn1"
+            node_pres_name = "node"
+            layout_xml = f'<dgm:layoutDef xmlns:dgm="{DGM}" uniqueId="{lo_type_id}"/>'.encode("utf-8")
+        else:
+            raise ValueError(f"Unknown SmartArt fixture kind: {kind}")
+
+        if ch_max is not None and kind != "venn_stub":
+            lo_root = XML.fromstring(layout_xml)
+            var_lst = XML.SubElement(lo_root.find(f"{{{DGM}}}layoutNode"), f"{{{DGM}}}varLst")
+            XML.SubElement(var_lst, f"{{{DGM}}}chMax", val=str(ch_max))
+            layout_xml = XML.tostring(lo_root)
+
+        doc_id = "{00000000-0000-0000-0000-000000000001}"
+        pres_root_id = "{00000000-0000-0000-0000-000000000002}"
+        data_root = XML.Element(f"{{{DGM}}}dataModel", nsmap={"dgm": DGM, "a": A, "r": R})
+        pt_lst = XML.SubElement(data_root, f"{{{DGM}}}ptLst")
+        cxn_lst = XML.SubElement(data_root, f"{{{DGM}}}cxnLst")
+        XML.SubElement(data_root, f"{{{DGM}}}bg")
+        XML.SubElement(data_root, f"{{{DGM}}}whole")
+        ext_lst = XML.SubElement(data_root, f"{{{DGM}}}extLst")
+        ext = XML.SubElement(ext_lst, f"{{{A}}}ext", uri="http://schemas.microsoft.com/office/drawing/2008/diagram")
+        XML.SubElement(ext, f"{{{DSP}}}dataModelExt", relId="rId5", minVer="http://schemas.openxmlformats.org/drawingml/2006/main")
+
+        doc_pt = XML.SubElement(pt_lst, f"{{{DGM}}}pt", modelId=doc_id, type="doc")
+        XML.SubElement(doc_pt, f"{{{DGM}}}prSet", loTypeId=lo_type_id)
+        XML.SubElement(doc_pt, f"{{{DGM}}}spPr")
+        pr_pt = XML.SubElement(pt_lst, f"{{{DGM}}}pt", modelId=pres_root_id, type="pres")
+        XML.SubElement(pr_pt, f"{{{DGM}}}prSet", presAssocID=doc_id, presName="diagram", loTypeId=lo_type_id)
+        XML.SubElement(pr_pt, f"{{{DGM}}}spPr")
+        XML.SubElement(cxn_lst, f"{{{DGM}}}cxn", modelId="{" + str(uuid.uuid4()).upper() + "}",
+                       type="presOf", srcId=doc_id, destId=pres_root_id, srcOrd="0", destOrd="0", presId=lo_type_id)
+
+        draw_root = XML.Element(f"{{{DSP}}}drawing", nsmap={"dsp": DSP, "a": A, "r": R})
+        sp_tree = XML.SubElement(draw_root, f"{{{DSP}}}spTree")
+        nvg = XML.SubElement(sp_tree, f"{{{DSP}}}nvGrpSpPr")
+        XML.SubElement(nvg, f"{{{DSP}}}cNvPr", id="0", name="")
+        XML.SubElement(nvg, f"{{{DSP}}}cNvGrpSpPr")
+        XML.SubElement(sp_tree, f"{{{DSP}}}grpSpPr")
+
+        def add_node_pt(nid, text, parent_id, ord_idx, pres_parent_id, pres_ord_idx, pres_name, idx_style, cnt_style):
+            npt = XML.SubElement(pt_lst, f"{{{DGM}}}pt", modelId=nid)
+            XML.SubElement(npt, f"{{{DGM}}}prSet")
+            XML.SubElement(npt, f"{{{DGM}}}spPr")
+            t_el = XML.SubElement(npt, f"{{{DGM}}}t")
+            XML.SubElement(t_el, f"{{{A}}}bodyPr")
+            XML.SubElement(t_el, f"{{{A}}}lstStyle")
+            p_el = XML.SubElement(t_el, f"{{{A}}}p")
+            r_el = XML.SubElement(p_el, f"{{{A}}}r")
+            XML.SubElement(r_el, f"{{{A}}}t").text = text
+            stid = "{" + str(uuid.uuid4()).upper() + "}"
+            ptid = "{" + str(uuid.uuid4()).upper() + "}"
+            XML.SubElement(pt_lst, f"{{{DGM}}}pt", modelId=stid, type="sibTrans", cxnId=nid)
+            XML.SubElement(pt_lst, f"{{{DGM}}}pt", modelId=ptid, type="parTrans", cxnId=nid)
+            XML.SubElement(cxn_lst, f"{{{DGM}}}cxn", modelId="{" + str(uuid.uuid4()).upper() + "}",
+                           srcId=parent_id, destId=nid, srcOrd=str(ord_idx), destOrd="0",
+                           parTransId=ptid, sibTransId=stid)
+            pid = "{" + str(uuid.uuid4()).upper() + "}"
+            ppt = XML.SubElement(pt_lst, f"{{{DGM}}}pt", modelId=pid, type="pres")
+            XML.SubElement(ppt, f"{{{DGM}}}prSet", presAssocID=nid, presName=pres_name,
+                           presStyleLbl="node0", presStyleIdx=str(idx_style), presStyleCnt=str(cnt_style),
+                           loTypeId=lo_type_id)
+            XML.SubElement(ppt, f"{{{DGM}}}spPr")
+            XML.SubElement(cxn_lst, f"{{{DGM}}}cxn", modelId="{" + str(uuid.uuid4()).upper() + "}",
+                           type="presOf", srcId=nid, destId=pid, srcOrd="0", destOrd="0", presId=lo_type_id)
+            XML.SubElement(cxn_lst, f"{{{DGM}}}cxn", modelId="{" + str(uuid.uuid4()).upper() + "}",
+                           type="presParOf", srcId=pres_parent_id, destId=pid, srcOrd=str(pres_ord_idx), destOrd="0", presId=lo_type_id)
+            return pid
+
+        if kind == "hierarchy1":
+            # texts = (root_text, [child1, child2, ...])
+            root_text, child_texts = texts
+            root_nid = "{10000000-0000-0000-0000-000000000001}"
+            branch_pid = "{" + str(uuid.uuid4()).upper() + "}"
+            bpt = XML.SubElement(pt_lst, f"{{{DGM}}}pt", modelId=branch_pid, type="pres")
+            XML.SubElement(bpt, f"{{{DGM}}}prSet", presAssocID=root_nid, presName="branch", loTypeId=lo_type_id)
+            XML.SubElement(bpt, f"{{{DGM}}}spPr")
+            XML.SubElement(cxn_lst, f"{{{DGM}}}cxn", modelId="{" + str(uuid.uuid4()).upper() + "}",
+                           type="presParOf", srcId=pres_root_id, destId=branch_pid, srcOrd="0", destOrd="0", presId=lo_type_id)
+            add_node_pt(root_nid, root_text, doc_id, 0, branch_pid, 0, "rootNode", 0, 1)
+            row_pid = "{" + str(uuid.uuid4()).upper() + "}"
+            rpt = XML.SubElement(pt_lst, f"{{{DGM}}}pt", modelId=row_pid, type="pres")
+            XML.SubElement(rpt, f"{{{DGM}}}prSet", presAssocID=root_nid, presName="childrenRow", loTypeId=lo_type_id)
+            XML.SubElement(rpt, f"{{{DGM}}}spPr")
+            XML.SubElement(cxn_lst, f"{{{DGM}}}cxn", modelId="{" + str(uuid.uuid4()).upper() + "}",
+                           type="presParOf", srcId=branch_pid, destId=row_pid, srcOrd="1", destOrd="0", presId=lo_type_id)
+            for idx, txt in enumerate(child_texts):
+                cid = f"{{20000000-0000-0000-0000-00000000000{idx + 1}}}"
+                add_node_pt(cid, txt, root_nid, idx, row_pid, idx, node_pres_name, idx, len(child_texts))
+        else:
+            container_pid = pres_root_id
+            if kind == "cycle4":
+                container_pid = "{" + str(uuid.uuid4()).upper() + "}"
+                cpt = XML.SubElement(pt_lst, f"{{{DGM}}}pt", modelId=container_pid, type="pres")
+                XML.SubElement(cpt, f"{{{DGM}}}prSet", presAssocID=doc_id, presName="cycle", loTypeId=lo_type_id)
+                XML.SubElement(cpt, f"{{{DGM}}}spPr")
+                XML.SubElement(cxn_lst, f"{{{DGM}}}cxn", modelId="{" + str(uuid.uuid4()).upper() + "}",
+                               type="presParOf", srcId=pres_root_id, destId=container_pid, srcOrd="0", destOrd="0", presId=lo_type_id)
+            for idx, txt in enumerate(texts):
+                nid = f"{{10000000-0000-0000-0000-00000000000{idx + 1}}}"
+                add_node_pt(nid, txt, doc_id, idx, container_pid, idx, node_pres_name, idx, len(texts))
+
+        out = io.BytesIO()
+        with zipfile.ZipFile(buf) as zin, zipfile.ZipFile(out, "w") as zout:
+            slide = XML.fromstring(zin.read("ppt/slides/slide1.xml"))
+            tree = slide.find(f".//{{{P}}}spTree")
+            gf = XML.SubElement(tree, f"{{{P}}}graphicFrame")
+            nvgf = XML.SubElement(gf, f"{{{P}}}nvGraphicFramePr")
+            XML.SubElement(nvgf, f"{{{P}}}cNvPr", id="2", name="SmartArt1")
+            XML.SubElement(nvgf, f"{{{P}}}cNvGraphicFramePr")
+            XML.SubElement(nvgf, f"{{{P}}}nvPr")
+            gxf = XML.SubElement(gf, f"{{{P}}}xfrm")
+            XML.SubElement(gxf, f"{{{A}}}off", x="457200", y="457200")
+            XML.SubElement(gxf, f"{{{A}}}ext", cx="8229600", cy="5943600")
+            gdata = XML.SubElement(XML.SubElement(gf, f"{{{A}}}graphic"), f"{{{A}}}graphicData", uri=DGM)
+            rids = XML.SubElement(gdata, f"{{{DGM}}}relIds")
+            rids.set(f"{{{R}}}dm", "rId2")
+            rids.set(f"{{{R}}}lo", "rId3")
+            rids.set(f"{{{R}}}qs", "rId4")
+            rids.set(f"{{{R}}}cs", "rId6")
+            srels = XML.fromstring(zin.read("ppt/slides/_rels/slide1.xml.rels"))
+            for rid, rtype, tgt in (
+                ("rId2", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData", "../diagrams/data1.xml"),
+                ("rId3", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramLayout", "../diagrams/layout1.xml"),
+                ("rId4", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramQuickStyle", "../diagrams/quickStyle1.xml"),
+                ("rId5", "http://schemas.microsoft.com/office/2007/relationships/diagramDrawing", "../diagrams/drawing1.xml"),
+                ("rId6", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramColors", "../diagrams/colors1.xml"),
+            ):
+                XML.SubElement(srels, f"{{{REL}}}Relationship", Id=rid, Type=rtype, Target=tgt)
+            ct = XML.fromstring(zin.read("[Content_Types].xml"))
+            for part, ctype in (
+                ("/ppt/diagrams/data1.xml", "application/vnd.openxmlformats-officedocument.drawingml.diagramData+xml"),
+                ("/ppt/diagrams/layout1.xml", "application/vnd.openxmlformats-officedocument.drawingml.diagramLayout+xml"),
+                ("/ppt/diagrams/quickStyle1.xml", "application/vnd.openxmlformats-officedocument.drawingml.diagramStyle+xml"),
+                ("/ppt/diagrams/colors1.xml", "application/vnd.openxmlformats-officedocument.drawingml.diagramColors+xml"),
+                ("/ppt/diagrams/drawing1.xml", "application/vnd.ms-office.drawingml.diagramDrawing+xml"),
+            ):
+                XML.SubElement(ct, f"{{{CT}}}Override", PartName=part, ContentType=ctype)
+            repls = {
+                "ppt/slides/slide1.xml": XML.tostring(slide),
+                "ppt/slides/_rels/slide1.xml.rels": XML.tostring(srels),
+                "[Content_Types].xml": XML.tostring(ct),
+            }
+            for info in zin.infolist():
+                zout.writestr(info, repls.get(info.filename, zin.read(info.filename)))
+            zout.writestr("ppt/diagrams/data1.xml", XML.tostring(data_root))
+            zout.writestr("ppt/diagrams/drawing1.xml", XML.tostring(draw_root))
+            zout.writestr("ppt/diagrams/layout1.xml", layout_xml)
+            zout.writestr("ppt/diagrams/quickStyle1.xml", b'<dgm:styleDef xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram"/>')
+            zout.writestr("ppt/diagrams/colors1.xml", b'<dgm:colorsDef xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram"/>')
+        return out.getvalue()
+
+    def test_smartart_add_or_remove_node_supported_families_and_limits(self):
+        # 1. Linear process (process1 with stub layoutDef): linear fallback still works
         proc_pptx = self._build_linear_smartart_pptx(
             "urn:microsoft.com/office/officeart/2005/8/layout/process1", "horizontal", ["Step1", "Step2", "Step3"], True
         )
@@ -956,6 +1200,7 @@ class DocumentWorkerTest(unittest.TestCase):
         info = json.loads(self.run_worker("pptx", "range", range={"part": "ppt/diagrams/data1.xml"}))
         self.assertTrue(info["supportsNodeAddRemove"])
         self.assertEqual(info["layoutFamily"], "linear_process")
+        self.assertEqual(info["layoutEngine"], "linear_reflow")
 
         added = self.run_worker("pptx", "edit", operations=[
             {"op": "pptx.smartart.add_or_remove_node", "slidePart": "ppt/slides/slide1.xml",
@@ -978,21 +1223,230 @@ class DocumentWorkerTest(unittest.TestCase):
         self.assertNotIn("Step2", txt_removed)
         self.assertIn("Step4", txt_removed)
 
-        # 2. Real PowerPoint Venn fixture (smartart-simple.pptx -> venn1): must report unsupported and exit code 4
+        # 2. Computable OOXML diagrams via LibreOffice DIAGRAM_IGNORE_EXTDRAWINGS=1:
+        #    Cycle, Pyramid, Matrix/Snake, and Hierarchy (with parentNodeId)
+        for kind, init_texts, add_op_extra, add_text, edit_text, remove_idx in (
+            ("cycle4", ["Plan", "Build", "Test"], {}, "Deploy", "Deploy2", 1),
+            ("pyramid1", ["Top", "Mid", "Base"], {}, "Foot", "Foot2", 1),
+            ("matrix_snake", ["Q1", "Q2", "Q3"], {}, "Q4", "Q4New", 0),
+            ("hierarchy1", ("CEO", ["VP1", "VP2"]), {"parentNodeId": "{10000000-0000-0000-0000-000000000001}"}, "VP3", "VP3X", 1),
+        ):
+            with self.subTest(smartart_kind=kind):
+                pptx_bytes = self._build_computable_smartart_pptx(kind, init_texts)
+                self.source.write_bytes(pptx_bytes)
+                meta = json.loads(self.run_worker("pptx", "range", range={"part": "ppt/diagrams/data1.xml"}))
+                self.assertTrue(meta["supportsNodeAddRemove"], msg=meta)
+                self.assertEqual(meta["layoutEngine"], "libreoffice_layout_def")
+
+                # Add node
+                out_added = self.run_worker("pptx", "edit", operations=[
+                    {"op": "pptx.smartart.add_or_remove_node", "slidePart": "ppt/slides/slide1.xml",
+                     "dataPart": "ppt/diagrams/data1.xml", "mode": "add", "text": add_text, **add_op_extra},
+                ])
+                self.source.write_bytes(out_added)
+                after_add = json.loads(self.run_worker("pptx", "range", range={"part": "ppt/diagrams/data1.xml"}))
+                content_nodes = [n for n in after_add["nodes"] if n["type"] is None]
+                added_node = next((n for n in content_nodes if n["text"] == add_text), None)
+                self.assertIsNotNone(added_node, msg=f"{kind}: added node missing in dataModel")
+
+                # Re-edit added node via smartart.update_node_text (proves editable SmartArt structure persists)
+                out_edited = self.run_worker("pptx", "edit", operations=[
+                    {"op": "pptx.smartart.update_node_text", "slidePart": "ppt/slides/slide1.xml",
+                     "dataPart": "ppt/diagrams/data1.xml", "nodeId": added_node["id"], "text": edit_text},
+                ])
+                self.source.write_bytes(out_edited)
+                pdf_edited = self.run_worker("pptx", "export", targetFormat="pdf")
+                txt_edited = PdfReader(io.BytesIO(pdf_edited)).pages[0].extract_text() or ""
+                self.assertIn(edit_text, txt_edited)
+
+                # Remove a node
+                out_removed = self.run_worker("pptx", "edit", operations=[
+                    {"op": "pptx.smartart.add_or_remove_node", "slidePart": "ppt/slides/slide1.xml",
+                     "dataPart": "ppt/diagrams/data1.xml", "mode": "remove", "index": remove_idx, **add_op_extra},
+                ])
+                self.source.write_bytes(out_removed)
+                verify_res = json.loads(self.run_worker("pptx", "verify"))
+                for check_id in ("package_structure", "archive_security", "relationship_ids"):
+                    chk = next(c for c in verify_res["checks"] if c["id"] == check_id)
+                    self.assertEqual(chk["status"], "passed", msg=f"{kind}: {chk}")
+                pdf_rem = self.run_worker("pptx", "export", targetFormat="pdf")
+                txt_rem = PdfReader(io.BytesIO(pdf_rem)).pages[0].extract_text() or ""
+                self.assertIn(edit_text, txt_rem)
+
+        # 3. Non-linear diagram with empty/stub layoutDef (uncomputable): must reject with exit code 4
+        stub_venn = self._build_computable_smartart_pptx("venn_stub", ["A", "B", "C"])
+        self.source.write_bytes(stub_venn)
+        stub_info = json.loads(self.run_worker("pptx", "range", range={"part": "ppt/diagrams/data1.xml"}))
+        self.assertFalse(stub_info["supportsNodeAddRemove"])
+        (self.inputs / "request.json").write_text(json.dumps({
+            "format": "pptx", "filename": "venn_stub.pptx", "action": "edit",
+            "operations": [{"op": "pptx.smartart.add_or_remove_node", "slidePart": "ppt/slides/slide1.xml",
+                            "dataPart": "ppt/diagrams/data1.xml", "mode": "add", "text": "D"}],
+        }), encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(WORKER)],
+            env=dict(os.environ, AGY_WORKER_IN_DIR=str(self.inputs), AGY_WORKER_OUT_DIR=str(self.outputs)),
+            cwd=self.directory, capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 4)
+
+        # 4. Real PowerPoint Venn fixture (smartart-simple.pptx -> venn1, chMax=7):
+        #    Must SUPPORT add -> update_node_text -> remove -> verify -> render, and REJECT 8th node (> chMax) with exit 4
         fixture = os.environ.get("AGY_TEST_SMARTART_FILE")
         if fixture and Path(fixture).is_file():
             self.source.write_bytes(Path(fixture).read_bytes())
             venn_info = json.loads(self.run_worker("pptx", "range", range={"part": "ppt/diagrams/data1.xml"}))
-            self.assertFalse(venn_info["supportsNodeAddRemove"])
+            self.assertTrue(venn_info["supportsNodeAddRemove"])
+            self.assertEqual(venn_info["layoutFamily"], "venn1")
+            self.assertEqual(venn_info["layoutEngine"], "libreoffice_layout_def")
+            self.assertEqual(venn_info["chMax"], 7)
+
+            # Add 5th circle ("Omega")
+            v_added = self.run_worker("pptx", "edit", operations=[
+                {"op": "pptx.smartart.add_or_remove_node", "slidePart": "ppt/slides/slide1.xml",
+                 "dataPart": "ppt/diagrams/data1.xml", "mode": "add", "text": "Omega"},
+            ])
+            self.source.write_bytes(v_added)
+            v_after = json.loads(self.run_worker("pptx", "range", range={"part": "ppt/diagrams/data1.xml"}))
+            v_nodes = [n for n in v_after["nodes"] if n["type"] is None]
+            self.assertEqual(len(v_nodes), 5)
+            omega_node = next(n for n in v_nodes if n["text"] == "Omega")
+
+            # Re-edit added node via smartart.update_node_text
+            v_edited = self.run_worker("pptx", "edit", operations=[
+                {"op": "pptx.smartart.update_node_text", "slidePart": "ppt/slides/slide1.xml",
+                 "dataPart": "ppt/diagrams/data1.xml", "nodeId": omega_node["id"], "text": "Zeta"},
+            ])
+            self.source.write_bytes(v_edited)
+
+            # Remove "def" (index 1)
+            v_removed = self.run_worker("pptx", "edit", operations=[
+                {"op": "pptx.smartart.add_or_remove_node", "slidePart": "ppt/slides/slide1.xml",
+                 "dataPart": "ppt/diagrams/data1.xml", "mode": "remove", "index": 1},
+            ])
+            self.source.write_bytes(v_removed)
+            v_verify = json.loads(self.run_worker("pptx", "verify"))
+            for check_id in ("package_structure", "archive_security", "relationship_ids", "layer_visual_consistency"):
+                chk = next(c for c in v_verify["checks"] if c["id"] == check_id)
+                self.assertEqual(chk["status"], "passed", msg=f"real venn1: {chk}")
+            v_pdf = self.run_worker("pptx", "export", targetFormat="pdf")
+            v_txt = PdfReader(io.BytesIO(v_pdf)).pages[0].extract_text() or ""
+            v_compact = "".join(v_txt.split())
+            self.assertNotIn("def", v_compact)
+            self.assertIn("Zeta", v_compact)
+
+            # Exceeding layoutDef chMax=7 (4 -> 5 -> 6 -> 7 ok, 8th node -> exit code 4)
+            cur = v_removed
+            for i in range(3):
+                self.source.write_bytes(cur)
+                cur = self.run_worker("pptx", "edit", operations=[
+                    {"op": "pptx.smartart.add_or_remove_node", "slidePart": "ppt/slides/slide1.xml",
+                     "dataPart": "ppt/diagrams/data1.xml", "mode": "add", "text": f"N{i}"},
+                ])
+            self.source.write_bytes(cur)
             (self.inputs / "request.json").write_text(json.dumps({
-                "format": "pptx", "filename": "venn.pptx", "action": "edit",
+                "format": "pptx", "filename": "venn_max.pptx", "action": "edit",
                 "operations": [{"op": "pptx.smartart.add_or_remove_node", "slidePart": "ppt/slides/slide1.xml",
-                                "dataPart": "ppt/diagrams/data1.xml", "mode": "add", "text": "Extra"}],
+                                "dataPart": "ppt/diagrams/data1.xml", "mode": "add", "text": "Overflow8"}],
             }), encoding="utf-8")
-            proc = subprocess.run(
+            proc_max = subprocess.run(
                 [sys.executable, str(WORKER)],
                 env=dict(os.environ, AGY_WORKER_IN_DIR=str(self.inputs), AGY_WORKER_OUT_DIR=str(self.outputs)),
                 cwd=self.directory, capture_output=True, text=True,
             )
-            self.assertEqual(proc.returncode, 4)
+            self.assertEqual(proc_max.returncode, 4)
+
+    def test_pptx_visual_consistency_arbitrary_slides_and_resource_budgets(self):
+        prs = Presentation()
+        prs.slide_width = Inches(10)
+        prs.slide_height = Inches(5.625)
+        for s_idx in range(4):
+            slide = prs.slides.add_slide(prs.slide_layouts[6])
+            shape_count = 10 if s_idx == 2 else 2
+            for k in range(shape_count):
+                col = k % 5
+                row = k // 5
+                tb = slide.shapes.add_textbox(Inches(0.5 + col * 1.8), Inches(0.5 + row * 1.6), Inches(1.5), Inches(1.0))
+                tb.text_frame.text = f"S{s_idx + 1}-Box{k + 1}"
+        buf = io.BytesIO()
+        prs.save(buf)
+        self.source.write_bytes(buf.getvalue())
+
+        # 1. Targeted verification of slide index 2 (3rd slide, 10 shapes — previously impossible under slides[:2] & <=8)
+        targeted = json.loads(self.run_worker("pptx", "verify", options={"slideIndices": [2], "maxShapesPerSlide": 12}))
+        lvc_check = next(c for c in targeted["checks"] if c["id"] == "layer_visual_consistency")
+        # Partial slide selection MUST NOT report whole-document passed
+        self.assertEqual(lvc_check["status"], "unverified")
+        self.assertEqual(targeted["coverage"], "partial")
+        lvc = targeted["metrics"]["layerVisualConsistency"]
+        self.assertEqual(lvc["verificationLayer"], "server_side_layer_decomposition")
+        self.assertEqual(lvc["scope"], "selected_slides_partial")
+        self.assertEqual(lvc["totalSlides"], 4)
+        self.assertEqual(lvc["verifiedSlides"], [2])
+        self.assertEqual(lvc["unverifiedSlides"], [0, 1, 3])
+        by_idx = {s["slideIndex"]: s for s in lvc["slides"]}
+        self.assertEqual(by_idx[2]["status"], "verified")
+        self.assertEqual(by_idx[2]["shapeCount"], 10)
+        self.assertGreaterEqual(by_idx[2]["ssim"], 0.90)
+        self.assertEqual(by_idx[0]["status"], "unverified")
+        self.assertEqual(by_idx[3]["status"], "unverified")
+
+        # 2. Resource budget exceeded on slide 2 (maxShapesPerSlide=5) -> explicit skipped_resource_limit
+        capped = json.loads(self.run_worker("pptx", "verify", options={"slideIndices": [2], "maxShapesPerSlide": 5}))
+        lvc_cap = capped["metrics"]["layerVisualConsistency"]
+        self.assertEqual(lvc_cap["skippedByResourceLimitSlides"], [2])
+        self.assertEqual(lvc_cap["slides"][2]["status"], "skipped_resource_limit")
+        self.assertIn("maxShapesPerSlide", lvc_cap["slides"][2]["reason"])
+
+        # 3. Full-deck verification within resource/time budget -> layer_visual_consistency == passed
+        small_prs = Presentation()
+        small_prs.slide_width = Inches(10)
+        small_prs.slide_height = Inches(5.625)
+        for s_idx in range(2):
+            sl = small_prs.slides.add_slide(small_prs.slide_layouts[6])
+            tb = sl.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1))
+            tb.text_frame.text = f"CompleteDeck-{s_idx + 1}"
+        sbuf = io.BytesIO()
+        small_prs.save(sbuf)
+        self.source.write_bytes(sbuf.getvalue())
+        full = json.loads(self.run_worker("pptx", "verify", options={"maxSlides": 4, "maxShapesPerSlide": 12}))
+        full_chk = next(c for c in full["checks"] if c["id"] == "layer_visual_consistency")
+        self.assertEqual(full_chk["status"], "passed")
+        self.assertEqual(full["metrics"]["layerVisualConsistency"]["scope"], "full_deck")
+        self.assertEqual(full["metrics"]["layerVisualConsistency"]["verifiedSlides"], [0, 1])
+
+    def test_streaming_xlsx_and_docx_range_reads(self):
+        # 1. 250-row XLSX with shared strings
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "BigData"
+        for row_idx in range(1, 251):
+            ws.cell(row=row_idx, column=1, value=f"RowLabel-{row_idx}")
+            ws.cell(row=row_idx, column=2, value=row_idx * 10)
+        xbuf = io.BytesIO()
+        wb.save(xbuf)
+        self.source.write_bytes(xbuf.getvalue())
+        xstruct = json.loads(self.run_worker("xlsx", "structure"))
+        sheet_id = xstruct["sheets"][0]["id"]
+        xrange = json.loads(self.run_worker("xlsx", "range", range={"sheetId": sheet_id, "rangeA1": "A120:B122"}))
+        cells_by_ref = {c["address"]: c["value"] for c in xrange["cells"]}
+        self.assertEqual(cells_by_ref, {
+            "A120": "RowLabel-120", "B120": "1200",
+            "A121": "RowLabel-121", "B121": "1210",
+            "A122": "RowLabel-122", "B122": "1220",
+        })
+
+        # 2. 250-paragraph DOCX streamed via XML.iterparse (250 w:p + 1 trailing w:sectPr = 251 body children)
+        doc = Document()
+        for p_idx in range(250):
+            doc.add_paragraph(f"Paragraph-{p_idx}")
+        dbuf = io.BytesIO()
+        doc.save(dbuf)
+        self.source.write_bytes(dbuf.getvalue())
+        drange = json.loads(self.run_worker("docx", "range", range={"start": 120, "count": 3}))
+        self.assertEqual(drange["blockCount"], 251)
+        self.assertTrue(drange["hasMore"])
+        self.assertEqual([b["text"] for b in drange["blocks"]], ["Paragraph-120", "Paragraph-121", "Paragraph-122"])
+        self.assertEqual([b["blockIndex"] for b in drange["blocks"]], [120, 121, 122])
+
 

@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import { createTwoFilesPatch } from 'diff';
 import { probeBwrapSandbox } from '../acp/env-isolation.js';
 import type { AppConfig } from '../config.js';
@@ -29,7 +30,13 @@ import type {
   ProjectFileRecord,
   SyncEventEnvelope,
 } from '../types.js';
-import { DOCUMENT_WORKER_MAX_INPUT_BYTES, DocumentWorker, isDocumentFormat, isWebRenderFormat } from './document-worker.js';
+import {
+  DOCUMENT_WORKER_MAX_INPUT_BYTES,
+  DocumentWorker,
+  isDocumentFormat,
+  isWebRenderFormat,
+  type DocumentVerifyOptions,
+} from './document-worker.js';
 import { detectArtifactFormat, documentFormatConstraint, DOCUMENT_ACTIONS, FormatAdapterRegistry } from './adapters/registry.js';
 import { executeRestoreBundle, getRestoreBatchRecord, recoverPendingRestoreBatches } from './batch-restore.js';
 import { PerUserBlobManager, type BlobLease } from './blob-store.js';
@@ -4023,16 +4030,417 @@ export class ArtifactService {
     };
   }
 
+  private openPinnedBlobMeta(userId: string, artifactId: string): {
+    artifact: ArtifactRecord;
+    revision: ArtifactRevisionRecord;
+    blobPath: string;
+    sizeBytes: number;
+    releasePin: () => void;
+  } {
+    const current = this.db.getArtifact(userId, artifactId);
+    if (!current) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
+    const artifact = this.ensureLegacyHistoryMigrated(current);
+    const snapshot = this.getRevisionContentBlob(userId, artifactId, artifact.revision);
+    const releasePin = this.blobManager.pinBlob(userId, snapshot.revision.sha256);
+    try {
+      const st = fs.lstatSync(snapshot.blobPath);
+      if (!st.isFile() || st.isSymbolicLink() || st.size !== snapshot.sizeBytes) {
+        throw new ArtifactError('REVISION_SNAPSHOT_UNAVAILABLE', 'Revision snapshot failed integrity verification.', 422);
+      }
+      return {
+        artifact,
+        revision: snapshot.revision,
+        blobPath: snapshot.blobPath,
+        sizeBytes: snapshot.sizeBytes,
+        releasePin,
+      };
+    } catch (err) {
+      releasePin();
+      if (err instanceof ArtifactError) throw err;
+      throw new ArtifactError('REVISION_SNAPSHOT_UNAVAILABLE', 'Revision snapshot is unavailable.', 422);
+    }
+  }
+
+  private readByteRangeFromBlob(blobPath: string, totalBytes: number, range: Record<string, unknown>): Record<string, unknown> {
+    const MAX_BYTE_WINDOW = 512 * 1024;
+    const rawOffset = Number(range.offsetBytes ?? 0);
+    const offsetBytes = Number.isFinite(rawOffset) ? Math.max(0, Math.min(totalBytes, Math.floor(rawOffset))) : 0;
+    const rawMax = Number(range.maxBytes ?? 64 * 1024);
+    const requestedBytes = Number.isFinite(rawMax) ? Math.max(1, Math.min(MAX_BYTE_WINDOW, Math.floor(rawMax))) : 64 * 1024;
+    const toRead = Math.max(0, Math.min(requestedBytes, totalBytes - offsetBytes));
+    const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+    const fd = fs.openSync(blobPath, flags);
+    try {
+      const st = fs.fstatSync(fd);
+      if (!st.isFile() || st.size !== totalBytes) {
+        throw new ArtifactError('REVISION_SNAPSHOT_UNAVAILABLE', 'Revision snapshot failed integrity verification.', 422);
+      }
+      const chunk = Buffer.allocUnsafe(toRead);
+      let filled = 0;
+      while (filled < toRead) {
+        const n = fs.readSync(fd, chunk, filled, toRead - filled, offsetBytes + filled);
+        if (n <= 0) break;
+        filled += n;
+      }
+      const slice = filled === toRead ? chunk : chunk.subarray(0, filled);
+      return {
+        offsetBytes,
+        byteLength: slice.length,
+        totalBytes,
+        hasMore: offsetBytes + slice.length < totalBytes,
+        truncated: offsetBytes + slice.length < totalBytes,
+        text: slice.toString('utf8'),
+      };
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
+  private async streamLineRangeFromBlob(blobPath: string, totalBytes: number, range: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const MAX_RESPONSE_BYTES = 512 * 1024;
+    const rawStart = Number(range.startLine ?? 1);
+    const startLine = Number.isFinite(rawStart) ? Math.max(1, Math.floor(rawStart)) : 1;
+    const hasExplicitEnd = range.endLine !== undefined && range.endLine !== null;
+    const rawEnd = hasExplicitEnd ? Number(range.endLine) : startLine + 499;
+    const targetEndLine = Number.isFinite(rawEnd) ? Math.max(startLine, Math.floor(rawEnd)) : startLine + 499;
+    const rawMaxBytes = Number(range.maxBytes ?? MAX_RESPONSE_BYTES);
+    const maxResponseBytes = Number.isFinite(rawMaxBytes)
+      ? Math.max(1024, Math.min(MAX_RESPONSE_BYTES, Math.floor(rawMaxBytes)))
+      : MAX_RESPONSE_BYTES;
+
+    if (totalBytes === 0) {
+      return { startLine: 1, endLine: 1, totalLines: 1, totalBytes: 0, hasMore: false, truncated: false, text: '' };
+    }
+
+    return new Promise((resolve, reject) => {
+      const stream = fs.createReadStream(blobPath, { highWaterMark: 64 * 1024 });
+      const decoder = new StringDecoder('utf8');
+      let lineNo = 1;
+      let pending = '';
+      const collected: string[] = [];
+      let collectedBytes = 0;
+      let truncated = false;
+      let stoppedEarly = false;
+      let reachedEof = false;
+      let settled = false;
+
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        const actualEndLine = collected.length > 0 ? startLine + collected.length - 1 : Math.min(startLine, lineNo);
+        resolve({
+          startLine,
+          endLine: actualEndLine,
+          ...(reachedEof ? { totalLines: lineNo } : {}),
+          totalBytes,
+          hasMore: stoppedEarly || !reachedEof,
+          truncated,
+          text: collected.join('\n'),
+        });
+      };
+
+      const pushLine = (line: string) => {
+        const clean = line.endsWith('\r') ? line.slice(0, -1) : line;
+        if (lineNo >= startLine && lineNo <= targetEndLine) {
+          const remaining = maxResponseBytes - collectedBytes;
+          if (remaining <= 0) {
+            truncated = true;
+            stoppedEarly = true;
+            return false;
+          }
+          const lineBytes = Buffer.byteLength(clean, 'utf8') + (collected.length > 0 ? 1 : 0);
+          if (lineBytes > remaining) {
+            const sliceBuf = Buffer.from(clean, 'utf8').subarray(0, Math.max(0, remaining - (collected.length > 0 ? 1 : 0)));
+            collected.push(sliceBuf.toString('utf8'));
+            collectedBytes = maxResponseBytes;
+            truncated = true;
+            stoppedEarly = true;
+            return false;
+          }
+          collected.push(clean);
+          collectedBytes += lineBytes;
+        }
+        return true;
+      };
+
+      stream.on('data', (chunk: Buffer | string) => {
+        if (settled) return;
+        const text = typeof chunk === 'string' ? chunk : decoder.write(chunk);
+        let cursor = 0;
+        while (cursor < text.length) {
+          const nlIdx = text.indexOf('\n', cursor);
+          if (nlIdx === -1) {
+            if (lineNo >= startLine && lineNo <= targetEndLine) {
+              const tail = text.slice(cursor);
+              if (pending.length + tail.length > maxResponseBytes) {
+                pending += tail.slice(0, Math.max(0, maxResponseBytes - pending.length));
+                truncated = true;
+                stoppedEarly = true;
+                pushLine(pending);
+                pending = '';
+                stream.destroy();
+                finish();
+                return;
+              }
+              pending += tail;
+            }
+            break;
+          }
+          const segment = text.slice(cursor, nlIdx);
+          const fullLine = lineNo >= startLine && lineNo <= targetEndLine ? pending + segment : '';
+          pending = '';
+          const ok = pushLine(fullLine);
+          lineNo += 1;
+          cursor = nlIdx + 1;
+          if (!ok || lineNo > targetEndLine) {
+            stoppedEarly = true;
+            stream.destroy();
+            finish();
+            return;
+          }
+        }
+      });
+
+      stream.on('end', () => {
+        if (settled) return;
+        const rem = decoder.end();
+        if (rem && lineNo >= startLine && lineNo <= targetEndLine) {
+          pending += rem;
+        }
+        if (lineNo >= startLine && lineNo <= targetEndLine) {
+          pushLine(pending);
+        }
+        reachedEof = true;
+        finish();
+      });
+
+      stream.on('close', () => {
+        if (!settled) finish();
+      });
+
+      stream.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      });
+    });
+  }
+
+  private async streamCsvRangeFromBlob(
+    blobPath: string,
+    totalBytes: number,
+    filename: string,
+    range: Record<string, unknown>
+  ): Promise<Record<string, unknown>> {
+    const MAX_RESPONSE_BYTES = 512 * 1024;
+    const delimiter = filename.toLowerCase().endsWith('.tsv') ? '\t' : ',';
+    const rawStartRow = Number(range.startRow ?? 0);
+    const startRow = Number.isFinite(rawStartRow) ? Math.max(0, Math.floor(rawStartRow)) : 0;
+    const rawEndRow = Number(range.endRow ?? startRow + 99);
+    const targetEndRow = Number.isFinite(rawEndRow) ? Math.max(startRow, Math.floor(rawEndRow)) : startRow + 99;
+    const rawStartCol = Number(range.startCol ?? 0);
+    const startCol = Number.isFinite(rawStartCol) ? Math.max(0, Math.floor(rawStartCol)) : 0;
+    const hasEndCol = range.endCol !== undefined && range.endCol !== null;
+    const requestedEndCol = hasEndCol && Number.isFinite(Number(range.endCol))
+      ? Math.max(startCol, Math.floor(Number(range.endCol)))
+      : undefined;
+
+    return new Promise((resolve, reject) => {
+      const stream = fs.createReadStream(blobPath, { highWaterMark: 64 * 1024 });
+      const decoder = new StringDecoder('utf8');
+      let rowIndex = 0;
+      let observedMaxCols = 0;
+      let inQuotes = false;
+      let pendingQuote = false;
+      let pendingCr = false;
+      let field = '';
+      let currentRow: string[] = [];
+      let fieldCountInRow = 0;
+      let isFirstChar = true;
+      const rows: string[][] = [];
+      let collectedBytes = 0;
+      let truncated = false;
+      let stoppedEarly = false;
+      let reachedEof = false;
+      let settled = false;
+
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        const maxColIndex = Math.max(0, observedMaxCols - 1);
+        const actualEndCol = requestedEndCol !== undefined ? Math.min(maxColIndex, requestedEndCol) : maxColIndex;
+        const sliced = rows.map((r) => r.slice(startCol, actualEndCol + 1));
+        const actualEndRow = sliced.length > 0 ? startRow + sliced.length - 1 : Math.min(startRow, Math.max(0, rowIndex - 1));
+        resolve({
+          startRow,
+          endRow: actualEndRow,
+          startCol,
+          endCol: actualEndCol,
+          ...(reachedEof ? { totalRows: rowIndex } : {}),
+          totalCols: observedMaxCols,
+          totalBytes,
+          hasMore: stoppedEarly || !reachedEof,
+          truncated,
+          rows: sliced,
+          valuesHash: crypto.createHash('sha256').update(JSON.stringify(sliced)).digest('hex'),
+        });
+      };
+
+      const commitField = () => {
+        if (rowIndex >= startRow && rowIndex <= targetEndRow) {
+          currentRow.push(field);
+        }
+        fieldCountInRow += 1;
+        field = '';
+      };
+
+      const commitRow = (): boolean => {
+        commitField();
+        if (fieldCountInRow > observedMaxCols) observedMaxCols = fieldCountInRow;
+        let keepGoing = true;
+        if (rowIndex >= startRow && rowIndex <= targetEndRow) {
+          const rowBytes = Buffer.byteLength(JSON.stringify(currentRow), 'utf8');
+          if (collectedBytes + rowBytes > MAX_RESPONSE_BYTES && rows.length > 0) {
+            truncated = true;
+            stoppedEarly = true;
+            keepGoing = false;
+          } else {
+            rows.push(currentRow);
+            collectedBytes += rowBytes;
+          }
+        }
+        currentRow = [];
+        fieldCountInRow = 0;
+        rowIndex += 1;
+        if (rowIndex > targetEndRow) {
+          stoppedEarly = true;
+          keepGoing = false;
+        }
+        return keepGoing;
+      };
+
+      const processText = (text: string): boolean => {
+        for (let i = 0; i < text.length; i++) {
+          const ch = text[i];
+          if (isFirstChar) {
+            isFirstChar = false;
+            if (ch === '\uFEFF') continue;
+          }
+          if (pendingCr) {
+            pendingCr = false;
+            if (ch === '\n') continue;
+          }
+          if (pendingQuote) {
+            pendingQuote = false;
+            if (ch === '"') {
+              if (rowIndex >= startRow && rowIndex <= targetEndRow && field.length < MAX_RESPONSE_BYTES) {
+                field += '"';
+              }
+              continue;
+            }
+            inQuotes = false;
+          }
+          if (inQuotes) {
+            if (ch === '"') {
+              pendingQuote = true;
+            } else if (rowIndex >= startRow && rowIndex <= targetEndRow && field.length < MAX_RESPONSE_BYTES) {
+              field += ch;
+            }
+            continue;
+          }
+          if (ch === '"' && field.length === 0) {
+            inQuotes = true;
+          } else if (ch === delimiter) {
+            commitField();
+          } else if (ch === '\r') {
+            pendingCr = true;
+            if (!commitRow()) return false;
+          } else if (ch === '\n') {
+            if (!commitRow()) return false;
+          } else if (rowIndex >= startRow && rowIndex <= targetEndRow && field.length < MAX_RESPONSE_BYTES) {
+            field += ch;
+          }
+        }
+        return true;
+      };
+
+      stream.on('data', (chunk: Buffer | string) => {
+        if (settled) return;
+        const text = typeof chunk === 'string' ? chunk : decoder.write(chunk);
+        if (!processText(text)) {
+          stream.destroy();
+          finish();
+        }
+      });
+
+      stream.on('end', () => {
+        if (settled) return;
+        const rem = decoder.end();
+        if (rem && !processText(rem)) {
+          finish();
+          return;
+        }
+        if (pendingQuote) {
+          pendingQuote = false;
+          inQuotes = false;
+        }
+        if (field.length > 0 || fieldCountInRow > 0) {
+          commitRow();
+        }
+        reachedEof = true;
+        finish();
+      });
+
+      stream.on('close', () => {
+        if (!settled) finish();
+      });
+
+      stream.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      });
+    });
+  }
+
   async readRange(userId: string, artifactId: string, range: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const artifact = this.db.getArtifact(userId, artifactId);
-    if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
-    const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
-    const maxBytes = isDocumentFormat(adapter.format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
-    const { bytes: buf, revision } = this.readCurrentRevision(userId, artifactId, maxBytes);
-    const data = isDocumentFormat(adapter.format) && ['xlsx', 'docx', 'pptx', 'pdf'].includes(adapter.format)
-      ? JSON.parse((await this.documentWorker.run(adapter.format, artifact.filename, buf, { action: 'range', range })).toString('utf8'))
-      : adapter.readRange(buf, range, artifact);
-    return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+    const pinned = this.openPinnedBlobMeta(userId, artifactId);
+    try {
+      const { artifact, revision, blobPath, sizeBytes } = pinned;
+      const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
+      const format = adapter.format;
+
+      if (isDocumentFormat(format) && ['xlsx', 'docx', 'pptx', 'pdf'].includes(format)) {
+        if (this.documentWorker.available) {
+          if (sizeBytes > DOCUMENT_WORKER_MAX_INPUT_BYTES) {
+            throw new ArtifactError('DOC_WORKER_INPUT_TOO_LARGE', 'Document input exceeds the worker size limit.', 413);
+          }
+          const data = JSON.parse(
+            (await this.documentWorker.run(format, artifact.filename, { path: blobPath, sizeBytes }, { action: 'range', range })).toString('utf8')
+          ) as Record<string, unknown>;
+          return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+        }
+        const fallback = adapter.readRange(Buffer.alloc(0), range, artifact);
+        return { ...fallback, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+      }
+
+      if (format === 'csv') {
+        const data = await this.streamCsvRangeFromBlob(blobPath, sizeBytes, artifact.filename, range);
+        return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+      }
+
+      if (['code', 'markdown', 'html', 'svg', 'mermaid', 'diff'].includes(format)) {
+        const data = range.offsetBytes !== undefined
+          ? this.readByteRangeFromBlob(blobPath, sizeBytes, range)
+          : await this.streamLineRangeFromBlob(blobPath, sizeBytes, range);
+        return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+      }
+
+      const fallback = adapter.readRange(Buffer.alloc(0), range, artifact);
+      return { ...fallback, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+    } finally {
+      pinned.releasePin();
+    }
   }
 
   async renderPng(
@@ -4078,7 +4486,11 @@ export class ArtifactService {
     return { png, revision: snapshot.revision.revision, sha256: snapshot.revision.sha256 };
   }
 
-  async verifyArtifact(userId: string, artifactId: string): Promise<AdapterVerifyResult> {
+  async verifyArtifact(
+    userId: string,
+    artifactId: string,
+    options?: DocumentVerifyOptions
+  ): Promise<AdapterVerifyResult> {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
     const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
@@ -4102,7 +4514,7 @@ export class ArtifactService {
       try {
         return {
           ...JSON.parse((await this.documentWorker.run(
-            format, artifact.filename, buf, { action: 'verify' }, [],
+            format, artifact.filename, buf, { action: 'verify', ...(options ? { options } : {}) }, [],
             compareDocument ? { entry: artifact.relPath, dependencies: [], compareDocument } : undefined
           )).toString('utf8')),
           ...identity,

@@ -1,8 +1,19 @@
+import { spawnSync } from 'node:child_process';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { expect, it, vi } from 'vitest';
 import { deriveAgyPermissionRule } from '../src/acp/client-manager.js';
 import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
+
+const fullRuntimeDir = process.env.AGY_TEST_FULL_RUNTIME_DIR?.trim() || '';
+const canRunRealBwrap = Boolean(
+  fullRuntimeDir &&
+    spawnSync(
+      'bwrap',
+      ['--unshare-all', '--unshare-net', '--die-with-parent', '--new-session', '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--ro-bind', '/usr', '/usr', '--ro-bind', '/bin', '/bin', '--ro-bind', '/lib', '/lib', '--ro-bind', '/lib64', '/lib64', '--', '/bin/true'],
+      { stdio: 'ignore', timeout: 5000 },
+    ).status === 0,
+);
 
 it('uses the native ACP HTTP transport and attaches only a completed rich_create receipt', async () => {
   const srv = await createTestServer({ INSTALL_DOC_RUNTIME: '0' });
@@ -308,11 +319,91 @@ it('exports CSV to valid OOXML XLSX and renders real Markdown HTML in Base ChatU
   }
 });
 
-it('supports Full Runtime Mermaid SVG export, parser syntax line errors, CSV PNG + region render, and Markdown PDF/DOCX via MCP when runtime is installed', async () => {
-  const runtimeDir = process.env.AGY_TEST_FULL_RUNTIME_DIR;
-  if (!runtimeDir) return;
+it('streams bounded ranges for large text/CSV artifacts without full-file reads and enforces runtime availability on Office/PDF readRange', async () => {
+  const srv = await createTestServer({ INSTALL_DOC_RUNTIME: '0' });
+  try {
+    const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'streamrange', 'user:streamrange');
+    const { data: { chat } } = await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Streaming Range' });
+
+    // 1. ~3MB multi-line log/text artifact (40,000 lines)
+    const textLines: string[] = [];
+    for (let i = 1; i <= 40_000; i += 1) {
+      textLines.push(`LINE-${String(i).padStart(6, '0')}: payload=alpha-beta-gamma-delta-epsilon-zeta-eta-${i}`);
+    }
+    const { artifact: bigText } = await srv.ctx.artifactService.createArtifact({
+      userId,
+      scopeKind: 'chat',
+      chatId: chat.id,
+      relPath: 'large-log.txt',
+      content: Buffer.from(textLines.join('\n'), 'utf8'),
+      actorKind: 'user',
+    });
+
+    const headSlice = await srv.ctx.artifactService.readRange(userId, bigText.id, { startLine: 1, endLine: 4 }) as Record<string, unknown>;
+    expect(headSlice.revision).toBe(1);
+    expect(headSlice.startLine).toBe(1);
+    expect(headSlice.endLine).toBe(4);
+    expect(headSlice.hasMore).toBe(true);
+    expect(headSlice.truncated).toBe(false);
+    expect(headSlice.text).toBe(textLines.slice(0, 4).join('\n'));
+
+    const midSlice = await srv.ctx.artifactService.readRange(userId, bigText.id, { startLine: 25_000, endLine: 25_002 }) as Record<string, unknown>;
+    expect(midSlice.startLine).toBe(25_000);
+    expect(midSlice.endLine).toBe(25_002);
+    expect(midSlice.hasMore).toBe(true);
+    expect(midSlice.text).toBe(textLines.slice(24_999, 25_002).join('\n'));
+
+    // Bounded byte-window read via fs.readSync at arbitrary offset
+    const byteSlice = await srv.ctx.artifactService.readRange(userId, bigText.id, { offsetBytes: 100_000, maxBytes: 128 }) as Record<string, unknown>;
+    expect(byteSlice.offsetBytes).toBe(100_000);
+    expect(byteSlice.byteLength).toBe(128);
+    expect(byteSlice.hasMore).toBe(true);
+    expect(typeof byteSlice.text).toBe('string');
+
+    // 2. ~2.5MB CSV artifact (40,000 rows) read via streaming RFC-4180 parser
+    const csvRows = ['id,label,amount,note'];
+    for (let i = 1; i <= 40_000; i += 1) {
+      csvRows.push(`${i},"Item, #${i}",${i * 10},memo-entry-${i}`);
+    }
+    const { artifact: bigCsv } = await srv.ctx.artifactService.createArtifact({
+      userId,
+      scopeKind: 'chat',
+      chatId: chat.id,
+      relPath: 'large-table.csv',
+      content: Buffer.from(csvRows.join('\n'), 'utf8'),
+      actorKind: 'user',
+    });
+    const csvSlice = await srv.ctx.artifactService.readRange(userId, bigCsv.id, { startRow: 15_000, endRow: 15_002 }) as Record<string, unknown>;
+    expect(csvSlice.startRow).toBe(15_000);
+    expect(csvSlice.endRow).toBe(15_002);
+    expect(csvSlice.hasMore).toBe(true);
+    expect(csvSlice.rows).toEqual([
+      ['15000', 'Item, #15000', '150000', 'memo-entry-15000'],
+      ['15001', 'Item, #15001', '150010', 'memo-entry-15001'],
+      ['15002', 'Item, #15002', '150020', 'memo-entry-15002'],
+    ]);
+
+    // 3. Base ChatUI (documentWorker.available === false) rejects Office/PDF readRange cleanly (PR Lens #4688517338)
+    const { artifact: pdfArt } = await srv.ctx.artifactService.createArtifact({
+      userId,
+      scopeKind: 'chat',
+      chatId: chat.id,
+      relPath: 'doc.pdf',
+      content: Buffer.from('%PDF-1.4\n%%EOF\n', 'utf8'),
+      actorKind: 'user',
+    });
+    await expect(srv.ctx.artifactService.readRange(userId, pdfArt.id, { pageIndex: 0 })).rejects.toMatchObject({
+      code: 'UNSUPPORTED_OPERATION',
+      statusCode: 422,
+    });
+  } finally {
+    await srv.cleanup();
+  }
+});
+
+it.skipIf(!fullRuntimeDir)('supports Full Runtime Mermaid SVG export, parser syntax line errors, CSV PNG + region render, Markdown PDF/DOCX, and targeted PPTX verify via MCP', async () => {
   const srv = await createTestServer({
-    docRuntimeDir: runtimeDir,
+    docRuntimeDir: fullRuntimeDir,
     installDocRuntime: 'full',
     allowUnsandboxedDocWorkers: true,
     sandboxMode: 'off',
@@ -412,6 +503,41 @@ it('supports Full Runtime Mermaid SVG export, parser syntax line errors, CSV PNG
         expect.objectContaining({ id: 'pdf_structure', status: 'passed' }),
         expect.objectContaining({ id: 'pdf_diff', status: 'passed' }),
       ]));
+
+      // 6. Targeted PPTX visual consistency via MCP artifact_verify options.slideIndices (slide 3 of 3)
+      const { artifact: pptxArt } = await srv.ctx.artifactService.createArtifact({
+        userId, scopeKind: 'chat', chatId: chat.id, relPath: 'deck.pptx',
+        createParams: { slides: [{ title: 'Slide 1' }, { title: 'Slide 2' }, { title: 'Slide 3' }] },
+        actorKind: 'ai',
+      });
+      const pptxVerifyRes = await mcp.callTool({
+        name: 'artifact_verify',
+        arguments: { artifactId: pptxArt.id, options: { slideIndices: [2], maxShapesPerSlide: 15 } },
+      });
+      expect(pptxVerifyRes.isError).toBeFalsy();
+      const pptxVerifyText = (pptxVerifyRes.content as Array<{ type: string; text?: string }>).find((c) => c.type === 'text')?.text ?? '{}';
+      const pptxVerifyBody = JSON.parse(pptxVerifyText) as {
+        coverage: string;
+        checks: Array<{ id: string; status: string }>;
+        metrics: {
+          layerVisualConsistency: {
+            verificationLayer: string;
+            scope: string;
+            verifiedSlides: number[];
+            unverifiedSlides: number[];
+            slides: Array<{ slideIndex: number; status: string }>;
+          };
+        };
+      };
+      expect(pptxVerifyBody.coverage).toBe('partial');
+      expect(pptxVerifyBody.checks).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: 'layer_visual_consistency', status: 'unverified' }),
+      ]));
+      expect(pptxVerifyBody.metrics.layerVisualConsistency.verificationLayer).toBe('server_side_layer_decomposition');
+      expect(pptxVerifyBody.metrics.layerVisualConsistency.scope).toBe('selected_slides_partial');
+      expect(pptxVerifyBody.metrics.layerVisualConsistency.verifiedSlides).toEqual([2]);
+      expect(pptxVerifyBody.metrics.layerVisualConsistency.unverifiedSlides).toEqual([0, 1]);
+      expect(pptxVerifyBody.metrics.layerVisualConsistency.slides[2]?.status).toBe('verified');
     } finally {
       await mcp.close();
       binding?.revoke();
@@ -419,5 +545,71 @@ it('supports Full Runtime Mermaid SVG export, parser syntax line errors, CSV PNG
   } finally {
     await srv.cleanup();
   }
-}, 60_000);
+}, 90_000);
+
+it.skipIf(!canRunRealBwrap)('executes real Python, LibreOffice, qpdf, and pandoc document workers inside strict bwrap sandbox', async () => {
+  const srv = await createTestServer({
+    agyMode: 'real',
+    docRuntimeDir: fullRuntimeDir,
+    installDocRuntime: 'full',
+    allowUnsandboxedDocWorkers: false,
+    sandboxMode: 'strict',
+  });
+  try {
+    const client = new (await import('./helpers/test-harness.js')).TestApiClient(srv.baseUrl);
+    const reg = await client.request<{ user: { id: string } }>('POST', '/api/auth/register', {
+      username: 'bwraprt',
+      displayName: 'bwraprt',
+      password: 'password123',
+    });
+    expect(reg.status).toBe(201);
+    const userId = reg.data.user.id;
+    const projRes = await client.request<{ project: { id: string } }>('POST', '/api/projects', { name: 'Strict Bwrap Runtime' });
+    expect(projRes.status).toBe(201);
+    const projectId = projRes.data.project.id;
+
+    // 1. PPTX creation + LibreOffice layer visual consistency verification inside real bwrap
+    const { artifact: deck } = await srv.ctx.artifactService.createArtifact({
+      userId, scopeKind: 'project', projectId, relPath: 'sandboxed.pptx',
+      createParams: { slides: [{ title: 'Sandboxed Slide' }] },
+      actorKind: 'user',
+    });
+    const pptxVerify = await srv.ctx.artifactService.verifyArtifact(userId, deck.id);
+    expect(pptxVerify.ok).toBe(true);
+    expect(pptxVerify.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'layer_visual_consistency', status: 'passed' }),
+    ]));
+
+    // 2. Markdown -> DOCX export via pandoc inside real bwrap
+    const { artifact: md } = await srv.ctx.artifactService.createArtifact({
+      userId, scopeKind: 'project', projectId, relPath: 'notes.md',
+      content: Buffer.from('# Sandboxed Doc\n\nConverted inside bwrap.\n', 'utf8'),
+      actorKind: 'user',
+    });
+    const { artifact: docxOut } = await srv.ctx.artifactService.exportArtifact({
+      userId, artifactId: md.id, targetFormat: 'docx', actorKind: 'user',
+    });
+    const docxRange = await srv.ctx.artifactService.readRange(userId, docxOut.id, { start: 0, count: 10 }) as { blocks: Array<{ text: string }> };
+    expect(docxRange.blocks.map((b) => b.text).join('\n')).toContain('Converted inside bwrap.');
+
+    // 3. PDF create + overlay + differential verify (qpdf/pypdf/pdftoppm) inside real bwrap
+    const { artifact: pdf } = await srv.ctx.artifactService.createArtifact({
+      userId, scopeKind: 'project', projectId, relPath: 'sandboxed.pdf',
+      createParams: { pages: ['Bwrap PDF page 1'] },
+      actorKind: 'user',
+    });
+    await srv.ctx.artifactService.editArtifact({
+      userId, artifactId: pdf.id, expectedRevision: 1, actorKind: 'user',
+      operations: [{ op: 'pdf.add_overlay', pageIndex: 0, kind: 'stamp', rect: [280, 680, 480, 740], text: 'SANDBOXED' }],
+    });
+    const pdfVerify = await srv.ctx.artifactService.verifyArtifact(userId, pdf.id);
+    expect(pdfVerify.ok).toBe(true);
+    expect(pdfVerify.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'pdf_structure', status: 'passed' }),
+      expect.objectContaining({ id: 'pdf_diff', status: 'passed' }),
+    ]));
+  } finally {
+    await srv.cleanup();
+  }
+}, 90_000);
 

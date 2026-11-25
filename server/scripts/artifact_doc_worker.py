@@ -2378,30 +2378,69 @@ def read_workbook_range(package, options):
     if len(bounds) > 2 or first_row > last_row or first_column > last_column \
             or (last_row - first_row + 1) * (last_column - first_column + 1) > 1000:
         raise ValueError("Requested worksheet range is out of bounds")
-    worksheet = parse_xml(package.read(sheet["part"]))
-    shared = None
-    if "xl/sharedStrings.xml" in package.namelist():
-        shared = parse_xml(package.read("xl/sharedStrings.xml"))
+
+    raw_cells = []
+    needed_ss = set()
+    row_tag = tag(SPREADSHEET, "row")
+    cell_tag = tag(SPREADSHEET, "c")
+    with package.open(sheet["part"]) as sheet_stream:
+        for _event, row_el in XML.iterparse(sheet_stream, events=("end",), tag=row_tag, resolve_entities=False, no_network=True):
+            row_attr = row_el.get("r")
+            row_num_hint = int(row_attr) if row_attr and row_attr.isdigit() else None
+            if row_num_hint is not None and row_num_hint > last_row:
+                row_el.clear()
+                break
+            if row_num_hint is None or first_row <= row_num_hint <= last_row:
+                for cell in row_el.findall(cell_tag):
+                    address = cell.get("r")
+                    if not address:
+                        continue
+                    row, column = cell_coordinates(address)
+                    if not (first_row <= row <= last_row and first_column <= column <= last_column):
+                        continue
+                    formula = cell.find(tag(SPREADSHEET, "f"))
+                    value = cell.findtext(tag(SPREADSHEET, "v"))
+                    cell_type = cell.get("t")
+                    ss_idx = None
+                    if cell_type == "s" and value is not None:
+                        ss_idx = bounded_integer(value, 0, 10_000_000)
+                        needed_ss.add(ss_idx)
+                    elif cell_type == "inlineStr":
+                        value = text_content(cell, SPREADSHEET)
+                    raw_cells.append((address, value, cell_type, ss_idx, formula.text if formula is not None else None))
+            row_el.clear()
+            parent = row_el.getparent()
+            if parent is not None:
+                while row_el.getprevious() is not None:
+                    del parent[0]
+
+    ss_lookup = {}
+    if needed_ss:
+        if "xl/sharedStrings.xml" not in package.namelist():
+            raise ValueError("Worksheet references missing shared strings")
+        max_ss = max(needed_ss)
+        si_tag = tag(SPREADSHEET, "si")
+        with package.open("xl/sharedStrings.xml") as ss_stream:
+            for idx, (_event, si_el) in enumerate(XML.iterparse(ss_stream, events=("end",), tag=si_tag, resolve_entities=False, no_network=True)):
+                if idx in needed_ss:
+                    ss_lookup[idx] = text_content(si_el, SPREADSHEET)
+                si_el.clear()
+                parent = si_el.getparent()
+                if parent is not None:
+                    while si_el.getprevious() is not None:
+                        del parent[0]
+                if idx >= max_ss:
+                    break
+        if len(ss_lookup) != len(needed_ss):
+            raise ValueError("Worksheet references out-of-bounds shared string index")
+
     cells = []
-    for cell in worksheet.iter(tag(SPREADSHEET, "c")):
-        address = cell.get("r")
-        if not address:
-            continue
-        row, column = cell_coordinates(address)
-        if not (first_row <= row <= last_row and first_column <= column <= last_column):
-            continue
-        formula = cell.find(tag(SPREADSHEET, "f"))
-        value = cell.findtext(tag(SPREADSHEET, "v"))
-        cell_type = cell.get("t")
-        if cell_type == "s" and value is not None:
-            if shared is None:
-                raise ValueError("Worksheet references missing shared strings")
-            value = text_content(shared[bounded_integer(value, 0, len(shared) - 1)], SPREADSHEET)
-        elif cell_type == "inlineStr":
-            value = text_content(cell, SPREADSHEET)
+    for address, value, cell_type, ss_idx, formula_text in raw_cells:
+        if ss_idx is not None:
+            value = ss_lookup[ss_idx]
         record = {"address": address, "value": value, "type": cell_type}
-        if formula is not None:
-            record.update(formula=formula.text, formulaStatus=(
+        if formula_text is not None:
+            record.update(formula=formula_text, formulaStatus=(
                 "error_formula" if cell_type == "e" else
                 "cached_existing" if value not in (None, "") else "unevaluated_unsupported"
             ))
@@ -3452,60 +3491,155 @@ SMARTART_SUPPORTED_LINEAR_LIST_RE = re.compile(
 SMARTART_SUPPORTED_LINEAR_PROCESS_RE = re.compile(
     r"(?:^|/)(?:process[0-9]*|chevron[0-9]*|arrow[0-9]*|lProcess[0-9]*|vProcess[0-9]*|hProcess[0-9]*)$", re.I
 )
+SMARTART_ORDINAL_PRES_NAME_RE = re.compile(r"^([A-Za-z_]+?)(\d+)([A-Za-z_]*)$")
 
 
-def classify_smartart_layout(data_root, drawing_root=None):
-    """Classify a SmartArt layout and check structural prerequisites for safe add/remove node sync."""
+def _smartart_layout_ch_max(layout_root):
+    """Return top-level chMax constraint from layoutDef varLst if positive, else None."""
+    if layout_root is None:
+        return None
+    root_ln = layout_root.find(tag(DIAGRAM, "layoutNode"))
+    if root_ln is None:
+        return None
+    var_lst = root_ln.find(tag(DIAGRAM, "varLst"))
+    if var_lst is None:
+        return None
+    ch_max_el = var_lst.find(tag(DIAGRAM, "chMax"))
+    if ch_max_el is None:
+        return None
+    try:
+        val = int(ch_max_el.get("val", "-1"))
+        return val if val > 0 else None
+    except ValueError:
+        return None
+
+
+def _smartart_layout_has_computable_atoms(layout_root):
+    """Return True if layoutDef declares DrawingML layout algorithms executable by LibreOffice."""
+    if layout_root is None:
+        return False
+    algs = [el.get("type") for el in layout_root.iter(tag(DIAGRAM, "alg")) if el.get("type")]
+    computable = {"lin", "cycle", "pyra", "snake", "composite", "hierRoot", "hierChild", "conn", "sp", "tx"}
+    return any(a in computable for a in algs)
+
+
+def classify_smartart_layout(data_root, drawing_root=None, layout_root=None):
+    """Classify a SmartArt layout and determine add/remove node capability using layoutDef + LibreOffice or 1D linear reflow."""
     lo_type = next(
         (node.get("loTypeId") for node in data_root.iter(tag(DIAGRAM, "prSet")) if node.get("loTypeId")),
         None,
     )
-    if not lo_type:
-        return {"layout": None, "family": "unknown", "supportsNodeAddRemove": False, "reason": "Missing SmartArt loTypeId."}
-    short_id = lo_type.rsplit("/", 1)[-1]
-    if SMARTART_SUPPORTED_LINEAR_LIST_RE.search(lo_type):
+    if not lo_type and layout_root is not None:
+        lo_type = layout_root.get("uniqueId")
+    short_id = lo_type.rsplit("/", 1)[-1] if lo_type else "unknown"
+    if lo_type and SMARTART_SUPPORTED_LINEAR_LIST_RE.search(lo_type):
         family = "linear_list"
-    elif SMARTART_SUPPORTED_LINEAR_PROCESS_RE.search(lo_type):
+    elif lo_type and SMARTART_SUPPORTED_LINEAR_PROCESS_RE.search(lo_type):
         family = "linear_process"
     else:
+        family = short_id
+
+    ch_max = _smartart_layout_ch_max(layout_root)
+    has_lo = bool(shutil.which("libreoffice") or shutil.which("soffice"))
+    has_atoms = _smartart_layout_has_computable_atoms(layout_root)
+
+    if has_atoms and has_lo:
         return {
             "layout": lo_type,
-            "family": short_id,
-            "supportsNodeAddRemove": False,
-            "reason": f"SmartArt layout '{short_id}' uses non-linear or constraint-coupled geometry (e.g. Venn/Cycle/Hierarchy/Pyramid/Matrix) that cannot be safely reflowed without PowerPoint's layout solver.",
+            "family": family,
+            "engine": "libreoffice_layout_def",
+            "chMax": ch_max,
+            "supportsNodeAddRemove": True,
+            "reason": None,
         }
-    if drawing_root is not None:
-        # Detached text-box transforms (dsp:txXfrm) indicate layout-coupled non-centered text placement.
-        if any(drawing_root.iter(tag(DIAGRAM_DRAWING, "txXfrm"))):
+
+    # Fallback when layoutDef lacks full layout atoms (or LibreOffice is absent):
+    # verified deterministic 1D geometric reflow for single-level linear lists/processes.
+    if family in {"linear_list", "linear_process"}:
+        if drawing_root is not None and any(drawing_root.iter(tag(DIAGRAM_DRAWING, "txXfrm"))):
             return {
                 "layout": lo_type,
                 "family": family,
+                "engine": "unsupported",
+                "chMax": ch_max,
                 "supportsNodeAddRemove": False,
-                "reason": "SmartArt shapes use detached dsp:txXfrm text-box coordinates that cannot be reflowed reliably.",
+                "reason": "SmartArt shapes use detached dsp:txXfrm text-box coordinates and layoutDef cannot be recalculated via LibreOffice.",
             }
-    return {"layout": lo_type, "family": family, "supportsNodeAddRemove": True, "reason": None}
+        return {
+            "layout": lo_type,
+            "family": family,
+            "engine": "linear_reflow",
+            "chMax": ch_max,
+            "supportsNodeAddRemove": True,
+            "reason": None,
+        }
+
+    return {
+        "layout": lo_type,
+        "family": family,
+        "engine": "unsupported",
+        "chMax": ch_max,
+        "supportsNodeAddRemove": False,
+        "reason": (
+            f"SmartArt layout '{short_id}' requires LibreOffice layoutDef recalculation "
+            f"(libreoffice={'available' if has_lo else 'missing'}, layoutAtoms={'present' if has_atoms else 'missing'})."
+        ),
+    }
 
 
-def _resolve_smartart_parts(package, slide_part, slide_root, data_part, replacements):
+def _resolve_smartart_parts(package, slide_part, slide_root, data_part, replacements, require_drawing=True):
     relationships = package_relationships(package, slide_part)
     data_ids = [rel_id for rel_id, (kind, part) in relationships.items()
                 if kind.endswith("/diagramData") and part == data_part]
-    if len(data_ids) != 1 or not any(element.get(tag(OFFICE_REL, "dm")) == data_ids[0]
-                                      for element in slide_root.iter(tag(DIAGRAM, "relIds"))):
+    rel_ids_el = None
+    graphic_frame = None
+    if len(data_ids) == 1:
+        for gf in slide_root.iter(tag(PRESENTATION, "graphicFrame")):
+            cand = next((el for el in gf.iter(tag(DIAGRAM, "relIds")) if el.get(tag(OFFICE_REL, "dm")) == data_ids[0]), None)
+            if cand is not None:
+                rel_ids_el = cand
+                graphic_frame = gf
+                break
+    if len(data_ids) != 1 or rel_ids_el is None:
         raise ValueError("The slide does not reference this SmartArt data model")
     data = replacements.get(data_part)
     if data is None:
         data = parse_xml(package.read(data_part))
+
+    layout_rel_id = rel_ids_el.get(tag(OFFICE_REL, "lo"))
+    layout_part = None
+    layout_root = None
+    if layout_rel_id and layout_rel_id in relationships:
+        l_kind, l_part = relationships[layout_rel_id]
+        if l_kind.endswith("/diagramLayout") and l_part in package.namelist():
+            layout_part = l_part
+            layout_root = replacements.get(layout_part)
+            if layout_root is None:
+                layout_root = parse_xml(package.read(layout_part))
+
     drawing_ids = [element.get("relId") for element in data.iter(tag(DIAGRAM_DRAWING, "dataModelExt"))]
-    if len(drawing_ids) != 1:
-        raise UnsupportedByFormatError("SmartArt drawing cache relationship is missing or ambiguous")
-    drawing_type, drawing_part = relationships.get(drawing_ids[0], ("", ""))
-    if not drawing_type.endswith("/diagramDrawing"):
-        raise UnsupportedByFormatError("SmartArt drawing cache is missing")
-    drawing = replacements.get(drawing_part)
-    if drawing is None:
-        drawing = parse_xml(package.read(drawing_part))
-    return data, drawing, drawing_part
+    drawing = None
+    drawing_part = None
+    if len(drawing_ids) == 1:
+        drawing_type, cand_part = relationships.get(drawing_ids[0], ("", ""))
+        if drawing_type.endswith("/diagramDrawing") and (cand_part in replacements or cand_part in package.namelist()):
+            drawing_part = cand_part
+            drawing = replacements.get(drawing_part)
+            if drawing is None:
+                drawing = parse_xml(package.read(drawing_part))
+    if require_drawing and (drawing is None or drawing_part is None):
+        raise UnsupportedByFormatError("SmartArt drawing cache is missing or ambiguous")
+    return {
+        "data": data,
+        "drawing": drawing,
+        "drawing_part": drawing_part,
+        "drawing_rel_id": drawing_ids[0] if len(drawing_ids) == 1 else None,
+        "layout": layout_root,
+        "layout_part": layout_part,
+        "graphic_frame": graphic_frame,
+        "data_rel_id": data_ids[0],
+        "relationships": relationships,
+    }
 
 
 def _smartart_sp_rect(sp):
@@ -3547,7 +3681,8 @@ def edit_smartart_text(package, operation, slide_root, replacements):
     text = operation["text"]
     if not isinstance(text, str) or not text.strip() or len(text) > 2000 or "\r" in text or "\n" in text:
         raise ValueError("SmartArt requires a nonempty, single-line label")
-    data, drawing, drawing_part = _resolve_smartart_parts(package, slide_part, slide_root, data_part, replacements)
+    parts = _resolve_smartart_parts(package, slide_part, slide_root, data_part, replacements, require_drawing=True)
+    data, drawing, drawing_part = parts["data"], parts["drawing"], parts["drawing_part"]
     points = list(data.iter(tag(DIAGRAM, "pt")))
     logical_points = [point for point in points if point.get("modelId") == model_id and point.get("type") in (None, "node")]
     if len(logical_points) != 1:
@@ -3571,18 +3706,600 @@ def edit_smartart_text(package, operation, slide_root, replacements):
     replacements[drawing_part] = drawing
 
 
-def edit_smartart_add_or_remove_node(package, operation, slide_root, replacements):
-    """Add or remove a node in verified 1D linear list/process SmartArt diagrams with full dataModel+drawing geometry sync."""
-    slide_part = operation["slidePart"]
-    data_part = operation["dataPart"]
-    mode = operation.get("mode")
-    if mode not in {"add", "remove"}:
-        raise ValueError("SmartArt add_or_remove_node requires mode 'add' or 'remove'")
-    data, drawing, drawing_part = _resolve_smartart_parts(package, slide_part, slide_root, data_part, replacements)
-    classification = classify_smartart_layout(data, drawing)
-    if not classification["supportsNodeAddRemove"]:
-        raise UnsupportedByFormatError(classification["reason"])
+def _smartart_convert_p_sp_to_dsp_sp(p_sp, model_id, shape_id, gf_x, gf_y):
+    """Convert a PresentationML <p:sp> extracted from LibreOffice into an OOXML Diagram Drawing <dsp:sp>."""
+    dsp_sp = XML.Element(
+        tag(DIAGRAM_DRAWING, "sp"),
+        nsmap={"dsp": DIAGRAM_DRAWING, "a": DRAWING},
+        modelId=model_id,
+    )
 
+    def _remap_element(el, target_ns=None):
+        qname = XML.QName(el)
+        ns = target_ns if target_ns is not None else qname.namespace
+        new_tag = f"{{{ns}}}{qname.localname}" if ns else qname.localname
+        # Strip any external/dangling office relationship attributes (r:embed/r:link/r:id) from synthesized cache shapes
+        clean_attrib = {
+            k: v for k, v in el.attrib.items()
+            if not k.startswith("{" + OFFICE_REL + "}")
+        }
+        node = XML.Element(new_tag, **clean_attrib)
+        node.text = el.text
+        node.tail = el.tail
+        for child in el:
+            if not isinstance(child.tag, str):
+                continue
+            child_q = XML.QName(child)
+            # Replace blipFill referencing stripped r:embed with clean solidFill fallback
+            if child_q.localname == "blipFill":
+                fb = XML.SubElement(node, tag(DRAWING, "solidFill"))
+                XML.SubElement(fb, tag(DRAWING, "srgbClr"), val="64748B")
+                continue
+            child_target_ns = DIAGRAM_DRAWING if child_q.namespace == PRESENTATION else None
+            node.append(_remap_element(child, child_target_ns))
+        return node
+
+    nv = p_sp.find(tag(PRESENTATION, "nvSpPr"))
+    dsp_nv = XML.SubElement(dsp_sp, tag(DIAGRAM_DRAWING, "nvSpPr"))
+    c_nv_pr = nv.find(tag(PRESENTATION, "cNvPr")) if nv is not None else None
+    XML.SubElement(
+        dsp_nv,
+        tag(DIAGRAM_DRAWING, "cNvPr"),
+        id=str(shape_id),
+        name=(c_nv_pr.get("name") if c_nv_pr is not None and c_nv_pr.get("name") else f"SmartArt Shape {shape_id}"),
+    )
+    c_nv_sp_pr = nv.find(tag(PRESENTATION, "cNvSpPr")) if nv is not None else None
+    if c_nv_sp_pr is not None:
+        dsp_nv.append(_remap_element(c_nv_sp_pr, DIAGRAM_DRAWING))
+    else:
+        XML.SubElement(dsp_nv, tag(DIAGRAM_DRAWING, "cNvSpPr"))
+
+    sp_pr = p_sp.find(tag(PRESENTATION, "spPr"))
+    if sp_pr is not None:
+        dsp_sp_pr = _remap_element(sp_pr, DIAGRAM_DRAWING)
+        xfrm = dsp_sp_pr.find(tag(DRAWING, "xfrm"))
+        if xfrm is not None:
+            off = xfrm.find(tag(DRAWING, "off"))
+            if off is not None and "x" in off.attrib and "y" in off.attrib:
+                off.set("x", str(int(off.attrib["x"]) - gf_x))
+                off.set("y", str(int(off.attrib["y"]) - gf_y))
+        dsp_sp.append(dsp_sp_pr)
+    else:
+        XML.SubElement(dsp_sp, tag(DIAGRAM_DRAWING, "spPr"))
+
+    style = p_sp.find(tag(PRESENTATION, "style"))
+    if style is not None:
+        dsp_sp.append(_remap_element(style, DIAGRAM_DRAWING))
+
+    tx_body = p_sp.find(tag(PRESENTATION, "txBody"))
+    if tx_body is not None:
+        dsp_sp.append(_remap_element(tx_body, DIAGRAM_DRAWING))
+
+    return dsp_sp
+
+
+def _smartart_collect_leaf_pres_dfs(data_root):
+    """Collect presentation points in presParOf DFS order, distinguishing leaf vs container pres nodes."""
+    pt_lst = data_root.find(tag(DIAGRAM, "ptLst"))
+    cxn_lst = data_root.find(tag(DIAGRAM, "cxnLst"))
+    if pt_lst is None or cxn_lst is None:
+        return [], {}
+    pt_by_id = {p.get("modelId"): p for p in pt_lst.findall(tag(DIAGRAM, "pt"))}
+    children_map = {}
+    has_parent = set()
+    for c in cxn_lst.findall(tag(DIAGRAM, "cxn")):
+        if c.get("type") == "presParOf":
+            src, dst = c.get("srcId"), c.get("destId")
+            if src and dst:
+                children_map.setdefault(src, []).append((int(c.get("srcOrd", "0")), dst))
+                has_parent.add(dst)
+    for k in children_map:
+        children_map[k].sort(key=lambda pair: pair[0])
+
+    pres_pts = [p for p in pt_lst.findall(tag(DIAGRAM, "pt")) if p.get("type") == "pres"]
+    roots = [p.get("modelId") for p in pres_pts if p.get("modelId") not in has_parent]
+    ordered_leaves = []
+    visited = set()
+
+    def walk(pid):
+        if pid in visited or pid not in pt_by_id:
+            return
+        visited.add(pid)
+        kids = children_map.get(pid, [])
+        if not kids:
+            ordered_leaves.append(pt_by_id[pid])
+        else:
+            for _, cid in kids:
+                walk(cid)
+
+    for r in roots:
+        walk(r)
+    for p in pres_pts:
+        pid = p.get("modelId")
+        if pid not in visited and not children_map.get(pid):
+            ordered_leaves.append(p)
+    return ordered_leaves, pt_by_id
+
+
+def _recalculate_smartart_drawing_via_libreoffice(package, slide_part, slide_root, graphic_frame, data_part, mutated_data, drawing_part, replacements):
+    """Run LibreOffice's DrawingML Diagram layout engine (DIAGRAM_IGNORE_EXTDRAWINGS=1) to recompute SmartArt geometry from layoutDef."""
+    soffice_bin = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice_bin:
+        return None
+
+    gf_xfrm = graphic_frame.find(tag(PRESENTATION, "xfrm"))
+    if gf_xfrm is None:
+        return None
+    gf_off = gf_xfrm.find(tag(DRAWING, "off"))
+    gf_ext = gf_xfrm.find(tag(DRAWING, "ext"))
+    if gf_off is None or gf_ext is None:
+        return None
+    gf_x, gf_y = int(gf_off.attrib["x"]), int(gf_off.attrib["y"])
+    gf_cx, gf_cy = int(gf_ext.attrib["cx"]), int(gf_ext.attrib["cy"])
+
+    # Prepare temp slide containing ONLY the target graphicFrame so extracted shapes belong exclusively to this SmartArt
+    temp_slide = deepcopy(slide_root)
+    temp_tree = temp_slide.find(".//" + tag(PRESENTATION, "spTree"))
+    target_dm_rel = next((el.get(tag(OFFICE_REL, "dm")) for el in graphic_frame.iter(tag(DIAGRAM, "relIds"))), None)
+    for child in list(temp_tree):
+        if not isinstance(child.tag, str):
+            continue
+        local = XML.QName(child).localname
+        if local in {"nvGrpSpPr", "grpSpPr"}:
+            continue
+        if local == "graphicFrame" and any(el.get(tag(OFFICE_REL, "dm")) == target_dm_rel for el in child.iter(tag(DIAGRAM, "relIds"))):
+            continue
+        temp_tree.remove(child)
+
+    # Strip dataModelExt ONLY in temp copy so LibreOffice ignores cached drawing and executes layoutDef
+    temp_data = deepcopy(mutated_data)
+    for ext_lst in list(temp_data.findall(tag(DIAGRAM, "extLst"))):
+        for ext in list(ext_lst):
+            if ext.find(tag(DIAGRAM_DRAWING, "dataModelExt")) is not None:
+                ext_lst.remove(ext)
+        if not len(ext_lst):
+            temp_data.remove(ext_lst)
+
+    slide_rels_part = str(PurePosixPath(slide_part).parent / "_rels" / (PurePosixPath(slide_part).name + ".rels"))
+    drawing_rels_part = (
+        str(PurePosixPath(drawing_part).parent / "_rels" / (PurePosixPath(drawing_part).name + ".rels"))
+        if drawing_part else None
+    )
+
+    # Determine slide 0-based index in presentation.xml
+    pres_main = replacements.get("ppt/presentation.xml")
+    if pres_main is None:
+        pres_main = parse_xml(package.read("ppt/presentation.xml"))
+    slides_list = presentation_slides(package, pres_main)
+    slide_index = next((idx for idx, s in enumerate(slides_list) if s["part"] == slide_part), 0)
+
+    with tempfile.TemporaryDirectory(prefix="agy-smartart-lo-") as tmpdir:
+        td = Path(tmpdir)
+        temp_in = td / "input.pptx"
+        with zipfile.ZipFile(temp_in, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in package.infolist():
+                name = item.filename
+                if drawing_part and name in {drawing_part, drawing_rels_part}:
+                    continue
+                if name == slide_part:
+                    raw = XML.tostring(temp_slide, xml_declaration=True, encoding="UTF-8", standalone=True)
+                elif name == data_part:
+                    raw = XML.tostring(temp_data, xml_declaration=True, encoding="UTF-8", standalone=True)
+                elif name == slide_rels_part and drawing_part:
+                    rr = parse_xml(package.read(name))
+                    for rel in list(rr):
+                        if rel.get("Type", "").endswith("/diagramDrawing"):
+                            target = resolve_relationship(str(PurePosixPath(slide_part).parent), rel.get("Target", ""))
+                            if target == drawing_part:
+                                rr.remove(rel)
+                    raw = XML.tostring(rr, xml_declaration=True, encoding="UTF-8", standalone=True)
+                elif name == "[Content_Types].xml" and drawing_part:
+                    ct = parse_xml(package.read(name))
+                    for ov in list(ct):
+                        if ov.get("PartName") == "/" + drawing_part:
+                            ct.remove(ov)
+                    raw = XML.tostring(ct, xml_declaration=True, encoding="UTF-8", standalone=True)
+                elif name in replacements:
+                    val = replacements[name]
+                    raw = val if isinstance(val, bytes) else XML.tostring(val, xml_declaration=True, encoding="UTF-8", standalone=True)
+                else:
+                    raw = package.read(name)
+                zout.writestr(name, raw)
+
+        env = dict(os.environ, HOME=tmpdir, DIAGRAM_IGNORE_EXTDRAWINGS="1")
+        odp_dir = td / "odp"
+        pptx_dir = td / "pptx"
+        odp_dir.mkdir()
+        pptx_dir.mkdir()
+        p1 = subprocess.run(
+            [soffice_bin, "--headless", "--nologo", "--nofirststartwizard",
+             f"-env:UserInstallation=file://{td}/lo1", "--convert-to", "odp", "--outdir", str(odp_dir), str(temp_in)],
+            env=env, capture_output=True, text=True, timeout=25,
+        )
+        odp_file = odp_dir / "input.odp"
+        if p1.returncode != 0 or not odp_file.is_file():
+            return None
+        p2 = subprocess.run(
+            [soffice_bin, "--headless", "--nologo", "--nofirststartwizard",
+             f"-env:UserInstallation=file://{td}/lo2", "--convert-to", "pptx", "--outdir", str(pptx_dir), str(odp_file)],
+            env=env, capture_output=True, text=True, timeout=25,
+        )
+        relaid_file = pptx_dir / "input.pptx"
+        if p2.returncode != 0 or not relaid_file.is_file():
+            return None
+
+        with zipfile.ZipFile(relaid_file) as zre:
+            re_pres = parse_xml(zre.read("ppt/presentation.xml"))
+            re_slides = presentation_slides(zre, re_pres)
+            if slide_index >= len(re_slides):
+                return None
+            re_slide_xml = parse_xml(zre.read(re_slides[slide_index]["part"]))
+            re_tree = re_slide_xml.find(".//" + tag(PRESENTATION, "spTree"))
+            if re_tree is None:
+                return None
+            # Collect all <p:sp> shapes (inside grpSp or directly in spTree)
+            raw_sps = list(re_tree.findall(".//" + tag(PRESENTATION, "sp")))
+
+    if not raw_sps:
+        return None
+
+    # Filter out the invisible full-frame background bounding box emitted for the diagram container
+    filtered_sps = []
+    for sp in raw_sps:
+        sp_txt = text_content(sp, DRAWING).strip()
+        xf = sp.find(".//" + tag(DRAWING, "xfrm"))
+        off = xf.find(tag(DRAWING, "off")) if xf is not None else None
+        ext = xf.find(tag(DRAWING, "ext")) if xf is not None else None
+        if not sp_txt and off is not None and ext is not None:
+            sx, sy = int(off.attrib["x"]), int(off.attrib["y"])
+            scx, scy = int(ext.attrib["cx"]), int(ext.attrib["cy"])
+            same_frame = (
+                abs(sx - gf_x) <= 5000 and abs(sy - gf_y) <= 5000
+                and abs(scx - gf_cx) <= 5000 and abs(scy - gf_cy) <= 5000
+            )
+            sp_pr = sp.find(tag(PRESENTATION, "spPr"))
+            has_visible_fill = sp_pr is not None and any(
+                sp_pr.find(tag(DRAWING, t)) is not None for t in ("solidFill", "gradFill", "blipFill", "pattFill")
+            )
+            if same_frame and not has_visible_fill:
+                continue
+        filtered_sps.append(sp)
+
+    if not filtered_sps:
+        return None
+
+    # Map extracted <p:sp> shapes back to dataModel pres point modelIds for full re-editability
+    leaf_pres, pt_by_id = _smartart_collect_leaf_pres_dfs(mutated_data)
+    logical_pts = [p for p in pt_by_id.values() if p.get("type") in (None, "node")]
+    logical_text_by_id = {p.get("modelId"): text_content(p, DRAWING).strip() for p in logical_pts}
+
+    # Build expected leaf pres metadata: (pres_id, assoc_node_id, expected_text)
+    pres_entries = []
+    for p in leaf_pres:
+        pr = p.find(tag(DIAGRAM, "prSet"))
+        assoc = pr.get("presAssocID") if pr is not None else None
+        pres_entries.append((p.get("modelId"), assoc, logical_text_by_id.get(assoc, "")))
+
+    assigned_model_ids = [None] * len(filtered_sps)
+    used_pres_indices = set()
+
+    if len(filtered_sps) == len(pres_entries):
+        # Exact 1:1 structural match in DFS layout order (handles both single-shape and 2-shape-per-node layouts like venn1)
+        for i, (pid, _assoc, _txt) in enumerate(pres_entries):
+            assigned_model_ids[i] = pid
+            used_pres_indices.add(i)
+    else:
+        # Match text-bearing shapes to pres entries with matching logical node text first
+        for sp_idx, sp in enumerate(filtered_sps):
+            sp_txt = text_content(sp, DRAWING).strip()
+            if not sp_txt:
+                continue
+            for p_idx, (pid, _assoc, exp_txt) in enumerate(pres_entries):
+                if p_idx not in used_pres_indices and exp_txt == sp_txt:
+                    assigned_model_ids[sp_idx] = pid
+                    used_pres_indices.add(p_idx)
+                    break
+        # Assign remaining shapes to remaining leaf pres entries in order
+        remaining_pres = [p_idx for p_idx in range(len(pres_entries)) if p_idx not in used_pres_indices]
+        rem_cursor = 0
+        for sp_idx in range(len(filtered_sps)):
+            if assigned_model_ids[sp_idx] is None:
+                if rem_cursor < len(remaining_pres):
+                    assigned_model_ids[sp_idx] = pres_entries[remaining_pres[rem_cursor]][0]
+                    rem_cursor += 1
+                else:
+                    assigned_model_ids[sp_idx] = "{" + str(uuid.uuid4()).upper() + "}"
+
+    # Synthesize fresh OOXML <dsp:drawing>
+    new_drawing = XML.Element(
+        tag(DIAGRAM_DRAWING, "drawing"),
+        nsmap={"dsp": DIAGRAM_DRAWING, "a": DRAWING},
+    )
+    sp_tree = XML.SubElement(new_drawing, tag(DIAGRAM_DRAWING, "spTree"))
+    nv_grp = XML.SubElement(sp_tree, tag(DIAGRAM_DRAWING, "nvGrpSpPr"))
+    XML.SubElement(nv_grp, tag(DIAGRAM_DRAWING, "cNvPr"), id="0", name="")
+    XML.SubElement(nv_grp, tag(DIAGRAM_DRAWING, "cNvGrpSpPr"))
+    XML.SubElement(sp_tree, tag(DIAGRAM_DRAWING, "grpSpPr"))
+
+    next_id = 100
+    for sp, mid in zip(filtered_sps, assigned_model_ids):
+        dsp_sp = _smartart_convert_p_sp_to_dsp_sp(sp, mid, next_id, gf_x, gf_y)
+        sp_tree.append(dsp_sp)
+        next_id += 1
+
+    # Verify EVERY non-empty logical node in mutated_data is represented with matching text in new_drawing
+    pres_assoc_by_pres_id = {}
+    for p in pt_by_id.values():
+        if p.get("type") == "pres":
+            pr = p.find(tag(DIAGRAM, "prSet"))
+            if pr is not None and pr.get("presAssocID"):
+                pres_assoc_by_pres_id[p.get("modelId")] = pr.get("presAssocID")
+
+    rendered_texts_by_logical = {}
+    for dsp_sp in sp_tree.findall(tag(DIAGRAM_DRAWING, "sp")):
+        mid = dsp_sp.get("modelId")
+        assoc = pres_assoc_by_pres_id.get(mid)
+        txt = text_content(dsp_sp, DRAWING).strip()
+        if assoc and txt:
+            rendered_texts_by_logical.setdefault(assoc, []).append(txt)
+
+    for nid, expected_txt in logical_text_by_id.items():
+        if not expected_txt:
+            continue
+        rendered_list = rendered_texts_by_logical.get(nid, [])
+        if expected_txt not in rendered_list:
+            return None
+
+    return new_drawing
+
+
+def _smartart_mutate_data_model(data, layout_id, operation):
+    """Mutate dgm:dataModel logical nodes, connections, and presentation tree (pres / presOf / presParOf)."""
+    pt_lst = data.find(tag(DIAGRAM, "ptLst"))
+    cxn_lst = data.find(tag(DIAGRAM, "cxnLst"))
+    if pt_lst is None or cxn_lst is None:
+        raise UnsupportedByFormatError("SmartArt data model is missing ptLst or cxnLst.")
+
+    pts = list(pt_lst.findall(tag(DIAGRAM, "pt")))
+    cxns = list(cxn_lst.findall(tag(DIAGRAM, "cxn")))
+    doc_pts = [p for p in pts if p.get("type") == "doc"]
+    if len(doc_pts) != 1:
+        raise UnsupportedByFormatError("SmartArt diagram does not have a single document root.")
+    doc_id = doc_pts[0].get("modelId")
+    pt_by_id = {p.get("modelId"): p for p in pts}
+
+    mode = operation["mode"]
+    logical_pts = [p for p in pts if p.get("type") in (None, "node")]
+    par_cxns = [c for c in cxns if c.get("type") in (None, "parOf")]
+    pres_of_cxns = [c for c in cxns if c.get("type") == "presOf"]
+    pres_par_cxns = [c for c in cxns if c.get("type") == "presParOf"]
+
+    pres_id_attr = next((c.get("presId") for c in pres_of_cxns if c.get("presId")), None) or layout_id or ""
+
+    def _pres_ids_for_logical(lid):
+        return [c.get("destId") for c in pres_of_cxns if c.get("srcId") == lid and c.get("destId") in pt_by_id]
+
+    def _renumber_sibling_pres(parent_logical_id):
+        sib_cxns = [c for c in cxn_lst.findall(tag(DIAGRAM, "cxn")) if c.get("type") in (None, "parOf") and c.get("srcId") == parent_logical_id]
+        sib_cxns.sort(key=lambda c: int(c.get("srcOrd", "0")))
+        for idx, c in enumerate(sib_cxns):
+            c.set("srcOrd", str(idx))
+        sib_ids = [c.get("destId") for c in sib_cxns]
+        cur_pts = {p.get("modelId"): p for p in pt_lst.findall(tag(DIAGRAM, "pt"))}
+        cur_pres_of = [c for c in cxn_lst.findall(tag(DIAGRAM, "cxn")) if c.get("type") == "presOf"]
+
+        # Group sibling pres points by positional slot (e.g. slot 0 = circN, slot 1 = circNTx)
+        sib_pres_lists = []
+        for sid in sib_ids:
+            pids = [c.get("destId") for c in sorted(
+                (c for c in cur_pres_of if c.get("srcId") == sid and c.get("destId") in cur_pts),
+                key=lambda c: int(c.get("srcOrd", "0")),
+            )]
+            sib_pres_lists.append([cur_pts[pid] for pid in pids])
+
+        if not sib_pres_lists or not sib_pres_lists[0]:
+            return
+
+        # Re-index presStyleIdx / presStyleCnt by presStyleLbl and renumber ordinal presName patterns (e.g. circ1..circN)
+        max_slots = max(len(lst) for lst in sib_pres_lists)
+        for slot in range(max_slots):
+            slot_pts = [lst[slot] for lst in sib_pres_lists if slot < len(lst)]
+            slot_prsets = [p.find(tag(DIAGRAM, "prSet")) for p in slot_pts]
+            valid_prsets = [pr for pr in slot_prsets if pr is not None]
+            if not valid_prsets:
+                continue
+            # Detect ordinal presName pattern like circ1..circN or circ1Tx..circNTx
+            matches = [SMARTART_ORDINAL_PRES_NAME_RE.match(pr.get("presName", "")) for pr in valid_prsets]
+            if all(m is not None for m in matches):
+                prefixes = {(m.group(1), m.group(3)) for m in matches}
+                if len(prefixes) == 1:
+                    pfx, sfx = next(iter(prefixes))
+                    for idx, pr in enumerate(valid_prsets, start=1):
+                        pr.set("presName", f"{pfx}{idx}{sfx}")
+            # Re-index presStyleIdx and presStyleCnt when siblings share a positive presStyleCnt
+            style_lbls = {pr.get("presStyleLbl") for pr in valid_prsets if pr.get("presStyleLbl")}
+            if len(style_lbls) == 1 and any(int(pr.get("presStyleCnt", "0")) > 0 for pr in valid_prsets if (pr.get("presStyleCnt") or "").isdigit()):
+                for idx, pr in enumerate(valid_prsets):
+                    pr.set("presStyleIdx", str(idx))
+                    pr.set("presStyleCnt", str(len(valid_prsets)))
+
+        # Re-index presParOf srcOrd per parent pres node in logical sibling order
+        parent_pres_groups = {}
+        for c in cxn_lst.findall(tag(DIAGRAM, "cxn")):
+            if c.get("type") == "presParOf":
+                parent_pres_groups.setdefault(c.get("srcId"), []).append(c)
+        sib_pres_rank = {}
+        rank = 0
+        for lst in sib_pres_lists:
+            for p in lst:
+                sib_pres_rank[p.get("modelId")] = rank
+                rank += 1
+        for p_src, group_cxns in parent_pres_groups.items():
+            if any(c.get("destId") in sib_pres_rank for c in group_cxns):
+                group_cxns.sort(key=lambda c: (0, sib_pres_rank[c.get("destId")]) if c.get("destId") in sib_pres_rank else (1, int(c.get("srcOrd", "0"))))
+                for idx, c in enumerate(group_cxns):
+                    c.set("srcOrd", str(idx))
+
+    if mode == "add":
+        text = operation.get("text", "")
+        if not isinstance(text, str) or not text.strip() or len(text) > 2000 or "\r" in text or "\n" in text:
+            raise ValueError("Adding a SmartArt node requires a nonempty, single-line text label")
+        if len(logical_pts) >= 30:
+            raise ValueError("SmartArt node count exceeds safe limit (30)")
+        parent_id = operation.get("parentNodeId") or doc_id
+        if parent_id != doc_id and (parent_id not in pt_by_id or pt_by_id[parent_id].get("type") not in (None, "node")):
+            raise ValueError("Unknown SmartArt parentNodeId")
+
+        sib_cxns = [c for c in par_cxns if c.get("srcId") == parent_id]
+        sib_cxns.sort(key=lambda c: int(c.get("srcOrd", "0")))
+        insert_idx = bounded_integer(operation.get("index", len(sib_cxns)), 0, len(sib_cxns))
+
+        # Find a template sibling logical node under the same parent (or any non-doc node with pres points)
+        tpl_id = sib_cxns[min(insert_idx, len(sib_cxns) - 1)].get("destId") if sib_cxns else None
+        if tpl_id is None:
+            # Adding first child to a hierarchy node: look for any existing non-root child node as template
+            tpl_id = next((c.get("destId") for c in par_cxns if c.get("srcId") != doc_id and _pres_ids_for_logical(c.get("destId"))), None)
+        if tpl_id is None or tpl_id not in pt_by_id:
+            raise UnsupportedByFormatError("SmartArt diagram has no sibling template node to clone presentation structure.")
+
+        new_node_id = "{" + str(uuid.uuid4()).upper() + "}"
+        new_par_tid = "{" + str(uuid.uuid4()).upper() + "}"
+        new_sib_tid = "{" + str(uuid.uuid4()).upper() + "}"
+
+        new_node_pt = deepcopy(pt_by_id[tpl_id])
+        new_node_pt.set("modelId", new_node_id)
+        if not list(new_node_pt.iter(tag(DRAWING, "t"))):
+            t_el = new_node_pt.find(tag(DIAGRAM, "t"))
+            if t_el is None:
+                t_el = XML.SubElement(new_node_pt, tag(DIAGRAM, "t"))
+                XML.SubElement(t_el, tag(DRAWING, "bodyPr"))
+                XML.SubElement(t_el, tag(DRAWING, "lstStyle"))
+            p_el = t_el.find(tag(DRAWING, "p"))
+            if p_el is None:
+                p_el = XML.SubElement(t_el, tag(DRAWING, "p"))
+            r_el = XML.SubElement(p_el, tag(DRAWING, "r"))
+            XML.SubElement(r_el, tag(DRAWING, "t")).text = text
+        else:
+            _set_smartart_shape_text(new_node_pt, text)
+        pt_lst.append(new_node_pt)
+        pt_lst.append(XML.Element(tag(DIAGRAM, "pt"), modelId=new_par_tid, type="parTrans"))
+        pt_lst.append(XML.Element(tag(DIAGRAM, "pt"), modelId=new_sib_tid, type="sibTrans"))
+
+        # Shift existing sibling srcOrd >= insert_idx
+        for c in sib_cxns:
+            ord_val = int(c.get("srcOrd", "0"))
+            if ord_val >= insert_idx:
+                c.set("srcOrd", str(ord_val + 1))
+
+        XML.SubElement(
+            cxn_lst, tag(DIAGRAM, "cxn"),
+            modelId="{" + str(uuid.uuid4()).upper() + "}",
+            srcId=parent_id, destId=new_node_id,
+            srcOrd=str(insert_idx), destOrd="0",
+            parTransId=new_par_tid, sibTransId=new_sib_tid,
+        )
+
+        # Clone ALL pres points associated with tpl_id via presOf and attach to same parent pres node(s)
+        tpl_pres_cxns = sorted(
+            (c for c in pres_of_cxns if c.get("srcId") == tpl_id and c.get("destId") in pt_by_id),
+            key=lambda c: int(c.get("srcOrd", "0")),
+        )
+        old_to_new_pres = {}
+        for tpc in tpl_pres_cxns:
+            old_pid = tpc.get("destId")
+            new_pid = "{" + str(uuid.uuid4()).upper() + "}"
+            old_to_new_pres[old_pid] = new_pid
+            cloned_pres = deepcopy(pt_by_id[old_pid])
+            cloned_pres.set("modelId", new_pid)
+            for pr in cloned_pres.findall(tag(DIAGRAM, "prSet")):
+                pr.set("presAssocID", new_node_id)
+            pt_lst.append(cloned_pres)
+            XML.SubElement(
+                cxn_lst, tag(DIAGRAM, "cxn"),
+                modelId="{" + str(uuid.uuid4()).upper() + "}",
+                type="presOf", srcId=new_node_id, destId=new_pid,
+                srcOrd=tpc.get("srcOrd", "0"), destOrd="0", presId=tpc.get("presId", pres_id_attr),
+            )
+        # Replicate presParOf relationships for cloned pres points
+        for ppc in pres_par_cxns:
+            old_dst = ppc.get("destId")
+            if old_dst in old_to_new_pres:
+                old_src = ppc.get("srcId")
+                new_src = old_to_new_pres.get(old_src, old_src)
+                XML.SubElement(
+                    cxn_lst, tag(DIAGRAM, "cxn"),
+                    modelId="{" + str(uuid.uuid4()).upper() + "}",
+                    type="presParOf", srcId=new_src, destId=old_to_new_pres[old_dst],
+                    srcOrd=str(int(ppc.get("srcOrd", "0")) + 1), destOrd="0",
+                    presId=ppc.get("presId", pres_id_attr),
+                )
+
+        _renumber_sibling_pres(parent_id)
+        return new_node_id
+
+    # mode == "remove"
+    target_id = operation.get("nodeId")
+    if target_id is None:
+        parent_id = operation.get("parentNodeId") or doc_id
+        sib_cxns = sorted((c for c in par_cxns if c.get("srcId") == parent_id), key=lambda c: int(c.get("srcOrd", "0")))
+        if not sib_cxns:
+            raise ValueError("No SmartArt nodes found under parent")
+        rm_idx = bounded_integer(operation.get("index", len(sib_cxns) - 1), 0, len(sib_cxns) - 1)
+        target_id = sib_cxns[rm_idx].get("destId")
+
+    if target_id not in pt_by_id or pt_by_id[target_id].get("type") not in (None, "node"):
+        raise ValueError("Unknown SmartArt nodeId")
+
+    # Collect target_id + any descendant logical nodes
+    drop_logical = set()
+    stack = [target_id]
+    while stack:
+        cur = stack.pop()
+        if cur in drop_logical:
+            continue
+        drop_logical.add(cur)
+        for c in par_cxns:
+            if c.get("srcId") == cur and c.get("destId"):
+                stack.append(c.get("destId"))
+
+    remaining_logical = [p for p in logical_pts if p.get("modelId") not in drop_logical]
+    if not remaining_logical:
+        raise ValueError("SmartArt diagram must retain at least one node")
+
+    parent_cxn = next((c for c in par_cxns if c.get("destId") == target_id), None)
+    parent_id = parent_cxn.get("srcId") if parent_cxn is not None else doc_id
+
+    # Collect transition & presentation points belonging to dropped logical nodes
+    drop_ids = set(drop_logical)
+    for c in par_cxns:
+        if c.get("destId") in drop_logical:
+            if c.get("parTransId"):
+                drop_ids.add(c.get("parTransId"))
+            if c.get("sibTransId"):
+                drop_ids.add(c.get("sibTransId"))
+    pres_stack = [c.get("destId") for c in pres_of_cxns if c.get("srcId") in drop_ids and c.get("destId")]
+    while pres_stack:
+        pid = pres_stack.pop()
+        if pid in drop_ids:
+            continue
+        drop_ids.add(pid)
+        for c in pres_par_cxns:
+            if c.get("srcId") == pid and c.get("destId"):
+                pres_stack.append(c.get("destId"))
+
+    for p in list(pt_lst.findall(tag(DIAGRAM, "pt"))):
+        if p.get("modelId") in drop_ids:
+            pt_lst.remove(p)
+    for c in list(cxn_lst.findall(tag(DIAGRAM, "cxn"))):
+        if c.get("srcId") in drop_ids or c.get("destId") in drop_ids:
+            cxn_lst.remove(c)
+
+    _renumber_sibling_pres(parent_id)
+    return target_id
+
+
+def _edit_smartart_linear_fallback(data, drawing, classification, operation):
+    """Deterministic 1D geometric reflow fallback for linear lists/processes without LibreOffice-computable layoutDef."""
     pt_lst = data.find(tag(DIAGRAM, "ptLst"))
     cxn_lst = data.find(tag(DIAGRAM, "cxnLst"))
     sp_tree = drawing.find(tag(DIAGRAM_DRAWING, "spTree"))
@@ -3596,18 +4313,15 @@ def edit_smartart_add_or_remove_node(package, operation, slide_root, replacement
         raise UnsupportedByFormatError("SmartArt diagram does not have a single document root.")
     doc_id = doc_pts[0].get("modelId")
 
-    # Ensure single-level tree: every logical node must attach directly under doc_id
     logical_pts = [p for p in pts if p.get("type") in (None, "node")]
     par_cxns = [c for c in cxns if c.get("type") in (None, "parOf")]
     child_par_cxns = [c for c in par_cxns if c.get("srcId") == doc_id]
     if len(child_par_cxns) != len(logical_pts) or len(logical_pts) < 1:
-        raise UnsupportedByFormatError("SmartArt diagram has nested multi-level nodes; only single-level linear lists/processes are supported.")
+        raise UnsupportedByFormatError("SmartArt diagram has nested multi-level nodes and no computable layoutDef.")
     child_par_cxns.sort(key=lambda c: int(c.get("srcOrd", "0")))
-    ordered_node_ids = [c.get("destId") for c in child_par_cxns]
     pt_by_id = {p.get("modelId"): p for p in pts}
     sp_by_model = {sp.get("modelId"): sp for sp in sp_tree.findall(tag(DIAGRAM_DRAWING, "sp"))}
 
-    # Map each logical node to its unique pres point & display shape (must be 1:1)
     pres_by_assoc = {}
     for p in pts:
         if p.get("type") == "pres":
@@ -3620,7 +4334,7 @@ def edit_smartart_add_or_remove_node(package, operation, slide_root, replacement
         nid = cxn.get("destId")
         pres_list = [p for p in pres_by_assoc.get(nid, []) if p.get("modelId") in sp_by_model]
         if len(pres_list) != 1:
-            raise UnsupportedByFormatError("SmartArt nodes must map 1:1 to display shapes for safe reflow.")
+            raise UnsupportedByFormatError("SmartArt nodes must map 1:1 to display shapes for fallback linear reflow.")
         sp = sp_by_model[pres_list[0].get("modelId")]
         rect = _smartart_sp_rect(sp)
         if rect is None:
@@ -3629,20 +4343,13 @@ def edit_smartart_add_or_remove_node(package, operation, slide_root, replacement
         sib_pres_list = [p for p in pres_by_assoc.get(sib_tid, []) if p.get("modelId") in sp_by_model] if sib_tid else []
         sib_sp = sp_by_model[sib_pres_list[0].get("modelId")] if len(sib_pres_list) == 1 else None
         node_records.append({
-            "node_id": nid,
-            "node_pt": pt_by_id[nid],
-            "par_cxn": cxn,
-            "par_trans_id": cxn.get("parTransId"),
-            "sib_trans_id": sib_tid,
-            "pres_pt": pres_list[0],
-            "sp": sp,
-            "rect": rect,
+            "node_id": nid, "node_pt": pt_by_id[nid], "par_cxn": cxn,
+            "par_trans_id": cxn.get("parTransId"), "sib_trans_id": sib_tid,
+            "pres_pt": pres_list[0], "sp": sp, "rect": rect,
             "sib_pres_pt": sib_pres_list[0] if len(sib_pres_list) == 1 else None,
-            "sib_sp": sib_sp,
-            "sib_rect": _smartart_sp_rect(sib_sp) if sib_sp is not None else None,
+            "sib_sp": sib_sp, "sib_rect": _smartart_sp_rect(sib_sp) if sib_sp is not None else None,
         })
 
-    # Detect monotonic 1D axis (horizontal vs vertical) and total bounding envelope
     rects = [rec["rect"] for rec in node_records]
     all_rects = list(rects) + [rec["sib_rect"] for rec in node_records if rec["sib_rect"] is not None]
     env_x0 = min(r[0] for r in all_rects)
@@ -3656,7 +4363,6 @@ def edit_smartart_add_or_remove_node(package, operation, slide_root, replacement
         dx_span = max(r[0] for r in rects) - min(r[0] for r in rects)
         dy_span = max(r[1] for r in rects) - min(r[1] for r in rects)
         axis = "horizontal" if dx_span >= dy_span else "vertical"
-        # Verify monotonic ordering along chosen axis (guards against 2D grids/circles)
         coords = [r[0] if axis == "horizontal" else r[1] for r in rects]
         if any(coords[i] >= coords[i + 1] for i in range(len(coords) - 1)):
             raise UnsupportedByFormatError("SmartArt shapes are not monotonically ordered along a single axis.")
@@ -3665,12 +4371,13 @@ def edit_smartart_add_or_remove_node(package, operation, slide_root, replacement
 
     pres_root_cxn = next((c for c in cxns if c.get("type") == "presOf" and c.get("srcId") == doc_id), None)
     pres_root_id = pres_root_cxn.get("destId") if pres_root_cxn is not None else None
-    lo_type = classification["layout"]
+    lo_type = classification["layout"] or ""
     has_arrows = any(rec["sib_sp"] is not None for rec in node_records)
     arrow_template_sp = next((rec["sib_sp"] for rec in node_records if rec["sib_sp"] is not None), None)
     arrow_template_pres = next((rec["sib_pres_pt"] for rec in node_records if rec["sib_pres_pt"] is not None), None)
     arrow_template_rect = next((rec["sib_rect"] for rec in node_records if rec["sib_rect"] is not None), None)
 
+    mode = operation["mode"]
     if mode == "add":
         text = operation.get("text", "")
         if not isinstance(text, str) or not text.strip() or len(text) > 2000 or "\r" in text or "\n" in text:
@@ -3727,13 +4434,12 @@ def edit_smartart_add_or_remove_node(package, operation, slide_root, replacement
         _set_smartart_shape_text(new_sp, text)
         sp_tree.append(new_sp)
 
-        new_rec = {
+        node_records.insert(insert_idx, {
             "node_id": new_node_id, "node_pt": new_node_pt, "par_cxn": new_par_cxn,
             "par_trans_id": new_par_tid, "sib_trans_id": new_sib_tid,
             "pres_pt": new_pres_pt, "sp": new_sp, "rect": tpl["rect"],
             "sib_pres_pt": None, "sib_sp": None, "sib_rect": None,
-        }
-        node_records.insert(insert_idx, new_rec)
+        })
     else:
         if len(node_records) <= 1:
             raise ValueError("SmartArt diagram must retain at least one node")
@@ -3762,7 +4468,6 @@ def edit_smartart_add_or_remove_node(package, operation, slide_root, replacement
         if removed_rec["sib_sp"] is not None and removed_rec["sib_sp"] in list(sp_tree):
             sp_tree.remove(removed_rec["sib_sp"])
 
-    # Synchronize sibling transition connectors (exactly N-1 arrows for linear_process with arrows)
     if has_arrows and arrow_template_sp is not None and arrow_template_pres is not None:
         used_ids = {int(n.get("id", "0")) for n in sp_tree.iter(tag(DIAGRAM_DRAWING, "cNvPr")) if (n.get("id") or "").isdigit()}
         next_sp_id = max([10] + list(used_ids)) + 1
@@ -3811,7 +4516,6 @@ def edit_smartart_add_or_remove_node(package, operation, slide_root, replacement
                 rec["sib_sp"] = None
                 rec["sib_pres_pt"] = None
 
-    # Re-sequence srcOrd on parent connections and presentation connections
     for idx, rec in enumerate(node_records):
         rec["par_cxn"].set("srcOrd", str(idx))
     pres_order_ids = []
@@ -3824,7 +4528,6 @@ def edit_smartart_add_or_remove_node(package, operation, slide_root, replacement
         if c.get("type") == "presParOf" and c.get("destId") in pres_ord_map:
             c.set("srcOrd", str(pres_ord_map[c.get("destId")]))
 
-    # Recalculate clean, non-overlapping linear geometry inside original bounding envelope
     n = len(node_records)
     arrow_count = sum(1 for rec in node_records if rec["sib_sp"] is not None)
     if axis == "horizontal":
@@ -3860,6 +4563,97 @@ def edit_smartart_add_or_remove_node(package, operation, slide_root, replacement
             else:
                 cursor += gap
 
+
+def edit_smartart_add_or_remove_node(package, operation, slide_root, replacements, additions=None):
+    """Add or remove a SmartArt node using LibreOffice DIAGRAM_IGNORE_EXTDRAWINGS layoutDef recalculation
+    and drawing cache regeneration (with deterministic 1D reflow fallback for stub layoutDef linear diagrams).
+    """
+    slide_part = operation["slidePart"]
+    data_part = operation["dataPart"]
+    mode = operation.get("mode")
+    if mode not in {"add", "remove"}:
+        raise ValueError("SmartArt add_or_remove_node requires mode 'add' or 'remove'")
+    parts = _resolve_smartart_parts(package, slide_part, slide_root, data_part, replacements, require_drawing=False)
+    data = parts["data"]
+    drawing = parts["drawing"]
+    drawing_part = parts["drawing_part"]
+    layout_root = parts["layout"]
+    graphic_frame = parts["graphic_frame"]
+
+    classification = classify_smartart_layout(data, drawing, layout_root)
+    if not classification["supportsNodeAddRemove"]:
+        raise UnsupportedByFormatError(classification["reason"])
+
+    # Enforce layoutDef chMax upper bound for top-level children when adding a node
+    if mode == "add" and classification["chMax"] is not None:
+        doc_pt = next((p for p in data.iter(tag(DIAGRAM, "pt")) if p.get("type") == "doc"), None)
+        doc_id = doc_pt.get("modelId") if doc_pt is not None else None
+        parent_id = operation.get("parentNodeId") or doc_id
+        if doc_id and parent_id == doc_id:
+            cur_top = sum(
+                1 for c in data.iter(tag(DIAGRAM, "cxn"))
+                if c.get("type") in (None, "parOf") and c.get("srcId") == doc_id
+            )
+            if cur_top >= classification["chMax"]:
+                raise UnsupportedByFormatError(
+                    f"SmartArt layout '{classification['family']}' supports at most {classification['chMax']} top-level nodes (layoutDef chMax={classification['chMax']})."
+                )
+
+    if classification["engine"] == "libreoffice_layout_def":
+        mutated_data = deepcopy(data)
+        _smartart_mutate_data_model(mutated_data, classification["layout"], operation)
+        new_drawing = _recalculate_smartart_drawing_via_libreoffice(
+            package, slide_part, slide_root, graphic_frame, data_part, mutated_data, drawing_part, replacements
+        )
+        if new_drawing is not None:
+            if drawing_part is None:
+                if additions is None:
+                    raise UnsupportedByFormatError("SmartArt diagram lacks a drawing part and cannot register one.")
+                # Register a new ppt/diagrams/drawingN.xml part, relationship, content type, and dataModelExt
+                existing_names = set(package.namelist()) | set(additions) | set(replacements)
+                idx = 1
+                while f"ppt/diagrams/drawing{idx}.xml" in existing_names:
+                    idx += 1
+                drawing_part = f"ppt/diagrams/drawing{idx}.xml"
+                slide_rels_part = str(PurePosixPath(slide_part).parent / "_rels" / (PurePosixPath(slide_part).name + ".rels"))
+                rels_root = load_edit_part(package, replacements, additions, slide_rels_part)
+                used_rids = {r.get("Id") for r in rels_root}
+                r_num = 1
+                while f"rId{r_num}" in used_rids:
+                    r_num += 1
+                new_rid = f"rId{r_num}"
+                XML.SubElement(
+                    rels_root, tag(PACKAGE_REL, "Relationship"),
+                    Id=new_rid,
+                    Type="http://schemas.microsoft.com/office/2007/relationships/diagramDrawing",
+                    Target=f"../diagrams/drawing{idx}.xml",
+                )
+                ct_root = load_edit_part(package, replacements, additions, "[Content_Types].xml")
+                XML.SubElement(
+                    ct_root, tag(CONTENT_TYPES, "Override"),
+                    PartName="/" + drawing_part,
+                    ContentType="application/vnd.ms-office.drawingml.diagramDrawing+xml",
+                )
+                ext_lst = mutated_data.find(tag(DIAGRAM, "extLst"))
+                if ext_lst is None:
+                    ext_lst = XML.SubElement(mutated_data, tag(DIAGRAM, "extLst"))
+                ext = XML.SubElement(ext_lst, tag(DRAWING, "ext"), uri="http://schemas.microsoft.com/office/drawing/2008/diagram")
+                XML.SubElement(ext, tag(DIAGRAM_DRAWING, "dataModelExt"), relId=new_rid, minVer="http://schemas.openxmlformats.org/drawingml/2006/diagram")
+                additions[drawing_part] = new_drawing
+            else:
+                replacements[drawing_part] = new_drawing
+            replacements[data_part] = mutated_data
+            return
+
+        # LibreOffice could not recalculate all nodes for this layoutDef; allow fallback ONLY for linear list/process
+        if classification["family"] not in {"linear_list", "linear_process"} or drawing is None or drawing_part is None:
+            raise UnsupportedByFormatError(
+                f"LibreOffice layoutDef recalculation could not lay out all nodes for SmartArt layout '{classification['family']}'."
+            )
+
+    if drawing is None or drawing_part is None:
+        raise UnsupportedByFormatError("SmartArt drawing cache is missing for linear fallback reflow.")
+    _edit_smartart_linear_fallback(data, drawing, classification, operation)
     replacements[data_part] = data
     replacements[drawing_part] = drawing
 
@@ -4476,7 +5270,7 @@ def edit_presentation(package, operations, output):
             edit_smartart_text(package, operation, root, replacements)
             continue
         if op == "pptx.smartart.add_or_remove_node":
-            edit_smartart_add_or_remove_node(package, operation, root, replacements)
+            edit_smartart_add_or_remove_node(package, operation, root, replacements, additions)
             continue
         tree = root.find(".//" + tag(PRESENTATION, "spTree"))
         if op in {"pptx.add_shape", "pptx.add_image", "pptx.add_table"}:
@@ -4978,7 +5772,7 @@ def export_presentation_image(package, replacements, name, dimensions):
     return slide.with_suffix(".png")
 
 
-def alpha_from_black_white(black_path, white_path, output, dimensions):
+def alpha_from_black_white(black_path, white_path, output, dimensions, allow_empty=False):
     from PIL import Image, ImageChops, ImageMath, PngImagePlugin
 
     with Image.open(black_path) as black, Image.open(white_path) as white:
@@ -4990,7 +5784,12 @@ def alpha_from_black_white(black_path, white_path, output, dimensions):
     deltas = [ImageChops.subtract(light, dark) for light, dark in zip(white_channels, black_channels)]
     delta = ImageChops.lighter(deltas[0], ImageChops.lighter(deltas[1], deltas[2]))
     alpha = ImageChops.invert(delta)
-    if alpha.getextrema() == (255, 255) or alpha.getbbox() is None:
+    if alpha.getextrema() == (255, 255):
+        raise ValueError("LibreOffice did not produce an isolatable sprite")
+    if alpha.getbbox() is None:
+        if allow_empty:
+            Image.new("RGBA", alpha.size, (0, 0, 0, 0)).save(output, format="PNG")
+            return
         raise ValueError("LibreOffice did not produce an isolatable sprite")
 
     def straight(channel):
@@ -5047,7 +5846,7 @@ def render_presentation_layer(package, request, output):
     black = export_presentation_image(package, replacements, "sprite-black", dimensions)
     solid_slide_background(slide, "FFFFFF")
     white = export_presentation_image(package, replacements, "sprite-white", dimensions)
-    alpha_from_black_white(black, white, output, dimensions)
+    alpha_from_black_white(black, white, output, dimensions, allow_empty=bool(request.get("allowEmpty")))
     crop_png_region(output, request.get("region"), page_size_pt=page_size_pt)
 
 
@@ -5229,66 +6028,208 @@ def verify_pptx_text_overflow(package, main, pages, result, finding):
                                 "warning", "pptx_rendered_text_overflow", f"{slide['part']}#{sid}",
                                 f"Rendered word '{w_text[:32]}' extends past shape bounds ({g['x']:.1f},{g['y']:.1f},{g['width']:.1f}x{g['height']:.1f}pt).",
                             )
+    checked_slides = min(len(slides), 20)
+    overflow_status = "failed" if overflow_shapes else ("unverified" if len(slides) > checked_slides else "passed")
     result(
         "text_overflow",
-        "failed" if overflow_shapes else "passed",
-        f"Checked {checked_shapes} text shape(s) across {min(len(slides), 20)} slide(s); overflow detections: {overflow_shapes}.",
+        overflow_status,
+        f"Checked {checked_shapes} text shape(s) across {checked_slides}/{len(slides)} slide(s); overflow detections: {overflow_shapes}.",
     )
 
 
-def verify_pptx_layer_visual_consistency(package, main, result, finding):
+def verify_pptx_layer_visual_consistency(package, main, result, finding, verify_options=None):
     """Server-side layer-decomposition visual consistency check (background + sprites vs full LibreOffice slide PNG).
     Distinct from PR 3A's browser UI canvas visual fidelity gate.
+    Supports arbitrary target slideIndices under bounded resource controls and never reports partial coverage as whole-document passed.
     """
-    if not shutil.which("libreoffice"):
-        result("layer_visual_consistency", "unverified", "LibreOffice is unavailable for server-side layer visual consistency check.")
-        return
-    from PIL import Image
+    import time
+
     slides = presentation_slides(package, main)
-    sampled = 0
-    min_ssim = 1.0
-    max_mae = 0.0
-    failed = 0
-    for slide_idx, slide in enumerate(slides[:2]):
+    total_slides = len(slides)
+    opts = verify_options if isinstance(verify_options, dict) else {}
+
+    if not shutil.which("libreoffice"):
+        slide_entries = [
+            {"slideIndex": idx, "part": s["part"], "status": "unverified", "reason": "LibreOffice is unavailable."}
+            for idx, s in enumerate(slides)
+        ]
+        result(
+            "layer_visual_consistency",
+            "unverified",
+            f"LibreOffice is unavailable for server-side layer visual consistency check ({total_slides} slide(s) unverified).",
+        )
+        return {
+            "verificationLayer": "server_side_layer_decomposition",
+            "scope": "none",
+            "totalSlides": total_slides,
+            "targetSlides": [],
+            "verifiedSlides": [],
+            "failedSlides": [],
+            "skippedByResourceLimitSlides": [],
+            "unverifiedSlides": list(range(total_slides)),
+            "minSsim": None,
+            "maxMae": None,
+            "slides": slide_entries,
+        }
+
+    raw_indices = opts.get("slideIndices")
+    explicit_targets = None
+    if raw_indices is not None:
+        if not isinstance(raw_indices, list) or len(raw_indices) == 0:
+            raise ValueError("verify options.slideIndices must be a non-empty list of slide indices")
+        explicit_targets = []
+        seen = set()
+        for raw_idx in raw_indices:
+            idx = bounded_integer(raw_idx, 0, max(0, total_slides - 1))
+            if idx not in seen:
+                seen.add(idx)
+                explicit_targets.append(idx)
+
+    max_slides = bounded_integer(opts.get("maxSlides", len(explicit_targets) if explicit_targets is not None else 5), 1, 50)
+    max_shapes = bounded_integer(opts.get("maxShapesPerSlide", 20), 1, 100)
+    max_total_sprites = 60
+    time_budget_sec = 25.0
+    target_order = explicit_targets if explicit_targets is not None else list(range(total_slides))
+    target_set = set(target_order)
+
+    from PIL import Image
+    started_at = time.monotonic()
+    sprites_rendered = 0
+    executed_slides = 0
+    slide_reports = {}
+
+    for idx, slide in enumerate(slides):
+        if idx not in target_set:
+            slide_reports[idx] = {
+                "slideIndex": idx,
+                "part": slide["part"],
+                "status": "unverified",
+                "reason": "Not included in requested slideIndices.",
+            }
+
+    for slide_idx in target_order:
+        slide = slides[slide_idx]
         content = parse_xml(package.read(slide["part"]))
         tree = content.find(".//" + tag(PRESENTATION, "spTree"))
         top_shapes = pptx_shape_order(tree)
-        if len(top_shapes) > 8:
+        shape_count = len(top_shapes)
+
+        if executed_slides >= max_slides:
+            slide_reports[slide_idx] = {
+                "slideIndex": slide_idx, "part": slide["part"], "status": "skipped_resource_limit",
+                "shapeCount": shape_count, "reason": f"Reached maxSlides budget ({max_slides}).",
+            }
             continue
-        sampled += 1
-        full_png = Path.cwd() / f"vis-full-{slide_idx}.png"
-        bg_png = Path.cwd() / f"vis-bg-{slide_idx}.png"
-        render_presentation_layer(package, {"format": "pptx", "action": "render", "pageIndex": slide_idx}, full_png)
-        render_presentation_layer(package, {"format": "pptx", "action": "render", "pageIndex": slide_idx, "variant": "background"}, bg_png)
-        with Image.open(bg_png) as bg_img:
-            composite = bg_img.convert("RGBA")
-        for sh in top_shapes:
-            sp_png = Path.cwd() / f"vis-sp-{slide_idx}-{sh['id']}.png"
-            render_presentation_layer(
-                package,
-                {"format": "pptx", "action": "render", "pageIndex": slide_idx, "variant": "sprite", "shapeId": int(sh["id"])},
-                sp_png,
-            )
-            with Image.open(sp_png) as sp_img:
-                composite.alpha_composite(sp_img.convert("RGBA"))
-        with Image.open(full_png) as ref_img:
-            ssim_val, mae_val = compute_image_ssim_and_mae(ref_img.convert("RGB"), composite.convert("RGB"))
-        min_ssim = min(min_ssim, ssim_val)
-        max_mae = max(max_mae, mae_val)
-        if ssim_val < 0.95:
-            failed += 1
+        if shape_count > max_shapes:
+            slide_reports[slide_idx] = {
+                "slideIndex": slide_idx, "part": slide["part"], "status": "skipped_resource_limit",
+                "shapeCount": shape_count, "reason": f"Slide has {shape_count} top-level shapes, exceeding maxShapesPerSlide ({max_shapes}).",
+            }
+            continue
+        if sprites_rendered + shape_count > max_total_sprites and executed_slides > 0:
+            slide_reports[slide_idx] = {
+                "slideIndex": slide_idx, "part": slide["part"], "status": "skipped_resource_limit",
+                "shapeCount": shape_count, "reason": f"Sprite render budget ({max_total_sprites}) would be exceeded.",
+            }
+            continue
+        if (time.monotonic() - started_at) > time_budget_sec and executed_slides > 0:
+            slide_reports[slide_idx] = {
+                "slideIndex": slide_idx, "part": slide["part"], "status": "skipped_resource_limit",
+                "shapeCount": shape_count, "reason": f"Verification time budget ({time_budget_sec:.0f}s) exceeded.",
+            }
+            continue
+
+        executed_slides += 1
+        try:
+            full_png = Path.cwd() / f"vis-full-{slide_idx}.png"
+            bg_png = Path.cwd() / f"vis-bg-{slide_idx}.png"
+            render_presentation_layer(package, {"format": "pptx", "action": "render", "pageIndex": slide_idx}, full_png)
+            render_presentation_layer(package, {"format": "pptx", "action": "render", "pageIndex": slide_idx, "variant": "background"}, bg_png)
+            with Image.open(bg_png) as bg_img:
+                composite = bg_img.convert("RGBA")
+            for sh in top_shapes:
+                sp_png = Path.cwd() / f"vis-sp-{slide_idx}-{sh['id']}.png"
+                render_presentation_layer(
+                    package,
+                    {"format": "pptx", "action": "render", "pageIndex": slide_idx, "variant": "sprite", "shapeId": int(sh["id"]), "allowEmpty": True},
+                    sp_png,
+                )
+                sprites_rendered += 1
+                with Image.open(sp_png) as sp_img:
+                    composite.alpha_composite(sp_img.convert("RGBA"))
+            with Image.open(full_png) as ref_img:
+                ssim_val, mae_val = compute_image_ssim_and_mae(ref_img.convert("RGB"), composite.convert("RGB"))
+        except Exception as exc:
+            slide_reports[slide_idx] = {
+                "slideIndex": slide_idx, "part": slide["part"], "status": "failed",
+                "shapeCount": shape_count, "reason": f"Layer render error: {exc}",
+            }
+            finding("error", "pptx_layer_visual_render_error", slide["part"], f"Failed rendering slide layers: {exc}")
+            continue
+
+        passed_slide = ssim_val >= 0.95
+        slide_reports[slide_idx] = {
+            "slideIndex": slide_idx,
+            "part": slide["part"],
+            "status": "verified" if passed_slide else "failed",
+            "shapeCount": shape_count,
+            "ssim": round(ssim_val, 4),
+            "mae": round(mae_val, 2),
+            "reason": (
+                f"Layer composite matched full LibreOffice PNG (SSIM={ssim_val:.4f} >= 0.95, MAE={mae_val:.2f}/255)."
+                if passed_slide else
+                f"Layer composite diverged from full LibreOffice PNG (SSIM={ssim_val:.4f} < 0.95, MAE={mae_val:.2f}/255)."
+            ),
+        }
+        if not passed_slide:
             finding(
                 "warning", "pptx_layer_visual_mismatch", slide["part"],
                 f"Layer-composited render diverged from full LibreOffice slide render (SSIM={ssim_val:.4f}, MAE={mae_val:.2f}).",
             )
-    if sampled == 0:
-        result("layer_visual_consistency", "unverified", "No sampled slides within shape budget for layer-composite SSIM check.")
-        return
+
+    ordered_reports = [slide_reports[idx] for idx in range(total_slides)]
+    verified_slides = [r["slideIndex"] for r in ordered_reports if r["status"] == "verified"]
+    failed_slides = [r["slideIndex"] for r in ordered_reports if r["status"] == "failed"]
+    skipped_slides = [r["slideIndex"] for r in ordered_reports if r["status"] == "skipped_resource_limit"]
+    unverified_slides = [r["slideIndex"] for r in ordered_reports if r["status"] == "unverified"]
+    measured = [r for r in ordered_reports if "ssim" in r]
+    min_ssim = min((r["ssim"] for r in measured), default=None)
+    max_mae = max((r["mae"] for r in measured), default=None)
+
+    all_slides_verified = total_slides > 0 and len(verified_slides) == total_slides and not failed_slides
+    if failed_slides:
+        check_status = "failed"
+    elif all_slides_verified:
+        check_status = "passed"
+    else:
+        # Partial slide verification (either due to explicit slideIndices subset or resource limits)
+        # MUST NOT be reported as whole-document passed.
+        check_status = "unverified"
+
+    scope = "full_deck" if all_slides_verified else ("selected_slides_partial" if explicit_targets is not None else "resource_bounded_partial")
+    metric_text = f"min SSIM={min_ssim:.4f}, max MAE={max_mae:.2f}/255" if min_ssim is not None else "no slides rendered"
     result(
         "layer_visual_consistency",
-        "failed" if failed else "passed",
-        f"Server-side layer-decomposition composite vs full LibreOffice PNG across {sampled} slide(s): min SSIM={min_ssim:.4f}, max MAE={max_mae:.2f}/255 (distinct from PR 3A UI canvas check).",
+        check_status,
+        (
+            f"Server-side layer-decomposition vs full LibreOffice PNG (distinct from PR 3A UI canvas check): "
+            f"verified={verified_slides}, failed={failed_slides}, skipped_resource_limit={skipped_slides}, "
+            f"unverified={unverified_slides} (total={total_slides}); {metric_text}."
+        ),
     )
+    return {
+        "verificationLayer": "server_side_layer_decomposition",
+        "scope": scope,
+        "totalSlides": total_slides,
+        "targetSlides": target_order,
+        "verifiedSlides": verified_slides,
+        "failedSlides": failed_slides,
+        "skippedByResourceLimitSlides": skipped_slides,
+        "unverifiedSlides": unverified_slides,
+        "minSsim": min_ssim,
+        "maxMae": max_mae,
+        "slides": ordered_reports,
+    }
 
 
 def verify_docx_layout_quality(package, main, pdf_path, pages, result, finding):
@@ -5458,9 +6399,10 @@ def verify_xlsx_text_truncation(package, source, result, finding):
     )
 
 
-def verify_office(package, source, fmt, names):
+def verify_office(package, source, fmt, names, verify_options=None):
     issues = []
     checks = []
+    extra_metrics = {}
 
     def result(identifier, status, evidence):
         checks.append({"id": identifier, "status": status, "evidence": evidence})
@@ -5519,9 +6461,35 @@ def verify_office(package, source, fmt, names):
                f"Top-level bounding boxes overlap in {overlaps} pairs. Intentional layering requires inspection.")
         verify_pptx_text_overflow(package, main, rendered_pages, result, finding)
         if safe_to_render:
-            verify_pptx_layer_visual_consistency(package, main, result, finding)
+            layer_summary = verify_pptx_layer_visual_consistency(
+                package, main, result, finding, verify_options=verify_options,
+            )
+            if layer_summary is not None:
+                extra_metrics["layerVisualConsistency"] = layer_summary
         else:
+            slides = presentation_slides(package, main)
             result("layer_visual_consistency", "unverified", "Rendering skipped because package has external links or active content.")
+            extra_metrics["layerVisualConsistency"] = {
+                "verificationLayer": "server_side_layer_decomposition",
+                "scope": "unverified_unsafe_package",
+                "totalSlides": len(slides),
+                "targetSlides": [],
+                "verifiedSlides": [],
+                "failedSlides": [],
+                "skippedByResourceLimitSlides": [],
+                "unverifiedSlides": list(range(len(slides))),
+                "minSsim": None,
+                "maxMae": None,
+                "slides": [
+                    {
+                        "slideIndex": idx,
+                        "part": slide["part"],
+                        "status": "unverified",
+                        "reason": "Rendering skipped because package has external links or active content.",
+                    }
+                    for idx, slide in enumerate(slides)
+                ],
+            }
     elif fmt == "docx":
         body = main.find(tag(WORD, "body"))
         sections = list(body.iter(tag(WORD, "sectPr"))) if body is not None else []
@@ -5552,9 +6520,10 @@ def verify_office(package, source, fmt, names):
             result("rendered_page_bounds", "unverified", "Rendering was skipped because the package has external links or active content.")
         else:
             verify_office_render(source, fmt, result, finding, pages=rendered_pages)
+    metrics = {"packageParts": len(names), **extra_metrics}
     return {"ok": not any(check["status"] == "failed" for check in checks),
             "coverage": "partial" if any(check["status"] == "unverified" for check in checks) else "complete",
-            "checks": checks, "issues": issues, "metrics": {"packageParts": len(names)}}
+            "checks": checks, "issues": issues, "metrics": metrics}
 
 
 def verify_slide_geometry(package, root, size, finding):
@@ -5835,23 +6804,56 @@ def process_document(request, source, output):
             edit_office_document(package, fmt, request["operations"], output)
             return None
         if action == "verify":
-            return verify_office(package, source, fmt, names)
+            return verify_office(package, source, fmt, names, verify_options=request.get("options"))
         if action == "range" and fmt == "xlsx":
             options = request["range"]
             result = read_workbook_range(package, options)
             if options.get("evaluate") is True and any("formulaStatus" in cell for cell in result["cells"]):
                 return evaluate_workbook_range(package, source, options, result)
             return result
-        main = parse_xml(package.read(MAIN_PART[fmt]))
         result = {"format": fmt, "packageParts": len(names),
                   "chartParts": sorted(name for name in names if re.fullmatch(r"(xl|ppt)/charts/[^/]+\.xml", name))}
-        if fmt == "xlsx" and action == "structure":
-            return {**result, "sheets": workbook_sheets(package)}
         if fmt == "docx" and action in {"structure", "range"}:
-            body = main.find(tag(WORD, "body"))
             options = request.get("range", {})
-            start = bounded_integer(options.get("start", 0), 0, len(body))
+            start = bounded_integer(options.get("start", 0), 0, 10_000_000)
             count = bounded_integer(options.get("count", 50), 1, 100)
+            body_tag = tag(WORD, "body")
+            blocks = []
+            block_count = 0
+            in_body = False
+            body_depth = 0
+            with package.open(MAIN_PART[fmt]) as doc_stream:
+                for event, elem in XML.iterparse(
+                    doc_stream, events=("start", "end"), resolve_entities=False, no_network=True,
+                ):
+                    if not in_body:
+                        if event == "start" and elem.tag == body_tag:
+                            in_body = True
+                            body_depth = 0
+                        continue
+                    if event == "start":
+                        body_depth += 1
+                    elif event == "end":
+                        if body_depth == 0 and elem.tag == body_tag:
+                            in_body = False
+                            break
+                        if body_depth == 1:
+                            if isinstance(elem.tag, str):
+                                if start <= block_count < start + count:
+                                    blocks.append({
+                                        "blockIndex": block_count,
+                                        "type": XML.QName(elem).localname,
+                                        "text": text_content(elem, WORD),
+                                    })
+                                block_count += 1
+                            elem.clear()
+                            parent = elem.getparent()
+                            if parent is not None:
+                                while elem.getprevious() is not None:
+                                    del parent[0]
+                        body_depth -= 1
+            if start > block_count:
+                raise ValueError("Start block index exceeds document block count")
             related = {}
             for family, filename, element, key in (
                 ("styles", "word/styles.xml", "style", "styleId"),
@@ -5863,11 +6865,16 @@ def process_document(request, source, output):
                     related[family] = [entry.get(tag(WORD, key)) for entry in entries
                                        if family != "styles" or entry.get(tag(WORD, "type")) == "paragraph"][:1000]
             related["headersAndFooters"] = sorted(part for part in names if re.fullmatch(r"word/(?:header|footer)[0-9]+\.xml", part))
-            return {**result, **related, "blockCount": len(body), "blocks": [
-                {"blockIndex": index, "type": XML.QName(node).localname, "text": text_content(node, WORD)}
-                for index, node in enumerate(body, start=0)
-                if start <= index < start + count and isinstance(node.tag, str)
-            ]}
+            return {
+                **result,
+                **related,
+                "blockCount": block_count,
+                "hasMore": start + len(blocks) < block_count,
+                "blocks": blocks,
+            }
+        main = parse_xml(package.read(MAIN_PART[fmt]))
+        if fmt == "xlsx" and action == "structure":
+            return {**result, "sheets": workbook_sheets(package)}
         if fmt == "pptx" and action in {"structure", "range"}:
             slides = presentation_slides(package, main)
             slide_parts = [slide["part"] for slide in slides]
@@ -5885,21 +6892,32 @@ def process_document(request, source, output):
             root = parse_xml(package.read(part))
             if part in diagrams:
                 drawing_root = None
+                layout_root = None
                 drawing_ids = [el.get("relId") for el in root.iter(tag(DIAGRAM_DRAWING, "dataModelExt"))]
-                if len(drawing_ids) == 1:
-                    for sp_part in slide_parts:
-                        rels = package_relationships(package, sp_part)
-                        if any(k.endswith("/diagramData") and v == part for k, v in rels.values()):
+                for sp_part in slide_parts:
+                    rels = package_relationships(package, sp_part)
+                    dm_rids = [rid for rid, (k, v) in rels.items() if k.endswith("/diagramData") and v == part]
+                    if dm_rids:
+                        if len(drawing_ids) == 1:
                             d_kind, d_part = rels.get(drawing_ids[0], ("", ""))
                             if d_kind.endswith("/diagramDrawing") and d_part in names:
                                 drawing_root = parse_xml(package.read(d_part))
-                                break
-                classification = classify_smartart_layout(root, drawing_root)
+                        sp_xml = parse_xml(package.read(sp_part))
+                        rel_el = next((el for el in sp_xml.iter(tag(DIAGRAM, "relIds")) if el.get(tag(OFFICE_REL, "dm")) == dm_rids[0]), None)
+                        if rel_el is not None:
+                            lo_rid = rel_el.get(tag(OFFICE_REL, "lo"))
+                            l_kind, l_part = rels.get(lo_rid or "", ("", ""))
+                            if l_kind.endswith("/diagramLayout") and l_part in names:
+                                layout_root = parse_xml(package.read(l_part))
+                        break
+                classification = classify_smartart_layout(root, drawing_root, layout_root)
                 return {
                     **result,
                     "part": part,
                     "layout": classification["layout"],
                     "layoutFamily": classification["family"],
+                    "layoutEngine": classification["engine"],
+                    "chMax": classification["chMax"],
                     "supportsNodeAddRemove": classification["supportsNodeAddRemove"],
                     "nodeAddRemoveReason": classification["reason"],
                     "nodes": [{"id": node.get("modelId"), "type": node.get("type"), "text": text_content(node, DRAWING)}

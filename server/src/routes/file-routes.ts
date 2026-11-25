@@ -659,8 +659,19 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const session = requireAuth(req, reply, db);
     if (!session) return;
     const { artifactId } = req.params as { artifactId: string };
+    const parsed = z
+      .object({
+        slideIndices: z.array(z.number().int().min(0).max(500)).max(50).optional(),
+        maxSlides: z.number().int().min(1).max(50).optional(),
+        maxShapesPerSlide: z.number().int().min(1).max(100).optional(),
+      })
+      .optional()
+      .safeParse(req.body ?? undefined);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'verify options が不正です。' });
+    }
     try {
-      return await artifactService.verifyArtifact(session.user.id, artifactId);
+      return await artifactService.verifyArtifact(session.user.id, artifactId, parsed.data);
     } catch (err) {
       return sendArtifactError(reply, err);
     }

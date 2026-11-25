@@ -8,15 +8,16 @@
 - **PR 3A / PR 3B / PR 4 境界**: 統合ビューアー UI（`web/src/components/ArtifactWorkspace/*`）・共通 UI コンポーネント（`web/src/components/shared-ui/*`）・旧 `ArtifactViewerModal.tsx` 撤去は設計書第 10 章に従い PR 3A 以降に属し、本 PR では前倒し実装を行わない。既存の `ArtifactService` 単一ゲートウェイ・`FormatAdapter` 隔離・`DocumentWorker` / `DocWorkerSandbox` アーキテクチャを維持する。
 - **ステータス 4 区分**:
   - **対応済み**: 設計書の要求仕様通りに実装・動作確認が完了。
-  - **部分実装**: コア機能または主要サブセットは実装・検証済みだが、形式固有の構造保護制約（例: SmartArt 線形図種のみノード増減対応、保護ノード非破壊拒否）や PR 3A 以降の UI 側未実装が残るもの。
+  - **部分実装**: コア機能または主要サブセットは実装・検証済みだが、形式固有の構造保護制約（例: SmartArt `chMax` 上限超過やスタブ `layoutDef` の安全拒否、保護ノード非破壊拒否）や PR 3A 以降の UI 側未実装が残るもの。
   - **未実装**: まだ未実装のもの（PR 3A / PR 3B / PR 4 で実装予定の UI・最終監査項目を含む。PR 2 必須バックエンド/MCP 機能に未実装残置は 0 件）。
   - **設計上許容された非対応**: 設計書 4.1〜4.3 節の形式方針または実ファイル技術調査に基づき、`unsupported_by_format` として非対応と確定したもの。
 
-### 検証環境区分（設計書 11.2 節）
+### 検証環境区分（設計書 11.2 節・未実行テスト非計上ルール）
 
-- **`VERIFIED (REAL RUNTIME)`**: 実 SQLite（`WAL` + `synchronous=FULL`）・実 FS・実 Streamable HTTP MCP サーバー・実ドキュメント/メディア/Web 処理ツール群（Python 3.12 / LibreOffice 24.2 Impress・Calc・Writer / `pdftoppm` / `pdftotext` / `qpdf` / `pandoc` / `rsvg-convert` / `ffmpeg` / Playwright Chromium + `mermaid` + `marked`）・実ビルド成果物による検証。
-- **`VERIFIED (MOCK / EMULATION)`**: 拡張モック ACP クライアントまたは Playwright ブラウザエミュレーションによる検証（実 `agy` および物理 iPhone の動作保証には含めない）。
-- **`UNVERIFIED (REQUIRES REAL AGY / PHYSICAL IPHONE)`**: CI/開発環境に `agy` バイナリおよび物理 iPhone が存在しないため、実稼働環境でのみ確定可能な検証項目（実 `agy` 向け再現スイート: `AGY_REAL_TEST=1 node scripts/verify-real-agy-artifact-mcp.mjs`）。
+- **`VERIFIED (REAL RUNTIME)`**: 実 SQLite（`WAL` + `synchronous=FULL`）・実 FS・実 Streamable HTTP MCP サーバー・実 **`bubblewrap` (`bwrap --unshare-all --unshare-net`) 厳格サンドボックス**・実ドキュメント/メディア/Web 処理ツール群（Python 3.12 / LibreOffice 24.2.7 Impress・Calc・Writer / `pdftoppm` / `pdftotext` / `qpdf` / `pandoc` / `rsvg-convert` / `ffmpeg` / Playwright Chromium + `mermaid` + `marked`）・実ビルド成果物による検証。
+  - 環境変数 `AGY_TEST_FULL_RUNTIME_DIR` が未設定の CI/Base 実行では、Full Runtime テストは `it.skipIf(...)` により明示的に **SKIPPED** 扱いとし、未実行テストを成功（passed）として計上しない。
+- **`VERIFIED (MOCK / EMULATION)`**: 拡張モック ACP クライアント（`agyMode: 'mock'`）またはブラウザエミュレーションによる検証（実 `agy`・実 Microsoft PowerPoint/Office デスクトップ・物理 iPhone の動作保証には含めない）。
+- **`UNVERIFIED`**: 開発/CI 環境（Linux コンテナ）に実バイナリ／実機が存在しないため未検証の項目。具体的には **(a) 実 `agy` バイナリ**（再現スイート: `AGY_REAL_TEST=1 node scripts/verify-real-agy-artifact-mcp.mjs`）、**(b) 実 Microsoft PowerPoint / Word / Excel デスクトップアプリでの再開封・再編集確認**、**(c) 物理 iPhone（iOS Safari / PWA）実機確認** はすべて `UNVERIFIED` として厳格に区別する。
 
 ---
 
@@ -26,45 +27,44 @@
 
 | 検証項目 | フェーズ | 責務・検証内容 | 実装箇所 |
 | --- | --- | --- | --- |
-| **PPTX 文字溢れ・枠外・重なり検査** | **PR 2（本 PR）** | 各図形の段落/フォントサイズ/行折り返しと `a:xfrm` 寸法からテキスト高さ超過（`PPTX_TEXT_OVERFLOW`）を算出し、スライド外はみ出し（`PPTX_SHAPE_OUT_OF_BOUNDS`）・図形重なり（`PPTX_SHAPE_OVERLAP`）と合わせて検出する。 | `server/scripts/artifact_doc_worker.py` (`verify_pptx_text_overflow`, `verify_document`) |
-| **PPTX サーバー側レイヤー分解視覚整合（SSIM / MAE）** | **PR 2（本 PR）** | `extract_pptx_slide_layers` が生成する背景プレート PNG と各透過スプライト PNG をサーバー側で合成し、LibreOffice Impress が出力した原本スライド全体 PNG とグレースケール 8×8 ブロック SSIM / MAE を比較検証する（チェック ID: `layer_visual_consistency`）。 | `server/scripts/artifact_doc_worker.py` (`verify_pptx_layer_visual_consistency`, `compute_image_ssim_and_mae`) |
-| **PPTX UI レイヤー分離キャンバス視覚一致（`UX-07`）** | **PR 3A（次フェーズ）** | ブラウザ上の `PptxModule.tsx` レイヤー分離キャンバス（背景プレート＋DOM/SVG 要素＋透過スプライト）の描画結果と、確定後 LibreOffice PNG との bbox＋SSIM 視覚一致およびゴースト 0 件を検証する。 | `web/src/components/ArtifactWorkspace/modules/PptxModule.tsx`（PR 3A） |
-| **DOCX レイアウト品質検査** | **PR 2（本 PR）** | `sectPr` 余白・ページ幅と表/図形幅の超過（`DOCX_MARGIN_OVERFLOW`）、過度な埋め込み画像サイズ（`DOCX_OVERSIZED_EMBED`）、LibreOffice PDF 出力の空白ページ（`DOCX_BLANK_PAGE`）および保護ノード・リンク整合を検査する（チェック ID: `docx_layout_quality`）。 | `server/scripts/artifact_doc_worker.py` (`verify_docx_layout_quality`) |
-| **XLSX 数式 4 区分評価・文字切れ検査** | **PR 2（本 PR）** | 隔離コピーの LibreOffice Calc 再計算で数式セルを `evaluated_lo` / `cached_existing` / `unevaluated_unsupported` / `error_formula` の 4 区分で評価し（`formula_values`）、さらに列幅メトリクス＋LibreOffice PDF 出力の `###` 検出により数値/文字列の文字切れ（`XLSX_TEXT_TRUNCATION`、`xlsx_text_truncation`）を検証する。 | `server/scripts/artifact_doc_worker.py` (`verify_workbook_formulas`, `verify_xlsx_text_truncation`) |
+| **PPTX 文字溢れ・枠外・重なり検査** | **PR 2（本 PR）** | 各図形の段落/フォントサイズ/行折り返しと `a:xfrm` 寸法からテキスト高さ超過（`PPTX_TEXT_OVERFLOW`）を算出し（20 スライド超過時は超過分を `unverified` 明示）、スライド外はみ出し（`PPTX_SHAPE_OUT_OF_BOUNDS`）・図形重なり（`PPTX_SHAPE_OVERLAP`）と合わせて検出する。 | `server/scripts/artifact_doc_worker.py` (`verify_pptx_text_overflow`, `verify_office`) |
+| **PPTX サーバー側レイヤー分解視覚整合（SSIM / MAE）** | **PR 2（本 PR）** | `render_presentation_layer` が生成する背景プレート PNG と各透過スプライト PNG（空プレースホルダーの透過扱い含む）をサーバー側で合成し、LibreOffice Impress が出力した原本スライド全体 PNG とグレースケール 8×8 ブロック SSIM / MAE を比較検証する（チェック ID: `layer_visual_consistency`、`verificationLayer: "server_side_layer_decomposition"`）。`options: { slideIndices, maxSlides, maxShapesPerSlide }` により任意スライドを対象化可能とし、各スライドを **`verified` / `failed` / `skipped_resource_limit` / `unverified`** の 4 状態＋根拠（SSIM/MAE・図形数・予算理由）で返却する。**一部スライドのみ検証成功した場合は文書全体の成功（`passed`）として扱わず、`layer_visual_consistency: "unverified"`・`coverage: "partial"` を返す。** | `server/scripts/artifact_doc_worker.py` (`verify_pptx_layer_visual_consistency`, `compute_image_ssim_and_mae`), `server/src/artifacts/artifact-service.ts` (`verifyArtifact`), `server/src/mcp/builtin-artifact-mcp.ts` (`artifact_verify`), `server/src/routes/file-routes.ts` |
+| **PPTX UI レイヤー分離キャンバス視覚一致（`UX-07`）** | **PR 3A（次フェーズ）** | ブラウザ上の `PptxModule.tsx` レイヤー分離キャンバス（背景プレート＋DOM/SVG 要素＋透過スプライト）の描画結果と、確定後 LibreOffice PNG との bbox＋SSIM 視覚一致およびゴースト 0 件を検証する。PR 2 のサーバー側レイヤー分解検証とは別レイヤーとして区別する。 | `web/src/components/ArtifactWorkspace/modules/PptxModule.tsx`（PR 3A） |
+| **DOCX レイアウト品質検査** | **PR 2（本 PR）** | `sectPr` 余白・ページ幅と表/図形幅の超過（`docx_margin_overflow`）、過度な埋め込み画像サイズ（`docx_oversized_embed`）、LibreOffice PDF 出力の空白ページ（`docx_blank_page`）および保護ノード・リンク整合を検査する（チェック ID: `layout_quality`）。 | `server/scripts/artifact_doc_worker.py` (`verify_docx_layout_quality`) |
+| **XLSX 数式 4 区分評価・文字切れ検査** | **PR 2（本 PR）** | 隔離コピーの LibreOffice Calc 再計算で数式セルを `evaluated_lo` / `cached_existing` / `unevaluated_unsupported` / `error_formula` の 4 区分で評価し（`formula_values`）、さらに列幅メトリクス＋LibreOffice PDF 出力の `###` 検出により数値/文字列の文字切れ（`text_truncation`）を検証する。 | `server/scripts/artifact_doc_worker.py` (`verify_workbook_formulas`, `verify_xlsx_text_truncation`) |
 
 ---
 
 ## 3. SmartArt ノード増減（`pptx.smartart.add_or_remove_node`）実ファイル・LibreOffice 技術調査結果
 
-設計書 4.3 節の「`dgm:dataModel`＋`dgm:drawing` 幾何同期の成立可否を実ファイルと LibreOffice 描画で検証し、破綻なく動作する図種のみ対応、それ以外は `unsupported_by_format` を明示申告」に従い、実 PowerPoint 生成ファイルおよび LibreOffice Impress 24.2（`impress_pdf_Export` + `pdftotext -bbox`）を用いて調査を実施した。
+設計書 4.3 節の「`dgm:dataModel`＋`dgm:drawing` 幾何同期の成立可否を実ファイルと LibreOffice 描画で検証し、破綻なく動作する図種のみ対応、それ以外は `unsupported_by_format` を明示申告」に従い、LibreOffice 24.2 の DrawingML Diagram レイアウトエンジン（`DIAGRAM_IGNORE_EXTDRAWINGS=1`＋`dgm:layoutDef` 再評価）を含めた包括的技術調査を実施した。
 
-### 3.1 調査環境・対象ファイル
+### 3.1 調査環境・対象ファイルと 6 検証観点
 
-1. **実 PowerPoint 生成フィクスチャ**: Apache POI 由来実ファイル `smartart-simple.pptx`（`layoutId = urn:microsoft.com/office/officeart/2005/8/layout/venn1`）
-2. **実 OOXML 準拠フィクスチャ**: `vList2`（垂直線形リスト 3 ノード）および `process1`（水平線形プロセス 3 ノード＋`sibTrans` 矢印 2 個）
-3. **検証ツール**: LibreOffice Impress 24.2.7 + `pdftotext -bbox` + `validate_package`
+1. **実 PowerPoint 生成フィクスチャ**: Apache POI 由来実ファイル `smartart-simple.pptx`（`layoutId = urn:microsoft.com/office/officeart/2005/8/layout/venn1`、`chMax = 7`、各ノードに背景円 `circN` と外部放射テキストボックス `circNTx` の 2 `pres` ポイントを持つ）
+2. **OOXML 仕様準拠 `dgm:layoutDef` フィクスチャ**: `cycle4`（`alg="cycle"`）、`pyramid1`（`alg="pyra"`）、`matrix1`（`alg="snake"`）、`hierarchy1`（階層親子 `parentNodeId`＋ネスト `lin`）、`vList2` / `process1`（線形リスト・プロセス）、およびスタブ空 `layoutDef` を持つ `venn_stub`
+3. **検証ツール**: LibreOffice Impress 24.2.7（`DIAGRAM_IGNORE_EXTDRAWINGS=1` `odp -> pptx` レイアウト再計算および通常 `impress_pdf_Export` / `impress_png_Export`）、`pypdf`、`validate_package`、`verify_office`
+4. **6 検証観点の実測確認**:
+   - **(1) `dataModel` のノード・接続関係変更**: `dgm:ptLst` / `dgm:cxnLst` において論理ノード（`node`）・`sibTrans`/`parTrans`・親子接続（`parentNodeId` 指定の階層追加/削除を含む）・`pres` サブツリー（`presOf` / `presParOf` / `circ1..circN` 等の連番 `presName` / `presStyleIdx` / `presStyleCnt`）を一貫更新。
+   - **(2) `layoutDef` に基づくレイアウト再計算**: 対象 SmartArt の `p:graphicFrame` のみを抽出した隔離 PPTX から既存 `drawing*.xml` と `dsp:dataModelExt` を除去し、`DIAGRAM_IGNORE_EXTDRAWINGS=1` 付きで LibreOffice `pptx -> odp -> pptx` を実行すると、LibreOffice C++ Diagram エンジン（`oox/source/drawingml/diagram/`）が `dgm:layoutDef` を評価して新幾何の `<p:sp>` 群を出力することを実証。
+   - **(3) 描画キャッシュの再生成・同期**: 再計算された `<p:sp>` 群を `p:graphicFrame/p:xfrm/a:off` 相対座標へ変換し、DFS 順で `pres` `modelId` を対応付けて `<dsp:drawing>`（`ppt/diagrams/drawing*.xml`）へ再構成し、元 PPTX に書き戻す（未存在時は `.rels` と `[Content_Types].xml` へ正規登録）。
+   - **(4) OOXML としての保存整合性**: 元の `p:graphicFrame`・`dgm:relIds`・`layout*.xml`・`colors*.xml`・`quickStyle*.xml` を 100% 保持し、孤立画像参照（`r:embed`）を除去。`verify` の `package_structure` / `archive_security` / `relationship_ids` / `layer_visual_consistency` 全合格を確認。
+   - **(5) 保存後の再読み込み・再編集・LibreOffice 描画**: 保存後に `artifact_read_range` で SmartArt ノード構造が取得でき、追加ノードへの `pptx.smartart.update_node_text` 再編集・連続 `add_or_remove_node` 削除・通常 LibreOffice PDF/PNG 描画（`DIAGRAM_IGNORE_EXTDRAWINGS` なし）まで破綻なく成立することを確認。
+   - **(6) 既存 PowerPoint 生成ファイルとの互換性**: 実 PowerPoint 生成 `smartart-simple.pptx`（`venn1`）で 4→5 ノード追加（正五角形配置＋外部放射テキストボックス 10 図形生成）→追加ノードの `update_node_text`（`"Omega"`→`"Zeta"`）→`"def"` 削除→通常 LibreOffice 描画・`verify` 合格→`chMax=7` 超過（8 ノード目）の安全拒否（終了コード 4）まで全工程を確認。※実 Microsoft PowerPoint デスクトップアプリでの再開封・再編集は Linux 環境制約のため **`UNVERIFIED`**。
 
-### 3.2 技術的発見事項
+### 3.2 確定した対応／非対応図種マトリクス
 
-- **LibreOffice Impress の描画仕様**: LibreOffice Impress は `dgm:layoutDef` の PowerPoint 制約ソルバーを再実行せず、`ppt/diagrams/drawing1.xml`（`dsp:spTree`）にキャッシュされた描画図形群をそのままレンダリングする。したがって、`dgm:dataModel`（`dgm:ptLst` / `dgm:cxnLst`）のみを変更すると表示が追従せず、逆に `dsp:spTree` を幾何学的に正しく同期再配置すれば LibreOffice・PowerPoint 双方で即時反映される。
-- **Venn 図（`venn1`）が成立しない根拠**:
-  - 実ファイル `smartart-simple.pptx` の解析により、1 つの論理ノードが `presOf` を介して **2 つの `pres` ポイント**（背景円とテキスト用）に紐付き、さらに各 `<dsp:sp>` が円の中心座標とは別に放射方向へオフセットした独立の `<dsp:txXfrm>`（テキスト専用変形行列）を持つことを確認した。
-  - ノード数を増減すると円の交差領域・半径・中心角度・テキスト逃がし位置（`txXfrm`）を PowerPoint の 2 次元制約ソルバーで再計算する必要があり、単純な矩形リフローでは円交差とテキスト重なりが発生し視覚的に破綻する。
-- **1 次元線形リスト（`vList2`）・線形プロセス（`process1`）が成立する根拠**:
-  - 単一階層（1 論理ノード＝1 `pres` ポイント＝1 `dsp:sp`、独立 `dsp:txXfrm` なし）の 1 次元配列では、親コンテナ枠内（`dsp:spTree` 既存バウンディングボックス）で等間隔の水平/垂直リフローを決定論的に計算でき、`process*` / `chevron*` / `arrow*` では隣接ノード間の `sibTrans` コネクタ矢印数（$N - 1$ 個）と座標も同時に再配置できる。
-  - **LibreOffice Impress + `pdftotext -bbox` 実測結果**:
-    - `vList2`（3 → 4 ノード追加）: 各ラベルの Y 座標ピッチが `124.8pt` → `93.6pt` へ完全均等再配置、バウンディングボックス重なり 0 件、追加ノード `"Phase 4"` が描画テキストとして抽出可能。
-    - `process1`（3 → 4 ノード追加＋`sibTrans` 矢印 2 → 3 個同期）: 各ラベルの X 座標ピッチが `205.1pt` → `153.8pt` へ完全均等再配置、バウンディングボックス重なり 0 件、削除時（4 → 3 ノード）も元ピッチへ整合復元。
-
-### 3.3 確定した対応／非対応図種マトリクス
-
-| 図種カテゴリ | 対象レイアウト ID 例（`dgm:layoutDef/@uniqueId`） | 判定 | 挙動・実装根拠 |
+| 図種カテゴリ | 対象レイアウト・条件 | 判定 | 採用エンジン・実装根拠 |
 | --- | --- | --- | --- |
-| **単一階層 1D 線形リスト** | `vList*`, `hList*`, `bList*`, `lList*`, `default`（独立 `dsp:txXfrm` なし、ネストなし） | **対応済み** | `dgm:dataModel`（`ptLst`/`cxnLst`）と `dsp:spTree` 座標・スタイルを同期リフロー（`edit_smartart_add_or_remove_node`） |
-| **単一階層 1D 線形プロセス** | `process*`, `chevron*`, `arrow*`（独立 `dsp:txXfrm` なし、ネストなし） | **対応済み** | ノード図形＋`sibTrans` 矢印図形（$N-1$ 個）および `cxnLst` 接続を同期リフロー（`edit_smartart_add_or_remove_node`） |
-| **2D 重畳・循環・階層・ピラミッド・マトリクス図種** | `venn*`, `cycle*`, `radial*`, `hierarchy*`, `orgChart*`, `pyramid*`, `matrix*`、多階層ツリー、独立 `<dsp:txXfrm>` を持つ図形 | **設計上許容された非対応** | `classify_smartart_layout` が事前検出し、`UnsupportedByFormatError`（終了コード 4 → API `unsupported_by_format`）で安全拒否 |
+| **Venn 図（重畳円＋外部テキスト）** | `venn1` 等（計算可能な `dgm:layoutDef` を保持、`chMax` 範囲内） | **対応済み**（実 PowerPoint `smartart-simple.pptx` 検証済） | `libreoffice_layout_def`（`DIAGRAM_IGNORE_EXTDRAWINGS=1` 再計算＋`drawing*.xml` 同期） |
+| **循環図（Cycle）** | `cycle4` 等（`alg="cycle"` 等の計算可能 `dgm:layoutDef`） | **対応済み** | `libreoffice_layout_def` |
+| **ピラミッド図（Pyramid）** | `pyramid1` 等（`alg="pyra"` 等の計算可能 `dgm:layoutDef`） | **対応済み** | `libreoffice_layout_def` |
+| **マトリクス / スネーク図（Matrix）** | `matrix1` 等（`alg="snake"` 等の計算可能 `dgm:layoutDef`） | **対応済み** | `libreoffice_layout_def` |
+| **階層図（Hierarchy）** | `hierarchy1` 等（`parentNodeId` 指定による子ノード増減、計算可能 `dgm:layoutDef`） | **対応済み** | `libreoffice_layout_def` |
+| **線形リスト・線形プロセス** | `vList*`, `hList*`, `bList*`, `lList*`, `process*`, `chevron*`, `arrow*` | **対応済み** | 計算可能 `layoutDef` 時は `libreoffice_layout_def`；スタブ `layoutDef` 時は決定論的 1D リフロー（`linear_reflow`、`sibTrans` 矢印同期含む） |
+| **非対応境界（技術的根拠確定分のみ）** | (1) `dgm:layoutDef` の `<dgm:chMax>` 上限超過（例: `venn1` の 8 ノード目）、(2) 計算可能アルゴリズムを含まない空/スタブ `layoutDef` を持つ非線形図種、(3) LibreOffice 再計算後に全論理ノードのテキスト/図形が再現できない特殊レイアウト | **設計上許容された非対応** | `classify_smartart_layout` / `_recalculate_smartart_drawing_via_libreoffice` が検証し、`UnsupportedByFormatError`（終了コード 4 → API `unsupported_by_format`）で非破壊拒否 |
 
-- 検証テスト: `server/tests/artifact_doc_worker_test.py` (`test_real_smartart_updates_data_and_cached_drawing`, `test_smartart_add_or_remove_node_supported_linear_and_rejects_venn`) — **`VERIFIED (REAL RUNTIME)`**
+- 検証テスト: `server/tests/artifact_doc_worker_test.py` (`test_real_smartart_updates_data_and_cached_drawing`, `test_smartart_add_or_remove_node_supported_families_and_limits`) — **`VERIFIED (REAL RUNTIME)`**（実 Microsoft PowerPoint デスクトップでの開封確認は **`UNVERIFIED`**）
 
 ---
 
@@ -74,9 +74,10 @@
 
 | 操作 / 機能 | ステータス | 実装箇所 | 検証結果・区分 |
 | --- | --- | --- | --- |
+| `artifact_read_range` 大規模ファイル安全・部分読み取り（`MCP-05`） | **対応済み** | `server/src/artifacts/artifact-service.ts` (`openPinnedBlobMeta`, `readByteRangeFromBlob`, `streamLineRangeFromBlob`, `streamCsvRangeFromBlob`, `readRange`), `server/src/artifacts/document-worker.ts` (zero-copy immutable blob path input), `server/scripts/artifact_doc_worker.py` (`read_workbook_range` `XML.iterparse`, DOCX `word/document.xml` `XML.iterparse`) | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts`: 40,000 行テキスト・バイトオフセット・40,000 行 CSV ストリーミング読取＋Base ChatUI 非稼働時ガード検証; `artifact_doc_worker_test.py`: 250 行 XLSX / 250 段落 DOCX ストリーミング読取) |
 | `artifact_render` 領域指定描画（`region: { x, y, width, height, unit?: 'norm' \| 'px' \| 'pt' }`） | **対応済み** | `server/src/artifacts/types.ts` (`RenderRegion`), `server/src/artifacts/artifact-service.ts` (`renderPng`), `server/src/artifacts/document-worker.ts`, `server/src/mcp/builtin-artifact-mcp.ts` (`artifact_render`), `server/src/routes/file-routes.ts` (`GET /api/files/:artifactId/render`), `server/scripts/artifact_doc_worker.py` (`crop_png_region`), `server/scripts/artifact_web_renderer.mjs` (`computeClip`) | `VERIFIED (REAL RUNTIME)` (`artifact_doc_worker_test.py` `test_csv_table_png_render_and_region_cropping_across_formats`, `builtin-artifact-mcp.test.ts` Full Runtime テスト) |
 | 能力 API（`artifact_capabilities` 3 プロファイル自動判定・理由付き返却） | **対応済み** | `server/src/artifacts/adapters/registry.ts`, `server/src/artifacts/resource-governor.ts`, `server/src/artifacts/artifact-service.ts` (`getCapabilities`) | `VERIFIED (REAL RUNTIME)` (`artifact-capabilities.test.ts`) |
-| 外部ワーカー隔離（`bwrap --unshare-net --unshare-pid`・RLIMIT・Pss/RSS 監視・タイムアウト・Zip Bomb/XXE 拒否） | **対応済み** | `server/src/artifacts/sandbox-worker.ts`, `server/src/artifacts/resource-governor.ts`, `server/scripts/artifact_doc_worker.py` (`validate_package`) | `VERIFIED (REAL RUNTIME)` (`sandbox-and-drafts.test.ts`, `artifact_doc_worker_test.py`, `builtin-artifact-mcp.test.ts`) |
+| 外部ワーカー隔離（`bwrap --unshare-all --unshare-net --die-with-parent`・`/etc/libreoffice` RO マウント・RLIMIT・Pss/RSS 監視・タイムアウト・Zip Bomb/XXE 拒否） | **対応済み** | `server/src/artifacts/sandbox-worker.ts`, `server/src/artifacts/resource-governor.ts`, `server/scripts/artifact_doc_worker.py` (`validate_package`) | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts` strict `bwrap` 実稼働テスト: Python＋LibreOffice＋pandoc＋qpdf を `sandboxMode='strict'` / `allowUnsandboxedDocWorkers=false` で実行合格; `sandbox-and-drafts.test.ts`; `artifact_doc_worker_test.py`) |
 | 3 プロファイル導入スクリプト（`full` / `compact` / `base`） | **対応済み** | `deploy/setup-doc-runtime.sh`, `server/src/artifacts/resource-governor.ts` (`detectRuntimeProfile`) | `VERIFIED (REAL RUNTIME)` (`doc-skills-and-runtime.test.ts`, `.github/workflows/ci-deploy.yml`) |
 
 ### 4.2 PPTX（`FUNC-01`）
@@ -84,19 +85,19 @@
 | 操作 | ステータス | 実装箇所 | 検証結果・区分 |
 | --- | --- | --- | --- |
 | `create` / `structure` / `read_range` | **対応済み** | `server/scripts/artifact_doc_worker.py` (`create_presentation`, `pptx_structure`, `pptx_read_range`, `extract_pptx_slide_layers`) | `VERIFIED (REAL RUNTIME)` (`artifact_doc_worker_test.py`) |
-| `pptx.set_shape_text`（複数段落・複数ラン・インライン書式・改行・グループ内図形対応） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`edit_presentation`, `_set_pptx_txbody`, `find_pptx_shape_with_parent`) | `VERIFIED (REAL RUNTIME)` (`test_pptx_advanced_multi_run_styles_shapes_grouping_and_z_order`) |
-| `pptx.set_shape_style`（単色/グラデーション/透過塗り・線種/破線・文字色/下線/取消線/CJK フォント・段落配置/行間/箇条書き/余白・影/光彩/ぼかし・反転） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`edit_presentation`, `_apply_pptx_shape_style`) | `VERIFIED (REAL RUNTIME)` (`test_pptx_advanced_multi_run_styles_shapes_grouping_and_z_order`) |
-| `pptx.add_shape`（20 種以上のプリセット図形＋初期テキスト・書式）／`pptx.remove_shape` | **対応済み** | `server/scripts/artifact_doc_worker.py` (`PPTX_PRESET_SHAPES`, `edit_presentation`) | `VERIFIED (REAL RUNTIME)` (`test_pptx_advanced_multi_run_styles_shapes_grouping_and_z_order`) |
-| `pptx.set_shape_bounds`（プレースホルダー安全・浮動小数点 pt 座標・回転対応） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`edit_presentation`) | `VERIFIED (REAL RUNTIME)` (`test_pptx_advanced_multi_run_styles_shapes_grouping_and_z_order`) |
-| `pptx.move_shape`（Z 順 `front`/`back`/`forward`/`backward`/数値インデックス） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`edit_presentation`) | `VERIFIED (REAL RUNTIME)` (`test_pptx_advanced_multi_run_styles_shapes_grouping_and_z_order`) |
-| `pptx.group_shapes`（非連続図形グループ化）／`pptx.ungroup_shapes`（アフィン変換展開: 拡縮・平行移動・反転・回転合成） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`edit_presentation`) | `VERIFIED (REAL RUNTIME)` (`test_pptx_advanced_multi_run_styles_shapes_grouping_and_z_order`) |
+| `pptx.set_shape_text`（複数段落・複数ラン・インライン書式・改行・グループ内図形対応） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`edit_presentation`, `_set_pptx_txbody`, `find_pptx_shape_with_parent`) | `VERIFIED (REAL RUNTIME)` (`test_pptx_advanced_multi_run_rich_style_non_contiguous_group_and_scaled_ungroup`) |
+| `pptx.set_shape_style`（単色/グラデーション/透過塗り・線種/破線・文字色/下線/取消線/CJK フォント・段落配置/行間/箇条書き/余白・影/光彩/ぼかし・反転） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`edit_presentation`, `_apply_pptx_shape_style`) | `VERIFIED (REAL RUNTIME)` (`test_pptx_advanced_multi_run_rich_style_non_contiguous_group_and_scaled_ungroup`) |
+| `pptx.add_shape`（20 種以上のプリセット図形＋初期テキスト・書式）／`pptx.remove_shape` | **対応済み** | `server/scripts/artifact_doc_worker.py` (`PPTX_PRESET_SHAPES`, `edit_presentation`) | `VERIFIED (REAL RUNTIME)` (`test_pptx_advanced_multi_run_rich_style_non_contiguous_group_and_scaled_ungroup`) |
+| `pptx.set_shape_bounds`（プレースホルダー安全・浮動小数点 pt 座標・回転対応） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`edit_presentation`) | `VERIFIED (REAL RUNTIME)` (`test_pptx_advanced_multi_run_rich_style_non_contiguous_group_and_scaled_ungroup`) |
+| `pptx.move_shape`（Z 順 `front`/`back`/`forward`/`backward`/数値インデックス） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`edit_presentation`) | `VERIFIED (REAL RUNTIME)` (`test_pptx_advanced_multi_run_rich_style_non_contiguous_group_and_scaled_ungroup`) |
+| `pptx.group_shapes`（非連続図形グループ化）／`pptx.ungroup_shapes`（アフィン変換展開: 拡縮・平行移動・反転・回転合成） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`edit_presentation`) | `VERIFIED (REAL RUNTIME)` (`test_pptx_advanced_multi_run_rich_style_non_contiguous_group_and_scaled_ungroup`) |
 | `pptx.add_image` / `pptx.add_table` / `pptx.set_table_cell`（複数ラン・セル書式） | **部分実装**（画像は PNG/JPEG 対応） | `server/scripts/artifact_doc_worker.py` (`edit_presentation`) | `VERIFIED (REAL RUNTIME)` (`artifact_doc_worker_test.py`) |
 | `pptx.add_slide` / `pptx.reorder_slide` / `pptx.remove_slide` / `pptx.set_notes` | **対応済み** | `server/scripts/artifact_doc_worker.py` (`edit_presentation`) | `VERIFIED (REAL RUNTIME)` (`artifact_doc_worker_test.py`) |
-| `pptx.smartart.get_structure` / `pptx.smartart.update_node_text`（`dataModel`＋`drawing` 同時同期） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`extract_smartart_nodes`, `edit_smartart_update_node_text`) | `VERIFIED (REAL RUNTIME)` (`test_real_smartart_updates_data_and_cached_drawing`) |
-| `pptx.smartart.add_or_remove_node`（線形リスト・線形プロセス対応／Venn・循環・階層等は `unsupported_by_format`） | **部分実装**（第 3 節の調査確定範囲） | `server/scripts/artifact_doc_worker.py` (`classify_smartart_layout`, `edit_smartart_add_or_remove_node`) | `VERIFIED (REAL RUNTIME)` (`test_smartart_add_or_remove_node_supported_linear_and_rejects_venn`) |
-| `chart.create` / `update_title_and_legend` / `update_series_data`（埋込 XLSX＋キャッシュ同時同期） / `update_series_style` / `add_or_remove_series` | **部分実装**（棒/縦棒/折線/円/ドーナツ/面/散布/複合・第 2 軸対応；3D 特殊曲面等は非対応） | `server/scripts/artifact_doc_worker.py` (`edit_chart`) | `VERIFIED (REAL RUNTIME)` (`test_pptx_chart_updates_embedded_workbook_and_cache`) |
-| `render_png`（領域指定対応） / `export:pdf` / `export:png` | **対応済み** | `server/scripts/artifact_doc_worker.py` (`render_presentation`, `export_presentation`, `crop_png_region`) | `VERIFIED (REAL RUNTIME)` (`artifact_doc_worker_test.py`) |
-| `verify`（OOXML 構造・文字溢れ・枠外・重なり・サーバー側レイヤー分解 SSIM/MAE 整合） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`verify_pptx_text_overflow`, `verify_pptx_layer_visual_consistency`, `verify_document`) | `VERIFIED (REAL RUNTIME)` (`test_office_verification_pptx_overflow_ssim_docx_layout_xlsx_truncation`, `test_verification_reports_structural_findings_and_unverified_checks`) |
+| `pptx.smartart.get_structure` / `pptx.smartart.update_node_text`（`dataModel`＋`drawing` 同時同期） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`edit_smartart_text`) | `VERIFIED (REAL RUNTIME)` (`test_real_smartart_updates_data_and_cached_drawing`, `test_smartart_add_or_remove_node_supported_families_and_limits`) |
+| `pptx.smartart.add_or_remove_node`（LibreOffice `DIAGRAM_IGNORE_EXTDRAWINGS=1` により Venn・循環・ピラミッド・マトリクス・階層＋線形リスト/プロセス対応；`chMax` 超過やスタブ非線形 `layoutDef` のみ `unsupported_by_format`） | **部分実装**（第 3 節の調査確定範囲・`chMax` 保護） | `server/scripts/artifact_doc_worker.py` (`classify_smartart_layout`, `_smartart_mutate_data_model`, `_recalculate_smartart_drawing_via_libreoffice`, `edit_smartart_add_or_remove_node`) | `VERIFIED (REAL RUNTIME)` (`test_smartart_add_or_remove_node_supported_families_and_limits`；PowerPoint デスクトップ再開封確認は `UNVERIFIED`) |
+| `chart.create` / `update_title_and_legend` / `update_series_data`（埋込 XLSX＋キャッシュ同時同期） / `update_series_style` / `add_or_remove_series` | **部分実装**（棒/縦棒/折線/円/ドーナツ/面/散布/複合・第 2 軸対応；3D 特殊曲面等は非対応） | `server/scripts/artifact_doc_worker.py` (`edit_chart`) | `VERIFIED (REAL RUNTIME)` (`test_pptx_chart_updates_match_embedded_workbook`) |
+| `render_png`（領域指定対応） / `export:pdf` / `export:png` | **対応済み** | `server/scripts/artifact_doc_worker.py` (`render_presentation_layer`, `render_office`, `crop_png_region`) | `VERIFIED (REAL RUNTIME)` (`artifact_doc_worker_test.py`) |
+| `verify`（OOXML 構造・文字溢れ・枠外・重なり・任意スライド指定可能なサーバー側レイヤー分解 SSIM/MAE 4 状態検証） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`verify_pptx_text_overflow`, `verify_pptx_layer_visual_consistency`, `verify_office`), `server/src/mcp/builtin-artifact-mcp.ts` (`artifact_verify`), `server/src/routes/file-routes.ts` | `VERIFIED (REAL RUNTIME)` (`test_pptx_visual_consistency_arbitrary_slides_and_resource_budgets`, `test_office_verification_detects_pptx_overflow_docx_layout_and_xlsx_truncation`, `builtin-artifact-mcp.test.ts` Full Runtime＋strict `bwrap` テスト) |
 | レイヤー分離キャンバス直接編集 UI（`PptxModule.tsx`） | **未実装**（PR 3A 計画対象） | `web/src/components/ArtifactWorkspace/modules/PptxModule.tsx`（PR 3A） | PR 3A 検証ゲート対象 |
 
 ### 4.3 DOCX（`FUNC-02`）
@@ -187,12 +188,12 @@
 | `MCP-02` | `artifact_capabilities` | **対応済み** | `VERIFIED (REAL RUNTIME)` (`artifact-capabilities.test.ts`, `builtin-artifact-mcp.test.ts`) |
 | `MCP-03` | `artifact_create` | **対応済み** | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts`) |
 | `MCP-04` | `artifact_get_structure` | **対応済み** | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts`) |
-| `MCP-05` | `artifact_read_range` | **対応済み** | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts`) |
+| `MCP-05` | `artifact_read_range`（大規模ファイル向けストリーミング・バイト部分読取・不変 Blob ゼロコピー入力・XLSX/DOCX `iterparse`） | **対応済み** | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts` 大規模テキスト/CSV テスト＋Base ChatUI 非稼働時ガード検証; `artifact_doc_worker_test.py` `test_streaming_xlsx_and_docx_range_reads`) |
 | `MCP-06` | `artifact_edit` | **対応済み** | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts`) |
 | `MCP-07` | `artifact_batch_edit` | **対応済み** | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts`) |
 | `MCP-08` | `artifact_render`（領域指定 `region` 対応） | **対応済み** | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts` Full Runtime テスト) |
-| `MCP-09` | `artifact_verify` | **対応済み** | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts` Base＋Full Runtime テスト) |
-| `MCP-10` | `artifact_export` | **対応済み** | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts` Base＋Full Runtime テスト) |
+| `MCP-09` | `artifact_verify`（任意スライド指定 `options.slideIndices`・予算制御・4 状態報告対応） | **対応済み** | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts` Base＋Full Runtime＋strict `bwrap` テスト; `artifact_doc_worker_test.py`) |
+| `MCP-10` | `artifact_export` | **対応済み** | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts` Base＋Full Runtime＋strict `bwrap` テスト) |
 | `MCP-11` | `artifact_history` | **対応済み** | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts`) |
 | `MCP-12` | `artifact_restore` | **対応済み** | `VERIFIED (REAL RUNTIME)` (`artifact-core-durability.test.ts`, `builtin-artifact-mcp.test.ts`) |
 | `MCP-13` | `artifact_restore_bundle` | **対応済み** | `VERIFIED (REAL RUNTIME)` (`artifact-core-durability.test.ts`, `builtin-artifact-mcp.test.ts`) |
@@ -226,9 +227,9 @@
 | `ARCH-10` | **対応済み** | PR 1 / 2 | `server/src/artifacts/adapters/registry.ts`, `server/src/artifacts/adapters/*` | `VERIFIED (REAL RUNTIME)` (`architecture-conformance.test.ts` `NEG-02`) |
 | `ARCH-11` | **未実装**（PR 3A/3B UI 構成対象） | PR 3A / 3B | `web/src/components/ArtifactWorkspace/*`（PR 3A） | PR 3A / 4 ゲート対象 |
 | `ARCH-12` | **未実装**（PR 3B/4 移行・撤去対象） | PR 3B / 4 | `web/src/App.tsx`, `web/src/components/ArtifactViewerModal.tsx`（PR 4 撤去） | PR 3B / 4 ゲート対象 |
-| `ARCH-13` | **対応済み** | PR 1 / 2 | `server/src/artifacts/render-cache.ts`, `server/src/artifacts/sandbox-worker.ts` | `VERIFIED (REAL RUNTIME)` (`sandbox-and-drafts.test.ts`) |
+| `ARCH-13` | **対応済み** | PR 1 / 2 | `server/src/artifacts/render-cache.ts`, `server/src/artifacts/sandbox-worker.ts` | `VERIFIED (REAL RUNTIME)` (`sandbox-and-drafts.test.ts`, `builtin-artifact-mcp.test.ts` strict `bwrap` テスト) |
 | `ARCH-14` | **対応済み** | PR 1 | `server/src/artifacts/undo-service.ts`, `server/src/artifacts/merge-policy.ts` | `VERIFIED (REAL RUNTIME)` (`artifact-core-durability.test.ts`) |
-| `ARCH-15` | **対応済み** | PR 1 / 2 | `server/src/acp/client-manager.ts`, `server/src/mcp/mcp-service.ts` | `VERIFIED (MOCK / EMULATION)` (`acp-transparency.test.ts`, `builtin-artifact-mcp.test.ts`)＋`UNVERIFIED (REQUIRES REAL AGY / PHYSICAL IPHONE)`（`scripts/verify-real-agy-artifact-mcp.mjs`） |
+| `ARCH-15` | **対応済み** | PR 1 / 2 | `server/src/acp/client-manager.ts`, `server/src/mcp/mcp-service.ts` | `VERIFIED (MOCK / EMULATION)` (`acp-transparency.test.ts`, `builtin-artifact-mcp.test.ts`)＋`UNVERIFIED`（実 `agy`: `scripts/verify-real-agy-artifact-mcp.mjs`） |
 
 ### B. 軽量リッチ UI・対象指定・ACP 透過性（`RICH-ARCH-01`〜`07`, `PIN-01`〜`06`, `RICH-01`〜`08`, `ACP-01`〜`02`）
 
@@ -237,16 +238,41 @@
 | `RICH-ARCH-02`, `03`, `05`, `06`, `07`（サーバー側） | **対応済み** | PR 1 / 2 | `server/src/rich/*`, `server/src/routes/rich-routes.ts`, `server/src/mcp/builtin-artifact-mcp.ts` | `VERIFIED (REAL RUNTIME)` (`rich-security-negative.test.ts`, `architecture-conformance.test.ts` `NEG-05`) |
 | `RICH-ARCH-01`, `04` および `RICH-01`〜`08`（ブラウザ側描画・操作 UI） | **未実装**（PR 3A/3B 計画対象） | PR 3A / 3B | `web/src/components/shared-ui/*`（PR 3A） | PR 3A / 3B ゲート対象 |
 | `PIN-01`〜`PIN-06`（サーバー/MCP/再解決コア） | **部分実装**（サーバー・MCP 実装済み、UI パネルは PR 3A/3B） | PR 1 / 2 / 3A / 3B | `server/src/edit-requests/*`, `server/src/artifacts/adapters/*`, `server/src/mcp/builtin-artifact-mcp.ts` | `VERIFIED (REAL RUNTIME)` (`artifact-core-durability.test.ts`, `builtin-artifact-mcp.test.ts`) |
-| `ACP-01`, `ACP-02` | **対応済み**（拡張モック検証済・実 `agy` 再現スクリプト提供済） | PR 2 | `server/src/acp/client-manager.ts`, `server/src/rich/rich-content-service.ts`, `scripts/verify-real-agy-artifact-mcp.mjs` | `VERIFIED (MOCK / EMULATION)` (`builtin-artifact-mcp.test.ts`, `acp-transparency.test.ts`)＋`UNVERIFIED (REQUIRES REAL AGY / PHYSICAL IPHONE)` |
+| `ACP-01`, `ACP-02` | **対応済み**（拡張モック検証済・実 `agy` 再現スクリプト提供済） | PR 2 | `server/src/acp/client-manager.ts`, `server/src/rich/rich-content-service.ts`, `scripts/verify-real-agy-artifact-mcp.mjs` | `VERIFIED (MOCK / EMULATION)` (`builtin-artifact-mcp.test.ts`, `acp-transparency.test.ts`)＋`UNVERIFIED`（実 `agy` バイナリ） |
 
 ### C. UI/UX・性能・セキュリティ・陰性自己テスト（`UX-01`〜`10`, `PERF-01`〜`06`, `SEC-01`〜`10`, `NEG-01`〜`11`）
 
 | 区分 / ID | ステータス | 計画 PR | 主実装箇所 | 検証結果・区分 |
 | --- | --- | --- | --- | --- |
-| `UX-01`〜`UX-10` | **未実装**（PR 3A/3B/4 UI 計画対象；既存 UI 非退行は維持） | PR 3A / 3B / 4 | `web/src/components/ArtifactWorkspace/*`, `web/src/components/shared-ui/*` | PR 3A / 3B / 4 ゲート対象（実機 iPhone 項目は `UNVERIFIED (REQUIRES REAL AGY / PHYSICAL IPHONE)`） |
-| `PERF-01`, `PERF-02`, `PERF-05` | **対応済み** | PR 1 / 2 | `server/src/artifacts/resource-governor.ts`, `server/src/artifacts/sandbox-worker.ts`, `server/src/artifacts/blob-store.ts`, `server/src/rich/rich-content-service.ts` | `VERIFIED (REAL RUNTIME)` (`artifact-core-durability.test.ts`, `sandbox-and-drafts.test.ts`, `builtin-artifact-mcp.test.ts`) |
+| `UX-01`〜`UX-10` | **未実装**（PR 3A/3B/4 UI 計画対象；既存 UI 非退行は維持） | PR 3A / 3B / 4 | `web/src/components/ArtifactWorkspace/*`, `web/src/components/shared-ui/*` | PR 3A / 3B / 4 ゲート対象（実機 iPhone 項目は `UNVERIFIED`） |
+| `PERF-01`, `PERF-02`, `PERF-05` | **対応済み**（`artifact_read_range` ストリーミング/部分読取・ゼロコピー入力・不変 Revision 整合・リソース予算制御） | PR 1 / 2 | `server/src/artifacts/artifact-service.ts`, `server/src/artifacts/document-worker.ts`, `server/src/artifacts/resource-governor.ts`, `server/src/artifacts/sandbox-worker.ts`, `server/src/artifacts/blob-store.ts`, `server/scripts/artifact_doc_worker.py` | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts`, `artifact_doc_worker_test.py`, `artifact-core-durability.test.ts`, `sandbox-and-drafts.test.ts`) |
 | `PERF-03`, `PERF-04`, `PERF-06` | **未実装**（PR 3A/4 フロントエンド性能計画対象） | PR 3A / 4 | `web/src/components/shared-ui/*`, `web/src/utils/viewerCache.ts` | PR 3A / 4 ゲート対象 |
 | `SEC-01`〜`SEC-06`, `SEC-09`（サーバー側）, `SEC-10` | **対応済み** | PR 1 / 2 | `server/src/artifacts/*`, `server/src/files/workspace.ts`, `server/src/mcp/builtin-artifact-mcp.ts`, `server/src/rich/rich-validator.ts`, `server/scripts/artifact_doc_worker.py` | `VERIFIED (REAL RUNTIME)` (`auth-and-rbac.test.ts`, `sandbox-and-drafts.test.ts`, `builtin-artifact-mcp.test.ts`, `rich-security-negative.test.ts`, `artifact_doc_worker_test.py`) |
 | `SEC-07`, `SEC-08`（サーバー側静的/評価検証済・ブラウザ側実行経路は PR 3A） | **部分実装**（サーバー側対応済・ブラウザ側 PR 3A） | PR 1 / 3A | `server/src/rich/rich-validator.ts`, `server/src/rich/rich-expr-evaluator.ts` | `VERIFIED (REAL RUNTIME)` (`rich-security-negative.test.ts`) |
 | `NEG-01`, `NEG-02`, `NEG-05`, `NEG-06`〜`NEG-11`（サーバー範囲） | **対応済み** | PR 1 / 2 | `server/tests/architecture-conformance.test.ts`, `server/tests/rich-security-negative.test.ts`, `server/tests/builtin-artifact-mcp.test.ts` | `VERIFIED (REAL RUNTIME)` (`architecture-conformance.test.ts`, `rich-security-negative.test.ts`) |
 | `NEG-03`, `NEG-04`（UI 構成・旧モーダル撤去検査） | **未実装**（PR 3A/4 計画対象） | PR 3A / 4 | PR 3A / PR 4 で追加予定 | PR 3A / 4 ゲート対象 |
+
+---
+
+## 7. 実行証拠サマリおよび PR Lens 指摘監査
+
+### 7.1 検証区分ごとの実測証拠
+
+| 検証区分 | 実行スイート / 環境 | 結果 | 備考 |
+| --- | --- | --- | --- |
+| **`VERIFIED (REAL RUNTIME)`** | `AGY_TEST_FULL_RUNTIME_DIR=/tmp/agy-doc-runtime PLAYWRIGHT_EXECUTABLE_PATH=/usr/bin/google-chrome npx vitest run server/tests/builtin-artifact-mcp.test.ts` | **13 passed / 0 skipped / 0 failed** | Mermaid SVG・`mermaid.parse()` 行エラー・CSV 表 PNG＋領域指定・Markdown PDF/DOCX・PDF 差分検証・任意スライド PPTX 検証に加え、**`sandboxMode: 'strict'` / `allowUnsandboxedDocWorkers: false` による実 `bwrap` サンドボックス内での Python・LibreOffice・pandoc・qpdf 実行**まで合格（`bwrap` で `/etc/libreoffice` 未マウントにより LibreOffice が `NoSuchElementException` で異常終了する実バグを検出し `sandbox-worker.ts` で修正済み）。 |
+| **`VERIFIED (REAL RUNTIME)`** | `AGY_TEST_SMARTART_FILE=/tmp/smartart-simple.pptx /tmp/agy-doc-runtime/venv/bin/python3 -m unittest server.tests.artifact_doc_worker_test -v` | **34 / 34 passed** | 実 PowerPoint `smartart-simple.pptx`（`venn1`）・`cycle4`・`pyramid1`・`matrix_snake`・`hierarchy1`・`process1` の SmartArt ノード増減＋再編集＋`chMax=7` 超過拒否（終了コード 4）、任意スライド PPTX 視覚整合＋リソース予算 4 状態、XLSX/DOCX `XML.iterparse` ストリーミング範囲読取を含む全 34 テスト合格。 |
+| **`VERIFIED (REAL RUNTIME)`** | `npm run typecheck && npm run build && npm test`（`AGY_TEST_FULL_RUNTIME_DIR` 未設定の Base ChatUI モード） | **全 22 スイート合格（Full Runtime 2 テストは明示的に `SKIPPED`）** | `it.skipIf(...)` により、未実行の Full Runtime / strict `bwrap` テストが誤って `passed` として計上されないことを保証。40,000 行テキスト・バイト窓・40,000 行 CSV ストリーミング読取および Base ChatUI 非稼働時ガードは常時実行・合格。 |
+| **`VERIFIED (MOCK / EMULATION)`** | `acp-transparency.test.ts`, `builtin-artifact-mcp.test.ts`（ACP ターン帰属・`session/load`・`session/resume` 経路） | **passed** | `agyMode: 'mock'` の拡張モック ACP クライアントによる検証。 |
+| **`UNVERIFIED`** | 実 `agy` バイナリ / 実 Microsoft PowerPoint・Word・Excel デスクトップアプリ / 物理 iPhone（iOS Safari・PWA） | **未検証（環境非搭載）** | LibreOffice やモック検証をもって検証済みと混同しない。実 `agy` 検証は `AGY_REAL_TEST=1 node scripts/verify-real-agy-artifact-mcp.mjs` を実機環境で実行すること。 |
+
+### 7.2 PR #37 PR Lens 過去指摘の再照合結果
+
+PR #37 に過去に記録された全 6 件の PR Lens 指摘について最新コードと再照合した：
+- `#4688390115`（`edit_presentation` の `text is None` ガード）: 修正済み確認（`c771621` 以降継続維持）。
+- `#4688390123`（`readActiveArtifactBytes` の 100MB 制限適用範囲）: 修正済み確認（`c771621` 以降継続維持、さらに `readRange` をストリーミング/部分読取化）。
+- `#4688441346`（`deploy/setup-doc-runtime.sh` の RAM プローブ失敗時フォールバック）: 修正済み確認（`80446ff` 以降継続維持）。
+- `#4688517338`（`artifact-service.ts` `readRange` における `this.documentWorker.available` 事前チェック欠落）: **本修正で解消**（`artifact-service.ts` に `this.documentWorker.available &&` ガードを追加し、`builtin-artifact-mcp.test.ts` で Base ChatUI 時の 422 `UNSUPPORTED_OPERATION` 返却をテスト化）。
+- `#4689345173`（`MarkdownAdapter.verify` の `decodeURIComponent` 例外保護）: 修正済み確認（`bc6f405` 以降継続維持）。
+- `#4689533352`（`MarkdownAdapter` `sanitizeHref` の二重 HTML エスケープ防止）: 修正済み確認（`88fe84e` 以降 `unescapeBasicHtmlEntities` により継続維持）。
+

@@ -62,7 +62,7 @@ const DIRECT_EDITOR_OPERATIONS = new Set([
 const LIMITED_OPERATIONS: Record<string, string> = {
   'pptx.add_image': 'PNG または JPEG。',
   'pptx.smartart.update_node_text': 'データモデルと描画キャッシュが対応付けできる既存ノードラベル。',
-  'pptx.smartart.add_or_remove_node': '単一階層の線形リスト（vList/hList/bList/default）および線形プロセス（process/chevron）に対応。Venn・循環・階層・ピラミッド・マトリクス等は unsupported_by_format を返却。',
+  'pptx.smartart.add_or_remove_node': 'LibreOffice の layoutDef 再計算と描画キャッシュ同期により、線形リスト・線形プロセス・Venn・循環・ピラミッド・マトリクス・階層図等の主要図種に対応（layoutDef の chMax 上限や LibreOffice 非対応レイアウトは unsupported_by_format を返却）。',
   'docx.set_paragraph_text': '複数ラン・書式指定に対応。フィールド・図形・ハイパーリンク・脚注参照等の保護ノードを含む段落は破壊的上書きを拒否。',
   'docx.add_image': 'PNG または JPEG。',
   'xlsx.mutate_rows': 'ブック横断参照を書き換え。ピボット・構造化テーブル・配列数式交差時は 422 で保護拒否。',

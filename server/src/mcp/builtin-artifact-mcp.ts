@@ -322,9 +322,16 @@ export class BuiltinArtifactMcpServer {
         { type: 'text', text: JSON.stringify({ artifactId, revision, sha256 }) },
       ]);
     });
-    tool('artifact_verify', 'Verify the current artifact revision.', artifactId, ({ artifactId }) => {
+    tool('artifact_verify', 'Verify the current artifact revision. PPTX accepts optional options.slideIndices, maxSlides, and maxShapesPerSlide for server-side layer visual consistency verification.', {
+      ...artifactId,
+      options: z.object({
+        slideIndices: z.array(z.number().int().min(0).max(500)).max(50).optional(),
+        maxSlides: z.number().int().min(1).max(50).optional(),
+        maxShapesPerSlide: z.number().int().min(1).max(100).optional(),
+      }).optional(),
+    }, ({ artifactId, options }) => {
       assertArtifact(artifactId);
-      return this.artifacts.verifyArtifact(userId, artifactId);
+      return this.artifacts.verifyArtifact(userId, artifactId, options);
     });
     tool('artifact_export', 'Convert an artifact and save the result in this chat.', {
       ...artifactId, targetFormat: identifier, outputRelPath: z.string().max(1024).optional(), ...idempotencyKey,
