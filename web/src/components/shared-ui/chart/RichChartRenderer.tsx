@@ -15,6 +15,16 @@ const pw = W - L - R;
 const ph = H - T - B;
 const fmt = (n: number) => new Intl.NumberFormat(undefined, { maximumFractionDigits: 2, notation: Math.abs(n) >= 100000 ? 'compact' : 'standard' }).format(n);
 const finite = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n);
+const timeFormat = new Intl.DateTimeFormat(undefined, { year: 'numeric', month: '2-digit', day: '2-digit' });
+/** Date-only values represent local calendar dates; explicit offsets represent instants. */
+export function parseChartTime(value: string | number): number {
+  const date = typeof value === 'number' ? new Date(value) : /^\d{4}-\d{2}-\d{2}$/.test(value)
+    ? new Date(value + 'T00:00:00') : new Date(value);
+  return date.getTime();
+}
+export function formatChartTime(value: number): string {
+  return Number.isFinite(new Date(value).getTime()) ? timeFormat.format(value) : '—';
+}
 function pathSegments(points: Array<{ x: number; y: number; base: number } | null>, connect: boolean) {
   const segments: Array<Array<{ x: number; y: number; base: number }>> = [];
   let segment: Array<{ x: number; y: number; base: number }> = [];
@@ -84,7 +94,7 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
     const count = Math.max(1, ...series.map(s => s.points.length), categories.length);
     const cat = Array.from({length:count}, (_,i) => categories[i] ?? series.find(s => s.points[i])?.points[i].x ?? i+1);
     const numericX = !horizontal && !stacked && !series.some(s => s.type === 'bar') && node.xAxis?.type !== undefined && node.xAxis.type !== 'category';
-    const xn = (x: string | number) => node.xAxis?.type === 'time' ? (typeof x === 'number' ? x : Date.parse(x)) : Number(x);
+    const xn = (x: string | number) => node.xAxis?.type === 'time' ? parseChartTime(x) : Number(x);
     const xvals = numericX ? series.flatMap(s => s.points.map(p => xn(p.x))).filter(finite) : [];
     const xmin = xvals.length ? Math.min(...xvals) : 0;
     const xmax = xvals.length ? Math.max(...xvals) : 1;
@@ -145,7 +155,7 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
             height={horizontal ? Math.max(0.5,barWidth-1) : Math.abs(y2-y1)} {...activate(s,s.points[i],i)}><title>{details(s,s.points[i])}</title></rect>;
         });
       }
-      const mapped = pts.map((p,i) => p ? { x:sx(s.points[i],i), y:sy(p.top,s.right), base:sy(p.base,s.right) } : null);
+      const mapped = pts.map((p,i) => p && (!numericX || finite(xn(s.points[i].x))) ? { x:sx(s.points[i],i), y:sy(p.top,s.right), base:sy(p.base,s.right) } : null);
       return <g key={s.key}>{s.type !== 'scatter' && pathSegments(mapped,Boolean(node.connectNulls)).map((seg,i) => {
         const line = seg.map((p,k)=>(k?' L ':'M ')+p.x+' '+p.y).join('');
         const area = line+seg.slice().reverse().map(p=>' L '+p.x+' '+p.base).join('')+' Z';
@@ -156,7 +166,7 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
     figure = <g className="rich-chart-axes" fill="currentColor" fontSize="12">
       {axes}
       {!numericX && cat.map((x,i) => i%labelStep===0 && <text key={i} x={horizontal ? L-8 : L+(i+0.5)/count*pw} y={horizontal ? T+(i+0.5)/count*ph+4 : H-B+17} textAnchor={horizontal?'end':'middle'}>{String(x).slice(0,14)}</text>)}
-      {numericX && Array.from({length:5},(_,i)=>{const x=xmin+(xmax-xmin)*i/4;return <text key={i} x={L+pw*i/4} y={H-B+17} textAnchor="middle">{node.xAxis?.type==='time'?new Date(x).toISOString().slice(0,10):fmt(x)}</text>})}
+      {numericX && Array.from({length:5},(_,i)=>{const x=xmin+(xmax-xmin)*i/4;return <text key={i} x={L+pw*i/4} y={H-B+17} textAnchor="middle">{node.xAxis?.type==='time'?formatChartTime(x):fmt(x)}</text>})}
       <defs><clipPath id={clipId}><rect x={L} y={T} width={pw} height={ph}/></clipPath></defs>
       <g clipPath={'url(#'+clipId+')'}>{marks}
       {(node.referenceLines??[]).map((r,i)=>{

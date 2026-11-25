@@ -1,6 +1,8 @@
 import React,{useEffect,useRef,useState} from 'react';
 import { workspaceApi,supportsOperation } from '../../../api/workspace';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
+import { PdfCanvasViewer } from '../../ArtifactViewerModal';
+import { buildArtifactContentUrl } from '../../../utils/viewerCache';
 import { assertRevision,useRevisionResource } from '../useRevisionResource';
 import type { WorkspaceModuleProps } from '../types';
 type Slide={id:string;part:string};
@@ -32,9 +34,11 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   const index=Math.max(0,slides.findIndex(s=>s.id===slideId));
   const slide=slides[index];
   const size=structure.data?.slideSize;
+  const renderCap=capabilities?.operations.find(op=>op.operation==='render_png');
+  const workerReady=renderCap?.availability==='supported'||renderCap?.availability==='partial';
   const layered=mode!=='view';
-  const scene=useRevisionResource<SlideData>(artifact,'pptx:'+String(slide?.id)+':'+layered,async signal=>{
-    if(!slide)throw Error('スライドがありません。');
+  const scene=useRevisionResource<SlideData>(artifact,'pptx:'+String(slide?.id)+':'+layered+':'+workerReady,async signal=>{
+    if(!slide||!workerReady)throw Error('スライドがありません。');
     if(!layered)return {slideId:slide.id,shapes:[],background:await workspaceApi.render(artifact,{pageIndex:index},signal),layers:[]};
     const r=await workspaceApi.range<{shapes:Shape[]}>(artifact.id,{part:slide.part},signal);assertRevision(artifact,r);
     if(r.shapes.length>60)throw Error('このスライドの編集表示は60要素まで対応しています。');
@@ -66,6 +70,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     {mode==='edit'&&shape?.type==='sp'&&<input aria-label="図形テキスト" value={String(draft?.entries.find(e=>e.key===key(shape.id,'text'))?.operation.text??shape.text)} readOnly={editingLocked||!supportsOperation(capabilities,'pptx.set_shape_text')} onChange={e=>editText(e.target.value)}/>}
     {mode==='edit'&&shape&&bounds(shape)&&['x','y','width','height'].map(field=><label key={field} className="workspace-bound">{field}<input aria-label={field} type="number" value={bounds(shape)![field as keyof Bounds]} disabled={editingLocked||!supportsOperation(capabilities,'pptx.set_shape_bounds')} onChange={e=>{const value=e.target.valueAsNumber;if(Number.isFinite(value)&&((field==='x'||field==='y')?Math.abs(value)<=14400:value>=1&&value<=14400))writeBounds(shape,{...bounds(shape)!,[field]:value})}}/></label>)}
   </div>;
+  if(mode==='view'&&!workerReady)return <PdfCanvasViewer documentKey={artifact.id} url={buildArtifactContentUrl(artifact,{convertedPdf:true})}/>;
   return <div className="workspace-presentation"><nav className="workspace-slide-nav" aria-label="スライド一覧">{slides.slice(Math.max(0,index-4),index+5).map(s=><MiniSlide key={s.id} artifact={artifact} index={slides.indexOf(s)} active={s.id===slide?.id} onClick={()=>{setSlideId(s.id);choose('')}}/>)}<button type="button" className="btn btn-secondary btn-xs" disabled={index===0} onClick={()=>{setSlideId(slides[index-1].id);choose('')}}>前へ</button><button type="button" className="btn btn-secondary btn-xs" disabled={index+1>=slides.length} onClick={()=>{setSlideId(slides[index+1].id);choose('')}}>次へ</button></nav>
     <UnifiedViewerZoomShell resetKey={artifact.id+':pptx'} controlsTop={toolbar}>
       {(structure.error||scene.error)&&<div className="error-box" role="alert">{structure.error||scene.error}<button type="button" onClick={()=>{structure.retry();scene.retry()}}>再試行</button></div>}

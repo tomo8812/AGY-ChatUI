@@ -289,6 +289,18 @@ class DocumentFormatAdapter implements FormatAdapter {
     }
 
     if (this.format === 'pdf') {
+      // A PDF.js page selection is bound to the exact immutable document.
+      // Any byte change requires review; never treat a whole-file hash as a page hash.
+      if (selector.kind === 'pdf_page' && typeof selector.expectedArtifactSha256 === 'string') {
+        const pageIndex = Number(selector.pageIndex);
+        const pageCount = Number(selector.expectedPageCount);
+        if (!Number.isInteger(pageIndex) || !Number.isInteger(pageCount) || pageIndex < 0 || pageIndex >= pageCount) {
+          return { status: 'stale', reason: 'invalid_page_selection' };
+        }
+        return selector.expectedArtifactSha256 === currentSha
+          ? { status: 'resolved', resolvedCoords: { pageIndex } }
+          : { status: 'needs_review', reason: 'pdf_document_changed' };
+      }
       const expectedPageContentHash = selector.expectedPageContentHash ? String(selector.expectedPageContentHash) : null;
       const currentPageHash = currentSha;
       if (!expectedPageContentHash || expectedPageContentHash !== currentPageHash) {

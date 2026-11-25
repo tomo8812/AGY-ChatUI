@@ -243,7 +243,12 @@ interface PdfPageFocalAnchor {
   relY: number;
 }
 
-export const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) => {
+export const PdfCanvasViewer: React.FC<{
+  url: string;
+  /** Stable identity enables page/zoom/scroll restoration on a newer revision. */
+  documentKey?: string;
+  onSelectPage?: (pageIndex: number, pageCount: number) => void;
+}> = React.memo(({ url, documentKey = url, onSelectPage }) => {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
   const pagesListRef = useRef<HTMLDivElement | null>(null);
@@ -260,6 +265,8 @@ export const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) =
   const scrollRafRef = useRef<number | null>(null);
   const scheduleRenderRef = useRef<() => void>(() => {});
   const pageNumRef = useRef(1);
+  const loadedKeyRef = useRef<string | null>(null);
+  const restoreViewRef = useRef<{ page: number; offsetY: number; scrollLeft: number } | null>(null);
 
   const [pdfDoc, setPdfDoc] = useState<PdfJsTypes.PDFDocumentProxy | null>(null);
   const [pageNum, setPageNum] = useState(1);
@@ -322,19 +329,37 @@ export const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) =
   useEffect(() => {
     let active = true;
     let loadedDoc: PdfJsTypes.PDFDocumentProxy | null = null;
+    const abort = new AbortController();
+    const sameDocument = loadedKeyRef.current === documentKey;
+    const previousPage = sameDocument ? pageNumRef.current : 1;
+    if (sameDocument) {
+      const sc = scrollRef.current;
+      const slot = pageElementsRef.current.get(previousPage);
+      if (sc && slot) {
+        restoreViewRef.current = { page: previousPage,
+          offsetY: slot.getBoundingClientRect().top - sc.getBoundingClientRect().top,
+          scrollLeft: sc.scrollLeft };
+      }
+    } else {
+      restoreViewRef.current = null;
+    }
+    loadedKeyRef.current = documentKey;
     setLoading(true);
     setError(null);
     setPageRenderErrorCount(0);
     setPdfDoc(null);
     setNumPages(0);
-    setPageNum(1);
-    setFitMode('auto');
+    if (!sameDocument) {
+      setPageNum(1);
+      setFitMode('auto');
+      setManualScale(1.0);
+    }
     setPageSizes([]);
     isZoomInteractingRef.current = false;
     programmaticScrollRef.current = null;
     pageElementsRef.current.clear();
     canvasElementsRef.current.clear();
-    visiblePagesRef.current = new Set([1, 2]);
+    visiblePagesRef.current = new Set([previousPage, previousPage + 1]);
     renderedKeyByPageRef.current.clear();
     jobTrackerRef.current.cancelAll();
     jobTrackerRef.current.clearAllFailures();
@@ -343,13 +368,14 @@ export const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) =
       try {
         let bytes = pdfBytesCache.get(url);
         if (!bytes) {
-          const res = await fetch(url, { credentials: 'include' });
+          const res = await fetch(url, { credentials: 'include', signal: abort.signal });
           if (!res.ok) {
             const j = await res.json().catch(() => null);
             throw new Error(j?.message || `PDF読込エラー (${res.status})`);
           }
           const buf = await res.arrayBuffer();
           bytes = new Uint8Array(buf);
+          if (!active) return;
           pdfBytesCache.set(url, bytes);
         }
 
@@ -363,7 +389,10 @@ export const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) =
         }
         setPdfDoc(loadedDoc);
         setNumPages(loadedDoc.numPages);
-        setPageNum(1);
+        const nextPage = Math.max(1, Math.min(loadedDoc.numPages, previousPage));
+        pageNumRef.current = nextPage;
+        setPageNum(nextPage);
+        if (restoreViewRef.current) restoreViewRef.current.page = nextPage;
         setPageSizes(new Array<PdfPageSize | null>(loadedDoc.numPages).fill(null));
       } catch (err) {
         if (active) setError(err instanceof Error ? err.message : 'PDFの表示に失敗しました');
@@ -375,14 +404,11 @@ export const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) =
 
     return () => {
       active = false;
+      abort.abort();
       jobTrackerRef.current.cancelAll();
       if (loadedDoc) void loadedDoc.destroy();
     };
-  }, [url]);
-
-  useEffect(() => {
-    scrollRef.current?.scrollTo({ top: 0, left: 0 });
-  }, [url]);
+  }, [url, documentKey]);
 
   const pendingSizeAnchorRef = useRef<{ pageNum: number; offsetTop: number } | null>(null);
 
@@ -494,6 +520,20 @@ export const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) =
   const readyToRender =
     Boolean(pdfDoc) &&
     (fitMode !== 'auto' || (pageSizes[0] !== null && containerSize.width > 0 && containerSize.height > 0));
+
+  useLayoutEffect(() => {
+    const anchor = restoreViewRef.current;
+    const sc = scrollRef.current;
+    if (!anchor || !sc || loading || !pdfDoc || !pageSizes[anchor.page - 1] || containerSize.width <= 0) return;
+    const slot = pageElementsRef.current.get(anchor.page);
+    if (!slot) return;
+    restoreViewRef.current = null;
+    programmaticScrollRef.current = { targetPage: anchor.page, expiresAt: performance.now() + 700 };
+    sc.scrollTo({ top: Math.max(0, sc.scrollTop + slot.getBoundingClientRect().top - sc.getBoundingClientRect().top - anchor.offsetY),
+      left: anchor.scrollLeft, behavior: 'instant' });
+    pageNumRef.current = anchor.page;
+    setPageNum(anchor.page);
+  }, [loading, pdfDoc, pageSizes, containerSize.width, scrollEl]);
 
   // Single shared IntersectionObserver for all pages (replaces N observers!)
   useEffect(() => {
@@ -972,7 +1012,7 @@ export const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) =
     onGestureStart: handleGestureStart,
     onGestureEnd: handleGestureEnd,
     onPanStart: cancelProgrammaticScrollLock,
-    resetKey: url,
+    resetKey: documentKey,
   });
 
   const applyStepZoom = useCallback(
@@ -1026,6 +1066,8 @@ export const PdfCanvasViewer: React.FC<{ url: string }> = React.memo(({ url }) =
           >
             次 <ChevronIcon size={14} dir="right" />
           </button>
+          {onSelectPage && <button type="button" className="btn btn-secondary btn-xs" disabled={!numPages}
+            onClick={() => onSelectPage(pageNum - 1, numPages)}>ページを対象にする</button>}
         </div>
         <div className="pdf-toolbar-group pdf-zoom-group">
           <button

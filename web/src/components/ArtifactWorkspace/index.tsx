@@ -11,7 +11,7 @@ import type { WorkspaceModule } from './types';
 export function prototypeModuleFor(artifact:ArtifactRecord):WorkspaceModule|null{
   const name=artifact.filename.toLowerCase();
   if(name.endsWith('.pptx'))return {Component:PptxModule,editOperations:['pptx.set_shape_text','pptx.set_shape_bounds'],canPin:true};
-  if(name.endsWith('.pdf'))return {Component:PdfModule,editOperations:[],canPin:false};
+  if(name.endsWith('.pdf'))return {Component:PdfModule,editOperations:[],canPin:true};
   if(name.endsWith('.docx'))return {Component:DocxModule,editOperations:['docx.set_paragraph_text'],canPin:true};
   if(/\.(xlsx|csv|tsv)$/.test(name))return {Component:GridModule,editOperations:name.endsWith('.xlsx')?['xlsx.set_cell','xlsx.set_formula']:['edit'],canPin:true};
   if(artifact.previewKind==='markdown'||artifact.previewKind==='code')return {Component:SourceModule,editOperations:['edit'],canPin:true};
