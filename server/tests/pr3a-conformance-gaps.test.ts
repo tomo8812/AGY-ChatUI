@@ -20,6 +20,9 @@ import { auditRegions, decodePng } from '../../e2e/helpers/visualAudit.js';
 import { BlockRenderAccounting, addNode, expression } from '../../web/src/components/shared-ui/runtime.js';
 import { RichStateStore } from '../../web/src/components/shared-ui/RichStateStore.js';
 import type { RichDocumentV1 } from '../../shared/rich-schema.js';
+import { gridAxisChanges, prepareGridOperations, savedGridOrigin } from '../../web/src/components/ArtifactWorkspace/gridDraft.js';
+import type { DraftEntry } from '../../web/src/components/ArtifactWorkspace/types.js';
+
 
 function buildMinimalXlsx(opts: {
   sheets: Array<{
@@ -1225,4 +1228,55 @@ describe('PR 3A target identity and large inputs', () => {
       kind: 'pdf_page', pageIndex: 0, expectedPageCount: pageCount, expectedPageContentHash: target!.pageContentHash,
     }, meta).status).toBe('needs_review');
   });
+});
+
+it('keeps cell edits mapped to the saved and inserted coordinates through structural changes', () => {
+  const insertRow: DraftEntry = {
+    key: 'grid-structure:1', label: 'Insert row', operation: { op: 'insert_row', index: 0, values: ['', ''] },
+  };
+  const rowChanges = gridAxisChanges([insertRow], 'csv', 'row');
+  const inserted = savedGridOrigin(0, rowChanges);
+  const original = savedGridOrigin(1, rowChanges);
+  const insertColumn: DraftEntry = {
+    key: 'grid-structure:2', label: 'Insert column', operation: { op: 'insert_col', index: 0 },
+  };
+  const entries: DraftEntry[] = [
+    insertRow,
+    {
+      key: 'inserted', label: 'New row',
+      operation: { op: 'set_cell', value: 'New row' },
+      gridLocation: { sheetId: 'csv', row: inserted, col: { index: 0 }, after: insertRow.key },
+    },
+    insertColumn,
+    {
+      key: 'existing', label: 'Original row',
+      operation: { op: 'set_cell', value: 'Original row' },
+      gridLocation: { sheetId: 'csv', row: original, col: { index: 0 }, after: insertColumn.key },
+    },
+  ];
+  expect(prepareGridOperations(entries)).toEqual([
+    insertRow.operation,
+    { op: 'set_cell', row: 0, col: 0, value: 'New row' },
+    insertColumn.operation,
+    { op: 'set_cell', row: 1, col: 1, value: 'Original row' },
+  ]);
+  expect(prepareGridOperations(entries.filter(entry => entry !== insertColumn)).at(-1)).toEqual(
+    { op: 'set_cell', row: 1, col: 0, value: 'Original row' },
+  );
+});
+
+it('binds edits on a new worksheet to the sheet created earlier in the same draft', () => {
+  const sheet = 'grid-structure:1';
+  const entries: DraftEntry[] = [
+    { key: sheet, label: 'New sheet', operation: { op: 'xlsx.add_sheet', name: 'New sheet' } },
+    {
+      key: sheet + ':A1', label: 'Cell A1',
+      operation: { op: 'xlsx.set_cell', address: 'A1', value: 'Draft value' },
+      gridLocation: { sheetId: sheet, row: { index: 0 }, col: { index: 0 }, after: sheet },
+    },
+  ];
+  expect(prepareGridOperations(entries)).toEqual([
+    { op: 'xlsx.add_sheet', name: 'New sheet', draftSheetKey: sheet },
+    { op: 'xlsx.set_cell', address: 'A1', value: 'Draft value', draftSheetKey: sheet },
+  ]);
 });

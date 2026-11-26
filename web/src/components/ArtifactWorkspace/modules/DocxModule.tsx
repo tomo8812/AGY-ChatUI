@@ -29,6 +29,9 @@ interface WordRange {
   headings?:{blockIndex:number;text:string;level:number}[];
 }
 
+const wordListMarkers:Record<string,string>={bullet:'•',decimal:'1.',lowerLetter:'a)',upperRoman:'I.'};
+const headingStyle=(level:number)=>level?{fontSize:Math.max(1,1.5-(level-1)*0.075)+'em'}:undefined;
+
 const CHUNK_SIZE=60;
 
 interface WordChunkProps {
@@ -169,11 +172,17 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   const stage=(key:string,operation:Record<string,unknown>&{op:string},label:string)=>{
     if(artifact.revision!==undefined&&!locked)onDraft(artifact.revision,{key,label,operation},key);
   };
+  const selectedAddition=additions.find(entry=>entry.key===activeAddition&&entry.operation.op==='docx.add_paragraph');
   const styleParagraph=(operation:Record<string,unknown>&{op:string},kind:string)=>{
-    if(!block||block.type!=='p'||!can(operation.op))return;
-    stage(kind+':'+block.blockIndex,{...operation,blockIndex:block.blockIndex},'段落 '+(block.blockIndex+1)+' の書式');
+    if(!can(operation.op))return;
+    if(selectedAddition){
+      const {op:_,...patch}=operation;
+      stage(selectedAddition.key,{...selectedAddition.operation,...patch},selectedAddition.label);
+    }else if(block?.type==='p'){
+      stage(kind+':'+block.blockIndex,{...operation,blockIndex:block.blockIndex},'段落 '+(block.blockIndex+1)+' の書式');
+    }
   };
-  const editableSelection=Boolean(block?.editableText||additions.some(e=>e.key===activeAddition&&e.operation.op==='docx.add_paragraph'));
+  const editableSelection=Boolean(block?.editableText||selectedAddition);
 
   async function pinParagraph(selectedBlock:WordBlock){
     if(artifact.revision===undefined||selectedBlock.type!=='p')return;
@@ -224,14 +233,14 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     onClick={()=>setOutlineOpen(open=>!open)}>見出し一覧</button>;
   const secondary=mode==='edit'?<>
     {outlineButton}
-    <select aria-label="見出しレベル" disabled={!block?.editableText||!can('docx.set_paragraph_style')}
-      value={String(draft?.entries.find(e=>e.key==='style:'+block?.blockIndex)?.operation.headingLevel??block?.headingLevel??0)}
+    <select aria-label="見出しレベル" disabled={!editableSelection||!can('docx.set_paragraph_style')}
+      value={String(selectedAddition?.operation.headingLevel??draft?.entries.find(e=>e.key==='style:'+block?.blockIndex)?.operation.headingLevel??block?.headingLevel??0)}
       onChange={event=>styleParagraph({op:'docx.set_paragraph_style',headingLevel:Number(event.target.value)},'style')}>
       <option value="0">本文</option>
       {Array.from({length:9},(_,index)=><option key={index+1} value={index+1}>見出し {index+1}</option>)}
     </select>
-    <select aria-label="リスト形式" disabled={!block?.editableText||!can('docx.set_list')}
-      value={String(draft?.entries.find(e=>e.key==='list:'+block?.blockIndex)?.operation.listType??block?.listType??(block?.listed?'current':'none'))}
+    <select aria-label="リスト形式" disabled={!editableSelection||!can('docx.set_list')}
+      value={String(selectedAddition?.operation.listType??draft?.entries.find(e=>e.key==='list:'+block?.blockIndex)?.operation.listType??block?.listType??(block?.listed?'current':'none'))}
       onChange={event=>styleParagraph({op:'docx.set_list',listType:event.target.value},'list')}>
       <option value="current" disabled>既存のリスト</option>
       <option value="none">リストなし</option>
@@ -290,13 +299,13 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     const headingLevel=Number(draft?.entries.find(e=>e.key==='style:'+b.blockIndex)?.operation.headingLevel??b.headingLevel??0);
     const listType=draft?.entries.find(e=>e.key==='list:'+b.blockIndex)?.operation.listType??b.listType;
     const list=listType?listType!=='none':b.listed;
-    const listMarker=({decimal:'1.',lowerLetter:'a)',upperRoman:'I.'} as Record<string,string>)[String(listType)]??'•';
+    const listMarker=wordListMarkers[String(listType)]??'•';
     const images=draft?.entries.filter(e=>e.operation.op==='docx.add_image'&&e.operation.blockIndex===b.blockIndex)??[];
     return <div
       key={b.blockIndex}
       data-word-block={b.blockIndex}
       data-list-marker={list?listMarker:undefined}
-      style={headingLevel?{fontSize:Math.max(1,1.5-(headingLevel-1)*0.075)+'em'}:undefined}
+      style={headingStyle(headingLevel)}
       className={'workspace-word-block '+(active?'selected ':'')+(headingLevel?'word-heading ':'')+(list?'word-list':'')}
       onClick={()=>{if(selected!==b.blockIndex)activeEditor.current=null;setActiveAddition(null);setSelected(b.blockIndex)}}
     >
@@ -348,10 +357,18 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
       />)}
       {mode==='edit'&&additions.map((entry,index)=>{
         const cancel=()=>{if(artifact.revision!==undefined)onDraft(artifact.revision,null,entry.key);if(activeAddition===entry.key){activeEditor.current=null;setActiveAddition(null)}};
-        if(entry.operation.op==='docx.add_paragraph')return <div key={entry.key}>
-          <WordParagraphEditor label={index===0?'追加段落':'追加段落 '+(index+1)} runs={(entry.operation.runs as WordRun[]|undefined)??[{text:String(entry.operation.text??'')}]} readOnly={locked} onFocus={ed=>{activeEditor.current=ed;setActiveAddition(entry.key);setSelected(null)}} onChange={runs=>stage(entry.key,{op:'docx.add_paragraph',runs:runs.map(({originIndex,...r})=>r)},entry.label)}/>
-          <button type="button" className="btn btn-ghost btn-xs" disabled={locked} onClick={cancel}>取消</button>
-        </div>;
+        if(entry.operation.op==='docx.add_paragraph'){
+          const level=Number(entry.operation.headingLevel??0);
+          const marker=wordListMarkers[String(entry.operation.listType)];
+          return <div key={entry.key} style={headingStyle(level)} data-list-marker={marker}
+            className={'workspace-word-block '+(level?'word-heading ':'')+(marker?'word-list ':'')}>
+            <WordParagraphEditor label={index===0?'追加段落':'追加段落 '+(index+1)}
+              runs={(entry.operation.runs as WordRun[]|undefined)??[{text:String(entry.operation.text??'')}]}
+              readOnly={locked} onFocus={ed=>{activeEditor.current=ed;setActiveAddition(entry.key);setSelected(null)}}
+              onChange={runs=>stage(entry.key,{...entry.operation,runs:runs.map(({originIndex,...run})=>run)},entry.label)}/>
+            <button type="button" className="btn btn-ghost btn-xs" disabled={locked} onClick={cancel}>取消</button>
+          </div>;
+        }
         const rows=entry.operation.rows as string[][],update=(next:string[][])=>stage(entry.key,{op:'docx.add_table',rows:next},entry.label);
         return <div key={entry.key} className="workspace-pptx-table"><table className="workspace-word-table"><tbody>{rows.map((row,r)=><tr key={r}>{row.map((cell,c)=><td key={c}><input aria-label={(index===0?'追加表':'追加表 '+(index+1))+' '+(r+1)+'行 '+(c+1)+'列'} value={cell} readOnly={locked} onChange={e=>update(rows.map((line,i)=>line.map((value,j)=>i===r&&j===c?e.target.value:value)))}/></td>)}</tr>)}</tbody></table>
           <button type="button" className="btn btn-secondary btn-xs" disabled={locked||rows.length>=100} onClick={()=>update([...rows,Array(rows[0].length).fill('')])}>行を追加</button>

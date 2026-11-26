@@ -23,6 +23,7 @@ export interface WorkspaceRevision {
   restorable: boolean;
   actorKind: 'user' | 'ai' | 'system';
   operationSummary: string;
+  diffPatch: string | null;
   createdAt: number;
 }
 

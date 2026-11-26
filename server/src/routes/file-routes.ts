@@ -646,7 +646,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     z.object({op:z.literal('pptx.set_shape_bounds'),slidePart:draftSlidePartSchema,shapeId:draftShapeId,boundsPt:draftBoundsSchema}).strict(),
     draftShapeStyle.extend({op:z.literal('pptx.set_shape_style'),slidePart:draftSlidePartSchema,shapeId:draftShapeId}),
     z.object({op:z.literal('pptx.add_shape'),slidePart:draftSlidePartSchema,kind:z.enum(['rectangle','ellipse','textbox']),boundsPt:draftBoundsSchema,text:z.string().max(20000),style:draftShapeStyle.optional()}).strict(),
-    z.object({op:z.literal('pptx.add_image'),slidePart:draftSlidePartSchema,boundsPt:draftBoundsSchema,imageBase64:z.string().min(1).max(8_000_000)}).strict(),
+    z.object({op:z.literal('pptx.add_image'),slidePart:draftSlidePartSchema,boundsPt:draftBoundsSchema,imageBase64:z.string().min(1).max(8_000_000),style:draftShapeStyle.optional()}).strict(),
     draftTableCellSchema.extend({op:z.literal('pptx.set_table_cell'),slidePart:draftSlidePartSchema,shapeId:draftShapeId}),
     z.object({op:z.literal('pptx.add_table'),slidePart:draftSlidePartSchema,boundsPt:draftBoundsSchema,rows:z.array(z.array(z.string().max(20_000)).min(1).max(30)).min(1).max(100)}).strict(),
     z.object({op:z.literal('pptx.remove_shape'),slidePart:draftSlidePartSchema,shapeId:z.number().int().positive().max(2147483647)}).strict(),

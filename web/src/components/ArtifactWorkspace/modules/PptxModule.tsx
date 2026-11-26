@@ -259,7 +259,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   const styleDraft=shape?.addition
     ? shape.addition.operation.style as BasicStyle|undefined
     : shape?draft?.entries.find(e=>e.key===key(shape.id,'style'))?.operation:undefined;
-  const styleEnabled=!!shape&&(shape.addition?shape.type==='sp':['sp','pic','cxnSp'].includes(shape.type))&&can('pptx.set_shape_style');
+  const styleEnabled=!!shape&&['sp','pic','cxnSp'].includes(shape.type)&&can('pptx.set_shape_style');
   function stageStyle(patch:BasicStyle){
     if(!shape||!slide||!styleEnabled||artifact.revision===undefined)return;
     if(shape.addition){updateAddition(shape.addition,{style:{...styleDraft,...patch}});return}

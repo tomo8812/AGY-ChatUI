@@ -10,6 +10,8 @@ import { EditRequestPanel } from './EditRequestPanel';
 import './workspace.css';
 
 export interface WorkspaceShellProps {artifact:ArtifactRecord;module:WorkspaceModule;onClose:()=>void;onArtifactChanged?:(artifact:ArtifactRecord)=>void}
+const inspectorLabels={details:'ファイル詳細',verify:'品質検証',history:'バージョン履歴',export:'エクスポート',diff:'差分'} as const;
+
 function newId(){return globalThis.crypto?.randomUUID?.()??String(Date.now())+'-'+Math.random().toString(36).slice(2)}
 function historicalArtifact(artifact:ArtifactRecord,version:WorkspaceRevision):ArtifactRecord{
   const {revision,sha256,sizeBytes,dependencyManifestHash}=version;
@@ -32,7 +34,7 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
   const [conflict,setConflict]=useState(false);
   const [chooseRequestVersion,setChooseRequestVersion]=useState(false);
   const [menu,setMenu]=useState(false);
-  const [inspector,setInspector]=useState<'details'|'verify'|'export'|'history'|null>(null);
+  const [inspector,setInspector]=useState<keyof typeof inspectorLabels|null>(null);
   const [verification,setVerification]=useState<Awaited<ReturnType<typeof workspaceApi.verify>>|null>(null);
   const [exported,setExported]=useState<ArtifactRecord|null>(null);
   const [exporting,setExporting]=useState(false);
@@ -57,6 +59,7 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
   const canPreviewHistory=artifact.previewKind==='pdf'||artifact.previewKind==='pptx'||
     (exportFormats.includes('pdf')&&(artifact.previewKind==='docx'||/\.xlsx$/i.test(artifact.filename)));
   const textHistoryPreview=artifact.previewKind==='markdown'||artifact.previewKind==='code'||/\.(csv|tsv)$/i.test(artifact.filename);
+  const [diffRevision,setDiffRevision]=useState<number|null>(null);
   const [previewVersion,setPreviewVersion]=useState<WorkspaceRevision|null>(null);
   const [previewText,setPreviewText]=useState<{revision:number;text:string;error?:boolean}|null>(null);
   useEffect(()=>{
@@ -108,8 +111,7 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
     if(!draft||!expectedRevision||busyRef.current||!capsReady||!canEdit)return;
     if(expectedRevision!==artifact.revision){setConflict(true);return}
     busyRef.current=true;setBusy(true);setError(null);
-    const operations=draft.entries.map(item=>item.operation);
-    const ops=module.prepareOperations?.(operations)??operations;
+    const ops=module.prepareOperations?.(draft.entries)??draft.entries.map(item=>item.operation);
     const signature=JSON.stringify([expectedRevision,ops]);
     if(pendingAttempt.current?.signature!==signature)pendingAttempt.current={signature,key:newId()};
     try{
@@ -179,6 +181,7 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
         <div className="workspace-overflow"><button className="icon-btn" type="button" aria-label="その他の操作" aria-expanded={menu} onClick={()=>setMenu(v=>!v)}>…</button>{menu&&<div className="workspace-menu">
           <button type="button" onClick={()=>{setInspector('details');setMenu(false)}}>ファイル詳細</button>
           <button type="button" onClick={()=>{setInspector('history');if(mode==='pin')setMode('view');setMenu(false)}}>バージョン履歴</button>
+          {artifact.diffPatch&&<button type="button" onClick={()=>{setInspector('diff');if(mode==='pin')setMode('view');setMenu(false)}}>差分を表示</button>}
           {exportFormats.length>0&&<button type="button" onClick={()=>{setInspector('export');if(mode==='pin')setMode('view');setMenu(false)}}>エクスポート</button>}
           <button type="button" onClick={()=>{setInspector('verify');setMenu(false);setVerification(null);void workspaceApi.verify(artifact.id).then(setVerification,e=>setError(e instanceof Error?e.message:'検証できませんでした。'))}}>品質検証</button>
           <button type="button" onClick={()=>{setMenu(false);void refresh().catch(e=>setError(e.message))}}>最新を再読込</button>
@@ -191,7 +194,7 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
       <div className="workspace-main">
         <div className="workspace-canvas"><Suspense fallback={<p role="status">読み込み中…</p>}><Module artifact={artifact} mode={mode} capabilities={caps} draft={mode==='pin'?null:draft} editingLocked={busy||changed||!canEdit||!capsReady} onDraft={onDraft} target={target} onTarget={setTarget}/></Suspense></div>
         {(mode==='pin'||inspector)&&<aside className="workspace-inspector">
-          {mode==='pin'?<EditRequestPanel artifact={artifact} target={target} onClear={()=>setTarget(null)}/>:<><div className="row-between"><strong>{inspector==='details'?'ファイル詳細':inspector==='export'?'エクスポート':inspector==='history'?'バージョン履歴':'品質検証'}</strong><button type="button" className="icon-btn" aria-label="パネルを閉じる" onClick={()=>{setInspector(null);setPreviewVersion(null);setPreviewText(null)}}><CloseIcon/></button></div>{inspector==='details'?<dl><dt>名前</dt><dd>{artifact.filename}</dd><dt>種類</dt><dd>{artifact.mimeType}</dd><dt>サイズ</dt><dd>{artifact.sizeBytes.toLocaleString()} B</dd><dt>バージョン</dt><dd>{artifact.revision??'—'}</dd></dl>:inspector==='history'?<>
+          {mode==='pin'?<EditRequestPanel artifact={artifact} target={target} onClear={()=>setTarget(null)}/>:<><div className="row-between"><strong>{inspector&&inspectorLabels[inspector]}</strong><button type="button" className="icon-btn" aria-label="パネルを閉じる" onClick={()=>{setInspector(null);setPreviewVersion(null);setPreviewText(null);setDiffRevision(null)}}><CloseIcon/></button></div>{inspector==='details'?<dl><dt>名前</dt><dd>{artifact.filename}</dd><dt>種類</dt><dd>{artifact.mimeType}</dd><dt>サイズ</dt><dd>{artifact.sizeBytes.toLocaleString()} B</dd><dt>バージョン</dt><dd>{artifact.revision??'—'}</dd></dl>:inspector==='diff'?<pre className="workspace-history-source">{artifact.diffPatch}</pre>:inspector==='history'?<>
             {historyError?<p role="alert">{historyError}</p>:!history?<p role="status">読み込み中…</p>:history.length===0?<p>履歴がありません。</p>:
               history.map(version=><div key={version.revision} className="workspace-check">
                 <strong>バージョン {version.revision}{version.revision===artifact.revision?'（現在）':''}</strong>
@@ -202,10 +205,13 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
                   target="_blank" rel="noopener noreferrer">プレビュー</a>}
                 {version.previewable&&textHistoryPreview&&<button type="button" className="btn btn-secondary btn-xs"
                   aria-expanded={previewVersion?.revision===version.revision}
-                  onClick={()=>{setPreviewText(null);setPreviewVersion(previewVersion?.revision===version.revision?null:version)}}>プレビュー</button>}
+                  onClick={()=>{setDiffRevision(null);setPreviewText(null);setPreviewVersion(previewVersion?.revision===version.revision?null:version)}}>プレビュー</button>}
+                {version.diffPatch&&<button type="button" className="btn btn-secondary btn-xs" aria-expanded={diffRevision===version.revision}
+                  onClick={()=>{setPreviewVersion(null);setDiffRevision(diffRevision===version.revision?null:version.revision)}}>差分</button>}
                 {version.blobAvailable&&<a href={buildArtifactContentUrl(historicalArtifact(artifact,version),{download:true})} download={artifact.filename}>ダウンロード</a>}
                 {version.restorable&&version.revision!==artifact.revision&&<button type="button" className="btn btn-secondary btn-xs"
                   disabled={busy} onClick={()=>void restoreVersion(version)}>復元</button>}
+                {diffRevision===version.revision&&version.diffPatch&&<pre className="workspace-history-source">{version.diffPatch}</pre>}
                 {previewVersion?.revision===version.revision&&(previewText?.revision===version.revision
                   ? previewText.error?<p role="alert">{previewText.text}</p>:<>
                     <pre className="workspace-history-source">{previewText.text}</pre>

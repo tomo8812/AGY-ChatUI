@@ -806,7 +806,7 @@ def update_sheet_metadata(package, replacements, additions, removed, operation):
         sheet_id = max([0] + [int(sheet.attrib["sheetId"]) for sheet in sheets]) + 1
         node = XML.SubElement(sheets, tag(SPREADSHEET, "sheet"), name=name, sheetId=str(sheet_id))
         node.set(tag(OFFICE_REL, "id"), rid)
-        return
+        return str(sheet_id), target
     if op == "xlsx.set_defined_name":
         name = operation["name"]
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,254}", name) or re.fullmatch(r"[A-Za-z]{1,3}[0-9]+|R|C|R[0-9]+C[0-9]+", name, re.I):
@@ -914,6 +914,7 @@ def update_sheet_metadata(package, replacements, additions, removed, operation):
                 types.remove(entry)
         if target in additions:
             additions.pop(target)
+            replacements.pop(target, None)
         else:
             removed.add(target)
         sheet_rels_path = f"xl/worksheets/_rels/{PurePosixPath(target).name}.rels"
@@ -1218,15 +1219,38 @@ def edit_workbook(package, operations, output):
     replacements = {}
     additions = {}
     removed = set()
+    draft_sheets = {}
     changes_cells = False
     for operation in operations:
         op = operation["op"]
+        draft_sheet = operation.get("draftSheetKey")
+        if draft_sheet is not None:
+            if not isinstance(draft_sheet, str) or not re.fullmatch(r"grid-structure:[1-9][0-9]{0,14}", draft_sheet):
+                raise ValueError("Invalid draft worksheet identity")
+            if op == "xlsx.add_sheet":
+                if draft_sheet in draft_sheets:
+                    raise ValueError("Duplicate draft worksheet identity")
+            else:
+                if draft_sheet not in draft_sheets or op not in {
+                    "xlsx.set_cell", "xlsx.set_formula", "xlsx.set_cell_style", "xlsx.mutate_rows",
+                    "xlsx.mutate_columns", "xlsx.rename_sheet", "xlsx.remove_empty_sheet",
+                }:
+                    raise ValueError("Unknown draft worksheet")
+                sheet_id, sheet_part = draft_sheets[draft_sheet]
+                if sheet_part not in additions:
+                    raise ValueError("Draft worksheet was deleted")
+                operation = {**operation, "sheetId": sheet_id, "sheetPart": sheet_part}
         if op.startswith("chart."):
             changes_cells |= edit_chart(package, "xlsx", operation, replacements)
             continue
         if op in {"xlsx.add_sheet", "xlsx.reorder_sheet", "xlsx.rename_sheet", "xlsx.remove_empty_sheet",
                   "xlsx.remove_sheet", "xlsx.duplicate_sheet", "xlsx.set_sheet_visibility", "xlsx.set_defined_name"}:
-            update_sheet_metadata(package, replacements, additions, removed, operation)
+            created_sheet = update_sheet_metadata(package, replacements, additions, removed, operation)
+            if draft_sheet is not None:
+                if created_sheet is not None:
+                    draft_sheets[draft_sheet] = created_sheet
+                elif op == "xlsx.remove_empty_sheet":
+                    del draft_sheets[draft_sheet]
             changes_cells = True
             continue
         if op in {"xlsx.set_merge", "xlsx.add_conditional_format", "xlsx.set_data_validation", "xlsx.set_auto_filter",
@@ -1235,7 +1259,7 @@ def edit_workbook(package, operations, output):
             continue
         changes_cells |= op != "xlsx.set_cell_style"
         if op in {"xlsx.mutate_rows", "xlsx.mutate_columns"}:
-            mutate_workbook_grid(package, operation, replacements)
+            mutate_workbook_grid(package, operation, replacements, additions)
         else:
             update_workbook_cell(package, operation, replacements, additions)
     if changes_cells:
@@ -2236,9 +2260,15 @@ def pptx_shape_order(node, include_table_rows=False):
     return children
 
 
-def workbook_sheets(package):
-    root = parse_xml(package.read(MAIN_PART["xlsx"]))
-    relations = parse_xml(package.read("xl/_rels/workbook.xml.rels"))
+def workbook_sheets(package, replacements=None, additions=None):
+    workbook_part = MAIN_PART["xlsx"]
+    relations_part = "xl/_rels/workbook.xml.rels"
+    if replacements is None:
+        root = parse_xml(package.read(workbook_part))
+        relations = parse_xml(package.read(relations_part))
+    else:
+        root = load_edit_part(package, replacements, additions, workbook_part)
+        relations = load_edit_part(package, replacements, additions, relations_part)
     paths = {relation.get("Id"): resolve_relationship("xl", relation.attrib["Target"])
              for relation in relations if relation.get("Type", "").endswith("/worksheet")
              and relation.get("TargetMode") != "External"}
@@ -2345,20 +2375,18 @@ def rewrite_workbook_formula(expression, current_sheet, target_sheet, mutation):
     return "".join(rewritten)
 
 
-def mutate_workbook_grid(package, operation, replacements):
+def mutate_workbook_grid(package, operation, replacements, additions):
     mutation = GridMutation(operation)
     if any(name.startswith(("xl/pivot", "xl/tables/", "xl/drawings/", "xl/externalLinks/", "xl/comments"))
            for name in package.namelist()):
         raise UnsupportedStructuralMutation("Pivot tables, structured tables, drawings, comments and external links are protected")
-    sheets = workbook_sheets(package)
+    sheets = workbook_sheets(package, replacements, additions)
     target = next((sheet for sheet in sheets if sheet["id"] == str(operation["sheetId"])), None)
     if target is None:
         raise ValueError("Unknown worksheet")
     for sheet in sheets:
         part = sheet["part"]
-        root = replacements.get(part)
-        if root is None:
-            root = parse_xml(package.read(part))
+        root = load_edit_part(package, replacements, additions, part)
         for formula in root.iter(tag(SPREADSHEET, "f")):
             if formula.get("t") not in (None, "normal"):
                 raise UnsupportedStructuralMutation("Shared, table, and array formulas are protected")
@@ -2368,9 +2396,7 @@ def mutate_workbook_grid(package, operation, replacements):
         replacements[part] = root
 
     workbook_part = MAIN_PART["xlsx"]
-    workbook = replacements.get(workbook_part)
-    if workbook is None:
-        workbook = parse_xml(package.read(workbook_part))
+    workbook = load_edit_part(package, replacements, additions, workbook_part)
     for name in workbook.iter(tag(SPREADSHEET, "definedName")):
         local_id = name.get("localSheetId")
         sheet_name = sheets[bounded_integer(local_id, 0, len(sheets) - 1)]["name"] if local_id is not None else None
@@ -3265,13 +3291,34 @@ def add_word_footnote(package, replacements, additions, body, operation):
     mark.set(tag(WORD, "id"), identifier)
 
 
+def _apply_word_list(package, replacements, additions, paragraph, operation):
+    if operation.get("listType") == "none" or operation.get("enabled") is False:
+        ppr = paragraph.find(tag(WORD, "pPr"))
+        if ppr is not None:
+            old_num = ppr.find(tag(WORD, "numPr"))
+            if old_num is not None:
+                ppr.remove(old_num)
+        return
+    if "listType" in operation:
+        number = _ensure_word_numbering_definition(package, replacements, additions, operation["listType"])
+    else:
+        numbering = load_edit_part(package, replacements, additions, "word/numbering.xml")
+        number = str(bounded_integer(operation["numberingId"], 1, 65535))
+        if not any(node.get(tag(WORD, "numId")) == number for node in numbering.findall(tag(WORD, "num"))):
+            raise ValueError("Unknown numbering definition")
+    props = xml_child(paragraph, WORD, "pPr", ("r", "hyperlink", "sdt"))
+    num = xml_child(props, WORD, "numPr", ("suppressLineNumbers", "pBdr", "shd", "tabs", "spacing", "ind", "jc"))
+    xml_child(num, WORD, "ilvl", ("numId",)).set(tag(WORD, "val"), str(bounded_integer(operation.get("level", 0), 0, 8)))
+    xml_child(num, WORD, "numId").set(tag(WORD, "val"), number)
+
+
 def word_edit_extra(package, replacements, additions, body, operation):
     source = MAIN_PART["docx"]
     op = operation["op"]
     if op == "docx.add_paragraph":
         if isinstance(operation.get("runs"), list) and operation["runs"]:
             paragraph = XML.Element(tag(WORD, "p"))
-            for r_spec in operation["runs"][:200]:
+            for r_spec in operation["runs"]:
                 run = XML.SubElement(paragraph, tag(WORD, "r"))
                 _apply_word_run_props(run, r_spec)
                 _set_run_multiline_text(run, r_spec.get("text", ""))
@@ -3282,6 +3329,8 @@ def word_edit_extra(package, replacements, additions, body, operation):
                                         "hangingIndentPt", "backgroundColor", "shading", "borders",
                                         "keepNext", "keepLines", "pageBreakBefore")):
             _apply_word_paragraph_props(package, replacements, additions, paragraph, operation)
+        if "listType" in operation:
+            _apply_word_list(package, replacements, additions, paragraph, operation)
         section = body.find(tag(WORD, "sectPr"))
         max_pos = body.index(section) if section is not None else len(body)
         insert_at = bounded_integer(operation.get("insertAt", max_pos), 0, max_pos)
@@ -3309,25 +3358,7 @@ def word_edit_extra(package, replacements, additions, body, operation):
                 raise ValueError("Select an unprotected text run")
             _apply_word_run_props(run, operation)
     elif op == "docx.set_list":
-        paragraph = word_block(body, operation, "p")
-        if operation.get("listType") == "none" or operation.get("enabled") is False:
-            ppr = paragraph.find(tag(WORD, "pPr"))
-            if ppr is not None:
-                old_num = ppr.find(tag(WORD, "numPr"))
-                if old_num is not None:
-                    ppr.remove(old_num)
-            return
-        if "listType" in operation:
-            number = _ensure_word_numbering_definition(package, replacements, additions, operation["listType"])
-        else:
-            numbering = load_edit_part(package, replacements, additions, "word/numbering.xml")
-            number = str(bounded_integer(operation["numberingId"], 1, 65535))
-            if not any(node.get(tag(WORD, "numId")) == number for node in numbering.findall(tag(WORD, "num"))):
-                raise ValueError("Unknown numbering definition")
-        props = xml_child(paragraph, WORD, "pPr", ("r", "hyperlink", "sdt"))
-        num = xml_child(props, WORD, "numPr", ("suppressLineNumbers", "pBdr", "shd", "tabs", "spacing", "ind", "jc"))
-        xml_child(num, WORD, "ilvl", ("numId",)).set(tag(WORD, "val"), str(bounded_integer(operation.get("level", 0), 0, 8)))
-        xml_child(num, WORD, "numId").set(tag(WORD, "val"), number)
+        _apply_word_list(package, replacements, additions, word_block(body, operation, "p"), operation)
     elif op == "docx.add_table":
         from docx import Document
         rows = operation["rows"]
@@ -5223,7 +5254,7 @@ def pptx_append_shape(package, slide, tree, replacements, additions, operation):
     used = {node.get("id") for node in tree.iter(tag(PRESENTATION, "cNvPr"))}
     properties = next(element.iter(tag(PRESENTATION, "cNvPr")))
     properties.set("id", next(str(i) for i in range(1, len(used) + 2) if str(i) not in used))
-    if op == "pptx.add_shape" and isinstance(operation.get("style"), dict):
+    if op in {"pptx.add_shape", "pptx.add_image"} and isinstance(operation.get("style"), dict):
         pptx_style(element, operation["style"])
     if op == "pptx.add_image":
         target = allocate_part(package, additions, "ppt/media/artifact-image", "." + fmt)

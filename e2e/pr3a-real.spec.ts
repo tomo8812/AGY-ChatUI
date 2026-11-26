@@ -553,13 +553,52 @@ for(const vp of targets){
             await openCommand(page,structureAction);
             await structureAction.selectOption('insert_row');
             await page.getByRole('button',{name:'適用',exact:true}).click();
+            await page.getByRole('textbox',{name:'数式・セル値'}).fill('New row');
+            await page.getByRole('gridcell',{name:'A2',exact:true}).click();
+            await expect(page.getByRole('textbox',{name:'数式・セル値'})).toHaveValue('Updated item');
             await page.getByRole('textbox',{name:'数式・セル値'}).fill('Edited after insertion');
             await page.getByRole('button',{name:'保存',exact:true}).click();
             await expect(page.locator('.workspace-status')).toContainText('バージョン 3');
             expect(await svc.readRange(userId,artifact.id,{startRow:0,endRow:2,startCol:0,endCol:1})).toMatchObject({
-              rows:[['',''],['Edited after insertion','Quantity'],['Apple','7']],
+              rows:[['New row',''],['Edited after insertion','Quantity'],['Apple','7']],
             });
             evidence.push({kind:'grid-edit-after-structure',revision:3});
+          }
+          if(item.kind==='markdown'&&(vp.width===1280||vp.width===375)){
+            await page.getByRole('button',{name:'その他の操作',exact:true}).click();
+            await page.getByRole('button',{name:'エクスポート',exact:true}).click();
+            await page.getByRole('button',{name:'HTML',exact:true}).click();
+            const exported=page.getByRole('link',{name:/\.html をダウンロード$/});
+            await expect(exported).toBeVisible();
+            const href=await exported.getAttribute('href');
+            expect(href).toContain('download=1');
+            const response=await client.request('GET',href!);
+            expect(response.status).toBe(200);
+            evidence.push({kind:'workspace-export',targetFormat:'html'});
+          }
+          if(item.kind==='xlsx'&&(vp.width===1280||vp.width===375)){
+            await page.getByRole('button',{name:'編集',exact:true}).click();
+            const structureAction=page.getByRole('combobox',{name:'表の編集操作',exact:true});
+            await openCommand(page,structureAction);
+            await structureAction.selectOption('xlsx.add_sheet');
+            await page.getByRole('textbox',{name:'シート名',exact:true}).fill('New sheet');
+            await page.getByRole('button',{name:'適用',exact:true}).click();
+            const activeSheet=()=>vp.width===375
+              ? expect(page.getByRole('combobox',{name:'シート',exact:true}).locator('option:checked')).toHaveText('New sheet')
+              : expect(page.getByRole('button',{name:'New sheet',exact:true})).toHaveAttribute('aria-pressed','true');
+            await activeSheet();
+            await page.getByRole('textbox',{name:'数式・セル値'}).fill('Created in the draft');
+            await page.screenshot({path:info.outputPath('real-xlsx-draft-sheet.png')});
+            await page.getByRole('button',{name:'保存',exact:true}).click();
+            await expect(page.locator('.workspace-status')).toContainText('バージョン 3');
+            await activeSheet();
+            const workbook=await svc.getStructure(userId,artifact.id) as {sheets:{id:string;name:string}[]};
+            const saved=workbook.sheets.find(sheet=>sheet.name==='New sheet');
+            expect(saved).toBeDefined();
+            expect(await svc.readRange(userId,artifact.id,{sheetId:saved!.id,rangeA1:'A1'})).toMatchObject({
+              cells:[{address:'A1',value:'Created in the draft'}],
+            });
+            evidence.push({kind:'xlsx-edit-draft-sheet',revision:3});
           }
           if(item.kind==='code'&&(vp.width===1280||vp.width===375)){
             // Actual server revision change delivered through the harness's
@@ -595,6 +634,9 @@ for(const vp of targets){
             evidence.push({kind:'live-revision-conflict',revision:3,draftPreserved:true,zoomPreserved:true,remotePreserved:true});
             await page.getByRole('button',{name:'その他の操作',exact:true}).click();
             await page.getByRole('button',{name:'バージョン履歴',exact:true}).click();
+            const latestHistory=page.locator('.workspace-check').filter({has:page.getByText('バージョン 3（現在）',{exact:true})});
+            await latestHistory.getByRole('button',{name:'差分',exact:true}).click();
+            await expect(latestHistory.locator('pre')).toContainText('remoteUpdate');
             const original=page.locator('.workspace-check').filter({has:page.getByText('バージョン 1',{exact:true})});
             await original.getByRole('button',{name:'プレビュー',exact:true}).click();
             const baseSource=fs.readFileSync(svc.getRevisionContentBlob(userId,artifact.id,1).blobPath,'utf8');

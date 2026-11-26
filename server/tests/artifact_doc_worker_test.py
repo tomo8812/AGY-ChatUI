@@ -208,6 +208,26 @@ class DocumentWorkerTest(unittest.TestCase):
         self.assertEqual(reopened["Sheet"].page_setup.orientation, "landscape")
         self.assertEqual(list(reopened.defined_names["ReportRange"].destinations), [("New worksheet", "$A$1:$A$2")])
 
+    def test_xlsx_edits_cells_on_a_sheet_created_in_the_same_revision(self):
+        workbook = Workbook()
+        workbook.active["A1"] = "Original"
+        workbook.save(self.source)
+        alias = "grid-structure:1"
+        edited = self.run_worker("xlsx", "edit", operations=[
+            {"op": "xlsx.add_sheet", "name": "Draft", "draftSheetKey": alias},
+            {"op": "xlsx.set_cell", "draftSheetKey": alias, "address": "A1", "value": "Existing"},
+            {"op": "xlsx.mutate_rows", "draftSheetKey": alias, "index": 1, "count": 1, "mode": "insert"},
+            {"op": "xlsx.set_cell", "draftSheetKey": alias, "address": "A1", "value": "Inserted"},
+            {"op": "xlsx.set_cell_style", "draftSheetKey": alias, "address": "A1", "italic": True},
+            {"op": "xlsx.rename_sheet", "draftSheetKey": alias, "name": "Completed"},
+        ])
+        reopened = load_workbook(io.BytesIO(edited))
+        self.assertEqual(reopened.sheetnames, ["Sheet", "Completed"])
+        self.assertEqual(reopened["Sheet"]["A1"].value, "Original")
+        self.assertEqual(reopened["Completed"]["A1"].value, "Inserted")
+        self.assertTrue(reopened["Completed"]["A1"].font.italic)
+        self.assertEqual(reopened["Completed"]["A2"].value, "Existing")
+
     def test_xlsx_renames_references_and_removes_an_empty_sheet(self):
         book = Workbook()
         book.active.title = "Old Data"
@@ -668,8 +688,7 @@ class DocumentWorkerTest(unittest.TestCase):
             {"op": "docx.set_paragraph_style", "blockIndex": 0, "alignment": "center", "spaceBeforePt": 12,
              "spaceAfterPt": 6, "backgroundColor": "EFF6FF", "borders": {"bottom": {"color": "2563EB", "sizePt": 1.5}}},
             {"op": "docx.set_run_style", "blockIndex": 0, "bold": True, "underline": "single", "highlight": "yellow", "fontSizePt": 13},
-            {"op": "docx.add_paragraph", "text": "Bullet item", "alignment": "left"},
-            {"op": "docx.set_list", "blockIndex": 2, "listType": "bullet", "level": 0},
+            {"op": "docx.add_paragraph", "text": "Numbered heading", "headingLevel": 4, "listType": "decimal"},
             {"op": "docx.set_table_cell", "blockIndex": 1, "row": 0, "column": 0, "text": "Updated Cell", "backgroundColor": "FEF3C7", "bold": True},
         ])
         reopened = Document(io.BytesIO(edited))
@@ -682,6 +701,11 @@ class DocumentWorkerTest(unittest.TestCase):
             self.assertIn("EFF6FF", doc_xml)
             self.assertIn("FEF3C7", doc_xml)
             self.assertIn("numPr", doc_xml)
+
+        self.source.write_bytes(edited)
+        result = json.loads(self.run_worker("docx", "range", range={"start": 2, "count": 1}))
+        block = result["blocks"][0]
+        self.assertEqual((block["text"], block["headingLevel"], block["listType"]), ("Numbered heading", 4, "decimal"))
 
     def test_xlsx_advanced_rich_cell_style_conditional_formats_validation_and_sheet_ops(self):
         wb = Workbook()

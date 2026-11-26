@@ -3,7 +3,9 @@ import type { ArtifactRecord } from '../../types';
 import type { EditOperation, WorkspaceCapabilities, WorkspaceTarget } from '../../api/workspace';
 
 export type WorkspaceMode='view'|'edit'|'pin';
-export interface DraftEntry {key:string;operation:EditOperation;label:string;displayValue?:string}
+export interface GridAxisOrigin {index:number;insertedBy?:string}
+export interface GridDraftLocation {sheetId:string;row:GridAxisOrigin;col:GridAxisOrigin;after?:string}
+export interface DraftEntry {key:string;operation:EditOperation;label:string;displayValue?:string;gridLocation?:GridDraftLocation}
 export interface WorkspaceDraft {baseRevision:number;entries:DraftEntry[]}
 export interface WorkspaceModuleProps {
   artifact:ArtifactRecord;
@@ -20,5 +22,5 @@ export interface WorkspaceModule {
   editOperations:readonly string[];
   canPin:boolean;
   /** Prepare a fresh, ordered operation list without mutating the draft. */
-  prepareOperations?:(operations:readonly EditOperation[])=>EditOperation[];
+  prepareOperations?:(entries:readonly DraftEntry[])=>EditOperation[];
 }
