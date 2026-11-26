@@ -122,14 +122,25 @@ async function capturePptx(page:Page,info:TestInfo,reference:Buffer,name:string)
       maxMae:10,
     });
   }
-  // Exposed background/master margin region (bottom-right)
-  regionSpecs.push({
-    id:'background-corner',
-    label:'Background/Master region',
-    rectPx:{x:actualImg.width*0.85,y:actualImg.height*0.85,width:actualImg.width*0.13,height:actualImg.height*0.13},
-    minSsim:0.95,
-    maxMae:4,
-  });
+  // The fixture's lower rows contain 61 SVG shapes. Measure them with the
+  // existing shape thresholds and audit the exposed layout and master
+  // separately so a background score measures only background pixels.
+  const sceneRegions=[
+    {id:'layout-background',label:'Exposed layout background',rect:[.84,.81,.13,.055],minSsim:.95,maxMae:4},
+    {id:'master-header',label:'Exposed master header',rect:[.65,.012,.30,.016],minSsim:.95,maxMae:4},
+    {id:'basic-geometry',label:'Basic geometry rows',rect:[.003,.878,.994,.096],minSsim:.85,maxMae:10},
+  ];
+  for(const {id,label,rect:[x,y,width,height],minSsim,maxMae} of sceneRegions){
+    if(id!=='basic-geometry'){
+      const overlapsShape=layoutAudit.hits.some(({geom})=>
+        geom.x/layoutAudit.width<x+width&&(geom.x+geom.width)/layoutAudit.width>x&&
+        geom.y/layoutAudit.height<y+height&&(geom.y+geom.height)/layoutAudit.height>y);
+      expect(overlapsShape,label+' must be exposed').toBe(false);
+    }
+    regionSpecs.push({id,label,minSsim,maxMae,rectPx:{
+      x:x*actualImg.width,y:y*actualImg.height,width:width*actualImg.width,height:height*actualImg.height,
+    }});
+  }
   const regionAudit=auditRegions(actualImg,expectedImg,regionSpecs);
   expect(regionAudit.failedRegions,'Per-element/region PPTX bbox visual consistency').toEqual([]);
   return {...result,regionCount:regionAudit.regions.length,zMonotonic:layoutAudit.zMonotonic,regions:regionAudit.regions.map(r=>({label:r.label,bboxPx:r.rectPx,ssim:Number(r.metrics.ssim.toFixed(4)),mae:Number(r.metrics.mae.toFixed(2))}))};
@@ -634,7 +645,9 @@ for(const vp of targets){
             }
           }
         })}catch(error){
-          failures.push(item.kind+': '+(error instanceof Error?error.message:String(error)));
+          const failure=item.kind+': '+(error instanceof Error?error.message:String(error));
+          failures.push(failure);
+          console.error(failure);
           await page.screenshot({path:info.outputPath('failed-'+item.kind+'.png')}).catch(()=>{});
         }
       }
