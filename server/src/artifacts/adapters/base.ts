@@ -105,15 +105,13 @@ export function resolveTextSnippetByContext(params: {
   contextAfterHash?: unknown;
   occurrenceIndex?: unknown;
   requireOccurrenceIndex?: boolean;
-  requireAfterContext?: boolean;
   snippetHint?: string;
   startCol?: number;
   endCol?: number;
 }): TargetResolutionResult {
   const { startLine: start, endLine: end, expectedSnippetHash, contextBeforeHash, contextAfterHash } = params;
   if (!isSha256(expectedSnippetHash)) return { status: 'needs_review', reason: 'missing_expected_snippet_hash' };
-  if (!isSha256(contextBeforeHash) ||
-      ((params.requireAfterContext !== false || contextAfterHash !== undefined) && !isSha256(contextAfterHash))) {
+  if (!isSha256(contextBeforeHash) || !isSha256(contextAfterHash)) {
     return { status: 'needs_review', reason: 'invalid_context_hash' };
   }
   const occurrence = params.occurrenceIndex;
@@ -143,7 +141,7 @@ export function resolveTextSnippetByContext(params: {
     return segment.join('\n');
   };
   const contextMatches = (i: number) => sha256Text(before(i)) === contextBeforeHash &&
-    (contextAfterHash === undefined || sha256Text(after(i)) === contextAfterHash);
+    sha256Text(after(i)) === contextAfterHash;
   if (lastStart < 0) return { status: 'stale', reason: 'line_range_out_of_bounds' };
 
   let snippet = params.snippetHint;

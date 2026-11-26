@@ -1,6 +1,6 @@
 import React,{useCallback,useEffect,useLayoutEffect,useMemo,useRef,useState} from 'react';
 import type * as PdfJsTypes from 'pdfjs-dist';
-import {PdfNavigationPanel} from './PdfNavigationPanel';
+import {PdfNavigationPanel,type PdfTextSelection} from './PdfNavigationPanel';
 import {useUnifiedViewerZoom,type ZoomAnchorAdapter} from '../../../hooks/useUnifiedViewerZoom';
 import {computeStepZoomScale} from '../../../utils/contentZoom';
 import {computePdfAutoFitScale,findActivePdfPage,PDF_MANUAL_MAX_SCALE,PDF_MANUAL_MIN_SCALE} from '../../../utils/pdfFit';
@@ -254,7 +254,7 @@ export const PdfCanvasViewer: React.FC<{
   url: string;
   /** Stable identity enables page/zoom/scroll restoration on a newer revision. */
   documentKey?: string;
-  onSelectPage?: (pageIndex: number, pageCount: number, selectedText?: string, readPage?:()=>Promise<string>) => void;
+  onSelectPage?: (pageIndex: number, pageCount: number, selectedText?: PdfTextSelection, readPage?:()=>Promise<string>) => void;
   enhancedNavigation?: boolean;
   selectionMode?:LocationSelection;
   onSelectLocation?:(location:PdfLocation,readPage:()=>Promise<string>)=>void;
@@ -1174,7 +1174,7 @@ export const PdfCanvasViewer: React.FC<{
           </button>
         </div>
       </div>
-      {enhancedNavigation&&navigation&&pdfDoc&&<PdfNavigationPanel doc={pdfDoc} page={pageNum} onJump={scrollToPage} onClose={()=>setNavigation(false)} onSelectText={onSelectPage?text=>onSelectPage(pageNumRef.current-1,numPages,text,()=>readPageIdentity(pageNumRef.current-1)):undefined}/>}
+      {enhancedNavigation&&navigation&&pdfDoc&&<PdfNavigationPanel doc={pdfDoc} page={pageNum} onJump={scrollToPage} onClose={()=>setNavigation(false)} onSelectText={onSelectPage?(selection,page)=>onSelectPage(page-1,numPages,selection,()=>readPageIdentity(page-1)):undefined}/>}
       {pageRenderErrorCount > 0 && (
         <div className="warn-banner pdf-render-error-banner" role="status">
           <span>一部ページの描画に失敗しました（他のページは閲覧を継続できます）。</span>

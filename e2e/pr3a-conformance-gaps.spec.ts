@@ -545,7 +545,9 @@ for (const vp of VIEWPORTS) {
     await page.getByLabel('シート全体を検索').fill('Needle');
     await page.getByRole('button', { name: '次の一致', exact: true }).click();
     // Switch sheet while search is in-flight!
-    await page.getByRole('combobox', { name: 'シート', exact: true }).selectOption({label:'Sheet2'});
+    const sheetTab=page.getByRole('button',{name:'Sheet2',exact:true});
+    if(await sheetTab.isVisible())await sheetTab.click();
+    else await page.getByRole('combobox',{name:'シート',exact:true}).selectOption({label:'Sheet2'});
     resolveDelayedSearch?.();
     await expect(page.getByRole('gridcell', { name: 'A1', exact: true })).toHaveText('SecondSheet');
     // Wait briefly for any late response to settle and verify no stale jump or error alert

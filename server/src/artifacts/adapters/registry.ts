@@ -398,6 +398,11 @@ class DocumentFormatAdapter implements FormatAdapter {
         const expectedBeforeHash = hex64(selector.contextBeforeHash) ? String(selector.contextBeforeHash) : null;
         const expectedAfterHash = hex64(selector.contextAfterHash) ? String(selector.contextAfterHash) : null;
         const expectedOccurrence = selector.occurrenceIndex;
+        const quads = selector.quadsPt;
+        if (!Array.isArray(quads) || quads.length === 0 || !quads.every(quad =>
+          Array.isArray(quad) && quad.length === 8 && quad.every(value => typeof value === 'number' && Number.isFinite(value)))) {
+          return { status: 'needs_review', reason: 'invalid_pdf_text_geometry' };
+        }
         if (!expectedSnippetHash || !expectedBeforeHash || !expectedAfterHash ||
             !Number.isSafeInteger(start) || !Number.isSafeInteger(end) ||
             start < 0 || end <= start || end > page.text.length ||
@@ -424,7 +429,7 @@ class DocumentFormatAdapter implements FormatAdapter {
         if (actualOcc !== expectedOccurrence) return { status: 'needs_review', reason: 'pdf_text_occurrence_changed' };
         return {
           status: 'resolved',
-          resolvedCoords: { pageIndex, textOffsetStart: start, textOffsetEnd: end, occurrenceIndex: actualOcc },
+          resolvedCoords: { pageIndex, textOffsetStart: start, textOffsetEnd: end, occurrenceIndex: actualOcc, quadsPt: quads },
           resolvedSnippet: slice,
         };
       }

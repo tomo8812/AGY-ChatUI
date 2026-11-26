@@ -122,3 +122,12 @@
 .workspace-pptx-target-bar label {display:flex;align-items:center;gap:3px;min-width:0}
 .workspace-pptx-target-bar label:nth-child(2) {flex:1 1 auto}
 .workspace-pptx-target-bar label:nth-child(2) select {min-width:0;flex:1 1 auto}
+
+.workspace-commandbar {container-type:inline-size}
+.workspace-sheet-switcher {flex:none}
+.workspace-sheet-tabs {display:none}
+@container (min-width:720px) {
+  .workspace-sheet-switcher.has-tabs > select {display:none}
+  .workspace-sheet-tabs {display:flex;gap:4px}
+  .workspace-sheet-tabs button {max-width:14ch;overflow:hidden;text-overflow:ellipsis}
+}

@@ -642,20 +642,50 @@ export class MarkdownAdapter implements FormatAdapter {
       return { status: 'resolved', resolvedSnippet: text.slice(matches[0].start, matches[0].end) };
     }
 
-    if (selector.kind === 'md_text_range' || selector.kind === 'md_block' || selector.kind === 'md_code_block') {
-      const expectedHash = selector.kind === 'md_block' ? selector.expectedBlockHash :
-        selector.kind === 'md_code_block' ? selector.expectedCodeHash : selector.expectedSnippetHash;
+    if (selector.kind === 'md_block' || selector.kind === 'md_code_block') {
+      const code = selector.kind === 'md_code_block';
+      const index = code ? selector.fenceIndex : selector.blockIndex;
+      const expected = code ? selector.expectedCodeHash : selector.expectedBlockHash;
+      const { startLine, endLine, contextBeforeHash, contextAfterHash } = selector;
+      if (typeof index !== 'number' || !Number.isSafeInteger(index) || index < 0 ||
+          typeof startLine !== 'number' || typeof endLine !== 'number' ||
+          !Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) || startLine < 1 || endLine < startLine ||
+          !isSha256(expected) || !isSha256(contextBeforeHash) ||
+          ((!code || contextAfterHash !== undefined) && !isSha256(contextAfterHash)) ||
+          (code ? selector.lang !== undefined && typeof selector.lang !== 'string' : typeof selector.blockKind !== 'string')) {
+        return { status: 'needs_review', reason: 'invalid_markdown_block_fingerprint' };
+      }
+      const lines = splitLines(text);
+      const blocks = markdownStructure(text, slugifyHeading);
+      const candidates = blocks.filter(block => {
+        if (block.endLine - block.startLine !== endLine - startLine) return false;
+        const kindAndHashMatch = code
+          ? block.node.type === 'code' && (selector.lang === undefined || (block.node.lang ?? '') === selector.lang) &&
+            sha256Text(block.node.value) === expected
+          : block.node.type === selector.blockKind && block.hash === expected;
+        if (!kindAndHashMatch) return false;
+        const before = lines.slice(Math.max(0, block.startLine - 3), block.startLine - 1).join('\n');
+        const after = lines.slice(block.endLine, block.endLine + 2).join('\n');
+        return sha256Text(before) === contextBeforeHash &&
+          (contextAfterHash === undefined || sha256Text(after) === contextAfterHash);
+      });
+      if (candidates.length !== 1) return { status: 'needs_review', reason: 'markdown_block_changed_or_ambiguous' };
+      const block = candidates[0];
+      return {
+        status: 'resolved', resolvedSnippet: text.slice(block.start, block.end),
+        resolvedRange: { startLine: block.startLine, endLine: block.endLine, blockIndex: block.index },
+      };
+    }
+
+    if (selector.kind === 'md_text_range') {
       return resolveTextSnippetByContext({
-        text,
-        startLine: selector.startLine,
-        endLine: selector.endLine,
-        expectedSnippetHash: expectedHash,
+        text, startLine: selector.startLine, endLine: selector.endLine,
+        expectedSnippetHash: selector.expectedSnippetHash,
         contextBeforeHash: selector.contextBeforeHash,
         contextAfterHash: selector.contextAfterHash,
         occurrenceIndex: selector.occurrenceIndex,
         snippetHint: _meta.snippetHint,
-        requireOccurrenceIndex: selector.kind === 'md_text_range',
-        requireAfterContext: selector.kind !== 'md_code_block',
+        requireOccurrenceIndex: true,
       });
     }
 

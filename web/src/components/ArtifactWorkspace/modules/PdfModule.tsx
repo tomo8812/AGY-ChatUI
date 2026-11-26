@@ -1,5 +1,6 @@
 import React,{useRef,useState} from 'react';
 import { PdfCanvasViewer,type PdfLocation } from '../../shared-ui/document/PdfCanvasCore';
+import type { PdfTextSelection } from '../../shared-ui/document/PdfNavigationPanel';
 import { buildArtifactContentUrl,artifactVersionKey } from '../../../utils/viewerCache';
 import { sha256Hex } from '../../../utils/sha256';
 import { workspaceApi,type WorkspaceTarget } from '../../../api/workspace';
@@ -28,7 +29,7 @@ export function PdfModule({artifact,mode,capabilities,onTarget}:WorkspaceModuleP
   latest.current={key:artifactVersionKey(artifact),mode};
   const generation=useRef(0);
   const workerReady=capabilities?.operations.some(op=>op.operation==='render_png'&&op.availability==='supported');
-  async function capture(pageIndex:number,pageCount:number,selectedText?:string,readPage?:()=>Promise<string>,location?:PdfLocation){
+  async function capture(pageIndex:number,pageCount:number,selectedText?:PdfTextSelection,readPage?:()=>Promise<string>,location?:PdfLocation){
     if(artifact.revision===undefined)return;
     const identity=latest.current.key,ticket=++generation.current;
     setError('');
@@ -38,7 +39,7 @@ export function PdfModule({artifact,mode,capabilities,onTarget}:WorkspaceModuleP
         ?[round2(location.x*location.pageWidth),round2(location.y*location.pageHeight),
           round2(location.width*location.pageWidth),round2(location.height*location.pageHeight)]
         :undefined;
-      let pageHash:string|undefined,regionDigest:string|undefined,resolvedPageCount=pageCount,snippet=selectedText;
+      let pageHash:string|undefined,regionDigest:string|undefined,resolvedPageCount=pageCount,snippet=selectedText?.text;
       let meta:Awaited<ReturnType<typeof workspaceApi.range<PdfTargetMetaResponse>>>|null=null;
       try {
         meta=await workspaceApi.range<PdfTargetMetaResponse>(artifact.id,{
@@ -47,6 +48,7 @@ export function PdfModule({artifact,mode,capabilities,onTarget}:WorkspaceModuleP
           ...(rectPt?{rectPt:JSON.stringify(rectPt)}:{}),
         });
       }catch{/* Fall back to client-side HTTP-safe hashing if metadata endpoint is unavailable in mock harness. */}
+      if(meta&&!meta.target)throw Error('ページの構造を確認できません。');
       if(meta?.target){
         assertRevision(artifact,meta);
         pageHash=meta.target.pageContentHash;
@@ -64,6 +66,20 @@ export function PdfModule({artifact,mode,capabilities,onTarget}:WorkspaceModuleP
       };
       let contentCoords:Record<string,unknown>|undefined;
       let regionImagePngBase64:string|undefined;
+      if(selectedText){
+        const pageText=meta?.target?.text;
+        const selected=selectedText.text.replace(/\s+/g,' ').trim();
+        const start=pageText?.indexOf(selected)??-1;
+        if(!pageText||!selected||start<0||pageText.indexOf(selected,start+1)>=0)throw Error('選択本文をページ内で一意に確認できません。');
+        const end=start+selected.length;
+        selector.kind='pdf_text_range';
+        contentCoords={pageIndex,unit:'pt',quadsPt:selectedText.quadsPt};
+        Object.assign(selector,contentCoords,{
+          textOffsetStart:start,textOffsetEnd:end,expectedSnippetHash:sha256Hex(selected),
+          contextBeforeHash:sha256Hex(pageText.slice(Math.max(0,start-64),start)),
+          contextAfterHash:sha256Hex(pageText.slice(end,end+64)),occurrenceIndex:0,
+        });
+      }
       if(location&&rectPt){
         selector.kind=pin?'pdf_pin':'pdf_region';
         contentCoords={pageIndex,unit:'pt',...(pin?{xPt:rectPt[0],yPt:rectPt[1]}:{rectPt})};
@@ -77,7 +93,7 @@ export function PdfModule({artifact,mode,capabilities,onTarget}:WorkspaceModuleP
       }
       if(latest.current.key!==identity||latest.current.mode!=='pin'||ticket!==generation.current)return;
       onTarget({baseRevision:artifact.revision,label:'ページ '+(pageIndex+1)+(location?(selector.kind==='pdf_pin'?' / ピン':' / 領域'):selectedText?' / 選択本文':''),
-        selectedContentSnapshot:snippet,selector,contentCoords,regionImagePngBase64});
+        selectedContentSnapshot:snippet?.slice(0,50_000),selector,contentCoords,regionImagePngBase64});
     }catch(e){
       if(latest.current.key===identity&&ticket===generation.current)setError(e instanceof Error?e.message:'ページを選択できませんでした。');
     }

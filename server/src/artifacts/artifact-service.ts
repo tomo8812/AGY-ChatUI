@@ -1,4 +1,3 @@
-import { createLineMatcher } from './adapters/base.js';
 import { inspectArtifactTarget } from './target-inspection.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -4278,73 +4277,6 @@ export class ArtifactService {
     });
   }
 
-  /**
-   * Streams a text blob line-by-line with a bounded sliding window of `spanLength` lines
-   * to compute the exact 0-based `occurrenceIndex` of the target span starting at `targetStartLine`
-   * and the total `duplicateCount` of identical spans across the file (Spec §5.2).
-   */
-  private async countLineSpanOccurrencesFromBlob(
-    blobPath: string,
-    targetStartLine: number,
-    selected: string[],
-  ): Promise<{ occurrenceIndex: number; duplicateCount: number }> {
-    return new Promise((resolve, reject) => {
-      const stream = fs.createReadStream(blobPath, { highWaterMark: 64 * 1024 });
-      const decoder = new StringDecoder('utf8');
-      let pending = '';
-      let lineNo = 0;
-      const accept = createLineMatcher(selected);
-      let occurrenceIndex = -1;
-      let duplicateCount = 0;
-      let settled = false;
-
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        resolve({
-          occurrenceIndex: occurrenceIndex >= 0 ? occurrenceIndex : 0,
-          duplicateCount: Math.max(duplicateCount, occurrenceIndex >= 0 ? 1 : 0),
-        });
-      };
-
-      const pushLine = (line: string) => {
-        lineNo += 1;
-        if (accept(line)) {
-          if (lineNo - selected.length + 1 === targetStartLine) occurrenceIndex = duplicateCount;
-          duplicateCount++;
-        }
-      };
-
-      stream.on('data', (chunk: Buffer | string) => {
-        const text = typeof chunk === 'string' ? chunk : decoder.write(chunk);
-        let cursor = 0;
-        while (cursor <= text.length) {
-          const nlIdx = text.indexOf('\n', cursor);
-          if (nlIdx < 0) {
-            pending += text.slice(cursor);
-            break;
-          }
-          const fullLine = pending + text.slice(cursor, nlIdx);
-          pending = '';
-          pushLine(fullLine.endsWith('\r') ? fullLine.slice(0, -1) : fullLine);
-          cursor = nlIdx + 1;
-        }
-      });
-
-      stream.on('end', () => {
-        if (settled) return;
-        pushLine(pending + decoder.end());
-        finish();
-      });
-
-      stream.on('error', (err) => {
-        if (settled) return;
-        settled = true;
-        reject(err);
-      });
-    });
-  }
-
   private async streamCsvRangeFromBlob(
     blobPath: string,
     totalBytes: number,
@@ -4577,40 +4509,12 @@ export class ArtifactService {
 
       if (['code', 'markdown', 'html', 'svg', 'mermaid', 'diff'].includes(format)) {
         if (range.targetHashes === true || range.targetHashes === 'true') {
-          const start = Number(range.startLine), end = Number(range.endLine);
-          if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start || end > Number.MAX_SAFE_INTEGER-2) {
-            throw new ArtifactError('INVALID_INPUT', 'Invalid source target range.', 400);
-          }
-          // Compute target identity from the same pinned server bytes, including
-          // context and exact 0-based occurrenceIndex, rather than depending on client crypto.subtle.
-          const first = Math.max(1, start-2);
-          const data = await this.streamLineRangeFromBlob(blobPath,sizeBytes,{startLine:first,endLine:end+2});
-          if (data.truncated || Number(data.endLine)<end) {
-            throw new ArtifactError('INVALID_INPUT', '選択範囲が大きすぎるか、存在しません。', 400);
-          }
-          const lines = String(data.text).split('\n');
-          const offset = start-first, length = end-start+1;
-          if(offset+length>lines.length)throw new ArtifactError('INVALID_INPUT','選択範囲が存在しません。',400);
-          const text=lines.slice(offset,offset+length).join('\n');
-          const before=lines.slice(0,offset).join('\n'), after=lines.slice(offset+length).join('\n');
-          const hash=(value:string)=>crypto.createHash('sha256').update(value,'utf8').digest('hex');
-          const expectedSnippetHash = hash(text);
-          const { occurrenceIndex, duplicateCount } = await this.countLineSpanOccurrencesFromBlob(blobPath, start, lines.slice(offset, offset + length));
-          return {
-            artifactId:artifact.id,
-            revision:revision.revision,
-            sha256:revision.sha256,
-            startLine:start,
-            endLine:end,
-            text,
-            before,
-            after,
-            expectedSnippetHash,
-            contextBeforeHash:hash(before),
-            contextAfterHash:hash(after),
-            occurrenceIndex,
-            duplicateCount,
-          };
+          const data = await inspectArtifactTarget<Record<string, unknown>>({
+            file: artifact,
+            range: { sourceTarget: true, startLine: Number(range.startLine), endLine: Number(range.endLine) },
+            snapshot: { path: blobPath, sha256: revision.sha256, sizeBytes },
+          });
+          return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
         }
         const data = range.offsetBytes !== undefined
           ? this.readByteRangeFromBlob(blobPath, sizeBytes, range)

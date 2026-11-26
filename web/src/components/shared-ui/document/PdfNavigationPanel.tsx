@@ -7,6 +7,41 @@ async function getPageText(doc:PDFDocumentProxy,pageNumber:number){
   const content=await page.getTextContent();
   return content.items.map(item=>'str'in item?item.str+(item.hasEOL?'\n':' '):'').join('').trim();
 }
+export interface PdfTextSelection {
+  text:string;
+  quadsPt:number[][];
+}
+
+async function getSelectedTextGeometry(doc:PDFDocumentProxy,pageNumber:number,expected:string,start:number,end:number):Promise<PdfTextSelection>{
+  const page=await doc.getPage(pageNumber);
+  const viewport=page.getViewport({scale:1});
+  const content=await page.getTextContent();
+  const items=content.items.filter(item=>'str'in item);
+  const raw=items.map(item=>item.str+(item.hasEOL?'\n':' ')).join('');
+  if(raw.trim()!==expected)throw Error('ページ本文が変更されました。');
+  const trimOffset=raw.length-raw.trimStart().length;
+  let offset=-trimOffset;
+  const quadsPt:number[][]=[];
+  for(const item of items){
+    const length=item.str.length;
+    const from=Math.max(0,start-offset),to=Math.min(length,end-offset);
+    offset+=length+1;
+    if(to<=from||!item.width||!item.height)continue;
+    const [a,b,c,d,x,y]=item.transform;
+    const horizontal=Math.hypot(a,b),vertical=Math.hypot(c,d);
+    if(!horizontal||!vertical)continue;
+    const left=item.dir==='rtl'?1-to/length:from/length;
+    const right=item.dir==='rtl'?1-from/length:to/length;
+    const point=(fraction:number,height:number)=>viewport.convertToViewportPoint(
+      x+a*item.width*fraction/horizontal+c*height/vertical,
+      y+b*item.width*fraction/horizontal+d*height/vertical,
+    ).map(value=>Math.round(value*100)/100);
+    quadsPt.push([...point(left,item.height),...point(right,item.height),...point(left,0),...point(right,0)]);
+  }
+  if(!quadsPt.length)throw Error('選択本文の位置を確認できません。');
+  return {text:expected.slice(start,end),quadsPt};
+}
+
 function Thumbnail({doc,page,onClick,active}:{doc:PDFDocumentProxy;page:number;onClick:()=>void;active:boolean}){
   const canvas=useRef<HTMLCanvasElement>(null);
   useEffect(()=>{
@@ -23,7 +58,7 @@ function Thumbnail({doc,page,onClick,active}:{doc:PDFDocumentProxy;page:number;o
   },[doc,page]);
   return <button className="pdf-nav-thumbnail" type="button" aria-label={'ページ '+page} aria-pressed={active} onClick={onClick}><canvas ref={canvas}/><span>{page}</span></button>;
 }
-export function PdfNavigationPanel({doc,page,onJump,onSelectText,onClose}:{doc:PDFDocumentProxy;page:number;onJump:(page:number)=>void;onSelectText?:(text:string)=>void;onClose:()=>void}){
+export function PdfNavigationPanel({doc,page,onJump,onSelectText,onClose}:{doc:PDFDocumentProxy;page:number;onJump:(page:number)=>void;onSelectText?:(selection:PdfTextSelection,pageNumber:number)=>void;onClose:()=>void}){
   const [tab,setTab]=useState<'pages'|'outline'|'search'|'text'>('pages');
   const [jump,setJump]=useState(String(page));
   const [outline,setOutline]=useState<OutlineItem[]|null>(null);
@@ -107,6 +142,6 @@ export function PdfNavigationPanel({doc,page,onJump,onSelectText,onClose}:{doc:P
       <p className="muted-xs" role="status">{scan.done} / {doc.numPages} ページ · {hits.length} 件{scan.truncated?'（途中まで）':''}{scan.errors?' · 読取不可 '+scan.errors+' ページ':''}</p>
       <div className="pdf-panel-results">{hits.map(hit=><button key={hit.page} type="button" onClick={()=>onJump(hit.page)}><strong>ページ {hit.page}</strong><span>{hit.excerpt}</span></button>)}</div>
     </>}
-    {tab==='text'&&<><p className="muted-xs">ページ {page} の本文</p><textarea ref={textBox} aria-label="ページ本文" readOnly value={text} placeholder={textLoading?'読み込み中…':'テキストがありません。'} rows={6}/>{onSelectText&&<button className="btn btn-secondary btn-xs" type="button" disabled={!text} onClick={()=>{const el=textBox.current;if(el){const selection=text.slice(el.selectionStart,el.selectionEnd);if(selection)onSelectText(selection);else setError('本文の範囲を選択してください。')}}}>選択本文を対象にする</button>}</>}
+    {tab==='text'&&<><p className="muted-xs">ページ {page} の本文</p><textarea ref={textBox} aria-label="ページ本文" readOnly value={text} placeholder={textLoading?'読み込み中…':'テキストがありません。'} rows={6}/>{onSelectText&&<button className="btn btn-secondary btn-xs" type="button" disabled={!text} onClick={()=>{const el=textBox.current;if(el){const selection=text.slice(el.selectionStart,el.selectionEnd);if(selection)void getSelectedTextGeometry(doc,page,text,el.selectionStart,el.selectionEnd).then(result=>onSelectText(result,page),err=>setError(err instanceof Error?err.message:'本文を選択できません。'));else setError('本文の範囲を選択してください。')}}}>選択本文を対象にする</button>}</>}
   </section>;
 }

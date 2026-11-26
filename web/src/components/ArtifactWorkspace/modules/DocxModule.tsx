@@ -73,8 +73,8 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   const activeEditor=useRef<Editor|null>(null);
   const imageInput=useRef<HTMLInputElement>(null);
   const revisionKey=artifactVersionKey(artifact);
-  const latest=useRef({artifact,revisionKey});
-  latest.current={artifact,revisionKey};
+  const latest=useRef({artifact,revisionKey,mode,selected});
+  latest.current={artifact,revisionKey,mode,selected};
   const [imageError,setImageError]=useState('');
   const [imageTypes,setImageTypes]=useState<Record<string,string>>({});
   const nextAddition=useRef(0);
@@ -189,7 +189,8 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
         }|null;
       }>(artifact.id,{targetBlockIndex:selectedBlock.blockIndex});
       assertRevision(artifact,result);
-      if(latest.current.artifact.revision!==identity||!result.target)return;
+      if(latest.current.revisionKey!==revisionKey||latest.current.mode!=='pin'||latest.current.selected!==selectedBlock.blockIndex)return;
+      if(!result.target)throw Error('段落を識別できません。');
       onTarget({
         baseRevision:identity,
         label:'段落 '+(selectedBlock.blockIndex+1),
@@ -327,7 +328,7 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
         key={index}
         index={index}
         count={Math.min(CHUNK_SIZE,Math.max(0,blockCount-index*CHUNK_SIZE))}
-        blocks={retained.has(index)?(index===0?resource.data?.blocks:activeChunks?.get(index)):undefined}
+        blocks={totalChunks===1||retained.has(index)?(index===0?resource.data?.blocks:activeChunks?.get(index)):undefined}
         onVisibility={onVisibility}
         renderBlock={renderBlock}
       />)}

@@ -80,7 +80,7 @@ async function capturePptx(page:Page,info:TestInfo,reference:Buffer,name:string)
   fs.writeFileSync(expected,reference);
   // The active selection outline is chrome, not document pixels. Temporarily hide
   // hit targets in this capture only; the canvas images remain the actual DOM output.
-  const style=await page.addStyleTag({content:'.workspace-shape-hit{visibility:hidden!important}'});
+  const style=await page.addStyleTag({content:'.workspace-shape-hit,.workspace-resize-handle{visibility:hidden!important}'});
   try{await scene.screenshot({path:actual,scale:'css'});}finally{await style.evaluate(el=>el.remove())}
   const result=comparePng(actual,expected);
   expect(result.ssim,'Browser layer composite vs formal LibreOffice PNG').toBeGreaterThanOrEqual(.95);
@@ -132,7 +132,7 @@ async function capturePptx(page:Page,info:TestInfo,reference:Buffer,name:string)
   });
   const regionAudit=auditRegions(actualImg,expectedImg,regionSpecs);
   expect(regionAudit.failedRegions,'Per-element/region PPTX bbox visual consistency').toEqual([]);
-  return {...result,regionCount:regionAudit.regions.length,zMonotonic:layoutAudit.zMonotonic,regions:regionAudit.regions.map(r=>({label:r.label,ssim:Number(r.metrics.ssim.toFixed(4)),mae:Number(r.metrics.mae.toFixed(2))}))};
+  return {...result,regionCount:regionAudit.regions.length,zMonotonic:layoutAudit.zMonotonic,regions:regionAudit.regions.map(r=>({label:r.label,bboxPx:r.rectPx,ssim:Number(r.metrics.ssim.toFixed(4)),mae:Number(r.metrics.mae.toFixed(2))}))};
 }
 
 for(const vp of targets){
@@ -182,6 +182,10 @@ for(const vp of targets){
         const savedBlob=svc.getRevisionContentBlob(userId,source.id,2);
         expect(fs.readFileSync(savedBlob.blobPath,'utf8')===content).toBe(true);
         evidence.push({kind:'large-source-save',bytes:Buffer.byteLength(content),revision:2});
+        const selection=await svc.readRange(userId,source.id,{startLine:1,endLine:1,targetHashes:true});
+        expect(selection).toMatchObject({startLine:1,endLine:1,occurrenceIndex:0,duplicateCount:1});
+        expect(selection.expectedSnippetHash).toMatch(/^[0-9a-f]{64}$/);
+        evidence.push({kind:'large-source-selection',bytes:Buffer.byteLength(content),revision:2});
       }
       await page.setViewportSize({width:vp.width,height:vp.height});
       await page.route(url=>url.origin==='http://127.0.0.1:4174'&&url.pathname.startsWith('/api/'),async route=>{
@@ -279,7 +283,9 @@ for(const vp of targets){
               }
               if(item.kind==='xlsx'){
                 const jump=page.getByRole('textbox',{name:'セル範囲へ移動'});
-                if(!await jump.isVisible())await page.getByRole('button',{name:'その他の表の移動操作'}).click();
+                const navigationMenu=page.getByRole('button',{name:'その他の表の移動操作'});
+                await expect(jump.or(navigationMenu).first()).toBeVisible();
+                if(!await jump.isVisible())await navigationMenu.click();
                 const search=page.getByRole('textbox',{name:'シート全体を検索'});
                 await search.fill('Beyond old grid window');
                 await page.getByRole('button',{name:'次の一致',exact:true}).click();
@@ -365,7 +371,7 @@ for(const vp of targets){
               await expect(page.locator('[data-slide-canvas]')).toHaveAttribute('data-preview-ready','true',{timeout:90000});
               expect(srv.ctx.db.getArtifact(userId,artifact.id)?.revision).toBe(1);
               await expect.poll(()=>page.locator('[data-slide-canvas] img').evaluateAll(imgs=>imgs.length===6&&imgs.every(img=>(img as HTMLImageElement).complete&&(img as HTMLImageElement).naturalWidth>0))).toBe(true);
-              const style=await page.addStyleTag({content:'.workspace-shape-hit{visibility:hidden!important}'});
+              const style=await page.addStyleTag({content:'.workspace-shape-hit,.workspace-resize-handle{visibility:hidden!important}'});
               try{await page.locator('[data-slide-canvas]').screenshot({path:info.outputPath('pptx-draft-canvas.png'),scale:'css'});}finally{await style.evaluate(el=>el.remove())}
               if(moveStageBox&&overlapBoxPre){
                 record.movedOverlapVacated={stage:moveStageBox,orig:overlapBoxPre};
@@ -480,6 +486,23 @@ for(const vp of targets){
             expect((await srv.ctx.editRequestService.resolveRequestTarget(regionRequest!)).status).toBe('resolved');
             evidence.push({kind:'pdf-region',selector:regionRequest!.selector});
             await page.screenshot({path:info.outputPath('real-pdf-region.png')});
+            await page.getByRole('combobox',{name:'PDF の選択方法'}).selectOption('page');
+            await page.getByRole('button',{name:'ナビゲーション',exact:true}).click();
+            await page.getByRole('button',{name:'本文',exact:true}).click();
+            const textBox=page.getByRole('textbox',{name:'ページ本文'});
+            await expect(textBox).toHaveValue('Wide second page');
+            await textBox.evaluate((el:HTMLTextAreaElement)=>el.setSelectionRange(5,11));
+            await page.getByRole('button',{name:'選択本文を対象にする'}).click();
+            await expect(page.locator('.workspace-selection')).toContainText('選択本文');
+            await page.locator('.pdf-navigation-panel').getByRole('button',{name:'閉じる',exact:true}).click();
+            await page.getByRole('textbox',{name:'変更内容'}).fill('Review selected PDF text');
+            await page.getByRole('button',{name:'依頼を追加'}).click();
+            await expect(page.locator('.workspace-request-item')).toHaveCount(3);
+            const textRequest=srv.ctx.editRequestService.listRequests(userId,chatId,{artifactId:artifact.id}).find(request=>request.selector.kind==='pdf_text_range');
+            expect(textRequest?.selector).toMatchObject({textOffsetStart:5,textOffsetEnd:11,quadsPt:[expect.any(Array)]});
+            expect((await srv.ctx.editRequestService.resolveRequestTarget(textRequest!)).status).toBe('resolved');
+            evidence.push({kind:'pdf-text',selector:textRequest!.selector});
+            await page.screenshot({path:info.outputPath('real-pdf-text.png')});
           }
 
           if(item.kind==='csv'&&(vp.width===1280||vp.width===375)){
@@ -584,7 +607,7 @@ for(const vp of targets){
               await saveStructural('pptx.remove_shape',async()=>{},0);
               if(sceneBox&&overlapBox){
                 const afterRemovePath=info.outputPath('pptx-after-remove-shape.png');
-                const style=await page.addStyleTag({content:'.workspace-shape-hit{visibility:hidden!important}'});
+                const style=await page.addStyleTag({content:'.workspace-shape-hit,.workspace-resize-handle{visibility:hidden!important}'});
                 try{await page.locator('[data-slide-canvas="true"]').screenshot({path:afterRemovePath,scale:'css'});}finally{await style.evaluate(el=>el.remove())}
                 const savedAfterRemove=await svc.renderPng(userId,artifact.id,{pageIndex:0});
                 const actualRm=decodePng(fs.readFileSync(afterRemovePath));

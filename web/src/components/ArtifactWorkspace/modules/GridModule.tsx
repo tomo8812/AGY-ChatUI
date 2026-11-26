@@ -377,10 +377,16 @@ export function GridModule(props:WorkspaceModuleProps){
       {editAction&&<button type="button" className="btn btn-secondary btn-xs" disabled={!structuralEnabled||!validName} onClick={stageStructure}>適用</button>}
     </>:null;
   const toolbar=<ResponsiveCommandBar primary={primary} secondary={secondary} minInlineWidth={850} closeOnButton/>;
-  const sheetTabs=sheets.length>1&&<select aria-label="シート" value={sheet?.id??''}
-    onChange={event=>{setSheetId(event.target.value);move(0,0)}}>
-    {sheets.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}
-  </select>;
+  const selectSheet=(id:string)=>{setSheetId(id);move(0,0)};
+  const sheetTabs=sheets.length>1&&<div className={'workspace-sheet-switcher'+(sheets.length<=3?' has-tabs':'')}>
+    <select aria-label="シート" value={sheet?.id??''} onChange={event=>selectSheet(event.target.value)}>
+      {sheets.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}
+    </select>
+    {sheets.length<=3&&<div className="workspace-sheet-tabs" role="group" aria-label="シート">
+      {sheets.map(s=><button key={s.id} type="button" className="btn btn-secondary btn-xs" title={s.name}
+        aria-pressed={s.id===sheet?.id} onClick={()=>selectSheet(s.id)}>{s.name}</button>)}
+    </div>}
+  </div>;
   const tabs=<ResponsiveCommandBar label="その他の表の移動操作" minInlineWidth={720}
     primary={<>{sheetTabs}<input className="workspace-command-input" aria-label={xlsx?'シート全体を検索':'表全体を検索'} placeholder={xlsx?'シート全体を検索':'表全体を検索'} value={search} onChange={e=>setSearch(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();void nextMatch()}}}/>
       <button type="button" className="btn btn-secondary btn-xs" disabled={!search.trim()||searching||!structure.ready} onClick={()=>void nextMatch()}>{searching?'検索中…':'次の一致'}</button></>}
