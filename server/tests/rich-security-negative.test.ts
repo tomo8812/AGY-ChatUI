@@ -58,7 +58,7 @@ function makeValidDoc(overrides: Partial<RichDocumentV1> = {}): RichDocumentV1 {
           id: 'svg-vis',
           type: 'svg_scene',
           viewBox: '0 0 200 100',
-          interactiveRole: 'interactive',
+          interactiveRole: 'diagram',
           elements: [
             {
               tag: 'rect',

@@ -4,7 +4,6 @@ import type {
   RichNode,
   RichSideEffectAction,
   RichStateAction,
-  RichSvgDef,
   RichSvgElement,
   RichValue,
 } from '../../../shared/rich-schema.js';
@@ -20,6 +19,11 @@ import {
   type RichEvalBudget,
   type RichEvalContext,
 } from './rich-expr-evaluator.js';
+
+import {
+  SVG_ATTRS, SVG_TAGS, validateSvgAttrValue, isSvgDefinition, validSvgViewBox,
+  svgDefinitionElementCount, visitSvgDefinitionValues, svgRoleMatchesActions,
+} from './rich-svg-contract.js';
 
 export const RICH_LIMITS = {
   maxJsonBytes: 512 * 1024,
@@ -124,54 +128,6 @@ const ALLOWED_NODE_TYPES = new Set<string>([
   'media_asset',
 ]);
 
-const ALLOWED_SVG_TAGS = new Set<string>([
-  'g',
-  'rect',
-  'circle',
-  'ellipse',
-  'line',
-  'polyline',
-  'polygon',
-  'path',
-  'text',
-  'tspan',
-]);
-
-const ALLOWED_SVG_ATTRS = new Set<string>([
-  'x',
-  'y',
-  'width',
-  'height',
-  'rx',
-  'ry',
-  'cx',
-  'cy',
-  'r',
-  'x1',
-  'y1',
-  'x2',
-  'y2',
-  'points',
-  'd',
-  'transform',
-  'fill',
-  'stroke',
-  'strokeWidth',
-  'strokeDasharray',
-  'strokeLinecap',
-  'strokeLinejoin',
-  'opacity',
-  'fillOpacity',
-  'strokeOpacity',
-  'fontSize',
-  'fontWeight',
-  'textAnchor',
-  'dominantBaseline',
-  'markerStart',
-  'markerEnd',
-  'clipPath',
-]);
-
 const STATE_ACTION_TYPES = new Set<RichStateAction['type']>([
   'set_state',
   'toggle_state',
@@ -214,54 +170,6 @@ export function isValidHttpUrl(raw: string): boolean {
   } catch {
     return false;
   }
-}
-
-export function validateSvgAttrValue(attrName: string, rawVal: unknown): string | null {
-  if (rawVal === null || rawVal === undefined) return null;
-  const s = String(rawVal).trim();
-  const lower = s.toLowerCase();
-
-  if (attrName.toLowerCase().startsWith('on')) {
-    return `SVG event handler attribute '${attrName}' is forbidden.`;
-  }
-  if (
-    lower.includes('javascript:') ||
-    lower.includes('vbscript:') ||
-    lower.includes('expression(') ||
-    lower.includes('@import') ||
-    lower.includes('<script') ||
-    lower.includes('<foreignobject')
-  ) {
-    return `Dangerous SVG attribute value detected in '${attrName}'.`;
-  }
-
-  // url(...) is permitted ONLY for local fragment references url(#id)
-  const urlMatches = s.matchAll(/url\s*\(([^)]*)\)/gi);
-  for (const m of urlMatches) {
-    const inner = m[1].trim().replace(/^['"]|['"]$/g, '');
-    if (!/^#[a-zA-Z_][a-zA-Z0-9_-]*$/.test(inner)) {
-      return `SVG attribute '${attrName}' contains forbidden external/non-local url(${inner}).`;
-    }
-  }
-
-  if (attrName === 'markerStart' || attrName === 'markerEnd' || attrName === 'clipPath') {
-    if (s !== '' && s !== 'none' && !/^url\(#([a-zA-Z_][a-zA-Z0-9_-]*)\)$/.test(s)) {
-      return `SVG reference attribute '${attrName}' must be a local url(#id).`;
-    }
-  }
-
-  if (attrName === 'fill' || attrName === 'stroke') {
-    if (
-      lower.startsWith('http://') ||
-      lower.startsWith('https://') ||
-      lower.startsWith('data:') ||
-      lower.startsWith('blob:')
-    ) {
-      return `SVG paint attribute '${attrName}' cannot reference external URLs.`;
-    }
-  }
-
-  return null;
 }
 
 export function validateRichMarkdownContent(content: string): string | null {
@@ -694,23 +602,31 @@ export function validateRichDocument(
     }
   };
 
-  const validateSvgElementStatic = (el: unknown, p: string, repeatDepth: number) => {
+  const countStaticSvg = (count: number, p: string) => {
+    staticSvgElements += count;
+    if (staticSvgElements > RICH_LIMITS.maxStaticSvgElements) {
+      issues.push({
+        code: 'RICH_SVG_LIMIT_EXCEEDED', path: p,
+        message: `Static SVG element count exceeded ${RICH_LIMITS.maxStaticSvgElements}.`, severity: 'error',
+      });
+    }
+  };
+  const checkSvgValue = (name: string, value: unknown, p: string, defs: ReadonlySet<string>) => {
+    if (isExprWrapper(value)) checkExprSyntax(value.expr, p + '.expr');
+    else {
+      const err = validateSvgAttrValue(name, value, defs);
+      if (err) issues.push({ code: 'RICH_UNSAFE_SVG_VALUE', path: p, message: err, severity: 'error' });
+    }
+  };
+  const validateSvgElementStatic = (el: unknown, p: string, repeatDepth: number, defs: ReadonlySet<string>) => {
     if (!el || typeof el !== 'object') {
       issues.push({ code: 'RICH_INVALID_SVG', path: p, message: 'SVG element must be an object.', severity: 'error' });
       return;
     }
-    staticSvgElements += 1;
-    if (staticSvgElements > RICH_LIMITS.maxStaticSvgElements) {
-      issues.push({
-        code: 'RICH_SVG_LIMIT_EXCEEDED',
-        path: p,
-        message: `Static SVG element count exceeded ${RICH_LIMITS.maxStaticSvgElements}.`,
-        severity: 'error',
-      });
-      return;
-    }
+    countStaticSvg(1, p);
+    if (staticSvgElements > RICH_LIMITS.maxStaticSvgElements) return;
     const svgEl = el as Partial<RichSvgElement> & Record<string, unknown>;
-    if (typeof svgEl.tag !== 'string' || !ALLOWED_SVG_TAGS.has(svgEl.tag)) {
+    if (typeof svgEl.tag !== 'string' || !SVG_TAGS.has(svgEl.tag)) {
       issues.push({
         code: 'RICH_FORBIDDEN_SVG_TAG',
         path: `${p}.tag`,
@@ -735,7 +651,7 @@ export function validateRichDocument(
     }
     if (svgEl.attrs && typeof svgEl.attrs === 'object') {
       for (const [k, v] of Object.entries(svgEl.attrs)) {
-        if (!ALLOWED_SVG_ATTRS.has(k)) {
+        if (!SVG_ATTRS.has(k)) {
           issues.push({
             code: 'RICH_FORBIDDEN_SVG_ATTR',
             path: `${p}.attrs.${k}`,
@@ -744,14 +660,7 @@ export function validateRichDocument(
           });
           continue;
         }
-        if (isExprWrapper(v)) {
-          checkExprSyntax(v.expr, `${p}.attrs.${k}.expr`);
-        } else {
-          const err = validateSvgAttrValue(k, v);
-          if (err) {
-            issues.push({ code: 'RICH_UNSAFE_SVG_VALUE', path: `${p}.attrs.${k}`, message: err, severity: 'error' });
-          }
-        }
+        checkSvgValue(k, v, `${p}.attrs.${k}`, defs);
       }
     }
     if (svgEl.textContent !== undefined) checkRichValueStatic(svgEl.textContent, `${p}.textContent`);
@@ -769,50 +678,46 @@ export function validateRichDocument(
           severity: 'error',
         });
       } else {
-        svgEl.children.forEach((child, idx) => validateSvgElementStatic(child, `${p}.children[${idx}]`, nextRepeatDepth));
+        svgEl.children.forEach((child, idx) => validateSvgElementStatic(child, `${p}.children[${idx}]`, nextRepeatDepth, defs));
       }
     }
   };
 
   const validateSvgSceneStatic = (scene: Record<string, unknown>, p: string, repeatDepth: number) => {
-    const vb = scene.viewBox;
-    if (typeof vb !== 'string' || !/^\s*-?\d+(?:\.\d+)?(?:\s+|,\s*)-?\d+(?:\.\d+)?(?:\s+|,\s*)\d+(?:\.\d+)?(?:\s+|,\s*)\d+(?:\.\d+)?\s*$/.test(vb)) {
-      issues.push({
-        code: 'RICH_INVALID_SVG',
-        path: `${p}.viewBox`,
-        message: 'svg_scene viewBox must contain 4 numeric values.',
-        severity: 'error',
-      });
+    if (!validSvgViewBox(scene.viewBox)) {
+      issues.push({ code: 'RICH_INVALID_SVG', path: `${p}.viewBox`, message: 'Invalid SVG viewBox.', severity: 'error' });
     }
-    if (Array.isArray(scene.defs)) {
-      for (let i = 0; i < scene.defs.length; i++) {
-        const def = scene.defs[i] as RichSvgDef;
-        if (!def || typeof def !== 'object' || !def.id || !/^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(def.id)) {
-          issues.push({ code: 'RICH_INVALID_SVG', path: `${p}.defs[${i}].id`, message: 'Invalid SVG def id.', severity: 'error' });
-          continue;
-        }
-        if (def.kind === 'linearGradient' || def.kind === 'radialGradient') {
-          for (let j = 0; j < (def.stops?.length ?? 0); j++) {
-            const st = def.stops[j];
-            if (isExprWrapper(st.color)) checkExprSyntax(st.color.expr, `${p}.defs[${i}].stops[${j}].color`);
-            else {
-              const err = validateSvgAttrValue('fill', st.color);
-              if (err) issues.push({ code: 'RICH_UNSAFE_SVG_VALUE', path: `${p}.defs[${i}].stops[${j}].color`, message: err, severity: 'error' });
-            }
-          }
-        } else if (def.kind === 'marker' && def.fill !== undefined) {
-          if (isExprWrapper(def.fill)) checkExprSyntax(def.fill.expr, `${p}.defs[${i}].fill`);
-          else {
-            const err = validateSvgAttrValue('fill', def.fill);
-            if (err) issues.push({ code: 'RICH_UNSAFE_SVG_VALUE', path: `${p}.defs[${i}].fill`, message: err, severity: 'error' });
-          }
-        }
+    const ids = new Set<string>();
+    if (scene.defs !== undefined && !Array.isArray(scene.defs)) {
+      issues.push({ code: 'RICH_INVALID_SVG', path: `${p}.defs`, message: 'SVG definitions must be an array.', severity: 'error' });
+    }
+    const defs = (Array.isArray(scene.defs) ? scene.defs : []).filter((def, idx) => {
+      if (!isSvgDefinition(def) || ids.has(def.id)) {
+        issues.push({ code: 'RICH_INVALID_SVG', path: `${p}.defs[${idx}]`, message: 'Invalid or duplicate SVG definition.', severity: 'error' });
+        return false;
       }
+      ids.add(def.id);
+      return true;
+    });
+    for (const [idx, def] of defs.entries()) {
+      const dp = `${p}.defs[${idx}]`;
+      countStaticSvg(svgDefinitionElementCount(def), dp);
+      visitSvgDefinitionValues(def, (name, value, field) => {
+        if (field.startsWith('attrs.') && !SVG_ATTRS.has(name)) {
+          issues.push({ code: 'RICH_FORBIDDEN_SVG_ATTR', path: `${dp}.${field}`, message: 'Invalid clipPath attribute.', severity: 'error' });
+        } else {
+          checkSvgValue(name, value, `${dp}.${field}`, ids);
+        }
+      });
     }
     if (!Array.isArray(scene.elements)) {
       issues.push({ code: 'RICH_INVALID_SVG', path: `${p}.elements`, message: 'svg_scene requires an elements array.', severity: 'error' });
     } else {
-      scene.elements.forEach((el, idx) => validateSvgElementStatic(el, `${p}.elements[${idx}]`, repeatDepth));
+      scene.elements.forEach((el, idx) => validateSvgElementStatic(el, `${p}.elements[${idx}]`, repeatDepth, ids));
+      if (!svgRoleMatchesActions(scene.interactiveRole, scene.elements)) {
+        issues.push({ code: 'RICH_INVALID_SVG_ROLE', path: `${p}.interactiveRole`,
+          message: 'Only interactive SVG scenes can contain actions, and they require an action.', severity: 'error' });
+      }
     }
   };
 
@@ -1368,23 +1273,14 @@ export function compileRichDynamicPlan(
       addRichValDeps(node.content, deps);
     } else if (node.type === 'mermaid') {
       addRichValDeps(node.code, deps);
-    } else if (node.type === 'svg_scene') {
-      if (Array.isArray(node.defs)) {
-        for (const d of node.defs) {
-          if (d.kind === 'linearGradient' || d.kind === 'radialGradient') {
-            for (const s of d.stops) addRichValDeps(s.color, deps);
-          } else if (d.kind === 'marker' && d.fill !== undefined) {
-            addRichValDeps(d.fill, deps);
-          }
-        }
+    } else if (node.type === 'svg_scene' || (node.type === 'media_asset' && node.sourceKind === 'inline_svg')) {
+      const scene = node.type === 'svg_scene' ? node : node.svgScene;
+      if (scene) {
+        for (const def of scene.defs ?? []) visitSvgDefinitionValues(def, (_name, value) => addRichValDeps(value, deps));
+        for (const el of scene.elements) addSvgElementDeps(el, deps);
       }
-      for (const el of node.elements) addSvgElementDeps(el, deps);
-    } else if (node.type === 'media_asset') {
-      if (node.sourceKind === 'artifact' && node.artifactId !== undefined) {
-        addRichValDeps(node.artifactId, deps);
-      } else if (node.sourceKind === 'inline_svg' && node.svgScene) {
-        for (const el of node.svgScene.elements) addSvgElementDeps(el, deps);
-      }
+    } else if (node.type === 'media_asset' && node.artifactId !== undefined) {
+      addRichValDeps(node.artifactId, deps);
     } else if (node.type === 'button') {
       addActionsDeps(node.onClick, deps);
     } else if (node.type === 'form') {
@@ -1590,32 +1486,8 @@ export function evaluateRichDynamicState(
       return result;
     };
 
-    const evalSvgElementPost = (
-      el: RichSvgElement,
-      p: string,
-      ctx: RichEvalContext,
-      localArtifacts: string[]
-    ) => {
-      if (el.repeat) {
-        const arr = evaluateRichAst(plan.getAst(el.repeat.itemsExpr), ctx, budget);
-        if (Array.isArray(arr)) {
-          for (let i = 0; i < arr.length; i++) {
-            const nextCtx: RichEvalContext = {
-              ...ctx,
-              item: arr[i],
-              index: i,
-              aliases: { ...(ctx.aliases ?? {}), [el.repeat.as]: arr[i] },
-            };
-            evalSvgElementPost({ ...el, repeat: undefined }, `${p}[${i}]`, nextCtx, localArtifacts);
-          }
-          return;
-        }
-      }
-      if (el.visibleWhen) {
-        const vis = evaluateRichAst(plan.getAst(el.visibleWhen), ctx, budget);
-        if (!vis) return;
-      }
-      expandedSvgElements += 1;
+    const countExpandedSvg = (count: number) => {
+      expandedSvgElements += count;
       if (expandedSvgElements > RICH_LIMITS.maxExpandedSvgElements) {
         throw new RichExprError(
           'RICH_EXPANDED_SVG_LIMIT_EXCEEDED',
@@ -1623,10 +1495,37 @@ export function evaluateRichDynamicState(
           422
         );
       }
+    };
+
+    const evalSvgElementPost = (
+      el: RichSvgElement,
+      p: string,
+      ctx: RichEvalContext,
+      defs: ReadonlySet<string>
+    ) => {
+      if (el.repeat) {
+        const arr = evaluateRichAst(plan.getAst(el.repeat.itemsExpr), ctx, budget);
+        if (!Array.isArray(arr)) return;
+        for (let i = 0; i < arr.length; i++) {
+          const nextCtx: RichEvalContext = {
+            ...ctx,
+            item: arr[i],
+            index: i,
+            aliases: { ...(ctx.aliases ?? {}), [el.repeat.as]: arr[i] },
+          };
+          evalSvgElementPost({ ...el, repeat: undefined }, `${p}[${i}]`, nextCtx, defs);
+        }
+        return;
+      }
+      if (el.visibleWhen) {
+        const vis = evaluateRichAst(plan.getAst(el.visibleWhen), ctx, budget);
+        if (!vis) return;
+      }
+      countExpandedSvg(1);
       if (el.attrs) {
         for (const [k, v] of Object.entries(el.attrs)) {
           const evaluated = evalRichVal(v, ctx);
-          const err = validateSvgAttrValue(k, evaluated);
+          const err = validateSvgAttrValue(k, evaluated, defs);
           if (err) {
             issues.push({ code: 'RICH_POST_EVAL_UNSAFE_SVG', path: `${p}.attrs.${k}`, message: err, severity: 'error' });
           }
@@ -1634,9 +1533,21 @@ export function evaluateRichDynamicState(
       }
       if (Array.isArray(el.children)) {
         for (let i = 0; i < el.children.length; i++) {
-          evalSvgElementPost(el.children[i], `${p}.children[${i}]`, ctx, localArtifacts);
+          evalSvgElementPost(el.children[i], `${p}.children[${i}]`, ctx, defs);
         }
       }
+    };
+
+    const evalSvgScenePost = (scene: Extract<RichNode, { type: 'svg_scene' }>, p: string, ctx: RichEvalContext) => {
+      const defs = new Set((scene.defs ?? []).map(def => def.id));
+      for (const [i, def] of (scene.defs ?? []).entries()) {
+        countExpandedSvg(svgDefinitionElementCount(def));
+        visitSvgDefinitionValues(def, (name, value, field) => {
+          const err = validateSvgAttrValue(name, evalRichVal(value, ctx), defs);
+          if (err) issues.push({ code: 'RICH_POST_EVAL_UNSAFE_SVG', path: `${p}.defs[${i}].${field}`, message: err, severity: 'error' });
+        });
+      }
+      scene.elements.forEach((el, i) => evalSvgElementPost(el, `${p}.elements[${i}]`, ctx, defs));
     };
 
     const evalActionsPost = (
@@ -1830,25 +1741,7 @@ export function evaluateRichDynamicState(
           issues.push({ code: 'RICH_POST_EVAL_UNSAFE_MERMAID', path: `${p}.code`, message: err, severity: 'error' });
         }
       } else if (node.type === 'svg_scene') {
-        if (Array.isArray(node.defs)) {
-          for (let i = 0; i < node.defs.length; i++) {
-            const d = node.defs[i];
-            if (d.kind === 'linearGradient' || d.kind === 'radialGradient') {
-              for (let j = 0; j < d.stops.length; j++) {
-                const c = evalRichVal(d.stops[j].color, ctx);
-                const err = validateSvgAttrValue('fill', c);
-                if (err) issues.push({ code: 'RICH_POST_EVAL_UNSAFE_SVG', path: `${p}.defs[${i}].stops[${j}].color`, message: err, severity: 'error' });
-              }
-            } else if (d.kind === 'marker' && d.fill !== undefined) {
-              const c = evalRichVal(d.fill, ctx);
-              const err = validateSvgAttrValue('fill', c);
-              if (err) issues.push({ code: 'RICH_POST_EVAL_UNSAFE_SVG', path: `${p}.defs[${i}].fill`, message: err, severity: 'error' });
-            }
-          }
-        }
-        for (let i = 0; i < node.elements.length; i++) {
-          evalSvgElementPost(node.elements[i], `${p}.elements[${i}]`, ctx, localArtifacts);
-        }
+        evalSvgScenePost(node, p, ctx);
       } else if (node.type === 'media_asset') {
         if (node.sourceKind === 'artifact' && node.artifactId !== undefined) {
           const evaluated = String(evalRichVal(node.artifactId, ctx) ?? '').trim();
@@ -1872,9 +1765,7 @@ export function evaluateRichDynamicState(
             }
           }
         } else if (node.sourceKind === 'inline_svg' && node.svgScene) {
-          for (let i = 0; i < node.svgScene.elements.length; i++) {
-            evalSvgElementPost(node.svgScene.elements[i], `${p}.svgScene.elements[${i}]`, ctx, localArtifacts);
-          }
+          evalSvgScenePost(node.svgScene, `${p}.svgScene`, ctx);
         }
       } else if (node.type === 'button') {
         evalActionsPost(node.onClick, `${p}.onClick`, ctx, localArtifacts);

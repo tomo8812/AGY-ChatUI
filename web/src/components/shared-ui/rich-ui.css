@@ -104,3 +104,12 @@
 .rich-diagram-zoom .rich-diagram-scroll{max-height:65vh}
 .rich-carousel-track::after{content:'';flex:0 0 max(0px,calc(100% - min(var(--rich-carousel-width,220px),90%) - 10px))}
 .rich-chart-reference:not([class*='rich-tone-']){color:var(--text-muted)}
+
+.rich-popover,.rich-tooltip{position:relative;width:fit-content;max-width:100%}
+.rich-overlay-trigger{display:flex;align-items:center;gap:4px}
+.rich-popover .rich-overlay-trigger{cursor:pointer}
+.rich-overlay-panel{position:absolute;z-index:4;inset-block-start:100%;inset-inline-start:0;width:max-content;max-width:min(320px,calc(100vw - 48px));padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--bg-surface);color:var(--text-primary);box-shadow:0 4px 14px #0002}
+.rich-tooltip .rich-overlay-panel{font-size:.875em}
+.rich-svg-scene[data-diagram-role='wireframe']{border:1px dashed var(--border)}
+.rich-svg-scene[data-diagram-role='interactive']{outline:1px solid var(--link-color);outline-offset:-1px}
+.rich-svg-scene[data-diagram-role='interactive'] [role='button']:focus-visible{outline:2px solid var(--link-color);outline-offset:2px}

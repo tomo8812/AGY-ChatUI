@@ -92,28 +92,46 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
   } else {
     const stacked = node.chartType === 'stacked_bar' || node.chartType === 'stacked_area';
     const horizontal = node.chartType === 'hbar';
-    const count = Math.max(1, ...series.map(s => s.points.length), categories.length);
-    const cat = Array.from({length:count}, (_,i) => categories[i] ?? series.find(s => s.points[i])?.points[i].x ?? i+1);
-    const numericX = !horizontal && !stacked && !series.some(s => s.type === 'bar') && node.xAxis?.type !== undefined && node.xAxis.type !== 'category';
-    const xn = (x: string | number) => node.xAxis?.type === 'time' ? parseChartTime(x) : Number(x);
-    const xvals = numericX ? series.flatMap(s => s.points.map(p => xn(p.x))).filter(finite) : [];
-    const [xmin = 0,xmax = 1] = extent(xvals);
-    const xScale = scaleLinear().domain([xmin,xmax===xmin?xmin+1:xmax]).range([L,L+pw]);
-    const slots=scaleBand<number>().domain(Array.from({length:count},(_,i)=>i)).range(horizontal?[T,T+ph]:[L,L+pw]);
-    const sx = (p: Point, i: number) => numericX ? xScale(xn(p.x)) : (slots(i)??L)+slots.bandwidth()/2;
-    const groups = { left: { pos: Array(count).fill(0) as number[], neg: Array(count).fill(0) as number[] },
-      right: { pos: Array(count).fill(0) as number[], neg: Array(count).fill(0) as number[] } };
+    const numericX = node.xAxis?.type === 'number' || node.xAxis?.type === 'time';
+    const xn = (x: string | number) => node.xAxis?.type === 'time'
+      ? parseChartTime(x)
+      : typeof x === 'number' || x.trim() ? Number(x) : NaN;
+    const dataX = series.flatMap(s => s.points.map(p => p.x));
+    const cat = [...new Set([...categories, ...dataX])];
+    const xvals = numericX ? [...new Set(cat.map(xn).filter(finite))].sort((a,b)=>a-b) : [];
+    const [xmin = 0, xmax = 1] = extent(xvals);
+    const plotStart = horizontal ? T : L;
+    const plotSize = horizontal ? ph : pw;
+    const barSeries = series.filter(s => s.type === 'bar');
+    const hasBars = barSeries.length > 0;
+    const hasRightAxis = series.some(s=>s.right);
+    const band = scaleBand<string | number>().domain(cat).range([plotStart,plotStart+plotSize]);
+    let gap = xmax-xmin;
+    for (let i=1;i<xvals.length;i++) gap=Math.min(gap,xvals[i]-xvals[i-1]);
+    const padding = xmin===xmax ? Math.max(1,Math.abs(xmin)*Number.EPSILON) : hasBars ? gap/2 : 0;
+    const xScale = scaleLinear().domain([xmin-padding,xmax+padding]).range([plotStart,plotStart+plotSize]);
+    const slot = numericX ? (xvals.length>1 ? Math.abs(xScale(xmin+gap)-xScale(xmin)) : plotSize/2) : band.bandwidth();
+    const xKey = (x: string | number) => numericX ? xn(x) : x;
+    const sx = (x: string | number) => {
+      if(numericX)return xScale(xn(x));
+      const start=band(x);
+      return start===undefined?NaN:start+slot/2;
+    };
+    type Stacks = { pos: Map<string|number,number>; neg: Map<string|number,number> };
+    const groups:Record<'left'|'right',Stacks> = {left:{pos:new Map(),neg:new Map()},right:{pos:new Map(),neg:new Map()}};
     const values = { left: [0], right: [0] };
     const prepared = series.map(s => {
       const axis = s.right ? 'right' : 'left';
-      return s.points.map((p,i) => {
-        if (p.y === null) return null;
+      return s.points.map(p => {
+        const key=xKey(p.x);
+        const x=sx(p.x);
+        if (p.y === null || !finite(x)) return null;
         const accumulator = p.y >= 0 ? groups[axis].pos : groups[axis].neg;
-        const base = stacked ? accumulator[i] : 0;
+        const base = stacked ? accumulator.get(key) ?? 0 : 0;
         const top = base + p.y;
-        if (stacked) accumulator[i] = top;
+        if (stacked) accumulator.set(key,top);
         values[axis].push(top, base);
-        return {base, top};
+        return {base, top, x};
       });
     });
     for (const ref of node.referenceLines ?? []) {
@@ -133,53 +151,54 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
     const scale = (v:number, r:boolean) => (r?rightScale:leftScale)(v);
     const sy = (v:number,r:boolean) => T + ph*(1-scale(v,r));
     const hx = (v:number,r:boolean) => L+pw*scale(v,r);
-    const barSeries = series.filter(s => s.type === 'bar');
     const axes = Array.from({length:5}, (_,i) => {
       const ratio = i/4;
       const a = left[0] + ratio*(left[1]-left[0]);
       const b = right[0] + ratio*(right[1]-right[0]);
       const y = T+ph*(1-ratio), x = L+pw*ratio;
-      return horizontal ? <g key={i}><line x1={x} x2={x} y1={T} y2={T+ph} stroke="var(--border)" /><text x={x} y={T+ph+16} textAnchor="middle">{formatLeft(a)}</text></g> :
-        <g key={i}><line x1={L} x2={L+pw} y1={y} y2={y} stroke="var(--border)" /><text x={L-8} y={y+4} textAnchor="end">{formatLeft(a)}</text>{series.some(s=>s.right)&&<text x={W-R+8} y={y+4}>{formatRight(b)}</text>}</g>;
+      return horizontal ? <g key={i}><line x1={x} x2={x} y1={T} y2={T+ph} stroke="var(--border)" /><text x={x} y={T+ph+16} textAnchor="middle">{formatLeft(a)}</text>{hasRightAxis&&<text x={x} y={T-3} textAnchor="middle">{formatRight(b)}</text>}</g> :
+        <g key={i}><line x1={L} x2={L+pw} y1={y} y2={y} stroke="var(--border)" /><text x={L-8} y={y+4} textAnchor="end">{formatLeft(a)}</text>{hasRightAxis&&<text x={W-R+8} y={y+4}>{formatRight(b)}</text>}</g>;
     });
     const marks = series.map((s,j) => {
       const pts = prepared[j];
       if (s.type === 'bar') {
-        const slot = (horizontal ? ph : pw)/count;
         const barWidth = slot*0.8/(stacked ? 1 : Math.max(1,barSeries.length));
-        const offset = stacked ? 0 : barSeries.indexOf(s)*barWidth;
+        const offset = -slot*0.4 + (stacked ? 0 : barSeries.indexOf(s)*barWidth) + barWidth*0.025;
         return pts.map((p,i) => {
           if (!p) return null;
           const x1=hx(p.base,s.right), x2=hx(p.top,s.right);
           const y1=sy(p.base,s.right), y2=sy(p.top,s.right);
           return <rect key={s.key+':'+i} fill={s.color}
-            x={horizontal ? Math.min(x1,x2) : L+i*slot+slot*0.1+offset}
-            y={horizontal ? T+i*slot+slot*0.1+offset : Math.min(y1,y2)}
-            width={horizontal ? Math.abs(x2-x1) : Math.max(0.5,barWidth-1)}
-            height={horizontal ? Math.max(0.5,barWidth-1) : Math.abs(y2-y1)} {...activate(s,s.points[i],i)}><title>{details(s,s.points[i])}</title></rect>;
+            x={horizontal ? Math.min(x1,x2) : p.x+offset}
+            y={horizontal ? p.x+offset : Math.min(y1,y2)}
+            width={horizontal ? Math.abs(x2-x1) : barWidth*0.95}
+            height={horizontal ? barWidth*0.95 : Math.abs(y2-y1)} {...activate(s,s.points[i],i)}><title>{details(s,s.points[i])}</title></rect>;
         });
       }
-      const mapped = pts.map((p,i) => p && (!numericX || finite(xn(s.points[i].x))) ? { x:sx(s.points[i],i), y:sy(p.top,s.right), base:sy(p.base,s.right) } : null);
+      const mapped = pts.map(p => p && { x:p.x, y:sy(p.top,s.right), base:sy(p.base,s.right) });
       const pathData=node.connectNulls?mapped.filter(p=>p!==null):mapped;
       return <g key={s.key}>{s.type !== 'scatter' && <>
         {s.type==='area'&&<path d={areaPath(pathData)??undefined} fill={s.color} opacity={0.22}/>}
         <path d={linePath(pathData)??undefined} stroke={s.color} strokeWidth="2.5" fill="none"/>
       </>}{mapped.map((p,i)=>p && <circle key={i} cx={p.x} cy={p.y} r={s.type==='scatter'?4:3} fill={s.color} {...activate(s,s.points[i],i)}><title>{details(s,s.points[i])}</title></circle>)}</g>;
     });
-    const labelStep=Math.max(1,Math.ceil(count/8));
+    const xLabels = numericX ? (xvals.length <= 1 ? xvals : Array.from({length:5},(_,i)=>xmin+(xmax-xmin)*i/4)) : cat;
+    const labelStep=Math.max(1,Math.ceil(xLabels.length/8));
     figure = <g className="rich-chart-axes" fill="currentColor" fontSize="12">
       {axes}
-      {!numericX && cat.map((x,i) => i%labelStep===0 && <text key={i} x={horizontal ? L-8 : L+(i+0.5)/count*pw} y={horizontal ? T+(i+0.5)/count*ph+4 : H-B+17} textAnchor={horizontal?'end':'middle'}>{formatX(x)}</text>)}
-      {numericX && Array.from({length:5},(_,i)=>{const x=xmin+(xmax-xmin)*i/4;return <text key={i} x={L+pw*i/4} y={H-B+17} textAnchor="middle">{formatX(x)}</text>})}
+      {xLabels.map((x,i) => {
+        if(i%labelStep!==0)return null;
+        const position=numericX?xScale(Number(x)):sx(x);
+        return <text key={i} x={horizontal?L-8:position} y={horizontal?position+4:H-B+17} textAnchor={horizontal?'end':'middle'}>{formatX(x)}</text>;
+      })}
       <defs><clipPath id={clipId}><rect x={L} y={T} width={pw} height={ph}/></clipPath></defs>
       <g clipPath={'url(#'+clipId+')'}>{marks}
       {(node.referenceLines??[]).map((r,i)=>{
-        const v=val(r.value); const idx=cat.findIndex(x=>x===v);
-        const x = numericX ? xScale(xn(v as string|number)) : L+(idx+0.5)/count*pw;
-        const y = sy(num(v,0),false);
+        const v=val(r.value);
         const vertical = horizontal ? r.axis==='y' : r.axis==='x';
-        const pos = horizontal ? (r.axis==='y'?hx(num(v,0),false):T+(idx+0.5)/count*ph) : r.axis==='y'?y:x;
-        if (!Number.isFinite(pos) || (r.axis==='x'&&!numericX&&idx<0)) return null;
+        const pos = r.axis==='x' && (typeof v==='number'||typeof v==='string') ? sx(v)
+          : r.axis==='y' && finite(v) ? (horizontal?hx(v,false):sy(v,false)) : NaN;
+        if (!finite(pos)) return null;
         return <g key={i} className={'rich-chart-reference'+toneClass(r.tone)}><line x1={vertical?pos:L} x2={vertical?pos:L+pw} y1={vertical?T:pos} y2={vertical?T+ph:pos} stroke="currentColor" strokeDasharray="5 4"/><text x={vertical?pos+3:L+4} y={vertical?T+14:pos-4}>{text(val(r.label))}</text></g>;
       })}
       </g>

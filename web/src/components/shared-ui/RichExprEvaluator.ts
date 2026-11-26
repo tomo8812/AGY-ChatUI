@@ -8,7 +8,7 @@ export type { ExprAst, RichEvalContext, RichEvalBudget } from '../../../../serve
 export {
   RICH_LIMITS, topologicalSortComputed, validateRichDocument,
   compileRichDynamicPlan, evaluateRichDynamicState,
-  validateSvgAttrValue, validateRichMarkdownContent, validateRichMermaidCode,
+  validateRichMarkdownContent, validateRichMermaidCode,
   isValidHttpUrl, validateSafeFilename,
 } from '../../../../server/src/rich/rich-validator';
 export type {

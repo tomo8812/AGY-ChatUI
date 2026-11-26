@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import type { RichBlockRecord, RichNode, RichSvgElement } from '../../../shared/rich-schema.js';
+import { targetSelectorSchema } from '../artifacts/target-selector-schema.js';
 import { canonicalJson } from '../artifacts/idempotency-coordinator.js';
 import type { TargetResolutionResult, TargetSelector } from '../artifacts/types.js';
 import { createRichEvalBudget, evaluateRichExpr } from '../rich/rich-expr-evaluator.js';
@@ -19,6 +20,10 @@ function findRichNodeById(root: RichNode | null | undefined, targetId: string): 
       const found = findRichNodeById(child, targetId);
       if (found) return found;
     }
+  }
+  if (root.type === 'media_asset' && root.svgScene) {
+    const found = findRichNodeById(root.svgScene, targetId);
+    if (found) return found;
   }
   if (root.type === 'card') {
     if (root.headerAction) {
@@ -53,15 +58,11 @@ function findRichNodeById(root: RichNode | null | undefined, targetId: string): 
   return null;
 }
 
-function findSvgElementById(elements: RichSvgElement[], elementId: string): RichSvgElement | null {
-  for (const el of elements) {
-    if (el.id === elementId) return el;
-    if (el.children) {
-      const f = findSvgElementById(el.children, elementId);
-      if (f) return f;
-    }
+function* svgElements(elements: RichSvgElement[]): Generator<RichSvgElement> {
+  for (const element of elements) {
+    yield element;
+    if (element.children) yield* svgElements(element.children);
   }
-  return null;
 }
 
 function evalBlockComputed(block: RichBlockRecord): { state: Record<string, unknown>; computed: Record<string, unknown> } {
@@ -83,11 +84,15 @@ function evalBlockComputed(block: RichBlockRecord): { state: Record<string, unkn
  * - repeat array reordered (missing keyField / duplicate itemKey / item content changed / order changed) -> needs_review / stale
  */
 export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetSelector): TargetResolutionResult {
+  if (!targetSelectorSchema.safeParse(selector).success || selector.blockId !== block.id ||
+      selector.baseRevision === undefined || selector.baseRevision > block.revision) {
+    return { status: 'needs_review', reason: 'invalid_target_selector' };
+  }
   const kind = selector.kind;
 
   if (kind === 'rich_block') {
     const docHash = sha256(block.document);
-    if (selector.expectedDocHash && String(selector.expectedDocHash) !== docHash) {
+    if (selector.expectedDocHash !== docHash) {
       return { status: 'needs_review', reason: 'rich_document_changed' };
     }
     return { status: 'resolved', resolvedSnippet: block.title || block.id };
@@ -97,10 +102,10 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
     const nodeId = String(selector.nodeId ?? '');
     const node = findRichNodeById(block.document.root, nodeId);
     if (!node) return { status: 'stale', reason: 'rich_node_not_found' };
-    const expectedType = selector.expectedNodeType ? String(selector.expectedNodeType) : null;
-    const expectedFp = selector.expectedNodeFingerprint ? String(selector.expectedNodeFingerprint) : null;
+    const expectedType = selector.expectedNodeType;
+    const expectedFp = selector.expectedNodeFingerprint;
     const currentFp = sha256(node);
-    if ((expectedType && node.type !== expectedType) || (expectedFp && currentFp !== expectedFp)) {
+    if (node.type !== expectedType || currentFp !== expectedFp) {
       return { status: 'needs_review', reason: 'rich_node_replaced_or_modified' };
     }
     return { status: 'resolved', resolvedSnippet: JSON.stringify(node).slice(0, 500) };
@@ -119,29 +124,27 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
     }
 
     const keyField = repeatNode.repeat.keyField;
-    const itemKey = selector.itemKey !== undefined && selector.itemKey !== null ? String(selector.itemKey) : null;
-    const hasItemIndex =
-      selector.itemIndex !== undefined && selector.itemIndex !== null && Number.isInteger(Number(selector.itemIndex));
-    const itemIndex = hasItemIndex ? Number(selector.itemIndex) : -1;
-    const expectedItemHash = selector.expectedItemHash ? String(selector.expectedItemHash) : null;
-    const expectedListOrderHash = selector.expectedListOrderHash ? String(selector.expectedListOrderHash) : null;
-
-    const currentOrderKeys = items.map((it, idx) =>
-      keyField && it && typeof it === 'object'
-        ? String((it as Record<string, unknown>)[keyField] ?? `__idx_${idx}`)
-        : `__idx_${idx}:${sha256(it)}`
-    );
+    const itemIndex = Number(selector.itemIndex);
+    const expectedItemHash = selector.expectedItemHash;
+    const expectedListOrderHash = selector.expectedListOrderHash;
+    const keyOf = (item: unknown) => {
+      if (!keyField || !item || typeof item !== 'object' || !Object.hasOwn(item, keyField)) return null;
+      const key = (item as Record<string, unknown>)[keyField];
+      return typeof key === 'string' || typeof key === 'number' ? String(key) : null;
+    };
+    const itemKey = selector.itemKey === undefined ? keyOf(items[itemIndex]) : String(selector.itemKey);
+    const currentOrderKeys = items.map((item, index) => keyOf(item) ?? `__idx_${index}:${sha256(item)}`);
     const currentListOrderHash = sha256(currentOrderKeys);
-    const orderChanged = Boolean(expectedListOrderHash && expectedListOrderHash !== currentListOrderHash);
+    const orderChanged = expectedListOrderHash !== currentListOrderHash;
 
-    // Case A: No keyField -> reordering makes index unreliable; require BOTH index item hash AND list order hash!
+    // An indexed item without a stable key must match both its content and the order fingerprint.
     if (!keyField || itemKey === null) {
       if (itemIndex < 0 || itemIndex >= items.length) {
         return { status: 'stale', reason: 'repeat_item_index_out_of_bounds' };
       }
       const curItem = items[itemIndex];
       const curHash = sha256(curItem);
-      if ((expectedItemHash && curHash !== expectedItemHash) || orderChanged) {
+      if (curHash !== expectedItemHash || orderChanged) {
         return {
           status: 'needs_review',
           reason: orderChanged ? 'repeat_order_changed_without_keyField' : 'repeat_item_content_changed',
@@ -154,8 +157,7 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
     // Case B: keyField present -> check uniqueness of itemKey and item hash
     const matchedIndices: number[] = [];
     for (let i = 0; i < items.length; i++) {
-      const it = items[i];
-      if (it && typeof it === 'object' && String((it as Record<string, unknown>)[keyField]) === itemKey) {
+      if (keyOf(items[i]) === itemKey) {
         matchedIndices.push(i);
       }
     }
@@ -169,10 +171,10 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
     const foundIdx = matchedIndices[0];
     const foundItem = items[foundIdx];
     const foundHash = sha256(foundItem);
-    if (expectedItemHash && foundHash !== expectedItemHash) {
+    if (foundHash !== expectedItemHash) {
       return { status: 'needs_review', reason: 'repeat_item_content_changed', orderChanged };
     }
-    if (orderChanged || (hasItemIndex && foundIdx !== itemIndex)) {
+    if (orderChanged || foundIdx !== itemIndex) {
       // Per 5.2: even when unique itemKey + expectedItemHash match, notify/require review on position change
       return {
         status: 'needs_review',
@@ -193,12 +195,13 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
   if (kind === 'rich_svg_element') {
     const svgNode = findRichNodeById(block.document.root, String(selector.svgNodeId ?? ''));
     if (!svgNode || svgNode.type !== 'svg_scene') return { status: 'stale', reason: 'svg_node_not_found' };
-    const elementId = String(selector.elementId ?? '');
-    const el = findSvgElementById(svgNode.elements, elementId);
-    if (!el) return { status: 'stale', reason: 'svg_element_not_found' };
-    const expectedTag = selector.expectedTag ? String(selector.expectedTag) : null;
-    const expectedFp = selector.expectedElementFingerprint ? String(selector.expectedElementFingerprint) : null;
-    if ((expectedTag && el.tag !== expectedTag) || (expectedFp && sha256(el) !== expectedFp)) {
+    const elements = [...svgElements(svgNode.elements)];
+    const matches = selector.elementId === undefined
+      ? elements.filter(el => el.tag === selector.expectedTag && sha256(el) === selector.expectedElementFingerprint)
+      : elements.filter(el => el.id === selector.elementId);
+    if (!matches.length) return { status: 'stale', reason: 'svg_element_not_found' };
+    const [el] = matches;
+    if (matches.length !== 1 || el.tag !== selector.expectedTag || sha256(el) !== selector.expectedElementFingerprint) {
       return { status: 'needs_review', reason: 'svg_element_replaced_or_modified' };
     }
     return { status: 'resolved', resolvedSnippet: JSON.stringify(el) };
@@ -209,28 +212,38 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
     if (!chartNode || chartNode.type !== 'chart') return { status: 'stale', reason: 'chart_node_not_found' };
     const series = chartNode.series.find((s) => s.key === String(selector.seriesKey ?? ''));
     if (!series) return { status: 'stale', reason: 'chart_series_not_found' };
-    const expectedFp = selector.expectedSeriesFingerprint ? String(selector.expectedSeriesFingerprint) : null;
-    if (expectedFp && sha256(series) !== expectedFp) {
-      return { status: 'needs_review', reason: 'chart_series_changed' };
-    }
-    return { status: 'resolved', resolvedSnippet: JSON.stringify(series) };
+    const data = Array.isArray(series.data) ? series.data
+      : evaluateRichExpr(series.data.expr, { ...evalBlockComputed(block), theme: 'light' });
+    if (!Array.isArray(data)) return { status: 'needs_review', reason: 'chart_data_unavailable' };
+    const fingerprint = sha256({ ...series, data });
+    if (fingerprint !== selector.expectedSeriesFingerprint) return { status: 'needs_review', reason: 'chart_series_changed' };
+    const index = selector.dataIndex as number | undefined;
+    if (index !== undefined && index >= data.length) return { status: 'stale', reason: 'chart_point_not_found' };
+    return { status: 'resolved', resolvedSnippet: JSON.stringify(index === undefined ? { ...series, data } : data[index]),
+      resolvedRange: { seriesKey: series.key, ...(index === undefined ? {} : { dataIndex: index }) } };
+
   }
 
   if (kind === 'rich_table_cell') {
     const tableNode = findRichNodeById(block.document.root, String(selector.tableNodeId ?? ''));
     if (!tableNode || tableNode.type !== 'data_table') return { status: 'stale', reason: 'table_node_not_found' };
-    const rowsVal = Array.isArray(tableNode.rows) ? tableNode.rows : [];
-    const rowIdx = Number(selector.row ?? -1);
-    const colKey = String(selector.col ?? '');
-    if (!Number.isInteger(rowIdx) || rowIdx < 0 || rowIdx >= rowsVal.length) {
-      return { status: 'stale', reason: 'table_row_out_of_bounds' };
+    const rows = Array.isArray(tableNode.rows) ? tableNode.rows
+      : evaluateRichExpr(tableNode.rows.expr, { ...evalBlockComputed(block), theme: 'light' });
+    if (!Array.isArray(rows)) return { status: 'needs_review', reason: 'table_rows_unavailable' };
+    const rowIdx = Number(selector.row);
+    const colKey = String(selector.col);
+    if (rowIdx >= rows.length || !tableNode.columns.some(column => column.key === colKey)) {
+      return { status: 'stale', reason: 'table_cell_not_found' };
     }
-    const cell = rowsVal[rowIdx]?.[colKey];
-    const expectedCellHash = selector.expectedCellHash ? String(selector.expectedCellHash) : null;
-    if (expectedCellHash && sha256(cell ?? null) !== expectedCellHash) {
-      return { status: 'needs_review', reason: 'table_cell_changed' };
+    const row = rows[rowIdx];
+    if (selector.expectedRowKey !== undefined && (row?.id !== selector.expectedRowKey ||
+        rows.filter(candidate => candidate?.id === selector.expectedRowKey).length !== 1)) {
+      return { status: 'needs_review', reason: 'table_row_changed' };
     }
-    return { status: 'resolved', resolvedSnippet: JSON.stringify(cell ?? null) };
+    const cell = row?.[colKey] ?? null;
+    if (sha256(cell) !== selector.expectedCellHash) return { status: 'needs_review', reason: 'table_cell_changed' };
+    return { status: 'resolved', resolvedSnippet: JSON.stringify(cell), resolvedRange: { row: rowIdx, col: colKey } };
+
   }
 
   return { status: 'needs_review', reason: 'unsupported_rich_selector_kind' };

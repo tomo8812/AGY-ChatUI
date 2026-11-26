@@ -366,7 +366,7 @@ class DocumentFormatAdapter implements FormatAdapter {
       if (!expectedSha || expectedSha !== sha256Buffer(buffer)) {
         return { status: 'needs_review', reason: 'image_content_changed' };
       }
-      return { status: 'resolved', resolvedCoords: { selector } };
+      return { status: 'needs_review', reason: 'image_region_unconfirmed' };
     }
 
     if (this.format === 'media') {
@@ -374,7 +374,7 @@ class DocumentFormatAdapter implements FormatAdapter {
       if (!expectedSha || expectedSha !== sha256Buffer(buffer)) {
         return { status: 'needs_review', reason: 'media_content_changed' };
       }
-      return { status: 'resolved', resolvedCoords: { selector } };
+      return { status: 'needs_review', reason: 'media_duration_unconfirmed' };
     }
 
     if (this.format === 'pdf') {
@@ -481,6 +481,7 @@ class DocumentFormatAdapter implements FormatAdapter {
           status: 'resolved',
           resolvedCoords: { pageIndex, textOffsetStart: start, textOffsetEnd: end, occurrenceIndex: actualOcc, quadsPt: quads },
           resolvedSnippet: slice,
+          surroundingContext: page.text.slice(Math.max(0, start - 64), start) + '\n---\n' + page.text.slice(end, end + 64),
         };
       }
 
@@ -612,7 +613,7 @@ class DocumentFormatAdapter implements FormatAdapter {
         const fingerprint = element ? (element.length === 1 ? element[0].fingerprint : null) : metadata.slideHash;
         const expected = element ? selector.expectedElementFingerprint : selector.expectedSlideHash;
         return fingerprint && fingerprint === expected
-          ? { status: 'resolved', resolvedRange: { selector } }
+          ? { status: 'resolved', resolvedRange: { selector }, resolvedSnippet: element ? element[0].text : metadata.shapes.map(shape => shape.text).filter(Boolean).join('\n') }
           : { status: 'needs_review', reason: 'element_fingerprint_changed' };
       } catch {
         return { status: 'needs_review', reason: 'target_structure_unavailable' };
@@ -635,6 +636,16 @@ class DocumentFormatAdapter implements FormatAdapter {
       }
       try {
         const { paragraphs, byBlockIndex } = readDocxAllParagraphTargets(buffer);
+        const paragraphResult = (match: (typeof paragraphs)[number]): TargetResolutionResult => {
+          const index = paragraphs.indexOf(match);
+          return {
+            status: 'resolved',
+            resolvedRange: { selector, resolvedBlockIndex: match.blockIndex },
+            resolvedSnippet: match.text,
+            surroundingContext: paragraphs.slice(Math.max(0, index - 2), index).map(p => p.text).join('\n') +
+              '\n---\n' + paragraphs.slice(index + 1, index + 3).map(p => p.text).join('\n'),
+          };
+        };
 
         if (paraId) {
           const byId = paragraphs.filter((p) => p.paraId === paraId);
@@ -644,11 +655,7 @@ class DocumentFormatAdapter implements FormatAdapter {
           if (match.fingerprint !== expectedBlockHash) {
             return { status: 'needs_review', reason: 'element_fingerprint_changed' };
           }
-          return {
-            status: 'resolved',
-            resolvedRange: { selector, resolvedBlockIndex: match.blockIndex },
-            resolvedSnippet: match.text,
-          };
+          return paragraphResult(match);
         }
 
         const matches = paragraphs.filter((p) => p.fingerprint === expectedBlockHash);
@@ -670,27 +677,10 @@ class DocumentFormatAdapter implements FormatAdapter {
             (matches.length > 1 && match.blockIndex !== blockIndex)) {
           return { status: 'needs_review', reason: 'ambiguous_duplicate_paragraph' };
         }
-        return {
-          status: 'resolved',
-          resolvedRange: { selector, resolvedBlockIndex: match.blockIndex },
-          resolvedSnippet: match.text,
-        };
+        return paragraphResult(match);
       } catch {
         return { status: 'needs_review', reason: 'target_structure_unavailable' };
       }
-    }
-
-    if (this.format === 'pptx' || this.format === 'docx') {
-      const expectedFp =
-        selector.expectedElementFingerprint ??
-        selector.expectedBlockHash ??
-        selector.expectedSlideHash ??
-        selector.expectedCellHash;
-      const currentFp = sha256Buffer(buffer);
-      if (!expectedFp || String(expectedFp) !== currentFp) {
-        return { status: 'needs_review', reason: 'element_fingerprint_changed' };
-      }
-      return { status: 'resolved', resolvedRange: { selector } };
     }
 
     return { status: 'needs_review', reason: 'unverified_rich_target' };

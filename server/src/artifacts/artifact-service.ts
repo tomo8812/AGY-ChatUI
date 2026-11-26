@@ -1,3 +1,4 @@
+import { selectorMatchesFormat, targetSelectorSchema } from './target-selector-schema.js';
 import { inspectArtifactTarget } from './target-inspection.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -1613,7 +1614,6 @@ export class ArtifactService {
     diffPatch?: string | null;
     sourceArtifactId?: string | null;
     sourceBaseRevision?: number | null;
-    emitEvent?: boolean;
   }): Promise<{ artifact: ArtifactRecord; created: boolean; changed: boolean }> {
     const pathLockKey = `path:${params.userId}:chat:${params.chatId}:${params.relPath}`;
 
@@ -1790,17 +1790,15 @@ export class ArtifactService {
             }
           }
 
-          if (params.emitEvent) {
-            envelope = this.db.insertSyncEventInTx({
-              userId: params.userId,
-              eventId: crypto.randomUUID(),
-              type: existing ? 'artifact.updated' : 'artifact.created',
-              chatId: params.chatId,
-              runId: params.runId ?? null,
-              payload: { artifact: saved },
-              createdAt: now,
-            });
-          }
+          envelope = this.db.insertSyncEventInTx({
+            userId: params.userId,
+            eventId: crypto.randomUUID(),
+            type: existing ? 'artifact.updated' : 'artifact.created',
+            chatId: params.chatId,
+            runId: params.runId ?? null,
+            payload: { artifact: saved },
+            createdAt: now,
+          });
 
           this.db.db.exec('COMMIT;');
         } catch (err) {
@@ -1905,7 +1903,6 @@ export class ArtifactService {
             source: 'generated',
             messageId: params.messageId ?? null,
             runId: params.runId ?? null,
-            emitEvent: false,
           });
           return { artifact: ingested.artifact };
         }
@@ -4991,6 +4988,46 @@ export class ArtifactService {
     return { artifact: created.artifact, exported };
   }
 
+  private async verifyImageTarget(artifact: ArtifactRecord, selector: TargetSelector): Promise<TargetResolutionResult> {
+    const { userId, id } = artifact;
+    try {
+      const image = await this.renderPng(userId, id);
+      const width = image.png.readUInt32BE(16);
+      const height = image.png.readUInt32BE(20);
+      if (image.revision !== artifact.revision || image.sha256 !== artifact.sha256 || width !== selector.expectedWidthPx || height !== selector.expectedHeightPx) {
+        return { status: 'needs_review', reason: 'image_dimensions_changed' };
+      }
+      let region;
+      if (selector.kind === 'image_pin') {
+        region = { unit: 'px' as const, x: Math.min(width - 1, Math.floor(Number(selector.xNorm) * width)),
+          y: Math.min(height - 1, Math.floor(Number(selector.yNorm) * height)), width: 1, height: 1 };
+      } else if (selector.kind === 'image_rect') {
+        region = { unit: 'norm' as const, x: Number(selector.xNorm), y: Number(selector.yNorm),
+          width: Number(selector.wNorm), height: Number(selector.hNorm) };
+      } else {
+        const points = selector.pointsNorm as Array<[number, number]>;
+        let left = 1, top = 1, right = 0, bottom = 0;
+        for (const [x, y] of points) {
+          left = Math.min(left, x);
+          top = Math.min(top, y);
+          right = Math.max(right, x);
+          bottom = Math.max(bottom, y);
+        }
+        if (left === right || top === bottom) return { status: 'needs_review', reason: 'invalid_image_region' };
+        region = { unit: 'norm' as const, x: left, y: top, width: right - left, height: bottom - top };
+      }
+      const cropped = await this.renderPng(userId, id, { region });
+      if (cropped.revision !== artifact.revision || cropped.sha256 !== artifact.sha256 ||
+          crypto.createHash('sha256').update(cropped.png).digest('hex') !== selector.expectedRegionSha256) {
+        return { status: 'needs_review', reason: 'image_region_changed' };
+      }
+      return { status: 'resolved', resolvedCoords: { selector, region } };
+    } catch (error) {
+      if (error instanceof ArtifactError && error.code === 'RESOURCE_BUSY') throw error;
+      return { status: 'needs_review', reason: 'image_region_unavailable' };
+    }
+  }
+
   async resolveTargetOnArtifact(
     userId: string,
     artifactId: string,
@@ -5003,6 +5040,19 @@ export class ArtifactService {
     const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
     if (!adapter.targetPinSupported) {
       throw unsupportedOperationError('target_pin', 'unsupported_by_format', `形式 '${adapter.format}' は対象指定に対応していません。`);
+    }
+    if (!targetSelectorSchema.safeParse(selector).success || !selectorMatchesFormat(selector, adapter.format)) {
+      return { status: 'needs_review', reason: 'invalid_target_selector' };
+    }
+    if (adapter.format === 'media' && !selector.kind.startsWith(artifact.previewKind + '_')) {
+      return { status: 'needs_review', reason: 'invalid_target_selector' };
+    }
+    baseRevision ??= selector.baseRevision;
+    if (baseRevision !== selector.baseRevision || baseRevision === undefined || baseRevision > artifact.revision ||
+        (baseRevision !== artifact.revision && !this.db.db.prepare(
+          'SELECT 1 FROM artifact_revisions WHERE artifact_id = ? AND user_id = ? AND revision = ?'
+        ).get(artifactId, userId, baseRevision))) {
+      return { status: 'needs_review', reason: 'invalid_base_revision' };
     }
     const rootDir = this.resolveScopeRootDir(artifact.userId, artifact.scopeKind, artifact.chatId, artifact.projectId);
     if (!rootDir) return { status: 'stale', reason: 'artifact_file_missing' };
@@ -5019,9 +5069,23 @@ export class ArtifactService {
       }
     }
     try {
-      const resolution = await inspectArtifactTarget<TargetResolutionResult>({
-        file: artifact, rootDir, selector, maxBytes, snippetHint, baseSnapshot,
+      let resolution = await inspectArtifactTarget<TargetResolutionResult>({
+        file: artifact, rootDir, selector, expectedSha256: artifact.sha256, maxBytes, snippetHint, baseSnapshot,
       });
+      if (resolution.reason === 'image_region_unconfirmed' && adapter.format === 'image') {
+        resolution = await this.verifyImageTarget(artifact, selector);
+      }
+      if (resolution.reason === 'media_duration_unconfirmed' && adapter.format === 'media') {
+        try {
+          const structure = await this.getStructure(userId, artifactId);
+          if (structure.revision === artifact.revision && structure.sha256 === artifact.sha256 &&
+              structure.durationSeconds === selector.expectedDurationSec) {
+            resolution = { status: 'resolved', resolvedCoords: { startSec: selector.startSec, endSec: selector.endSec } };
+          }
+        } catch (error) {
+          if (error instanceof ArtifactError && error.code === 'RESOURCE_BUSY') throw error;
+        }
+      }
       const latest = this.db.getArtifact(userId, artifactId);
       if (!latest) return { status: 'stale', reason: 'artifact_file_missing' };
       if (latest.revision !== artifact.revision) return { status: 'needs_review', reason: 'revision_changed_during_resolution' };

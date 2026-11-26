@@ -22,7 +22,7 @@ interface FileMeta {
 
 export type InspectionJob = { file: FileMeta; maxBytes?: number } & (
   | { range: Record<string, unknown>; snapshot: Snapshot }
-  | { selector: TargetSelector; rootDir: string; snippetHint?: string; baseSnapshot?: Snapshot }
+  | { selector: TargetSelector; rootDir: string; expectedSha256: string; snippetHint?: string; baseSnapshot?: Snapshot }
 );
 
 function readSnapshot(snapshot: Snapshot, maxBytes?: number) {
@@ -89,6 +89,7 @@ function inspect(job: InspectionJob) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { status: 'stale', reason: 'artifact_file_missing' };
     return { status: 'needs_review', reason: 'target_content_unavailable' };
   }
+  if (source.sha256 !== job.expectedSha256) return { status: 'needs_review', reason: 'revision_content_changed' };
   let snippetHint = job.snippetHint;
   const { startLine, endLine, kind } = job.selector;
   if (job.baseSnapshot && (snippetHint === undefined || sha256Text(snippetHint) !== job.selector.expectedSnippetHash) && (kind === 'code_line_range' || kind === 'md_text_range') &&
@@ -102,7 +103,7 @@ function inspect(job: InspectionJob) {
     }
   }
   const result = adapter.resolveTarget(source.buffer, job.selector, { ...job.file, snippetHint });
-  if (result.status === 'resolved') {
+  if (result.status === 'resolved' || result.reason === 'image_region_unconfirmed' || result.reason === 'media_duration_unconfirmed') {
     try {
       const latest = openContainedRegularFileNoFollow(job.rootDir, job.file.relPath);
       try {

@@ -47,6 +47,22 @@ export interface RichArtifactSaveGateway {
 }
 
 export class RichContentService {
+  private readonly targetChangeListeners = new Set<(block: RichBlockRecord) => void>();
+
+  onTargetChanged(listener: (block: RichBlockRecord) => void): void {
+    this.targetChangeListeners.add(listener);
+  }
+
+  private notifyTargetChanged(block: RichBlockRecord): void {
+    for (const listener of this.targetChangeListeners) {
+      try {
+        listener(block);
+      } catch (error) {
+        console.error('Rich block edit-request revalidation failed', error);
+      }
+    }
+  }
+
   constructor(
     private readonly config: AppConfig,
     private readonly db: AppDatabase,
@@ -624,6 +640,7 @@ export class RichContentService {
 
     const block = this.getBlock(params.userId, params.chatId, current.id)!;
     this.hub.broadcastPersistedEvent(envelope);
+    this.notifyTargetChanged(block);
     return { block, validation };
   }
 
@@ -660,7 +677,9 @@ export class RichContentService {
       this.db.db.exec('ROLLBACK;');
       throw err;
     }
-    return this.getBlock(userId, chatId, blockId)!;
+    const block = this.getBlock(userId, chatId, blockId)!;
+    this.notifyTargetChanged(block);
+    return block;
   }
 
   async saveBlockAsArtifact(params: {

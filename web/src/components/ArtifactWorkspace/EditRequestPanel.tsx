@@ -1,7 +1,7 @@
 import React,{useEffect,useRef,useState} from 'react';
 import type { ArtifactRecord } from '../../types';
 import type { EditRequestRecord,WorkspaceTarget } from '../../api/workspace';
-import { workspaceApi } from '../../api/workspace';
+import { subscribeEditRequests, workspaceApi } from '../../api/workspace';
 
 export function EditRequestPanel({artifact,target,onClear}:{artifact:ArtifactRecord;target:WorkspaceTarget|null;onClear:()=>void}){
   const [instruction,setInstruction]=useState('');
@@ -22,6 +22,9 @@ export function EditRequestPanel({artifact,target,onClear}:{artifact:ArtifactRec
     else setLoading(false);
     return()=>c.abort();
   },[artifact.chatId,artifact.id,artifact.revision,refresh]);
+  useEffect(()=>subscribeEditRequests(chatId=>{
+    if(chatId===artifact.chatId)setRefresh(value=>value+1);
+  }),[artifact.chatId]);
   async function mutate(run:()=>Promise<void>){
     if(!artifact.chatId||mutation.current||loading)return;
     mutation.current=true;setBusy(true);setError(null);listController.current?.abort();
@@ -53,6 +56,16 @@ export function EditRequestPanel({artifact,target,onClear}:{artifact:ArtifactRec
     const chatId=artifact.chatId;
     void mutate(async()=>{await workspaceApi.deleteRequest(chatId,id);if(alive.current){setRequests(prev=>prev.filter(req=>req.id!==id));if(editing===id)setEditing(null)}});
   };
+  const reconfirm=(id:string)=>{
+    if(!artifact.chatId||!target||target.baseRevision!==artifact.revision)return;
+    const selected=target,chatId=artifact.chatId;
+    void mutate(async()=>{
+      const {request}=await workspaceApi.reconfirmRequest(chatId,id,selected);
+      if(!alive.current)return;
+      setRequests(prev=>prev.map(req=>req.id===id?request:req));
+      if(latestTarget.current===selected)onClear();
+    });
+  };
   const resolve=(id:string)=>{
     if(!artifact.chatId||!window.confirm('変更内容を確認済みにしますか？'))return;
     const chatId=artifact.chatId;
@@ -81,6 +94,8 @@ export function EditRequestPanel({artifact,target,onClear}:{artifact:ArtifactRec
       {req.selectedContentSnapshot&&<details className="workspace-request-target"><summary>対象の内容</summary><pre>{req.selectedContentSnapshot}</pre></details>}
       <div className="workspace-request-actions">
         {req.status==='draft'&&editing!==req.id&&<><button type="button" className="btn btn-ghost btn-xs" disabled={disabled} onClick={()=>{setEditing(req.id);setEditedInstruction(req.instruction)}}>指示を修正</button><button type="button" className="btn btn-ghost btn-xs" disabled={disabled||drafts[0]?.id===req.id} onClick={()=>reorder(req.id,-1)}>上へ</button><button type="button" className="btn btn-ghost btn-xs" disabled={disabled||drafts.at(-1)?.id===req.id} onClick={()=>reorder(req.id,1)}>下へ</button><button type="button" className="btn btn-ghost btn-xs" disabled={disabled} onClick={()=>remove(req.id)}>削除</button></>}
+        {(req.status==='needs_review'||req.status==='stale')&&target?.baseRevision===artifact.revision&&target&&
+          <button type="button" className="btn btn-secondary btn-xs" disabled={disabled} onClick={()=>reconfirm(req.id)}>選択した対象で再確認</button>}
         {req.status==='applied_unverified'&&<button type="button" className="btn btn-secondary btn-xs" disabled={disabled} onClick={()=>resolve(req.id)}>変更を確認</button>}
       </div>
     </div>)}

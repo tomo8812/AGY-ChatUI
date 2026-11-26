@@ -135,7 +135,8 @@ test('browser renders the rich UI node catalog and runs each explicit action',as
   await expect(page.getByText('Detail body')).toBeVisible();
   await page.getByText('Open popover',{exact:true}).click();
   await expect(page.getByText('Popover body')).toBeVisible();
-  await page.getByText('Open help',{exact:true}).click();
+  await page.getByRole('button',{name:'ポップオーバーを閉じる'}).press('Escape');
+  await richNode('tooltip').locator('.rich-overlay-trigger').focus();
   await expect(page.getByText('Help body')).toBeVisible();
   await page.getByRole('button',{name:'送信',exact:true}).click();
   await expect(page.getByRole('slider')).toHaveValue('9');

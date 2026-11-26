@@ -370,24 +370,17 @@ export class BuiltinArtifactMcpServer {
     });
 
     tool('edit_request_list', 'List submitted editing requests in this chat.', {}, () =>
-      this.editRequests.listRequests(userId, chatId).filter(({ status }) => status !== 'draft'));
+      this.editRequests.listRequests(userId, chatId).filter(({ batchId }) => batchId !== null));
     tool('edit_request_get', 'Read a submitted editing request and its target.', requestId, async ({ requestId }, authorize) => {
       const { regionImagePngBase64, ...payload } = await this.editRequests.getForAgent(userId, chatId, requestId);
       authorize();
-      if (payload.status === 'draft') throw new ArtifactError('NOT_FOUND', 'Editing request was not submitted.', 404);
       const content: CallToolResult['content'] = [{ type: 'text', text: JSON.stringify(payload) }];
       if (regionImagePngBase64) content.push({ type: 'image', mimeType: 'image/png', data: regionImagePngBase64 });
       return new ToolOutput(content);
     });
     tool('edit_request_mark_applied', 'Mark a submitted request applied, pending user verification.', {
       ...requestId, appliedRevision: revision,
-    }, (input) => {
-      const request = this.editRequests.getRequest(userId, chatId, input.requestId);
-      if (!request || request.status !== 'sent') {
-        throw new ArtifactError('EDIT_REQUEST_NOT_SENT', 'Only submitted editing requests can be marked applied.', 409);
-      }
-      return this.editRequests.markAppliedByAgent({ ...context, ...input });
-    });
+    }, input => this.editRequests.markAppliedByAgent({ ...context, ...input }));
 
     tool('rich_capabilities', 'Get the rich content schema and limits.', {}, () => this.rich.getCapabilities());
     tool('rich_validate', 'Validate a rich document without writing it.', {

@@ -94,7 +94,7 @@ export class ResourceGovernor {
     );
   }
 
-  async runWithBudget<T>(kind: DocWorkerKind, fn: () => Promise<T>): Promise<T> {
+  async runWithBudget<T>(kind: DocWorkerKind, fn: (checkMemoryBeforeSpawn: () => Promise<void>) => Promise<T>): Promise<T> {
     const weight = Math.min(WORKER_WEIGHTS[kind], this.maxWeightBudget);
     await this.ensureMemAvailableForHeavyWorker(kind);
 
@@ -108,7 +108,8 @@ export class ResourceGovernor {
     }
 
     try {
-      return await fn();
+      await this.ensureMemAvailableForHeavyWorker(kind);
+      return await fn(() => this.ensureMemAvailableForHeavyWorker(kind));
     } finally {
       this.usedWeight = Math.max(0, this.usedWeight - weight);
       this.drainWaiters();

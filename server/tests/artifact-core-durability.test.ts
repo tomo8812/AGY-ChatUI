@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ArtifactService } from '../src/artifacts/artifact-service.js';
 import { ArtifactError } from '../src/artifacts/errors.js';
 import { ResourceGovernor } from '../src/artifacts/resource-governor.js';
@@ -610,8 +610,8 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
     expect(binPin.data.error).toBe('UNSUPPORTED_OPERATION');
 
     // Case 1 (PIN-02): Same-dimension different image -> needs_review
-    const imgBuf1 = Buffer.from('FAKE_PNG_1_SAME_LEN');
-    const imgBuf2 = Buffer.from('FAKE_PNG_2_SAME_LEN');
+    const imgBuf1 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==', 'base64');
+    const imgBuf2 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg+M/wHwAEAQH/cetH5QAAAABJRU5ErkJggg==', 'base64');
     const imgArt = await srv.ctx.artifactService.createArtifact({
       userId,
       scopeKind: 'chat',
@@ -621,14 +621,27 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       actorKind: 'user',
       actorId: userId,
     });
-    const imgReq = srv.ctx.editRequestService.createRequest({
-      userId,
-      chatId,
-      targetKind: 'artifact',
-      artifactId: imgArt.artifact.id,
-      selector: { kind: 'image_pin', xNorm: 0.5, yNorm: 0.5, expectedWidthPx: 100, expectedHeightPx: 100, expectedImageSha256: sha256(imgBuf1) },
-      instruction: 'brighten center',
+    const imageSelector = {
+      kind: 'image_pin', baseRevision: 1, xNorm: 0.5, yNorm: 0.5, expectedWidthPx: 1, expectedHeightPx: 1,
+      expectedImageSha256: sha256(imgBuf1), expectedRegionSha256: sha256(imgBuf1),
+    };
+    // The 1x1 fixture has the same cropped pixel and full rendition.
+    const render = vi.spyOn(srv.ctx.artifactService, 'renderPng').mockResolvedValue({
+      revision: 1, sha256: sha256(imgBuf1), png: imgBuf1,
     });
+    let imgReq;
+    try {
+      const input = { userId, chatId, targetKind: 'artifact' as const, artifactId: imgArt.artifact.id, instruction: 'brighten center' };
+      await expect(srv.ctx.editRequestService.createRequest({
+        ...input, selector: { ...imageSelector, expectedRegionSha256: sha256('wrong region') },
+      })).rejects.toMatchObject({ code: 'TARGET_CONTENT_DRIFT' });
+      imgReq = await srv.ctx.editRequestService.createRequest({ ...input, selector: imageSelector });
+      expect(render).toHaveBeenLastCalledWith(userId, imgArt.artifact.id, {
+        region: { unit: 'px', x: 0, y: 0, width: 1, height: 1 },
+      });
+    } finally {
+      render.mockRestore();
+    }
     await srv.ctx.artifactService.replaceArtifactBytes({
       userId,
       artifactId: imgArt.artifact.id,
@@ -653,10 +666,10 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
     });
     const pdfRes = await srv.ctx.artifactService.resolveTargetOnArtifact(userId, pdfArt.artifact.id, {
       kind: 'pdf_page',
+      baseRevision: 1,
       pageIndex: 0,
       expectedPageCount: 2,
       expectedPageContentHash: sha256('old-page-0'),
-      _currentPageContentHash: sha256('swapped-page-1'),
     });
     expect(pdfRes.status).toBe('needs_review');
 
@@ -672,11 +685,11 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
     });
     const xlsxRes = await srv.ctx.artifactService.resolveTargetOnArtifact(userId, xlsxArt.artifact.id, {
       kind: 'xlsx_range',
+      baseRevision: 1,
       sheetId: 'Sheet1',
       rangeA1: 'A1:B2',
-      expectedSheetStructHash: 'same',
+      expectedSheetStructHash: sha256('same'),
       expectedRangeValuesHash: sha256('10,20'),
-      _currentRangeValuesHash: sha256('20,10'),
     });
     expect(xlsxRes.status).toBe('needs_review');
     expect(xlsxRes.reason).toBe('TARGET_CONTENT_DRIFT');
@@ -705,6 +718,7 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
     });
     const svgRes = await srv.ctx.artifactService.resolveTargetOnArtifact(userId, svgArt.artifact.id, {
       kind: 'svg_element',
+      baseRevision: 1,
       elementId: 'hero',
       expectedTag: heroEl.tag,
       expectedElementFingerprint: heroEl.fingerprint,
@@ -731,8 +745,10 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
     });
     const dupRes = await srv.ctx.artifactService.resolveTargetOnArtifact(userId, codeArt.artifact.id, {
       kind: 'code_line_range',
-      startLine: 1,
-      endLine: 1,
+      baseRevision: 1,
+      startLine: 2,
+      endLine: 2,
+      occurrenceIndex: 0,
       expectedSnippetHash: sha256('const dup = 1;'),
       contextBeforeHash: sha256('line0'),
       contextAfterHash: sha256('line2'),
@@ -766,13 +782,15 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
         },
       },
     });
-    const reqRich = srv.ctx.editRequestService.createRequest({
+    const reqRich = await srv.ctx.editRequestService.createRequest({
       userId,
       chatId,
       targetKind: 'rich_block',
       richBlockId: richCreated.block.id,
       selector: {
         kind: 'rich_repeat_item',
+        baseRevision: 1,
+        blockId: richCreated.block.id,
         repeatNodeId: 'rep-row',
         itemKey: 'r1',
         itemIndex: 0,
@@ -781,22 +799,12 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       },
       instruction: 'Highlight first item',
     });
-    // Key-based selector without itemIndex resolves cleanly when key + hash match and order is unchanged
-    const reqRichKeyOnly = srv.ctx.editRequestService.createRequest({
-      userId,
-      chatId,
-      targetKind: 'rich_block',
-      richBlockId: richCreated.block.id,
-      selector: {
-        kind: 'rich_repeat_item',
-        repeatNodeId: 'rep-row',
-        itemKey: 'r1',
-        expectedItemHash: sha256(JSON.stringify({ id: 'r1', name: 'First' })),
-        expectedListOrderHash: sha256(JSON.stringify(['r1', 'r2'])),
-      },
-      instruction: 'Check key-only item',
-    });
-    expect((await srv.ctx.editRequestService.resolveRequestTarget(reqRichKeyOnly)).status).toBe('resolved');
+    // An item key does not replace the mandatory position fingerprint.
+    const { itemIndex: _itemIndex, ...noIndex } = reqRich.selector;
+    await expect(srv.ctx.editRequestService.createRequest({
+      userId, chatId, targetKind: 'rich_block', richBlockId: richCreated.block.id, selector: noIndex, instruction: 'invalid',
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+    await srv.ctx.editRequestService.sendBatch({ userId, chatId, requestIds: [reqRich.id] });
 
     // Swap array order r2, r1
     srv.ctx.richContentService.updateBlock({
@@ -820,6 +828,16 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
     expect(agentPayload.userInstruction).toBe('Highlight first item');
     expect(agentPayload.untrustedTargetContent).toBeDefined();
 
+    const requests = srv.ctx.editRequestService;
+    expect(() => requests.markAppliedByAgent({ userId, chatId, requestId: reqRich.id, appliedRevision: 2 }))
+      .toThrow(expect.objectContaining({ code: 'EDIT_REQUEST_NOT_SENT' }));
+    const reconfirmed = await requests.reconfirmByUser({
+      userId, chatId, requestId: reqRich.id, newBaseRevision: 2,
+      newSelector: { ...reqRich.selector, baseRevision: 2, itemIndex: 1, expectedListOrderHash: sha256(JSON.stringify(['r2', 'r1'])) },
+    });
+    expect(reconfirmed.status).toBe('draft');
+    await requests.sendBatch({ userId, chatId, requestIds: [reqRich.id] });
+
     const applied = srv.ctx.editRequestService.markAppliedByAgent({
       userId,
       chatId,
@@ -834,7 +852,7 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
     );
     expect(userResolved.status).toBe(200);
     expect(userResolved.data.request.status).toBe('resolved');
-  }, 20_000);
+  }, 45_000);
 
   it('ARCH-08, ARCH-09 & Basic 8 Adapters: supports immutable revision Range serving, WS user_seq/pong/snapshot, and Pure-JS CRUD/verify/export', async () => {
     const srv = await createTestServer();

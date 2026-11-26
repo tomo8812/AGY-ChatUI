@@ -74,7 +74,8 @@ export function PdfModule({artifact,mode,capabilities,onTarget}:WorkspaceModuleP
         const end=start+selected.length;
         selector.kind='pdf_text_range';
         contentCoords={pageIndex,unit:'pt',quadsPt:selectedText.quadsPt};
-        Object.assign(selector,contentCoords,{
+        Object.assign(selector,{
+          quadsPt:selectedText.quadsPt,
           textOffsetStart:start,textOffsetEnd:end,expectedSnippetHash:sha256Hex(selected),
           contextBeforeHash:sha256Hex(pageText.slice(Math.max(0,start-64),start)),
           contextAfterHash:sha256Hex(pageText.slice(end,end+64)),occurrenceIndex:0,
@@ -84,7 +85,7 @@ export function PdfModule({artifact,mode,capabilities,onTarget}:WorkspaceModuleP
         selector.kind=pin?'pdf_pin':'pdf_region';
         contentCoords={pageIndex,unit:'pt',...(pin?{xPt:rectPt[0],yPt:rectPt[1]}:{rectPt})};
         const digest=regionDigest??sha256Hex(JSON.stringify([pageHash,rectPt]));
-        Object.assign(selector,contentCoords,{expectedRegionDigest:digest});
+        Object.assign(selector,pin?{xPt:rectPt[0],yPt:rectPt[1]}:{rectPt},{expectedRegionDigest:digest});
         if(workerReady&&!pin){
           try{
             regionImagePngBase64=await workspaceApi.renderRegion(artifact,pageIndex,{x:location.x,y:location.y,width:location.width,height:location.height},'norm');

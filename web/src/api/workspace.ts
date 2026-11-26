@@ -12,6 +12,22 @@ export type EditOperation={op:string;[key:string]:unknown};
 export interface RevisionResponse {artifactId:string;revision:number;sha256:string}
 export interface WorkspaceTarget {selector:{kind:string;[key:string]:unknown};baseRevision:number;label:string;selectedContentSnapshot?:string;surroundingContext?:string;regionImagePngBase64?:string;range?:Record<string,unknown>;contentCoords?:Record<string,unknown>}
 export interface EditRequestRecord {id:string;artifactId:string|null;instruction:string;status:string;selector:WorkspaceTarget['selector'];baseRevision:number;selectedContentSnapshot:string}
+const editRequestListeners = new Set<(chatId: string) => void>();
+export function notifyEditRequestsChanged(chatId: string): void {
+  for (const listener of editRequestListeners) listener(chatId);
+}
+export function subscribeEditRequests(listener: (chatId: string) => void): () => void {
+  editRequestListeners.add(listener);
+  return () => { editRequestListeners.delete(listener); };
+}
+function requestTarget(target: WorkspaceTarget) {
+  return {
+    selector: { ...target.selector, baseRevision: target.baseRevision },
+    range: target.range, contentCoords: target.contentCoords,
+    selectedContentSnapshot: target.selectedContentSnapshot, surroundingContext: target.surroundingContext,
+    regionImagePngBase64: target.regionImagePngBase64,
+  };
+}
 const path=(id:string,suffix:string)=>'/api/files/'+encodeURIComponent(id)+'/'+suffix;
 export interface WorkspaceRevision {
   revision: number;
@@ -88,11 +104,16 @@ export const workspaceApi={
   },
   listRequests:(chatId:string,artifactId:string,signal?:AbortSignal)=>apiFetch<{requests:EditRequestRecord[]}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests?'+new URLSearchParams({artifactId}),{signal}),
   createRequest:(chatId:string,artifactId:string,target:WorkspaceTarget,instruction:string)=>apiFetch<{request:EditRequestRecord}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests',{method:'POST',body:{
-    targetKind:'artifact',artifactId,baseRevision:target.baseRevision,selector:target.selector,range:target.range,contentCoords:target.contentCoords,
-    selectedContentSnapshot:target.selectedContentSnapshot,surroundingContext:target.surroundingContext,regionImagePngBase64:target.regionImagePngBase64,instruction,
+    targetKind:'artifact',artifactId,...requestTarget(target),instruction,
   }}),
   reorderRequests:(chatId:string,orderedIds:string[])=>apiFetch<{requests:EditRequestRecord[]}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests/reorder',{method:'POST',body:{orderedIds}}),
   updateRequest:(chatId:string,id:string,instruction:string)=>apiFetch<{request:EditRequestRecord}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests/'+encodeURIComponent(id),{method:'PATCH',body:{instruction}}),
+  reconfirmRequest:(chatId:string,id:string,target:WorkspaceTarget)=>{
+    const {selector,...details}=requestTarget(target);
+    return apiFetch<{request:EditRequestRecord}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests/'+encodeURIComponent(id)+'/reconfirm',{
+      method:'POST',body:{...details,newBaseRevision:target.baseRevision,newSelector:selector},
+    });
+  },
   resolveRequest:(chatId:string,id:string)=>apiFetch<{request:EditRequestRecord}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests/'+encodeURIComponent(id)+'/resolve',{method:'POST',body:{}}),
   deleteRequest:(chatId:string,id:string)=>apiFetch<{ok:boolean}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests/'+encodeURIComponent(id),{method:'DELETE'}),
   history:(id:string,signal?:AbortSignal)=>apiFetch<{revisions:WorkspaceRevision[]}>(path(id,'history'),{signal}),

@@ -9,6 +9,7 @@ import { isValidHttpUrl, validateRichMarkdownContent, parseRichExpr, type ExprAs
 import { RichStateStore, type RichStateSnapshot } from './RichStateStore';
 import { runExplicitRichActions, type RichActionHost } from './RichActionRunner';
 import { BlockRenderAccounting, addNode, color, evaluate, expression, num, repeatContexts, safeArray, text, type RenderCycle, type SelectValue } from './runtime';
+import { RichPopover, RichTooltip, originatesInControl, type RichPopoverTrigger } from './display/RichOverlays';
 import { RichBadge, toneClass } from './display/RichBadge';
 import './rich-ui.css';
 
@@ -170,7 +171,7 @@ function expressionKeys(expr:string,keys:Set<string>){
 }
 /** Children subscribe independently; SVG internals and chart series belong to
  * the node that paints them. Whole-record or dynamic indices stay conservative. */
-export function richNodeProjection(node:RichNode,repeat=true):string[]{
+export function richNodeProjection(node:RichNode):string[]{
   const keys=new Set<string>();
   const visit=(value:unknown,field:string)=>{
     if(typeof value==='string'){
@@ -180,7 +181,7 @@ export function richNodeProjection(node:RichNode,repeat=true):string[]{
     else if(value&&typeof value==='object')Object.entries(value).forEach(([k,v])=>visit(v,k));
   };
   for(const [k,v] of Object.entries(node)){
-    if(['children','headerAction','footer','trigger'].includes(k)||k==='repeat'&&!repeat)continue;
+    if(['children','headerAction','footer','trigger','visibleWhen','repeat'].includes(k))continue;
     if((node.type==='popover'||node.type==='tooltip')&&k==='content'&&Array.isArray(v))continue;
     if(node.type==='tabs'&&k==='items'){for(const item of node.items){visit(item.label,'label');visit(item.badge,'badge')}continue}
     visit(v,k);
@@ -239,24 +240,100 @@ function RichRendererInner({document:doc,userId,chatId,artifacts=noArtifacts,act
   },[store,doc,authorized,prefix,actions,accounting]);
   return <section className="rich-document"><RichTitle value={doc.title} store={store} accounting={accounting}/>{error&&<div className="error-box" role="alert">{error}<button className="btn btn-ghost btn-xs" type="button" onClick={()=>setError(null)}>閉じる</button></div>}<RichNodeView node={doc.root} local={emptyLocal} path="root" environment={environment}/></section>;
 }
-const RichNodeView=React.memo(function RichNodePaint({node,local,path,environment,repeat=true}:{node:RichNode;local:LocalContext;path:string;environment:NodeEnvironment;repeat?:boolean}){
-  const {store,doc,authorized,prefix,host,accounting,fail,dispatch,select,explicit}=environment;
-  const keys=useMemo(()=>richNodeProjection(node,repeat),[node,repeat]);
-  const heavy=['chart','svg_scene','node_edge_diagram','mermaid'].includes(node.type)&&!node.visibleWhen&&!(repeat&&node.repeat);
+interface NodeProps {
+  node: RichNode;
+  local: LocalContext;
+  path: string;
+  environment: NodeEnvironment;
+  repeat?: boolean;
+  popoverTrigger?: RichPopoverTrigger;
+}
+
+const heavyNodes = new Set(['chart', 'svg_scene', 'node_edge_diagram', 'mermaid', 'data_table']);
+const RichNodeView = React.memo(function RichNodeView(props: NodeProps) {
+  const { node, repeat = true } = props;
+  if (repeat && node.repeat) return <RichRepeatView {...props}/>;
+  if (node.visibleWhen) return <RichVisibilityGate {...props}/>;
+  return <RichVisibleNode {...props}/>;
+});
+
+const RichRepeatView = React.memo(function RichRepeatView({ node, local, path, environment }: NodeProps) {
+  const { store, accounting } = environment;
+  const spec = node.repeat!;
+  const keys = useMemo(() => {
+    const keys = new Set<string>();
+    expressionKeys(spec.itemsExpr, keys);
+    return [...keys];
+  }, [spec]);
+  const snap = useProjection(store, keys);
+  accounting.setBaseSteps(snap.stats.computedStepsUsed);
+  const cycle = accounting.beginScope(path + ':repeat');
+  useEffect(() => () => accounting.removeScope(path + ':repeat'), [accounting, path]);
+  const items = repeatContexts(spec, store.context(local.item, local.index, local.aliases), cycle);
+  return <>{items.map(({key, context}) => <RichNodeView key={key} node={node} repeat={false}
+    local={{item:context.item,index:context.index,aliases:context.aliases}} path={path+'-'+key} environment={environment}/>)}</>;
+});
+
+const RichVisibilityGate = React.memo(function RichVisibilityGate(props: NodeProps) {
+  const { node, local, path, environment: { store, accounting } } = props;
+  const condition = node.visibleWhen!;
+  const keys = useMemo(() => {
+    const keys = new Set<string>();
+    expressionKeys(condition, keys);
+    return [...keys];
+  }, [condition]);
+  const snap = useProjection(store, keys);
+  accounting.setBaseSteps(snap.stats.computedStepsUsed);
+  const scope = path + ':visible';
+  const cycle = accounting.beginScope(scope);
+  useEffect(() => () => accounting.removeScope(scope), [accounting, scope]);
+  if (expression(condition, store.context(local.item, local.index, local.aliases), cycle)) {
+    return <RichVisibleNode {...props}/>;
+  }
+  accounting.removeSubtree(path, scope);
+  return null;
+});
+
+function RichVisibleNode(props: NodeProps) {
+  const {node}=props;
+  const heavy=heavyNodes.has(node.type)||(node.type==='media_asset'&&node.sourceKind==='inline_svg');
+  return heavy ? <RichHeavyViewport {...props}/> : <RichNodePaint {...props}/>;
+}
+
+function RichHeavyViewport(props: NodeProps) {
+  const {node}=props;
   const paintRef=useRef<HTMLDivElement>(null);
+  const intersects=useRef(true);
   const [visible,setVisible]=useState(true);
   useEffect(()=>{
-    if(!heavy||!paintRef.current||typeof IntersectionObserver==='undefined')return;
     const element=paintRef.current;
-    const observer=new IntersectionObserver(([entry])=>setVisible(entry.isIntersecting||element.contains(document.activeElement)),{rootMargin:'200px'});
-    observer.observe(element);return()=>observer.disconnect();
-  },[heavy]);
+    if(!element||typeof IntersectionObserver==='undefined')return;
+    const observer=new IntersectionObserver(entries=>{
+      const entry=entries.at(-1);
+      if(!entry)return;
+      intersects.current=entry.isIntersecting;
+      setVisible(entry.isIntersecting||element.contains(document.activeElement));
+    },{rootMargin:'200px'});
+    observer.observe(element);
+    return()=>observer.disconnect();
+  },[]);
+  return <div ref={paintRef} className={'rich-node'+(node.layout?.hideOn?' rich-hide-'+node.layout.hideOn:'')}
+    data-rich-node-id={node.id} style={styleLayout(node.layout)} onFocusCapture={()=>setVisible(true)}
+    onBlurCapture={event=>{if(!intersects.current&&!event.currentTarget.contains(event.relatedTarget))setVisible(false)}}>
+    <RichNodePaint {...props} insideViewport paused={!visible}/>
+  </div>;
+}
+
+const emptyProjection: string[] = [];
+const RichNodePaint=React.memo(function RichNodePaint({node,local,path,environment,insideViewport=false,paused=false,popoverTrigger}:
+  NodeProps&{insideViewport?:boolean;paused?:boolean}){
+  const {store,doc,authorized,prefix,host,accounting,fail,dispatch,select,explicit}=environment;
+  const keys=useMemo(()=>richNodeProjection(node),[node]);
   useEffect(()=>()=>{accounting.removeScope(path);accounting.removeScope(path+':lazy');},[accounting,path]);
-  const pausedKeys=useMemo<string[]>(()=>[],[]);
-  const snap=useProjection(store,heavy&&!visible?pausedKeys:keys);
-  // Enforce block-wide cumulative AST steps, expanded nodes, expanded SVG
-  // elements, and expanded data points across all mounted nodes, partial
-  // re-renders, dynamic repeat expansions, and lazy-loaded renderers.
+  const snap=useProjection(store,paused?emptyProjection:keys);
+  const lastPaint=useRef<React.ReactElement|null>(null);
+  // Keep the mounted subtree and its local controls while releasing live subscriptions.
+  if(paused)return lastPaint.current;
   accounting.setBaseSteps(snap.stats.computedStepsUsed);
   const cycle:RenderCycle=accounting.beginScope(path);
   const c=store.context(local.item,local.index,local.aliases);
@@ -265,14 +342,6 @@ const RichNodeView=React.memo(function RichNodePaint({node,local,path,environmen
     return [s?.name??id,asOf??s?.asOf,fetchedAt??s?.fetchedAt].filter(Boolean).join(' · ');
   };
     const renderNode=(child:RichNode,_context:RichEvalContext,childPath:string)=><RichNodeView node={child} local={local} path={childPath} environment={environment}/>;
-    if(repeat&&node.repeat){
-      const items=repeatContexts(node.repeat,c,cycle);
-      return <>{items.map(r=><RichNodeView key={r.key} node={node} local={{item:r.context.item,index:r.context.index,aliases:r.context.aliases}} path={path+'-'+r.key} environment={environment} repeat={false}/>)}</>;
-    }
-    if(node.visibleWhen&&!expression(node.visibleWhen,c,cycle)){
-      accounting.removeSubtree(path);
-      return null;
-    }
     addNode(cycle);
     const v=<T,>(x:T|{expr:string}|undefined)=>evaluate<T>(x,c,cycle);
     const label=(x:unknown)=>text(x);
@@ -320,15 +389,51 @@ const RichNodeView=React.memo(function RichNodePaint({node,local,path,environmen
       case 'svg_scene':body=<SvgScene args={[node,c,cycle,unique,dispatch]} accounting={accounting} scopePath={path+':lazy'}/>;break;
       case 'node_edge_diagram':body=<NodeEdgeDiagram args={[node,c,cycle,select,unique]} accounting={accounting} scopePath={path+':lazy'}/>;break;
       case 'chart':body=<RichChart node={node} context={c} cycle={cycle} select={select} clipId={unique+'-clip'} accounting={accounting} scopePath={path+':lazy'}/>;break;
-      case 'button':{const Icon=richIcon(node.icon);body=<button type="button" className={'btn btn-'+(node.variant==='danger'?'danger-outline':node.variant??'secondary')} disabled={Boolean(node.disabledWhen&&expression(node.disabledWhen,c,cycle))} onClick={()=>explicit(node.onClick,c)}>{Icon&&<span aria-hidden="true" className="rich-button-icon"><Icon size={16}/></span>}{label(v(node.label))}</button>;break;}
-      case 'clickable':case 'selectable_card':{const selected=Boolean(node.selectedWhen&&expression(node.selectedWhen,c,cycle));body=<div className={'rich-selectable'+(selected?' selected':'')} role="button" tabIndex={0} aria-pressed={selected} onClick={e=>{if(!(e.target as HTMLElement).closest('button,input,select,textarea,a,[role=button]:not(.rich-selectable)'))dispatch(node.onClick,c)}} onKeyDown={e=>{if(e.target===e.currentTarget&&(e.key==='Enter'||e.key===' ')){e.preventDefault();dispatch(node.onClick,c)}}}>{children(node.children)}</div>;break}
+      case 'button':{
+        const Icon=richIcon(node.icon);
+        body=<button type="button" ref={popoverTrigger?.ref} aria-expanded={popoverTrigger?.expanded} aria-controls={popoverTrigger?.controls}
+          className={'btn btn-'+(node.variant==='danger'?'danger-outline':node.variant??'secondary')}
+          disabled={Boolean(node.disabledWhen&&expression(node.disabledWhen,c,cycle))}
+          onClick={()=>{popoverTrigger?.toggle();explicit(node.onClick,c)}}>
+          {Icon&&<span aria-hidden="true" className="rich-button-icon"><Icon size={16}/></span>}{label(v(node.label))}
+        </button>;
+        break;
+      }
+      case 'clickable':case 'selectable_card':{
+        const selected=Boolean(node.selectedWhen&&expression(node.selectedWhen,c,cycle));
+        body=<div className={'rich-selectable'+(selected?' selected':'')} role="button" tabIndex={0} aria-pressed={selected}
+          onClick={event=>{
+            if (event.defaultPrevented || originatesInControl(event.target,event.currentTarget)) return;
+            event.stopPropagation();
+            dispatch(node.onClick,c);
+          }}
+          onKeyDown={event=>{
+            if(event.target===event.currentTarget&&(event.key==='Enter'||event.key===' ')){
+              event.preventDefault();
+              event.stopPropagation();
+              dispatch(node.onClick,c);
+            }
+          }}>{children(node.children)}</div>;
+        break;
+      }
       case 'text_input':case 'textarea':case 'date_input':{const val=label(read(node.bind));const common={value:val,onChange:(e:React.ChangeEvent<HTMLInputElement|HTMLTextAreaElement>)=>change(node.bind,e.target.value,node.onChange)};body=<label className="field">{label(v(node.label))}{node.type==='textarea'?<textarea rows={4} maxLength={node.maxLength??50000} placeholder={node.placeholder} {...common}/>:node.type==='date_input'?<input type="date" min={node.min} max={node.max} {...common}/>:<input type="text" maxLength={node.maxLength??50000} placeholder={node.placeholder} {...common}/>}</label>;break}
       case 'number_input':case 'slider':{const min=num(v(node.min),0),max=Math.max(min,num(v(node.max),100)),step=Math.max(0.000001,num(v(node.step),1));const value=num(read(node.bind),min);body=<label className="field"><span>{label(v(node.label))}{node.type==='slider'&&<output> {value}{node.unit??''}</output>}</span><input type={node.type==='slider'?'range':'number'} value={value} min={min} max={max} step={step} onChange={e=>{const value=e.target.valueAsNumber;if(Number.isFinite(value))change(node.bind,Math.min(max,Math.max(min,value)),node.onChange)}}/></label>;break}
       case 'checkbox':case 'toggle':body=<label className="rich-checkbox"><input type="checkbox" role={node.type==='toggle'?'switch':undefined} checked={Boolean(read(node.bind))} onChange={e=>change(node.bind,e.target.checked,node.onChange)}/>{label(v(node.label))}</label>;break;
       case 'radio_group':case 'select':case 'segmented':{const options=safeArray<{value:string|number;label:string;disabled?:boolean}>(v(node.options),cycle);const index=options.findIndex(o=>Object.is(o.value,read(node.bind)));body=node.type==='select'?<label className="field">{label(v(node.label))}<select className="compact-select" value={String(index)} onChange={e=>{const o=options[Number(e.target.value)];if(o&&!o.disabled)change(node.bind,o.value,node.onChange)}}>{index<0&&<option value="-1" disabled>選択してください</option>}{options.map((o,i)=><option key={i} value={i} disabled={o.disabled}>{o.label}</option>)}</select></label>:<fieldset className={'rich-options '+node.type}><legend>{label(v(node.label))}</legend>{options.map((o,i)=><label key={i} className={index===i?'selected':''}><input name={unique} type="radio" checked={i===index} disabled={o.disabled} onChange={()=>change(node.bind,o.value,node.onChange)}/>{o.label}</label>)}</fieldset>;break}
       case 'tabs':body=<Tabs items={node.items.map((item,i)=>({id:item.id,label:label(v(item.label)),badge:label(v(item.badge)),content:children(item.content,'tab-'+i)}))} value={node.bind?label(read(node.bind)):undefined} onChange={node.bind?id=>change(node.bind!,id):undefined}/>;break;
       case 'collapsible':body=<Collapsible title={label(v(node.title))} open={node.bind?Boolean(read(node.bind)):undefined} defaultOpen={node.defaultOpen} onChange={node.bind?open=>change(node.bind!,open):undefined}>{children(node.children)}</Collapsible>;break;
-      case 'popover':case 'tooltip':body=<details className="rich-collapsible"><summary>{renderNode(node.trigger,c,path+'-trigger')}</summary>{Array.isArray(node.content)?children(node.content):label(v(node.content))}</details>;break;
+      case 'popover':case 'tooltip':{
+        const triggerPath=path+'-trigger';
+        const trigger=renderNode(node.trigger,c,triggerPath);
+        const content=Array.isArray(node.content)?children(node.content):label(v(node.content));
+        if(node.type==='popover'){
+          const popoverTrigger=node.trigger.type==='button'&&!node.trigger.repeat?
+            (binding:RichPopoverTrigger)=><RichNodeView node={node.trigger} local={local} path={triggerPath}
+              environment={environment} popoverTrigger={binding}/>:trigger;
+          body=<RichPopover trigger={popoverTrigger}>{content}</RichPopover>;
+        }else body=<RichTooltip trigger={trigger}>{content}</RichTooltip>;
+        break;
+      }
       case 'form':body=<form className="rich-form" onSubmit={e=>{e.preventDefault();explicit(node.onSubmit,c)}}>{children(node.children)}<button className="btn btn-primary" type="submit">送信</button></form>;break;
       case 'editable_draft':body=<div className="rich-form"><label className="field">{label(v(node.label))}<textarea rows={6} value={label(read(node.bind))} onChange={e=>change(node.bind,e.target.value)}/></label>{node.format==='markdown'&&<MarkdownContent content={label(read(node.bind))} strictRich/>}{node.saveAction&&<button type="button" className="btn btn-secondary" onClick={()=>explicit([node.saveAction!],c)}>ファイルに保存</button>}</div>;break;
       case 'code_block':body=<CodeBlock code={label(v(node.code))} language={node.language??''} copyable={node.copyable}/>;break;
@@ -341,7 +446,14 @@ const RichNodeView=React.memo(function RichNodePaint({node,local,path,environmen
       body=<DiagramZoom enabled={node.zoomable} id={unique}>{body}</DiagramZoom>;
     }
     const responsive=node.type==='responsive_box';
-    return <div ref={heavy?paintRef:undefined} onFocusCapture={heavy?()=>setVisible(true):undefined} className={'rich-node'+(responsive?' rich-responsive-layout':node.layout?.hideOn?' rich-hide-'+node.layout.hideOn:'')} style={responsive?responsiveLayout(node.layout,node.pc,node.mobile):styleLayout(node.layout)} data-rich-node-id={node.id} aria-label={node.ariaLabel?label(v(node.ariaLabel)):undefined}><Suspense fallback={<span className="muted-xs" role="status">読み込み中…</span>}>{body}</Suspense></div>;
+    const content=<Suspense fallback={<span className="muted-xs" role="status">読み込み中…</span>}>{body}</Suspense>;
+    const ariaLabel=node.ariaLabel?label(v(node.ariaLabel)):undefined;
+    const rendered=insideViewport?<div aria-label={ariaLabel}>{content}</div>:
+      <div className={'rich-node'+(responsive?' rich-responsive-layout':node.layout?.hideOn?' rich-hide-'+node.layout.hideOn:'')}
+        style={responsive?responsiveLayout(node.layout,node.pc,node.mobile):styleLayout(node.layout)}
+        data-rich-node-id={node.id} aria-label={ariaLabel}>{content}</div>;
+    lastPaint.current=rendered;
+    return rendered;
 });
 
 export function RichRenderer(props:RichRendererProps){

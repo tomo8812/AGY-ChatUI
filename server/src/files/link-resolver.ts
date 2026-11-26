@@ -412,7 +412,6 @@ export async function resolveAuthorizedChatFileReference(params: {
       source: existing?.source ?? (relPath.startsWith('.project-context/') ? 'project_copy' : 'generated'),
       messageId: params.messageId ?? existing?.messageId ?? null,
       runId: params.runId ?? existing?.runId ?? null,
-      emitEvent: false,
     });
     return { artifact, ...buildArtifactUrls(artifact) };
   } catch {

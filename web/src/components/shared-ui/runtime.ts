@@ -74,9 +74,9 @@ export class BlockRenderAccounting {
     this.scopes.delete(scopePath);
   }
 
-  removeSubtree(prefix: string): void {
+  removeSubtree(prefix: string, except?: string): void {
     for (const key of [...this.scopes.keys()]) {
-      if (key === prefix || key.startsWith(prefix + '-') || key.startsWith(prefix + ':')) {
+      if (key !== except && (key === prefix || key.startsWith(prefix + '-') || key.startsWith(prefix + ':'))) {
         this.removeScope(key);
       }
     }

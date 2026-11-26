@@ -1,3 +1,4 @@
+import { notifyEditRequestsChanged } from './api/workspace';
 import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, api } from './api/client';
 import { SyncSocketClient, type WsConnectionStatus } from './api/ws';
@@ -1415,6 +1416,13 @@ export const App: React.FC = () => {
         }
         break;
       }
+      case 'edit_request.created':
+      case 'edit_request.updated':
+      case 'edit_request.deleted':
+      case 'edit_request.reordered':
+      case 'edit_request.batch_sent':
+        if (evt.chatId) notifyEditRequestsChanged(evt.chatId);
+        break;
       case 'artifact.created':
       case 'artifact.updated': {
         const art = p.artifact as ArtifactRecord | undefined;
@@ -1542,6 +1550,7 @@ export const App: React.FC = () => {
           seedChatArtifacts(chat.id, byChat.get(chat.id) ?? []);
         }
         setViewerArtifact(cur => cur ? snapshot.artifacts.find(item => item.id === cur.id) ?? null : cur);
+        if (chatId) notifyEditRequestsChanged(chatId);
         const detail = snapshot.activeChatDetail;
         if (detail && chatId === detail.chat.id) {
           setChatLoadError(null);

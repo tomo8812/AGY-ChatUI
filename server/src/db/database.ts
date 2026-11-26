@@ -481,6 +481,7 @@ export class AppDatabase {
         batch_id TEXT REFERENCES ai_edit_request_batches(batch_id) ON DELETE SET NULL,
         sent_message_id TEXT,
         applied_revision INTEGER,
+        sort_order INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -867,6 +868,20 @@ export class AppDatabase {
     if (!journalCols.some((col) => col.name === 'staging_isolation_mode')) {
       this.db.exec('ALTER TABLE artifact_commit_journal ADD COLUMN staging_isolation_mode TEXT;');
     }
+    const requestCols = this.db.prepare('PRAGMA table_info(ai_edit_requests)').all();
+    if (!requestCols.some(col => col.name === 'sort_order')) {
+      this.db.exec(`
+        BEGIN IMMEDIATE;
+        ALTER TABLE ai_edit_requests ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;
+        WITH ranked AS (
+          SELECT id, ROW_NUMBER() OVER (PARTITION BY user_id, chat_id ORDER BY created_at, id) AS position
+          FROM ai_edit_requests
+        )
+        UPDATE ai_edit_requests SET sort_order = (SELECT position FROM ranked WHERE ranked.id = ai_edit_requests.id);
+        COMMIT;
+      `);
+    }
+
   }
 
   recoverInterruptedRuns(): void {
