@@ -476,6 +476,14 @@ describe('PR 3A Conformance Gap Fixes', () => {
         userId, scopeKind: 'chat', chatId, relPath: 'report.pdf', content: pdf1, actorKind: 'user', actorId: userId,
       });
 
+      for (const rectPt of ['[60,730,', '[60,"730",220,40]']) {
+        await expect(server.ctx.artifactService.readRange(userId, created.artifact.id, {
+          pageIndex: 0,
+          rectPt,
+          targetMetadata: 'true',
+        })).rejects.toMatchObject({ code: 'INVALID_INPUT', statusCode: 400 });
+      }
+
       const rectPt: [number, number, number, number] = [60, 730, 220, 40];
       const meta = await server.ctx.artifactService.readRange(userId, created.artifact.id, {
         pageIndex: 0,

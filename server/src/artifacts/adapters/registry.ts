@@ -1,6 +1,6 @@
 import path from 'node:path';
 import type { PreviewKind } from '../../types.js';
-import { unsupportedOperationError } from '../errors.js';
+import { ArtifactError, unsupportedOperationError } from '../errors.js';
 import type {
   AdapterEditResult,
   AdapterOperation,
@@ -262,10 +262,17 @@ class DocumentFormatAdapter implements FormatAdapter {
       const pageIndex = Number(range.pageIndex);
       let rectPt: [number, number, number, number] | undefined;
       if (range.rectPt !== undefined) {
-        const parsed = typeof range.rectPt === 'string' ? JSON.parse(range.rectPt) : range.rectPt;
-        if (Array.isArray(parsed) && parsed.length === 4 && parsed.every((n) => typeof n === 'number' && Number.isFinite(n))) {
-          rectPt = [parsed[0], parsed[1], parsed[2], parsed[3]];
+        let parsed: unknown = range.rectPt;
+        try {
+          if (typeof parsed === 'string') parsed = JSON.parse(parsed);
+        } catch {
+          parsed = undefined;
         }
+        if (!Array.isArray(parsed) || parsed.length !== 4 ||
+            !parsed.every((n) => typeof n === 'number' && Number.isFinite(n))) {
+          throw new ArtifactError('INVALID_INPUT', 'PDF の領域は 4 個の有限な座標で指定してください。', 400);
+        }
+        rectPt = [parsed[0], parsed[1], parsed[2], parsed[3]];
       } else if (range.xPt !== undefined && range.yPt !== undefined) {
         const x = Number(range.xPt), y = Number(range.yPt);
         if (Number.isFinite(x) && Number.isFinite(y)) rectPt = [x, y, 0, 0];
