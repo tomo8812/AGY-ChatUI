@@ -35,11 +35,11 @@ async function readSprite(image:Blob):Promise<Sprite>{
   // Older render fixtures return a full-slide PNG; retain the full-slide path.
   return {image};
 }
-const BasicLayer=React.memo(function BasicLayer({geometry,bounds,slideWidth,slideHeight,dx,dy}:{geometry:BasicGeometry;bounds:Bounds;slideWidth:number;slideHeight:number;dx:number;dy:number}){
+const BasicLayer=React.memo(function BasicLayer({shapeId,zOrder,geometry,bounds,slideWidth,slideHeight,dx,dy,rotationDegrees}:{shapeId:string;zOrder:number;geometry:BasicGeometry;bounds:Bounds;slideWidth:number;slideHeight:number;dx:number;dy:number;rotationDegrees?:number}){
   const {width,height}=bounds;
   if(width<=0||height<=0)return null;
   const paint={fill:geometry.fill,stroke:geometry.stroke,strokeWidth:geometry.strokeWidthPt};
-  return <svg aria-hidden="true" data-basic-geometry={geometry.kind} viewBox={'0 0 '+width+' '+height} preserveAspectRatio="none" style={{position:'absolute',pointerEvents:'none',overflow:'visible',left:(bounds.x+dx)/slideWidth*100+'%',top:(bounds.y+dy)/slideHeight*100+'%',width:width/slideWidth*100+'%',height:height/slideHeight*100+'%'}}>
+  return <svg aria-hidden="true" data-basic-geometry={geometry.kind} data-shape-id={shapeId} data-z-order={zOrder} data-layer-kind="basic" viewBox={'0 0 '+width+' '+height} preserveAspectRatio="none" style={{position:'absolute',pointerEvents:'none',overflow:'visible',left:(bounds.x+dx)/slideWidth*100+'%',top:(bounds.y+dy)/slideHeight*100+'%',width:width/slideWidth*100+'%',height:height/slideHeight*100+'%',...(rotationDegrees?{transform:`rotate(${rotationDegrees}deg)`,transformOrigin:'center'}:{})}}>
     {geometry.kind==='rect'?<rect x={0} y={0} width={width} height={height} {...paint}/>:<ellipse cx={width/2} cy={height/2} rx={width/2} ry={height/2} {...paint}/>}
   </svg>;
 });
@@ -48,13 +48,36 @@ function useImage(blob:Blob|undefined){
   useEffect(()=>{if(!blob){setImage(null);return}const u=URL.createObjectURL(blob);setImage({blob,url:u});return()=>URL.revokeObjectURL(u)},[blob]);
   return image?.blob===blob?image?.url??'':'';
 }
-function Layer({blob,style,alt=''}:{blob:Blob;style?:React.CSSProperties;alt?:string}){
-  const url=useImage(blob);return url?<img className="workspace-slide-layer" draggable={false} src={url} style={style} alt={alt}/>:null;
+function Layer({blob,style,alt='',shapeId,zOrder,layerKind}:{blob:Blob;style?:React.CSSProperties;alt?:string;shapeId?:string;zOrder?:number;layerKind?:string}){
+  const url=useImage(blob);return url?<img className="workspace-slide-layer" draggable={false} src={url} style={style} alt={alt} data-shape-id={shapeId} data-z-order={zOrder} data-layer-kind={layerKind}/>:null;
 }
 function MiniSlide({artifact,index,active,onClick,disabled}:{artifact:WorkspaceModuleProps['artifact'];index:number;active:boolean;onClick:()=>void;disabled?:boolean}){
-  const r=useRevisionResource(artifact,'thumb:'+index,signal=>workspaceApi.render(artifact,{pageIndex:index},signal));
+  const buttonRef=useRef<HTMLButtonElement>(null);
+  const [visible,setVisible]=useState(active||index<12);
+  useEffect(()=>{
+    if(active){
+      setVisible(true);
+      buttonRef.current?.scrollIntoView({block:'nearest',inline:'nearest'});
+    }
+  },[active]);
+  useEffect(()=>{
+    if(visible)return;
+    const el=buttonRef.current;
+    if(!el)return;
+    if(typeof IntersectionObserver==='undefined'){setVisible(true);return}
+    const observer=new IntersectionObserver(
+      entries=>{if(entries.some(entry=>entry.isIntersecting)){setVisible(true);observer.disconnect()}},
+      {rootMargin:'240px'},
+    );
+    observer.observe(el);
+    return()=>observer.disconnect();
+  },[visible]);
+  const r=useRevisionResource<Blob|null>(artifact,'thumb:'+index+':'+(visible?'1':'0'),async signal=>{
+    if(!visible)return null;
+    return workspaceApi.render(artifact,{pageIndex:index},signal);
+  });
   const url=useImage(r.ready?r.data??undefined:undefined);
-  return <button type="button" className={'workspace-slide-nav-item '+(active?'active':'')} aria-label={'スライド '+(index+1)} aria-pressed={active} disabled={disabled} onClick={onClick}>{url?<img src={url} alt=""/>:<span> {index+1} </span>}<small>{index+1}</small></button>;
+  return <button ref={buttonRef} type="button" className={'workspace-slide-nav-item '+(active?'active':'')} data-slide-index={index} aria-label={'スライド '+(index+1)} aria-pressed={active} disabled={disabled} onClick={onClick}>{url?<img src={url} alt=""/>:<span>{index+1}</span>}<small>{index+1}</small></button>;
 }
 export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDraft,onTarget,target}:WorkspaceModuleProps){
   const [slideId,setSlideId]=useState('');
@@ -74,6 +97,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   const [destination,setDestination]=useState(1);
   const [fileData,setFileData]=useState<{name:string;base64:string}|null>(null);
   const [operationError,setOperationError]=useState('');
+  const [jumpInput,setJumpInput]=useState('');
   const fileGeneration=useRef(0);
   const pendingNavigation=useRef<{revision:number;index:number}|null>(null);
   const [drag,setDrag]=useState<{id:string;dx:number;dy:number}|null>(null);
@@ -107,11 +131,12 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     return {slideId:slide.id,shapes:r.shapes,background,layers};
   });
   const data=scene.data;
-  const shape=data?.shapes.find(s=>s.id===selected);
   const structural=(draft?.entries??[]).filter(e=>e.key.startsWith('pptx-structure:'));
   const lock=editingLocked;
   const currentStructural=mode==='edit'&&scene.ready&&draft?.baseRevision===artifact.revision&&structural.length>0;
   const operations=preparePptxOperations(draft?.entries.map(e=>e.operation)??[]);
+  const removedShapeIds=new Set(operations.filter(op=>op.op==='pptx.remove_shape'&&op.slidePart===slide?.part).map(op=>Number(op.shapeId)));
+  const shape=data?.shapes.find(s=>s.id===selected&&!removedShapeIds.has(Number(s.id)));
   const projected=projectSlides(slides,operations);
   const projectedIndex=slide?projected.indexOf(slide):-1;
   const previewIndex=projectedIndex>=0?projectedIndex:Math.min(index,Math.max(0,projected.length-1));
@@ -213,6 +238,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
       case 'pptx.reorder_slide':operation={op:operationKind,index:projectedIndex,toIndex:destination-1};break;
       default:return;
     }
+    if(operation.op==='pptx.remove_shape'){setSelected('');setCanvasText(false);setDrag(null);setResize(null);resizePointer.current=null}
     if(['pptx.add_slide','pptx.remove_slide','pptx.reorder_slide'].includes(operation.op))pendingNavigation.current={revision:artifact.revision,index:operation.op==='pptx.add_slide'?projectedIndex+1:operation.op==='pptx.remove_slide'?Math.min(projectedIndex,projected.length-2):destination-1};
     const draftKey='pptx-structure:'+(++sequence.current);
     onDraft(artifact.revision,{key:draftKey,label:availableActions.find(a=>a.id===operationKind)!.label,operation},draftKey);chooseOperation('');
@@ -290,18 +316,36 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
         void pin(clicked,undefined,{pageIndex:location.pageIndex,unit:'pt',xPt:location.x*(size?.widthPt??location.pageWidth),yPt:location.y*(size?.heightPt??location.pageHeight)});
       }:undefined}/>
   </div>;
-  return <div className="workspace-presentation"><nav className="workspace-slide-nav" aria-label="スライド一覧">{slides.slice(Math.max(0,index-4),index+5).map(s=><MiniSlide key={s.id} artifact={artifact} index={slides.indexOf(s)} active={s.id===slide?.id} disabled={projected.indexOf(s)<0} onClick={()=>{setSlideId(s.id);choose('')}}/>)}<button type="button" className="btn btn-secondary btn-xs" disabled={index===0||!projected.includes(slides[index-1])} onClick={()=>{setSlideId(slides[index-1].id);choose('')}}>前へ</button><button type="button" className="btn btn-secondary btn-xs" disabled={index+1>=slides.length||!projected.includes(slides[index+1])} onClick={()=>{setSlideId(slides[index+1].id);choose('')}}>次へ</button></nav>
+  const jumpToSlide=(raw:string)=>{
+    const num=Number(raw);
+    if(!Number.isInteger(num)||num<1||num>slides.length)return;
+    const targetSlide=slides[num-1];
+    if(targetSlide&&projected.includes(targetSlide)){setSlideId(targetSlide.id);choose('');setJumpInput('')}
+  };
+  return <div className="workspace-presentation"><nav className="workspace-slide-nav" aria-label="スライド一覧" data-total-slides={slides.length}>
+      <div className="workspace-slide-nav-controls">
+        <button type="button" className="btn btn-secondary btn-xs" disabled={index===0||!projected.includes(slides[index-1])} onClick={()=>{setSlideId(slides[index-1].id);choose('')}}>前へ</button>
+        <button type="button" className="btn btn-secondary btn-xs" disabled={index+1>=slides.length||!projected.includes(slides[index+1])} onClick={()=>{setSlideId(slides[index+1].id);choose('')}}>次へ</button>
+      </div>
+      {slides.length>5&&<form className="workspace-slide-jump" onSubmit={e=>{e.preventDefault();jumpToSlide(jumpInput)}}>
+        <input type="number" min={1} max={slides.length} aria-label="スライド番号へ移動" placeholder={`1–${slides.length}`} value={jumpInput} onChange={e=>setJumpInput(e.target.value)}/>
+        <button type="submit" className="btn btn-secondary btn-xs">移動</button>
+      </form>}
+      <div className="workspace-slide-nav-list">
+        {slides.map((s,slideIdx)=><MiniSlide key={s.id} artifact={artifact} index={slideIdx} active={s.id===slide?.id} disabled={projected.indexOf(s)<0} onClick={()=>{setSlideId(s.id);choose('')}}/>)}
+      </div>
+    </nav>
     <UnifiedViewerZoomShell resetKey={artifact.id+':pptx'} controlsTop={<>{toolbar}{operationForm}</>} scrollClassName="workspace-pptx-scroll">
       {(structure.error||scene.error)&&<div className="error-box" role="alert">{structure.error||scene.error}<button type="button" onClick={()=>{structure.retry();scene.retry()}}>再試行</button></div>}
       {scene.loading&&data&&<p className="workspace-refresh muted-xs" role="status">最新の内容を読み込み中…</p>}
       {!data||!size?.widthPt||!size.heightPt?<div className="workspace-loading">{scene.error||structure.error?'スライドを表示できません。':'読み込み中…'}</div>:<div className="workspace-slide" ref={stage} style={{aspectRatio:size.widthPt+'/'+size.heightPt,'--slide-ratio':size.widthPt/size.heightPt} as React.CSSProperties} data-slide-canvas="true" data-scene-ready={scene.ready} data-preview-ready={previewReady?'true':'false'}>
-        {currentStructural&&previewReady&&currentPreview?.fullSlide?<Layer blob={currentPreview.fullSlide} alt="変更後のスライド"/>:<>
-        <Layer blob={data.background} alt="スライド背景"/>
-        {data.layers.map(({shape:s,sprite})=>{
+        {currentStructural&&previewReady&&currentPreview?.fullSlide?<Layer blob={currentPreview.fullSlide} alt="変更後のスライド" layerKind="full-slide"/>:<>
+        <Layer blob={data.background} alt="スライド背景" layerKind="background"/>
+        {data.layers.filter(({shape:s})=>!removedShapeIds.has(Number(s.id))).map(({shape:s,sprite})=>{
           const exact=previewReady?currentPreview?.images.get(Number(s.id)):undefined;
           const b=displayBounds(s),orig=exact?bounds(s):s.transform?.geomBoundsPt;
           const dx=(b&&orig?b.x-orig.x:0)+(drag?.id===s.id?drag.dx:0),dy=(b&&orig?b.y-orig.y:0)+(drag?.id===s.id?drag.dy:0);
-          if(!exact&&s.basicGeometry&&b)return <BasicLayer key={s.id} geometry={s.basicGeometry} bounds={b} slideWidth={size.widthPt} slideHeight={size.heightPt} dx={drag?.id===s.id?drag.dx:0} dy={drag?.id===s.id?drag.dy:0}/>;
+          if(!exact&&s.basicGeometry&&b)return <BasicLayer key={s.id} shapeId={s.id} zOrder={s.zOrder} geometry={s.basicGeometry} bounds={b} slideWidth={size.widthPt} slideHeight={size.heightPt} dx={drag?.id===s.id?drag.dx:0} dy={drag?.id===s.id?drag.dy:0} rotationDegrees={s.transform?.rotationDegrees}/>;
           const rendered=exact??sprite;
           if(!rendered)return null;
           const sx=orig&&b&&orig.width>0?b.width/orig.width:1,sy=orig&&b&&orig.height>0?b.height/orig.height:1;
@@ -309,12 +353,12 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
             const ink=rendered.ink;
             if(!ink.width||!ink.height)return null;
             const x=orig?orig.x+(ink.x-orig.x)*sx+dx:ink.x+dx,y=orig?orig.y+(ink.y-orig.y)*sy+dy:ink.y+dy;
-            return <Layer key={s.id} blob={rendered.image} style={{left:x/size.widthPt*100+'%',top:y/size.heightPt*100+'%',width:ink.width*sx/size.widthPt*100+'%',height:ink.height*sy/size.heightPt*100+'%'}}/>;
+            return <Layer key={s.id} blob={rendered.image} shapeId={s.id} zOrder={s.zOrder} layerKind="sprite-ink" style={{left:x/size.widthPt*100+'%',top:y/size.heightPt*100+'%',width:ink.width*sx/size.widthPt*100+'%',height:ink.height*sy/size.heightPt*100+'%'}}/>;
           }
-          return <Layer key={s.id} blob={rendered.image} style={{transformOrigin:orig?(orig.x/size.widthPt*100+'% '+orig.y/size.heightPt*100+'%'):undefined,
+          return <Layer key={s.id} blob={rendered.image} shapeId={s.id} zOrder={s.zOrder} layerKind="sprite-full" style={{transformOrigin:orig?(orig.x/size.widthPt*100+'% '+orig.y/size.heightPt*100+'%'):undefined,
             transform:'translate('+dx/size.widthPt*100+'%,'+dy/size.heightPt*100+'%) scale('+sx+','+sy+')'}}/>})}
         </>}
-        {previewSlideMatchesSelection&&data.shapes.filter(s=>!operations.some(op=>op.op==='pptx.remove_shape'&&op.slidePart===slide?.part&&op.shapeId===Number(s.id))).map(s=>{const b=displayBounds(s);if(!b||b.width<=0||b.height<=0)return null;const active=selected===s.id||target?.selector.shapeId===Number(s.id);return <button key={s.id} type="button" aria-label={s.name||'図形 '+s.id} className={'workspace-shape-hit '+(active?'selected':'')} style={{left:(b.x+(drag?.id===s.id?drag.dx:0))/size.widthPt*100+'%',top:(b.y+(drag?.id===s.id?drag.dy:0))/size.heightPt*100+'%',width:b.width/size.widthPt*100+'%',height:b.height/size.heightPt*100+'%'}} onClick={()=>choose(s.id)}
+        {previewSlideMatchesSelection&&data.shapes.filter(s=>!removedShapeIds.has(Number(s.id))).map(s=>{const b=displayBounds(s);if(!b||b.width<=0||b.height<=0)return null;const active=selected===s.id||target?.selector.shapeId===Number(s.id);return <button key={s.id} type="button" aria-label={s.name||'図形 '+s.id} data-shape-id={s.id} data-z-order={s.zOrder} className={'workspace-shape-hit '+(active?'selected':'')} style={{left:(b.x+(drag?.id===s.id?drag.dx:0))/size.widthPt*100+'%',top:(b.y+(drag?.id===s.id?drag.dy:0))/size.heightPt*100+'%',width:b.width/size.widthPt*100+'%',height:b.height/size.heightPt*100+'%'}} onClick={()=>choose(s.id)}
           onDoubleClick={()=>{if(s.type==='sp'&&can('pptx.set_shape_text')){setSelected(s.id);setCanvasText(true)}}}
           onKeyDown={event=>{
             if(event.key==='F2'&&s.type==='sp'&&can('pptx.set_shape_text')){event.preventDefault();setSelected(s.id);setCanvasText(true);return;}

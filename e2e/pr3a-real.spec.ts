@@ -4,6 +4,7 @@ import path from 'node:path';
 import {execFileSync} from 'node:child_process';
 import {createTestServer,TestApiClient} from '../server/tests/helpers/test-harness.js';
 import type {ArtifactRecord} from '../web/src/types';
+import {auditRegions,computeRegionMetrics,decodePng,type RegionAuditSpec} from './helpers/visualAudit.js';
 
 const runtime=process.env.AGY_PR3A_RUNTIME_DIR;
 const fixtureDir=process.env.AGY_PR3A_FIXTURE_DIR;
@@ -47,6 +48,31 @@ async function capturePptx(page:Page,info:TestInfo,reference:Buffer,name:string)
     const a=el.getBoundingClientRect(),b=viewport.getBoundingClientRect();
     return a.top>=b.top-2&&a.bottom<=b.bottom+2&&a.left>=b.left-2&&a.right<=b.right+2;
   }),{timeout:10000}).toBe(true);
+  // Verify DOM Z-order matches ascending zOrder metadata and collect per-element bboxes (geom + rendered layer ink).
+  const layoutAudit=await scene.evaluate(el=>{
+    const rootRect=el.getBoundingClientRect();
+    const layers=Array.from(el.querySelectorAll<HTMLElement>('[data-shape-id][data-layer-kind]'));
+    const zOrders=layers.map(n=>Number(n.dataset.zOrder??0));
+    const zMonotonic=zOrders.every((z,i)=>i===0||z>=zOrders[i-1]);
+    const hits=Array.from(el.querySelectorAll<HTMLElement>('.workspace-shape-hit[data-shape-id]')).map(btn=>{
+      const r=btn.getBoundingClientRect();
+      return {
+        shapeId:btn.dataset.shapeId??'',
+        label:btn.getAttribute('aria-label')??'',
+        geom:{x:r.left-rootRect.left,y:r.top-rootRect.top,width:r.width,height:r.height},
+      };
+    });
+    const rendered=layers.map(node=>{
+      const r=node.getBoundingClientRect();
+      return {
+        shapeId:node.dataset.shapeId??'',
+        kind:node.dataset.layerKind??'',
+        ink:{x:r.left-rootRect.left,y:r.top-rootRect.top,width:r.width,height:r.height},
+      };
+    });
+    return {width:rootRect.width,height:rootRect.height,zMonotonic,hits,rendered};
+  });
+  expect(layoutAudit.zMonotonic,'PPTX layer DOM Z-order must be monotonic').toBe(true);
   const actual=info.outputPath(name+'-canvas.png'),expected=info.outputPath(name+'-reference.png');
   fs.writeFileSync(expected,reference);
   // The active selection outline is chrome, not document pixels. Temporarily hide
@@ -56,7 +82,42 @@ async function capturePptx(page:Page,info:TestInfo,reference:Buffer,name:string)
   const result=comparePng(actual,expected);
   expect(result.ssim,'Browser layer composite vs formal LibreOffice PNG').toBeGreaterThanOrEqual(.95);
   expect(result.mae,'Browser layer mean absolute error').toBeLessThanOrEqual(5);
-  return result;
+
+  // Per-element & region-level bbox audit: union of geometric bounds and rendered ink bounds
+  // plus exposed background corner so whole-slide SSIM cannot mask local defects.
+  const actualImg=decodePng(fs.readFileSync(actual));
+  const expectedImg=decodePng(reference);
+  const scaleX=actualImg.width/Math.max(1,layoutAudit.width);
+  const scaleY=actualImg.height/Math.max(1,layoutAudit.height);
+  const keyTargets=['Title','Overlap','Grouped diagram','Attached image','Native table','Basic 1','Basic 61'];
+  const regionSpecs:RegionAuditSpec[]=[];
+  for(const label of keyTargets){
+    const hit=layoutAudit.hits.find(h=>h.label===label);
+    if(!hit)continue;
+    const layer=layoutAudit.rendered.find(l=>l.shapeId===hit.shapeId);
+    const x0=Math.min(hit.geom.x,layer?layer.ink.x:hit.geom.x);
+    const y0=Math.min(hit.geom.y,layer?layer.ink.y:hit.geom.y);
+    const x1=Math.max(hit.geom.x+hit.geom.width,layer?layer.ink.x+layer.ink.width:hit.geom.x+hit.geom.width);
+    const y1=Math.max(hit.geom.y+hit.geom.height,layer?layer.ink.y+layer.ink.height:hit.geom.y+hit.geom.height);
+    regionSpecs.push({
+      id:hit.shapeId,
+      label,
+      rectPx:{x:x0*scaleX-2,y:y0*scaleY-2,width:(x1-x0)*scaleX+4,height:(y1-y0)*scaleY+4},
+      minSsim:0.85,
+      maxMae:10,
+    });
+  }
+  // Exposed background/master margin region (bottom-right)
+  regionSpecs.push({
+    id:'background-corner',
+    label:'Background/Master region',
+    rectPx:{x:actualImg.width*0.85,y:actualImg.height*0.85,width:actualImg.width*0.13,height:actualImg.height*0.13},
+    minSsim:0.95,
+    maxMae:4,
+  });
+  const regionAudit=auditRegions(actualImg,expectedImg,regionSpecs);
+  expect(regionAudit.failedRegions,'Per-element/region PPTX bbox visual consistency').toEqual([]);
+  return {...result,regionCount:regionAudit.regions.length,zMonotonic:layoutAudit.zMonotonic,regions:regionAudit.regions.map(r=>({label:r.label,ssim:Number(r.metrics.ssim.toFixed(4)),mae:Number(r.metrics.mae.toFixed(2))}))};
 }
 
 for(const vp of targets){
@@ -470,6 +531,28 @@ for(const vp of targets){
             // The extended native structure operations are covered on both
             // Chromium and WebKit; the basic addition runs at all five sizes.
             if(vp.width===1280||vp.width===375){
+              // Verify removing a shape leaves 0 residual ghost in its vacated bbox against the saved slide
+              const overlapBtn=page.getByRole('button',{name:'Overlap',exact:true});
+              const sceneBox=await page.locator('[data-slide-canvas="true"]').boundingBox();
+              const overlapBox=await overlapBtn.boundingBox();
+              await overlapBtn.click();
+              page.once('dialog',d=>void d.accept());
+              await saveStructural('pptx.remove_shape',async()=>{},0);
+              if(sceneBox&&overlapBox){
+                const afterRemovePath=info.outputPath('pptx-after-remove-shape.png');
+                const style=await page.addStyleTag({content:'.workspace-shape-hit{visibility:hidden!important}'});
+                try{await page.locator('[data-slide-canvas="true"]').screenshot({path:afterRemovePath,scale:'css'});}finally{await style.evaluate(el=>el.remove())}
+                const savedAfterRemove=await svc.renderPng(userId,artifact.id,{pageIndex:0});
+                const actualRm=decodePng(fs.readFileSync(afterRemovePath));
+                const expectedRm=decodePng(savedAfterRemove.png);
+                const sx=actualRm.width/Math.max(1,sceneBox.width),sy=actualRm.height/Math.max(1,sceneBox.height);
+                const vacatedMetrics=computeRegionMetrics(actualRm,expectedRm,{
+                  x:(overlapBox.x-sceneBox.x)*sx,y:(overlapBox.y-sceneBox.y)*sy,
+                  width:overlapBox.width*sx,height:overlapBox.height*sy,
+                });
+                expect(vacatedMetrics.mae,'Vacated bbox after removing Overlap must have 0 ghosting').toBeLessThanOrEqual(4);
+                evidence.push({kind:'pptx-remove-ghost-check',vacatedMetrics});
+              }
               await stageStructural('pptx.add_table',async()=>{await page.getByRole('textbox',{name:'追加表 1行 1列'}).fill('Table cell')});
               await saveStructural('pptx.add_image',async()=>{await page.getByLabel('スライド画像ファイル').setInputFiles({name:'sample.png',mimeType:'image/png',buffer:Buffer.from('iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAIAAABvFaqvAAAAIklEQVR4nGO8VKHLQA3ARBVTRg0aNWjUoFGDRg0aNYgiAACvzQGn6yar6wAAAABJRU5ErkJggg==','base64')})},0);
               await saveStructural('pptx.add_slide',async()=>{},1);

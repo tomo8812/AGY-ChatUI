@@ -7,8 +7,8 @@ type Node=Extract<RichDiagramNode,{type:'node_edge_diagram'}>;
 interface Vertex{id:string;label:string;sublabel?:string;tone?:string;x?:number;y?:number}
 interface Edge{id?:string;from:string;to:string;label?:string;style?:'solid'|'dashed';directed?:boolean}
 export function renderNodeEdgeDiagram(node:Node,context:RichEvalContext,cycle:RenderCycle,select:SelectValue,prefix:string){
-  const vertices=safeArray<Vertex>(evaluate(node.nodes,context,cycle));
-  const edges=safeArray<Edge>(evaluate(node.edges,context,cycle));
+  const vertices=safeArray<Vertex>(evaluate(node.nodes,context,cycle),cycle);
+  const edges=safeArray<Edge>(evaluate(node.edges,context,cycle),cycle);
   if(vertices.length>500||edges.length>1000)throw Error('図の項目数が上限を超えました。');
   const ids=new Set<string>();for(const v of vertices){if(ids.has(v.id))throw Error('図の項目が重複しています。');ids.add(v.id)}
   const valid=edges.filter(e=>ids.has(e.from)&&ids.has(e.to));

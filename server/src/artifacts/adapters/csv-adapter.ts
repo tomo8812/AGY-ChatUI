@@ -599,28 +599,51 @@ export class CsvAdapter implements FormatAdapter {
     const rows = parseCsvRows(buffer.toString('utf8'), delimiter);
     const rowCount = rows.length;
     const colCount = rows.reduce((m, r) => Math.max(m, r.length), 0);
+    const headerHash = sha256Text(JSON.stringify(rows[0] ?? []));
 
-    if (selector.expectedRowCount !== undefined && Number(selector.expectedRowCount) !== rowCount) {
+    if (selector.kind !== 'csv_range' && selector.kind !== 'csv_row_col') {
+      return { status: 'needs_review', reason: 'unsupported_selector_kind' };
+    }
+
+    const expectedRowCount = Number(selector.expectedRowCount);
+    const expectedColCount = Number(selector.expectedColCount);
+    if (!Number.isInteger(expectedRowCount) || expectedRowCount < 0) {
+      return { status: 'needs_review', reason: 'missing_expected_row_count' };
+    }
+    if (!Number.isInteger(expectedColCount) || expectedColCount < 0) {
+      return { status: 'needs_review', reason: 'missing_expected_col_count' };
+    }
+    if (expectedRowCount !== rowCount) {
       return { status: 'needs_review', reason: 'row_count_changed' };
     }
-    if (selector.expectedColCount !== undefined && Number(selector.expectedColCount) !== colCount) {
+    if (expectedColCount !== colCount) {
       return { status: 'needs_review', reason: 'col_count_changed' };
-    }
-    if (selector.expectedHeaderHash && sha256Text(JSON.stringify(rows[0] ?? [])) !== String(selector.expectedHeaderHash)) {
-      return { status: 'needs_review', reason: 'header_changed' };
     }
 
     if (selector.kind === 'csv_range') {
-      const sr = Number(selector.startRow ?? 0);
-      const er = Number(selector.endRow ?? sr);
-      const sc = Number(selector.startCol ?? 0);
-      const ec = Number(selector.endCol ?? sc);
-      if (er >= rowCount || ec >= colCount || sr < 0 || sc < 0) {
+      if (typeof selector.expectedHeaderHash !== 'string' || !selector.expectedHeaderHash) {
+        return { status: 'needs_review', reason: 'missing_expected_header_hash' };
+      }
+      if (headerHash !== selector.expectedHeaderHash) {
+        return { status: 'needs_review', reason: 'header_changed' };
+      }
+      if (typeof selector.expectedRangeValuesHash !== 'string' || !selector.expectedRangeValuesHash) {
+        return { status: 'needs_review', reason: 'missing_expected_range_values_hash' };
+      }
+
+      const sr = Number(selector.startRow);
+      const er = Number(selector.endRow);
+      const sc = Number(selector.startCol);
+      const ec = Number(selector.endCol);
+      if (
+        !Number.isInteger(sr) || !Number.isInteger(er) || !Number.isInteger(sc) || !Number.isInteger(ec) ||
+        sr < 0 || sc < 0 || er < sr || ec < sc || er >= rowCount || ec >= colCount
+      ) {
         return { status: 'stale', reason: 'range_out_of_bounds' };
       }
       const slice = rows.slice(sr, er + 1).map((r) => r.slice(sc, ec + 1));
       const valHash = sha256Text(JSON.stringify(slice));
-      if (selector.expectedRangeValuesHash && valHash !== String(selector.expectedRangeValuesHash)) {
+      if (valHash !== selector.expectedRangeValuesHash) {
         return { status: 'needs_review', reason: 'range_values_changed' };
       }
       return {
@@ -630,25 +653,34 @@ export class CsvAdapter implements FormatAdapter {
       };
     }
 
-    if (selector.kind === 'csv_row_col') {
-      const axis = String(selector.axis ?? 'row');
-      const start = Number(selector.start ?? 0);
-      const end = Number(selector.end ?? start);
-      const slice =
-        axis === 'col'
-          ? rows.map((r) => r.slice(start, end + 1))
-          : rows.slice(start, end + 1);
-      const valHash = sha256Text(JSON.stringify(slice));
-      if (selector.expectedRangeValuesHash && valHash !== String(selector.expectedRangeValuesHash)) {
-        return { status: 'needs_review', reason: 'row_col_values_changed' };
-      }
-      return {
-        status: 'resolved',
-        resolvedSnippet: serializeCsvRows(slice, delimiter),
-        resolvedRange: { axis, start, end },
-      };
+    // csv_row_col
+    if (selector.expectedHeaderHash !== undefined && headerHash !== String(selector.expectedHeaderHash)) {
+      return { status: 'needs_review', reason: 'header_changed' };
     }
-
-    return { status: 'needs_review', reason: 'unsupported_selector_kind' };
+    if (typeof selector.expectedRangeValuesHash !== 'string' || !selector.expectedRangeValuesHash) {
+      return { status: 'needs_review', reason: 'missing_expected_range_values_hash' };
+    }
+    const axis = String(selector.axis ?? 'row');
+    const start = Number(selector.start);
+    const end = Number(selector.end);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start) {
+      return { status: 'stale', reason: 'range_out_of_bounds' };
+    }
+    if ((axis === 'col' && end >= colCount) || (axis !== 'col' && end >= rowCount)) {
+      return { status: 'stale', reason: 'range_out_of_bounds' };
+    }
+    const slice =
+      axis === 'col'
+        ? rows.map((r) => r.slice(start, end + 1))
+        : rows.slice(start, end + 1);
+    const valHash = sha256Text(JSON.stringify(slice));
+    if (valHash !== selector.expectedRangeValuesHash) {
+      return { status: 'needs_review', reason: 'row_col_values_changed' };
+    }
+    return {
+      status: 'resolved',
+      resolvedSnippet: serializeCsvRows(slice, delimiter),
+      resolvedRange: { axis, start, end },
+    };
   }
 }

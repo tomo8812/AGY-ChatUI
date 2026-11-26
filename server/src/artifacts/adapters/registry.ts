@@ -23,7 +23,15 @@ import { HtmlAdapter } from './html-adapter.js';
 import { MarkdownAdapter } from './markdown-adapter.js';
 import { MermaidAdapter } from './mermaid-adapter.js';
 import { SvgAdapter } from './svg-adapter.js';
-import { readDocxParagraphTarget, readPptxSlideTargets, readPptxTargets } from './ooxml-target.js';
+import {
+  readDocxAllParagraphTargets,
+  readDocxParagraphTarget,
+  readPptxSlideTargets,
+  readPptxTargets,
+  readXlsxRangeTarget,
+  readXlsxWorkbookTargets,
+} from './ooxml-target.js';
+import { computePdfRegionDigest, inspectPdfDocument, readPdfPageTarget } from './pdf-target.js';
 
 const CHART_EDITS = ['chart.create', 'chart.update_title_and_legend', 'chart.update_series_data', 'chart.update_series_style', 'chart.add_or_remove_series'];
 
@@ -235,12 +243,33 @@ class DocumentFormatAdapter implements FormatAdapter {
   }
 
   readRange(buffer: Buffer, range: Record<string, unknown>, _meta: AdapterFileMeta): Record<string, unknown> {
-    if (this.format === 'pptx' && range.targetMetadata === 'true' && typeof range.part === 'string') {
+    const isTargetMeta = range.targetMetadata === true || range.targetMetadata === 'true';
+    if (this.format === 'pptx' && isTargetMeta && typeof range.part === 'string') {
       return readPptxSlideTargets(buffer, range.part);
     }
     if (this.format === 'docx' && range.targetBlockIndex !== undefined) {
       const index = Number(range.targetBlockIndex);
       return { target: Number.isSafeInteger(index) && index >= 0 ? readDocxParagraphTarget(buffer, index) : null };
+    }
+    if (this.format === 'xlsx' && isTargetMeta && typeof range.rangeA1 === 'string') {
+      const sheetSel = String(range.sheetId ?? range.sheetName ?? range.sheetPart ?? '');
+      const target = readXlsxRangeTarget(buffer, sheetSel, range.rangeA1);
+      return { target };
+    }
+    if (this.format === 'pdf' && isTargetMeta && range.pageIndex !== undefined) {
+      const pageIndex = Number(range.pageIndex);
+      let rectPt: [number, number, number, number] | undefined;
+      if (range.rectPt !== undefined) {
+        const parsed = typeof range.rectPt === 'string' ? JSON.parse(range.rectPt) : range.rectPt;
+        if (Array.isArray(parsed) && parsed.length === 4 && parsed.every((n) => typeof n === 'number' && Number.isFinite(n))) {
+          rectPt = [parsed[0], parsed[1], parsed[2], parsed[3]];
+        }
+      } else if (range.xPt !== undefined && range.yPt !== undefined) {
+        const x = Number(range.xPt), y = Number(range.yPt);
+        if (Number.isFinite(x) && Number.isFinite(y)) rectPt = [x, y, 0, 0];
+      }
+      const target = Number.isInteger(pageIndex) && pageIndex >= 0 ? readPdfPageTarget(buffer, pageIndex, rectPt) : null;
+      return { target };
     }
     throw unsupportedOperationError(
       'read_range',
@@ -299,52 +328,145 @@ class DocumentFormatAdapter implements FormatAdapter {
     }
 
     if (this.format === 'pdf') {
-      // A PDF.js page selection is bound to the exact immutable document.
-      // Any byte change requires review; never treat a whole-file hash as a page hash.
-      if (selector.kind === 'pdf_page' && typeof selector.expectedArtifactSha256 === 'string') {
-        const pageIndex = Number(selector.pageIndex);
-        const pageCount = Number(selector.expectedPageCount);
-        if (!Number.isInteger(pageIndex) || !Number.isInteger(pageCount) || pageIndex < 0 || pageIndex >= pageCount) {
-          return { status: 'stale', reason: 'invalid_page_selection' };
-        }
-        return selector.expectedArtifactSha256 === currentSha
-          ? { status: 'resolved', resolvedCoords: { pageIndex } }
-          : { status: 'needs_review', reason: 'pdf_document_changed' };
-      }
-      if (['pdf_pin','pdf_region'].includes(selector.kind) && typeof selector.expectedArtifactSha256 === 'string') {
-        const pageIndex = Number(selector.pageIndex), pageCount = Number(selector.expectedPageCount);
-        const coords = selector.kind === 'pdf_pin' ? [selector.xPt, selector.yPt] : selector.rectPt;
-        const hex = (value: unknown) => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
-        if (!Number.isInteger(pageIndex) || !Number.isInteger(pageCount) || pageIndex < 0 || pageIndex >= pageCount ||
-          !hex(selector.expectedPageContentHash) || !hex(selector.expectedRegionDigest) ||
-          !Array.isArray(coords) || coords.length !== (selector.kind === 'pdf_pin' ? 2 : 4) ||
-          !coords.every(value => typeof value === 'number' && Number.isFinite(value) && value >= 0)) {
-          return { status: 'stale', reason: 'invalid_page_selection' };
-        }
-        const rectangle = selector.kind === 'pdf_pin' ? [...coords, 0, 0] : coords;
-        if (selector.kind === 'pdf_region' && (rectangle[2] <= 0 || rectangle[3] <= 0) ||
-          sha256Buffer(Buffer.from(JSON.stringify([selector.expectedPageContentHash, rectangle]))) !== selector.expectedRegionDigest) {
-          return { status: 'needs_review', reason: 'pdf_region_digest_changed' };
-        }
-        return selector.expectedArtifactSha256 === currentSha
-          ? { status: 'resolved', resolvedCoords: { pageIndex, selector } }
-          : { status: 'needs_review', reason: 'pdf_page_content_changed' };
-      }
-      const expectedPageContentHash = selector.expectedPageContentHash ? String(selector.expectedPageContentHash) : null;
-      const currentPageHash = currentSha;
-      if (!expectedPageContentHash || expectedPageContentHash !== currentPageHash) {
+      const hex64 = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+      const doc = inspectPdfDocument(buffer);
+      if (!doc) {
         return { status: 'needs_review', reason: 'pdf_page_content_changed' };
       }
-      return { status: 'resolved', resolvedCoords: { pageIndex: selector.pageIndex } };
+
+      const pageIndex = Number(selector.pageIndex);
+      const expectedPageCount = Number(selector.expectedPageCount);
+      if (!Number.isInteger(pageIndex) || pageIndex < 0 || !Number.isInteger(expectedPageCount) || expectedPageCount <= 0) {
+        return { status: 'stale', reason: 'invalid_page_selection' };
+      }
+      if (expectedPageCount !== doc.pageCount) {
+        return { status: 'needs_review', reason: 'pdf_page_count_changed' };
+      }
+      if (pageIndex >= doc.pageCount) {
+        return { status: 'stale', reason: 'invalid_page_selection' };
+      }
+      const page = doc.pages[pageIndex];
+      if (!hex64(selector.expectedPageContentHash) || selector.expectedPageContentHash !== page.pageContentHash) {
+        return { status: 'needs_review', reason: 'pdf_page_content_changed' };
+      }
+
+      if (selector.kind === 'pdf_page') {
+        return {
+          status: 'resolved',
+          resolvedCoords: { pageIndex, widthPt: page.widthPt, heightPt: page.heightPt, rotate: page.rotate },
+          resolvedSnippet: page.text,
+        };
+      }
+
+      if (selector.kind === 'pdf_pin' || selector.kind === 'pdf_region') {
+        const coords = selector.kind === 'pdf_pin' ? [selector.xPt, selector.yPt] : selector.rectPt;
+        if (
+          !hex64(selector.expectedRegionDigest) ||
+          !Array.isArray(coords) ||
+          coords.length !== (selector.kind === 'pdf_pin' ? 2 : 4) ||
+          !coords.every((value) => typeof value === 'number' && Number.isFinite(value) && value >= 0)
+        ) {
+          return { status: 'stale', reason: 'invalid_page_selection' };
+        }
+        const rectangle: [number, number, number, number] =
+          selector.kind === 'pdf_pin'
+            ? [coords[0], coords[1], 0, 0]
+            : [coords[0], coords[1], coords[2], coords[3]];
+        if (selector.kind === 'pdf_region' && (rectangle[2] <= 0 || rectangle[3] <= 0)) {
+          return { status: 'stale', reason: 'invalid_page_selection' };
+        }
+        if (
+          rectangle[0] > page.widthPt + 2 ||
+          rectangle[1] > page.heightPt + 2 ||
+          rectangle[0] + rectangle[2] > page.widthPt + 4 ||
+          rectangle[1] + rectangle[3] > page.heightPt + 4
+        ) {
+          return { status: 'needs_review', reason: 'pdf_region_out_of_bounds' };
+        }
+        const actualDigest = computePdfRegionDigest(page, rectangle);
+        if (actualDigest !== selector.expectedRegionDigest) {
+          return { status: 'needs_review', reason: 'pdf_region_digest_changed' };
+        }
+        return {
+          status: 'resolved',
+          resolvedCoords: { pageIndex, selector },
+          resolvedSnippet: page.text,
+        };
+      }
+
+      if (selector.kind === 'pdf_text_range') {
+        const start = Number(selector.textOffsetStart);
+        const end = Number(selector.textOffsetEnd);
+        if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end > page.text.length) {
+          return { status: 'needs_review', reason: 'pdf_text_range_changed' };
+        }
+        const slice = page.text.slice(start, end);
+        const snippetHash = sha256Buffer(Buffer.from(slice, 'utf8'));
+        if (!hex64(selector.expectedSnippetHash) || snippetHash !== selector.expectedSnippetHash) {
+          return { status: 'needs_review', reason: 'pdf_text_range_changed' };
+        }
+        return {
+          status: 'resolved',
+          resolvedCoords: { pageIndex, textOffsetStart: start, textOffsetEnd: end },
+          resolvedSnippet: slice,
+        };
+      }
+
+      if (selector.kind === 'pdf_annotation') {
+        const annotUid = typeof selector.annotUid === 'string' ? selector.annotUid : '';
+        const expectedAnnotFp = typeof selector.expectedAnnotFingerprint === 'string' ? selector.expectedAnnotFingerprint : '';
+        const found = page.annotations.find((a) => a.uid === annotUid);
+        if (!found) return { status: 'stale', reason: 'pdf_annotation_not_found' };
+        if (!expectedAnnotFp || found.fingerprint !== expectedAnnotFp) {
+          return { status: 'needs_review', reason: 'pdf_annotation_changed' };
+        }
+        return { status: 'resolved', resolvedCoords: { pageIndex, annotUid }, resolvedSnippet: found.contents };
+      }
+
+      return { status: 'needs_review', reason: 'unsupported_pdf_selector' };
     }
 
     if (this.format === 'xlsx') {
-      const expectedValuesHash = selector.expectedRangeValuesHash ? String(selector.expectedRangeValuesHash) : null;
-      const currentValuesHash = currentSha;
-      if (!expectedValuesHash || expectedValuesHash !== currentValuesHash) {
+      if (selector.kind !== 'xlsx_range') {
+        return { status: 'needs_review', reason: 'unsupported_xlsx_selector' };
+      }
+      const sheetId = typeof selector.sheetId === 'string' && selector.sheetId ? selector.sheetId : null;
+      const rangeA1 = typeof selector.rangeA1 === 'string' && selector.rangeA1 ? selector.rangeA1 : null;
+      const expectedStructHash =
+        typeof selector.expectedSheetStructHash === 'string' && selector.expectedSheetStructHash
+          ? selector.expectedSheetStructHash
+          : null;
+      const expectedValuesHash =
+        typeof selector.expectedRangeValuesHash === 'string' && selector.expectedRangeValuesHash
+          ? selector.expectedRangeValuesHash
+          : null;
+      if (!sheetId || !rangeA1 || !expectedStructHash || !expectedValuesHash) {
         return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
       }
-      return { status: 'resolved', resolvedRange: { sheetId: selector.sheetId, rangeA1: selector.rangeA1 } };
+      try {
+        const wb = readXlsxWorkbookTargets(buffer);
+        const sheetExists = wb.sheets.some((s) => s.id === sheetId || s.name === sheetId || s.part === sheetId);
+        if (!sheetExists) {
+          return { status: 'stale', reason: 'sheet_not_found' };
+        }
+        const target = readXlsxRangeTarget(buffer, sheetId, rangeA1);
+        if (!target) {
+          return { status: 'stale', reason: 'invalid_range' };
+        }
+        if (target.expectedSheetStructHash !== expectedStructHash) {
+          return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+        }
+        if (target.expectedRangeValuesHash !== expectedValuesHash) {
+          return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+        }
+        return {
+          status: 'resolved',
+          resolvedRange: { sheetId: target.sheetId, sheetName: target.sheetName, rangeA1: target.rangeA1 },
+          resolvedSnippet: target.snippet,
+        };
+      } catch {
+        return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+      }
     }
 
     if (this.format === 'pptx' && ['pptx_slide', 'pptx_element'].includes(selector.kind)) {
@@ -366,13 +488,91 @@ class DocumentFormatAdapter implements FormatAdapter {
       }
     }
 
-    if (this.format === 'docx' && selector.kind === 'docx_paragraph' && selector.expectedBlockHash !== currentSha) {
+    if (this.format === 'docx' && selector.kind === 'docx_paragraph') {
+      const expectedBlockHash =
+        typeof selector.expectedBlockHash === 'string' && selector.expectedBlockHash
+          ? selector.expectedBlockHash
+          : null;
+      const blockIndex = Number(selector.blockIndex);
+      if (!expectedBlockHash || !Number.isInteger(blockIndex) || blockIndex < 0) {
+        return { status: 'needs_review', reason: 'element_fingerprint_changed' };
+      }
       try {
-        const block = readDocxParagraphTarget(buffer, Number(selector.blockIndex));
-        if (!block) return { status: 'stale', reason: 'word_block_not_found' };
-        return block.fingerprint === selector.expectedBlockHash && (!selector.paraId || selector.paraId === block.paraId)
-          ? { status: 'resolved', resolvedRange: { selector } }
-          : { status: 'needs_review', reason: 'element_fingerprint_changed' };
+        const { paragraphs, byBlockIndex } = readDocxAllParagraphTargets(buffer);
+        const paraId = typeof selector.paraId === 'string' && selector.paraId ? selector.paraId : null;
+
+        if (paraId) {
+          const byId = paragraphs.filter((p) => p.paraId === paraId);
+          if (byId.length === 0) return { status: 'stale', reason: 'word_block_not_found' };
+          if (byId.length > 1) return { status: 'needs_review', reason: 'ambiguous_para_id' };
+          const match = byId[0];
+          if (match.fingerprint !== expectedBlockHash) {
+            return { status: 'needs_review', reason: 'element_fingerprint_changed' };
+          }
+          return {
+            status: 'resolved',
+            resolvedRange: { selector, resolvedBlockIndex: match.blockIndex },
+            resolvedSnippet: match.text,
+          };
+        }
+
+        // paraId is absent: require strict uniqueness & surrounding context verification
+        const matches = paragraphs.filter((p) => p.fingerprint === expectedBlockHash);
+        const atIndex = byBlockIndex.get(blockIndex);
+        if (matches.length === 0) {
+          return atIndex
+            ? { status: 'needs_review', reason: 'element_fingerprint_changed' }
+            : { status: 'stale', reason: 'word_block_not_found' };
+        }
+
+        const hasBefore = typeof selector.contextBeforeHash === 'string' && selector.contextBeforeHash.length > 0;
+        const hasAfter = typeof selector.contextAfterHash === 'string' && selector.contextAfterHash.length > 0;
+        const hadDuplicates = Number(selector.duplicateCount ?? 0) > 1;
+        const hasOccurrence = Number.isInteger(Number(selector.occurrenceIndex)) && selector.occurrenceIndex !== undefined;
+
+        if (atIndex && atIndex.fingerprint === expectedBlockHash) {
+          const beforeOk = hasBefore && atIndex.contextBeforeHash === selector.contextBeforeHash;
+          const afterOk = hasAfter && atIndex.contextAfterHash === selector.contextAfterHash;
+
+          if (matches.length > 1 || hadDuplicates) {
+            if (!hasBefore || !hasAfter || !beforeOk || !afterOk) {
+              return { status: 'needs_review', reason: 'ambiguous_duplicate_paragraph' };
+            }
+            if (hasOccurrence && atIndex.occurrenceIndex !== Number(selector.occurrenceIndex)) {
+              return { status: 'needs_review', reason: 'ambiguous_duplicate_paragraph' };
+            }
+            const identicalContextCount = matches.filter(
+              (p) => p.contextBeforeHash === selector.contextBeforeHash && p.contextAfterHash === selector.contextAfterHash,
+            ).length;
+            if (identicalContextCount > 1 && !hasOccurrence) {
+              return { status: 'needs_review', reason: 'ambiguous_duplicate_paragraph' };
+            }
+          } else if (hasBefore && hasAfter && !beforeOk && !afterOk) {
+            return { status: 'needs_review', reason: 'paragraph_context_changed' };
+          }
+
+          return {
+            status: 'resolved',
+            resolvedRange: { selector, resolvedBlockIndex: atIndex.blockIndex },
+            resolvedSnippet: atIndex.text,
+          };
+        }
+
+        // Paragraph is no longer at blockIndex (shifted or deleted/replaced)
+        if (!hasBefore || !hasAfter) {
+          return { status: 'needs_review', reason: 'paragraph_position_shifted' };
+        }
+        const contextMatches = matches.filter(
+          (p) => p.contextBeforeHash === selector.contextBeforeHash && p.contextAfterHash === selector.contextAfterHash,
+        );
+        if (contextMatches.length === 1 && matches.length === 1 && !hadDuplicates) {
+          return {
+            status: 'resolved',
+            resolvedRange: { selector, resolvedBlockIndex: contextMatches[0].blockIndex },
+            resolvedSnippet: contextMatches[0].text,
+          };
+        }
+        return { status: 'needs_review', reason: 'ambiguous_duplicate_paragraph' };
       } catch {
         return { status: 'needs_review', reason: 'target_structure_unavailable' };
       }

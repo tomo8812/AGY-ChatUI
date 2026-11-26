@@ -1,13 +1,24 @@
 import React,{useRef,useState} from 'react';
 import { PdfCanvasViewer,type PdfLocation } from '../../shared-ui/document/PdfCanvasCore';
 import { buildArtifactContentUrl,artifactVersionKey } from '../../../utils/viewerCache';
+import { sha256Hex } from '../../../utils/sha256';
 import { workspaceApi,type WorkspaceTarget } from '../../../api/workspace';
 import { assertRevision } from '../useRevisionResource';
 import type { WorkspaceModuleProps } from '../types';
 
-async function digest(value:string) {
-  const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value));
-  return Array.from(new Uint8Array(bytes),n=>n.toString(16).padStart(2,'0')).join('');
+function round2(value:number){return Math.round(value*100)/100}
+
+interface PdfTargetMetaResponse{
+  target:{
+    pageIndex:number;
+    pageCount:number;
+    widthPt:number;
+    heightPt:number;
+    rotate:number;
+    pageContentHash:string;
+    text:string;
+    regionDigest?:string;
+  }|null;
 }
 
 export function PdfModule({artifact,mode,capabilities,onTarget}:WorkspaceModuleProps){
@@ -16,33 +27,51 @@ export function PdfModule({artifact,mode,capabilities,onTarget}:WorkspaceModuleP
   const latest=useRef({key:artifactVersionKey(artifact),mode});
   latest.current={key:artifactVersionKey(artifact),mode};
   const generation=useRef(0);
-  const workerReady=capabilities?.operations.some(op=>op.operation==='read_range'&&op.availability==='supported');
+  const workerReady=capabilities?.operations.some(op=>op.operation==='render_png'&&op.availability==='supported');
   async function capture(pageIndex:number,pageCount:number,selectedText?:string,readPage?:()=>Promise<string>,location?:PdfLocation){
     if(artifact.revision===undefined)return;
     const identity=latest.current.key,ticket=++generation.current;
     setError('');
     try {
-      let pageHash:string|undefined,snippet=selectedText;
-      if(workerReady){
-        const page=await workspaceApi.range<{pageContentHash:string;text:string}>(artifact.id,{pageIndex});
-        assertRevision(artifact,page);pageHash=page.pageContentHash;snippet??=page.text;
+      const pin=Boolean(location&&location.width===0&&location.height===0);
+      const rectPt=location
+        ?[round2(location.x*location.pageWidth),round2(location.y*location.pageHeight),
+          round2(location.width*location.pageWidth),round2(location.height*location.pageHeight)]
+        :undefined;
+      let pageHash:string|undefined,regionDigest:string|undefined,resolvedPageCount=pageCount,snippet=selectedText;
+      let meta:Awaited<ReturnType<typeof workspaceApi.range<PdfTargetMetaResponse>>>|null=null;
+      try {
+        meta=await workspaceApi.range<PdfTargetMetaResponse>(artifact.id,{
+          targetMetadata:'true',
+          pageIndex,
+          ...(rectPt?{rectPt:JSON.stringify(rectPt)}:{}),
+        });
+      }catch{/* Fall back to client-side HTTP-safe hashing if metadata endpoint is unavailable in mock harness. */}
+      if(meta?.target){
+        assertRevision(artifact,meta);
+        pageHash=meta.target.pageContentHash;
+        regionDigest=meta.target.regionDigest;
+        resolvedPageCount=meta.target.pageCount;
+        snippet??=meta.target.text;
       }
       if(!pageHash&&readPage)pageHash=await readPage();
       if(!pageHash)throw Error('ページの内容を識別できません。');
-      const selector:WorkspaceTarget['selector']={kind:'pdf_page',pageIndex,expectedPageCount:pageCount,
-        expectedPageContentHash:pageHash,expectedArtifactSha256:artifact.sha256};
+      const selector:WorkspaceTarget['selector']={
+        kind:'pdf_page',
+        pageIndex,
+        expectedPageCount:resolvedPageCount,
+        expectedPageContentHash:pageHash,
+      };
       let contentCoords:Record<string,unknown>|undefined;
       let regionImagePngBase64:string|undefined;
-      if(location){
-        const {x,y,width,height,pageWidth,pageHeight}=location;
-        const pin=width===0&&height===0;
-        const rectPt=[x*pageWidth,y*pageHeight,width*pageWidth,height*pageHeight];
+      if(location&&rectPt){
         selector.kind=pin?'pdf_pin':'pdf_region';
         contentCoords={pageIndex,unit:'pt',...(pin?{xPt:rectPt[0],yPt:rectPt[1]}:{rectPt})};
-        Object.assign(selector,contentCoords,{expectedRegionDigest:await digest(JSON.stringify([pageHash,rectPt]))});
+        const digest=regionDigest??sha256Hex(JSON.stringify([pageHash,rectPt]));
+        Object.assign(selector,contentCoords,{expectedRegionDigest:digest});
         if(workerReady&&!pin){
           try{
-            regionImagePngBase64=await workspaceApi.renderRegion(artifact,pageIndex,{x,y,width,height},'norm');
+            regionImagePngBase64=await workspaceApi.renderRegion(artifact,pageIndex,{x:location.x,y:location.y,width:location.width,height:location.height},'norm');
           }catch{/* A pinned document and its coordinates remain sufficient to create a request. */}
         }
       }

@@ -24,6 +24,9 @@ export default defineConfig({
         ...devices['Desktop Chrome'],
         browserName: 'chromium',
         viewport: { width: 1280, height: 720 },
+        ...(process.env.PLAYWRIGHT_EXECUTABLE_PATH
+          ? { launchOptions: { executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH } }
+          : {}),
       },
     },
     {

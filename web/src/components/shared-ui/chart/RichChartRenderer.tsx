@@ -36,14 +36,14 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
   node: RichChartNode; context: RichEvalContext; cycle: RenderCycle; select: SelectValue; clipId: string;
 }) {
   const val = <T,>(v: T | { expr: string } | undefined) => evaluate<T>(v, context, cycle);
-  const categories = safeArray<string | number>(val(node.categories));
+  const categories = safeArray<string | number>(val(node.categories), cycle);
   const series: Series[] = node.series.map((s, index) => ({
     key: s.key, label: text(val(s.label), s.key), color: color(s.colorToken, index),
     type: node.chartType === 'combo' ? s.type ?? 'line' :
       node.chartType === 'scatter' ? 'scatter' : node.chartType.includes('area') ? 'area' :
       node.chartType.includes('bar') ? 'bar' : 'line',
     right: s.yAxisId === 'right', unit: s.unit, sourceId: s.sourceId, asOf: text(val(s.asOf)),
-    points: safeArray<number | null | RichChartDatum>(val(s.data)).map((p, i) => {
+    points: safeArray<number | null | RichChartDatum>(val(s.data), cycle).map((p, i) => {
       const d = p && typeof p === 'object' ? p : { y: p };
       return { ...d, x: 'x' in d && (typeof d.x === 'number' || typeof d.x === 'string') ? d.x : categories[i] ?? i + 1,
         y: finite(d.y) ? d.y : null };

@@ -4,18 +4,31 @@ import type { ArtifactRecord } from '../../types';
 import { buildArtifactContentUrl } from '../../utils/viewerCache';
 import { MarkdownContent, MermaidBlock, CodeBlock } from '../MarkdownContent';
 import { CheckIcon, CopyIcon, DownloadIcon, ExternalLinkIcon, FileIcon, SearchIcon, SettingsIcon, PlusIcon, CloseIcon, FolderIcon, GaugeIcon, ShieldIcon } from '../Icons';
-import { createRichEvalBudget, isValidHttpUrl, validateRichMarkdownContent, parseRichExpr, type ExprAst, type RichEvalContext } from './RichExprEvaluator';
+import { isValidHttpUrl, validateRichMarkdownContent, parseRichExpr, type ExprAst, type RichEvalContext } from './RichExprEvaluator';
 import { RichStateStore, type RichStateSnapshot } from './RichStateStore';
 import { runExplicitRichActions, type RichActionHost } from './RichActionRunner';
-import { addNode, color, evaluate, expression, num, repeatContexts, safeArray, text, type RenderCycle, type SelectValue } from './runtime';
+import { BlockRenderAccounting, addNode, color, evaluate, expression, num, repeatContexts, safeArray, text, type RenderCycle, type SelectValue } from './runtime';
 import './rich-ui.css';
 
-const RichChart=lazy(()=>import('./chart/RichChartRenderer').then(({renderRichChart})=>({default:renderRichChart})));
+const RichChart=lazy(()=>import('./chart/RichChartRenderer').then(({renderRichChart})=>({
+  default:(props:Parameters<typeof renderRichChart>[0]&{accounting:BlockRenderAccounting;scopePath:string})=>{
+    const cycle=props.accounting.beginScope(props.scopePath);
+    return renderRichChart({...props,cycle});
+  },
+})));
 const SvgScene=lazy(()=>import('./diagram/SvgSceneRenderer').then(({renderSvgScene})=>({
-  default: (props:{args:Parameters<typeof renderSvgScene>})=>renderSvgScene(...props.args),
+  default:(props:{args:Parameters<typeof renderSvgScene>;accounting:BlockRenderAccounting;scopePath:string})=>{
+    const cycle=props.accounting.beginScope(props.scopePath);
+    const [node,c,_unusedCycle,prefix,dispatch]=props.args;
+    return renderSvgScene(node,c,cycle,prefix,dispatch);
+  },
 })));
 const NodeEdgeDiagram=lazy(()=>import('./diagram/NodeEdgeDiagram').then(({renderNodeEdgeDiagram})=>({
-  default: (props:{args:Parameters<typeof renderNodeEdgeDiagram>})=>renderNodeEdgeDiagram(...props.args),
+  default:(props:{args:Parameters<typeof renderNodeEdgeDiagram>;accounting:BlockRenderAccounting;scopePath:string})=>{
+    const cycle=props.accounting.beginScope(props.scopePath);
+    const [node,c,_unusedCycle,select,prefix]=props.args;
+    return renderNodeEdgeDiagram(node,c,cycle,select,prefix);
+  },
 })));
 const RichDataTable=lazy(()=>import('./display/RichDataTable').then(m=>({default:m.RichDataTable})));
 
@@ -78,6 +91,7 @@ type LocalContext=Pick<RichEvalContext,'item'|'index'|'aliases'>;
 const emptyLocal:LocalContext={};
 type NodeEnvironment={
   store:RichStateStore;doc:RichDocumentV1;authorized:Map<string,ArtifactRecord>;prefix:string;host:RichActionHost;
+  accounting:BlockRenderAccounting;
   fail:()=>void;dispatch:(a:RichStateAction[],c:RichEvalContext)=>void;select:SelectValue;
   explicit:(a:readonly RichAction[],c:RichEvalContext)=>void;
 };
@@ -141,10 +155,13 @@ function useProjection(store:RichStateStore,keys:readonly string[]){
   },[store,keys]);
   return useSyncExternalStore(selector.subscribe,selector.get,selector.get);
 }
-function RichTitle({value,store}:{value:RichDocumentV1['title'];store:RichStateStore}){
+function RichTitle({value,store,accounting}:{value:RichDocumentV1['title'];store:RichStateStore;accounting:BlockRenderAccounting}){
   const keys=useMemo(()=>{const set=new Set<string>();if(value&&typeof value==='object'&&'expr' in value)expressionKeys(String(value.expr),set);return [...set]},[value]);
-  useProjection(store,keys);
-  return value?<div className="rich-document-title">{text(evaluate(value,store.context(),{budget:createRichEvalBudget(),nodes:0,svgElements:0}))}</div>:null;
+  const snap=useProjection(store,keys);
+  useEffect(()=>()=>accounting.removeScope('title'),[accounting]);
+  accounting.setBaseSteps(snap.stats.computedStepsUsed);
+  const cycle=accounting.beginScope('title');
+  return value?<div className="rich-document-title">{text(evaluate(value,store.context(),cycle))}</div>:null;
 }
 function RichRendererInner({document:doc,userId,chatId,artifacts=noArtifacts,actions=noActions}:RichRendererProps){
   const theme=useTheme();
@@ -153,6 +170,7 @@ function RichRendererInner({document:doc,userId,chatId,artifacts=noArtifacts,act
   const authKey=useMemo(()=>JSON.stringify([...authorized.keys()].sort()),[authorized]);
   const docKey=useMemo(()=>JSON.stringify(doc),[doc]);
   const store=useMemo(()=>new RichStateStore(JSON.parse(docKey) as RichDocumentV1,JSON.parse(authKey) as string[],theme),[docKey,authKey,userId,chatId]);
+  const accounting=useMemo(()=>new BlockRenderAccounting(),[store]);
   const [error,setError]=useState<string|null>(null);
   const activeAction=useRef<AbortController|null>(null);
   const latestAuthorization=useRef(authorized);latestAuthorization.current=authorized;
@@ -169,12 +187,12 @@ function RichRendererInner({document:doc,userId,chatId,artifacts=noArtifacts,act
     const controller=new AbortController();activeAction.current=controller;setError(null);
     void runExplicitRichActions(a,store,c,host,controller.signal).catch(()=>{if(!controller.signal.aborted)fail()}).finally(()=>{if(activeAction.current===controller)activeAction.current=null});
   };
-  return {store,doc,authorized,prefix,host,fail,dispatch,select,explicit};
-  },[store,doc,authorized,prefix,actions]);
-  return <section className="rich-document"><RichTitle value={doc.title} store={store}/>{error&&<div className="error-box" role="alert">{error}<button className="btn btn-ghost btn-xs" type="button" onClick={()=>setError(null)}>閉じる</button></div>}<RichNodeView node={doc.root} local={emptyLocal} path="root" environment={environment}/></section>;
+  return {store,doc,authorized,prefix,host,accounting,fail,dispatch,select,explicit};
+  },[store,doc,authorized,prefix,actions,accounting]);
+  return <section className="rich-document"><RichTitle value={doc.title} store={store} accounting={accounting}/>{error&&<div className="error-box" role="alert">{error}<button className="btn btn-ghost btn-xs" type="button" onClick={()=>setError(null)}>閉じる</button></div>}<RichNodeView node={doc.root} local={emptyLocal} path="root" environment={environment}/></section>;
 }
 const RichNodeView=React.memo(function RichNodePaint({node,local,path,environment,repeat=true}:{node:RichNode;local:LocalContext;path:string;environment:NodeEnvironment;repeat?:boolean}){
-  const {store,doc,authorized,prefix,host,fail,dispatch,select,explicit}=environment;
+  const {store,doc,authorized,prefix,host,accounting,fail,dispatch,select,explicit}=environment;
   const keys=useMemo(()=>richNodeProjection(node,repeat),[node,repeat]);
   const heavy=['chart','svg_scene','node_edge_diagram','mermaid'].includes(node.type)&&!node.visibleWhen&&!(repeat&&node.repeat);
   const paintRef=useRef<HTMLDivElement>(null);
@@ -185,19 +203,28 @@ const RichNodeView=React.memo(function RichNodePaint({node,local,path,environmen
     const observer=new IntersectionObserver(([entry])=>setVisible(entry.isIntersecting||element.contains(document.activeElement)),{rootMargin:'200px'});
     observer.observe(element);return()=>observer.disconnect();
   },[heavy]);
+  useEffect(()=>()=>{accounting.removeScope(path);accounting.removeScope(path+':lazy');},[accounting,path]);
   const pausedKeys=useMemo<string[]>(()=>[],[]);
-  useProjection(store,heavy&&!visible?pausedKeys:keys);
-  // RichStateStore validates the entire expanded document atomically, including
-  // global limits, before publishing. Keep a bounded evaluator for each paint.
-  const cycle:RenderCycle={budget:createRichEvalBudget(),nodes:0,svgElements:0};
+  const snap=useProjection(store,heavy&&!visible?pausedKeys:keys);
+  // Enforce block-wide cumulative AST steps, expanded nodes, expanded SVG
+  // elements, and expanded data points across all mounted nodes, partial
+  // re-renders, dynamic repeat expansions, and lazy-loaded renderers.
+  accounting.setBaseSteps(snap.stats.computedStepsUsed);
+  const cycle:RenderCycle=accounting.beginScope(path);
   const c=store.context(local.item,local.index,local.aliases);
   const source=(id:string|undefined,asOf?:string,fetchedAt?:string)=>{
     const s=doc.sources?.find(x=>x.id===id);
     return [s?.name??id,asOf??s?.asOf,fetchedAt??s?.fetchedAt].filter(Boolean).join(' · ');
   };
     const renderNode=(child:RichNode,_context:RichEvalContext,childPath:string)=><RichNodeView node={child} local={local} path={childPath} environment={environment}/>;
-    if(repeat&&node.repeat)return <>{repeatContexts(node.repeat,c,cycle).map(r=><RichNodeView key={r.key} node={node} local={{item:r.context.item,index:r.context.index,aliases:r.context.aliases}} path={path+'-'+r.key} environment={environment} repeat={false}/>)}</>;
-    if(node.visibleWhen&&!expression(node.visibleWhen,c,cycle))return null;
+    if(repeat&&node.repeat){
+      const items=repeatContexts(node.repeat,c,cycle);
+      return <>{items.map(r=><RichNodeView key={r.key} node={node} local={{item:r.context.item,index:r.context.index,aliases:r.context.aliases}} path={path+'-'+r.key} environment={environment} repeat={false}/>)}</>;
+    }
+    if(node.visibleWhen&&!expression(node.visibleWhen,c,cycle)){
+      accounting.removeSubtree(path);
+      return null;
+    }
     addNode(cycle);
     const v=<T,>(x:T|{expr:string}|undefined)=>evaluate<T>(x,c,cycle);
     const label=(x:unknown)=>text(x);
@@ -234,23 +261,23 @@ const RichNodeView=React.memo(function RichNodePaint({node,local,path,environmen
       case 'stat':case 'kpi_card':{const value=v(node.value);body=<div className={'rich-kpi'+(node.type==='stat'?' plain':'')}><span className="muted-sm">{label(v(node.label))}</span><div className="rich-kpi-value">{value==null?node.missingLabel??'—':label(value)}{value!=null&&node.unit&&<small> {label(v(node.unit))}</small>}</div>{value==null&&node.missingReason&&<small>{label(v(node.missingReason))}</small>}{node.delta&&<span className={v(node.deltaTone)==='positive'?'rich-tone-success':v(node.deltaTone)==='negative'?'rich-tone-danger':''}>{label(v(node.delta))}</span>}<small className="rich-cell-meta">{source(node.sourceId,label(v(node.asOf))||undefined,label(v(node.fetchedAt))||undefined)}</small>{children(node.children)}</div>;break}
       case 'progress':{const max=Math.max(0.00001,num(v(node.max),100)),value=Math.min(max,Math.max(0,num(v(node.value),0)));body=<label className={'rich-progress'+toneClass(node.tone)}><span>{label(v(node.label))}{node.showPercent&&' '+Math.round(value/max*100)+'%'}</span><progress max={max} value={value}/></label>;break}
       case 'list':case 'checklist':case 'steps':case 'timeline':{
-        const items=safeArray<{id?:string;title:string;description?:string;meta?:string;checked?:boolean;status?:string;sourceId?:string;asOf?:string}>(v(node.items));
+        const items=safeArray<{id?:string;title:string;description?:string;meta?:string;checked?:boolean;status?:string;sourceId?:string;asOf?:string}>(v(node.items),cycle);
         const selected=node.bindKey&&Array.isArray(read(node.bindKey))?read(node.bindKey) as unknown[]:undefined;
         const Tag=node.type==='steps'?'ol':'ul';
         body=<Tag className={'rich-list rich-list-'+node.type}>{items.map((item,i)=>{const itemId=item.id??String(i);const checked=selected?selected.includes(itemId):Boolean(item.checked);return <li key={itemId}><div className="rich-list-row">{node.type==='checklist'&&(node.bindKey?<input type="checkbox" aria-label={item.title} checked={checked} onChange={e=>{const current=(selected??items.map((x,j)=>x.checked?x.id??String(j):null).filter(x=>x!==null));change(node.bindKey!,e.target.checked?[...current,itemId]:current.filter(x=>x!==itemId))}}/>:<span aria-hidden="true">{checked?'✓':'○'}</span>)}<div><strong>{item.title}</strong>{item.description&&<div>{item.description}</div>}<small className="rich-cell-meta">{[item.meta,item.status,source(item.sourceId,item.asOf)].filter(Boolean).join(' · ')}</small></div></div></li>})}{children(node.children)}</Tag>;break;
       }
-      case 'data_table':{const rows=safeArray<Record<string,RichPrimitive|RichCellObject>>(v(node.rows));body=<RichDataTable node={node} rows={rows} onSelect={node.selectedRowBind||node.onRowSelect?.length?(row,index)=>select(node.selectedRowBind,index,node.onRowSelect,{...c,item:row,index}):undefined}/>;break}
+      case 'data_table':{const rows=safeArray<Record<string,RichPrimitive|RichCellObject>>(v(node.rows),cycle,Math.max(1,node.columns?.length??1));body=<RichDataTable node={node} rows={rows} onSelect={node.selectedRowBind||node.onRowSelect?.length?(row,index)=>select(node.selectedRowBind,index,node.onRowSelect,{...c,item:row,index}):undefined}/>;break}
       case 'source_attribution':body=<SourceAttribution sources={(doc.sources??[]).filter(s=>!node.sourceIds||node.sourceIds.includes(s.id))}/>;break;
       case 'mermaid':body=<MermaidBlock code={label(v(node.code))} strictRich/>;break;
-      case 'svg_scene':body=<SvgScene args={[node,c,cycle,unique,dispatch]}/>;break;
-      case 'node_edge_diagram':body=<NodeEdgeDiagram args={[node,c,cycle,select,unique]}/>;break;
-      case 'chart':body=<RichChart node={node} context={c} cycle={cycle} select={select} clipId={unique+'-clip'}/>;break;
+      case 'svg_scene':body=<SvgScene args={[node,c,cycle,unique,dispatch]} accounting={accounting} scopePath={path+':lazy'}/>;break;
+      case 'node_edge_diagram':body=<NodeEdgeDiagram args={[node,c,cycle,select,unique]} accounting={accounting} scopePath={path+':lazy'}/>;break;
+      case 'chart':body=<RichChart node={node} context={c} cycle={cycle} select={select} clipId={unique+'-clip'} accounting={accounting} scopePath={path+':lazy'}/>;break;
       case 'button':body=<button type="button" className={'btn btn-'+(node.variant==='danger'?'danger-outline':node.variant??'secondary')} disabled={Boolean(node.disabledWhen&&expression(node.disabledWhen,c,cycle))} onClick={()=>explicit(node.onClick,c)}>{label(v(node.label))}</button>;break;
       case 'clickable':case 'selectable_card':{const selected=Boolean(node.selectedWhen&&expression(node.selectedWhen,c,cycle));body=<div className={'rich-selectable'+(selected?' selected':'')} role="button" tabIndex={0} aria-pressed={selected} onClick={e=>{if(!(e.target as HTMLElement).closest('button,input,select,textarea,a,[role=button]:not(.rich-selectable)'))dispatch(node.onClick,c)}} onKeyDown={e=>{if(e.target===e.currentTarget&&(e.key==='Enter'||e.key===' ')){e.preventDefault();dispatch(node.onClick,c)}}}>{children(node.children)}</div>;break}
       case 'text_input':case 'textarea':case 'date_input':{const val=label(read(node.bind));const common={value:val,onChange:(e:React.ChangeEvent<HTMLInputElement|HTMLTextAreaElement>)=>change(node.bind,e.target.value,node.onChange)};body=<label className="field">{label(v(node.label))}{node.type==='textarea'?<textarea rows={4} maxLength={node.maxLength??50000} placeholder={node.placeholder} {...common}/>:node.type==='date_input'?<input type="date" min={node.min} max={node.max} {...common}/>:<input type="text" maxLength={node.maxLength??50000} placeholder={node.placeholder} {...common}/>}</label>;break}
       case 'number_input':case 'slider':{const min=num(v(node.min),0),max=Math.max(min,num(v(node.max),100)),step=Math.max(0.000001,num(v(node.step),1));const value=num(read(node.bind),min);body=<label className="field"><span>{label(v(node.label))}{node.type==='slider'&&<output> {value}{node.unit??''}</output>}</span><input type={node.type==='slider'?'range':'number'} value={value} min={min} max={max} step={step} onChange={e=>{const value=e.target.valueAsNumber;if(Number.isFinite(value))change(node.bind,Math.min(max,Math.max(min,value)),node.onChange)}}/></label>;break}
       case 'checkbox':case 'toggle':body=<label className="rich-checkbox"><input type="checkbox" role={node.type==='toggle'?'switch':undefined} checked={Boolean(read(node.bind))} onChange={e=>change(node.bind,e.target.checked,node.onChange)}/>{label(v(node.label))}</label>;break;
-      case 'radio_group':case 'select':case 'segmented':{const options=safeArray<{value:string|number;label:string;disabled?:boolean}>(v(node.options));const index=options.findIndex(o=>Object.is(o.value,read(node.bind)));body=node.type==='select'?<label className="field">{label(v(node.label))}<select className="compact-select" value={String(index)} onChange={e=>{const o=options[Number(e.target.value)];if(o&&!o.disabled)change(node.bind,o.value,node.onChange)}}>{index<0&&<option value="-1" disabled>選択してください</option>}{options.map((o,i)=><option key={i} value={i} disabled={o.disabled}>{o.label}</option>)}</select></label>:<fieldset className={'rich-options '+node.type}><legend>{label(v(node.label))}</legend>{options.map((o,i)=><label key={i} className={index===i?'selected':''}><input name={unique} type="radio" checked={i===index} disabled={o.disabled} onChange={()=>change(node.bind,o.value,node.onChange)}/>{o.label}</label>)}</fieldset>;break}
+      case 'radio_group':case 'select':case 'segmented':{const options=safeArray<{value:string|number;label:string;disabled?:boolean}>(v(node.options),cycle);const index=options.findIndex(o=>Object.is(o.value,read(node.bind)));body=node.type==='select'?<label className="field">{label(v(node.label))}<select className="compact-select" value={String(index)} onChange={e=>{const o=options[Number(e.target.value)];if(o&&!o.disabled)change(node.bind,o.value,node.onChange)}}>{index<0&&<option value="-1" disabled>選択してください</option>}{options.map((o,i)=><option key={i} value={i} disabled={o.disabled}>{o.label}</option>)}</select></label>:<fieldset className={'rich-options '+node.type}><legend>{label(v(node.label))}</legend>{options.map((o,i)=><label key={i} className={index===i?'selected':''}><input name={unique} type="radio" checked={i===index} disabled={o.disabled} onChange={()=>change(node.bind,o.value,node.onChange)}/>{o.label}</label>)}</fieldset>;break}
       case 'tabs':body=<Tabs items={node.items.map((item,i)=>({id:item.id,label:label(v(item.label)),badge:label(v(item.badge)),content:children(item.content,'tab-'+i)}))} value={node.bind?label(read(node.bind)):undefined} onChange={node.bind?id=>change(node.bind!,id):undefined}/>;break;
       case 'collapsible':body=<Collapsible title={label(v(node.title))} open={node.bind?Boolean(read(node.bind)):undefined} defaultOpen={node.defaultOpen} onChange={node.bind?open=>change(node.bind!,open):undefined}>{children(node.children)}</Collapsible>;break;
       case 'popover':case 'tooltip':body=<details className="rich-collapsible"><summary>{renderNode(node.trigger,c,path+'-trigger')}</summary>{Array.isArray(node.content)?children(node.content):label(v(node.content))}</details>;break;
@@ -259,7 +286,7 @@ const RichNodeView=React.memo(function RichNodePaint({node,local,path,environmen
       case 'code_block':body=<CodeBlock code={label(v(node.code))} language={node.language??''}/>;break;
       case 'diff_block':body=<div className="rich-diff"><div><span className="muted-sm">変更前</span><CodeBlock code={label(v(node.oldText))} language={node.language??''}/></div><div><span className="muted-sm">変更後</span><CodeBlock code={label(v(node.newText))} language={node.language??''}/></div></div>;break;
       case 'math_block':{const tex=label(v(node.tex));body=<MarkdownContent strictRich content={node.displayMode===false?'$'+tex+'$':'$$\n'+tex+'\n$$'}/>;break}
-      case 'media_asset':{const alt=label(v(node.alt));let media:ReactNode;if(node.sourceKind==='inline_svg'&&node.svgScene)media=<SvgScene args={[node.svgScene,c,cycle,unique,dispatch]}/>;else{const artifact=authorized.get(label(v(node.artifactId)));if(!artifact)throw Error('ファイルを表示できません。');const src=buildArtifactContentUrl(artifact);media=artifact.previewKind==='image'||artifact.previewKind==='svg'?<img alt={alt} src={src} loading="lazy"/>:artifact.previewKind==='video'?<video controls playsInline preload="metadata" src={src} aria-label={alt}/>:artifact.previewKind==='audio'?<audio controls preload="metadata" src={src} aria-label={alt}/>:<button type="button" className="btn btn-secondary" disabled={!host.openArtifact} onClick={()=>{void Promise.resolve(host.openArtifact?.(artifact.id)).catch(fail)}}>{artifact.filename}</button>}body=<figure className="rich-media">{media}{node.caption&&<figcaption>{label(v(node.caption))}</figcaption>}</figure>;break}
+      case 'media_asset':{const alt=label(v(node.alt));let media:ReactNode;if(node.sourceKind==='inline_svg'&&node.svgScene)media=<SvgScene args={[node.svgScene,c,cycle,unique,dispatch]} accounting={accounting} scopePath={path+':lazy'}/>;else{const artifact=authorized.get(label(v(node.artifactId)));if(!artifact)throw Error('ファイルを表示できません。');const src=buildArtifactContentUrl(artifact);media=artifact.previewKind==='image'||artifact.previewKind==='svg'?<img alt={alt} src={src} loading="lazy"/>:artifact.previewKind==='video'?<video controls playsInline preload="metadata" src={src} aria-label={alt}/>:artifact.previewKind==='audio'?<audio controls preload="metadata" src={src} aria-label={alt}/>:<button type="button" className="btn btn-secondary" disabled={!host.openArtifact} onClick={()=>{void Promise.resolve(host.openArtifact?.(artifact.id)).catch(fail)}}>{artifact.filename}</button>}body=<figure className="rich-media">{media}{node.caption&&<figcaption>{label(v(node.caption))}</figcaption>}</figure>;break}
       default:body=<div className="error-box">この項目は表示できません。</div>;
     }
     return <div ref={heavy?paintRef:undefined} onFocusCapture={heavy?()=>setVisible(true):undefined} className={'rich-node'+(node.layout?.hideOn?' rich-hide-'+node.layout.hideOn:'')} style={styleLayout(node.layout)} data-rich-node-id={node.id} aria-label={node.ariaLabel?label(v(node.ariaLabel)):undefined}><Suspense fallback={<span className="muted-xs" role="status">読み込み中…</span>}>{body}</Suspense></div>;

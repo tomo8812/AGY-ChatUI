@@ -252,17 +252,39 @@ export function GridModule(props:WorkspaceModuleProps){
     const rangeLabel=selectedRange,identity=latest.current;
     let snippet:string|undefined;
     try{
-      let selector:Record<string,unknown>&{kind:string}={kind:'xlsx_range',sheetId:sheet.id,rangeA1:rangeLabel,expectedRangeValuesHash:artifact.sha256};
+      let selector:Record<string,unknown>&{kind:string};
       if(!xlsx){
-        const exact=await workspaceApi.range<{rows:string[][];valuesHash:string;truncated?:boolean}>(artifact.id,{startRow:row0,endRow:row1,startCol:col0,endCol:col1});
+        const exact=await workspaceApi.range<{rows:string[][];valuesHash:string;headerHash?:string;totalRows?:number;totalCols?:number;truncated?:boolean}>(artifact.id,{startRow:row0,endRow:row1,startCol:col0,endCol:col1,targetHashes:'true'});
         assertRevision(artifact,exact);
-        if(exact.truncated||exact.rows.length!==row1-row0+1||!exact.valuesHash)throw Error('選択対象を読み込めませんでした。');
-        selector={kind:'csv_range',startRow:row0,endRow:row1,startCol:col0,endCol:col1,expectedRangeValuesHash:exact.valuesHash};
+        if(exact.truncated||exact.rows.length!==row1-row0+1||!exact.valuesHash||!exact.headerHash||exact.totalRows===undefined||exact.totalCols===undefined){
+          throw Error('選択対象を読み込めませんでした。');
+        }
+        selector={
+          kind:'csv_range',
+          startRow:row0,
+          endRow:row1,
+          startCol:col0,
+          endCol:col1,
+          expectedRowCount:exact.totalRows,
+          expectedColCount:exact.totalCols,
+          expectedHeaderHash:exact.headerHash,
+          expectedRangeValuesHash:exact.valuesHash,
+        };
         snippet=exact.rows.map(row=>row.join('\t')).join('\n');
-      }else if(row0===row1&&col0===col1)snippet=original(row0,col0);
-      else if((row1-row0+1)*(col1-col0+1)<=1000){
-        const exact=await workspaceApi.range<{cells:Cell[]}>(artifact.id,{sheetId:sheet.id,rangeA1:rangeLabel});
-        assertRevision(artifact,exact);snippet=exact.cells.map(c=>c.address+' '+String(c.formula?'='+c.formula:c.value??'')).join('\n');
+      }else{
+        const meta=await workspaceApi.range<{target:{sheetId:string;sheetName:string;rangeA1:string;expectedSheetStructHash:string;expectedRangeValuesHash:string;snippet?:string}|null}>(artifact.id,{targetMetadata:'true',sheetId:sheet.id,rangeA1:rangeLabel});
+        assertRevision(artifact,meta);
+        if(!meta.target||!meta.target.expectedSheetStructHash||!meta.target.expectedRangeValuesHash){
+          throw Error('選択対象を読み込めませんでした。');
+        }
+        selector={
+          kind:'xlsx_range',
+          sheetId:meta.target.sheetId,
+          rangeA1:meta.target.rangeA1,
+          expectedSheetStructHash:meta.target.expectedSheetStructHash,
+          expectedRangeValuesHash:meta.target.expectedRangeValuesHash,
+        };
+        snippet=meta.target.snippet||(row0===row1&&col0===col1?original(row0,col0):undefined);
       }
       if(latest.current.revisionKey!==identity.revisionKey||latest.current.sheetId!==identity.sheetId||latest.current.selectedRange!==identity.selectedRange)return;
       onTarget({baseRevision:artifact.revision,label:sheet.name+' '+rangeLabel,selector,selectedContentSnapshot:snippet});
@@ -331,7 +353,7 @@ export function GridModule(props:WorkspaceModuleProps){
         if(!staged||fold(String(staged.operation.value??'')).includes(q)){hit=next;break;}
         cursor=next;
       }
-      if(controller.signal.aborted||latest.current!==identity&&latest.current.selectedRange!==identity.selectedRange)return;
+      if(controller.signal.aborted||latest.current.revisionKey!==identity.revisionKey||latest.current.sheetId!==identity.sheetId||latest.current.selectedRange!==identity.selectedRange)return;
       const candidate=matchingDrafts[0];if(candidate&&(!hit||circular(candidate,hit)<0))hit=candidate;
       if(hit){
         if(filter){setAppliedFilter('');setFilterInput('');setSelected(hit);setAnchor(hit);pendingReveal.current=hit}

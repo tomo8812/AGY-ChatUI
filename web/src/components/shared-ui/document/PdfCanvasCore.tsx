@@ -6,6 +6,7 @@ import {computeStepZoomScale} from '../../../utils/contentZoom';
 import {computePdfAutoFitScale,findActivePdfPage,PDF_MANUAL_MAX_SCALE,PDF_MANUAL_MIN_SCALE} from '../../../utils/pdfFit';
 import {closeBitmapIfOwned,commitPdfBitmapToCanvas,computeBoundedPdfDpr,isPdfRenderCancelledError,MAX_PDF_CONCURRENT_RENDERS,MAX_TOTAL_PDF_CANVAS_PIXELS,PdfRenderJobTracker,selectPdfCanvasesToRelease} from '../../../utils/pdfRenderBudget';
 import {pdfBytesCache,pdfPageBitmapCache} from '../../../utils/viewerCache';
+import {sha256Hex} from '../../../utils/sha256';
 import {ChevronIcon} from '../../Icons';
 
 let pdfjsPromise: Promise<typeof import('pdfjs-dist')> | null = null;
@@ -1108,8 +1109,7 @@ export const PdfCanvasViewer: React.FC<{
     const [text,operators]=await Promise.all([page.getTextContent(),page.getOperatorList()]);
     const identity=JSON.stringify([page.view,page.rotate,page.userUnit,text.items,operators.fnArray,operators.argsArray],(_,value)=>
       ArrayBuffer.isView(value)?Array.from(new Uint8Array(value.buffer,value.byteOffset,value.byteLength)):value);
-    const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(identity));
-    return Array.from(new Uint8Array(bytes),value=>value.toString(16).padStart(2,'0')).join('');
+    return sha256Hex(identity);
   };
 
   if (loading) return <div className="viewer-state muted-sm">PDFを読み込み中...</div>;

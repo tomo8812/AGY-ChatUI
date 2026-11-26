@@ -1,7 +1,18 @@
 import type { RichDocumentV1, RichStateAction, RichStateValue } from '../../../../shared/rich-schema';
 import {
-  createRichEvalBudget, evaluateRichAst, evaluateRichExpr, RichExprError, topologicalSortComputed,
-  RICH_LIMITS, validateRichDocument, type RichEvalBudget, type RichEvalContext,
+  compileRichDynamicPlan,
+  createRichEvalBudget,
+  evaluateRichAst,
+  evaluateRichDynamicState,
+  evaluateRichExpr,
+  RichExprError,
+  RICH_LIMITS,
+  validateRichDocument,
+  type RichDynamicPlan,
+  type RichDynamicStats,
+  type RichEvalBudget,
+  type RichEvalContext,
+  type RichSubtreeCache,
 } from './RichExprEvaluator';
 
 type Theme = 'light' | 'dark';
@@ -11,6 +22,8 @@ export interface RichStateSnapshot {
   readonly state: Readonly<State>;
   readonly computed: Readonly<Record<string, unknown>>;
   readonly theme: Theme;
+  readonly version: number;
+  readonly stats: Readonly<RichDynamicStats>;
 }
 
 const forbidden = new Set(['__proto__', 'constructor', 'prototype']);
@@ -49,12 +62,15 @@ function assertStateLimit(state: State): void {
 export class RichStateStore {
   private readonly document: RichDocumentV1;
   private readonly initial: State;
-  private readonly computedPlan: ReturnType<typeof topologicalSortComputed>;
+  private readonly plan: RichDynamicPlan;
   private readonly authorized: Set<string>;
   private readonly listeners = new Set<Listener>();
   private readonly keyListeners = new Map<string, Set<Listener>>();
   private readonly projectionListeners = new Map<string, Set<Listener>>();
   private snapshot: RichStateSnapshot;
+  private subtreeCache: RichSubtreeCache | undefined;
+  private computedStepsByKey: Map<string, number> | undefined;
+  private versionCounter = 0;
 
   constructor(document: RichDocumentV1, authorizedArtifactIds: Iterable<string> = [], theme: Theme = 'light') {
     this.document = JSON.parse(JSON.stringify(document)) as RichDocumentV1;
@@ -65,9 +81,47 @@ export class RichStateStore {
       this.initial[key] = cloneValue(value);
     }
     Object.freeze(this.initial);
-    this.computedPlan = topologicalSortComputed(this.document.computed ?? {});
-    if (this.computedPlan.cycle) throw new RichExprError('RICH_COMPUTED_CYCLE', 'Circular computed values.');
-    this.snapshot = this.validateAndCompute(this.initial, theme);
+
+    // Run full static + initial dynamic validation once at construction time.
+    assertStateLimit(this.initial);
+    const initialValidation = validateRichDocument({ ...this.document, state: this.initial }, {
+      authorizedArtifactIds: this.authorized,
+      theme,
+    });
+    if (!initialValidation.valid) {
+      throw new RichExprError(
+        initialValidation.primaryErrorCode ?? 'RICH_INVALID_STATE',
+        initialValidation.issues[0]?.message ?? 'Invalid rich state.',
+        initialValidation.statusCode,
+      );
+    }
+
+    // Compile AST + dependency plan once so subsequent slider/control updates
+    // avoid whole-document JSON serialization, static re-validation, AST
+    // re-parsing, and untouched computed/subtree re-evaluation.
+    this.plan = compileRichDynamicPlan(this.document, undefined);
+    const initialEval = evaluateRichDynamicState(this.plan, {
+      state: this.initial,
+      theme,
+      authorizedArtifactIds: this.authorized,
+    });
+    if (!initialEval.valid) {
+      throw new RichExprError(
+        initialEval.primaryErrorCode ?? 'RICH_INVALID_STATE',
+        initialEval.issues[0]?.message ?? 'Invalid rich state.',
+        initialEval.statusCode,
+      );
+    }
+    this.subtreeCache = initialEval.subtreeCache;
+    this.computedStepsByKey = initialEval.computedStepsByKey;
+    this.versionCounter = 1;
+    this.snapshot = Object.freeze({
+      state: this.initial,
+      computed: Object.freeze(initialEval.computed),
+      theme,
+      version: this.versionCounter,
+      stats: Object.freeze(initialEval.stats),
+    });
   }
 
   getSnapshot = (): RichStateSnapshot => this.snapshot;
@@ -111,7 +165,7 @@ export class RichStateStore {
   }
 
   setTheme(theme: Theme): void {
-    if (theme !== this.snapshot.theme) this.publish(this.validateAndCompute({ ...this.snapshot.state }, theme));
+    if (theme !== this.snapshot.theme) this.validateAndPublish({ ...this.snapshot.state }, theme);
   }
 
   set(key: string, value: unknown, actions: readonly RichStateAction[] = [], context: Partial<RichEvalContext> = {}): void {
@@ -134,25 +188,76 @@ export class RichStateStore {
     }
   }
 
-  private compute(state: State, theme: Theme, budget: RichEvalBudget): Record<string, unknown> {
+  private computeForActions(state: State, theme: Theme, budget: RichEvalBudget): Record<string, unknown> {
     const computed: Record<string, unknown> = Object.create(null);
     const ctx: RichEvalContext = { state, computed, theme };
-    for (const key of this.computedPlan.order) {
+    for (const key of this.plan.computedOrder) {
       if (forbidden.has(key)) throw new RichExprError('RICH_INVALID_COMPUTED_KEY', 'Invalid computed key.');
-      computed[key] = evaluateRichAst(this.computedPlan.asts.get(key)!, ctx, budget);
+      computed[key] = evaluateRichAst(this.plan.computedAsts.get(key)!, ctx, budget);
     }
     return computed;
   }
 
-  private validateAndCompute(state: State, theme: Theme): RichStateSnapshot {
+  private validateAndPublish(state: State, theme: Theme): void {
     assertStateLimit(state);
-    const result = validateRichDocument({ ...this.document, state }, {
-      authorizedArtifactIds: this.authorized,
+    const previous = this.snapshot;
+    const result = evaluateRichDynamicState(this.plan, {
+      state,
       theme,
+      authorizedArtifactIds: this.authorized,
+      previousState: previous.state,
+      previousComputed: previous.computed,
+      previousTheme: previous.theme,
+      previousSubtreeCache: this.subtreeCache,
+      previousComputedSteps: this.computedStepsByKey,
     });
-    if (!result.valid) throw new RichExprError(result.primaryErrorCode ?? 'RICH_INVALID_STATE', result.issues[0]?.message ?? 'Invalid rich state.', result.statusCode);
-    const computed = this.compute(state, theme, createRichEvalBudget());
-    return Object.freeze({ state: Object.freeze(state), computed: Object.freeze(computed), theme });
+    if (!result.valid) {
+      throw new RichExprError(
+        result.primaryErrorCode ?? 'RICH_INVALID_STATE',
+        result.issues[0]?.message ?? 'Invalid rich state.',
+        result.statusCode,
+      );
+    }
+
+    this.subtreeCache = result.subtreeCache;
+    this.computedStepsByKey = result.computedStepsByKey;
+    this.versionCounter += 1;
+
+    const frozenState = Object.freeze(state);
+    const frozenComputed = Object.freeze(result.computed);
+    const nextSnapshot: RichStateSnapshot = Object.freeze({
+      state: frozenState,
+      computed: frozenComputed,
+      theme,
+      version: this.versionCounter,
+      stats: Object.freeze(result.stats),
+    });
+
+    this.snapshot = nextSnapshot;
+    const pending = new Set<Listener>();
+    const notify = (key: string) => {
+      for (const listener of this.projectionListeners.get(key) ?? []) pending.add(listener);
+    };
+    for (const key of Object.keys(frozenState)) {
+      if (!Object.is(previous.state[key], frozenState[key])) {
+        notify('state:' + key);
+        notify('state:*');
+      }
+    }
+    for (const key of Object.keys(frozenComputed)) {
+      if (!Object.is(previous.computed[key], frozenComputed[key])) {
+        notify('computed:' + key);
+        notify('computed:*');
+      }
+    }
+    if (previous.theme !== theme) notify('theme');
+    for (const listener of pending) listener();
+    for (const [key, listeners] of this.keyListeners) {
+      if (!Object.is(previous.state[key], frozenState[key])) {
+        for (const listener of [...listeners]) listener();
+      }
+    }
+    for (const listener of [...this.listeners]) listener();
   }
 
   private apply(actions: readonly RichStateAction[], binding?: { key: string; value: unknown }, local: Partial<RichEvalContext> = {}): void {
@@ -163,7 +268,7 @@ export class RichStateStore {
     assertStateLimit(next);
     for (const action of actions) {
       const evalValue = (expr: string) => evaluateRichExpr(expr, {
-        ...local, state: next, computed: this.compute(next, theme, budget), theme,
+        ...local, state: next, computed: this.computeForActions(next, theme, budget), theme,
       }, budget);
       switch (action.type) {
         case 'set_state':
@@ -197,37 +302,6 @@ export class RichStateStore {
       }
       assertStateLimit(next);
     }
-    this.publish(this.validateAndCompute(next, theme));
-  }
-
-  private publish(snapshot: RichStateSnapshot): void {
-    const previous = this.snapshot;
-    // The evaluator can return new arrays for unchanged computed values.
-    // Preserve their identity so unrelated state changes do not redraw charts.
-    const computed = Object.assign(Object.create(null), snapshot.computed) as Record<string, unknown>;
-    for (const key of Object.keys(computed)) {
-      const old = previous.computed[key], next = computed[key];
-      if (Object.is(old, next) || (old !== undefined && next !== undefined &&
-        typeof old === 'object' && typeof next === 'object' && JSON.stringify(old) === JSON.stringify(next))) {
-        computed[key] = old;
-      }
-    }
-    this.snapshot = Object.freeze({ ...snapshot, computed: Object.freeze(computed) });
-    const pending = new Set<Listener>();
-    const notify = (key: string) => { for (const listener of this.projectionListeners.get(key) ?? []) pending.add(listener); };
-    for (const key of Object.keys(snapshot.state)) if (!Object.is(previous.state[key], snapshot.state[key])) {
-      notify('state:' + key); notify('state:*');
-    }
-    for (const key of Object.keys(computed)) if (!Object.is(previous.computed[key], computed[key])) {
-      notify('computed:' + key); notify('computed:*');
-    }
-    if (previous.theme !== snapshot.theme) notify('theme');
-    for (const listener of pending) listener();
-    for (const [key, listeners] of this.keyListeners) {
-      if (!Object.is(previous.state[key], snapshot.state[key])) {
-        for (const listener of [...listeners]) listener();
-      }
-    }
-    for (const listener of [...this.listeners]) listener();
+    this.validateAndPublish(next, theme);
   }
 }

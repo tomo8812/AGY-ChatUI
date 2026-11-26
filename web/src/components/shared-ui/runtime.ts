@@ -1,11 +1,148 @@
 import type { RichStateAction, RichValue, RichColorToken } from '../../../../shared/rich-schema';
-import { evaluateRichExpr, RICH_LIMITS, type RichEvalBudget, type RichEvalContext } from './RichExprEvaluator';
+import {
+  createRichEvalBudget,
+  evaluateRichExpr,
+  RICH_LIMITS,
+  RichExprError,
+  type RichEvalBudget,
+  type RichEvalContext,
+} from './RichExprEvaluator';
 
 export interface RenderCycle {
   budget: RichEvalBudget;
   nodes: number;
   svgElements: number;
+  dataPoints?: number;
+  readonly accounting?: BlockRenderAccounting;
+  readonly scopePath?: string;
 }
+
+interface ScopeContribution {
+  nodes: number;
+  svgElements: number;
+  dataPoints: number;
+  steps: number;
+}
+
+/**
+ * Block-wide render safety accountant shared across every RichNodeView,
+ * repeat instance, partial re-render, and lazy-loaded renderer (SvgScene,
+ * RichChart, NodeEdgeDiagram) inside a single RichRenderer block.
+ *
+ * Each mounted scope (identified by its deterministic node path) owns its own
+ * contribution slot. Re-rendering a scope replaces only its own previous
+ * contribution while preserving all sibling scopes, preventing both:
+ *   1. Cross-node/cross-lazy budget evasion (total <= block ceilings), and
+ *   2. False drift from React StrictMode double-renders or partial slider updates.
+ */
+export class BlockRenderAccounting {
+  private readonly scopes = new Map<string, ScopeContribution>();
+  private baseSteps = 0;
+  private totalNodes = 0;
+  private totalSvgElements = 0;
+  private totalDataPoints = 0;
+  private totalScopeSteps = 0;
+
+  setBaseSteps(steps: number): void {
+    this.baseSteps = Math.max(0, Number.isFinite(steps) ? Math.floor(steps) : 0);
+    if (this.baseSteps + this.totalScopeSteps > RICH_LIMITS.maxAstSteps) {
+      throw new RichExprError(
+        'RICH_EXPR_BUDGET_EXCEEDED',
+        `Expression evaluation exceeded the maximum budget of ${RICH_LIMITS.maxAstSteps} AST steps.`,
+        422,
+      );
+    }
+  }
+
+  getTotals(): { nodes: number; svgElements: number; dataPoints: number; steps: number; scopeCount: number } {
+    return {
+      nodes: this.totalNodes,
+      svgElements: this.totalSvgElements,
+      dataPoints: this.totalDataPoints,
+      steps: this.baseSteps + this.totalScopeSteps,
+      scopeCount: this.scopes.size,
+    };
+  }
+
+  removeScope(scopePath: string): void {
+    const prev = this.scopes.get(scopePath);
+    if (!prev) return;
+    this.totalNodes -= prev.nodes;
+    this.totalSvgElements -= prev.svgElements;
+    this.totalDataPoints -= prev.dataPoints;
+    this.totalScopeSteps -= prev.steps;
+    this.scopes.delete(scopePath);
+  }
+
+  removeSubtree(prefix: string): void {
+    for (const key of [...this.scopes.keys()]) {
+      if (key === prefix || key.startsWith(prefix + '-') || key.startsWith(prefix + ':')) {
+        this.removeScope(key);
+      }
+    }
+  }
+
+  beginScope(scopePath: string): RenderCycle {
+    this.removeScope(scopePath);
+    const slot: ScopeContribution = { nodes: 0, svgElements: 0, dataPoints: 0, steps: 0 };
+    this.scopes.set(scopePath, slot);
+    const accounting = this;
+    const budget: RichEvalBudget = {
+      get steps() {
+        return accounting.baseSteps + accounting.totalScopeSteps;
+      },
+      set steps(nextTotal: number) {
+        const delta = nextTotal - (accounting.baseSteps + accounting.totalScopeSteps);
+        if (delta !== 0) {
+          slot.steps += delta;
+          accounting.totalScopeSteps += delta;
+        }
+      },
+      maxSteps: RICH_LIMITS.maxAstSteps,
+    };
+
+    return {
+      budget,
+      get nodes() {
+        return accounting.totalNodes;
+      },
+      set nodes(nextTotal: number) {
+        const delta = nextTotal - accounting.totalNodes;
+        if (delta !== 0) {
+          slot.nodes += delta;
+          accounting.totalNodes += delta;
+        }
+      },
+      get svgElements() {
+        return accounting.totalSvgElements;
+      },
+      set svgElements(nextTotal: number) {
+        const delta = nextTotal - accounting.totalSvgElements;
+        if (delta !== 0) {
+          slot.svgElements += delta;
+          accounting.totalSvgElements += delta;
+        }
+      },
+      get dataPoints() {
+        return accounting.totalDataPoints;
+      },
+      set dataPoints(nextTotal: number) {
+        const delta = nextTotal - accounting.totalDataPoints;
+        if (delta !== 0) {
+          slot.dataPoints += delta;
+          accounting.totalDataPoints += delta;
+        }
+      },
+      accounting,
+      scopePath,
+    };
+  }
+}
+
+export function createStandaloneRenderCycle(): RenderCycle {
+  return { budget: createRichEvalBudget(), nodes: 0, svgElements: 0, dataPoints: 0 };
+}
+
 export function evaluate<T>(value: RichValue<T> | undefined, context: RichEvalContext, cycle: RenderCycle): T | undefined {
   if (value && typeof value === 'object' && !Array.isArray(value) && 'expr' in value) {
     return evaluateRichExpr(String(value.expr), context, cycle.budget) as T;
@@ -17,8 +154,20 @@ export function expression(expr: string, context: RichEvalContext, cycle: Render
 }
 export function addNode(cycle: RenderCycle, svg = false): void {
   if (svg) {
-    if (++cycle.svgElements > RICH_LIMITS.maxExpandedSvgElements) throw Error('図の表示上限を超えました。');
-  } else if (++cycle.nodes > RICH_LIMITS.maxExpandedNodes) throw Error('表示項目数の上限を超えました。');
+    if (++cycle.svgElements > RICH_LIMITS.maxExpandedSvgElements) {
+      throw new RichExprError('RICH_EXPANDED_SVG_LIMIT_EXCEEDED', '図の表示上限を超えました。', 422);
+    }
+  } else if (++cycle.nodes > RICH_LIMITS.maxExpandedNodes) {
+    throw new RichExprError('RICH_EXPANDED_NODE_LIMIT_EXCEEDED', '表示項目数の上限を超えました。', 422);
+  }
+}
+export function addDataPoints(cycle: RenderCycle, count: number): void {
+  if (count <= 0) return;
+  const next = (cycle.dataPoints ?? 0) + count;
+  cycle.dataPoints = next;
+  if (next > RICH_LIMITS.maxArrayPoints) {
+    throw new RichExprError('RICH_EXPANDED_ARRAY_LIMIT_EXCEEDED', 'データ点数の上限を超えました。', 422);
+  }
 }
 export function text(value: unknown, fallback = ''): string {
   if (value === null || value === undefined) return fallback;
@@ -28,9 +177,13 @@ export function text(value: unknown, fallback = ''): string {
 export function num(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
-export function safeArray<T>(value: unknown): T[] {
+export function safeArray<T>(value: unknown, cycle?: RenderCycle, multiplier = 1): T[] {
   if (!Array.isArray(value)) return [];
-  if (value.length > RICH_LIMITS.maxArrayPoints) throw Error('データ点数の上限を超えました。');
+  const weight = value.length * Math.max(1, multiplier);
+  if (weight > RICH_LIMITS.maxArrayPoints) {
+    throw new RichExprError('RICH_EXPANDED_ARRAY_LIMIT_EXCEEDED', 'データ点数の上限を超えました。', 422);
+  }
+  if (cycle) addDataPoints(cycle, weight);
   return value as T[];
 }
 export function repeatContexts(spec: { itemsExpr: string; as: string; keyField?: string }, context: RichEvalContext, cycle: RenderCycle) {

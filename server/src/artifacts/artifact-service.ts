@@ -4332,6 +4332,10 @@ export class ArtifactService {
     const fitsField = (bytes:number) => collectedBytes + (rows.length?1:0) + rowBytes + (currentRow.length?1:0) + 2 + bytes <= MAX_RESPONSE_BYTES;
     let matchLength=0, fieldMatched=false;
     let firstMatch:{row:number;col:number}|null=null, nextMatch:{row:number;col:number}|null=null;
+    const targetHashes = range.targetHashes === true || range.targetHashes === 'true';
+    let headerRow: string[] | null = null;
+    const collectHeader = () => targetHashes && rowIndex === 0 && !filter;
+    let currentHeaderRow: string[] = [];
     const collectRow = () => !fullCell && !dimensionsOnly && !searchQuery && visibleRow() >= startRow && visibleRow() <= targetEndRow;
     const collectField = () => collectRow() && fieldCount >= startCol && fieldCount <= requestedEndCol;
     const isRequestedCell = () => fullCell && rowIndex === startRow && fieldCount === startCol;
@@ -4348,11 +4352,15 @@ export class ArtifactService {
         field += ch;
         return;
       }
-      if (collectField()&&!rowTruncated) {
+      if ((collectField() || collectHeader()) && !rowTruncated) {
         const cp=ch.codePointAt(0)!;
         const bytes=cp===34||cp===92||[8,9,10,12,13].includes(cp)?2:cp<32?6:cp<128?1:cp<2048?2:cp<65536?3:4;
-        if(fitsField(fieldBytes+bytes)){field+=ch;fieldBytes+=bytes;}
-        else {rowTruncated=true;field='';}
+        if (collectField()) {
+          if(fitsField(fieldBytes+bytes)){field+=ch;fieldBytes+=bytes;}
+          else {rowTruncated=true;field='';}
+        } else if (collectHeader() && field.length < 65536) {
+          field += ch;
+        }
       }
     }
     function commitField() {
@@ -4370,6 +4378,9 @@ export class ArtifactService {
         }
       }
       matchLength=0;fieldMatched=false;
+      if (collectHeader()) {
+        currentHeaderRow.push(field);
+      }
       if (collectField()&&!rowTruncated) {
         if(fitsField(fieldBytes)){rowBytes+=(currentRow.length?1:0)+2+fieldBytes;currentRow.push(field);}
         else rowTruncated=true;
@@ -4380,6 +4391,10 @@ export class ArtifactService {
     function commitRow(): boolean {
       commitField();
       observedMaxCols = Math.max(observedMaxCols, fieldCount);
+      if (collectHeader() && headerRow === null) {
+        headerRow = currentHeaderRow;
+        currentHeaderRow = [];
+      }
       if (collectRow() && (!filter || rowMatches)) {
         if (rowTruncated) {truncated = true; stoppedEarly = true; truncatedSourceRow = rowIndex;}
         else {
@@ -4390,7 +4405,7 @@ export class ArtifactService {
       }
       if (rowMatches) matchedRows++;
       currentRow = []; rowBytes=2; rowTruncated=false; rowMatches=false; fieldCount = 0; rowIndex++;
-      if (visibleRow() > targetEndRow) stoppedEarly = true;
+      if (!targetHashes && visibleRow() > targetEndRow) stoppedEarly = true;
       return !stoppedEarly;
     }
     function feed(ch: string): boolean {
@@ -4446,6 +4461,7 @@ export class ArtifactService {
       ...(!stoppedEarly ? { totalRows: visibleRow() } : {}),
       totalCols: observedMaxCols, totalBytes, hasMore: stoppedEarly, truncated, rows,
       ...(filter ? { sourceRows, truncatedSourceRow } : {}),
+      ...(targetHashes ? { headerHash: crypto.createHash('sha256').update(JSON.stringify(headerRow ?? [])).digest('hex') } : {}),
       valuesHash: crypto.createHash('sha256').update(JSON.stringify(rows)).digest('hex'),
     };
   }
@@ -4457,7 +4473,13 @@ export class ArtifactService {
       const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
       const format = adapter.format;
 
-      if (format === 'pptx' && range.targetMetadata === 'true' || format === 'docx' && range.targetBlockIndex !== undefined) {
+      const isTargetMeta = range.targetMetadata === true || range.targetMetadata === 'true';
+      if (
+        (format === 'pptx' && isTargetMeta) ||
+        (format === 'docx' && range.targetBlockIndex !== undefined) ||
+        (format === 'xlsx' && isTargetMeta && typeof range.rangeA1 === 'string') ||
+        (format === 'pdf' && isTargetMeta && range.pageIndex !== undefined)
+      ) {
         const { bytes } = this.readRevisionSnapshot(pinned, DOCUMENT_WORKER_MAX_INPUT_BYTES);
         const data = adapter.readRange(bytes, range, artifact);
         return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };

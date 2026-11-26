@@ -6381,6 +6381,10 @@ def verify_pptx_layer_visual_consistency(package, main, result, finding, verify_
             render_presentation_layer(package, {"format": "pptx", "action": "render", "pageIndex": slide_idx, "variant": "background"}, bg_png)
             with Image.open(bg_png) as bg_img:
                 composite = bg_img.convert("RGBA")
+            slide_size_el = main.find(tag(PRESENTATION, "sldSz"))
+            slide_w_pt = max(1.0, int(slide_size_el.get("cx", "9144000")) / 12700.0) if slide_size_el is not None else 720.0
+            slide_h_pt = max(1.0, int(slide_size_el.get("cy", "6858000")) / 12700.0) if slide_size_el is not None else 540.0
+            shape_regions = []
             for sh in top_shapes:
                 sp_png = Path.cwd() / f"vis-sp-{slide_idx}-{sh['id']}.png"
                 render_presentation_layer(
@@ -6390,9 +6394,57 @@ def verify_pptx_layer_visual_consistency(package, main, result, finding, verify_
                 )
                 sprites_rendered += 1
                 with Image.open(sp_png) as sp_img:
-                    composite.alpha_composite(sp_img.convert("RGBA"))
+                    sp_rgba = sp_img.convert("RGBA")
+                    ink_box = sp_rgba.getchannel("A").getbbox()
+                    composite.alpha_composite(sp_rgba)
+                    shape_regions.append((sh, ink_box))
             with Image.open(full_png) as ref_img:
-                ssim_val, mae_val = compute_image_ssim_and_mae(ref_img.convert("RGB"), composite.convert("RGB"))
+                ref_rgb = ref_img.convert("RGB")
+                comp_rgb = composite.convert("RGB")
+                if ref_rgb.size != comp_rgb.size:
+                    ref_rgb = ref_rgb.resize(comp_rgb.size, Image.Resampling.LANCZOS)
+                ssim_val, mae_val = compute_image_ssim_and_mae(ref_rgb, comp_rgb)
+                img_w, img_h = comp_rgb.size
+                sx = img_w / slide_w_pt
+                sy = img_h / slide_h_pt
+                region_checks = []
+                failed_regions = []
+                for sh, ink_box in shape_regions:
+                    geom = (sh.get("transform") or {}).get("geomBoundsPt") if isinstance(sh, dict) else None
+                    x0, y0, x1, y1 = img_w, img_h, 0, 0
+                    if isinstance(geom, dict) and geom.get("width", 0) > 0 and geom.get("height", 0) > 0:
+                        x0 = min(x0, int(geom["x"] * sx) - 2)
+                        y0 = min(y0, int(geom["y"] * sy) - 2)
+                        x1 = max(x1, int((geom["x"] + geom["width"]) * sx) + 2)
+                        y1 = max(y1, int((geom["y"] + geom["height"]) * sy) + 2)
+                    if ink_box is not None:
+                        x0 = min(x0, ink_box[0] - 2)
+                        y0 = min(y0, ink_box[1] - 2)
+                        x1 = max(x1, ink_box[2] + 2)
+                        y1 = max(y1, ink_box[3] + 2)
+                    x0 = max(0, min(img_w - 1, x0))
+                    y0 = max(0, min(img_h - 1, y0))
+                    x1 = max(x0 + 1, min(img_w, x1))
+                    y1 = max(y0 + 1, min(img_h, y1))
+                    if x1 - x0 < 2 or y1 - y0 < 2:
+                        continue
+                    r_ssim, r_mae = compute_image_ssim_and_mae(
+                        ref_rgb.crop((x0, y0, x1, y1)),
+                        comp_rgb.crop((x0, y0, x1, y1)),
+                    )
+                    ssim_applies = (x1 - x0) >= 8 and (y1 - y0) >= 8
+                    r_ok = r_mae <= 10.0 and (not ssim_applies or r_ssim >= 0.85)
+                    entry = {
+                        "shapeId": sh["id"],
+                        "name": sh.get("name", sh["id"]),
+                        "bboxPx": [x0, y0, x1 - x0, y1 - y0],
+                        "ssim": round(r_ssim, 4),
+                        "mae": round(r_mae, 2),
+                        "passed": r_ok,
+                    }
+                    region_checks.append(entry)
+                    if not r_ok:
+                        failed_regions.append(entry)
         except Exception as exc:
             slide_reports[slide_idx] = {
                 "slideIndex": slide_idx, "part": slide["part"], "status": "failed",
@@ -6401,7 +6453,7 @@ def verify_pptx_layer_visual_consistency(package, main, result, finding, verify_
             finding("error", "pptx_layer_visual_render_error", slide["part"], f"Failed rendering slide layers: {exc}")
             continue
 
-        passed_slide = ssim_val >= 0.95
+        passed_slide = ssim_val >= 0.95 and mae_val <= 5.0 and len(failed_regions) == 0
         slide_reports[slide_idx] = {
             "slideIndex": slide_idx,
             "part": slide["part"],
@@ -6409,16 +6461,18 @@ def verify_pptx_layer_visual_consistency(package, main, result, finding, verify_
             "shapeCount": shape_count,
             "ssim": round(ssim_val, 4),
             "mae": round(mae_val, 2),
+            "regionChecks": region_checks,
+            "failedRegionCount": len(failed_regions),
             "reason": (
-                f"Layer composite matched full LibreOffice PNG (SSIM={ssim_val:.4f} >= 0.95, MAE={mae_val:.2f}/255)."
+                f"Layer composite matched full LibreOffice PNG across whole slide and {len(region_checks)} element bbox(es) (SSIM={ssim_val:.4f} >= 0.95, MAE={mae_val:.2f}/255)."
                 if passed_slide else
-                f"Layer composite diverged from full LibreOffice PNG (SSIM={ssim_val:.4f} < 0.95, MAE={mae_val:.2f}/255)."
+                f"Layer composite diverged from full LibreOffice PNG (SSIM={ssim_val:.4f}, MAE={mae_val:.2f}/255, failedRegions={len(failed_regions)})."
             ),
         }
         if not passed_slide:
             finding(
                 "warning", "pptx_layer_visual_mismatch", slide["part"],
-                f"Layer-composited render diverged from full LibreOffice slide render (SSIM={ssim_val:.4f}, MAE={mae_val:.2f}).",
+                f"Layer-composited render diverged from full LibreOffice slide render (SSIM={ssim_val:.4f}, MAE={mae_val:.2f}, failedRegions={len(failed_regions)}).",
             )
 
     ordered_reports = [slide_reports[idx] for idx in range(total_slides)]

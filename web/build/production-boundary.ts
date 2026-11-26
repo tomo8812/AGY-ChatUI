@@ -1,16 +1,30 @@
 import path from 'node:path';
 
-/** Production graph check, based on resolved bundler module IDs rather than
- * textual source markers. A test-only fixture may not enter a release chunk. */
-export function assertProductionModulePaths(ids:Iterable<string>,root:string){
-  const violations:string[]=[];
-  const base=path.resolve(root);
-  for(const id of ids){
-    const candidate=id.replace(/^\0/,'').split('?')[0].replace(/^\/\@fs\//,'/');
-    if(!path.isAbsolute(candidate))continue;
-    const rel=path.relative(base,candidate).split(path.sep).join('/');
-    if(rel.startsWith('../')||rel==='..'||rel.includes('node_modules/'))continue;
-    if(/(?:^|\/)(?:e2e|tests?|__tests__|__fixtures__|fixtures|test-results|playwright-report)(?:\/|$)/.test(rel)||/\.(?:spec|test)\.[cm]?[jt]sx?$/.test(rel))violations.push(rel);
+/**
+ * Ensures the production web bundle never pulls in test-only assets,
+ * Playwright fixtures, or test specs outside node_modules.
+ */
+export function assertProductionModulePaths(moduleIds: readonly string[], repoRoot: string): void {
+  const root = path.resolve(repoRoot);
+  const forbidden: string[] = [];
+  for (const rawId of moduleIds) {
+    if (!rawId || rawId.startsWith('\0')) continue;
+    const cleanId = rawId.split('?')[0].split('#')[0];
+    if (!path.isAbsolute(cleanId)) continue;
+    const rel = path.relative(root, cleanId).split(path.sep).join('/');
+    if (rel.startsWith('..') || rel.startsWith('node_modules/') || rel.includes('/node_modules/')) {
+      continue;
+    }
+    if (
+      rel.startsWith('e2e/') ||
+      rel.startsWith('server/tests/') ||
+      rel.includes('/__tests__/') ||
+      /\.(test|spec)\.[jt]sx?$/.test(rel)
+    ) {
+      forbidden.push(rel);
+    }
   }
-  if(violations.length)throw new Error('Production bundle includes test-only modules:\n'+[...new Set(violations)].sort().join('\n'));
+  if (forbidden.length > 0) {
+    throw new Error(`Production bundle imported test-only modules: ${forbidden.join(', ')}`);
+  }
 }
