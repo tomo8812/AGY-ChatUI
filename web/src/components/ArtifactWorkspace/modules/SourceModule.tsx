@@ -1,3 +1,4 @@
+import { ResponsiveCommandBar } from '../../shared-ui/layout/ResponsiveCommandBar';
 import React,{useDeferredValue,useLayoutEffect,useMemo,useRef,useState} from 'react';
 import { buildArtifactContentUrl } from '../../../utils/viewerCache';
 import { MarkdownContent,CodeBlock } from '../../MarkdownContent';
@@ -60,11 +61,26 @@ export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget
       const result=await workspaceApi.range<{text:string;before:string;after:string;expectedSnippetHash:string;contextBeforeHash:string;contextAfterHash:string;occurrenceIndex:number}>(artifact.id,{startLine:start,endLine:end,targetHashes:true});
       assertRevision(artifact,result);
       if(!Number.isInteger(result.occurrenceIndex)||result.occurrenceIndex<0)throw Error('Invalid occurrenceIndex');
-      onTarget({baseRevision:artifact.revision,label:start+'–'+end+' 行',selector:{kind:markdown?'md_text_range':'code_line_range',startLine:start,endLine:end,expectedSnippetHash:result.expectedSnippetHash,contextBeforeHash:result.contextBeforeHash,contextAfterHash:result.contextAfterHash,occurrenceIndex:result.occurrenceIndex},range:{startLine:start,endLine:end},selectedContentSnapshot:result.text,surroundingContext:result.before+'\n---\n'+result.after});
+      onTarget({baseRevision:artifact.revision,label:start+'–'+end+' 行',selector:{kind:markdown?'md_text_range':'code_line_range',startLine:start,endLine:end,expectedSnippetHash:result.expectedSnippetHash,contextBeforeHash:result.contextBeforeHash,contextAfterHash:result.contextAfterHash,occurrenceIndex:result.occurrenceIndex},range:{startLine:start,endLine:end},selectedContentSnapshot:result.text.slice(0,50_000),surroundingContext:(result.before+'\n---\n'+result.after).slice(0,50_000)});
       setPinError('');
     }catch{setPinError('選択対象の識別情報を作成できませんでした。')}
   }
-  const tools=<div className="workspace-toolbar"><input aria-label="検索" placeholder="検索" value={query} onChange={e=>{setQuery(e.target.value);searchOffset.current=0}} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();find()}}}/>{query&&<><small>{matches} 件（ソース）</small><button type="button" className="btn btn-secondary btn-xs" onClick={find}>次の一致</button></>}{markdown&&mode!=='pin'&&<button type="button" className="btn btn-secondary btn-xs" aria-expanded={outlineOpen} onClick={()=>setOutlineOpen(v=>!v)}>目次</button>}{mode!=='view'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready} onClick={()=>editor.current?.selectAll()}>全選択</button>}{mode==='edit'&&markdown&&<>{[['太字','**','**'],['斜体','*','*'],['見出し','## ',''],['コード','`','`']].map(([label,a,b])=><button key={label} type="button" disabled={editingLocked||!resource.ready} className="btn btn-secondary btn-xs" onClick={()=>editor.current?.wrapSelection(a,b)}>{label}</button>)}</>}{mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready} onClick={()=>void selectLines()}>選択行を対象にする</button>}</div>;
+  const primary=mode==='pin'?<>
+    <button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready} onClick={()=>editor.current?.selectAll()}>全選択</button>
+    <button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready} onClick={()=>void selectLines()}>選択行を対象にする</button>
+  </>:<>
+    <input className="workspace-command-input" aria-label="検索" placeholder="検索" value={query}
+      onChange={e=>{setQuery(e.target.value);searchOffset.current=0}} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();find()}}}/>
+    {query&&<button type="button" className="btn btn-secondary btn-xs" title={matches+' 件（ソース）'} onClick={find}>次の一致</button>}
+    {markdown&&<button type="button" className="btn btn-secondary btn-xs" aria-expanded={outlineOpen} onClick={()=>setOutlineOpen(v=>!v)}>目次</button>}
+    {mode==='edit'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready} onClick={()=>editor.current?.selectAll()}>全選択</button>}
+  </>;
+  const secondary=mode==='edit'&&markdown
+    ?[['太字','**','**'],['斜体','*','*'],['見出し','## ',''],['コード','`','`']].map(([label,a,b])=>
+      <button key={label} type="button" disabled={editingLocked||!resource.ready} className="btn btn-secondary btn-xs"
+        onClick={()=>editor.current?.wrapSelection(a,b)}>{label}</button>)
+    :null;
+  const tools=<ResponsiveCommandBar primary={primary} secondary={secondary} minInlineWidth={640}/>;
   return <UnifiedViewerZoomShell resetKey={artifact.id+':source'} controlsTop={<>{tools}{outlineOpen&&markdown&&mode!=='pin'&&<nav className="workspace-source-outline" aria-label="文書目次">{outline.length?outline.map((item,index)=><button key={index} type="button" style={{paddingInlineStart:8+(item.level-1)*10}} onClick={()=>jumpHeading(index)}>{item.label}</button>):<span className="muted-xs">見出しがありません。</span>}</nav>}</>}>
     {resource.error&&<div className="error-box" role="alert">{resource.error}<button type="button" onClick={resource.retry}>再試行</button></div>}
     {pinError&&<div role="alert">{pinError}</div>}

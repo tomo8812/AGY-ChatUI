@@ -5,7 +5,7 @@ import { workspaceApi,supportsOperation,MAX_WORKSPACE_IMAGE_BYTES } from '../../
 import {ResponsiveCommandBar} from '../../shared-ui/layout/ResponsiveCommandBar';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
 import { PdfCanvasViewer } from '../../shared-ui/document/PdfCanvasCore';
-import { artifactVersionKey,buildArtifactContentUrl } from '../../../utils/viewerCache';
+import { artifactVersionKey,buildArtifactContentUrl,ByteLruCache } from '../../../utils/viewerCache';
 import { assertRevision,useRevisionResource } from '../useRevisionResource';
 import type { WorkspaceModuleProps } from '../types';
 
@@ -30,37 +30,35 @@ interface WordRange {
 
 const CHUNK_SIZE=60;
 
-interface DocxChunkSentinelProps{
-  chunkIndex:number;
-  startIndex:number;
+interface WordChunkProps {
+  index:number;
   count:number;
-  loading:boolean;
-  onVisible:(chunkIndex:number)=>void;
+  blocks?:WordBlock[];
+  onVisibility:(index:number,visible:boolean)=>void;
+  renderBlock:(block:WordBlock)=>React.ReactNode;
 }
 
-function DocxChunkSentinel({chunkIndex,startIndex,count,loading,onVisible}:DocxChunkSentinelProps){
-  const ref=useRef<HTMLDivElement>(null);
+function WordChunk({index,count,blocks,onVisibility,renderBlock}:WordChunkProps){
+  const container=useRef<HTMLDivElement>(null);
+  const content=useRef<HTMLDivElement>(null);
+  const measured=useRef<number|undefined>(undefined);
   useEffect(()=>{
-    const el=ref.current;
+    const observer=new IntersectionObserver(([entry])=>onVisibility(index,entry.isIntersecting),{rootMargin:'320px 0px'});
+    if(container.current)observer.observe(container.current);
+    return()=>observer.disconnect();
+  },[index,onVisibility]);
+  React.useLayoutEffect(()=>{
+    const el=content.current;
     if(!el)return;
-    if(typeof IntersectionObserver==='undefined'){
-      onVisible(chunkIndex);
-      return;
-    }
-    const observer=new IntersectionObserver(
-      entries=>{if(entries.some(entry=>entry.isIntersecting))onVisible(chunkIndex)},
-      {rootMargin:'320px 0px'},
-    );
+    const measure=()=>{measured.current=el.offsetHeight};
+    measure();
+    const observer=new ResizeObserver(measure);
     observer.observe(el);
     return()=>observer.disconnect();
-  },[chunkIndex,onVisible]);
-  return <div
-    ref={ref}
-    className="workspace-word-chunk-placeholder muted-xs"
-    data-word-chunk={chunkIndex}
-    style={{minHeight:Math.min(count*36,640),padding:'12px 0'}}
-  >
-    {loading?`段落 ${startIndex+1}–${startIndex+count} を読み込み中…`:`段落 ${startIndex+1}–${startIndex+count}`}
+  },[Boolean(blocks)]);
+  return <div ref={container} data-word-chunk={index}>
+    {blocks?<div ref={content}>{blocks.map(renderBlock)}</div>:
+      <div aria-hidden="true" style={{height:measured.current??count*42}}/>}
   </div>;
 }
 
@@ -84,75 +82,71 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   const additions=(draft?.entries??[]).filter(e=>e.operation.op==='docx.add_paragraph'||e.operation.op==='docx.add_table');
   const [activeAddition,setActiveAddition]=useState<string|null>(null);
 
-  // Continuous chunked loading across the full document without manual pagination.
-  const [extraChunks,setExtraChunks]=useState<Record<number,WordBlock[]>>({});
-  const [loadingChunks,setLoadingChunks]=useState<Record<number,boolean>>({});
-  const inFlightChunks=useRef<Set<number>>(new Set());
-  const chunkControllers=useRef<AbortController[]>([]);
-
+  const [visibleChunks,setVisibleChunks]=useState<ReadonlySet<number>>(()=>new Set([0]));
+  const [loaded,setLoaded]=useState<{revisionKey:string;chunks:Map<number,WordBlock[]>}>({revisionKey,chunks:new Map()});
+  const cache=useMemo(()=>new ByteLruCache<number,WordBlock[]>({
+    maxEntries:6,maxBytes:4*1024*1024,sizeOf:blocks=>2*JSON.stringify(blocks).length,
+  }),[revisionKey]);
+  const requests=useRef(new Map<number,AbortController>());
   const resource=useRevisionResource(artifact,'docx:chunk0',async signal=>{
     const data=await workspaceApi.range<WordRange>(artifact.id,{start:0,count:CHUNK_SIZE},signal);
     assertRevision(artifact,data);
     return data;
   });
+  const blockCount=resource.data?.blockCount??resource.data?.blocks.length??0;
+  const totalChunks=Math.max(1,Math.ceil(blockCount/CHUNK_SIZE));
+  const selectedChunk=selected===null?-1:Math.floor(selected/CHUNK_SIZE);
+  const targetChunk=typeof target?.selector.blockIndex==='number'?Math.floor(target.selector.blockIndex/CHUNK_SIZE):-1;
+  const retained=useMemo(()=>new Set([...visibleChunks,selectedChunk,targetChunk]),[visibleChunks,selectedChunk,targetChunk]);
+  const displayed=(mode!=='view'||reading!=='page'||!canRender)&&!!resource.data;
+  const activeChunks=loaded.revisionKey===revisionKey?loaded.chunks:undefined;
+  const onVisibility=useCallback((index:number,visible:boolean)=>{
+    setVisibleChunks(current=>{
+      if(current.has(index)===visible)return current;
+      const next=new Set(current);
+      if(visible)next.add(index);else next.delete(index);
+      return next;
+    });
+  },[]);
 
   useEffect(()=>{
-    setExtraChunks({});
-    setLoadingChunks({});
-    inFlightChunks.current.clear();
-    chunkControllers.current.forEach(ctrl=>ctrl.abort());
-    chunkControllers.current=[];
-    return()=>{
-      chunkControllers.current.forEach(ctrl=>ctrl.abort());
-      chunkControllers.current=[];
-      inFlightChunks.current.clear();
-    };
+    const current=requests.current;
+    return()=>{for(const controller of current.values())controller.abort();current.clear()};
   },[revisionKey]);
-
-  const totalBlocks=resource.data?.blockCount??resource.data?.blocks.length??0;
-  const totalChunks=Math.max(1,Math.ceil(totalBlocks/CHUNK_SIZE));
-
-  const chunksMap=useMemo(()=>{
-    const map:Record<number,WordBlock[]>={};
-    if(resource.data?.blocks)map[0]=resource.data.blocks;
-    for(const [k,v] of Object.entries(extraChunks))map[Number(k)]=v;
-    return map;
-  },[resource.data,extraChunks]);
-
-  const loadedBlocks=useMemo(()=>{
-    const byIndex=new Map<number,WordBlock>();
-    for(const chunk of Object.values(chunksMap)){
-      for(const b of chunk)byIndex.set(b.blockIndex,b);
+  useEffect(()=>{
+    const current=requests.current;
+    for(const [index,controller] of current){
+      if(!displayed||!retained.has(index)||index>=totalChunks){controller.abort();current.delete(index)}
     }
-    return byIndex;
-  },[chunksMap]);
-
-  const loadChunk=useCallback((chunkIndex:number)=>{
-    if(chunkIndex<=0||chunkIndex>=totalChunks)return;
-    if(chunksMap[chunkIndex]||inFlightChunks.current.has(chunkIndex))return;
-    const identity=latest.current.revisionKey;
-    const currentArtifact=latest.current.artifact;
-    inFlightChunks.current.add(chunkIndex);
-    setLoadingChunks(prev=>({...prev,[chunkIndex]:true}));
-    const controller=new AbortController();
-    chunkControllers.current.push(controller);
-    void workspaceApi.range<WordRange>(
-      currentArtifact.id,
-      {start:chunkIndex*CHUNK_SIZE,count:CHUNK_SIZE},
-      controller.signal,
-    ).then(data=>{
-      assertRevision(currentArtifact,data);
-      if(latest.current.revisionKey!==identity)return;
-      setExtraChunks(prev=>({...prev,[chunkIndex]:data.blocks}));
-    }).catch(()=>{
-      // Silently ignore aborted or transient chunk load errors; re-entry retries.
-    }).finally(()=>{
-      inFlightChunks.current.delete(chunkIndex);
-      if(latest.current.revisionKey===identity){
-        setLoadingChunks(prev=>{const next={...prev};delete next[chunkIndex];return next;});
-      }
+    setLoaded(previous=>{
+      const chunks=new Map(previous.revisionKey===revisionKey?previous.chunks:undefined);
+      for(const index of chunks.keys())if(!displayed||!retained.has(index)||index>=totalChunks)chunks.delete(index);
+      return {revisionKey,chunks};
     });
-  },[chunksMap,totalChunks]);
+    if(!displayed||!resource.ready)return;
+    const currentArtifact=latest.current.artifact;
+    for(const index of retained){
+      if(index<=0||index>=totalChunks||current.has(index))continue;
+      const publish=(blocks:WordBlock[])=>setLoaded(previous=>{
+        const chunks=new Map(previous.revisionKey===revisionKey?previous.chunks:undefined);
+        chunks.set(index,blocks);
+        return {revisionKey,chunks};
+      });
+      const cached=cache.get(index);
+      if(cached){publish(cached);continue}
+      const controller=new AbortController();
+      current.set(index,controller);
+      void workspaceApi.range<WordRange>(currentArtifact.id,{start:index*CHUNK_SIZE,count:CHUNK_SIZE},controller.signal)
+        .then(data=>{
+          assertRevision(currentArtifact,data);
+          if(controller.signal.aborted||latest.current.revisionKey!==revisionKey)return;
+          cache.set(index,data.blocks);
+          publish(data.blocks);
+        }).catch(()=>{}).finally(()=>{
+          if(current.get(index)===controller)current.delete(index);
+        });
+    }
+  },[retained,totalChunks,revisionKey,resource.ready,displayed,cache]);
 
   const revealHeading=useCallback((index:number)=>{
     const element=canvas.current?.querySelector<HTMLElement>('[data-word-block="'+index+'"]');
@@ -165,9 +159,10 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     if(resource.ready&&jumpBlock.current!==null&&revealHeading(jumpBlock.current)){
       jumpBlock.current=null;
     }
-  },[resource.ready,resource.data,extraChunks,revealHeading]);
+  },[resource.ready,resource.data,activeChunks,revealHeading]);
 
-  const block=selected!==null?loadedBlocks.get(selected):undefined;
+  const selectedBlocks=selectedChunk===0?resource.data?.blocks:activeChunks?.get(selectedChunk);
+  const block=selectedBlocks?.find(block=>block.blockIndex===selected);
   const locked=editingLocked||!resource.ready||artifact.revision===undefined;
   const can=(op:string)=>!locked&&supportsOperation(capabilities,op);
   const stage=(key:string,operation:Record<string,unknown>&{op:string},label:string)=>{
@@ -214,7 +209,7 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   }
 
   const primary=<>
-    {mode==='view'&&totalBlocks>0&&<span className="muted-xs">全 {totalBlocks} ブロック</span>}
+    {mode==='view'&&blockCount>0&&<span className="muted-xs">全 {blockCount} ブロック</span>}
     {mode==='edit'&&<>
       <button type="button" className="btn btn-secondary btn-xs" disabled={locked||!editableSelection} onMouseDown={e=>e.preventDefault()} onClick={()=>{const ed=activeEditor.current;if(ed&&!ed.isDestroyed&&ed.isEditable)ed.chain().focus().selectAll().run()}}>段落全選択</button>
       {([['bold','太字'],['italic','斜体'],['underline','下線']] as const).map(([mark,label])=><button key={mark} type="button" className="btn btn-secondary btn-xs" disabled={locked||!editableSelection} onMouseDown={e=>e.preventDefault()} onClick={()=>{const ed=activeEditor.current;if(ed&&!ed.isDestroyed&&ed.isEditable)ed.chain().focus().toggleMark(mark).run()}}>{label}</button>)}
@@ -223,7 +218,10 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
       onClick={()=>{if(block)void pinParagraph(block)}}>選択段落を対象にする</button>}
   </>;
 
+  const outlineButton=<button type="button" className="btn btn-secondary btn-xs" aria-expanded={outlineOpen}
+    onClick={()=>setOutlineOpen(open=>!open)}>見出し一覧</button>;
   const secondary=mode==='edit'?<>
+    {outlineButton}
     <button type="button" className="btn btn-secondary btn-xs" disabled={!block?.editableText||!can('docx.set_paragraph_style')} onClick={()=>styleParagraph({op:'docx.set_paragraph_style',headingLevel:1},'style')}>見出し</button>
     <button type="button" className="btn btn-secondary btn-xs" disabled={!block?.editableText||!can('docx.set_list')} onClick={()=>{
       const staged=draft?.entries.find(e=>e.key==='list:'+block?.blockIndex)?.operation.listType;
@@ -250,8 +248,7 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     }}/>
   </>:null;
 
-  const toolbar=<ResponsiveCommandBar primary={<>{primary}<button type="button" className="btn btn-secondary btn-xs" aria-expanded={outlineOpen}
-    onClick={()=>setOutlineOpen(open=>!open)}>見出し一覧</button></>} secondary={secondary} minInlineWidth={1280}/>;
+  const toolbar=<ResponsiveCommandBar primary={<>{primary}{mode!=='edit'&&outlineButton}</>} secondary={secondary} minInlineWidth={1050}/>;
 
   const outline=outlineOpen&&<nav className="workspace-source-outline" aria-label="文書の見出し">
     {resource.data?.headings?.length?resource.data.headings.map(heading=><button type="button" key={heading.blockIndex}
@@ -260,7 +257,6 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
         if(!revealHeading(heading.blockIndex)){
           jumpBlock.current=heading.blockIndex;
           const targetChunk=Math.floor(heading.blockIndex/CHUNK_SIZE);
-          loadChunk(targetChunk);
           canvas.current?.querySelector<HTMLElement>('[data-word-chunk="'+targetChunk+'"]')?.scrollIntoView({block:'nearest'});
         }
       }}>{heading.text}</button>):<span className="muted-xs">見出しがありません。</span>}
@@ -287,7 +283,6 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
       key={b.blockIndex}
       data-word-block={b.blockIndex}
       className={'workspace-word-block '+(active?'selected ':'')+(heading?'word-heading ':'')+(list?'word-list':'')}
-      style={totalBlocks>120?{contentVisibility:'auto',containIntrinsicSize:'auto 44px'}:undefined}
       onClick={()=>{if(selected!==b.blockIndex)activeEditor.current=null;setActiveAddition(null);setSelected(b.blockIndex)}}
     >
       {b.type==='p'?editable?<WordParagraphEditor label={'段落 '+(b.blockIndex+1)} runs={runs} readOnly={locked} onFocus={ed=>{activeEditor.current=ed;setActiveAddition(null);setSelected(b.blockIndex)}} onChange={next=>{
@@ -328,22 +323,14 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     {resource.error&&<div className="error-box" role="alert">{resource.error}<button onClick={resource.retry}>再試行</button></div>}
     {resource.loading&&resource.data&&<p className="workspace-refresh muted-xs" role="status">最新の内容を読み込み中…</p>}
     {!resource.data?<div className="workspace-loading">{resource.error?'文書を表示できません。':'読み込み中…'}</div>:<article ref={canvas} className="workspace-word" aria-label="文書" data-continuous-canvas="true">
-      {Array.from({length:totalChunks},(_,chunkIndex)=>{
-        const chunkBlocks=chunksMap[chunkIndex];
-        if(chunkBlocks){
-          return <React.Fragment key={chunkIndex}>{chunkBlocks.map(renderBlock)}</React.Fragment>;
-        }
-        const startIndex=chunkIndex*CHUNK_SIZE;
-        const count=Math.min(CHUNK_SIZE,Math.max(1,totalBlocks-startIndex));
-        return <DocxChunkSentinel
-          key={chunkIndex}
-          chunkIndex={chunkIndex}
-          startIndex={startIndex}
-          count={count}
-          loading={Boolean(loadingChunks[chunkIndex])}
-          onVisible={loadChunk}
-        />;
-      })}
+      {Array.from({length:totalChunks},(_,index)=><WordChunk
+        key={index}
+        index={index}
+        count={Math.min(CHUNK_SIZE,Math.max(0,blockCount-index*CHUNK_SIZE))}
+        blocks={retained.has(index)?(index===0?resource.data?.blocks:activeChunks?.get(index)):undefined}
+        onVisibility={onVisibility}
+        renderBlock={renderBlock}
+      />)}
       {mode==='edit'&&additions.map((entry,index)=>{
         const cancel=()=>{if(artifact.revision!==undefined)onDraft(artifact.revision,null,entry.key);if(activeAddition===entry.key){activeEditor.current=null;setActiveAddition(null)}};
         if(entry.operation.op==='docx.add_paragraph')return <div key={entry.key}>

@@ -64,9 +64,8 @@ type PdfVal =
   | PdfVal[]
   | PdfDict;
 
-const MAX_PAGES = 20_000;
-const MAX_TREE_DEPTH = 64;
-const MAX_DECOMPRESSED_STREAM_BYTES = 16 * 1024 * 1024;
+// Bound expansion across the selected page and its object streams, including intermediate filter output.
+const PDF_EXPANSION_BUDGET_BYTES = 200 * 1024 * 1024;
 
 function sha256(data: string | Buffer): string {
   return crypto.createHash('sha256').update(data).digest('hex');
@@ -211,7 +210,7 @@ class PdfTokenizer {
   }
 
   readValue(depth = 0): PdfVal | undefined {
-    if (depth > 48) return null;
+    if (depth > 48) throw new Error('PDF object nesting exceeds the parser budget');
     this.skipWs();
     if (this.pos >= this.end) return undefined;
     const b = this.buf[this.pos];
@@ -265,16 +264,15 @@ class PdfTokenizer {
     const arr: PdfVal[] = [];
     while (this.pos < this.end) {
       this.skipWs();
-      if (this.pos >= this.end) break;
       if (this.buf[this.pos] === 0x5d) {
         this.pos++;
-        break;
+        return arr;
       }
       const val = this.readValue(depth);
       if (val === undefined) break;
       arr.push(val);
     }
-    return arr;
+    throw new Error('Unterminated PDF array');
   }
 
   readDict(depth: number): Record<string, PdfVal> {
@@ -282,22 +280,17 @@ class PdfTokenizer {
     const dict: Record<string, PdfVal> = {};
     while (this.pos < this.end) {
       this.skipWs();
-      if (this.pos >= this.end) break;
-      if (this.buf[this.pos] === 0x3e && this.pos + 1 < this.end && this.buf[this.pos + 1] === 0x3e) {
+      if (this.buf[this.pos] === 0x3e && this.buf[this.pos + 1] === 0x3e) {
         this.pos += 2;
-        break;
+        return dict;
       }
-      if (this.buf[this.pos] !== 0x2f) {
-        // Recover from unexpected token inside dict
-        this.pos++;
-        continue;
-      }
+      if (this.buf[this.pos] !== 0x2f) break;
       const key = this.readName();
       const val = this.readValue(depth);
-      if (val === undefined) break;
+      if (val === undefined || Object.hasOwn(dict, key)) break;
       dict[key] = val;
     }
-    return dict;
+    throw new Error('Incomplete or ambiguous PDF dictionary');
   }
 }
 
@@ -400,6 +393,7 @@ function applyPngPredictor(raw: Buffer, predictor: number, columns: number): Buf
 class PdfReader {
   readonly objects = new Map<number, PdfVal>();
   rootRef: PdfRef | null = null;
+  private expansionRemaining = PDF_EXPANSION_BUDGET_BYTES;
 
   constructor(readonly buf: Buffer) {
     this.parseAllObjects();
@@ -491,20 +485,21 @@ class PdfReader {
 
   private findRoot(): void {
     // 1. Check classic trailers from end of file backwards
-    const text = this.buf.toString('latin1');
-    let idx = text.lastIndexOf('trailer');
+    let idx = this.buf.lastIndexOf('trailer');
     while (idx >= 0) {
       const tok = new PdfTokenizer(this.buf, idx + 7, this.buf.length);
       const val = tok.readValue();
       if (isDict(val) && isRef(val['/Root'])) {
+        if (val['/Encrypt']) throw new Error('Encrypted PDF');
         this.rootRef = val['/Root'];
         return;
       }
-      idx = text.lastIndexOf('trailer', idx - 1);
+      idx = idx > 0 ? this.buf.lastIndexOf('trailer', idx - 1) : -1;
     }
     // 2. Check /Type /XRef stream dicts (PDF 1.5+ cross-reference streams)
     for (const val of this.objects.values()) {
       if (isStream(val) && val.dict['/Type'] === '/XRef' && isRef(val.dict['/Root'])) {
+        if (val.dict['/Encrypt']) throw new Error('Encrypted PDF');
         this.rootRef = val.dict['/Root'];
       }
     }
@@ -518,14 +513,15 @@ class PdfReader {
     }
   }
 
-  resolve(val: PdfVal | undefined, depth = 0): PdfVal | undefined {
-    let cur = val;
-    let steps = depth;
-    while (isRef(cur) && steps < 16) {
-      cur = this.objects.get(cur.obj);
-      steps++;
+  resolve(value: PdfVal | undefined): PdfVal | undefined {
+    if (!isRef(value)) return value;
+    const seen = new Set<number>();
+    while (isRef(value)) {
+      if (seen.has(value.obj)) throw new Error('Cyclic PDF reference');
+      seen.add(value.obj);
+      value = this.objects.get(value.obj);
     }
-    return cur;
+    return value;
   }
 
   decodeStream(stm: PdfStream): Buffer | null {
@@ -547,13 +543,14 @@ class PdfReader {
 
     let data: Buffer = stm.rawBytes;
     for (let i = 0; i < filters.length; i++) {
+      if (this.expansionRemaining < 1) return null;
       const f = filters[i];
       if (f === '/FlateDecode' || f === '/Fl') {
         try {
-          data = zlib.inflateSync(data, { maxOutputLength: MAX_DECOMPRESSED_STREAM_BYTES });
+          data = zlib.inflateSync(data, { maxOutputLength: this.expansionRemaining });
         } catch {
           try {
-            data = zlib.inflateRawSync(data, { maxOutputLength: MAX_DECOMPRESSED_STREAM_BYTES });
+            data = zlib.inflateRawSync(data, { maxOutputLength: this.expansionRemaining });
           } catch {
             return null;
           }
@@ -571,42 +568,48 @@ class PdfReader {
       } else if (f === '/ASCII85Decode' || f === '/A85') {
         data = decodeAscii85(data);
       } else {
-        // Unsupported stream filter (e.g. DCTDecode image) — keep raw bytes
-        break;
+        return null;
       }
+      this.expansionRemaining -= data.length;
+      if (this.expansionRemaining < 0) return null;
     }
     return data;
   }
 
-  hashResources(resVal: PdfVal | undefined, depth = 0): string {
-    if (depth > 4) return 'depth';
-    const resolved = this.resolve(resVal);
-    if (!isDict(resolved)) return 'none';
-    const summary: Record<string, unknown> = {};
-    for (const key of Object.keys(resolved).sort()) {
-      const entry = this.resolve(resolved[key]);
-      if (isDict(entry)) {
-        const sub: Record<string, string> = {};
-        for (const subKey of Object.keys(entry).sort()) {
-          const item = this.resolve(entry[subKey]);
-          if (isStream(item)) {
-            sub[subKey] = sha256(item.rawBytes);
-          } else if (isDict(item)) {
-            const subType = String(item['/Subtype'] ?? item['/BaseFont'] ?? item['/Type'] ?? '');
-            const subFontFile = item['/FontDescriptor'] ? this.hashResources(item['/FontDescriptor'], depth + 1) : '';
-            sub[subKey] = sha256(JSON.stringify([subType, subFontFile, Object.keys(item).sort()]));
-          } else {
-            sub[subKey] = String(item ?? '');
-          }
-        }
-        summary[key] = sub;
-      } else if (Array.isArray(entry)) {
-        summary[key] = entry.map((v) => String(this.resolve(v) ?? ''));
-      } else {
-        summary[key] = String(entry ?? '');
-      }
+  hashPageDependency(value: PdfVal | undefined, active = new Set<number>(), memo = new Map<number, string>()): string {
+    if (isRef(value)) {
+      if (active.has(value.obj)) return sha256(JSON.stringify(['cycle', value.obj, value.gen]));
+      const cached = memo.get(value.obj);
+      if (cached) return cached;
+      const object = this.objects.get(value.obj);
+      if (object === undefined) throw new Error('Missing PDF dependency');
+      active.add(value.obj);
+      const fingerprint = this.hashPageDependency(object, active, memo);
+      active.delete(value.obj);
+      memo.set(value.obj, fingerprint);
+      return fingerprint;
     }
-    return sha256(JSON.stringify(summary));
+    const hash = crypto.createHash('sha256');
+    const dict = isStream(value) ? value.dict : isDict(value) ? value : undefined;
+    if (dict) {
+      hash.update(isStream(value) ? 'stream' : 'dict');
+      for (const key of Object.keys(dict).sort()) {
+        // The annotation page backlink is not part of its appearance.
+        if (key === '/P') {
+          const parent = this.resolve(dict[key]);
+          if (isDict(parent) && parent['/Type'] === '/Page') continue;
+        }
+        if (isStream(value) && key === '/Length') continue;
+        hash.update(JSON.stringify(key)).update(this.hashPageDependency(dict[key], active, memo));
+      }
+      if (isStream(value)) hash.update(value.rawBytes);
+    } else if (Array.isArray(value)) {
+      hash.update('array');
+      for (const item of value) hash.update(this.hashPageDependency(item, active, memo));
+    } else {
+      hash.update(JSON.stringify(value ?? null));
+    }
+    return hash.digest('hex');
   }
 }
 
@@ -708,9 +711,7 @@ function extractContentItems(
     });
   };
 
-  let guard = 0;
-  while (tok.pos < tok.end && guard < 200_000) {
-    guard++;
+  while (tok.pos < tok.end) {
     tok.skipWs();
     if (tok.pos >= tok.end) break;
     const b = tok.buf[tok.pos];
@@ -734,7 +735,7 @@ function extractContentItems(
     }
     // Operator
     if (word === 'q') {
-      if (ctmStack.length < 64) ctmStack.push([...ctm]);
+      ctmStack.push([...ctm]);
     } else if (word === 'Q') {
       const prev = ctmStack.pop();
       if (prev) ctm = prev;
@@ -833,17 +834,18 @@ function extractContentItems(
   return { text: textParts.join(' ').replace(/\s+/g, ' ').trim(), items };
 }
 
-export function inspectPdfDocument(buffer: Buffer): PdfDocumentTargets | null {
-  if (!buffer.length) return null;
-  const headerProbe = buffer.subarray(0, Math.min(buffer.length, 1024)).toString('latin1');
-  if (!headerProbe.includes('%PDF-')) return null;
+export function inspectPdfDocument(buffer: Buffer, targetPageIndex?: number): PdfDocumentTargets | null {
+  if (!buffer.subarray(0, 1024).includes('%PDF-')) return null;
+  try {
+    return inspectPageTree(new PdfReader(buffer), targetPageIndex);
+  } catch {
+    return null;
+  }
+}
 
-  const reader = new PdfReader(buffer);
-  if (!reader.rootRef) return null;
-  const catalog = reader.resolve(reader.rootRef);
-  if (!isDict(catalog)) return null;
-  const pagesRoot = reader.resolve(catalog['/Pages']);
-  if (!isDict(pagesRoot)) return null;
+function inspectPageTree(reader: PdfReader, targetPageIndex?: number): PdfDocumentTargets | null {
+  const catalog = reader.resolve(reader.rootRef ?? undefined);
+  if (!isDict(catalog) || !catalog['/Pages']) return null;
 
   interface Inherited {
     mediaBox: [number, number, number, number] | null;
@@ -853,17 +855,24 @@ export function inspectPdfDocument(buffer: Buffer): PdfDocumentTargets | null {
     resources: PdfVal | undefined;
   }
 
-  const pageDicts: Array<{ dict: Record<string, PdfVal>; inh: Inherited }> = [];
-  const visited = new Set<number>();
-
-  const walk = (nodeRef: PdfVal | undefined, inh: Inherited, depth: number) => {
-    if (depth > MAX_TREE_DEPTH || pageDicts.length >= MAX_PAGES) return;
-    if (isRef(nodeRef)) {
-      if (visited.has(nodeRef.obj)) return;
-      visited.add(nodeRef.obj);
+  const selected: Array<{ dict: PdfDict; inh: Inherited; pageIndex: number }> = [];
+  const visited = new Set<PdfDict>();
+  type TreeEntry = { node: PdfVal; inherited: Inherited } | { count: number; offset: number };
+  const stack: TreeEntry[] = [{
+    node: catalog['/Pages'],
+    inherited: { mediaBox: null, cropBox: null, rotate: 0, userUnit: 1, resources: undefined },
+  }];
+  let pageCount = 0;
+  while (stack.length) {
+    const entry = stack.pop()!;
+    if ('count' in entry) {
+      if (pageCount - entry.offset !== entry.count) return null;
+      continue;
     }
-    const node = reader.resolve(nodeRef);
-    if (!isDict(node)) return;
+    const inh = entry.inherited;
+    const node = reader.resolve(entry.node);
+    if (!isDict(node) || visited.has(node)) return null;
+    visited.add(node);
 
     const nextInh: Inherited = {
       mediaBox: parseBox(node['/MediaBox'], reader) ?? inh.mediaBox,
@@ -878,24 +887,25 @@ export function inspectPdfDocument(buffer: Buffer): PdfDocumentTargets | null {
 
     const nodeType = reader.resolve(node['/Type']);
     const kids = reader.resolve(node['/Kids']);
-    if (nodeType === '/Pages' || (Array.isArray(kids) && nodeType !== '/Page')) {
-      if (Array.isArray(kids)) {
-        for (const kid of kids) {
-          walk(kid, nextInh, depth + 1);
-        }
+    if (nodeType === '/Pages') {
+      const count = reader.resolve(node['/Count']);
+      if (!Array.isArray(kids) || typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0) return null;
+      stack.push({ count, offset: pageCount });
+      for (let index = kids.length - 1; index >= 0; index--) {
+        stack.push({ node: kids[index], inherited: nextInh });
       }
-      return;
+    } else if (nodeType === '/Page' && kids === undefined) {
+      if (targetPageIndex === undefined || targetPageIndex === pageCount) {
+        selected.push({ dict: node, inh: nextInh, pageIndex: pageCount });
+      }
+      pageCount++;
+    } else {
+      return null;
     }
-    if (nodeType === '/Page') {
-      pageDicts.push({ dict: node, inh: nextInh });
-    }
-  };
+  }
 
-  walk(catalog['/Pages'], { mediaBox: null, cropBox: null, rotate: 0, userUnit: 1, resources: undefined }, 0);
-  if (pageDicts.length === 0) return null;
-
-  const pageCount = pageDicts.length;
-  const pages: PdfPageTargetInfo[] = pageDicts.map(({ dict, inh }, pageIndex) => {
+  if (!pageCount) return null;
+  const pages = selected.map(({ dict, inh, pageIndex }) => {
     const mediaBox: [number, number, number, number] = inh.mediaBox ?? [0, 0, 612, 792];
     const cropBox: [number, number, number, number] = inh.cropBox ?? mediaBox;
     const rotate = inh.rotate;
@@ -907,45 +917,50 @@ export function inspectPdfDocument(buffer: Buffer): PdfDocumentTargets | null {
 
     // Resolve and decode /Contents stream(s)
     const contentsVal = reader.resolve(dict['/Contents']);
+    if (contentsVal === undefined && dict['/Contents'] !== undefined) throw new Error('Missing PDF content');
     const contentRefs: PdfVal[] = Array.isArray(contentsVal)
       ? contentsVal
       : contentsVal !== undefined
         ? [contentsVal]
         : [];
+    let contentLength = 0;
     const decodedBuffers: Buffer[] = [];
     const streamHashes: string[] = [];
     for (const ref of contentRefs) {
       const stm = reader.resolve(ref);
-      if (isStream(stm)) {
-        const decoded = reader.decodeStream(stm) ?? stm.rawBytes;
-        decodedBuffers.push(decoded);
-        streamHashes.push(sha256(decoded));
+      if (!isStream(stm)) throw new Error('Missing PDF content stream');
+      const decoded = reader.decodeStream(stm);
+      if (!decoded || (contentLength += decoded.length) > PDF_EXPANSION_BUDGET_BYTES) {
+        throw new Error('PDF content could not be decoded within the expansion budget');
       }
+      decodedBuffers.push(decoded);
+      streamHashes.push(sha256(decoded));
     }
-    const mergedContent = decodedBuffers.length > 0 ? Buffer.concat(decodedBuffers) : Buffer.alloc(0);
-    const { text, items } = extractContentItems(mergedContent, cropBox, rotate, userUnit);
+    const content = decodedBuffers.length === 1 ? decodedBuffers[0] : Buffer.concat(decodedBuffers, contentLength);
+    const { text, items } = extractContentItems(content, cropBox, rotate, userUnit);
 
     // Resolve annotations
     const annotsVal = reader.resolve(dict['/Annots']);
+    if (annotsVal === undefined && dict['/Annots'] !== undefined) throw new Error('Missing PDF annotations');
     const annotations: PdfAnnotationTarget[] = [];
     if (Array.isArray(annotsVal)) {
       for (let ai = 0; ai < annotsVal.length; ai++) {
         const annot = reader.resolve(annotsVal[ai]);
-        if (!isDict(annot)) continue;
+        if (!isDict(annot)) throw new Error('Invalid PDF annotation');
         const subtype = String(reader.resolve(annot['/Subtype']) ?? '');
         const rect = parseBox(annot['/Rect'], reader);
         const contents = String(reader.resolve(annot['/Contents']) ?? '');
         const nm = reader.resolve(annot['/NM']);
         const uid = typeof nm === 'string' && nm ? nm : `annot-${ai}`;
-        const fingerprint = sha256(JSON.stringify({ uid, subtype, rect, contents }));
+        const fingerprint = reader.hashPageDependency(annot);
         annotations.push({ uid, subtype, rect, contents, fingerprint });
       }
     }
 
-    const resourcesHash = reader.hashResources(inh.resources);
+    const resourcesHash = reader.hashPageDependency(inh.resources);
     const pageContentHash = sha256(
       JSON.stringify({
-        v: 1,
+        v: 2,
         mediaBox,
         cropBox,
         rotate,
@@ -1022,12 +1037,12 @@ export function readPdfPageTarget(
   text: string;
   regionDigest?: string;
 } | null {
-  const doc = inspectPdfDocument(buffer);
-  if (!doc || pageIndex < 0 || pageIndex >= doc.pageCount) return null;
-  const page = doc.pages[pageIndex];
+  const doc = inspectPdfDocument(buffer, pageIndex);
+  const page = doc?.pages[0];
+  if (!page) return null;
   return {
     pageIndex: page.pageIndex,
-    pageCount: doc.pageCount,
+    pageCount: page.pageCount,
     widthPt: page.widthPt,
     heightPt: page.heightPt,
     rotate: page.rotate,

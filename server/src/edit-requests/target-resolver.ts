@@ -1,6 +1,5 @@
 import crypto from 'node:crypto';
 import type { RichBlockRecord, RichNode, RichSvgElement } from '../../../shared/rich-schema.js';
-import type { ArtifactService } from '../artifacts/artifact-service.js';
 import { canonicalJson } from '../artifacts/idempotency-coordinator.js';
 import type { TargetResolutionResult, TargetSelector } from '../artifacts/types.js';
 import { createRichEvalBudget, evaluateRichExpr } from '../rich/rich-expr-evaluator.js';
@@ -235,13 +234,4 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
   }
 
   return { status: 'needs_review', reason: 'unsupported_rich_selector_kind' };
-}
-
-export function resolveArtifactTarget(
-  artifactService: ArtifactService,
-  userId: string,
-  artifactId: string,
-  selector: TargetSelector
-): TargetResolutionResult {
-  return artifactService.resolveTargetOnArtifact(userId, artifactId, selector);
 }

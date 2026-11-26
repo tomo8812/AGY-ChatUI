@@ -373,3 +373,16 @@ HEAD `807e4ff` 以降の設計書（4.3 節、5.2 節、6.2 節、7.1 節、PIN-
 | **`VERIFIED (MOCK / EMULATION)`** | `PLAYWRIGHT_EXECUTABLE_PATH=... npx playwright test --project=pc-chromium e2e/pr3a-conformance-gaps.spec.ts e2e/pr3a-prototype.spec.ts e2e/pr3a-rich.spec.ts e2e/pr3a-rich-catalog.spec.ts` | **13 passed / 0 failed**（`iphone-webkit` 専用 4 件のみ環境未導入により `skipped`） | `pr3a-conformance-gaps.spec.ts` で 5 解像度（`1280×720`, `1440×900`, `1920×1080`, `375×812`, `430×932`）の `SourceEditor` Python hljs・`DocxModule` 130 ブロック連続キャンバス＆見出しジャンプ・`PptxModule` 15 スライド全一覧＆番号ジャンプ＆図形削除後 0 ゴースト（SVG・リサイズハンドル・bbox 差分）・`RichRenderer` 連続スライダー操作時非依存 DOM 変更 0 件を実 Chromium とスクリーンショット目視で確認。 |
 | **`UNVERIFIED`** | Full / Compact Runtime（LibreOffice + Python doc-runtime による `e2e/pr3a-real.spec.ts`・`artifact_doc_worker_test.py`）、WebKit エンジン（`--project=iphone-webkit`）・物理 iPhone（iOS Safari / PWA）、実 `agy` バイナリ、Microsoft Office デスクトップ、GitHub PR Lens CI | **未検証（本 Linux コンテナ非搭載）** | 本環境には LibreOffice / Python doc-runtime venv / Playwright WebKit / `agy` / `gh` が未導入のため未実行。CI（Compact/Full ランタイム＋WebKit）および実機環境での実行結果をもって最終確定すること。 |
 
+
+## 10. PR #38 の対象同一性・大規模文書・操作幅
+
+起点は `733a78c284caea0d670a848be593ff59478ee5ab`。この修正の判定は、[PR #38 の Checks](https://github.com/tomo8812/AGY-ChatUI/pull/38/checks) でコミット SHA が最新 HEAD と一致する実行を参照する。
+
+| 設計要件 | 実装と回帰検証 |
+| --- | --- |
+| 5.2・PIN-02 | Markdown／コードの行・文字範囲は必須の SHA-256 と前後文脈、出現順を検証する。同じ文脈で一致する候補が複数ある場合は `needs_review` とする。DOCX は一意の段落 ID または内容と文脈の一意一致が必要。PPTX はスライドの構造と、レイアウト・マスター・テーマ・画像・グラフ・埋め込みパートなどの依存関係を照合する。PDF と PPTX の旧フィンガープリントは、新方式との照合時に再確認が必要になる。 |
+| 4.2・PERF-01 | OOXML の展開安全予算は 2,000 エントリ、200 MiB、圧縮比 100 倍。XLSX の広範囲は SAX で実セルだけを順序付きでハッシュ化する。旧形式の範囲ハッシュも照合できる。PDF はページツリーを反復走査して全枝の件数と循環を確認し、選択ページだけの本文・資源・注釈を処理する。展開は対象処理全体の 200 MiB 予算内で行う。 |
+| 5.2・PERF-01／06 | 対象照合は ACP や外部レンダラーと独立の Node.js ワーカースレッドに移した。処理を 1 並列に保ち、材料となる版とディスク内容を照合する。行範囲の出現照合は線形のパターン照合を使う。DOCX は表示付近とアクティブな選択を描画し、計測済みの高さと容量制限付きキャッシュでスクロールと下書きを維持する。 |
+| 7.1・UX-01／02 | ソース編集、Word 書式、表移動の補助操作は表示幅に応じて開閉式のコマンドメニューへ移す。DOCX の見出しジャンプ、描画範囲外のアンマウントと復帰、表検索の途中でのシート切替をブラウザーで検証する。 |
+
+ブラウザー検証は実ドキュメント処理とビューポートエミュレーションを併用する。CI の `pr3a-browser-captures` は Compact／Full の結果をディレクトリ別に保存し、`pr3a-evidence.json` にプロファイル、解像度、操作、Revision、PPTX の bbox 領域別 MAE／SSIM、移動・削除後の比較を記録する。対象は Chromium 1280×720・1440×900・1920×1080 と WebKit 375×812・430×932。ブラウザーハーネスの Office 操作は開発／CI 用の明示的な非隔離構成で実行する。物理 iPhone と実 `agy` の確認は §11.2 の環境区分に従う。

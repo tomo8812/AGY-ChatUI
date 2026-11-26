@@ -14,6 +14,7 @@ import type {
 import {
   editCapabilities,
   resolveTextSnippetByContext,
+  isSha256,
   sha256Text,
   splitLines,
   type AdapterCapabilityContext,
@@ -607,30 +608,21 @@ export class MarkdownAdapter implements FormatAdapter {
   resolveTarget(buffer: Buffer, selector: TargetSelector, _meta: AdapterFileMeta): TargetResolutionResult {
     const text = buffer.toString('utf8');
     if (selector.kind === 'md_heading') {
-      const blocks = markdownStructure(text, slugifyHeading).filter((block) => block.node.type === 'heading' &&
-        block.slug === selector.headingSlug && (!selector.headingLevel || block.node.depth === selector.headingLevel));
-      if (blocks.length === 0) return { status: 'stale', reason: 'heading_not_found' };
-      const hasOcc = selector.occurrenceIndex !== undefined && selector.occurrenceIndex !== null;
-      if (hasOcc) {
-        const occ = Number(selector.occurrenceIndex);
-        if (!Number.isInteger(occ) || occ < 0 || occ >= blocks.length) {
-          return { status: 'needs_review', reason: 'heading_occurrence_changed' };
-        }
-        const candidate = blocks[occ];
-        if (!selector.expectedHeadingHash || sha256Text(text.slice(candidate.start, candidate.end).trim()) !== selector.expectedHeadingHash) {
-          return { status: 'needs_review', reason: 'heading_changed_or_ambiguous' };
-        }
-        return {
-          status: 'resolved',
-          resolvedSnippet: text.slice(candidate.start, candidate.end),
-          resolvedRange: { startLine: candidate.startLine, endLine: candidate.endLine, occurrenceIndex: occ },
-        };
+      const { headingLevel, headingSlug, expectedHeadingHash, occurrenceIndex } = selector;
+      if (typeof headingSlug !== 'string' || typeof headingLevel !== 'number' || !Number.isInteger(headingLevel) ||
+          headingLevel < 1 || headingLevel > 6 || !isSha256(expectedHeadingHash) ||
+          typeof occurrenceIndex !== 'number' || !Number.isSafeInteger(occurrenceIndex) || occurrenceIndex < 0) {
+        return { status: 'needs_review', reason: 'invalid_heading_fingerprint' };
       }
-      const matches = blocks.filter(({ start, end }) =>
-        Boolean(selector.expectedHeadingHash) && sha256Text(text.slice(start, end).trim()) === selector.expectedHeadingHash);
-      if (matches.length !== 1) return { status: 'needs_review', reason: 'heading_changed_or_ambiguous' };
+      const blocks = markdownStructure(text, slugifyHeading).filter((block) => block.node.type === 'heading' &&
+        block.slug === headingSlug && block.node.depth === headingLevel);
+      if (blocks.length === 0) return { status: 'stale', reason: 'heading_not_found' };
+      const matches = blocks.filter(({ start, end }) => sha256Text(text.slice(start, end).trim()) === expectedHeadingHash);
+      if (matches.length !== 1 || blocks[occurrenceIndex] !== matches[0]) {
+        return { status: 'needs_review', reason: 'heading_changed_or_ambiguous' };
+      }
       const { start, end, startLine, endLine } = matches[0];
-      return { status: 'resolved', resolvedSnippet: text.slice(start, end), resolvedRange: { startLine, endLine } };
+      return { status: 'resolved', resolvedSnippet: text.slice(start, end), resolvedRange: { startLine, endLine, occurrenceIndex } };
     }
 
     if (selector.kind === 'md_table') {
@@ -651,17 +643,19 @@ export class MarkdownAdapter implements FormatAdapter {
     }
 
     if (selector.kind === 'md_text_range' || selector.kind === 'md_block' || selector.kind === 'md_code_block') {
-      const expectedHash =
-        selector.expectedSnippetHash ?? selector.expectedBlockHash ?? selector.expectedCodeHash;
+      const expectedHash = selector.kind === 'md_block' ? selector.expectedBlockHash :
+        selector.kind === 'md_code_block' ? selector.expectedCodeHash : selector.expectedSnippetHash;
       return resolveTextSnippetByContext({
         text,
-        startLine: Number(selector.startLine ?? 1),
-        endLine: Number(selector.endLine ?? 1),
-        expectedSnippetHash: expectedHash ? String(expectedHash) : undefined,
-        contextBeforeHash: selector.contextBeforeHash ? String(selector.contextBeforeHash) : undefined,
-        contextAfterHash: selector.contextAfterHash ? String(selector.contextAfterHash) : undefined,
-        occurrenceIndex: selector.occurrenceIndex !== undefined ? Number(selector.occurrenceIndex) : undefined,
+        startLine: selector.startLine,
+        endLine: selector.endLine,
+        expectedSnippetHash: expectedHash,
+        contextBeforeHash: selector.contextBeforeHash,
+        contextAfterHash: selector.contextAfterHash,
+        occurrenceIndex: selector.occurrenceIndex,
+        snippetHint: _meta.snippetHint,
         requireOccurrenceIndex: selector.kind === 'md_text_range',
+        requireAfterContext: selector.kind !== 'md_code_block',
       });
     }
 

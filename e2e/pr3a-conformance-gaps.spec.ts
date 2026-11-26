@@ -166,7 +166,7 @@ test('Base ChatUI non-localhost HTTP (no crypto.subtle): PDF & CSV target pinnin
     expect(pdfSel.expectedPageContentHash).toMatch(/^[0-9a-f]{64}$/);
     expect(pdfSel.expectedPageContentHash).not.toBe(pdfArt.sha256);
     expect(pdfSel.expectedRegionDigest).toMatch(/^[0-9a-f]{64}$/);
-    expect(server.ctx.editRequestService.resolveRequestTarget(pdfRequests[0]).status).toBe('resolved');
+    expect((await server.ctx.editRequestService.resolveRequestTarget(pdfRequests[0])).status).toBe('resolved');
 
     // 2. CSV target pinning with mandatory expectedRowCount/expectedColCount/expectedHeaderHash/expectedRangeValuesHash
     await page.goto(BASE_HARNESS + '?kind=csv');
@@ -189,7 +189,7 @@ test('Base ChatUI non-localhost HTTP (no crypto.subtle): PDF & CSV target pinnin
     const csvSel = csvRequests[0].selector as { expectedHeaderHash?: string; expectedRangeValuesHash?: string };
     expect(csvSel.expectedHeaderHash).toMatch(/^[0-9a-f]{64}$/);
     expect(csvSel.expectedRangeValuesHash).toMatch(/^[0-9a-f]{64}$/);
-    expect(server.ctx.editRequestService.resolveRequestTarget(csvRequests[0]).status).toBe('resolved');
+    expect((await server.ctx.editRequestService.resolveRequestTarget(csvRequests[0])).status).toBe('resolved');
     expect(consoleErrors).toEqual([]);
   } finally {
     await page.unrouteAll({ behavior: 'wait' });
@@ -321,9 +321,15 @@ for (const vp of VIEWPORTS) {
     await expect(page.getByRole('button', { name: '前の段落' })).toHaveCount(0);
     await expect(page.getByRole('button', { name: '次の段落' })).toHaveCount(0);
     // Jump directly to heading at block 95 across chunk boundary
-    await page.getByRole('button', { name: '見出し一覧' }).click();
+    const outlineButton=page.getByRole('button', { name: '見出し一覧' });
+    if(!await outlineButton.isVisible())await page.getByRole('button',{name:'その他の編集操作'}).click();
+    await outlineButton.click();
     await page.getByRole('button', { name: 'Appendix Section' }).click();
-    await expect(page.locator('[data-word-block="95"]')).toBeVisible();
+    await expect(page.locator('[data-word-block="95"]')).toBeInViewport();
+    await expect(page.locator('[data-word-block="0"]')).toHaveCount(0);
+    await page.locator('.viewer-zoom-scroll').evaluate(el=>{el.scrollTop=0});
+    await expect(page.locator('[data-word-block="0"]')).toBeInViewport();
+    await expect(page.locator('[data-word-block="95"]')).toHaveClass(/selected/);
     await assertNoHorizontalOverflow(page);
     await page.screenshot({ path: info.outputPath(`docx-continuous-${vp.width}x${vp.height}.png`) });
 
@@ -391,7 +397,8 @@ for (const vp of VIEWPORTS) {
           },
         });
       }
-      if (endpoint === 'render' || endpoint === 'render-draft-sprite') {
+      if(endpoint==='render-draft-sprite'||endpoint==='render-draft-slide')return route.fulfill({status:422,json:{error:'fixture preview unavailable'}});
+      if (endpoint === 'render') {
         return route.fulfill({ body: bgPng, contentType: 'image/png', headers: { 'X-Artifact-Revision': '1', 'X-Artifact-Sha256': SHA } });
       }
       return route.fulfill({ json: {} });
@@ -424,14 +431,17 @@ for (const vp of VIEWPORTS) {
     const removableSvg = page.locator('svg[data-shape-id="11"]');
     await expect(removableSvg).toBeVisible();
     const stage = page.locator('.workspace-slide');
+    const captureSlide=()=>stage.screenshot({scale:'css',style:'.workspace-shape-hit,.workspace-resize-handle{visibility:hidden!important}'});
+    await expect(stage.getByAltText('スライド背景')).toBeVisible();
+    await stage.getByAltText('スライド背景').evaluate((img:HTMLImageElement)=>img.decode());
     const stageBox = await stage.boundingBox();
-    const beforeMovePng = await stage.screenshot();
+    const beforeMovePng = await captureSlide();
 
     // Move RemovableBox left by 40pt via Shift+ArrowLeft and confirm old right strip cleared with 0 ghosting
     const removableBtn = page.getByRole('button', { name: 'RemovableBox', exact: true });
     await removableBtn.click();
     for (let k = 0; k < 4; k++) await removableBtn.press('Shift+ArrowLeft');
-    const afterMovePng = await stage.screenshot();
+    const afterMovePng = await captureSlide();
     if (stageBox && stageBox.width > 0 && stageBox.height > 0) {
       const sx = stageBox.width / 640;
       const sy = stageBox.height / 360;
@@ -447,7 +457,7 @@ for (const vp of VIEWPORTS) {
       expect(moveAudit.regions.find((r) => r.id === 'vacatedRight')!.metrics.mae).toBeGreaterThan(1.0);
     }
 
-    const beforePng = await stage.screenshot();
+    const beforePng = await captureSlide();
     const cmdToggle = page.locator('.workspace-commandbar-toggle');
     if (await cmdToggle.isVisible()) {
       await cmdToggle.click();
@@ -460,7 +470,7 @@ for (const vp of VIEWPORTS) {
     await expect(page.locator('.workspace-resize-handle')).toHaveCount(0);
 
     // Verify visually that the vacated bbox actually changed (no residual ghost of the red box!)
-    const afterPng = await stage.screenshot();
+    const afterPng = await captureSlide();
     if (stageBox && stageBox.width > 0 && stageBox.height > 0) {
       const sx = stageBox.width / 640;
       const sy = stageBox.height / 360;
@@ -535,7 +545,7 @@ for (const vp of VIEWPORTS) {
     await page.getByLabel('シート全体を検索').fill('Needle');
     await page.getByRole('button', { name: '次の一致', exact: true }).click();
     // Switch sheet while search is in-flight!
-    await page.getByRole('button', { name: 'Sheet2', exact: true }).click();
+    await page.getByRole('combobox', { name: 'シート', exact: true }).selectOption({label:'Sheet2'});
     resolveDelayedSearch?.();
     await expect(page.getByRole('gridcell', { name: 'A1', exact: true })).toHaveText('SecondSheet');
     // Wait briefly for any late response to settle and verify no stale jump or error alert

@@ -272,7 +272,7 @@ export function GridModule(props:WorkspaceModuleProps){
         };
         snippet=exact.rows.map(row=>row.join('\t')).join('\n');
       }else{
-        const meta=await workspaceApi.range<{target:{sheetId:string;sheetName:string;rangeA1:string;expectedSheetStructHash:string;expectedRangeValuesHash:string;snippet?:string}|null}>(artifact.id,{targetMetadata:'true',sheetId:sheet.id,rangeA1:rangeLabel});
+        const meta=await workspaceApi.range<{target:{sheetId:string;sheetName:string;rangeA1:string;expectedSheetStructHash:string;expectedRangeValuesHash:string;expectedOrderKeysHash?:string;snippet?:string}|null}>(artifact.id,{targetMetadata:'true',sheetId:sheet.id,rangeA1:rangeLabel});
         assertRevision(artifact,meta);
         if(!meta.target||!meta.target.expectedSheetStructHash||!meta.target.expectedRangeValuesHash){
           throw Error('選択対象を読み込めませんでした。');
@@ -283,11 +283,12 @@ export function GridModule(props:WorkspaceModuleProps){
           rangeA1:meta.target.rangeA1,
           expectedSheetStructHash:meta.target.expectedSheetStructHash,
           expectedRangeValuesHash:meta.target.expectedRangeValuesHash,
+          ...(meta.target.expectedOrderKeysHash?{expectedOrderKeysHash:meta.target.expectedOrderKeysHash}:{}),
         };
         snippet=meta.target.snippet||(row0===row1&&col0===col1?original(row0,col0):undefined);
       }
       if(latest.current.revisionKey!==identity.revisionKey||latest.current.sheetId!==identity.sheetId||latest.current.selectedRange!==identity.selectedRange)return;
-      onTarget({baseRevision:artifact.revision,label:sheet.name+' '+rangeLabel,selector,selectedContentSnapshot:snippet});
+      onTarget({baseRevision:artifact.revision,label:sheet.name+' '+rangeLabel,selector,selectedContentSnapshot:snippet?.slice(0,50_000)});
       setPinError('');
     }catch{setPinError('選択対象を識別できませんでした。')}
   }
@@ -367,7 +368,7 @@ export function GridModule(props:WorkspaceModuleProps){
   const activeFormulaStatus=raw(current.row,current.col)?.formulaStatus;
   const formulaWarning=(activeFormulaStatus==='unevaluated_unsupported'||activeFormulaStatus==='error_formula')
     && !entries.has(key(current.row,current.col)) && !previews.has(address(current.row,current.col));
-  const primary=<><span className="workspace-cell-address">{selectedRange}</span><span aria-hidden="true">ƒx</span><input ref={formulaInput} className="workspace-formula" aria-label="数式・セル値" value={ready?value(current.row,current.col):''} readOnly={!inputEnabled} onChange={e=>change(e.target.value)}/>{formulaWarning&&<small title={FORMULA_STATUS[activeFormulaStatus]}>{activeFormulaStatus==='error_formula'?'数式エラー':'未評価'}</small>}{mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!ready||!inData} onClick={()=>void pin()}>セルを対象にする</button>}{mode==='edit'&&<>
+  const primary=<><span className="workspace-cell-address" title={selectedRange}>{selectedRange}</span><span aria-hidden="true">ƒx</span><input ref={formulaInput} className="workspace-formula" aria-label="数式・セル値" value={ready?value(current.row,current.col):''} readOnly={!inputEnabled} onChange={e=>change(e.target.value)}/>{formulaWarning&&<small title={FORMULA_STATUS[activeFormulaStatus]}>{activeFormulaStatus==='error_formula'?'数式エラー':'未評価'}</small>}{mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!ready||!inData} onClick={()=>void pin()}>セルを対象にする</button>}{mode==='edit'&&<>
       {xlsx&&<button type="button" className="btn btn-secondary btn-xs" aria-pressed={Boolean(styleEntry?.operation.bold??raw(current.row,current.col)?.bold)} disabled={!canStyle} onClick={toggleBold}>太字</button>}
     </>}</>;
   const secondary=mode==='edit'?<>
@@ -376,10 +377,16 @@ export function GridModule(props:WorkspaceModuleProps){
       {editAction&&<button type="button" className="btn btn-secondary btn-xs" disabled={!structuralEnabled||!validName} onClick={stageStructure}>適用</button>}
     </>:null;
   const toolbar=<ResponsiveCommandBar primary={primary} secondary={secondary} minInlineWidth={850} closeOnButton/>;
-  const tabs=<div className="workspace-toolbar" role="group" aria-label="シート">{sheets.map(s=><button key={s.id} type="button" className={'btn btn-secondary btn-xs '+(s.id===sheet?.id?'active':'')} aria-pressed={s.id===sheet?.id} onClick={()=>{setSheetId(s.id);move(0,0)}}>{s.name}</button>)}
-    <input aria-label="セル範囲へ移動" placeholder="A1:B2" value={jump} onChange={e=>setJump(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();jumpToRange()}}}/><button type="button" className="btn btn-secondary btn-xs" disabled={!jump.trim()} onClick={jumpToRange}>移動</button>
-    <input aria-label={xlsx?'シート全体を検索':'表全体を検索'} placeholder={xlsx?'シート全体を検索':'表全体を検索'} value={search} onChange={e=>{setSearch(e.target.value)}} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();void nextMatch()}}}/><button type="button" className="btn btn-secondary btn-xs" disabled={!search.trim()||searching||!structure.ready} onClick={()=>void nextMatch()}>{searching?'検索中…':'次の一致'}</button></div>;
-  const filters=!xlsx&&mode!=='pin'&&<form className="workspace-toolbar" onSubmit={event=>{
+  const sheetTabs=sheets.length>1&&<select aria-label="シート" value={sheet?.id??''}
+    onChange={event=>{setSheetId(event.target.value);move(0,0)}}>
+    {sheets.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}
+  </select>;
+  const tabs=<ResponsiveCommandBar label="その他の表の移動操作" minInlineWidth={720}
+    primary={<>{sheetTabs}<input className="workspace-command-input" aria-label={xlsx?'シート全体を検索':'表全体を検索'} placeholder={xlsx?'シート全体を検索':'表全体を検索'} value={search} onChange={e=>setSearch(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();void nextMatch()}}}/>
+      <button type="button" className="btn btn-secondary btn-xs" disabled={!search.trim()||searching||!structure.ready} onClick={()=>void nextMatch()}>{searching?'検索中…':'次の一致'}</button></>}
+    secondary={<><input aria-label="セル範囲へ移動" placeholder="A1:B2" value={jump} onChange={e=>setJump(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();jumpToRange()}}}/>
+      <button type="button" className="btn btn-secondary btn-xs" disabled={!jump.trim()} onClick={jumpToRange}>移動</button></>}/>;
+  const filters=!xlsx&&mode!=='pin'&&<form className="workspace-toolbar workspace-toolbar-fields" onSubmit={event=>{
     event.preventDefault();setAppliedFilter(filterInput.trim());move(0,0)
   }}>
     <input aria-label="行を絞り込む" placeholder="行を絞り込む" value={filterInput} onChange={event=>setFilterInput(event.target.value)}/>
@@ -388,7 +395,7 @@ export function GridModule(props:WorkspaceModuleProps){
   </form>;
   return <UnifiedViewerZoomShell resetKey={artifact.id+':grid'} controlsTop={<>{toolbar}{filters}</>} controlsBottom={tabs}>
     {(structure.error||rangeError||pinError)&&<div role="alert" className="error-box">{structure.error||rangeError||pinError}<button type="button" onClick={()=>{structure.retry();setRetry(v=>v+1);setPinError('')}}>再試行</button></div>}
-    {structural.length>0&&<div className="workspace-toolbar" role="status">
+    {structural.length>0&&<div className="workspace-toolbar workspace-toolbar-fields" role="status">
       {structural.map(entry=><span key={entry.key}>{entry.label}</span>)}
       <button type="button" className="btn btn-secondary btn-xs" disabled={editingLocked} onClick={()=>{
         const entry=structural.at(-1);if(entry&&artifact.revision!==undefined)onDraft(artifact.revision,null,entry.key)

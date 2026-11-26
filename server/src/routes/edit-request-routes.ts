@@ -98,7 +98,7 @@ export async function registerEditRequestRoutes(app: FastifyInstance, deps: Edit
     try {
       const request = editRequestService.getRequest(session.user.id, chatId, requestId);
       if (!request) return reply.code(404).send({ error: 'NOT_FOUND' });
-      const reResolution = editRequestService.resolveRequestTarget(request);
+      const reResolution = await editRequestService.resolveRequestTarget(request);
       return { request, reResolution };
     } catch (err) {
       return sendEditRequestError(reply, err);

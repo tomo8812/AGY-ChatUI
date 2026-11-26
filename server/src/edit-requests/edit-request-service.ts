@@ -6,7 +6,7 @@ import type { ArtifactService } from '../artifacts/artifact-service.js';
 import { ArtifactError, unsupportedOperationError } from '../artifacts/errors.js';
 import type { TargetResolutionResult, TargetSelector } from '../artifacts/types.js';
 import type { RichContentService } from '../rich/rich-content-service.js';
-import { resolveArtifactTarget, resolveRichBlockTarget } from './target-resolver.js';
+import { resolveRichBlockTarget } from './target-resolver.js';
 
 export type EditRequestStatus =
   | 'draft'
@@ -78,7 +78,7 @@ export class EditRequestService {
     // Automatically re-validate open edit requests whenever an artifact is updated
     this.artifactService.onArtifactUpdated((artifact) => {
       if (artifact.scopeKind === 'chat' && artifact.chatId) {
-        this.revalidateForArtifact(artifact.userId, artifact.id);
+        void this.revalidateForArtifact(artifact.userId, artifact.id, artifact.revision).catch(() => {});
       }
     });
   }
@@ -386,9 +386,9 @@ export class EditRequestService {
   /**
    * Re-resolves a single edit request against the latest target content.
    */
-  resolveRequestTarget(req: AiEditRequestRecord): TargetResolutionResult {
+  async resolveRequestTarget(req: AiEditRequestRecord): Promise<TargetResolutionResult> {
     if (req.targetKind === 'artifact' && req.artifactId) {
-      return resolveArtifactTarget(this.artifactService, req.userId, req.artifactId, req.selector);
+      return this.artifactService.resolveTargetOnArtifact(req.userId, req.artifactId, req.selector, req.baseRevision, req.selectedContentSnapshot);
     }
     if (req.targetKind === 'rich_block' && req.richBlockId) {
       const block = this.richContentService.getBlock(req.userId, req.chatId, req.richBlockId);
@@ -401,10 +401,10 @@ export class EditRequestService {
   /**
    * Returns strictly separated `userInstruction` and `untrustedTargetContent` for AI/MCP consumption (`PIN-05`).
    */
-  getForAgent(userId: string, chatId: string, requestId: string): AgentEditRequestPayload {
+  async getForAgent(userId: string, chatId: string, requestId: string): Promise<AgentEditRequestPayload> {
     const req = this.getRequest(userId, chatId, requestId);
     if (!req) throw new ArtifactError('NOT_FOUND', '編集依頼が見つかりません。', 404);
-    const reResolution = this.resolveRequestTarget(req);
+    const reResolution = await this.resolveRequestTarget(req);
     let regionImagePngBase64: string | undefined;
     if (req.regionImageBlobSha256) {
       const buf = this.artifactService.blobManager.readBlob(userId, req.regionImageBlobSha256);
@@ -541,7 +541,7 @@ export class EditRequestService {
     return this.getRequest(params.userId, params.chatId, existing.id)!;
   }
 
-  revalidateForArtifact(userId: string, artifactId: string): AiEditRequestRecord[] {
+  async revalidateForArtifact(userId: string, artifactId: string, revision: number): Promise<AiEditRequestRecord[]> {
     const rows = this.db.db
       .prepare(
         `SELECT * FROM ai_edit_requests
@@ -553,7 +553,17 @@ export class EditRequestService {
     const updated: AiEditRequestRecord[] = [];
     for (const r of rows) {
       const req = this.mapRow(r);
-      const res = this.resolveRequestTarget(req);
+      if (this.db.getArtifact(userId, artifactId)?.revision !== revision) break;
+      let res;
+      try {
+        res = await this.resolveRequestTarget(req);
+      } catch {
+        continue; // Resource contention is not evidence that the target changed.
+      }
+      if (this.db.getArtifact(userId, artifactId)?.revision !== revision) break;
+      const current = this.getRequest(userId, req.chatId, req.id);
+      if (!current || current.updatedAt !== req.updatedAt || current.status !== req.status ||
+          current.baseRevision !== req.baseRevision || JSON.stringify(current.selector) !== JSON.stringify(req.selector)) continue;
       if (res.status === 'needs_review' || res.status === 'stale') {
         if (req.status !== res.status) {
           const now = Date.now();
@@ -586,7 +596,8 @@ export class EditRequestService {
     const updated: AiEditRequestRecord[] = [];
     for (const r of rows) {
       const req = this.mapRow(r);
-      const res = this.resolveRequestTarget(req);
+      const block = this.richContentService.getBlock(userId, chatId, richBlockId);
+      const res = block ? resolveRichBlockTarget(block, req.selector) : { status: 'stale', reason: 'rich_block_deleted' };
       if (res.status === 'needs_review' || res.status === 'stale') {
         if (req.status !== res.status) {
           const now = Date.now();

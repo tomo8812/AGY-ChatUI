@@ -16,6 +16,7 @@ export interface AdapterFileMeta {
   filename: string;
   relPath: string;
   mimeType: string;
+  snippetHint?: string;
   dependencyManifestTruncated?: boolean;
   dependencies?: Array<{ relPath: string; status: 'present' | 'missing' | 'outside_root' }>;
 }
@@ -73,109 +74,145 @@ export function splitLines(text: string): string[] {
   return text.replace(/\r\n/g, '\n').split('\n');
 }
 
-/**
- * Resolves a line-range snippet strictly by content hash + surrounding context hash.
- * Guarantees single unique match; multiple candidates or missing matches return `needs_review` / `stale` (`PIN-02`).
- */
+export function isSha256(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+}
+
+/** Incremental exact line matching, including overlapping occurrences. */
+export function createLineMatcher(pattern: readonly string[]): (line: string) => boolean {
+  const prefix = new Uint32Array(pattern.length);
+  for (let i = 1, length = 0; i < pattern.length; i++) {
+    while (length && pattern[i] !== pattern[length]) length = prefix[length - 1];
+    if (pattern[i] === pattern[length]) length++;
+    prefix[i] = length;
+  }
+  let length = 0;
+  return line => {
+    while (length && line !== pattern[length]) length = prefix[length - 1];
+    if (line === pattern[length]) length++;
+    if (length !== pattern.length) return false;
+    length = prefix[length - 1];
+    return true;
+  };
+}
+
 export function resolveTextSnippetByContext(params: {
   text: string;
-  startLine?: number;
-  endLine?: number;
-  expectedSnippetHash?: string;
-  contextBeforeHash?: string;
-  contextAfterHash?: string;
-  occurrenceIndex?: number;
+  startLine?: unknown;
+  endLine?: unknown;
+  expectedSnippetHash?: unknown;
+  contextBeforeHash?: unknown;
+  contextAfterHash?: unknown;
+  occurrenceIndex?: unknown;
   requireOccurrenceIndex?: boolean;
+  requireAfterContext?: boolean;
+  snippetHint?: string;
+  startCol?: number;
+  endCol?: number;
 }): TargetResolutionResult {
-  const lines = splitLines(params.text);
-  const start = Math.max(1, Number(params.startLine ?? 1));
-  const end = Math.min(lines.length, Math.max(start, Number(params.endLine ?? start)));
-
-  if (!params.expectedSnippetHash) {
-    return { status: 'needs_review', reason: 'missing_expected_snippet_hash' };
+  const { startLine: start, endLine: end, expectedSnippetHash, contextBeforeHash, contextAfterHash } = params;
+  if (!isSha256(expectedSnippetHash)) return { status: 'needs_review', reason: 'missing_expected_snippet_hash' };
+  if (!isSha256(contextBeforeHash) ||
+      ((params.requireAfterContext !== false || contextAfterHash !== undefined) && !isSha256(contextAfterHash))) {
+    return { status: 'needs_review', reason: 'invalid_context_hash' };
   }
-
-  const hasOccurrenceIndex = params.occurrenceIndex !== undefined && params.occurrenceIndex !== null;
-  if (params.requireOccurrenceIndex && !hasOccurrenceIndex) {
+  const occurrence = params.occurrenceIndex;
+  if (params.requireOccurrenceIndex && occurrence === undefined) {
     return { status: 'needs_review', reason: 'missing_occurrence_index' };
   }
-  if (hasOccurrenceIndex && (!Number.isInteger(params.occurrenceIndex) || (params.occurrenceIndex as number) < 0)) {
+  if (occurrence !== undefined && (typeof occurrence !== 'number' || !Number.isSafeInteger(occurrence) || occurrence < 0)) {
     return { status: 'needs_review', reason: 'invalid_occurrence_index' };
   }
-  const expectedOccurrenceIndex = hasOccurrenceIndex ? (params.occurrenceIndex as number) : undefined;
-
-  if (start > lines.length) {
-    return { status: 'stale', reason: 'line_range_out_of_bounds' };
+  if (typeof start !== 'number' || typeof end !== 'number' ||
+      !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start) {
+    return { status: 'stale', reason: 'invalid_line_range' };
   }
 
-  // Enumerate all occurrences of the expected snippet in order so occurrenceIndex is exact.
-  const spanLen = end - start + 1;
-  const candidates: Array<{
-    startLine: number;
-    endLine: number;
-    occurrenceIndex: number;
-    contextMatch: boolean;
-    beforeSlice: string;
-    afterSlice: string;
-  }> = [];
-  for (let i = 0; i + spanLen <= lines.length; i++) {
-    const seg = lines.slice(i, i + spanLen).join('\n');
-    if (sha256Text(seg) !== params.expectedSnippetHash) continue;
-    const b = lines.slice(Math.max(0, i - 2), i).join('\n');
-    const a = lines.slice(i + spanLen, Math.min(lines.length, i + spanLen + 2)).join('\n');
-    const bOk = !params.contextBeforeHash || sha256Text(b) === params.contextBeforeHash;
-    const aOk = !params.contextAfterHash || sha256Text(a) === params.contextAfterHash;
-    candidates.push({
-      startLine: i + 1,
-      endLine: i + spanLen,
-      occurrenceIndex: candidates.length,
-      contextMatch: bOk && aOk,
-      beforeSlice: b,
-      afterSlice: a,
-    });
-  }
-
-  if (candidates.length === 0) {
-    return { status: 'stale', reason: 'snippet_not_found' };
-  }
-
-  const exactContext = candidates.filter((c) => c.contextMatch);
-  const atOriginal = candidates.find((c) => c.startLine === start && c.endLine === end);
-
-  if (atOriginal && atOriginal.contextMatch) {
-    if (expectedOccurrenceIndex !== undefined && atOriginal.occurrenceIndex !== expectedOccurrenceIndex) {
-      return { status: 'needs_review', reason: 'occurrence_index_changed' };
+  const lines = splitLines(params.text);
+  const span = end - start + 1;
+  const lastStart = lines.length - span;
+  const before = (i: number) => lines.slice(Math.max(0, i - 2), i).join('\n');
+  const after = (i: number) => lines.slice(i + span, i + span + 2).join('\n');
+  const snippetAt = (i: number) => {
+    const segment = lines.slice(i, i + span);
+    if (params.startCol !== undefined && params.endCol !== undefined) {
+      if (params.startCol - 1 > segment[0].length || params.endCol - 1 > segment[span - 1].length) return undefined;
+      segment[span - 1] = segment[span - 1].slice(0, params.endCol - 1);
+      segment[0] = segment[0].slice(params.startCol - 1);
     }
-    if (expectedOccurrenceIndex === undefined && exactContext.length > 1) {
-      return { status: 'needs_review', reason: 'ambiguous_multiple_matches' };
-    }
-    const currentSlice = lines.slice(start - 1, end).join('\n');
-    return {
-      status: 'resolved',
-      resolvedSnippet: currentSlice,
-      surroundingContext: `${atOriginal.beforeSlice}\n---\n${atOriginal.afterSlice}`,
-      resolvedRange: { startLine: start, endLine: end, occurrenceIndex: atOriginal.occurrenceIndex },
-    };
-  }
+    return segment.join('\n');
+  };
+  const contextMatches = (i: number) => sha256Text(before(i)) === contextBeforeHash &&
+    (contextAfterHash === undefined || sha256Text(after(i)) === contextAfterHash);
+  if (lastStart < 0) return { status: 'stale', reason: 'line_range_out_of_bounds' };
 
-  // Relocated match: require a UNIQUE exact-context match whose occurrenceIndex also agrees (PIN-02)
-  if (exactContext.length === 1) {
-    const match = exactContext[0];
-    if (expectedOccurrenceIndex !== undefined && match.occurrenceIndex !== expectedOccurrenceIndex) {
-      return { status: 'needs_review', reason: 'occurrence_index_changed' };
-    }
-    const resolvedSnippet = lines.slice(match.startLine - 1, match.endLine).join('\n');
-    return {
-      status: 'resolved',
-      resolvedSnippet,
-      surroundingContext: `${match.beforeSlice}\n---\n${match.afterSlice}`,
-      resolvedRange: { startLine: match.startLine, endLine: match.endLine, occurrenceIndex: match.occurrenceIndex },
-    };
+  let snippet = params.snippetHint;
+  if (snippet === undefined || sha256Text(snippet) !== expectedSnippetHash) {
+    snippet = start - 1 <= lastStart ? snippetAt(start - 1) : undefined;
+    if (snippet !== undefined && sha256Text(snippet) !== expectedSnippetHash) snippet = undefined;
   }
+  if (snippet === undefined) {
+    // Legacy requests may have no snapshot. Test context before hashing candidate spans.
+    for (let i = 0; i <= lastStart; i++) {
+      if (!contextMatches(i)) continue;
+      const candidate = snippetAt(i);
+      if (candidate !== undefined && sha256Text(candidate) === expectedSnippetHash) {
+        snippet = candidate;
+        break;
+      }
+    }
+  }
+  if (snippet === undefined) return { status: 'needs_review', reason: 'snippet_or_context_changed' };
 
-  // Multiple candidates or ambiguous context -> NEVER guess (PIN-02)
+  const pattern = snippet.split('\n');
+  let count = 0;
+  let match: { index: number; occurrenceIndex: number } | undefined;
+  const register = (index: number) => {
+    const occurrenceIndex = count++;
+    if (!contextMatches(index)) return true;
+    if (match) return false;
+    match = { index, occurrenceIndex };
+    return true;
+  };
+  if (params.startCol === undefined) {
+    if (pattern.length !== span) return { status: 'needs_review', reason: 'invalid_snippet_span' };
+    const accept = createLineMatcher(pattern);
+    for (let i = 0; i < lines.length; i++) {
+      if (accept(lines[i]) && !register(i - span + 1)) {
+        return { status: 'needs_review', reason: 'ambiguous_multiple_matches' };
+      }
+    }
+  } else {
+    const startOffset = params.startCol - 1;
+    const endOffset = params.endCol! - 1;
+    if (pattern.length !== span) return { status: 'needs_review', reason: 'invalid_snippet_span' };
+    const sameEdges = (i: number) => span === 1
+      ? lines[i].slice(startOffset, endOffset) === pattern[0] && endOffset <= lines[i].length
+      : lines[i].slice(startOffset) === pattern[0] && lines[i + span - 1].slice(0, endOffset) === pattern[span - 1] &&
+        startOffset <= lines[i].length && endOffset <= lines[i + span - 1].length;
+    const inner = span > 2 ? createLineMatcher(pattern.slice(1, -1)) : undefined;
+    for (let index = 0; index <= lastStart; index++) {
+      const endOfInner = index + span - 2;
+      // Prime the interior matcher for the first candidate, then advance it once per line.
+      if (inner && index === 0) {
+        for (let j = 1; j < endOfInner; j++) inner(lines[j]);
+      }
+      if ((!inner || inner(lines[endOfInner])) && sameEdges(index) && !register(index)) {
+        return { status: 'needs_review', reason: 'ambiguous_multiple_matches' };
+      }
+    }
+  }
+  if (!match) return { status: 'needs_review', reason: 'surrounding_context_changed' };
+  if (occurrence !== undefined && occurrence !== match.occurrenceIndex) {
+    return { status: 'needs_review', reason: 'occurrence_index_changed' };
+  }
   return {
-    status: 'needs_review',
-    reason: candidates.length > 1 ? 'ambiguous_multiple_matches' : 'surrounding_context_changed',
+    status: 'resolved',
+    resolvedSnippet: snippet,
+    surroundingContext: `${before(match.index)}\n---\n${after(match.index)}`,
+    resolvedRange: {
+      startLine: match.index + 1, endLine: match.index + span, occurrenceIndex: match.occurrenceIndex,
+      ...(params.startCol !== undefined ? { startCol: params.startCol, endCol: params.endCol } : {}),
+    },
   };
 }

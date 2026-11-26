@@ -1,3 +1,5 @@
+import { createLineMatcher } from './adapters/base.js';
+import { inspectArtifactTarget } from './target-inspection.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -4284,15 +4286,14 @@ export class ArtifactService {
   private async countLineSpanOccurrencesFromBlob(
     blobPath: string,
     targetStartLine: number,
-    spanLength: number,
-    expectedSnippetHash: string,
+    selected: string[],
   ): Promise<{ occurrenceIndex: number; duplicateCount: number }> {
     return new Promise((resolve, reject) => {
       const stream = fs.createReadStream(blobPath, { highWaterMark: 64 * 1024 });
       const decoder = new StringDecoder('utf8');
       let pending = '';
       let lineNo = 0;
-      const windowLines: string[] = [];
+      const accept = createLineMatcher(selected);
       let occurrenceIndex = -1;
       let duplicateCount = 0;
       let settled = false;
@@ -4308,19 +4309,9 @@ export class ArtifactService {
 
       const pushLine = (line: string) => {
         lineNo += 1;
-        windowLines.push(line);
-        if (windowLines.length > spanLength) {
-          windowLines.shift();
-        }
-        if (windowLines.length === spanLength) {
-          const spanStartLine = lineNo - spanLength + 1;
-          const h = crypto.createHash('sha256').update(windowLines.join('\n'), 'utf8').digest('hex');
-          if (h === expectedSnippetHash) {
-            if (spanStartLine === targetStartLine) {
-              occurrenceIndex = duplicateCount;
-            }
-            duplicateCount += 1;
-          }
+        if (accept(line)) {
+          if (lineNo - selected.length + 1 === targetStartLine) occurrenceIndex = duplicateCount;
+          duplicateCount++;
         }
       };
 
@@ -4342,8 +4333,7 @@ export class ArtifactService {
 
       stream.on('end', () => {
         if (settled) return;
-        const tail = pending + decoder.end();
-        pushLine(tail.endsWith('\r') ? tail.slice(0, -1) : tail);
+        pushLine(pending + decoder.end());
         finish();
       });
 
@@ -4559,8 +4549,10 @@ export class ArtifactService {
         (format === 'xlsx' && isTargetMeta && typeof range.rangeA1 === 'string') ||
         (format === 'pdf' && isTargetMeta && range.pageIndex !== undefined)
       ) {
-        const { bytes } = this.readRevisionSnapshot(pinned, DOCUMENT_WORKER_MAX_INPUT_BYTES);
-        const data = adapter.readRange(bytes, range, artifact);
+        const data = await inspectArtifactTarget<Record<string, unknown>>({
+          file: artifact, range, maxBytes: DOCUMENT_WORKER_MAX_INPUT_BYTES,
+          snapshot: { path: blobPath, sha256: revision.sha256, sizeBytes },
+        });
         return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
       }
 
@@ -4603,7 +4595,7 @@ export class ArtifactService {
           const before=lines.slice(0,offset).join('\n'), after=lines.slice(offset+length).join('\n');
           const hash=(value:string)=>crypto.createHash('sha256').update(value,'utf8').digest('hex');
           const expectedSnippetHash = hash(text);
-          const { occurrenceIndex, duplicateCount } = await this.countLineSpanOccurrencesFromBlob(blobPath, start, length, expectedSnippetHash);
+          const { occurrenceIndex, duplicateCount } = await this.countLineSpanOccurrencesFromBlob(blobPath, start, lines.slice(offset, offset + length));
           return {
             artifactId:artifact.id,
             revision:revision.revision,
@@ -5045,24 +5037,44 @@ export class ArtifactService {
     return { artifact: created.artifact, exported };
   }
 
-  resolveTargetOnArtifact(
+  async resolveTargetOnArtifact(
     userId: string,
     artifactId: string,
-    selector: TargetSelector
-  ): TargetResolutionResult {
+    selector: TargetSelector,
+    baseRevision?: number,
+    snippetHint?: string,
+  ): Promise<TargetResolutionResult> {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
     const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
     if (!adapter.targetPinSupported) {
       throw unsupportedOperationError('target_pin', 'unsupported_by_format', `形式 '${adapter.format}' は対象指定に対応していません。`);
     }
-    const buf = this.readActiveArtifactBytes(artifact);
-    if (!buf) return { status: 'stale', reason: 'artifact_file_missing' };
-    return adapter.resolveTarget(buf, selector, {
-      filename: artifact.filename,
-      relPath: artifact.relPath,
-      mimeType: artifact.mimeType,
-    });
+    const rootDir = this.resolveScopeRootDir(artifact.userId, artifact.scopeKind, artifact.chatId, artifact.projectId);
+    if (!rootDir) return { status: 'stale', reason: 'artifact_file_missing' };
+    const maxBytes = isDocumentFormat(adapter.format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
+    let baseSnapshot;
+    let releasePin;
+    if (baseRevision !== undefined && (selector.kind === 'code_line_range' || selector.kind === 'md_text_range')) {
+      try {
+        const base = this.getRevisionContentBlob(userId, artifactId, baseRevision);
+        releasePin = this.blobManager.pinBlob(userId, base.revision.sha256);
+        baseSnapshot = { path: base.blobPath, sizeBytes: base.sizeBytes, sha256: base.revision.sha256 };
+      } catch {
+        // A legacy request can still resolve from a hash-verified snippet and context.
+      }
+    }
+    try {
+      const resolution = await inspectArtifactTarget<TargetResolutionResult>({
+        file: artifact, rootDir, selector, maxBytes, snippetHint, baseSnapshot,
+      });
+      const latest = this.db.getArtifact(userId, artifactId);
+      if (!latest) return { status: 'stale', reason: 'artifact_file_missing' };
+      if (latest.revision !== artifact.revision) return { status: 'needs_review', reason: 'revision_changed_during_resolution' };
+      return resolution;
+    } finally {
+      releasePin?.();
+    }
   }
 
   listHistory(userId: string, artifactId: string): ArtifactRevisionRecord[] {

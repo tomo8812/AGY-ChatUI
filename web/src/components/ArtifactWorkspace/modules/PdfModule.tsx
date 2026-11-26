@@ -83,7 +83,7 @@ export function PdfModule({artifact,mode,capabilities,onTarget}:WorkspaceModuleP
     }
   }
   return <div className="workspace-page-view">
-    {mode==='pin'&&<div className="workspace-toolbar" role="group" aria-label="PDF の対象指定">
+    {mode==='pin'&&<div className="workspace-toolbar workspace-toolbar-fields" role="group" aria-label="PDF の対象指定">
       <label>対象 <select aria-label="PDF の選択方法" value={selection} onChange={event=>{generation.current++;setSelection(event.target.value as typeof selection)}}>
         <option value="page">ページ・本文</option><option value="pin">ピン</option><option value="region">領域</option>
       </select></label>

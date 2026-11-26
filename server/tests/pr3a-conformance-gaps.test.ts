@@ -9,11 +9,12 @@ import { createTestServer } from './helpers/test-harness.js';
 import { FormatAdapterRegistry } from '../src/artifacts/adapters/registry.js';
 import {
   readDocxAllParagraphTargets,
+  readPptxSlideTargets,
   readXlsxRangeTarget,
   readXlsxRowColTarget,
   readXlsxSheetTarget,
 } from '../src/artifacts/adapters/ooxml-target.js';
-import { inspectPdfDocument, computePdfRegionDigest } from '../src/artifacts/adapters/pdf-target.js';
+import { inspectPdfDocument, computePdfRegionDigest, readPdfPageTarget } from '../src/artifacts/adapters/pdf-target.js';
 import { sha256Hex } from '../../web/src/utils/sha256.js';
 import { auditRegions, decodePng } from '../../e2e/helpers/visualAudit.js';
 import { BlockRenderAccounting, addNode, expression } from '../../web/src/components/shared-ui/runtime.js';
@@ -1036,6 +1037,7 @@ describe('PR 3A Conformance Gap Fixes', () => {
       kind: 'xlsx_sheet',
       sheetId: '1',
       expectedSheetStructHash: sheetTarget.expectedSheetStructHash,
+      expectedSheetContentHash: sheetTarget.expectedSheetContentHash,
     }, xlsxMeta).status).toBe('resolved');
   });
 
@@ -1112,5 +1114,105 @@ describe('PR 3A Conformance Gap Fixes', () => {
     expect(listeners[0]).toHaveBeenCalledTimes(50);
     expect(listeners[1]).not.toHaveBeenCalled();
     expect(listeners[2]).not.toHaveBeenCalled();
+  });
+});
+
+describe('PR 3A target identity and large inputs', () => {
+  const registry = new FormatAdapterRegistry();
+  const meta = { filename: 'target', relPath: 'target', mimeType: 'application/octet-stream' };
+  const sha = (text: string) => crypto.createHash('sha256').update(text).digest('hex');
+
+  it('rejects duplicate Markdown, code and DOCX targets with identical surrounding context', () => {
+    const lines = ['lead 1', 'lead 2', 'target', 'after 1', 'after 2'];
+    const text = ['title', ...lines, 'separator', ...lines, 'end'].join('\n');
+    for (const [filename, format, kind] of [
+      ['target.md', 'markdown', 'md_text_range'],
+      ['target.ts', 'code', 'code_line_range'],
+    ] as const) {
+      const adapter = registry.resolve(filename, format);
+      const selector = {
+        kind, startLine: 4, endLine: 4, expectedSnippetHash: sha('target'),
+        contextBeforeHash: sha('lead 1\nlead 2'), contextAfterHash: sha('after 1\nafter 2'), occurrenceIndex: 0,
+      };
+      expect(adapter.resolveTarget(Buffer.from(text), selector, meta)).toMatchObject({
+        status: 'needs_review', reason: 'ambiguous_multiple_matches',
+      });
+      expect(adapter.resolveTarget(Buffer.from(text), { ...selector, contextAfterHash: undefined }, meta)).toMatchObject({
+        status: 'needs_review', reason: 'invalid_context_hash',
+      });
+    }
+    const docx = buildMinimalDocx(text.split('\n').map(text => ({ text })));
+    const target = readDocxAllParagraphTargets(docx).byBlockIndex.get(3)!;
+    expect(registry.resolve('target.docx', 'docx').resolveTarget(docx, {
+      kind: 'docx_paragraph', ...target, expectedBlockHash: target.fingerprint,
+    }, meta)).toMatchObject({ status: 'needs_review', reason: 'ambiguous_duplicate_paragraph' });
+  });
+
+  it('detects PPTX theme drift through the slide layout and master', () => {
+    const p = 'http://schemas.openxmlformats.org/presentationml/2006/main';
+    const r = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+    const packageRel = 'http://schemas.openxmlformats.org/package/2006/relationships';
+    const rel = (type: string, target: string) =>
+      `<Relationships xmlns="${packageRel}"><Relationship Id="rId1" Type="${r}/${type}" Target="${target}"/></Relationships>`;
+    const build = (color: string) => Buffer.from(zipSync(Object.fromEntries(Object.entries({
+      'ppt/presentation.xml': `<p:presentation xmlns:p="${p}" xmlns:r="${r}"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>`,
+      'ppt/_rels/presentation.xml.rels': rel('slide', 'slides/slide1.xml'),
+      'ppt/slides/slide1.xml': `<p:sld xmlns:p="${p}"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="4"/></p:nvSpPr></p:sp></p:spTree></p:cSld></p:sld>`,
+      'ppt/slides/_rels/slide1.xml.rels': rel('slideLayout', '../slideLayouts/slideLayout1.xml'),
+      'ppt/slideLayouts/slideLayout1.xml': `<p:sldLayout xmlns:p="${p}"/>`,
+      'ppt/slideLayouts/_rels/slideLayout1.xml.rels': rel('slideMaster', '../slideMasters/slideMaster1.xml'),
+      'ppt/slideMasters/slideMaster1.xml': `<p:sldMaster xmlns:p="${p}"/>`,
+      'ppt/slideMasters/_rels/slideMaster1.xml.rels': rel('theme', '../theme/theme1.xml'),
+      'ppt/theme/theme1.xml': `<theme><accent val="${color}"/></theme>`,
+    }).map(([name, xml]) => [name, strToU8(xml)]))));
+    const before = build('001122');
+    const selected = readPptxSlideTargets(before, 'ppt/slides/slide1.xml');
+    const adapter = registry.resolve('target.pptx', 'pptx');
+    const selector = { kind: 'pptx_element', slideId: selected.slideId, shapeId: '4', expectedElementFingerprint: selected.shapes[0].fingerprint };
+    expect(adapter.resolveTarget(before, selector, meta).status).toBe('resolved');
+    expect(adapter.resolveTarget(build('998877'), selector, meta).status).toBe('needs_review');
+  });
+
+  it('hashes a sparse selection across the entire XLSX grid and detects a far-corner change', () => {
+    const build = (v: number) => buildMinimalXlsx({ sheets: [{ name: 'Data', rows: [
+      { r: 1, cells: [{ ref: 'A1', v: 1 }] },
+      { r: 1_048_576, cells: [{ ref: 'XFD1048576', v }] },
+    ] }] });
+    const fullSheet = 'A1:XFD1048576';
+    const before = readXlsxRangeTarget(build(2), '1', fullSheet)!;
+    const after = readXlsxRangeTarget(build(3), '1', fullSheet)!;
+    expect(before.cells.map(cell => cell.address)).toEqual(['A1', 'XFD1048576']);
+    expect(before.expectedSheetStructHash).toBe(after.expectedSheetStructHash);
+    expect(before.expectedRangeValuesHash).not.toBe(after.expectedRangeValuesHash);
+  });
+
+  it('counts a deep, large PDF tree completely and only inspects the selected page', () => {
+    const pageCount = 20_001;
+    const depth = 75;
+    const firstPage = depth + 2;
+    const build = (lastKid: string, count = pageCount) => Buffer.from([
+      '%PDF-1.4',
+      '1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj',
+      ...Array.from({ length: depth }, (_, index) => {
+        const id = index + 2;
+        const kids = index === depth - 1
+          ? Array.from({ length: pageCount }, (_, n) => n === pageCount - 1 ? lastKid : `${firstPage + n} 0 R`).join(' ')
+          : `${id + 1} 0 R`;
+        return `${id} 0 obj << /Type /Pages /Count ${count} /Kids [${kids}] /MediaBox [0 0 300 400] >> endobj`;
+      }),
+      ...Array.from({ length: pageCount }, (_, n) =>
+        `${firstPage + n} 0 obj << /Type /Page${n === 0 ? '' : ' /Contents 50000 0 R'} >> endobj`),
+      'trailer << /Root 1 0 R >>',
+      '%%EOF',
+    ].join('\n'));
+    const doc = build(`${firstPage + pageCount - 1} 0 R`);
+    const target = readPdfPageTarget(doc, 0);
+    expect(target).toMatchObject({ pageIndex: 0, pageCount, widthPt: 300 });
+    expect(readPdfPageTarget(doc, 1)).toBeNull();
+    expect(readPdfPageTarget(build('60000 0 R'), 0)).toBeNull();
+    expect(readPdfPageTarget(build(`${firstPage + pageCount - 1} 0 R`, pageCount - 1), 0)).toBeNull();
+    expect(registry.resolve('target.pdf', 'pdf').resolveTarget(build('2 0 R'), {
+      kind: 'pdf_page', pageIndex: 0, expectedPageCount: pageCount, expectedPageContentHash: target!.pageContentHash,
+    }, meta).status).toBe('needs_review');
   });
 });

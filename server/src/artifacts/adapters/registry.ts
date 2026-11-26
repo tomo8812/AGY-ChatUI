@@ -14,7 +14,7 @@ import type {
   TargetResolutionResult,
   TargetSelector,
 } from '../types.js';
-import { sha256Buffer, type AdapterCapabilityContext, type AdapterFileMeta, type FormatAdapter } from './base.js';
+import { isSha256, sha256Buffer, type AdapterCapabilityContext, type AdapterFileMeta, type FormatAdapter } from './base.js';
 import { BinaryAdapter } from './binary-adapter.js';
 import { CodeAdapter } from './code-adapter.js';
 import { CsvAdapter } from './csv-adapter.js';
@@ -311,11 +311,9 @@ class DocumentFormatAdapter implements FormatAdapter {
    *  same-ID element replacement, media hash change).
    */
   resolveTarget(buffer: Buffer, selector: TargetSelector, _meta: AdapterFileMeta): TargetResolutionResult {
-    const currentSha = sha256Buffer(buffer);
-
     if (this.format === 'image') {
       const expectedSha = selector.expectedImageSha256 ? String(selector.expectedImageSha256) : null;
-      if (!expectedSha || expectedSha !== currentSha) {
+      if (!expectedSha || expectedSha !== sha256Buffer(buffer)) {
         return { status: 'needs_review', reason: 'image_content_changed' };
       }
       return { status: 'resolved', resolvedCoords: { selector } };
@@ -323,7 +321,7 @@ class DocumentFormatAdapter implements FormatAdapter {
 
     if (this.format === 'media') {
       const expectedSha = selector.expectedMediaSha256 ? String(selector.expectedMediaSha256) : null;
-      if (!expectedSha || expectedSha !== currentSha) {
+      if (!expectedSha || expectedSha !== sha256Buffer(buffer)) {
         return { status: 'needs_review', reason: 'media_content_changed' };
       }
       return { status: 'resolved', resolvedCoords: { selector } };
@@ -331,23 +329,20 @@ class DocumentFormatAdapter implements FormatAdapter {
 
     if (this.format === 'pdf') {
       const hex64 = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
-      const doc = inspectPdfDocument(buffer);
-      if (!doc) {
-        return { status: 'needs_review', reason: 'pdf_page_content_changed' };
-      }
-
       const pageIndex = Number(selector.pageIndex);
       const expectedPageCount = Number(selector.expectedPageCount);
       if (!Number.isInteger(pageIndex) || pageIndex < 0 || !Number.isInteger(expectedPageCount) || expectedPageCount <= 0) {
         return { status: 'stale', reason: 'invalid_page_selection' };
       }
+      const doc = inspectPdfDocument(buffer, pageIndex);
+      if (!doc) return { status: 'needs_review', reason: 'pdf_page_content_changed' };
       if (expectedPageCount !== doc.pageCount) {
         return { status: 'needs_review', reason: 'pdf_page_count_changed' };
       }
       if (pageIndex >= doc.pageCount) {
         return { status: 'stale', reason: 'invalid_page_selection' };
       }
-      const page = doc.pages[pageIndex];
+      const page = doc.pages[0];
       if (!hex64(selector.expectedPageContentHash) || selector.expectedPageContentHash !== page.pageContentHash) {
         return { status: 'needs_review', reason: 'pdf_page_content_changed' };
       }
@@ -402,50 +397,31 @@ class DocumentFormatAdapter implements FormatAdapter {
         const expectedSnippetHash = hex64(selector.expectedSnippetHash) ? String(selector.expectedSnippetHash) : null;
         const expectedBeforeHash = hex64(selector.contextBeforeHash) ? String(selector.contextBeforeHash) : null;
         const expectedAfterHash = hex64(selector.contextAfterHash) ? String(selector.contextAfterHash) : null;
-        const hasOccurrence = selector.occurrenceIndex !== undefined && selector.occurrenceIndex !== null;
-        const expectedOccurrence = hasOccurrence ? Number(selector.occurrenceIndex) : undefined;
-        if (
-          !expectedSnippetHash ||
-          !Number.isInteger(start) ||
-          !Number.isInteger(end) ||
-          start < 0 ||
-          end <= start ||
-          end > page.text.length ||
-          (hasOccurrence && (!Number.isInteger(expectedOccurrence) || (expectedOccurrence as number) < 0))
-        ) {
+        const expectedOccurrence = selector.occurrenceIndex;
+        if (!expectedSnippetHash || !expectedBeforeHash || !expectedAfterHash ||
+            !Number.isSafeInteger(start) || !Number.isSafeInteger(end) ||
+            start < 0 || end <= start || end > page.text.length ||
+            typeof expectedOccurrence !== 'number' || !Number.isSafeInteger(expectedOccurrence) || expectedOccurrence < 0) {
           return { status: 'needs_review', reason: 'pdf_text_range_changed' };
         }
         const slice = page.text.slice(start, end);
-        const snippetHash = sha256Buffer(Buffer.from(slice, 'utf8'));
-        if (snippetHash !== expectedSnippetHash) {
+        if (sha256Buffer(Buffer.from(slice)) !== expectedSnippetHash) {
           return { status: 'needs_review', reason: 'pdf_text_range_changed' };
         }
-        // Verify surrounding text context and exact occurrenceIndex on the page (Spec §5.2)
-        const ctxWindow = 64;
-        const beforeText = page.text.slice(Math.max(0, start - ctxWindow), start);
-        const afterText = page.text.slice(end, Math.min(page.text.length, end + ctxWindow));
-        if (expectedBeforeHash && sha256Buffer(Buffer.from(beforeText, 'utf8')) !== expectedBeforeHash) {
-          return { status: 'needs_review', reason: 'pdf_text_context_changed' };
+        const contextMatches = (offset: number) => {
+          const limit = offset + slice.length;
+          return sha256Buffer(Buffer.from(page.text.slice(Math.max(0, offset - 64), offset))) === expectedBeforeHash &&
+            sha256Buffer(Buffer.from(page.text.slice(limit, limit + 64))) === expectedAfterHash;
+        };
+        if (!contextMatches(start)) return { status: 'needs_review', reason: 'pdf_text_context_changed' };
+        let actualOcc = -1;
+        let occurrence = 0;
+        for (let offset = page.text.indexOf(slice); offset !== -1; offset = page.text.indexOf(slice, offset + 1)) {
+          if (offset === start) actualOcc = occurrence;
+          else if (contextMatches(offset)) return { status: 'needs_review', reason: 'ambiguous_multiple_matches' };
+          occurrence++;
         }
-        if (expectedAfterHash && sha256Buffer(Buffer.from(afterText, 'utf8')) !== expectedAfterHash) {
-          return { status: 'needs_review', reason: 'pdf_text_context_changed' };
-        }
-        // Count occurrences of exact slice within page.text
-        const occurrences: number[] = [];
-        let searchPos = 0;
-        while (searchPos <= page.text.length - slice.length) {
-          const foundAt = page.text.indexOf(slice, searchPos);
-          if (foundAt < 0) break;
-          occurrences.push(foundAt);
-          searchPos = foundAt + 1;
-        }
-        const actualOcc = occurrences.indexOf(start);
-        if (expectedOccurrence !== undefined && actualOcc !== expectedOccurrence) {
-          return { status: 'needs_review', reason: 'pdf_text_occurrence_changed' };
-        }
-        if (occurrences.length > 1 && expectedOccurrence === undefined && (!expectedBeforeHash || !expectedAfterHash)) {
-          return { status: 'needs_review', reason: 'ambiguous_multiple_matches' };
-        }
+        if (actualOcc !== expectedOccurrence) return { status: 'needs_review', reason: 'pdf_text_occurrence_changed' };
         return {
           status: 'resolved',
           resolvedCoords: { pageIndex, textOffsetStart: start, textOffsetEnd: end, occurrenceIndex: actualOcc },
@@ -456,12 +432,12 @@ class DocumentFormatAdapter implements FormatAdapter {
       if (selector.kind === 'pdf_annotation') {
         const annotUid = typeof selector.annotUid === 'string' ? selector.annotUid : '';
         const expectedAnnotFp = typeof selector.expectedAnnotFingerprint === 'string' ? selector.expectedAnnotFingerprint : '';
-        const found = page.annotations.find((a) => a.uid === annotUid);
-        if (!found) return { status: 'stale', reason: 'pdf_annotation_not_found' };
-        if (!expectedAnnotFp || found.fingerprint !== expectedAnnotFp) {
+        const matches = page.annotations.filter((a) => a.uid === annotUid);
+        if (!matches.length) return { status: 'stale', reason: 'pdf_annotation_not_found' };
+        if (matches.length !== 1 || !expectedAnnotFp || matches[0].fingerprint !== expectedAnnotFp) {
           return { status: 'needs_review', reason: 'pdf_annotation_changed' };
         }
-        return { status: 'resolved', resolvedCoords: { pageIndex, annotUid }, resolvedSnippet: found.contents };
+        return { status: 'resolved', resolvedCoords: { pageIndex, annotUid }, resolvedSnippet: matches[0].contents };
       }
 
       return { status: 'needs_review', reason: 'unsupported_pdf_selector' };
@@ -475,7 +451,7 @@ class DocumentFormatAdapter implements FormatAdapter {
           : null;
 
       if (selector.kind === 'xlsx_sheet') {
-        if (!sheetId || !expectedStructHash) {
+        if (!sheetId || !expectedStructHash || !isSha256(selector.expectedSheetContentHash)) {
           return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
         }
         try {
@@ -484,7 +460,8 @@ class DocumentFormatAdapter implements FormatAdapter {
           if (!sheetExists) return { status: 'stale', reason: 'sheet_not_found' };
           const target = readXlsxSheetTarget(buffer, sheetId);
           if (!target) return { status: 'stale', reason: 'sheet_not_found' };
-          if (target.expectedSheetStructHash !== expectedStructHash) {
+          if (target.expectedSheetStructHash !== expectedStructHash ||
+              target.expectedSheetContentHash !== selector.expectedSheetContentHash) {
             return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
           }
           return {
@@ -619,66 +596,30 @@ class DocumentFormatAdapter implements FormatAdapter {
           };
         }
 
-        // paraId is absent: require strict uniqueness & surrounding context verification
         const matches = paragraphs.filter((p) => p.fingerprint === expectedBlockHash);
-        const atIndex = byBlockIndex.get(blockIndex);
-        if (matches.length === 0) {
-          return atIndex
+        if (!matches.length) {
+          return byBlockIndex.has(blockIndex)
             ? { status: 'needs_review', reason: 'element_fingerprint_changed' }
             : { status: 'stale', reason: 'word_block_not_found' };
         }
 
-        const hasBefore = typeof selector.contextBeforeHash === 'string' && selector.contextBeforeHash.length > 0;
-        const hasAfter = typeof selector.contextAfterHash === 'string' && selector.contextAfterHash.length > 0;
-        const expectedDuplicateCount = selector.duplicateCount !== undefined ? Number(selector.duplicateCount) : undefined;
-        const hadDuplicates = Number(expectedDuplicateCount ?? 0) > 1;
-        const hasOccurrence = Number.isInteger(Number(selector.occurrenceIndex)) && selector.occurrenceIndex !== undefined;
-
-        if (atIndex && atIndex.fingerprint === expectedBlockHash) {
-          const beforeOk = hasBefore && atIndex.contextBeforeHash === selector.contextBeforeHash;
-          const afterOk = hasAfter && atIndex.contextAfterHash === selector.contextAfterHash;
-
-          if (matches.length > 1 || hadDuplicates) {
-            if (!hasBefore || !hasAfter || !beforeOk || !afterOk) {
-              return { status: 'needs_review', reason: 'ambiguous_duplicate_paragraph' };
-            }
-            if (hasOccurrence && atIndex.occurrenceIndex !== Number(selector.occurrenceIndex)) {
-              return { status: 'needs_review', reason: 'ambiguous_duplicate_paragraph' };
-            }
-            const identicalContextCount = matches.filter(
-              (p) => p.contextBeforeHash === selector.contextBeforeHash && p.contextAfterHash === selector.contextAfterHash,
-            ).length;
-            if (identicalContextCount > 1) {
-              if (!hasOccurrence || (expectedDuplicateCount !== undefined && matches.length !== expectedDuplicateCount)) {
-                return { status: 'needs_review', reason: 'ambiguous_duplicate_paragraph' };
-              }
-            }
-          } else if (hasBefore && hasAfter && !beforeOk && !afterOk) {
-            return { status: 'needs_review', reason: 'paragraph_context_changed' };
-          }
-
-          return {
-            status: 'resolved',
-            resolvedRange: { selector, resolvedBlockIndex: atIndex.blockIndex },
-            resolvedSnippet: atIndex.text,
-          };
+        const { contextBeforeHash, contextAfterHash, duplicateCount, occurrenceIndex } = selector;
+        if (!isSha256(contextBeforeHash) || !isSha256(contextAfterHash)) {
+          return { status: 'needs_review', reason: 'invalid_context_hash' };
         }
-
-        // Paragraph is no longer at blockIndex (shifted or deleted/replaced)
-        if (!hasBefore || !hasAfter) {
-          return { status: 'needs_review', reason: 'paragraph_position_shifted' };
+        const contextual = matches.filter(p =>
+          p.contextBeforeHash === contextBeforeHash && p.contextAfterHash === contextAfterHash);
+        const match = contextual.length === 1 ? contextual[0] : undefined;
+        if (!match || (duplicateCount !== undefined && duplicateCount !== matches.length) ||
+            (occurrenceIndex !== undefined && occurrenceIndex !== match.occurrenceIndex) ||
+            (matches.length > 1 && match.blockIndex !== blockIndex)) {
+          return { status: 'needs_review', reason: 'ambiguous_duplicate_paragraph' };
         }
-        const contextMatches = matches.filter(
-          (p) => p.contextBeforeHash === selector.contextBeforeHash && p.contextAfterHash === selector.contextAfterHash,
-        );
-        if (contextMatches.length === 1 && matches.length === 1 && !hadDuplicates) {
-          return {
-            status: 'resolved',
-            resolvedRange: { selector, resolvedBlockIndex: contextMatches[0].blockIndex },
-            resolvedSnippet: contextMatches[0].text,
-          };
-        }
-        return { status: 'needs_review', reason: 'ambiguous_duplicate_paragraph' };
+        return {
+          status: 'resolved',
+          resolvedRange: { selector, resolvedBlockIndex: match.blockIndex },
+          resolvedSnippet: match.text,
+        };
       } catch {
         return { status: 'needs_review', reason: 'target_structure_unavailable' };
       }
@@ -690,7 +631,7 @@ class DocumentFormatAdapter implements FormatAdapter {
         selector.expectedBlockHash ??
         selector.expectedSlideHash ??
         selector.expectedCellHash;
-      const currentFp = currentSha;
+      const currentFp = sha256Buffer(buffer);
       if (!expectedFp || String(expectedFp) !== currentFp) {
         return { status: 'needs_review', reason: 'element_fingerprint_changed' };
       }

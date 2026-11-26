@@ -119,7 +119,7 @@ test('Base ChatUI edits source and tables and targets PPTX through its existing 
     expect(requests[1].contentCoords).toMatchObject({unit:'pt',xPt:360,yPt:202.5});
     for(const request of requests){
       expect(request.regionImageBlobSha256).toBeNull();
-      expect(server.ctx.editRequestService.resolveRequestTarget(request).status).toBe('resolved');
+      expect((await server.ctx.editRequestService.resolveRequestTarget(request)).status).toBe('resolved');
     }
     await page.screenshot({path:info.outputPath('base-pptx-requests.png')});
     await open('rich');

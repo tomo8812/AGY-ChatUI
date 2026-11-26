@@ -254,6 +254,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libreoffice-calc libreoffice-impress libreoffice-writer poppler-utils
           mkdir -p "${RUNNER_TEMP}/pr3a-runtime"
+          ln -s "${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}" "${RUNNER_TEMP}/pr3a-runtime/playwright"
           python3 -m venv "${RUNNER_TEMP}/pr3a-runtime/venv"
           "${RUNNER_TEMP}/pr3a-runtime/venv/bin/pip" install lxml openpyxl python-docx python-pptx pillow pypdf reportlab
           "${RUNNER_TEMP}/pr3a-runtime/venv/bin/python" e2e/prototype/make-fixtures.py "${RUNNER_TEMP}/pr3a-fixtures"
@@ -263,6 +264,12 @@ jobs:
       - name: Run mechanical UI layout & zoom tests
         run: npm run test:ui
 
+      - name: Repeat PR3A real-file operations with Full Runtime
+        if: success() || failure()
+        env:
+          AGY_PR3A_PROFILE: full
+        run: npm run test:ui -- e2e/pr3a-real.spec.ts --output=test-results-full
+
       - name: Upload PR3A browser captures
         if: always()
         uses: actions/upload-artifact@v4
@@ -271,6 +278,8 @@ jobs:
           path: |
             test-results/**/*.png
             test-results/**/pr3a-evidence.json
+            test-results-full/**/*.png
+            test-results-full/**/pr3a-evidence.json
           retention-days: 7
           if-no-files-found: ignore
 

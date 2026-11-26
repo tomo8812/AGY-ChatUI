@@ -371,8 +371,9 @@ export class BuiltinArtifactMcpServer {
 
     tool('edit_request_list', 'List submitted editing requests in this chat.', {}, () =>
       this.editRequests.listRequests(userId, chatId).filter(({ status }) => status !== 'draft'));
-    tool('edit_request_get', 'Read a submitted editing request and its target.', requestId, ({ requestId }) => {
-      const { regionImagePngBase64, ...payload } = this.editRequests.getForAgent(userId, chatId, requestId);
+    tool('edit_request_get', 'Read a submitted editing request and its target.', requestId, async ({ requestId }, authorize) => {
+      const { regionImagePngBase64, ...payload } = await this.editRequests.getForAgent(userId, chatId, requestId);
+      authorize();
       if (payload.status === 'draft') throw new ArtifactError('NOT_FOUND', 'Editing request was not submitted.', 404);
       const content: CallToolResult['content'] = [{ type: 'text', text: JSON.stringify(payload) }];
       if (regionImagePngBase64) content.push({ type: 'image', mimeType: 'image/png', data: regionImagePngBase64 });

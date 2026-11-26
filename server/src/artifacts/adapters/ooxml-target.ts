@@ -11,25 +11,33 @@ const WORD = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
 const SPREADSHEET = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
 const OFFICE_REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
 const PACKAGE_REL = 'http://schemas.openxmlformats.org/package/2006/relationships';
-const MAX_PACKAGE_XML_BYTES = 32 * 1024 * 1024;
-const MAX_XLSX_TARGET_CELLS = 50_000;
-const MAX_SAX_ELEMENTS = 1_000_000;
+// The same archive expansion envelope as the document runtime (§4.2).
+const MAX_PACKAGE_BYTES = 200 * 1024 * 1024;
+const MAX_PACKAGE_ENTRIES = 2_000;
+const MAX_COMPRESSION_RATIO = 100;
+// Retain the dense fingerprint for ranges that existing selectors could capture.
+const LEGACY_DENSE_RANGE_CELLS = 50_000;
 
 function invalidPackage(): never {
   throw new ArtifactError('INVALID_OFFICE_PACKAGE', '文書の構造を読み取れません。', 422);
 }
 
-function readParts(bytes: Buffer, names: ReadonlySet<string>, maximumBytes = MAX_PACKAGE_XML_BYTES) {
+function readParts(bytes: Buffer, names: ReadonlySet<string>) {
   try {
-    let remaining = maximumBytes;
+    if (bytes.length < 22) invalidPackage();
+    let remaining = MAX_PACKAGE_BYTES;
     const declared = new Set<string>();
     return unzipSync(bytes, { filter: entry => {
-      if (!names.has(entry.name)) return false;
-      if (declared.has(entry.name) || !Number.isSafeInteger(entry.originalSize) || entry.originalSize < 0) invalidPackage();
-      declared.add(entry.name);
-      remaining -= Math.max(entry.originalSize, entry.size);
+      const { name, originalSize, size } = entry;
+      if (declared.size >= MAX_PACKAGE_ENTRIES || declared.has(name) ||
+          !name || /[\\:\0]/.test(name) || name.replace(/\/$/, '').split('/').some(segment => !segment || segment === '.' || segment === '..') ||
+          !Number.isSafeInteger(originalSize) || originalSize < 0 ||
+          !Number.isSafeInteger(size) || size < 0 || originalSize > Math.max(1, size) * MAX_COMPRESSION_RATIO ||
+          (entry.compression === 0 && originalSize !== size)) invalidPackage();
+      declared.add(name);
+      remaining -= originalSize;
       if (remaining < 0) invalidPackage();
-      return true;
+      return names.has(name);
     } });
   } catch { return invalidPackage(); }
 }
@@ -44,10 +52,6 @@ function xml(data: Uint8Array | undefined, namespace: string, root: string) {
 
 function child(elements: XmlParsedElement[], parent: number, namespace: string, name: string) {
   return elements.find(element => element.parentIndex === parent && element.namespace === namespace && element.name === name);
-}
-function localAttribute(element: XmlParsedElement | undefined, name: string) {
-  if (!element) return undefined;
-  return element.attrs[name] ?? Object.entries(element.attrs).find(([key]) => key.split(':').at(-1) === name)?.[1];
 }
 function snippet(source: string, element: XmlParsedElement) {
   return source.slice(element.start, element.end);
@@ -92,21 +96,76 @@ export function readPptxTargets(bytes: Buffer) {
   return { format: 'pptx', slideSize, slides };
 }
 
+function relationshipsPath(part: string) {
+  return posix.join(posix.dirname(part), '_rels', posix.basename(part) + '.rels');
+}
+
+function hashPptxDependencies(bytes: Buffer, slidePart: string, slideRelation: Uint8Array | undefined) {
+  const hash = createHash('sha256');
+  const presentationPart = 'ppt/presentation.xml';
+  const seen = new Set([slidePart, presentationPart]);
+  const pending: string[] = [];
+  const visitRelationships = (part: string, relationships: Uint8Array | undefined) => {
+    if (!relationships) return;
+    hash.update(digest(part, relationships));
+    const entries = xml(relationships, PACKAGE_REL, 'Relationships').elements;
+    const ids = new Set<string>();
+    for (const entry of entries) {
+      if (entry.namespace !== PACKAGE_REL || entry.name !== 'Relationship') continue;
+      const { Id, Target, TargetMode, Type } = entry.attrs;
+      if (!Id || ids.has(Id) || !Target || !Type) invalidPackage();
+      ids.add(Id);
+      const kind = Type.split('/').at(-1);
+      if (part === presentationPart && kind !== 'tableStyles' && kind !== 'font' && kind !== 'theme') continue;
+      if (kind === 'notesSlide' || kind === 'comments' ||
+          (kind === 'slideLayout' && part.startsWith('ppt/slideMasters/'))) continue;
+      if (TargetMode === 'External') {
+        // Hyperlink destinations do not supply slide content. Linked media can change outside the package.
+        if (kind !== 'hyperlink') invalidPackage();
+        continue;
+      }
+      const target = decodeURIComponent(Target.split('#', 1)[0]);
+      if (!target || /[\\:\0]/.test(target)) invalidPackage();
+      const resolved = posix.resolve('/', posix.dirname(part), target).slice(1);
+      if (!seen.has(resolved)) {
+        seen.add(resolved);
+        pending.push(resolved);
+      }
+    }
+  };
+  const presentationRelation = relationshipsPath(presentationPart);
+  const presentationParts = readParts(bytes, new Set([presentationPart, presentationRelation]));
+  const presentation = xml(presentationParts[presentationPart], PRESENTATION, 'presentation');
+  for (const entry of presentation.elements) {
+    if (entry.parentIndex !== 0 || ['sldIdLst', 'sldMasterIdLst', 'notesMasterIdLst', 'handoutMasterIdLst'].includes(entry.name)) continue;
+    hash.update(digest(snippet(presentation.source, entry)));
+  }
+  visitRelationships(presentationPart, presentationParts[presentationRelation]);
+  visitRelationships(slidePart, slideRelation);
+  while (pending.length) {
+    const part = pending.pop()!;
+    const relation = relationshipsPath(part);
+    const parts = readParts(bytes, new Set([part, relation]));
+    if (!Object.hasOwn(parts, part)) invalidPackage();
+    hash.update(digest(part, parts[part]));
+    visitRelationships(part, parts[relation]);
+  }
+  return hash.digest('hex');
+}
+
 export function readPptxSlideTargets(bytes: Buffer, part: string) {
   const slide = readPptxTargets(bytes).slides.find(slide => slide.part === part);
   if (!slide) throw new ArtifactError('INVALID_TARGET', 'スライドが見つかりません。', 422);
-  const relation = posix.join(posix.dirname(part), '_rels', posix.basename(part) + '.rels');
+  const relation = relationshipsPath(part);
   const parts = readParts(bytes, new Set([part, relation]));
   const { source, elements } = xml(parts[part], PRESENTATION, 'sld');
   const common = child(elements, 0, PRESENTATION, 'cSld');
   const tree = common && child(elements, elements.indexOf(common), PRESENTATION, 'spTree');
   if (!tree) return invalidPackage();
-  const relationships = parts[relation] ? xml(parts[relation], PACKAGE_REL, 'Relationships') : undefined;
-  const related = new Map(relationships?.elements.filter(element => element.name === 'Relationship' && element.attrs.TargetMode !== 'External')
-    .map(element => [element.attrs.Id, posix.resolve('/', posix.dirname(part), element.attrs.Target ?? '').slice(1)]) ?? []);
-  const relevant = new Set([...related.values()].filter(name => /^ppt\/(?:media|charts|diagrams|slideLayouts)\//.test(name)));
-  const referencedParts = readParts(bytes, relevant, 100 * 1024 * 1024);
-  const relationshipsHash = digest(parts[relation] ?? '', ...[...relevant].sort().flatMap(name => [name, referencedParts[name] ?? '']));
+  const relationshipsHash = hashPptxDependencies(bytes, part, parts[relation]);
+  // The slide also supplies inherited color mappings, background and the other
+  // shapes that can clip, connect to or overlap the selected element.
+  const slideHash = digest(source, relationshipsHash);
   const shapeTypes = new Set(['sp', 'pic', 'graphicFrame', 'grpSp', 'cxnSp']);
   const shapes = elements.flatMap((element, index) => {
     if (!shapeTypes.has(element.name) || element.namespace !== PRESENTATION || !inside(element, tree)) return [];
@@ -124,9 +183,9 @@ export function readPptxSlideTargets(bytes: Buffer, part: string) {
     }
     return [{ id: props.attrs.id, name: props.attrs.name || props.attrs.id, type: element.name, groupPath: groups,
       text: textOf(source, elements, element, DRAWING),
-      fingerprint: digest(snippet(source, element), ...geometry, relationshipsHash) }];
+      fingerprint: digest(snippet(source, element), ...geometry, slideHash) }];
   });
-  return { slideId: slide.id, shapes, slideHash: digest(source, relationshipsHash) };
+  return { slideId: slide.id, shapes, slideHash };
 }
 
 export interface DocxParagraphTargetInfo {
@@ -146,26 +205,60 @@ export function readDocxAllParagraphTargets(bytes: Buffer): {
   byBlockIndex: Map<number, DocxParagraphTargetInfo>;
 } {
   const name = 'word/document.xml';
-  const { source, elements } = xml(readParts(bytes, new Set([name]))[name], WORD, 'document');
-  const body = child(elements, 0, WORD, 'body');
-  const bodyIndex = body ? elements.indexOf(body) : -1;
-  const blocks = bodyIndex >= 0 ? elements.filter(element => element.parentIndex === bodyIndex) : [];
-  const blockFingerprints = blocks.map(block => digest(snippet(source, block)));
-
-  const counts = new Map<string, number>();
+  const data = readParts(bytes, new Set([name]))[name];
+  if (!data) return invalidPackage();
+  const source = new TextDecoder('utf-8', { fatal: true }).decode(data);
+  const parser = new SaxesParser({ xmlns: true });
+  const blockFingerprints: string[] = [];
   const rawParagraphs: Array<{ blockIndex: number; paraId?: string; fingerprint: string; text: string }> = [];
-  for (let i = 0; i < blocks.length; i++) {
-    const block = blocks[i];
-    if (block.namespace !== WORD || block.name !== 'p') continue;
-    const fp = blockFingerprints[i];
-    counts.set(fp, (counts.get(fp) ?? 0) + 1);
-    rawParagraphs.push({
-      blockIndex: i,
-      paraId: localAttribute(block, 'paraId'),
-      fingerprint: fp,
-      text: textOf(source, elements, block, WORD),
-    });
-  }
+  const counts = new Map<string, number>();
+  let depth = 0;
+  let bodyDepth = -1;
+  let foundBody = false;
+  let tagStart = 0;
+  let blockStart = 0;
+  let paragraph: { paraId?: string; text: string } | undefined;
+  let textDepth = -1;
+  parser.on('error', invalidPackage);
+  parser.on('doctype', invalidPackage);
+  parser.on('opentagstart', () => { tagStart = source.lastIndexOf('<', parser.position - 1); });
+  parser.on('opentag', tag => {
+    depth++;
+    if (depth === 1 && (tag.local !== 'document' || tag.uri !== WORD)) invalidPackage();
+    if (depth === 2 && tag.local === 'body' && tag.uri === WORD) {
+      if (foundBody) invalidPackage();
+      foundBody = true;
+      bodyDepth = depth;
+    } else if (bodyDepth !== -1 && depth === bodyDepth + 1) {
+      blockStart = tagStart;
+      if (tag.local === 'p' && tag.uri === WORD) {
+        paragraph = {
+          paraId: Object.values(tag.attributes).find(attr =>
+            attr.local === 'paraId' && attr.uri === 'http://schemas.microsoft.com/office/word/2010/wordml')?.value,
+          text: '',
+        };
+      }
+    }
+    if (paragraph && tag.local === 't' && tag.uri === WORD) textDepth = depth;
+  });
+  parser.on('text', text => { if (paragraph && textDepth !== -1) paragraph.text += text; });
+  parser.on('cdata', text => { if (paragraph && textDepth !== -1) paragraph.text += text; });
+  parser.on('closetag', () => {
+    if (depth === textDepth) textDepth = -1;
+    if (bodyDepth !== -1 && depth === bodyDepth + 1) {
+      const fingerprint = digest(source.slice(blockStart, parser.position));
+      if (paragraph) {
+        counts.set(fingerprint, (counts.get(fingerprint) ?? 0) + 1);
+        rawParagraphs.push({ ...paragraph, blockIndex: blockFingerprints.length, fingerprint });
+        paragraph = undefined;
+      }
+      blockFingerprints.push(fingerprint);
+    }
+    if (depth === bodyDepth) bodyDepth = -1;
+    depth--;
+  });
+  parser.write(source).close();
+  if (!foundBody) invalidPackage();
 
   const seen = new Map<string, number>();
   const paragraphs: DocxParagraphTargetInfo[] = [];
@@ -175,7 +268,7 @@ export function readDocxAllParagraphTargets(bytes: Buffer): {
     seen.set(item.fingerprint, occ + 1);
     const i = item.blockIndex;
     const beforeSlice = blockFingerprints.slice(Math.max(0, i - 2), i);
-    const afterSlice = blockFingerprints.slice(i + 1, Math.min(blocks.length, i + 3));
+    const afterSlice = blockFingerprints.slice(i + 1, Math.min(blockFingerprints.length, i + 3));
     const entry: DocxParagraphTargetInfo = {
       blockIndex: i,
       paraId: item.paraId,
@@ -189,7 +282,7 @@ export function readDocxAllParagraphTargets(bytes: Buffer): {
     paragraphs.push(entry);
     byBlockIndex.set(i, entry);
   }
-  return { totalBlocks: blocks.length, paragraphs, byBlockIndex };
+  return { totalBlocks: blockFingerprints.length, paragraphs, byBlockIndex };
 }
 
 export function readDocxParagraphTarget(bytes: Buffer, blockIndex: number): DocxParagraphTargetInfo | null {
@@ -221,6 +314,7 @@ export interface XlsxRangeTargetResult {
 }
 
 export interface XlsxSheetTargetResult {
+  expectedSheetContentHash: string;
   sheetId: string;
   sheetName: string;
   sheetPart: string;
@@ -263,7 +357,7 @@ function parseCellRef(ref: string): { row: number; col: number } | null {
   if (!m) return null;
   const col = colLettersToIndex(m[1].toUpperCase());
   const row = Number(m[2]) - 1;
-  if (col < 0 || !Number.isSafeInteger(row) || row < 0) return null;
+  if (col < 0 || col >= 16_384 || !Number.isSafeInteger(row) || row < 0 || row >= 1_048_576) return null;
   return { row, col };
 }
 
@@ -282,21 +376,26 @@ export function parseA1Range(rangeA1: string): { row0: number; row1: number; col
   return { row0, row1, col0, col1, canonical: startA1 === endA1 ? startA1 : `${startA1}:${endA1}` };
 }
 
+function parseSaxBytes(parser: SaxesParser<{ xmlns: true; position: false }>, bytes: Uint8Array) {
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  for (let offset = 0; offset < bytes.length; offset += 64 * 1024) {
+    parser.write(decoder.decode(bytes.subarray(offset, offset + 64 * 1024), { stream: true }));
+  }
+  parser.write(decoder.decode()).close();
+}
+
 function parseSharedStringsXml(data: Uint8Array | undefined): string[] {
   if (!data) return [];
-  const source = new TextDecoder('utf-8', { fatal: true }).decode(data);
   const parser = new SaxesParser({ xmlns: true, position: false });
   const strings: string[] = [];
   let inSi = false;
   let inT = false;
   let inPhonetic = false;
   let current = '';
-  let count = 0;
 
   parser.on('doctype', () => invalidPackage());
   parser.on('error', () => invalidPackage());
   parser.on('opentag', (tag) => {
-    if (++count > MAX_SAX_ELEMENTS) invalidPackage();
     if (tag.local === 'si') {
       inSi = true;
       current = '';
@@ -318,7 +417,7 @@ function parseSharedStringsXml(data: Uint8Array | undefined): string[] {
       current = '';
     }
   });
-  parser.write(source).close();
+  parseSaxBytes(parser, data);
   return strings;
 }
 
@@ -357,6 +456,8 @@ export function readXlsxWorkbookTargets(bytes: Buffer): { format: 'xlsx'; sheets
     }
   }
   if (sheets.length === 0) invalidPackage();
+  if (new Set(sheets.map(sheet => sheet.id)).size !== sheets.length ||
+      new Set(sheets.map(sheet => sheet.name)).size !== sheets.length) invalidPackage();
   return { format: 'xlsx', sheets };
 }
 
@@ -375,16 +476,13 @@ export function readXlsxRangeTarget(
   const parsedRange = parseA1Range(rangeA1);
   if (!parsedRange) return null;
   const totalRangeCells = (parsedRange.row1 - parsedRange.row0 + 1) * (parsedRange.col1 - parsedRange.col0 + 1);
-  if (totalRangeCells <= 0 || totalRangeCells > MAX_XLSX_TARGET_CELLS) {
-    throw new ArtifactError('INVALID_TARGET', '選択範囲が大きすぎます。', 422);
-  }
+  const dense = totalRangeCells <= LEGACY_DENSE_RANGE_CELLS;
 
   const sharedStringsPath = 'xl/sharedStrings.xml';
   const parts = readParts(bytes, new Set([sheet.part, sharedStringsPath]));
   const sheetBytes = parts[sheet.part];
   if (!sheetBytes) return null;
   const sharedStrings = parseSharedStringsXml(parts[sharedStringsPath]);
-  const sheetXml = new TextDecoder('utf-8', { fatal: true }).decode(sheetBytes);
 
   // Stream-parse worksheet XML for structure hash + target range cell map
   const structHash = createHash('sha256');
@@ -396,10 +494,27 @@ export function readXlsxRangeTarget(
     f: string | null;
     fAttrs: string;
   }
+  const rangeHash = createHash('sha256').update(`range:${sheet.id}:${parsedRange.canonical}\n`);
+  const orderKeysHash = createHash('sha256').update(`order:${sheet.id}:${parsedRange.canonical}\n`);
+  if (!dense) {
+    rangeHash.update('sparse-v1\n');
+    orderKeysHash.update('sparse-v1\n');
+  }
+  const snippetCells: XlsxRangeTargetResult['cells'] = [];
+  let lastPosition = -1;
+  const append = (row: number, col: number, entry?: CellEntry) => {
+    const a1 = `${colIndexToLetters(col)}${row + 1}`;
+    rangeHash.update(JSON.stringify([a1, entry?.t ?? '', entry?.v ?? '', entry?.f ?? null, entry?.fAttrs ?? ''])).update('\n');
+    if (col === parsedRange.col0) {
+      orderKeysHash.update(JSON.stringify([row, entry?.v ?? '', entry?.f ?? null])).update('\n');
+    }
+    if (entry && snippetCells.length < 1000) {
+      snippetCells.push({ address: a1, value: entry.v, ...(entry.f !== null ? { formula: entry.f } : {}), type: entry.t });
+    }
+  };
   const rangeCells = new Map<string, CellEntry>();
 
   const parser = new SaxesParser({ xmlns: true, position: false });
-  let elemCount = 0;
   let currentRowNum = 0;
   let autoColIdx = 0;
 
@@ -425,7 +540,6 @@ export function readXlsxRangeTarget(
   parser.on('doctype', () => invalidPackage());
   parser.on('error', () => invalidPackage());
   parser.on('opentag', (tag) => {
-    if (++elemCount > MAX_SAX_ELEMENTS) invalidPackage();
     const local = tag.local;
     const attrs = tag.attributes as Record<string, { value: string }>;
 
@@ -509,44 +623,36 @@ export function readXlsxRangeTarget(
         } else if (cellType === 'inlineStr') {
           resolvedValue = isBuf;
         }
-        rangeCells.set(`${cellRow}:${cellCol}`, {
+        const entry = {
           t: cellType || (hasFormula ? 'formula' : 'n'),
           v: resolvedValue,
           f: hasFormula ? fBuf : null,
           fAttrs: hasFormula ? fAttrs : '',
-        });
+        };
+        if (dense) {
+          const key = `${cellRow}:${cellCol}`;
+          if (rangeCells.has(key)) invalidPackage();
+          rangeCells.set(key, entry);
+        } else {
+          // OOXML rows and cells are in ascending index order. Missing cells are
+          // implicit blanks bound to the canonical range, so no blank loop is needed.
+          const position = cellRow * 16_384 + cellCol;
+          if (position <= lastPosition) invalidPackage();
+          lastPosition = position;
+          append(cellRow, cellCol, entry);
+        }
       }
       inCell = false;
       cellInRange = false;
     }
   });
 
-  parser.write(sheetXml).close();
+  parseSaxBytes(parser, sheetBytes);
 
-  // Build ordered row-major hash of values, formulas, types, and order across the exact range
-  const rangeHash = createHash('sha256');
-  rangeHash.update(`range:${sheet.id}:${parsedRange.canonical}\n`);
-  const orderKeysHash = createHash('sha256');
-  orderKeysHash.update(`order:${sheet.id}:${parsedRange.canonical}\n`);
-  const snippetCells: Array<{ address: string; value: string; formula?: string; type?: string }> = [];
-
-  for (let r = parsedRange.row0; r <= parsedRange.row1; r++) {
-    const firstKeyEntry = rangeCells.get(`${r}:${parsedRange.col0}`);
-    orderKeysHash.update(JSON.stringify([r, firstKeyEntry?.v ?? '', firstKeyEntry?.f ?? null])).update('\n');
-    for (let c = parsedRange.col0; c <= parsedRange.col1; c++) {
-      const a1 = `${colIndexToLetters(c)}${r + 1}`;
-      const entry = rangeCells.get(`${r}:${c}`);
-      const serialized = entry
-        ? JSON.stringify([a1, entry.t, entry.v, entry.f, entry.fAttrs])
-        : JSON.stringify([a1, '', '', null, '']);
-      rangeHash.update(serialized).update('\n');
-      if (entry && snippetCells.length < 1000) {
-        snippetCells.push({
-          address: a1,
-          value: entry.v,
-          ...(entry.f !== null ? { formula: entry.f } : {}),
-          type: entry.t,
-        });
+  if (dense) {
+    for (let row = parsedRange.row0; row <= parsedRange.row1; row++) {
+      for (let col = parsedRange.col0; col <= parsedRange.col1; col++) {
+        append(row, col, rangeCells.get(`${row}:${col}`));
       }
     }
   }
@@ -572,13 +678,14 @@ export function readXlsxSheetTarget(
   bytes: Buffer,
   sheetSelector: string,
 ): XlsxSheetTargetResult | null {
-  const single = readXlsxRangeTarget(bytes, sheetSelector, 'A1');
-  if (!single) return null;
+  const full = readXlsxRangeTarget(bytes, sheetSelector, 'A1:XFD1048576');
+  if (!full) return null;
   return {
-    sheetId: single.sheetId,
-    sheetName: single.sheetName,
-    sheetPart: single.sheetPart,
-    expectedSheetStructHash: single.expectedSheetStructHash,
+    sheetId: full.sheetId,
+    sheetName: full.sheetName,
+    sheetPart: full.sheetPart,
+    expectedSheetStructHash: full.expectedSheetStructHash,
+    expectedSheetContentHash: full.expectedRangeValuesHash,
   };
 }
 
@@ -601,14 +708,12 @@ export function readXlsxRowColTarget(
   const sheetBytes = parts[sheet.part];
   if (!sheetBytes) return null;
   const sharedStrings = parseSharedStringsXml(parts[sharedStringsPath]);
-  const sheetXml = new TextDecoder('utf-8', { fatal: true }).decode(sheetBytes);
 
   const structHash = createHash('sha256');
   structHash.update(`sheet:${sheet.id}:${sheet.name}\n`);
 
   const sliceEntries: Array<{ pos: number; a1: string; t: string; v: string; f: string | null; fAttrs: string }> = [];
   const parser = new SaxesParser({ xmlns: true, position: false });
-  let elemCount = 0;
   let currentRowNum = 0;
   let autoColIdx = 0;
   let inCell = false;
@@ -631,7 +736,6 @@ export function readXlsxRowColTarget(
   parser.on('doctype', () => invalidPackage());
   parser.on('error', () => invalidPackage());
   parser.on('opentag', (tag) => {
-    if (++elemCount > MAX_SAX_ELEMENTS) invalidPackage();
     const local = tag.local;
     const attrs = tag.attributes as Record<string, { value: string }>;
     if (local === 'dimension') {
@@ -718,7 +822,7 @@ export function readXlsxRowColTarget(
     }
   });
 
-  parser.write(sheetXml).close();
+  parseSaxBytes(parser, sheetBytes);
   sliceEntries.sort((a, b) => a.pos - b.pos);
 
   const sliceHash = createHash('sha256');

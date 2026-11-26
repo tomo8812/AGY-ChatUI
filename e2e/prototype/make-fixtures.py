@@ -114,11 +114,17 @@ for row, values in zip(table.table.rows, [["Metric", "Value"], ["Count", "24"]])
 master_bg = deck.slide_master.background
 master_bg.fill.solid()
 master_bg.fill.fore_color.rgb = RGBColor(232, 238, 246)
-master_band = deck.slide_master.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(10), Inches(0.22))
+master_band = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(10), Inches(0.22))
 master_band.name = "Master header band"
 master_band.fill.solid()
 master_band.fill.fore_color.rgb = RGBColor(30, 58, 95)
 master_band.line.fill.background()
+# python-pptx exposes master shapes as a read-only collection. Move the
+# generated XML into the master, with an ID unique in that master.
+master_tree = deck.slide_master.shapes._spTree
+master_ids = [int(element.get("id")) for element in master_tree.xpath(".//p:cNvPr")]
+master_band._element.xpath(".//p:cNvPr")[0].set("id", str(max(master_ids, default=0) + 1))
+master_tree.insert_element_before(master_band._element, "p:extLst")
 slide.slide_layout.background.fill.solid()
 slide.slide_layout.background.fill.fore_color.rgb = RGBColor(240, 244, 249)
 deck.save(out / "sample.pptx")

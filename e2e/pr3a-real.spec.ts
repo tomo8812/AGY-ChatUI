@@ -8,6 +8,7 @@ import {auditRegions,computeRegionMetrics,decodePng,type RegionAuditSpec} from '
 
 const runtime=process.env.AGY_PR3A_RUNTIME_DIR;
 const fixtureDir=process.env.AGY_PR3A_FIXTURE_DIR;
+const profile=process.env.AGY_PR3A_PROFILE==='full'?'full':'compact';
 if(process.env.CI&&(!runtime||!fixtureDir))throw Error('PR3A real browser fixtures are required in CI');
 const targets=[{width:1280,height:720,project:'pc-chromium'},{width:1440,height:900,project:'pc-chromium'},{width:1920,height:1080,project:'pc-chromium'},{width:375,height:812,project:'iphone-webkit'},{width:430,height:932,project:'iphone-webkit'}];
 const base='http://127.0.0.1:4174/';
@@ -22,7 +23,9 @@ const cases=[
 ] as const;
 
 async function openCommand(page:Page,control:ReturnType<Page['getByRole']>){
-  if(!await control.isVisible())await page.getByRole('button',{name:'その他の編集操作',exact:true}).click();
+  const toggle=page.getByRole('button',{name:'その他の編集操作',exact:true});
+  await expect(control.or(toggle).first()).toBeVisible();
+  if(!await control.isVisible())await toggle.click();
   await expect(control).toBeVisible();
 }
 async function readySlide(page:Page){
@@ -86,14 +89,26 @@ async function capturePptx(page:Page,info:TestInfo,reference:Buffer,name:string)
   // Per-element & region-level bbox audit: union of geometric bounds and rendered ink bounds
   // plus exposed background corner so whole-slide SSIM cannot mask local defects.
   const actualImg=decodePng(fs.readFileSync(actual));
-  const expectedImg=decodePng(reference);
+  const alignedReference=info.outputPath(name+'-reference-in-viewport.png');
+  const overlay=await scene.evaluateHandle(async(el,src)=>{
+    const img=document.createElement('img');
+    img.src=src;
+    await img.decode();
+    Object.assign(img.style,{position:'absolute',inset:'0',width:'100%',height:'100%',zIndex:'9999',pointerEvents:'none'});
+    el.append(img);
+    return img;
+  },'data:image/png;base64,'+reference.toString('base64'));
+  try{await scene.screenshot({path:alignedReference,scale:'css'});}
+  finally{await overlay.evaluate(img=>img.remove());await overlay.dispose();}
+  const expectedImg=decodePng(fs.readFileSync(alignedReference));
   const scaleX=actualImg.width/Math.max(1,layoutAudit.width);
   const scaleY=actualImg.height/Math.max(1,layoutAudit.height);
   const keyTargets=['Title','Overlap','Grouped diagram','Attached image','Native table','Basic 1','Basic 61'];
   const regionSpecs:RegionAuditSpec[]=[];
   for(const label of keyTargets){
     const hit=layoutAudit.hits.find(h=>h.label===label);
-    if(!hit)continue;
+    expect(hit,'Missing PPTX hit bbox for '+label).toBeDefined();
+    if(!hit)throw new Error('Missing PPTX hit bbox for '+label);
     const layer=layoutAudit.rendered.find(l=>l.shapeId===hit.shapeId);
     const x0=Math.min(hit.geom.x,layer?layer.ink.x:hit.geom.x);
     const y0=Math.min(hit.geom.y,layer?layer.ink.y:hit.geom.y);
@@ -124,7 +139,7 @@ for(const vp of targets){
   test('PR3A actual files and persistent edits '+vp.width+'x'+vp.height,async({page},info)=>{
     test.skip(info.project.name!==vp.project||!runtime||!fixtureDir);
     test.setTimeout(600000);
-    const srv=await createTestServer({docRuntimeDir:runtime!,installDocRuntime:'compact',sandboxMode:'off',allowUnsandboxedDocWorkers:true,docWorkerBudget:2});
+    const srv=await createTestServer({docRuntimeDir:runtime!,installDocRuntime:profile,sandboxMode:'off',allowUnsandboxedDocWorkers:true,docWorkerBudget:2});
     const evidence:unknown[]=[];
     const failures:string[]=[];
     try{
@@ -183,6 +198,7 @@ for(const vp of targets){
       for(const item of cases){
         artifacts[item.kind]=(await svc.createArtifact({userId,scopeKind:'chat',chatId,relPath:item.filename,content:fs.readFileSync(path.join(fixtureDir!,item.filename)),actorKind:'user',actorId:userId})).artifact;
       }
+      expect(svc.getCapabilities(userId,artifacts.pptx.id).runtimeProfile).toBe(profile==='full'?'full_runtime':'compact_doc_runtime');
       await page.addInitScript(records=>{
         const kind=new URLSearchParams(location.search).get('kind')??'';
         (window as Window&{__pr3aFixtureArtifact?:unknown}).__pr3aFixtureArtifact=records[kind];
@@ -263,6 +279,7 @@ for(const vp of targets){
               }
               if(item.kind==='xlsx'){
                 const jump=page.getByRole('textbox',{name:'セル範囲へ移動'});
+                if(!await jump.isVisible())await page.getByRole('button',{name:'その他の表の移動操作'}).click();
                 const search=page.getByRole('textbox',{name:'シート全体を検索'});
                 await search.fill('Beyond old grid window');
                 await page.getByRole('button',{name:'次の一致',exact:true}).click();
@@ -281,6 +298,7 @@ for(const vp of targets){
                 await expect(page.getByRole('button',{name:'太字',exact:true})).toHaveAttribute('aria-pressed','true');
               }
             }else if(item.kind==='docx'){
+              await openCommand(page,page.getByRole('button',{name:'見出し一覧',exact:true}));
               await page.getByRole('button',{name:'見出し一覧',exact:true}).click();
               await page.getByRole('navigation',{name:'文書の見出し'}).getByRole('button',{name:'Editing notes'}).click();
               await expect(page.locator('[data-word-block="4"]')).toHaveClass(/selected/);
@@ -395,7 +413,7 @@ for(const vp of targets){
               // Verify vacated bbox strip from moved Overlap shape has 0 ghosting against saved LibreOffice render
               const movedInfo=record.movedOverlapVacated as {stage:{x:number;y:number;width:number;height:number};orig:{x:number;y:number;width:number;height:number}}|undefined;
               if(movedInfo){
-                const actualAfter=decodePng(fs.readFileSync(info.outputPath('pptx-after-actual.png')));
+                const actualAfter=decodePng(fs.readFileSync(info.outputPath('pptx-after-canvas.png')));
                 const expectedAfter=decodePng(fs.readFileSync(info.outputPath('pptx-after-reference.png')));
                 const sx=actualAfter.width/Math.max(1,movedInfo.stage.width);
                 const sy=actualAfter.height/Math.max(1,movedInfo.stage.height);
@@ -431,7 +449,7 @@ for(const vp of targets){
           await expect(page.locator('.workspace-request-item')).toContainText('Change this selected target');
           const requests=srv.ctx.editRequestService.listRequests(userId,chatId,{artifactId:artifact.id});
           expect(requests).toHaveLength(1);
-          expect(srv.ctx.editRequestService.resolveRequestTarget(requests[0]).status).toBe('resolved');
+          expect((await srv.ctx.editRequestService.resolveRequestTarget(requests[0])).status).toBe('resolved');
           if(item.kind==='pptx')expect(requests[0].regionImageBlobSha256).toMatch(/^[0-9a-f]{64}$/);
           record.pin=requests[0].selector;
           await page.screenshot({path:info.outputPath('real-'+item.kind+'-pin.png')});
@@ -459,7 +477,7 @@ for(const vp of targets){
             await expect(page.locator('.workspace-request-item')).toHaveCount(2);
             const regionRequest=srv.ctx.editRequestService.listRequests(userId,chatId,{artifactId:artifact.id}).find(request=>request.selector.kind==='pdf_region');
             expect(regionRequest?.selector).toMatchObject({expectedPageContentHash:expect.stringMatching(/^[0-9a-f]{64}$/),expectedRegionDigest:expect.stringMatching(/^[0-9a-f]{64}$/)});
-            expect(srv.ctx.editRequestService.resolveRequestTarget(regionRequest!).status).toBe('resolved');
+            expect((await srv.ctx.editRequestService.resolveRequestTarget(regionRequest!)).status).toBe('resolved');
             evidence.push({kind:'pdf-region',selector:regionRequest!.selector});
             await page.screenshot({path:info.outputPath('real-pdf-region.png')});
           }
@@ -599,7 +617,7 @@ for(const vp of targets){
       }
       expect(failures,'Independent actual-file failures').toEqual([]);
     }finally{
-      fs.writeFileSync(info.outputPath('pr3a-evidence.json'),JSON.stringify({viewport:vp,results:evidence,failures},null,2));
+      fs.writeFileSync(info.outputPath('pr3a-evidence.json'),JSON.stringify({profile,viewport:vp,results:evidence,failures},null,2));
       await page.unrouteAll({behavior:'wait'});
       await srv.cleanup();
     }

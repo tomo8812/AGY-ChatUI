@@ -639,7 +639,7 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       operationType: 'replace',
       operationSummary: 'replaced image',
     });
-    expect(srv.ctx.editRequestService.getRequest(userId, chatId, imgReq.id)!.status).toBe('needs_review');
+    await expect.poll(() => srv.ctx.editRequestService.getRequest(userId, chatId, imgReq.id)?.status, { timeout: 10_000 }).toBe('needs_review');
 
     // Case 2 (PIN-02): Same page count PDF page swap -> needs_review
     const pdfArt = await srv.ctx.artifactService.createArtifact({
@@ -651,7 +651,7 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       actorKind: 'user',
       actorId: userId,
     });
-    const pdfRes = srv.ctx.artifactService.resolveTargetOnArtifact(userId, pdfArt.artifact.id, {
+    const pdfRes = await srv.ctx.artifactService.resolveTargetOnArtifact(userId, pdfArt.artifact.id, {
       kind: 'pdf_page',
       pageIndex: 0,
       expectedPageCount: 2,
@@ -670,7 +670,7 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       actorKind: 'user',
       actorId: userId,
     });
-    const xlsxRes = srv.ctx.artifactService.resolveTargetOnArtifact(userId, xlsxArt.artifact.id, {
+    const xlsxRes = await srv.ctx.artifactService.resolveTargetOnArtifact(userId, xlsxArt.artifact.id, {
       kind: 'xlsx_range',
       sheetId: 'Sheet1',
       rangeA1: 'A1:B2',
@@ -703,7 +703,7 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       actorKind: 'user',
       actorId: userId,
     });
-    const svgRes = srv.ctx.artifactService.resolveTargetOnArtifact(userId, svgArt.artifact.id, {
+    const svgRes = await srv.ctx.artifactService.resolveTargetOnArtifact(userId, svgArt.artifact.id, {
       kind: 'svg_element',
       elementId: 'hero',
       expectedTag: heroEl.tag,
@@ -729,7 +729,7 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       actorKind: 'user',
       actorId: userId,
     });
-    const dupRes = srv.ctx.artifactService.resolveTargetOnArtifact(userId, codeArt.artifact.id, {
+    const dupRes = await srv.ctx.artifactService.resolveTargetOnArtifact(userId, codeArt.artifact.id, {
       kind: 'code_line_range',
       startLine: 1,
       endLine: 1,
@@ -796,7 +796,7 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       },
       instruction: 'Check key-only item',
     });
-    expect(srv.ctx.editRequestService.resolveRequestTarget(reqRichKeyOnly).status).toBe('resolved');
+    expect((await srv.ctx.editRequestService.resolveRequestTarget(reqRichKeyOnly)).status).toBe('resolved');
 
     // Swap array order r2, r1
     srv.ctx.richContentService.updateBlock({
@@ -811,12 +811,12 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
         ],
       },
     });
-    const richReRes = srv.ctx.editRequestService.resolveRequestTarget(reqRich);
+    const richReRes = await srv.ctx.editRequestService.resolveRequestTarget(reqRich);
     expect(richReRes.status).toBe('needs_review');
     expect(richReRes.orderChanged).toBe(true);
 
     // PIN-05 & PIN-06: getForAgent separates userInstruction vs untrustedTargetContent; markApplied ONLY transitions to applied_unverified
-    const agentPayload = srv.ctx.editRequestService.getForAgent(userId, chatId, reqRich.id);
+    const agentPayload = await srv.ctx.editRequestService.getForAgent(userId, chatId, reqRich.id);
     expect(agentPayload.userInstruction).toBe('Highlight first item');
     expect(agentPayload.untrustedTargetContent).toBeDefined();
 
@@ -834,7 +834,7 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
     );
     expect(userResolved.status).toBe(200);
     expect(userResolved.data.request.status).toBe('resolved');
-  });
+  }, 20_000);
 
   it('ARCH-08, ARCH-09 & Basic 8 Adapters: supports immutable revision Range serving, WS user_seq/pong/snapshot, and Pure-JS CRUD/verify/export', async () => {
     const srv = await createTestServer();
