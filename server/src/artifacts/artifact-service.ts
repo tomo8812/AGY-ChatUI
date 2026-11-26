@@ -4529,15 +4529,15 @@ export class ArtifactService {
     }
   }
 
-  /** Revision-pinned, read-only document preview. Unlike the legacy PPTX viewer,
-   * DOCX conversion uses the resource-governed document worker and its isolation policy.
+  /** Revision-pinned, read-only document preview using the isolated document worker.
    * No exported artifact or workspace mutation is created.
    */
-  async renderDocxPreviewPdf(userId: string, artifactId: string, revisionNumber: number): Promise<string> {
+  async renderOfficePreviewPdf(userId: string, artifactId: string, revisionNumber: number): Promise<string> {
     const pinned = this.getRevisionContentBlob(userId, artifactId, revisionNumber);
     const { artifact, revision } = pinned;
-    if (this.registry.resolve(artifact.filename, artifact.previewKind).format !== 'docx') {
-      throw unsupportedOperationError('export:pdf', 'unsupported_by_format', 'DOCX preview requires a Word document.');
+    const format = this.registry.resolve(artifact.filename, artifact.previewKind).format;
+    if (format !== 'docx' && format !== 'xlsx') {
+      throw unsupportedOperationError('export:pdf', 'unsupported_by_format', 'A DOCX or XLSX snapshot is required.');
     }
     if (!this.documentWorker.available) {
       throw unsupportedOperationError('export:pdf', 'disabled_by_resource_tier', 'Document runtime is unavailable.');
@@ -4546,12 +4546,12 @@ export class ArtifactService {
     const converted = await this.renderCache.getOrRender({
       keyInput: {
         artifactId, revision: revision.revision, sha256: revision.sha256,
-        dependencyManifestHash: revision.dependencyManifestHash, variant: 'docx_view_pdf',
+        dependencyManifestHash: revision.dependencyManifestHash, variant: `${format}_view_pdf`,
         engineVersion: 'document-worker-v1',
       },
       ext: '.pdf',
       produce: async (output) => {
-        const pdf = await this.documentWorker.run('docx', artifact.filename, snapshot.bytes, { action: 'export', targetFormat: 'pdf' });
+        const pdf = await this.documentWorker.run(format, artifact.filename, snapshot.bytes, { action: 'export', targetFormat: 'pdf' });
         if (pdf.length < 8 || pdf.length > DOCUMENT_WORKER_MAX_INPUT_BYTES || pdf.subarray(0, 5).toString('ascii') !== '%PDF-') return false;
         fs.writeFileSync(output, pdf, { mode: 0o600 });
         return true;
@@ -4562,13 +4562,13 @@ export class ArtifactService {
   }
 
   /** Render an edited sprite from an isolated copy without publishing any revision.
-   * Only the two basic canvas operations are accepted here; the regular edit
-   * transaction remains the sole path for committing bytes or emitting events.
+   * The regular edit transaction commits bytes and emits revision events.
    */
   async renderPptxDraftSprite(userId: string, artifactId: string, draft: {
     expectedRevision: number; pageIndex: number; shapeId: number; cropSprite?: boolean; text?: string;
     boundsPt?: [number, number, number, number];
     style?: {bold?:boolean;italic?:boolean;fontSizePt?:number;fontColor?:string;fill?:string};
+    cells?: Array<{row:number;column:number;text:string}>;
   }, assertAuthorized?: () => void | Promise<void>): Promise<{png: Buffer; revision: number; sha256: string}> {
     await assertAuthorized?.();
     const snapshot = this.readCurrentRevision(userId, artifactId, DOCUMENT_WORKER_MAX_INPUT_BYTES);
@@ -4587,7 +4587,9 @@ export class ArtifactService {
     if (!Number.isInteger(draft.pageIndex) || draft.pageIndex < 0 ||
         !Number.isSafeInteger(draft.shapeId) || draft.shapeId < 1 || !validBounds ||
         (draft.text !== undefined && (typeof draft.text !== 'string' || draft.text.length > 20000)) ||
-        (draft.text === undefined && draft.boundsPt === undefined && draft.style === undefined)) {
+        (draft.cells?.some(cell=>!Number.isSafeInteger(cell.row)||cell.row<0||
+          !Number.isSafeInteger(cell.column)||cell.column<0||typeof cell.text!=='string'||cell.text.length>20_000)) ||
+        (draft.text === undefined && draft.boundsPt === undefined && draft.style === undefined && !draft.cells?.length)) {
       throw new ArtifactError('INVALID_INPUT', 'Invalid draft sprite request.', 400);
     }
     const structure = JSON.parse((await this.documentWorker.run('pptx', artifact.filename, bytes, {action:'structure'})).toString('utf8')) as {slides?:Array<{part:string}>};
@@ -4596,6 +4598,9 @@ export class ArtifactService {
     const operations: AdapterOperation[] = [];
     if (draft.text !== undefined) operations.push({op:'pptx.set_shape_text', slidePart, shapeId:draft.shapeId, text:draft.text});
     if (draft.boundsPt !== undefined) operations.push({op:'pptx.set_shape_bounds', slidePart, shapeId:draft.shapeId, boundsPt:draft.boundsPt});
+    for(const {row,column,text} of draft.cells??[]){
+      operations.push({op:'pptx.set_table_cell',slidePart,shapeId:draft.shapeId,row,column,text});
+    }
     if(draft.style!==undefined){
       const {bold,italic,fontSizePt,fontColor,fill}=draft.style;
       if(Object.keys(draft.style).some(k=>!['bold','italic','fontSizePt','fontColor','fill'].includes(k))||

@@ -202,7 +202,8 @@ class DocumentFormatAdapter implements FormatAdapter {
       { operation: 'view', availability: 'supported', scope: 'ui_view_only' },
       { operation: 'target_pin', availability: 'supported', scope: 'mcp_and_ui' },
       ...DOCUMENT_ACTIONS[this.format].map((operation): OperationCapability => {
-        const scope = DIRECT_EDITOR_OPERATIONS.has(operation) || operation === 'structure' || operation === 'read_range'
+        const workspaceExport = operation.startsWith('export:') && ['pptx', 'docx', 'xlsx', 'pdf'].includes(this.format);
+        const scope = DIRECT_EDITOR_OPERATIONS.has(operation) || operation === 'structure' || operation === 'read_range' || workspaceExport
           ? 'mcp_and_ui' : 'mcp_only';
         const constraint = documentFormatConstraint(this.format, ctx.filename ?? '', operation, ctx.previewKind, ctx.content);
         if (constraint) return { operation, availability: 'unsupported_by_format', scope, notes: constraint };

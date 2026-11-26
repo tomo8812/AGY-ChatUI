@@ -313,6 +313,12 @@ for(const vp of targets){
                 await expect(page.getByRole('gridcell',{name:'C1',exact:true})).toHaveText('61',{timeout:30000});
                 await page.getByRole('button',{name:'太字',exact:true}).click();
                 await expect(page.getByRole('button',{name:'太字',exact:true})).toHaveAttribute('aria-pressed','true');
+                const italic=page.getByRole('button',{name:'斜体',exact:true});
+                await openCommand(page,italic);
+                await italic.click();
+                const alignment=page.getByRole('combobox',{name:'セルの配置',exact:true});
+                await expect(alignment).toBeVisible();
+                await alignment.selectOption('right');
               }
             }else if(item.kind==='docx'){
               await openCommand(page,page.getByRole('button',{name:'見出し一覧',exact:true}));
@@ -325,6 +331,10 @@ for(const vp of targets){
               await page.getByRole('button',{name:'段落全選択',exact:true}).click();
               await page.getByRole('button',{name:'太字',exact:true}).click();
               await expect(word.locator('strong')).toHaveText(item.updated);
+              const heading=page.getByRole('combobox',{name:'見出しレベル',exact:true});
+              await openCommand(page,heading);
+              await heading.selectOption('3');
+              await page.getByRole('combobox',{name:'リスト形式',exact:true}).selectOption('decimal');
               const mixed=page.getByRole('textbox',{name:'段落 2',exact:true});
               await mixed.click();
               await page.getByRole('button',{name:'段落全選択',exact:true}).click();
@@ -406,12 +416,12 @@ for(const vp of targets){
               expect(fs.readFileSync(pinned.blobPath,'utf8')).toBe(item.updated);
               await expect.poll(()=>page.locator('.cm-line').allTextContents()).toEqual(item.updated.split('\n'));
             }else if(item.kind==='xlsx'){
-              expect(await svc.readRange(userId,artifact.id,{sheetId:'1',rangeA1:'A1:B1'})).toMatchObject({cells:[{address:'A1',value:'42',bold:true},{address:'B1',formula:'A1*2'}]});
+              expect(await svc.readRange(userId,artifact.id,{sheetId:'1',rangeA1:'A1:B1'})).toMatchObject({cells:[{address:'A1',value:'42',bold:true,italic:true,horizontal:'right'},{address:'B1',formula:'A1*2'}]});
             }else if(item.kind==='csv'){
               expect(await svc.readRange(userId,artifact.id,{startRow:0,endRow:1,startCol:0,endCol:1})).toMatchObject({rows:[['Updated item','Quantity'],['Apple','7']]});
             }else if(item.kind==='docx'){
               const result=await svc.readRange(userId,artifact.id,{start:0,count:3});
-              expect(result).toMatchObject({blocks:[{text:item.updated,marks:{bold:true}},{text:'Keep formatting',uiRuns:[{text:'Keep ',bold:true,underline:true},{text:'formatting',italic:true,underline:true}]},{text:'Edited existing table'}]});
+              expect(result).toMatchObject({blocks:[{text:item.updated,marks:{bold:true},headingLevel:3,listType:'decimal'},{text:'Keep formatting',uiRuns:[{text:'Keep ',bold:true,underline:true},{text:'formatting',italic:true,underline:true}]},{text:'Edited existing table'}]});
               if(vp.width===1280||vp.width===375){
                 const added=await svc.readRange(userId,artifact.id,{start:0,count:40}) as {blocks:Array<{type:string;text:string}>};
                 expect(added.blocks.filter(block=>block.type!=='sectPr').slice(-3)).toMatchObject([{type:'p',text:'First appended revised'},{type:'tbl',text:expect.stringContaining('Third row and column')},{type:'p',text:'Last appended'}]);
@@ -537,6 +547,19 @@ for(const vp of targets){
             await expect(items).toHaveCount(1);
             expect(srv.ctx.editRequestService.listRequests(userId,chatId,{artifactId:artifact.id})).toMatchObject([{instruction:'Revised cell instruction',status:'draft'}]);
             evidence.push({kind:'multiple-target-drafts',count:2,edited:true,reordered:true,deleted:true});
+            await page.getByRole('button',{name:'編集',exact:true}).click();
+            await page.getByRole('gridcell',{name:'A1',exact:true}).click();
+            const structureAction=page.getByRole('combobox',{name:'表の編集操作',exact:true});
+            await openCommand(page,structureAction);
+            await structureAction.selectOption('insert_row');
+            await page.getByRole('button',{name:'適用',exact:true}).click();
+            await page.getByRole('textbox',{name:'数式・セル値'}).fill('Edited after insertion');
+            await page.getByRole('button',{name:'保存',exact:true}).click();
+            await expect(page.locator('.workspace-status')).toContainText('バージョン 3');
+            expect(await svc.readRange(userId,artifact.id,{startRow:0,endRow:2,startCol:0,endCol:1})).toMatchObject({
+              rows:[['',''],['Edited after insertion','Quantity'],['Apple','7']],
+            });
+            evidence.push({kind:'grid-edit-after-structure',revision:3});
           }
           if(item.kind==='code'&&(vp.width===1280||vp.width===375)){
             // Actual server revision change delivered through the harness's
@@ -570,6 +593,18 @@ for(const vp of targets){
             await expect.poll(()=>page.locator('.cm-line').allTextContents()).toEqual(remoteText.split('\n'));
             expect(srv.ctx.db.getArtifact(userId,artifact.id)?.revision).toBe(3);
             evidence.push({kind:'live-revision-conflict',revision:3,draftPreserved:true,zoomPreserved:true,remotePreserved:true});
+            await page.getByRole('button',{name:'その他の操作',exact:true}).click();
+            await page.getByRole('button',{name:'バージョン履歴',exact:true}).click();
+            const original=page.locator('.workspace-check').filter({has:page.getByText('バージョン 1',{exact:true})});
+            await original.getByRole('button',{name:'プレビュー',exact:true}).click();
+            const baseSource=fs.readFileSync(svc.getRevisionContentBlob(userId,artifact.id,1).blobPath,'utf8');
+            await expect(original.locator('pre')).toHaveText(baseSource);
+            await page.screenshot({path:info.outputPath('real-code-history.png')});
+            page.once('dialog',dialog=>void dialog.accept());
+            await original.getByRole('button',{name:'復元',exact:true}).click();
+            await expect(page.locator('.workspace-status')).toContainText('バージョン 4');
+            expect(fs.readFileSync(svc.getRevisionContentBlob(userId,artifact.id,4).blobPath,'utf8')).toBe(baseSource);
+            evidence.push({kind:'history-preview-restore',sourceRevision:1,restoredRevision:4});
           }
           if(item.kind==='pptx'){
             await page.getByRole('button',{name:'編集',exact:true}).click();
@@ -582,8 +617,9 @@ for(const vp of targets){
               await page.getByRole('button',{name:'適用',exact:true}).click();
 
             };
-            const saveStructural=async(op:string,configure:()=>Promise<void>,renderIndex:number)=>{
+            const saveStructural=async(op:string,configure:()=>Promise<void>,renderIndex:number,editDraft?:()=>Promise<void>)=>{
               await stageStructural(op,configure);
+              await editDraft?.();
               await expect(page.locator('[data-slide-canvas]')).toHaveAttribute('data-preview-ready','true',{timeout:90000});
               const image=page.getByRole('img',{name:'変更後のスライド'});
               await expect.poll(()=>image.evaluate(el=>(el as HTMLImageElement).complete&&(el as HTMLImageElement).naturalWidth>0),{timeout:30000}).toBe(true);
@@ -604,8 +640,13 @@ for(const vp of targets){
             };
             await saveStructural('pptx.add_shape',async()=>{
               await page.getByRole('textbox',{name:'追加図形テキスト'}).fill('Added by editor');
-            },0);
-            expect(await svc.readRange(userId,artifact.id,{part:'ppt/slides/slide1.xml'})).toMatchObject({shapes:expect.arrayContaining([expect.objectContaining({text:'Added by editor'})])});
+            },0,async()=>{
+              const newShape=page.locator('[data-shape-id^="pptx-structure:"]');
+              await expect(newShape).toHaveClass(/selected/);
+              await newShape.press('ArrowRight');
+              await page.getByRole('textbox',{name:'図形テキスト'}).fill('Edited before saving');
+            });
+            expect(await svc.readRange(userId,artifact.id,{part:'ppt/slides/slide1.xml'})).toMatchObject({shapes:expect.arrayContaining([expect.objectContaining({text:'Edited before saving'})])});
             // The extended native structure operations are covered on both
             // Chromium and WebKit; the basic addition runs at all five sizes.
             if(vp.width===1280||vp.width===375){
@@ -642,6 +683,19 @@ for(const vp of targets){
               page.once('dialog',d=>void d.accept());
               await saveStructural('pptx.remove_slide',async()=>{},0);
               expect((await svc.getStructure(userId,artifact.id)).slides).toHaveLength(1);
+              await page.getByRole('button',{name:'Native table',exact:true}).click();
+              const table=page.getByRole('group',{name:'Native table のセル'});
+              await table.getByRole('textbox',{name:'2行 2列'}).fill('38');
+              await expect(page.locator('[data-slide-canvas]')).toHaveAttribute('data-preview-ready','true',{timeout:90000});
+              await page.screenshot({path:info.outputPath('pptx-existing-table-edit.png')});
+              await page.getByRole('button',{name:'保存',exact:true}).click();revision++;
+              await expect(page.locator('.workspace-status')).toContainText('バージョン '+revision,{timeout:90000});
+              expect(await svc.readRange(userId,artifact.id,{part:'ppt/slides/slide1.xml'})).toMatchObject({
+                shapes:expect.arrayContaining([expect.objectContaining({name:'Native table',tableRows:[
+                  [{text:'Metric',editable:true},{text:'Value',editable:true}],
+                  [{text:'Count',editable:true},{text:'38',editable:true}],
+                ]})]),
+              });
             }
           }
         })}catch(error){

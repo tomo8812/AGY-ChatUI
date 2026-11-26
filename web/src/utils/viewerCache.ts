@@ -289,12 +289,12 @@ function versionQuery(artifact: ArtifactContentVersion, pinRevision: boolean): U
 }
 
 export function buildArtifactContentUrl(
-  artifact: ArtifactContentVersion & Pick<ArtifactRecord, 'previewKind'>,
+  artifact: ArtifactContentVersion & Pick<ArtifactRecord, 'previewKind'> & Partial<Pick<ArtifactRecord, 'filename'>>,
   opts?: { download?: boolean; convertedPdf?: boolean }
 ): string {
   const qs = versionQuery(artifact, true);
   if (opts?.download) qs.set('download', '1');
-  if (opts?.convertedPdf && (artifact.previewKind === 'pptx' || (artifact.previewKind === 'docx' && artifact.revision !== undefined))) {
+  if (opts?.convertedPdf && (artifact.previewKind === 'pptx' || (artifact.revision !== undefined && (artifact.previewKind === 'docx' || /\.xlsx$/i.test(artifact.filename ?? ''))))) {
     qs.set('converted', 'pdf');
   }
   const suffix = qs.toString();

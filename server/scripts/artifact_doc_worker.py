@@ -646,6 +646,8 @@ def allocate_workbook_style_index(package, replacements, additions, spec, base_i
                 if merged_font[key]:
                     if existing is None:
                         new_font.insert(0, XML.Element(tag(SPREADSHEET, el_name)))
+                    elif existing.get("val") in ("0", "false", "off", "none"):
+                        del existing.attrib["val"]
                 elif existing is not None:
                     new_font.remove(existing)
         size_val = merged_font.get("fontSizePt", merged_font.get("size"))
@@ -2200,7 +2202,19 @@ def pptx_basic_geometry(shape):
             "strokeWidthPt": int(line.get("w", "0")) / 12700 if stroke != "none" else 0}
 
 
-def pptx_shape_order(node):
+def _pptx_table_rows(shape):
+    if shape.tag != tag(PRESENTATION, "graphicFrame"):
+        return None
+    table = shape.find("./" + tag(DRAWING, "graphic") + "/" + tag(DRAWING, "graphicData") + "/" + tag(DRAWING, "tbl"))
+    if table is None:
+        return None
+    return [[{
+        "text": "\n".join(text_content(paragraph, DRAWING) for paragraph in cell.findall("./" + tag(DRAWING, "txBody") + "/" + tag(DRAWING, "p"))),
+        "editable": not any(cell.get(attribute) in ("1", "true") for attribute in ("hMerge", "vMerge")),
+    } for cell in row.findall(tag(DRAWING, "tc"))] for row in table.findall(tag(DRAWING, "tr"))]
+
+
+def pptx_shape_order(node, include_table_rows=False):
     # XML parsing already enforces bounded depth; the worker's memory/output
     # budgets apply to the full tree, not an independent shape count.
     children = []
@@ -2212,9 +2226,13 @@ def pptx_shape_order(node):
         props = shape.find("./*/" + tag(PRESENTATION, "cNvPr"))
         if props is None:
             continue
-        children.append({"id": props.get("id"), "name": props.get("name"), "type": XML.QName(shape).localname,
+        entry = {"id": props.get("id"), "name": props.get("name"), "type": XML.QName(shape).localname,
                          "text": text_content(shape, DRAWING), "zOrder": len(children),
-                         "transform": shape_transform(shape), "basicGeometry": pptx_basic_geometry(shape), "children": pptx_shape_order(shape)})
+                         "transform": shape_transform(shape), "basicGeometry": pptx_basic_geometry(shape), "children": pptx_shape_order(shape)}
+        table_rows = _pptx_table_rows(shape) if include_table_rows else None
+        if table_rows is not None:
+            entry["tableRows"] = table_rows
+        children.append(entry)
     return children
 
 
@@ -2465,6 +2483,11 @@ def spreadsheet_elements(stream, name):
             del parent[0]
 
 
+def _xlsx_ui_color(node):
+    value = node.get("rgb", "") if node is not None else ""
+    return "#" + value[-6:].lower() if re.fullmatch(r"(?:[0-9A-Fa-f]{2})?[0-9A-Fa-f]{6}", value) else None
+
+
 def read_workbook_range(package, options):
     sheet = next((sheet for sheet in workbook_sheets(package) if sheet["id"] == str(options["sheetId"])), None)
     if sheet is None:
@@ -2532,23 +2555,41 @@ def read_workbook_range(package, options):
             raise ValueError("Worksheet references out-of-bounds shared string index")
 
     # Read native font style metadata only for cells in the requested range.
-    bold_styles = set()
+    cell_styles = {}
     if "xl/styles.xml" in package.namelist():
         styles = parse_xml(package.read("xl/styles.xml"))
         fonts = styles.find(tag(SPREADSHEET, "fonts"))
+        fills = styles.find(tag(SPREADSHEET, "fills"))
         xfs = styles.find(tag(SPREADSHEET, "cellXfs"))
-        if fonts is not None and xfs is not None:
+        if xfs is not None:
             for idx, xf in enumerate(xfs):
+                style = {}
                 font_idx = int(xf.get("fontId", "0"))
-                if 0 <= font_idx < len(fonts):
-                    bold = fonts[font_idx].find(tag(SPREADSHEET, "b"))
-                    if bold is not None and bold.get("val", "1") not in ("0", "false", "off"):
-                        bold_styles.add(idx)
+                if fonts is not None and 0 <= font_idx < len(fonts):
+                    for name, element in (("bold", "b"), ("italic", "i"), ("underline", "u"), ("strike", "strike")):
+                        mark = fonts[font_idx].find(tag(SPREADSHEET, element))
+                        if mark is not None and mark.get("val", "1") not in ("0", "false", "off", "none"):
+                            style[name] = True
+                    font_color = _xlsx_ui_color(fonts[font_idx].find(tag(SPREADSHEET, "color")))
+                    if font_color is not None:
+                        style["fontColor"] = font_color
+                fill_idx = int(xf.get("fillId", "0"))
+                if fills is not None and 0 <= fill_idx < len(fills):
+                    pattern = fills[fill_idx].find(tag(SPREADSHEET, "patternFill"))
+                    if pattern is not None and pattern.get("patternType") == "solid":
+                        background = _xlsx_ui_color(pattern.find(tag(SPREADSHEET, "fgColor")))
+                        if background is not None:
+                            style["backgroundColor"] = background
+                alignment = xf.find(tag(SPREADSHEET, "alignment"))
+                if alignment is not None and alignment.get("horizontal"):
+                    style["horizontal"] = alignment.get("horizontal")
+                cell_styles[idx] = style
     cells = []
     for address, value, cell_type, ss_idx, formula_text, style_index in raw_cells:
         if ss_idx is not None:
             value = ss_lookup[ss_idx]
-        record = {"address": address, "value": value, "type": cell_type, "bold": style_index in bold_styles}
+        record = {"address": address, "value": value, "type": cell_type, "bold": False,
+                  **cell_styles.get(style_index, {})}
         if formula_text is not None:
             record.update(formula=formula_text, formulaStatus=(
                 "error_formula" if cell_type == "e" else
@@ -2839,7 +2880,36 @@ def _word_ui_table_rows(table):
     return rows
 
 
-def _word_ui_paragraph_kind(paragraph):
+def _word_ui_numbering_formats(package):
+    relations = package_relationships(package, MAIN_PART["docx"])
+    part = next((part for kind, part in relations.values() if kind.endswith("/numbering")), None)
+    if part is None or part not in package.namelist():
+        return {}
+    root = parse_xml(package.read(part))
+
+    def level_formats(parent):
+        formats = {}
+        for level in parent.findall(tag(WORD, "lvl")):
+            fmt = level.find(tag(WORD, "numFmt"))
+            if fmt is not None:
+                formats[level.get(tag(WORD, "ilvl"), "0")] = fmt.get(tag(WORD, "val"))
+        return formats
+
+    definitions = {
+        definition.get(tag(WORD, "abstractNumId")): level_formats(definition)
+        for definition in root.findall(tag(WORD, "abstractNum"))
+    }
+    result = {}
+    for number in root.findall(tag(WORD, "num")):
+        reference = number.find(tag(WORD, "abstractNumId"))
+        formats = dict(definitions.get(reference.get(tag(WORD, "val")), {})) if reference is not None else {}
+        for override in number.findall(tag(WORD, "lvlOverride")):
+            formats.update(level_formats(override))
+        result[number.get(tag(WORD, "numId"))] = formats
+    return result
+
+
+def _word_ui_paragraph_kind(paragraph, numbering_formats):
     if paragraph.tag != tag(WORD, "p"):
         return {}
     properties = paragraph.find(tag(WORD, "pPr"))
@@ -2855,8 +2925,15 @@ def _word_ui_paragraph_kind(paragraph):
     elif match:
         result["headingLevel"] = int(match[1])
     number = properties.find(tag(WORD, "numPr"))
-    if number is not None and number.find(tag(WORD, "numId")) is not None:
-        result["listed"] = number.find(tag(WORD, "numId")).get(tag(WORD, "val")) != "0"
+    if number is not None:
+        num_id = number.find(tag(WORD, "numId"))
+        level = number.find(tag(WORD, "ilvl"))
+        if num_id is not None:
+            value = num_id.get(tag(WORD, "val"))
+            result["listed"] = value != "0"
+            fmt = numbering_formats.get(value, {}).get(level.get(tag(WORD, "val"), "0") if level is not None else "0")
+            if result["listed"] and fmt in ("bullet", "decimal", "lowerLetter", "upperRoman"):
+                result["listType"] = fmt
     return result
 
 
@@ -2998,11 +3075,22 @@ def _apply_word_paragraph_props(package, replacements, additions, paragraph, ope
             tag(WORD, "val"), style_id
         )
     if "headingLevel" in operation:
-        h_id = f"Heading{bounded_integer(operation['headingLevel'], 1, 9)}"
-        _ensure_word_heading_style(package, replacements, additions, h_id)
-        xml_child(ppr, WORD, "pStyle", ("keepNext", "keepLines", "pageBreakBefore", "numPr", "pBdr", "shd", "spacing", "ind", "jc")).set(
-            tag(WORD, "val"), h_id
-        )
+        heading_level = bounded_integer(operation["headingLevel"], 0, 9)
+        outline = ppr.find(tag(WORD, "outlineLvl"))
+        if heading_level == 0:
+            paragraph_style = ppr.find(tag(WORD, "pStyle"))
+            if paragraph_style is not None:
+                ppr.remove(paragraph_style)
+            if outline is not None:
+                ppr.remove(outline)
+        else:
+            h_id = f"Heading{heading_level}"
+            if outline is not None:
+                outline.set(tag(WORD, "val"), str(heading_level - 1))
+            _ensure_word_heading_style(package, replacements, additions, h_id)
+            xml_child(ppr, WORD, "pStyle", ("keepNext", "keepLines", "pageBreakBefore", "numPr", "pBdr", "shd", "spacing", "ind", "jc")).set(
+                tag(WORD, "val"), h_id
+            )
     for flag_key, el_name, before in (
         ("keepNext", "keepNext", ("keepLines", "pageBreakBefore", "numPr", "pBdr", "shd", "spacing", "ind", "jc")),
         ("keepLines", "keepLines", ("pageBreakBefore", "numPr", "pBdr", "shd", "spacing", "ind", "jc")),
@@ -4922,7 +5010,7 @@ def presentation_layer(package, part, next_relation, depth=0):
         layers = [layer for layer in layers if layer["kind"] != "master"]
     return layers + [{"kind": kind, "part": part,
                       "hasBackground": common.find(tag(PRESENTATION, "bg")) is not None,
-                      "shapes": pptx_shape_order(tree)}]
+                      "shapes": pptx_shape_order(tree, include_table_rows=depth == 0)}]
 
 
 PPTX_SHAPE_PRESETS = {
@@ -7108,6 +7196,7 @@ def process_document(request, source, output):
             start = bounded_integer(options.get("start", 0), 0, 10_000_000)
             count = bounded_integer(options.get("count", 50), 1, 100)
             body_tag = tag(WORD, "body")
+            numbering_formats = _word_ui_numbering_formats(package)
             blocks = []
             headings = []
             block_count = 0
@@ -7130,7 +7219,7 @@ def process_document(request, source, output):
                             break
                         if body_depth == 1:
                             if isinstance(elem.tag, str):
-                                kind = _word_ui_paragraph_kind(elem)
+                                kind = _word_ui_paragraph_kind(elem, numbering_formats)
                                 if "headingLevel" in kind:
                                     headings.append({"blockIndex": block_count, "text": text_content(elem, WORD), "level": kind["headingLevel"]})
                                 if start <= block_count < start + count:

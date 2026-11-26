@@ -1,19 +1,19 @@
 import React,{useEffect,useRef,useState} from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { workspaceApi,supportsOperation,MAX_WORKSPACE_IMAGE_BYTES,type EditOperation } from '../../../api/workspace';
+import { workspaceApi,supportsOperation,MAX_WORKSPACE_IMAGE_BYTES,type EditOperation, type WorkspaceTableCellEdit } from '../../../api/workspace';
 import {ResponsiveCommandBar} from '../../shared-ui/layout/ResponsiveCommandBar';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
 import { PdfCanvasViewer } from '../../shared-ui/document/PdfCanvasCore';
 import { artifactVersionKey, buildArtifactContentUrl } from '../../../utils/viewerCache';
 import { assertRevision,useRevisionResource } from '../useRevisionResource';
 import { preparePptxOperations,projectSlides } from '../pptxDraft';
-import type { WorkspaceModuleProps } from '../types';
+import type { DraftEntry, WorkspaceModuleProps } from '../types';
 type Slide={id:string;part:string};
 type TargetSlide={slideId:string;slideHash:string;shapes:{id:string;name:string;text:string;groupPath:string[];fingerprint:string}[]};
 type Bounds={x:number;y:number;width:number;height:number};
 type BasicGeometry={kind:'rect'|'ellipse';fill:string;stroke:string;strokeWidthPt:number};
 type Sprite={image:Blob;ink?:Bounds};
-type Shape={id:string;name:string;type:string;text:string;zOrder:number;basicGeometry?:BasicGeometry|null;transform?:{geomBoundsPt?:Bounds;rotationDegrees?:number}};
+type Shape={addition?:DraftEntry;tableRows?:{text:string;editable:boolean}[][];id:string;name:string;type:string;text:string;zOrder:number;basicGeometry?:BasicGeometry|null;transform?:{geomBoundsPt?:Bounds;rotationDegrees?:number}};
 type Presentation={slides:Slide[];layouts?:{part:string;name:string;type:string}[];slideSize:{widthPt:number;heightPt:number}};
 type SlideData={slideId:string;shapes:Shape[];background:Blob;layers:{shape:Shape;sprite?:Sprite}[]};
 /** Read crop coordinates from the native worker's PNG tEXt chunk. */
@@ -162,7 +162,19 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   const currentStructural=mode==='edit'&&scene.ready&&draft?.baseRevision===artifact.revision&&structural.length>0;
   const operations=preparePptxOperations(draft?.entries.map(e=>e.operation)??[]);
   const removedShapeIds=new Set(operations.filter(op=>op.op==='pptx.remove_shape'&&op.slidePart===slide?.part).map(op=>Number(op.shapeId)));
-  const shape=data?.shapes.find(s=>s.id===selected&&!removedShapeIds.has(Number(s.id)));
+  const pendingShapes:Shape[]=mode==='edit'?structural.flatMap(entry=>{
+    const op=entry.operation;
+    if(op.slidePart!==slide?.part||!Array.isArray(op.boundsPt))return [];
+    const type=op.op==='pptx.add_shape'?'sp':op.op==='pptx.add_image'?'pic':op.op==='pptx.add_table'?'graphicFrame':null;
+    if(!type)return [];
+    const [x,y,width,height]=op.boundsPt as number[];
+    const rows=op.rows as string[][]|undefined;
+    return [{id:entry.key,name:entry.label,type,text:String(op.text??''),zOrder:(data?.shapes.length??0)+structural.indexOf(entry),
+      addition:entry,transform:{geomBoundsPt:{x,y,width,height}},
+      tableRows:rows?.map(row=>row.map(text=>({text,editable:true})))}];
+  }):[];
+  const selectableShapes=[...(data?.shapes??[]).filter(s=>!removedShapeIds.has(Number(s.id))),...pendingShapes];
+  const shape=selectableShapes.find(s=>s.id===selected);
   const projected=projectSlides(slides,operations);
   const projectedIndex=slide?projected.indexOf(slide):-1;
   const previewIndex=projectedIndex>=0?projectedIndex:Math.min(index,Math.max(0,projected.length-1));
@@ -176,7 +188,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     pendingNavigation.current=null;
   },[artifact.revision,structure.ready,draft,slides]);
   type BasicStyle={bold?:boolean;italic?:boolean;fontSizePt?:number;fontColor?:string;fill?:string};
-  type PreviewChange={shapeId:number;text?:string;boundsPt?:[number,number,number,number];style?:BasicStyle};
+  type PreviewChange={shapeId:number;text?:string;boundsPt?:[number,number,number,number];style?:BasicStyle;cells?:WorkspaceTableCellEdit[]};
   type PreviewResult={signature:string;images:Map<number,Sprite>;fullSlide?:Blob;status:'pending'|'ready'|'error'};
   const changes:PreviewChange[]=[];
   if(mode==='edit'&&scene.ready&&draft&&!currentStructural&&draft.baseRevision===artifact.revision&&slide){
@@ -189,7 +201,11 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
       if(Array.isArray(b)&&b.length===4)change.boundsPt=b as [number,number,number,number];
       const style=entries.find(e=>e.operation.op==='pptx.set_shape_style')?.operation;
       if(style){const {bold,italic,fontSizePt,fontColor,fill}=style;change.style={bold:bold as boolean|undefined,italic:italic as boolean|undefined,fontSizePt:fontSizePt as number|undefined,fontColor:fontColor as string|undefined,fill:fill as string|undefined}}
-      if(change.text!==undefined||change.boundsPt!==undefined||change.style!==undefined)changes.push(change);
+      const cells=entries.filter(e=>e.operation.op==='pptx.set_table_cell').map(({operation})=>({
+        row:Number(operation.row),column:Number(operation.column),text:String(operation.text),
+      }));
+      if(cells.length)change.cells=cells;
+      if(change.text!==undefined||change.boundsPt!==undefined||change.style!==undefined||change.cells!==undefined)changes.push(change);
     }
   }
   const signature=JSON.stringify([artifactVersionKey(artifact),slide?.part,changes,currentStructural?operations:null,previewIndex]);
@@ -224,20 +240,29 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   const key=(id:string,kind:string)=>String(slide?.part)+':'+id+':'+kind;
   const bounds=(s:Shape):Bounds|undefined=>{const b=s.transform?.geomBoundsPt;if(!b)return;const next=draft?.entries.find(e=>e.key===key(s.id,'bounds'))?.operation.boundsPt;if(Array.isArray(next)&&next.length===4)return {x:Number(next[0]),y:Number(next[1]),width:Number(next[2]),height:Number(next[3])};return b};
   const displayBounds=(s:Shape)=>resize?.id===s.id?resize.bounds:bounds(s);
+  function updateAddition(entry:DraftEntry,patch:Partial<EditOperation>){
+    if(lock||!scene.ready||artifact.revision===undefined)return;
+    onDraft(artifact.revision,{...entry,operation:{...entry.operation,...patch}},entry.key);
+  }
   function writeBounds(s:Shape,b:Bounds){
     if(!slide||artifact.revision===undefined||lock||!scene.ready||!supportsOperation(capabilities,'pptx.set_shape_bounds'))return;
+    if(s.addition){updateAddition(s.addition,{boundsPt:[b.x,b.y,b.width,b.height]});return}
     const original=s.transform?.geomBoundsPt,k=key(s.id,'bounds');
     onDraft(artifact.revision,original&&Object.keys(b).every(field=>b[field as keyof Bounds]===original[field as keyof Bounds])?null:{key:k,label:s.name+' 位置・サイズ',operation:{op:'pptx.set_shape_bounds',slidePart:slide.part,shapeId:Number(s.id),boundsPt:[b.x,b.y,b.width,b.height]}},k);
   }
   function editText(v:string){
     if(!shape||!slide||artifact.revision===undefined||lock||!scene.ready||!supportsOperation(capabilities,'pptx.set_shape_text'))return;
+    if(shape.addition){updateAddition(shape.addition,{text:v});return}
     const k=key(shape.id,'text');onDraft(artifact.revision,v===shape.text?null:{key:k,label:shape.name+' テキスト',operation:{op:'pptx.set_shape_text',slidePart:slide.part,shapeId:Number(shape.id),text:v}},k);
   }
   const can=(op:string)=>mode==='edit'&&!lock&&scene.ready&&supportsOperation(capabilities,op);
-  const styleDraft=shape?draft?.entries.find(e=>e.key===key(shape.id,'style'))?.operation:undefined;
-  const styleEnabled=!!shape&&['sp','pic','cxnSp'].includes(shape.type)&&can('pptx.set_shape_style');
+  const styleDraft=shape?.addition
+    ? shape.addition.operation.style as BasicStyle|undefined
+    : shape?draft?.entries.find(e=>e.key===key(shape.id,'style'))?.operation:undefined;
+  const styleEnabled=!!shape&&(shape.addition?shape.type==='sp':['sp','pic','cxnSp'].includes(shape.type))&&can('pptx.set_shape_style');
   function stageStyle(patch:BasicStyle){
     if(!shape||!slide||!styleEnabled||artifact.revision===undefined)return;
+    if(shape.addition){updateAddition(shape.addition,{style:{...styleDraft,...patch}});return}
     const k=key(shape.id,'style');onDraft(artifact.revision,{key:k,label:shape.name+' 書式',operation:{...styleDraft,op:'pptx.set_shape_style',slidePart:slide.part,shapeId:Number(shape.id),...patch}},k);
   }
   const structureEnabled=mode==='edit'&&!editingLocked&&scene.ready&&structure.ready&&!!slide&&!!size&&projectedIndex>=0;
@@ -258,7 +283,9 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
       case 'pptx.add_shape':operation={op:operationKind,slidePart:slide.part,kind:shapeKind,text:shapeText,boundsPt:newBounds};break;
       case 'pptx.add_image':operation={op:operationKind,slidePart:slide.part,imageBase64:fileData!.base64,boundsPt:newBounds};break;
       case 'pptx.add_table':operation={op:operationKind,slidePart:slide.part,rows:newRows,boundsPt:newBounds};break;
-      case 'pptx.remove_shape':if(!shape||!window.confirm('選択した要素を削除しますか？'))return;operation={op:operationKind,slidePart:slide.part,shapeId:Number(shape.id)};break;
+      case 'pptx.remove_shape':if(!shape||!window.confirm('選択した要素を削除しますか？'))return;
+        if(shape.addition){onDraft(artifact.revision,null,shape.addition.key);choose('');chooseOperation('');return}
+        operation={op:operationKind,slidePart:slide.part,shapeId:Number(shape.id)};break;
       case 'pptx.add_slide':operation={op:operationKind,index:projectedIndex+1,layoutPart};break;
       case 'pptx.remove_slide':if(!window.confirm('このスライドを削除しますか？'))return;operation={op:operationKind,index:projectedIndex};break;
       case 'pptx.reorder_slide':operation={op:operationKind,index:projectedIndex,toIndex:destination-1};break;
@@ -267,7 +294,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     if(operation.op==='pptx.remove_shape'){setSelected('');setCanvasText(false);setDrag(null);setResize(null);resizePointer.current=null}
     if(['pptx.add_slide','pptx.remove_slide','pptx.reorder_slide'].includes(operation.op))pendingNavigation.current={revision:artifact.revision,index:operation.op==='pptx.add_slide'?projectedIndex+1:operation.op==='pptx.remove_slide'?Math.min(projectedIndex,projected.length-2):destination-1};
     const draftKey='pptx-structure:'+(++sequence.current);
-    onDraft(artifact.revision,{key:draftKey,label:availableActions.find(a=>a.id===operationKind)!.label,operation},draftKey);chooseOperation('');
+    onDraft(artifact.revision,{key:draftKey,label:availableActions.find(a=>a.id===operationKind)!.label,operation},draftKey);if(addingElement)choose(draftKey);chooseOperation('');
   }
   const choose=(id:string)=>{setSelected(id);setCanvasText(false);setDrag(null);setResize(null);resizePointer.current=null};
   async function pin(targetSlide:Slide,shapeId?:string,contentCoords?:Record<string,unknown>){
@@ -314,6 +341,29 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     {<select aria-label="スライド編集操作" disabled={!structureEnabled} value={operationKind} onChange={e=>chooseOperation(e.target.value)}><option value="">スライド操作…</option>{availableActions.map(a=><option key={a.id} value={a.id}>{a.label}</option>)}</select>}
   </>:null;
   const toolbar=<ResponsiveCommandBar primary={primary} secondary={secondary} minInlineWidth={1400} closeOnButton closeOnSelect/>;
+  const tableEditor=mode==='edit'&&shape?.tableRows&&(shape.addition||supportsOperation(capabilities,'pptx.set_table_cell'))&&
+    <div className="workspace-pptx-table" role="group" aria-label={shape.name+' のセル'}>
+      <table><tbody>{shape.tableRows.map((row,rowIndex)=><tr key={rowIndex}>{row.map((cell,column)=>{
+        const cellKey=key(shape.id,'cell:'+rowIndex+':'+column);
+        const text=String(draft?.entries.find(entry=>entry.key===cellKey)?.operation.text??cell.text);
+        return <td key={column}>{cell.editable?<textarea rows={Math.min(4,text.split('\n').length)}
+          aria-label={(rowIndex+1)+'行 '+(column+1)+'列'} value={text} maxLength={20000}
+          readOnly={lock||!scene.ready} onChange={event=>{
+            if(!slide||artifact.revision===undefined||(!shape.addition&&!can('pptx.set_table_cell')))return;
+            const value=event.target.value;
+            if(shape.addition){
+              const rows=(shape.addition.operation.rows as string[][]).map((line,r)=>
+                r===rowIndex?line.map((text,c)=>c===column?value:text):line,
+              );
+              updateAddition(shape.addition,{rows});return;
+            }
+            onDraft(artifact.revision,value===cell.text?null:{
+              key:cellKey,label:shape.name+' '+(rowIndex+1)+'行 '+(column+1)+'列',
+              operation:{op:'pptx.set_table_cell',slidePart:slide.part,shapeId:Number(shape.id),row:rowIndex,column,text:value},
+            },cellKey);
+          }}/>:cell.text}</td>;
+      })}</tr>)}</tbody></table>
+    </div>;
   const operationForm=mode==='edit'&&operationKind?<div className="workspace-pptx-operation" role="group" aria-label="追加・構造変更">
     {addingElement&&<div className="workspace-toolbar workspace-toolbar-fields">{['X','Y','幅','高さ'].map((label,i)=><label key={label} className="workspace-bound">{label}<input aria-label={'追加要素 '+label} type="number" value={Number.isFinite(newBounds[i])?newBounds[i]:''} onChange={e=>setNewBounds(v=>v.map((n,j)=>i===j?e.target.valueAsNumber:n) as [number,number,number,number])}/></label>)}</div>}
     {operationKind==='pptx.add_shape'&&<div className="workspace-toolbar workspace-toolbar-fields"><select aria-label="追加図形" value={shapeKind} onChange={e=>setShapeKind(e.target.value as typeof shapeKind)}><option value="rectangle">四角形</option><option value="ellipse">楕円</option><option value="textbox">テキストボックス</option></select><input aria-label="追加図形テキスト" value={shapeText} maxLength={20000} onChange={e=>setShapeText(e.target.value)}/></div>}
@@ -366,7 +416,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
         onSelect={id=>{setSlideId(id);choose('')}}
       />
     </nav>
-    <UnifiedViewerZoomShell resetKey={artifact.id+':pptx'} controlsTop={<>{toolbar}{operationForm}</>} scrollClassName="workspace-pptx-scroll">
+    <UnifiedViewerZoomShell resetKey={artifact.id+':pptx'} controlsTop={<>{toolbar}{operationForm}{tableEditor}</>} scrollClassName="workspace-pptx-scroll">
       {(structure.error||scene.error)&&<div className="error-box" role="alert">{structure.error||scene.error}<button type="button" onClick={()=>{structure.retry();scene.retry()}}>再試行</button></div>}
       {scene.loading&&data&&<p className="workspace-refresh muted-xs" role="status">最新の内容を読み込み中…</p>}
       {!data||!size?.widthPt||!size.heightPt?<div className="workspace-loading">{scene.error||structure.error?'スライドを表示できません。':'読み込み中…'}</div>:<div className="workspace-slide" ref={stage} style={{aspectRatio:size.widthPt+'/'+size.heightPt,'--slide-ratio':size.widthPt/size.heightPt} as React.CSSProperties} data-slide-canvas="true" data-scene-ready={scene.ready} data-preview-ready={previewReady?'true':'false'}>
@@ -389,7 +439,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
           return <Layer key={s.id} blob={rendered.image} shapeId={s.id} zOrder={s.zOrder} layerKind="sprite-full" style={{transformOrigin:orig?(orig.x/size.widthPt*100+'% '+orig.y/size.heightPt*100+'%'):undefined,
             transform:'translate('+dx/size.widthPt*100+'%,'+dy/size.heightPt*100+'%) scale('+sx+','+sy+')'}}/>})}
         </>}
-        {previewSlideMatchesSelection&&data.shapes.filter(s=>!removedShapeIds.has(Number(s.id))).map(s=>{const b=displayBounds(s);if(!b||b.width<=0||b.height<=0)return null;const active=selected===s.id||target?.selector.shapeId===Number(s.id);return <button key={s.id} type="button" aria-label={s.name||'図形 '+s.id} data-shape-id={s.id} data-z-order={s.zOrder} className={'workspace-shape-hit '+(active?'selected':'')} style={{left:(b.x+(drag?.id===s.id?drag.dx:0))/size.widthPt*100+'%',top:(b.y+(drag?.id===s.id?drag.dy:0))/size.heightPt*100+'%',width:b.width/size.widthPt*100+'%',height:b.height/size.heightPt*100+'%'}} onClick={()=>choose(s.id)}
+        {previewSlideMatchesSelection&&selectableShapes.map(s=>{const b=displayBounds(s);if(!b||b.width<=0||b.height<=0)return null;const active=selected===s.id||target?.selector.shapeId===Number(s.id);return <button key={s.id} type="button" aria-label={s.name||'図形 '+s.id} data-shape-id={s.id} data-z-order={s.zOrder} className={'workspace-shape-hit '+(active?'selected':'')} style={{left:(b.x+(drag?.id===s.id?drag.dx:0))/size.widthPt*100+'%',top:(b.y+(drag?.id===s.id?drag.dy:0))/size.heightPt*100+'%',width:b.width/size.widthPt*100+'%',height:b.height/size.heightPt*100+'%'}} onClick={()=>choose(s.id)}
           onDoubleClick={()=>{if(s.type==='sp'&&can('pptx.set_shape_text')){setSelected(s.id);setCanvasText(true)}}}
           onKeyDown={event=>{
             if(event.key==='F2'&&s.type==='sp'&&can('pptx.set_shape_text')){event.preventDefault();setSelected(s.id);setCanvasText(true);return;}

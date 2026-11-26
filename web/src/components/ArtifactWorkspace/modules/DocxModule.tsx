@@ -18,6 +18,7 @@ interface WordBlock {
   uiRuns?:WordRun[];
   headingLevel?:number;
   listed?:boolean;
+  listType?:'bullet'|'decimal'|'lowerLetter'|'upperRoman';
   tableRows?:{text:string;editable:boolean}[][];
 }
 
@@ -223,12 +224,22 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     onClick={()=>setOutlineOpen(open=>!open)}>見出し一覧</button>;
   const secondary=mode==='edit'?<>
     {outlineButton}
-    <button type="button" className="btn btn-secondary btn-xs" disabled={!block?.editableText||!can('docx.set_paragraph_style')} onClick={()=>styleParagraph({op:'docx.set_paragraph_style',headingLevel:1},'style')}>見出し</button>
-    <button type="button" className="btn btn-secondary btn-xs" disabled={!block?.editableText||!can('docx.set_list')} onClick={()=>{
-      const staged=draft?.entries.find(e=>e.key==='list:'+block?.blockIndex)?.operation.listType;
-      const listed=staged?staged!=='none':block?.listed;
-      styleParagraph({op:'docx.set_list',listType:listed?'none':'bullet'},'list');
-    }}>箇条書き</button>
+    <select aria-label="見出しレベル" disabled={!block?.editableText||!can('docx.set_paragraph_style')}
+      value={String(draft?.entries.find(e=>e.key==='style:'+block?.blockIndex)?.operation.headingLevel??block?.headingLevel??0)}
+      onChange={event=>styleParagraph({op:'docx.set_paragraph_style',headingLevel:Number(event.target.value)},'style')}>
+      <option value="0">本文</option>
+      {Array.from({length:9},(_,index)=><option key={index+1} value={index+1}>見出し {index+1}</option>)}
+    </select>
+    <select aria-label="リスト形式" disabled={!block?.editableText||!can('docx.set_list')}
+      value={String(draft?.entries.find(e=>e.key==='list:'+block?.blockIndex)?.operation.listType??block?.listType??(block?.listed?'current':'none'))}
+      onChange={event=>styleParagraph({op:'docx.set_list',listType:event.target.value},'list')}>
+      <option value="current" disabled>既存のリスト</option>
+      <option value="none">リストなし</option>
+      <option value="bullet">箇条書き</option>
+      <option value="decimal">番号付きリスト</option>
+      <option value="lowerLetter">英小文字リスト</option>
+      <option value="upperRoman">ローマ数字リスト</option>
+    </select>
     <button type="button" className="btn btn-secondary btn-xs" disabled={!can('docx.add_paragraph')} onClick={()=>stage(additionKey('new-paragraph'),{op:'docx.add_paragraph',text:''},'段落を追加')}>段落を追加</button>
     <button type="button" className="btn btn-secondary btn-xs" disabled={!can('docx.add_table')} onClick={()=>stage(additionKey('new-table'),{op:'docx.add_table',rows:[['',''],['','']]},'表を追加')}>表を追加</button>
     <button type="button" className="btn btn-secondary btn-xs" disabled={!block?.editableText||!can('docx.add_image')} onClick={()=>imageInput.current?.click()}>画像を追加</button>
@@ -276,14 +287,17 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     const v=runs.map(r=>r.text).join('');
     const active=selected===b.blockIndex||target?.selector.blockIndex===b.blockIndex;
     const editable=mode==='edit'&&b.editableText===true&&supportsOperation(capabilities,'docx.set_paragraph_text');
-    const heading=Boolean(draft?.entries.find(e=>e.key==='style:'+b.blockIndex)?.operation.headingLevel??b.headingLevel);
-    const listType=draft?.entries.find(e=>e.key==='list:'+b.blockIndex)?.operation.listType;
+    const headingLevel=Number(draft?.entries.find(e=>e.key==='style:'+b.blockIndex)?.operation.headingLevel??b.headingLevel??0);
+    const listType=draft?.entries.find(e=>e.key==='list:'+b.blockIndex)?.operation.listType??b.listType;
     const list=listType?listType!=='none':b.listed;
+    const listMarker=({decimal:'1.',lowerLetter:'a)',upperRoman:'I.'} as Record<string,string>)[String(listType)]??'•';
     const images=draft?.entries.filter(e=>e.operation.op==='docx.add_image'&&e.operation.blockIndex===b.blockIndex)??[];
     return <div
       key={b.blockIndex}
       data-word-block={b.blockIndex}
-      className={'workspace-word-block '+(active?'selected ':'')+(heading?'word-heading ':'')+(list?'word-list':'')}
+      data-list-marker={list?listMarker:undefined}
+      style={headingLevel?{fontSize:Math.max(1,1.5-(headingLevel-1)*0.075)+'em'}:undefined}
+      className={'workspace-word-block '+(active?'selected ':'')+(headingLevel?'word-heading ':'')+(list?'word-list':'')}
       onClick={()=>{if(selected!==b.blockIndex)activeEditor.current=null;setActiveAddition(null);setSelected(b.blockIndex)}}
     >
       {b.type==='p'?editable?<WordParagraphEditor label={'段落 '+(b.blockIndex+1)} runs={runs} readOnly={locked} onFocus={ed=>{activeEditor.current=ed;setActiveAddition(null);setSelected(b.blockIndex)}} onChange={next=>{

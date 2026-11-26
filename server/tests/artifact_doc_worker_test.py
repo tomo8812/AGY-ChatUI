@@ -100,6 +100,12 @@ class DocumentWorkerTest(unittest.TestCase):
         self.assertEqual(len(reopened.slides[1].shapes[0].shapes), 2)
         self.assertEqual(reopened.slides[1].shapes[0].shapes[0].left.pt, 20)
         self.assertEqual(reopened.slides[1].shapes[1].table.cell(0, 0).text, "After")
+        self.source.write_bytes(result)
+        slide_range = json.loads(self.run_worker("pptx", "range", range={"part": part}))
+        table = next(shape for shape in slide_range["shapes"] if "tableRows" in shape)
+        self.assertEqual(table["tableRows"], [[
+            {"text": "After", "editable": True}, {"text": "Value", "editable": True},
+        ]])
         self.assertEqual(reopened.slides[1].notes_slide.notes_text_frame.text, "Updated notes")
 
     def test_pptx_creates_notes_master_when_presentation_has_none(self):
@@ -716,8 +722,12 @@ class DocumentWorkerTest(unittest.TestCase):
         self.assertGreaterEqual(len(cf_rules), 2)
         self.assertEqual({rule.type for rule in cf_rules}, {"cellIs", "dataBar"})
 
-        # General non-empty sheet removal on the duplicated sheet
         self.source.write_bytes(edited)
+        record = json.loads(self.run_worker("xlsx", "range", range={"sheetId": "1", "rangeA1": "A1"}))["cells"][0]
+        self.assertEqual({field: record[field] for field in ("bold", "fontColor", "backgroundColor", "horizontal")},
+                         {"bold": True, "fontColor": "#ffffff", "backgroundColor": "#1e3a8a", "horizontal": "center"})
+
+        # General non-empty sheet removal on the duplicated sheet
         after_rm = self.run_worker("xlsx", "edit", operations=[
             {"op": "xlsx.remove_sheet", "sheetId": 3},
         ])

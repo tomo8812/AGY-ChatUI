@@ -223,7 +223,8 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const { req, reply, userId, artifactId, revNum, query, immutableByPath } = params;
     const { artifact, revision, blobPath, sizeBytes } = artifactService.getRevisionContentBlob(userId, artifactId, revNum);
     const forceDownload = query.download === '1' || query.download === 'true';
-    const isConvertedPdf = query.converted === 'pdf' && (artifact.previewKind === 'pptx' || artifact.previewKind === 'docx');
+    const workerPdf = artifact.previewKind === 'docx' || /\.xlsx$/i.test(artifact.filename);
+    const isConvertedPdf = query.converted === 'pdf' && (artifact.previewKind === 'pptx' || workerPdf);
 
     let serveAbsPath = blobPath;
     let serveSize = sizeBytes;
@@ -231,8 +232,8 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     let serveFilename = artifact.filename;
 
     if (isConvertedPdf) {
-      const convertedPath = artifact.previewKind === 'docx'
-        ? await artifactService.renderDocxPreviewPdf(userId, artifact.id, revision.revision)
+      const convertedPath = workerPdf
+        ? await artifactService.renderOfficePreviewPdf(userId, artifact.id, revision.revision)
         : await convertPresentationToPdfCached({
         artifactService,
         artifactId: artifact.id,
@@ -607,17 +608,28 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     }
   });
 
+  const draftBoundsSchema=z.tuple([z.number().finite().min(-14400).max(14400),z.number().finite().min(-14400).max(14400),z.number().finite().min(1).max(14400),z.number().finite().min(1).max(14400)]);
+  const draftSlidePartSchema=z.string().regex(/^ppt\/slides\/[^/]+\.xml$/).max(200);
+  const draftShapeId=z.number().int().positive().max(2147483647);
+  const draftShapeStyle=z.object({
+    bold:z.boolean().optional(),italic:z.boolean().optional(),fontSizePt:z.number().finite().min(6).max(200).optional(),
+    fontColor:z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),fill:z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
+  }).strict();
+  const draftTableCellSchema=z.object({
+    row:z.number().int().nonnegative().safe(),column:z.number().int().nonnegative().safe(),text:z.string().max(20000),
+  }).strict();
   app.post('/api/files/:artifactId/render-draft-sprite', async (req, reply) => {
     const session = requireAuth(req, reply, db);
     if (!session) return;
     const parsed = z.object({
       expectedRevision:z.number().int().min(1), pageIndex:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
-      shapeId:z.number().int().positive().max(2147483647),
+      shapeId:draftShapeId,
       cropSprite:z.boolean().optional(),
       text:z.string().max(20000).optional(),
-      boundsPt:z.tuple([z.number().finite().min(-14400).max(14400),z.number().finite().min(-14400).max(14400),z.number().finite().min(1).max(14400),z.number().finite().min(1).max(14400)]).optional(),
-      style:z.object({bold:z.boolean().optional(),italic:z.boolean().optional(),fontSizePt:z.number().finite().min(6).max(200).optional(),fontColor:z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),fill:z.string().regex(/^#[0-9a-fA-F]{6}$/).optional()}).strict().optional(),
-    }).strict().refine(body=>body.text!==undefined||body.boundsPt!==undefined||body.style!==undefined).safeParse(req.body);
+      boundsPt:draftBoundsSchema.optional(),
+      style:draftShapeStyle.optional(),
+      cells:z.array(draftTableCellSchema).min(1).optional(),
+    }).strict().refine(body=>body.text!==undefined||body.boundsPt!==undefined||body.style!==undefined||body.cells!==undefined).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({error:'INVALID_INPUT'});
     const {artifactId}=req.params as {artifactId:string};
     try {
@@ -629,17 +641,13 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     } catch (error) { return sendArtifactError(reply,error); }
   });
 
-  const draftBoundsSchema=z.tuple([z.number().finite().min(-14400).max(14400),z.number().finite().min(-14400).max(14400),z.number().finite().min(1).max(14400),z.number().finite().min(1).max(14400)]);
-  const draftSlidePartSchema=z.string().regex(/^ppt\/slides\/[^/]+\.xml$/).max(200);
-  const draftShapeId=z.number().int().positive().max(2147483647);
   const draftSlideOperation=z.discriminatedUnion('op',[
     z.object({op:z.literal('pptx.set_shape_text'),slidePart:draftSlidePartSchema,shapeId:draftShapeId,text:z.string().max(20000)}).strict(),
     z.object({op:z.literal('pptx.set_shape_bounds'),slidePart:draftSlidePartSchema,shapeId:draftShapeId,boundsPt:draftBoundsSchema}).strict(),
-    z.object({op:z.literal('pptx.set_shape_style'),slidePart:draftSlidePartSchema,shapeId:draftShapeId,
-      bold:z.boolean().optional(),italic:z.boolean().optional(),fontSizePt:z.number().finite().min(6).max(200).optional(),
-      fontColor:z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),fill:z.string().regex(/^#[0-9a-fA-F]{6}$/).optional()}).strict(),
-    z.object({op:z.literal('pptx.add_shape'),slidePart:draftSlidePartSchema,kind:z.enum(['rectangle','ellipse','textbox']),boundsPt:draftBoundsSchema,text:z.string().max(20000)}).strict(),
+    draftShapeStyle.extend({op:z.literal('pptx.set_shape_style'),slidePart:draftSlidePartSchema,shapeId:draftShapeId}),
+    z.object({op:z.literal('pptx.add_shape'),slidePart:draftSlidePartSchema,kind:z.enum(['rectangle','ellipse','textbox']),boundsPt:draftBoundsSchema,text:z.string().max(20000),style:draftShapeStyle.optional()}).strict(),
     z.object({op:z.literal('pptx.add_image'),slidePart:draftSlidePartSchema,boundsPt:draftBoundsSchema,imageBase64:z.string().min(1).max(8_000_000)}).strict(),
+    draftTableCellSchema.extend({op:z.literal('pptx.set_table_cell'),slidePart:draftSlidePartSchema,shapeId:draftShapeId}),
     z.object({op:z.literal('pptx.add_table'),slidePart:draftSlidePartSchema,boundsPt:draftBoundsSchema,rows:z.array(z.array(z.string().max(20_000)).min(1).max(30)).min(1).max(100)}).strict(),
     z.object({op:z.literal('pptx.remove_shape'),slidePart:draftSlidePartSchema,shapeId:z.number().int().positive().max(2147483647)}).strict(),
     z.object({op:z.literal('pptx.add_slide'),index:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),layoutPart:z.string().regex(/^ppt\/slideLayouts\/slideLayout[0-9]+\.xml$/)}).strict(),

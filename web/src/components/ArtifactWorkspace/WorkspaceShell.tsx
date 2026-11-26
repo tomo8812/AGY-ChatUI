@@ -1,7 +1,7 @@
 import React,{Suspense,useCallback,useEffect,useRef,useState} from 'react';
 import type { ArtifactRecord } from '../../types';
 import { api,ApiError } from '../../api/client';
-import { supportsOperation,workspaceApi,type WorkspaceCapabilities,type WorkspaceTarget } from '../../api/workspace';
+import { supportsOperation,workspaceApi,type WorkspaceCapabilities,type WorkspaceRevision,type WorkspaceTarget } from '../../api/workspace';
 import { artifactVersionKey,buildArtifactContentUrl,isStaleArtifactVersion,notifyArtifactUpdated } from '../../utils/viewerCache';
 import { ModalDialog } from '../ModalDialog';
 import { CloseIcon,DownloadIcon } from '../Icons';
@@ -11,6 +11,10 @@ import './workspace.css';
 
 export interface WorkspaceShellProps {artifact:ArtifactRecord;module:WorkspaceModule;onClose:()=>void;onArtifactChanged?:(artifact:ArtifactRecord)=>void}
 function newId(){return globalThis.crypto?.randomUUID?.()??String(Date.now())+'-'+Math.random().toString(36).slice(2)}
+function historicalArtifact(artifact:ArtifactRecord,version:WorkspaceRevision):ArtifactRecord{
+  const {revision,sha256,sizeBytes,dependencyManifestHash}=version;
+  return {...artifact,revision,sha256,sizeBytes,dependencyManifestHash};
+}
 export function WorkspaceShell(props:WorkspaceShellProps){return <WorkspaceShellInner key={props.artifact.userId+':'+props.artifact.id} {...props}/>}
 function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged}:WorkspaceShellProps){
   const [local,setLocal]=useState(incoming);
@@ -28,8 +32,45 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
   const [conflict,setConflict]=useState(false);
   const [chooseRequestVersion,setChooseRequestVersion]=useState(false);
   const [menu,setMenu]=useState(false);
-  const [inspector,setInspector]=useState<'details'|'verify'|null>(null);
+  const [inspector,setInspector]=useState<'details'|'verify'|'export'|'history'|null>(null);
   const [verification,setVerification]=useState<Awaited<ReturnType<typeof workspaceApi.verify>>|null>(null);
+  const [exported,setExported]=useState<ArtifactRecord|null>(null);
+  const [exporting,setExporting]=useState(false);
+  const exportAttempt=useRef<{signature:string;key:string}|null>(null);
+  const exportFormats=capsReady?(caps?.operations??[]).filter(op=>
+    op.operation.startsWith('export:')&&op.scope==='mcp_and_ui'&&
+    (op.availability==='supported'||op.availability==='partial'),
+  ).map(op=>op.operation.slice('export:'.length)):[];
+  const [history,setHistory]=useState<WorkspaceRevision[]|null>(null);
+  const [historyError,setHistoryError]=useState<string|null>(null);
+  const restoreAttempt=useRef<{signature:string;key:string}|null>(null);
+  useEffect(()=>{
+    if(inspector!=='history')return;
+    const controller=new AbortController();
+    setHistory(null);setHistoryError(null);
+    void workspaceApi.history(artifact.id,controller.signal).then(
+      result=>{if(!controller.signal.aborted)setHistory(result.revisions)},
+      e=>{if(!controller.signal.aborted)setHistoryError(e instanceof Error?e.message:'履歴を読み込めませんでした。')},
+    );
+    return()=>controller.abort();
+  },[inspector,artifact.id,revisionKey]);
+  const canPreviewHistory=artifact.previewKind==='pdf'||artifact.previewKind==='pptx'||
+    (exportFormats.includes('pdf')&&(artifact.previewKind==='docx'||/\.xlsx$/i.test(artifact.filename)));
+  const textHistoryPreview=artifact.previewKind==='markdown'||artifact.previewKind==='code'||/\.(csv|tsv)$/i.test(artifact.filename);
+  const [previewVersion,setPreviewVersion]=useState<WorkspaceRevision|null>(null);
+  const [previewText,setPreviewText]=useState<{revision:number;text:string;error?:boolean}|null>(null);
+  useEffect(()=>{
+    if(inspector!=='history'||!previewVersion||!textHistoryPreview)return;
+    const controller=new AbortController();
+    const url=buildArtifactContentUrl(historicalArtifact(artifact,previewVersion));
+    void fetch(url,{credentials:'include',headers:previewVersion.sizeBytes>65536?{Range:'bytes=0-65535'}:undefined,signal:controller.signal})
+      .then(response=>{
+        if(!response.ok||response.headers.get('X-Artifact-Revision')!==String(previewVersion.revision))throw Error('プレビューを読み込めませんでした。');
+        return response.text();
+      }).then(text=>{if(!controller.signal.aborted)setPreviewText({revision:previewVersion.revision,text})},
+        ()=>{if(!controller.signal.aborted)setPreviewText({revision:previewVersion.revision,text:'プレビューを読み込めませんでした。',error:true})});
+    return()=>controller.abort();
+  },[inspector,artifact.id,previewVersion,textHistoryPreview]);
   const pendingAttempt=useRef<{signature:string;key:string}|null>(null);
   const busyRef=useRef(false);
   const mounted=useRef(false);
@@ -89,6 +130,41 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
     if(value==='pin'&&draft&&mode!=='pin'){setChooseRequestVersion(true);return}
     setError(null);setMode(value);setMenu(false);
   };
+  const restoreVersion=async(revision:WorkspaceRevision)=>{
+    if(busyRef.current||!revision.restorable||revision.revision===artifact.revision)return;
+    const confirmation='バージョン '+revision.revision+' を新しいバージョンとして復元しますか？';
+    if(!window.confirm(confirmation+(draft?' 未保存の変更は保持されます。':'')))return;
+    busyRef.current=true;setBusy(true);setError(null);
+    const signature=JSON.stringify([revisionKey,revision.revision]);
+    if(restoreAttempt.current?.signature!==signature)restoreAttempt.current={signature,key:newId()};
+    try{
+      const {artifact:next}=await workspaceApi.restore(artifact.id,revision.revision,restoreAttempt.current.key);
+      if(!mounted.current)return;
+      if(next.id!==artifact.id||next.userId!==artifact.userId)throw Error('復元結果を確認できませんでした。');
+      if(!isStaleArtifactVersion(currentArtifact.current,next)){
+        setLocal(next);onArtifactChanged?.(next);notifyArtifactUpdated(next);
+      }
+      restoreAttempt.current=null;
+    }catch(e){
+      if(mounted.current)setError(e instanceof Error?e.message:'復元できませんでした。');
+    }finally{
+      busyRef.current=false;setBusy(false);
+    }
+  };
+  const exportFile=async(format:string)=>{
+    if(exporting||!exportFormats.includes(format))return;
+    const signature=JSON.stringify([revisionKey,format]);
+    if(exportAttempt.current?.signature!==signature)exportAttempt.current={signature,key:newId()};
+    setExporting(true);setExported(null);setError(null);
+    try{
+      const result=await workspaceApi.exportArtifact(artifact.id,format,exportAttempt.current.key);
+      if(mounted.current){setExported(result.artifact);exportAttempt.current=null}
+    }catch(e){
+      if(mounted.current)setError(e instanceof Error?e.message:'エクスポートできませんでした。');
+    }finally{
+      if(mounted.current)setExporting(false);
+    }
+  };
   const Module=module.Component;
   return <ModalDialog label={artifact.filename} size="artifact-workspace-modal" onClose={close}>
     <div className="artifact-workspace">
@@ -102,6 +178,8 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
         <a className="icon-btn" title="ダウンロード" aria-label="ダウンロード" href={buildArtifactContentUrl(artifact,{download:true})} download={artifact.filename}><DownloadIcon size={17}/></a>
         <div className="workspace-overflow"><button className="icon-btn" type="button" aria-label="その他の操作" aria-expanded={menu} onClick={()=>setMenu(v=>!v)}>…</button>{menu&&<div className="workspace-menu">
           <button type="button" onClick={()=>{setInspector('details');setMenu(false)}}>ファイル詳細</button>
+          <button type="button" onClick={()=>{setInspector('history');if(mode==='pin')setMode('view');setMenu(false)}}>バージョン履歴</button>
+          {exportFormats.length>0&&<button type="button" onClick={()=>{setInspector('export');if(mode==='pin')setMode('view');setMenu(false)}}>エクスポート</button>}
           <button type="button" onClick={()=>{setInspector('verify');setMenu(false);setVerification(null);void workspaceApi.verify(artifact.id).then(setVerification,e=>setError(e instanceof Error?e.message:'検証できませんでした。'))}}>品質検証</button>
           <button type="button" onClick={()=>{setMenu(false);void refresh().catch(e=>setError(e.message))}}>最新を再読込</button>
         </div>}</div>
@@ -113,7 +191,34 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
       <div className="workspace-main">
         <div className="workspace-canvas"><Suspense fallback={<p role="status">読み込み中…</p>}><Module artifact={artifact} mode={mode} capabilities={caps} draft={mode==='pin'?null:draft} editingLocked={busy||changed||!canEdit||!capsReady} onDraft={onDraft} target={target} onTarget={setTarget}/></Suspense></div>
         {(mode==='pin'||inspector)&&<aside className="workspace-inspector">
-          {mode==='pin'?<EditRequestPanel artifact={artifact} target={target} onClear={()=>setTarget(null)}/>:<><div className="row-between"><strong>{inspector==='details'?'ファイル詳細':'品質検証'}</strong><button type="button" className="icon-btn" aria-label="パネルを閉じる" onClick={()=>setInspector(null)}><CloseIcon/></button></div>{inspector==='details'?<dl><dt>名前</dt><dd>{artifact.filename}</dd><dt>種類</dt><dd>{artifact.mimeType}</dd><dt>サイズ</dt><dd>{artifact.sizeBytes.toLocaleString()} B</dd><dt>バージョン</dt><dd>{artifact.revision??'—'}</dd></dl>:verification?<>{verification.revision!==undefined&&verification.revision!==artifact.revision&&<p className="warn-banner">以前のバージョンの検証結果です。</p>}{verification.checks?.map(check=><div key={check.id} className="workspace-check"><strong>{check.status==='passed'?'合格':check.status==='failed'?'不合格':'未確認'}</strong><div>{check.evidence}</div></div>)}{verification.issues.map((issue,i)=><p key={i}>{issue.message}</p>)}</>:<p className="muted-sm">検証中…</p>}</>}
+          {mode==='pin'?<EditRequestPanel artifact={artifact} target={target} onClear={()=>setTarget(null)}/>:<><div className="row-between"><strong>{inspector==='details'?'ファイル詳細':inspector==='export'?'エクスポート':inspector==='history'?'バージョン履歴':'品質検証'}</strong><button type="button" className="icon-btn" aria-label="パネルを閉じる" onClick={()=>{setInspector(null);setPreviewVersion(null);setPreviewText(null)}}><CloseIcon/></button></div>{inspector==='details'?<dl><dt>名前</dt><dd>{artifact.filename}</dd><dt>種類</dt><dd>{artifact.mimeType}</dd><dt>サイズ</dt><dd>{artifact.sizeBytes.toLocaleString()} B</dd><dt>バージョン</dt><dd>{artifact.revision??'—'}</dd></dl>:inspector==='history'?<>
+            {historyError?<p role="alert">{historyError}</p>:!history?<p role="status">読み込み中…</p>:history.length===0?<p>履歴がありません。</p>:
+              history.map(version=><div key={version.revision} className="workspace-check">
+                <strong>バージョン {version.revision}{version.revision===artifact.revision?'（現在）':''}</strong>
+                <div>{({user:'ユーザー',ai:'AI',system:'システム'})[version.actorKind]} · {new Date(version.createdAt).toLocaleString()}</div>
+                {version.operationSummary&&<div>{version.operationSummary}</div>}
+                {version.previewable&&canPreviewHistory&&<a
+                  href={buildArtifactContentUrl(historicalArtifact(artifact,version),{convertedPdf:true})}
+                  target="_blank" rel="noopener noreferrer">プレビュー</a>}
+                {version.previewable&&textHistoryPreview&&<button type="button" className="btn btn-secondary btn-xs"
+                  aria-expanded={previewVersion?.revision===version.revision}
+                  onClick={()=>{setPreviewText(null);setPreviewVersion(previewVersion?.revision===version.revision?null:version)}}>プレビュー</button>}
+                {version.blobAvailable&&<a href={buildArtifactContentUrl(historicalArtifact(artifact,version),{download:true})} download={artifact.filename}>ダウンロード</a>}
+                {version.restorable&&version.revision!==artifact.revision&&<button type="button" className="btn btn-secondary btn-xs"
+                  disabled={busy} onClick={()=>void restoreVersion(version)}>復元</button>}
+                {previewVersion?.revision===version.revision&&(previewText?.revision===version.revision
+                  ? previewText.error?<p role="alert">{previewText.text}</p>:<>
+                    <pre className="workspace-history-source">{previewText.text}</pre>
+                    {version.sizeBytes>65536&&<small>先頭 64 KiB を表示しています。</small>}
+                  </>:<p role="status">読み込み中…</p>)}
+              </div>)}
+          </>:inspector==='export'?<>
+            {draft&&<p>保存済みのバージョン {artifact.revision} を変換します。</p>}
+            {exportFormats.map(format=><button type="button" key={format} className="btn btn-secondary btn-xs" disabled={exporting||busy}
+              onClick={()=>void exportFile(format)}>{format.toUpperCase()}</button>)}
+            {exporting&&<p role="status">変換中…</p>}
+            {exported&&<p><a href={buildArtifactContentUrl(exported,{download:true})} download={exported.filename}>{exported.filename} をダウンロード</a></p>}
+          </>:verification?<>{verification.revision!==undefined&&verification.revision!==artifact.revision&&<p className="warn-banner">以前のバージョンの検証結果です。</p>}{verification.checks?.map(check=><div key={check.id} className="workspace-check"><strong>{check.status==='passed'?'合格':check.status==='failed'?'不合格':'未確認'}</strong><div>{check.evidence}</div></div>)}{verification.issues.map((issue,i)=><p key={i}>{issue.message}</p>)}</>:<p className="muted-sm">検証中…</p>}</>}
         </aside>}
       </div>
       <footer className="workspace-status">

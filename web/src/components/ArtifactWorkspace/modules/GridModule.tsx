@@ -8,7 +8,13 @@ import {artifactVersionKey,ByteLruCache} from '../../../utils/viewerCache';
 import type { WorkspaceModuleProps } from '../types';
 
 type Sheet={id:string;name:string;part:string};
-type Cell={address:string;value:unknown;type?:string;formula?:string;formulaStatus?:string;bold?:boolean};
+const CELL_MARKS = { bold: '太字', italic: '斜体', underline: '下線', strike: '取り消し線' } as const;
+type CellMark = keyof typeof CELL_MARKS;
+type CellStyleField = CellMark|'horizontal'|'fontColor'|'backgroundColor';
+const cellMarks = Object.keys(CELL_MARKS) as CellMark[];
+const horizontalAlignment={general:'標準',left:'左揃え',center:'中央揃え',right:'右揃え'} as const;
+type HorizontalAlignment=keyof typeof horizontalAlignment;
+type Cell = Partial<Record<CellMark, boolean>> & {address:string;value:unknown;type?:string;formula?:string;formulaStatus?:string;horizontal?:string;fontColor?:string;backgroundColor?:string};
 type Coordinate={row:number;col:number};
 const FORMULA_STATUS:Record<string,string>={
   evaluated_lo:'再計算済み',
@@ -173,7 +179,22 @@ export function GridModule(props:WorkspaceModuleProps){
   const entries=useMemo(()=>new Map(draft?.entries.map(e=>[e.key,e])),[draft]);
   function value(r:number,c:number){const e=entries.get(key(r,c));return e?.displayValue??String(e?.operation.value??original(r,c))}
   const structural=(draft?.entries??[]).filter(entry=>entry.key.startsWith('grid-structure:'));
-  const cellEditLocked=editingLocked||structural.length>0;
+  let projectedRow=sourceRow(current.row,current.col),projectedCol=current.col;
+  let cellRemoved=false;
+  for(const {operation} of structural){
+    if(xlsx&&operation.sheetId!==sheet?.id)continue;
+    if(operation.op==='xlsx.remove_empty_sheet'){cellRemoved=true;break}
+    const rowOp=operation.op==='xlsx.mutate_rows'||operation.op==='insert_row'||operation.op==='delete_row';
+    const colOp=operation.op==='xlsx.mutate_columns'||operation.op==='insert_col'||operation.op==='delete_col';
+    if(!rowOp&&!colOp)continue;
+    const index=Number(operation.index)-(xlsx?1:0);
+    const coordinate=rowOp?projectedRow:projectedCol;
+    const insertion=xlsx?operation.mode==='insert':operation.op.startsWith('insert');
+    if(!insertion&&coordinate===index){cellRemoved=true;break}
+    const shift=coordinate<index?0:insertion?1:-1;
+    if(rowOp)projectedRow+=shift;else projectedCol+=shift;
+  }
+  const cellEditLocked=editingLocked||cellRemoved;
   function change(v:string){
     if(!ready||cellEditLocked||artifact.revision===undefined||!sheet||!editableCoordinate)return;
     const {row,col}=current;
@@ -297,7 +318,47 @@ export function GridModule(props:WorkspaceModuleProps){
   const styleKey='style:'+key(current.row,current.col);
   const styleEntry=entries.get(styleKey);
   const canStyle=xlsx&&inputEnabled&&supportsOperation(capabilities,'xlsx.set_cell_style');
-  function toggleBold(){if(!canStyle||!sheet||artifact.revision===undefined)return;const existing=raw(current.row,current.col)?.bold===true;const next=!(styleEntry?.operation.bold??existing);onDraft(artifact.revision,next===existing?null:{key:styleKey,label:address(current.row,current.col)+' 太字',operation:{op:'xlsx.set_cell_style',sheetPart:sheet.part,address:address(current.row,current.col),bold:next}},styleKey)}
+  function stageCellStyle(field: CellStyleField, next: boolean|string, original: boolean|string|undefined) {
+    if (!canStyle || !sheet || artifact.revision === undefined) return;
+    const cellAddress = address(current.row, current.col);
+    const operation: Record<string, unknown> & { op: string } = { op: 'xlsx.set_cell_style', sheetPart: sheet.part, address: cellAddress, ...styleEntry?.operation };
+    if (next === original) delete operation[field];
+    else operation[field] = next;
+    const changed = [...cellMarks,'horizontal','fontColor','backgroundColor'].some(field => operation[field] !== undefined);
+    onDraft(artifact.revision, changed ? { key: styleKey, label: cellAddress + ' の書式', operation } : null, styleKey);
+  }
+  const selectedCell=raw(current.row,current.col);
+  const markButton=(mark:CellMark)=>{
+    const original=selectedCell?.[mark]===true;
+    const active=Boolean(styleEntry?.operation[mark]??original);
+    return <button key={mark} type="button" className="btn btn-secondary btn-xs" aria-pressed={active} disabled={!canStyle}
+      data-keep-open onClick={()=>stageCellStyle(mark,!active,original)}>{CELL_MARKS[mark]}</button>;
+  };
+  const cellAlignment=selectedCell?.horizontal??'general';
+  const selectedAlignment=String(styleEntry?.operation.horizontal??cellAlignment);
+  const colorControl=(field:'fontColor'|'backgroundColor',label:string,fallback:string)=>{
+    const original=selectedCell?.[field];
+    const active=String(styleEntry?.operation[field]??original??'');
+    return <label className="workspace-cell-color">{label}<input type="color" aria-label={label}
+      value={/^#[0-9a-f]{6}$/i.test(active)?active:fallback} disabled={!canStyle}
+      onChange={event=>stageCellStyle(field,event.target.value,original)}/></label>;
+  };
+  function cellFontStyle(row: number, col: number): React.CSSProperties {
+    const cell = raw(row, col);
+    const style = entries.get('style:' + key(row, col))?.operation;
+    const hasMark = (mark: CellMark) => style?.[mark] ?? cell?.[mark];
+    const alignment=style?.horizontal??cell?.horizontal;
+    const color=String(style?.fontColor??cell?.fontColor??'');
+    const background=String(style?.backgroundColor??cell?.backgroundColor??'');
+    return {
+      color:/^#[0-9a-f]{6}$/i.test(color)?color:undefined,
+      backgroundColor:/^#[0-9a-f]{6}$/i.test(background)?background:undefined,
+      textAlign:alignment==='left'||alignment==='center'||alignment==='right'?alignment:undefined,
+      fontWeight: hasMark('bold') ? 'bold' : undefined,
+      fontStyle: hasMark('italic') ? 'italic' : undefined,
+      textDecorationLine: [hasMark('underline') && 'underline', hasMark('strike') && 'line-through'].filter(Boolean).join(' ') || undefined,
+    };
+  }
   const actions=[{id:'insert_row',label:'行を挿入'},{id:'delete_row',label:'行を削除'},{id:'insert_col',label:'列を挿入'},{id:'delete_col',label:'列を削除'},...(xlsx?[{id:'xlsx.add_sheet',label:'シートを追加'},{id:'xlsx.rename_sheet',label:'シート名変更'},{id:'xlsx.remove_empty_sheet',label:'空のシートを削除'}]:[])].filter(action=>supportsOperation(capabilities,xlsx?(action.id.startsWith('xlsx.')?action.id:action.id.endsWith('row')?'xlsx.mutate_rows':'xlsx.mutate_columns'):'edit'));
   const needsName=['xlsx.add_sheet','xlsx.rename_sheet'].includes(editAction);
   const validName=!needsName||(sheetName.trim().length>0&&sheetName.trim().length<=31&&!Array.from('[]:*?/\\').some(ch=>sheetName.includes(ch))&&!sheets.some(s=>s.name.toLowerCase()===sheetName.trim().toLowerCase()&&(editAction!=='xlsx.rename_sheet'||s.id!==sheet?.id)));
@@ -369,9 +430,21 @@ export function GridModule(props:WorkspaceModuleProps){
   const formulaWarning=(activeFormulaStatus==='unevaluated_unsupported'||activeFormulaStatus==='error_formula')
     && !entries.has(key(current.row,current.col)) && !previews.has(address(current.row,current.col));
   const primary=<><span className="workspace-cell-address" title={selectedRange}>{selectedRange}</span><span aria-hidden="true">ƒx</span><input ref={formulaInput} className="workspace-formula" aria-label="数式・セル値" value={ready?value(current.row,current.col):''} readOnly={!inputEnabled} onChange={e=>change(e.target.value)}/>{formulaWarning&&<small title={FORMULA_STATUS[activeFormulaStatus]}>{activeFormulaStatus==='error_formula'?'数式エラー':'未評価'}</small>}{mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!ready||!inData} onClick={()=>void pin()}>セルを対象にする</button>}{mode==='edit'&&<>
-      {xlsx&&<button type="button" className="btn btn-secondary btn-xs" aria-pressed={Boolean(styleEntry?.operation.bold??raw(current.row,current.col)?.bold)} disabled={!canStyle} onClick={toggleBold}>太字</button>}
+      {xlsx&&markButton('bold')}
     </>}</>;
   const secondary=mode==='edit'?<>
+      {xlsx&&<>
+        {cellMarks.filter(mark=>mark!=='bold').map(markButton)}
+        {colorControl('fontColor','文字色','#000000')}
+        {colorControl('backgroundColor','塗りつぶし','#ffffff')}
+        <button type="button" className="btn btn-secondary btn-xs" disabled={!canStyle} data-keep-open
+          onClick={()=>stageCellStyle('backgroundColor','none',selectedCell?.backgroundColor)}>塗りつぶしなし</button>
+        <select aria-label="セルの配置" value={selectedAlignment in horizontalAlignment?selectedAlignment:''} disabled={!canStyle}
+          onChange={event=>stageCellStyle('horizontal',event.target.value as HorizontalAlignment,cellAlignment)}>
+          <option value="" disabled>既存の配置</option>
+          {Object.entries(horizontalAlignment).map(([id,label])=><option value={id} key={id}>{label}</option>)}
+        </select>
+      </>}
       <select aria-label="表の編集操作" disabled={!structuralEnabled} value={editAction} onChange={e=>{setEditAction(e.target.value);setSheetName(e.target.value==='xlsx.rename_sheet'?sheet?.name??'':'')}}><option value="">表の操作…</option>{actions.map(a=><option key={a.id} value={a.id}>{a.label}</option>)}</select>
       {needsName&&<input aria-label="シート名" value={sheetName} maxLength={31} onChange={e=>setSheetName(e.target.value)}/>}
       {editAction&&<button type="button" className="btn btn-secondary btn-xs" disabled={!structuralEnabled||!validName} onClick={stageStructure}>適用</button>}
@@ -402,6 +475,7 @@ export function GridModule(props:WorkspaceModuleProps){
   return <UnifiedViewerZoomShell resetKey={artifact.id+':grid'} controlsTop={<>{toolbar}{filters}</>} controlsBottom={tabs}>
     {(structure.error||rangeError||pinError)&&<div role="alert" className="error-box">{structure.error||rangeError||pinError}<button type="button" onClick={()=>{structure.retry();setRetry(v=>v+1);setPinError('')}}>再試行</button></div>}
     {structural.length>0&&<div className="workspace-toolbar workspace-toolbar-fields" role="status">
+      <span>行・列・シートの変更は保存時に反映されます。</span>
       {structural.map(entry=><span key={entry.key}>{entry.label}</span>)}
       <button type="button" className="btn btn-secondary btn-xs" disabled={editingLocked} onClick={()=>{
         const entry=structural.at(-1);if(entry&&artifact.revision!==undefined)onDraft(artifact.revision,null,entry.key)
@@ -413,7 +487,7 @@ export function GridModule(props:WorkspaceModuleProps){
         <div role="row" className="workspace-grid-header" style={{height:CELL_HEIGHT}}><div role="columnheader" className="workspace-grid-corner" style={{width:HEADER}}/>{cols.map(c=><div key={colAxis.start+c.index} role="columnheader" className="workspace-grid-col" style={{left:c.start,width:c.size}}>{colName(colAxis.start+c.index)}</div>)}</div>
         {rows.map(r=>{const row=rowAxis.start+r.index;return <div key={row} role="row" aria-rowindex={row+2} className="workspace-grid-row" style={{top:r.start,height:r.size}}>
           <div role="rowheader" className="workspace-grid-rowhead" style={{width:HEADER}}>{sourceRow(row,current.col)+1}</div>
-          {cols.map(c=>{const col=colAxis.start+c.index,addr=address(sourceRow(row,col),col),cell=raw(row,col),pending=entries.has(key(row,col)),active=row>=bounds.row0&&row<=bounds.row1&&col>=bounds.col0&&col<=bounds.col1,preview=previews.get(addr),loaded=!!tile(row,col);return <div key={col} role="gridcell" aria-colindex={col+2} aria-selected={active} aria-label={addr} aria-busy={!loaded} onClick={e=>{move(row,col,e.shiftKey);scroll.current?.focus({preventScroll:true})}} title={preview!==undefined?'未保存の数式プレビュー':cell?.formulaStatus?FORMULA_STATUS[cell.formulaStatus]:undefined} data-formula-preview={preview!==undefined?'true':undefined} className={'workspace-grid-cell'+(pending?' pending':'')} style={{left:c.start,width:c.size,fontWeight:entries.get('style:'+key(row,col))?.operation.bold??cell?.bold?'bold':undefined}}>{preview??(pending?value(row,col):!loaded?'…':xlsx?String(cell?.value??''):original(row,col))}</div>})}
+          {cols.map(c=>{const col=colAxis.start+c.index,addr=address(sourceRow(row,col),col),cell=raw(row,col),pending=entries.has(key(row,col)),active=row>=bounds.row0&&row<=bounds.row1&&col>=bounds.col0&&col<=bounds.col1,preview=previews.get(addr),loaded=!!tile(row,col);return <div key={col} role="gridcell" aria-colindex={col+2} aria-selected={active} aria-label={addr} aria-busy={!loaded} onClick={e=>{move(row,col,e.shiftKey);scroll.current?.focus({preventScroll:true})}} title={preview!==undefined?'未保存の数式プレビュー':cell?.formulaStatus?FORMULA_STATUS[cell.formulaStatus]:undefined} data-formula-preview={preview!==undefined?'true':undefined} className={'workspace-grid-cell'+(pending?' pending':'')} style={{left:c.start,width:c.size,...cellFontStyle(row,col)}}>{preview??(pending?value(row,col):!loaded?'…':xlsx?String(cell?.value??''):original(row,col))}</div>})}
         </div>})}
       </div>
     </div>}
