@@ -4276,6 +4276,85 @@ export class ArtifactService {
     });
   }
 
+  /**
+   * Streams a text blob line-by-line with a bounded sliding window of `spanLength` lines
+   * to compute the exact 0-based `occurrenceIndex` of the target span starting at `targetStartLine`
+   * and the total `duplicateCount` of identical spans across the file (Spec §5.2).
+   */
+  private async countLineSpanOccurrencesFromBlob(
+    blobPath: string,
+    targetStartLine: number,
+    spanLength: number,
+    expectedSnippetHash: string,
+  ): Promise<{ occurrenceIndex: number; duplicateCount: number }> {
+    return new Promise((resolve, reject) => {
+      const stream = fs.createReadStream(blobPath, { highWaterMark: 64 * 1024 });
+      const decoder = new StringDecoder('utf8');
+      let pending = '';
+      let lineNo = 0;
+      const windowLines: string[] = [];
+      let occurrenceIndex = -1;
+      let duplicateCount = 0;
+      let settled = false;
+
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve({
+          occurrenceIndex: occurrenceIndex >= 0 ? occurrenceIndex : 0,
+          duplicateCount: Math.max(duplicateCount, occurrenceIndex >= 0 ? 1 : 0),
+        });
+      };
+
+      const pushLine = (line: string) => {
+        lineNo += 1;
+        windowLines.push(line);
+        if (windowLines.length > spanLength) {
+          windowLines.shift();
+        }
+        if (windowLines.length === spanLength) {
+          const spanStartLine = lineNo - spanLength + 1;
+          const h = crypto.createHash('sha256').update(windowLines.join('\n'), 'utf8').digest('hex');
+          if (h === expectedSnippetHash) {
+            if (spanStartLine === targetStartLine) {
+              occurrenceIndex = duplicateCount;
+            }
+            duplicateCount += 1;
+          }
+        }
+      };
+
+      stream.on('data', (chunk: Buffer | string) => {
+        const text = typeof chunk === 'string' ? chunk : decoder.write(chunk);
+        let cursor = 0;
+        while (cursor <= text.length) {
+          const nlIdx = text.indexOf('\n', cursor);
+          if (nlIdx < 0) {
+            pending += text.slice(cursor);
+            break;
+          }
+          const fullLine = pending + text.slice(cursor, nlIdx);
+          pending = '';
+          pushLine(fullLine.endsWith('\r') ? fullLine.slice(0, -1) : fullLine);
+          cursor = nlIdx + 1;
+        }
+      });
+
+      stream.on('end', () => {
+        if (settled) return;
+        const tail = pending + decoder.end();
+        pushLine(tail.endsWith('\r') ? tail.slice(0, -1) : tail);
+        finish();
+      });
+
+      stream.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      });
+    });
+  }
+
   private async streamCsvRangeFromBlob(
     blobPath: string,
     totalBytes: number,
@@ -4511,7 +4590,7 @@ export class ArtifactService {
             throw new ArtifactError('INVALID_INPUT', 'Invalid source target range.', 400);
           }
           // Compute target identity from the same pinned server bytes, including
-          // context, rather than depending on the client's secure-context API.
+          // context and exact 0-based occurrenceIndex, rather than depending on client crypto.subtle.
           const first = Math.max(1, start-2);
           const data = await this.streamLineRangeFromBlob(blobPath,sizeBytes,{startLine:first,endLine:end+2});
           if (data.truncated || Number(data.endLine)<end) {
@@ -4523,7 +4602,23 @@ export class ArtifactService {
           const text=lines.slice(offset,offset+length).join('\n');
           const before=lines.slice(0,offset).join('\n'), after=lines.slice(offset+length).join('\n');
           const hash=(value:string)=>crypto.createHash('sha256').update(value,'utf8').digest('hex');
-          return {artifactId:artifact.id,revision:revision.revision,sha256:revision.sha256,startLine:start,endLine:end,text,before,after,expectedSnippetHash:hash(text),contextBeforeHash:hash(before),contextAfterHash:hash(after)};
+          const expectedSnippetHash = hash(text);
+          const { occurrenceIndex, duplicateCount } = await this.countLineSpanOccurrencesFromBlob(blobPath, start, length, expectedSnippetHash);
+          return {
+            artifactId:artifact.id,
+            revision:revision.revision,
+            sha256:revision.sha256,
+            startLine:start,
+            endLine:end,
+            text,
+            before,
+            after,
+            expectedSnippetHash,
+            contextBeforeHash:hash(before),
+            contextAfterHash:hash(after),
+            occurrenceIndex,
+            duplicateCount,
+          };
         }
         const data = range.offsetBytes !== undefined
           ? this.readByteRangeFromBlob(blobPath, sizeBytes, range)

@@ -185,6 +185,7 @@ export class CodeAdapter implements FormatAdapter {
         contextBeforeHash: selector.contextBeforeHash ? String(selector.contextBeforeHash) : undefined,
         contextAfterHash: selector.contextAfterHash ? String(selector.contextAfterHash) : undefined,
         occurrenceIndex: selector.occurrenceIndex !== undefined ? Number(selector.occurrenceIndex) : undefined,
+        requireOccurrenceIndex: selector.kind === 'code_line_range',
       });
     }
 

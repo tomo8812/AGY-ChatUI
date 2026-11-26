@@ -88,15 +88,37 @@ right.rotation = 18
 right.fill.solid()
 right.fill.fore_color.rgb = RGBColor(75, 125, 72)
 image = BytesIO()
-Image.new("RGB", (32, 20), (112, 75, 145)).save(image, "PNG")
+clipped_img = Image.new("RGB", (64, 40), (220, 48, 48))
+for y in range(10, 30):
+    for x in range(12, 52):
+        clipped_img.putpixel((x, y), (112, 75, 145))
+clipped_img.save(image, "PNG")
 image.seek(0)
-slide.shapes.add_picture(image, Inches(8.1), Inches(2.7), Inches(1.1), Inches(.7)).name = "Attached image"
+pic = slide.shapes.add_picture(image, Inches(8.1), Inches(2.7), Inches(1.1), Inches(.7))
+pic.name = "Attached image"
+# Exercise picture clipping (a:srcRect crop + rounded-rectangle clip geometry)
+pic.crop_left = 0.2
+pic.crop_top = 0.2
+pic.crop_right = 0.2
+pic.crop_bottom = 0.2
+prst_geom = pic._element.spPr.find("{http://schemas.openxmlformats.org/drawingml/2006/main}prstGeom")
+if prst_geom is not None:
+    prst_geom.set("prst", "roundRect")
 table = slide.shapes.add_table(2, 2, Inches(7.15), Inches(3.55), Inches(2.5), Inches(.9))
 table.name = "Native table"
 for row, values in zip(table.table.rows, [["Metric", "Value"], ["Count", "24"]]):
     for cell, value in zip(row.cells, values):
         cell.text = value
         cell.text_frame.paragraphs[0].runs[0].font.size = Pt(11)
+# Exercise slide master accent + layout background inheritance
+master_bg = deck.slide_master.background
+master_bg.fill.solid()
+master_bg.fill.fore_color.rgb = RGBColor(232, 238, 246)
+master_band = deck.slide_master.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(10), Inches(0.22))
+master_band.name = "Master header band"
+master_band.fill.solid()
+master_band.fill.fore_color.rgb = RGBColor(30, 58, 95)
+master_band.line.fill.background()
 slide.slide_layout.background.fill.solid()
 slide.slide_layout.background.fill.fore_color.rgb = RGBColor(240, 244, 249)
 deck.save(out / "sample.pptx")

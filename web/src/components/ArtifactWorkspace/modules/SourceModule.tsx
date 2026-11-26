@@ -25,7 +25,7 @@ export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget
   const value=String(draft?.entries.find(e=>e.key==='source')?.operation.content??text);
   const previewValue=useDeferredValue(value);
   const markdown=artifact.previewKind==='markdown';
-  const language=artifact.filename.split('.').pop()??'text';
+  const language=artifact.filename.includes('.')?(artifact.filename.split('.').pop()??'text'):artifact.filename.toLowerCase();
   const matches=useMemo(()=>{
     const needle=query.toLowerCase();
     if(!needle)return 0;
@@ -57,9 +57,10 @@ export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget
     if(!resource.ready||artifact.revision===undefined||!editor.current)return;
     const {startLine:start,endLine:end}=editor.current.getSelection();
     try{
-      const result=await workspaceApi.range<{text:string;before:string;after:string;expectedSnippetHash:string;contextBeforeHash:string;contextAfterHash:string}>(artifact.id,{startLine:start,endLine:end,targetHashes:true});
+      const result=await workspaceApi.range<{text:string;before:string;after:string;expectedSnippetHash:string;contextBeforeHash:string;contextAfterHash:string;occurrenceIndex:number}>(artifact.id,{startLine:start,endLine:end,targetHashes:true});
       assertRevision(artifact,result);
-      onTarget({baseRevision:artifact.revision,label:start+'–'+end+' 行',selector:{kind:markdown?'md_text_range':'code_line_range',startLine:start,endLine:end,expectedSnippetHash:result.expectedSnippetHash,contextBeforeHash:result.contextBeforeHash,contextAfterHash:result.contextAfterHash},range:{startLine:start,endLine:end},selectedContentSnapshot:result.text,surroundingContext:result.before+'\n---\n'+result.after});
+      if(!Number.isInteger(result.occurrenceIndex)||result.occurrenceIndex<0)throw Error('Invalid occurrenceIndex');
+      onTarget({baseRevision:artifact.revision,label:start+'–'+end+' 行',selector:{kind:markdown?'md_text_range':'code_line_range',startLine:start,endLine:end,expectedSnippetHash:result.expectedSnippetHash,contextBeforeHash:result.contextBeforeHash,contextAfterHash:result.contextAfterHash,occurrenceIndex:result.occurrenceIndex},range:{startLine:start,endLine:end},selectedContentSnapshot:result.text,surroundingContext:result.before+'\n---\n'+result.after});
       setPinError('');
     }catch{setPinError('選択対象の識別情報を作成できませんでした。')}
   }

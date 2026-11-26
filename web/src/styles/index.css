@@ -3672,20 +3672,22 @@ details[open] > .activity-summary > .activity-chevron {
 .hljs { color: #1f2328; }
 .hljs-comment, .hljs-quote { color: #6e7781; font-style: italic; }
 .hljs-keyword, .hljs-selector-tag, .hljs-subst { color: #cf222e; }
-.hljs-number, .hljs-literal, .hljs-variable, .hljs-template-variable { color: #0550ae; }
+.hljs-number, .hljs-literal, .hljs-variable, .hljs-template-variable, .hljs-symbol { color: #0550ae; }
 .hljs-string, .hljs-doctag { color: #0a3069; }
 .hljs-title, .hljs-section, .hljs-selector-id { color: #116329; font-weight: 600; }
-.hljs-type, .hljs-class .hljs-title { color: #953800; }
-.hljs-tag, .hljs-name, .hljs-attribute { color: #116329; }
+.hljs-type, .hljs-class .hljs-title, .hljs-built_in { color: #953800; }
+.hljs-tag, .hljs-name, .hljs-attribute, .hljs-attr, .hljs-property { color: #116329; }
+.hljs-meta, .hljs-params { color: #6639ba; }
 
 [data-theme='dark'] .hljs { color: #e6edf3; }
-[data-theme='dark'] .hljs-comment, [data-theme='dark'] .hljs-quote { color: #8b949e; }
-[data-theme='dark'] .hljs-keyword, [data-theme='dark'] .hljs-selector-tag { color: #ff7b72; }
-[data-theme='dark'] .hljs-number, [data-theme='dark'] .hljs-literal, [data-theme='dark'] .hljs-variable { color: #79c0ff; }
+[data-theme='dark'] .hljs-comment, [data-theme='dark'] .hljs-quote { color: #8b949e; font-style: italic; }
+[data-theme='dark'] .hljs-keyword, [data-theme='dark'] .hljs-selector-tag, [data-theme='dark'] .hljs-subst { color: #ff7b72; }
+[data-theme='dark'] .hljs-number, [data-theme='dark'] .hljs-literal, [data-theme='dark'] .hljs-variable, [data-theme='dark'] .hljs-symbol { color: #79c0ff; }
 [data-theme='dark'] .hljs-string, [data-theme='dark'] .hljs-doctag { color: #a5d6ff; }
-[data-theme='dark'] .hljs-title, [data-theme='dark'] .hljs-section { color: #7ee787; }
-[data-theme='dark'] .hljs-type { color: #ffa657; }
-[data-theme='dark'] .hljs-tag, [data-theme='dark'] .hljs-name { color: #7ee787; }
+[data-theme='dark'] .hljs-title, [data-theme='dark'] .hljs-section, [data-theme='dark'] .hljs-selector-id { color: #7ee787; font-weight: 600; }
+[data-theme='dark'] .hljs-type, [data-theme='dark'] .hljs-built_in { color: #ffa657; }
+[data-theme='dark'] .hljs-tag, [data-theme='dark'] .hljs-name, [data-theme='dark'] .hljs-attribute, [data-theme='dark'] .hljs-attr, [data-theme='dark'] .hljs-property { color: #7ee787; }
+[data-theme='dark'] .hljs-meta, [data-theme='dark'] .hljs-params { color: #d2a8ff; }
 
 /* Mobile & iPhone Responsive Rules */
 .mobile-only {

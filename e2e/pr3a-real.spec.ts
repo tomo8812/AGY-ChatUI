@@ -324,6 +324,13 @@ for(const vp of targets){
               expect(srv.ctx.db.getArtifact(userId,artifact.id)?.revision).toBe(1);
               const before=await svc.renderPng(userId,artifact.id,{pageIndex:0});
               record.beforeVisual=await capturePptx(page,info,before.png,'pptx-before');
+              // Record Overlap bbox before moving so we can verify 0-ghosting in its vacated strip
+              const moveStageBox=await page.locator('[data-slide-canvas="true"]').boundingBox();
+              const overlapBtnPre=page.getByRole('button',{name:'Overlap',exact:true});
+              const overlapBoxPre=await overlapBtnPre.boundingBox();
+              await overlapBtnPre.click();
+              await overlapBtnPre.press('Shift+ArrowRight');
+              await overlapBtnPre.press('Shift+ArrowRight');
               await page.getByRole('button',{name:'Title',exact:true}).click();
               const textInput=page.getByRole('textbox',{name:'図形テキスト',exact:true});
               await page.getByRole('button',{name:'Title',exact:true}).press('F2');
@@ -342,6 +349,9 @@ for(const vp of targets){
               await expect.poll(()=>page.locator('[data-slide-canvas] img').evaluateAll(imgs=>imgs.length===6&&imgs.every(img=>(img as HTMLImageElement).complete&&(img as HTMLImageElement).naturalWidth>0))).toBe(true);
               const style=await page.addStyleTag({content:'.workspace-shape-hit{visibility:hidden!important}'});
               try{await page.locator('[data-slide-canvas]').screenshot({path:info.outputPath('pptx-draft-canvas.png'),scale:'css'});}finally{await style.evaluate(el=>el.remove())}
+              if(moveStageBox&&overlapBoxPre){
+                record.movedOverlapVacated={stage:moveStageBox,orig:overlapBoxPre};
+              }
             }
             await expect(page.getByRole('button',{name:'保存',exact:true})).toBeEnabled();
             await page.getByRole('button',{name:'拡大',exact:true}).click();
@@ -382,6 +392,22 @@ for(const vp of targets){
               expect(draftVisual.ssim,'Unsaved sprite preview vs final saved slide').toBeGreaterThanOrEqual(.95);
               expect(draftVisual.mae).toBeLessThanOrEqual(5);
               record.draftVisual=draftVisual;
+              // Verify vacated bbox strip from moved Overlap shape has 0 ghosting against saved LibreOffice render
+              const movedInfo=record.movedOverlapVacated as {stage:{x:number;y:number;width:number;height:number};orig:{x:number;y:number;width:number;height:number}}|undefined;
+              if(movedInfo){
+                const actualAfter=decodePng(fs.readFileSync(info.outputPath('pptx-after-actual.png')));
+                const expectedAfter=decodePng(fs.readFileSync(info.outputPath('pptx-after-reference.png')));
+                const sx=actualAfter.width/Math.max(1,movedInfo.stage.width);
+                const sy=actualAfter.height/Math.max(1,movedInfo.stage.height);
+                const movedVacatedMetrics=computeRegionMetrics(actualAfter,expectedAfter,{
+                  x:(movedInfo.orig.x-movedInfo.stage.x)*sx,
+                  y:(movedInfo.orig.y-movedInfo.stage.y)*sy,
+                  width:Math.max(6,20*sx*(movedInfo.stage.width/720)),
+                  height:movedInfo.orig.height*sy,
+                });
+                expect(movedVacatedMetrics.mae,'Vacated strip after moving Overlap must have 0 ghosting').toBeLessThanOrEqual(4);
+                record.movedVacatedMetrics=movedVacatedMetrics;
+              }
             }
             await page.getByRole('button',{name:'依頼',exact:true}).click({timeout:30000});
             if(item.kind==='markdown'||item.kind==='code'){

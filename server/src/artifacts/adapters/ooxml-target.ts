@@ -215,7 +215,26 @@ export interface XlsxRangeTargetResult {
   rangeA1: string;
   expectedSheetStructHash: string;
   expectedRangeValuesHash: string;
+  expectedOrderKeysHash: string;
   cells: Array<{ address: string; value: string; formula?: string; type?: string }>;
+  snippet: string;
+}
+
+export interface XlsxSheetTargetResult {
+  sheetId: string;
+  sheetName: string;
+  sheetPart: string;
+  expectedSheetStructHash: string;
+}
+
+export interface XlsxRowColTargetResult {
+  sheetId: string;
+  sheetName: string;
+  sheetPart: string;
+  axis: 'row' | 'col';
+  index: number;
+  expectedSheetStructHash: string;
+  expectedSliceHash: string;
   snippet: string;
 }
 
@@ -507,9 +526,13 @@ export function readXlsxRangeTarget(
   // Build ordered row-major hash of values, formulas, types, and order across the exact range
   const rangeHash = createHash('sha256');
   rangeHash.update(`range:${sheet.id}:${parsedRange.canonical}\n`);
+  const orderKeysHash = createHash('sha256');
+  orderKeysHash.update(`order:${sheet.id}:${parsedRange.canonical}\n`);
   const snippetCells: Array<{ address: string; value: string; formula?: string; type?: string }> = [];
 
   for (let r = parsedRange.row0; r <= parsedRange.row1; r++) {
+    const firstKeyEntry = rangeCells.get(`${r}:${parsedRange.col0}`);
+    orderKeysHash.update(JSON.stringify([r, firstKeyEntry?.v ?? '', firstKeyEntry?.f ?? null])).update('\n');
     for (let c = parsedRange.col0; c <= parsedRange.col1; c++) {
       const a1 = `${colIndexToLetters(c)}${r + 1}`;
       const entry = rangeCells.get(`${r}:${c}`);
@@ -539,8 +562,184 @@ export function readXlsxRangeTarget(
     rangeA1: parsedRange.canonical,
     expectedSheetStructHash: structHash.digest('hex'),
     expectedRangeValuesHash: rangeHash.digest('hex'),
+    expectedOrderKeysHash: orderKeysHash.digest('hex'),
     cells: snippetCells,
     snippet: snippetText,
+  };
+}
+
+export function readXlsxSheetTarget(
+  bytes: Buffer,
+  sheetSelector: string,
+): XlsxSheetTargetResult | null {
+  const single = readXlsxRangeTarget(bytes, sheetSelector, 'A1');
+  if (!single) return null;
+  return {
+    sheetId: single.sheetId,
+    sheetName: single.sheetName,
+    sheetPart: single.sheetPart,
+    expectedSheetStructHash: single.expectedSheetStructHash,
+  };
+}
+
+export function readXlsxRowColTarget(
+  bytes: Buffer,
+  sheetSelector: string,
+  axis: 'row' | 'col',
+  index: number,
+): XlsxRowColTargetResult | null {
+  if (!Number.isInteger(index) || index < 0) return null;
+  const wb = readXlsxWorkbookTargets(bytes);
+  const sheet =
+    wb.sheets.find((s) => s.id === sheetSelector) ??
+    wb.sheets.find((s) => s.name === sheetSelector) ??
+    wb.sheets.find((s) => s.part === sheetSelector);
+  if (!sheet) return null;
+
+  const sharedStringsPath = 'xl/sharedStrings.xml';
+  const parts = readParts(bytes, new Set([sheet.part, sharedStringsPath]));
+  const sheetBytes = parts[sheet.part];
+  if (!sheetBytes) return null;
+  const sharedStrings = parseSharedStringsXml(parts[sharedStringsPath]);
+  const sheetXml = new TextDecoder('utf-8', { fatal: true }).decode(sheetBytes);
+
+  const structHash = createHash('sha256');
+  structHash.update(`sheet:${sheet.id}:${sheet.name}\n`);
+
+  const sliceEntries: Array<{ pos: number; a1: string; t: string; v: string; f: string | null; fAttrs: string }> = [];
+  const parser = new SaxesParser({ xmlns: true, position: false });
+  let elemCount = 0;
+  let currentRowNum = 0;
+  let autoColIdx = 0;
+  let inCell = false;
+  let cellRef = '';
+  let cellRow = -1;
+  let cellCol = -1;
+  let cellType = '';
+  let inSlice = false;
+  let inV = false;
+  let inF = false;
+  let inIs = false;
+  let inIsT = false;
+  let vBuf = '';
+  let fBuf = '';
+  let fAttrs = '';
+  let hasFormula = false;
+  let isBuf = '';
+  const attrStr = (attrs: Record<string, { value: string }>, key: string) => attrs[key]?.value ?? '';
+
+  parser.on('doctype', () => invalidPackage());
+  parser.on('error', () => invalidPackage());
+  parser.on('opentag', (tag) => {
+    if (++elemCount > MAX_SAX_ELEMENTS) invalidPackage();
+    const local = tag.local;
+    const attrs = tag.attributes as Record<string, { value: string }>;
+    if (local === 'dimension') {
+      structHash.update(`dim:${attrStr(attrs, 'ref')}\n`);
+    } else if (local === 'col') {
+      structHash.update(`col:${attrStr(attrs, 'min')}:${attrStr(attrs, 'max')}:${attrStr(attrs, 'hidden')}\n`);
+    } else if (local === 'mergeCell') {
+      structHash.update(`merge:${attrStr(attrs, 'ref')}\n`);
+    } else if (local === 'autoFilter') {
+      structHash.update(`filter:${attrStr(attrs, 'ref')}\n`);
+    } else if (local === 'pane') {
+      structHash.update(`pane:${attrStr(attrs, 'xSplit')}:${attrStr(attrs, 'ySplit')}:${attrStr(attrs, 'topLeftCell')}\n`);
+    } else if (local === 'tablePart') {
+      const rId = Object.entries(attrs).find(([k]) => k === 'r:id' || k.endsWith(':id'))?.[1]?.value ?? '';
+      structHash.update(`table:${rId}\n`);
+    } else if (local === 'row') {
+      const rAttr = Number(attrStr(attrs, 'r'));
+      currentRowNum = Number.isInteger(rAttr) && rAttr > 0 ? rAttr : currentRowNum + 1;
+      autoColIdx = 0;
+      structHash.update(`row:${currentRowNum}:${attrStr(attrs, 'hidden')}\n`);
+    } else if (local === 'c') {
+      inCell = true;
+      cellRef = attrStr(attrs, 'r');
+      cellType = attrStr(attrs, 't');
+      const parsed = cellRef ? parseCellRef(cellRef) : null;
+      if (parsed) {
+        cellRow = parsed.row;
+        cellCol = parsed.col;
+        autoColIdx = parsed.col + 1;
+      } else {
+        cellRow = Math.max(0, currentRowNum - 1);
+        cellCol = autoColIdx++;
+        cellRef = `${colIndexToLetters(cellCol)}${cellRow + 1}`;
+      }
+      structHash.update(`c:${cellRef}\n`);
+      inSlice = axis === 'row' ? cellRow === index : cellCol === index;
+      vBuf = '';
+      fBuf = '';
+      fAttrs = '';
+      hasFormula = false;
+      isBuf = '';
+    } else if (inCell && inSlice) {
+      if (local === 'v') inV = true;
+      else if (local === 'f') {
+        inF = true;
+        hasFormula = true;
+        fAttrs = `${attrStr(attrs, 't')}|${attrStr(attrs, 'ref')}|${attrStr(attrs, 'si')}`;
+      } else if (local === 'is') inIs = true;
+      else if (inIs && local === 't') inIsT = true;
+    }
+  });
+  parser.on('text', (text) => {
+    if (!inCell || !inSlice) return;
+    if (inV) vBuf += text;
+    else if (inF) fBuf += text;
+    else if (inIs && inIsT) isBuf += text;
+  });
+  parser.on('closetag', (tag) => {
+    const local = tag.local;
+    if (local === 'v') inV = false;
+    else if (local === 'f') inF = false;
+    else if (local === 't') inIsT = false;
+    else if (local === 'is') inIs = false;
+    else if (local === 'c' && inCell) {
+      if (inSlice) {
+        let resolvedValue = vBuf;
+        if (cellType === 's') {
+          const idx = Number(vBuf);
+          resolvedValue = Number.isInteger(idx) && idx >= 0 && idx < sharedStrings.length ? sharedStrings[idx] : vBuf;
+        } else if (cellType === 'inlineStr') {
+          resolvedValue = isBuf;
+        }
+        sliceEntries.push({
+          pos: axis === 'row' ? cellCol : cellRow,
+          a1: cellRef,
+          t: cellType || (hasFormula ? 'formula' : 'n'),
+          v: resolvedValue,
+          f: hasFormula ? fBuf : null,
+          fAttrs: hasFormula ? fAttrs : '',
+        });
+      }
+      inCell = false;
+      inSlice = false;
+    }
+  });
+
+  parser.write(sheetXml).close();
+  sliceEntries.sort((a, b) => a.pos - b.pos);
+
+  const sliceHash = createHash('sha256');
+  sliceHash.update(`slice:${sheet.id}:${axis}:${index}\n`);
+  for (const e of sliceEntries) {
+    sliceHash.update(JSON.stringify([e.a1, e.t, e.v, e.f, e.fAttrs])).update('\n');
+  }
+  const snippet = sliceEntries
+    .slice(0, 200)
+    .map((e) => `${e.a1} ${e.f !== null ? '=' + e.f : e.v}`)
+    .join('\n');
+
+  return {
+    sheetId: sheet.id,
+    sheetName: sheet.name,
+    sheetPart: sheet.part,
+    axis,
+    index,
+    expectedSheetStructHash: structHash.digest('hex'),
+    expectedSliceHash: sliceHash.digest('hex'),
+    snippet,
   };
 }
 

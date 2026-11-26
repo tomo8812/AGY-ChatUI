@@ -169,7 +169,7 @@ export function GridModule(props:WorkspaceModuleProps){
   const inData=xlsx||current.row<csvRows&&current.col<csvCols;
   const editableCoordinate=inData||csvEmpty&&current.row===0&&current.col===0;
   const loading=structure.loading||keys.some(key=>!readTile(key));
-  const latest=useRef({revisionKey,sheetId:sheet?.id,selectedRange});latest.current={revisionKey,sheetId:sheet?.id,selectedRange};
+  const latest=useRef({revisionKey,sheetId:sheet?.id,selectedRange,filter});latest.current={revisionKey,sheetId:sheet?.id,selectedRange,filter};
   const entries=useMemo(()=>new Map(draft?.entries.map(e=>[e.key,e])),[draft]);
   function value(r:number,c:number){const e=entries.get(key(r,c));return e?.displayValue??String(e?.operation.value??original(r,c))}
   const structural=(draft?.entries??[]).filter(entry=>entry.key.startsWith('grid-structure:'));
@@ -323,11 +323,12 @@ export function GridModule(props:WorkspaceModuleProps){
     const draftKey='grid-structure:'+(++structureSequence.current);
     onDraft(artifact.revision,{key:draftKey,label:action.label+' · '+selectedRange,operation:op},draftKey);setEditAction('');setSheetName('');
   }
-  useEffect(()=>{setSearching(false);return()=>{searchAbort.current?.abort();searchAbort.current=null}},[search,revisionKey,sheet?.id,draft]);
+  useEffect(()=>{setSearching(false);return()=>{searchAbort.current?.abort();searchAbort.current=null}},[search,revisionKey,sheet?.id,draft,filter]);
   async function nextMatch(){
     if(!search.trim()||!sheet||!structure.ready||searchAbort.current)return;
     const controller=new AbortController();searchAbort.current=controller;setSearching(true);setPinError('');
     const identity=latest.current,origin={row:sourceRow(current.row,current.col),col:current.col};
+    const isStale=()=>controller.signal.aborted||latest.current.revisionKey!==identity.revisionKey||latest.current.sheetId!==identity.sheetId||latest.current.filter!==identity.filter;
     const fold=(s:string)=>Array.from(s,ch=>ch.toLowerCase()).join('');
     const q=fold(search.trim()),compare=(a:Coordinate,b:Coordinate)=>a.row-b.row||a.col-b.col;
     const circular=(a:Coordinate,b:Coordinate)=>Number(compare(a,origin)<=0)-Number(compare(b,origin)<=0)||compare(a,b);
@@ -344,8 +345,9 @@ export function GridModule(props:WorkspaceModuleProps){
       let cursor=origin,hit:Coordinate|null=null;const seen=new Set<string>();
       // A staged cell may hide a match in the persisted bytes. Skip only
       // those overwritten hits; merge matching staged values in cyclic order.
-      while(!controller.signal.aborted){
+      while(!isStale()){
         const result=await workspaceApi.range<{match:Coordinate|null}>(artifact.id,{gridSearch:search.trim(),afterRow:cursor.row,afterCol:cursor.col,...(xlsx?{sheetId:sheet.id}:{})},controller.signal);
+        if(isStale())return;
         assertRevision(artifact,result);
         const next=result.match;if(!next)break;
         const addressKey=sheet.id+':'+address(next.row,next.col);if(seen.has(addressKey))break;seen.add(addressKey);
@@ -353,13 +355,13 @@ export function GridModule(props:WorkspaceModuleProps){
         if(!staged||fold(String(staged.operation.value??'')).includes(q)){hit=next;break;}
         cursor=next;
       }
-      if(controller.signal.aborted||latest.current.revisionKey!==identity.revisionKey||latest.current.sheetId!==identity.sheetId||latest.current.selectedRange!==identity.selectedRange)return;
+      if(isStale()||latest.current.selectedRange!==identity.selectedRange)return;
       const candidate=matchingDrafts[0];if(candidate&&(!hit||circular(candidate,hit)<0))hit=candidate;
       if(hit){
         if(filter){setAppliedFilter('');setFilterInput('');setSelected(hit);setAnchor(hit);pendingReveal.current=hit}
         else move(hit.row,hit.col);
       }else setPinError('一致するセルがありません。');
-    }catch(e){if(!controller.signal.aborted)setPinError(e instanceof Error?e.message:'検索に失敗しました。')}
+    }catch(e){if(!isStale())setPinError(e instanceof Error?e.message:'検索に失敗しました。')}
     finally{if(searchAbort.current===controller){searchAbort.current=null;setSearching(false)}}
   }
   const activeFormulaStatus=raw(current.row,current.col)?.formulaStatus;

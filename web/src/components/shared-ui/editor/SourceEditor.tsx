@@ -97,18 +97,20 @@ function buildHljsDecorations(view:EditorView,hljsLang:string):DecorationSet{
       const lt=html.indexOf('<',pos);
       if(lt===-1){
         const decoded=decodeHtmlEntities(html.slice(pos));
-        if(decoded.length>0&&classStack.length>0){
+        const cls=classStack.filter(Boolean).join(' ');
+        if(decoded.length>0&&cls){
           const end=Math.min(to,offset+decoded.length);
-          if(end>offset)builder.add(offset,end,Decoration.mark({class:classStack.join(' ')}));
+          if(end>offset)builder.add(offset,end,Decoration.mark({class:cls}));
         }
         offset+=decoded.length;
         break;
       }
       if(lt>pos){
         const decoded=decodeHtmlEntities(html.slice(pos,lt));
-        if(decoded.length>0&&classStack.length>0){
+        const cls=classStack.filter(Boolean).join(' ');
+        if(decoded.length>0&&cls){
           const end=Math.min(to,offset+decoded.length);
-          if(end>offset)builder.add(offset,end,Decoration.mark({class:classStack.join(' ')}));
+          if(end>offset)builder.add(offset,end,Decoration.mark({class:cls}));
         }
         offset+=decoded.length;
       }

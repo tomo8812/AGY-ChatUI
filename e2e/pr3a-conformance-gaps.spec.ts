@@ -327,7 +327,7 @@ for (const vp of VIEWPORTS) {
     await assertNoHorizontalOverflow(page);
     await page.screenshot({ path: info.outputPath(`docx-continuous-${vp.width}x${vp.height}.png`) });
 
-    // --- 3. PPTX full slide thumbnail rail (15 slides) + jump + 0-ghosting visual bbox check ---
+    // --- 3. PPTX virtualized slide thumbnail rail (120 slides) + jump + 0-ghosting (move & remove) ---
     await page.unrouteAll({ behavior: 'wait' });
     const pptxArtifact: ArtifactRecord = {
       ...pyArtifact,
@@ -337,7 +337,7 @@ for (const vp of VIEWPORTS) {
       mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
     };
     const bgPng = buildSyntheticPng(640, 360);
-    const slides = Array.from({ length: 15 }, (_, i) => ({ id: String(i + 1), part: `ppt/slides/slide${i + 1}.xml` }));
+    const slides = Array.from({ length: 120 }, (_, i) => ({ id: String(i + 1), part: `ppt/slides/slide${i + 1}.xml` }));
     await page.route('**/api/files/fixture/**', async (route) => {
       const u = new URL(route.request().url());
       const endpoint = u.pathname.split('/').pop();
@@ -402,16 +402,22 @@ for (const vp of VIEWPORTS) {
     }, pptxArtifact);
     await page.goto(BASE_HARNESS + '?kind=pptx');
 
-    // Full scrollable slide rail renders all 15 slides (NOT capped to ±4!)
-    await expect(page.locator('.workspace-slide-nav-item')).toHaveCount(15);
-    // Jump directly to slide 14 via slide-number jump control
+    // Virtualized slide rail supports 120 slides while mounting only visible + overscan thumbnails!
+    const navList = page.locator('.workspace-slide-nav-list');
+    await expect(navList).toHaveAttribute('data-virtualized', 'true');
+    await expect(navList).toHaveAttribute('data-total-slides', '120');
+    const mountedCount = await page.locator('.workspace-slide-nav-item').count();
+    expect(mountedCount).toBeGreaterThan(0);
+    expect(mountedCount).toBeLessThan(35);
+
+    // Jump directly to slide 105 (far beyond ±4) via slide-number jump control
     const jumpInput = page.getByLabel('スライド番号へ移動');
     await expect(jumpInput).toBeVisible();
-    await jumpInput.fill('14');
+    await jumpInput.fill('105');
     await jumpInput.press('Enter');
-    await expect(page.locator('.workspace-slide-nav-item.active')).toContainText('14');
+    await expect(page.locator('.workspace-slide-nav-item.active')).toContainText('105');
 
-    // Return to slide 1 and verify layered Z-order + 0-ghost removal
+    // Return to slide 1 and verify layered Z-order + 0-ghosting on both move and removal
     await jumpInput.fill('1');
     await jumpInput.press('Enter');
     await page.getByRole('button', { name: '編集', exact: true }).click();
@@ -419,9 +425,29 @@ for (const vp of VIEWPORTS) {
     await expect(removableSvg).toBeVisible();
     const stage = page.locator('.workspace-slide');
     const stageBox = await stage.boundingBox();
-    const beforePng = await stage.screenshot();
+    const beforeMovePng = await stage.screenshot();
 
-    await page.getByRole('button', { name: 'RemovableBox', exact: true }).click();
+    // Move RemovableBox left by 40pt via Shift+ArrowLeft and confirm old right strip cleared with 0 ghosting
+    const removableBtn = page.getByRole('button', { name: 'RemovableBox', exact: true });
+    await removableBtn.click();
+    for (let k = 0; k < 4; k++) await removableBtn.press('Shift+ArrowLeft');
+    const afterMovePng = await stage.screenshot();
+    if (stageBox && stageBox.width > 0 && stageBox.height > 0) {
+      const sx = stageBox.width / 640;
+      const sy = stageBox.height / 360;
+      const moveAudit = auditRegions(
+        decodePng(afterMovePng),
+        decodePng(beforeMovePng),
+        [
+          { id: 'title', label: 'Title', rectPx: { x: 40 * sx, y: 24 * sy, width: 320 * sx, height: 60 * sy } },
+          { id: 'vacatedRight', label: 'VacatedRight', rectPx: { x: 522 * sx, y: 180 * sy, width: 38 * sx, height: 80 * sy } },
+        ],
+      );
+      expect(moveAudit.regions.find((r) => r.id === 'title')!.passed).toBe(true);
+      expect(moveAudit.regions.find((r) => r.id === 'vacatedRight')!.metrics.mae).toBeGreaterThan(1.0);
+    }
+
+    const beforePng = await stage.screenshot();
     const cmdToggle = page.locator('.workspace-commandbar-toggle');
     if (await cmdToggle.isVisible()) {
       await cmdToggle.click();
@@ -443,7 +469,7 @@ for (const vp of VIEWPORTS) {
         decodePng(beforePng),
         [
           { id: 'title', label: 'Title', rectPx: { x: 40 * sx, y: 24 * sy, width: 320 * sx, height: 60 * sy } },
-          { id: 'removed', label: 'RemovableBox', rectPx: { x: 400 * sx, y: 180 * sy, width: 160 * sx, height: 80 * sy } },
+          { id: 'removed', label: 'RemovableBox', rectPx: { x: 360 * sx, y: 180 * sy, width: 160 * sx, height: 80 * sy } },
         ],
       );
       // Title stayed visually identical while RemovableBox bbox genuinely cleared!
@@ -454,6 +480,70 @@ for (const vp of VIEWPORTS) {
     }
     await assertNoHorizontalOverflow(page);
     await page.screenshot({ path: info.outputPath(`pptx-full-rail-${vp.width}x${vp.height}.png`) });
+
+    // --- 3b. GridModule search revision/sheet change regression (stale search must NOT jump or leak error) ---
+    await page.unrouteAll({ behavior: 'wait' });
+    const xlsxArtifact: ArtifactRecord = {
+      ...pyArtifact,
+      relPath: 'book.xlsx',
+      filename: 'book.xlsx',
+      previewKind: 'table',
+      mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    };
+    let resolveDelayedSearch: (() => void) | null = null;
+    await page.route('**/api/files/fixture/**', async (route) => {
+      const u = new URL(route.request().url());
+      const endpoint = u.pathname.split('/').pop();
+      if (endpoint === 'capabilities') {
+        return route.fulfill({ json: { format: 'xlsx', directEditUiSupported: true, targetPinSupported: true, operations: [{ operation: 'xlsx.set_cell', availability: 'supported', scope: 'mcp_and_ui' }] } });
+      }
+      if (endpoint === 'structure') {
+        return route.fulfill({
+          json: {
+            artifactId: 'fixture',
+            revision: 1,
+            sha256: SHA,
+            sheets: [
+              { id: '1', name: 'Sheet1', part: 'xl/worksheets/sheet1.xml', rows: 10, cols: 5 },
+              { id: '2', name: 'Sheet2', part: 'xl/worksheets/sheet2.xml', rows: 10, cols: 5 },
+            ],
+          },
+        });
+      }
+      if (endpoint === 'range') {
+        if (u.searchParams.has('gridSearch')) {
+          await new Promise<void>((resolve) => { resolveDelayedSearch = resolve; setTimeout(resolve, 600); });
+          return route.fulfill({ json: { artifactId: 'fixture', revision: 1, sha256: SHA, match: { row: 4, col: 2 } } });
+        }
+        return route.fulfill({
+          json: {
+            artifactId: 'fixture',
+            revision: 1,
+            sha256: SHA,
+            cells: [{ address: 'A1', value: u.searchParams.get('sheetId') === '2' ? 'SecondSheet' : 'FirstSheet' }],
+          },
+        });
+      }
+      return route.fulfill({ json: {} });
+    });
+    await page.route('**/api/chats/fixture-chat/edit-requests**', (r) => r.fulfill({ json: { requests: [] } }));
+    await page.addInitScript((art) => {
+      (window as Window & { __pr3aFixtureArtifact?: ArtifactRecord }).__pr3aFixtureArtifact = art;
+    }, xlsxArtifact);
+    await page.goto(BASE_HARNESS + '?kind=xlsx');
+    await expect(page.getByRole('gridcell', { name: 'A1', exact: true })).toHaveText('FirstSheet');
+    await page.getByLabel('シート全体を検索').fill('Needle');
+    await page.getByRole('button', { name: '次の一致', exact: true }).click();
+    // Switch sheet while search is in-flight!
+    await page.getByRole('button', { name: 'Sheet2', exact: true }).click();
+    resolveDelayedSearch?.();
+    await expect(page.getByRole('gridcell', { name: 'A1', exact: true })).toHaveText('SecondSheet');
+    // Wait briefly for any late response to settle and verify no stale jump or error alert
+    await page.waitForTimeout(150);
+    await expect(page.locator('.workspace-cell-address')).toHaveText('A1');
+    await expect(page.locator('[role="alert"]')).toHaveCount(0);
+    await assertNoHorizontalOverflow(page);
+    await page.screenshot({ path: info.outputPath(`grid-search-guard-${vp.width}x${vp.height}.png`) });
 
     // --- 4. Rich UI continuous slider partial subscription (0 DOM mutations on untouched heavy nodes) ---
     await page.unrouteAll({ behavior: 'wait' });

@@ -610,6 +610,22 @@ export class MarkdownAdapter implements FormatAdapter {
       const blocks = markdownStructure(text, slugifyHeading).filter((block) => block.node.type === 'heading' &&
         block.slug === selector.headingSlug && (!selector.headingLevel || block.node.depth === selector.headingLevel));
       if (blocks.length === 0) return { status: 'stale', reason: 'heading_not_found' };
+      const hasOcc = selector.occurrenceIndex !== undefined && selector.occurrenceIndex !== null;
+      if (hasOcc) {
+        const occ = Number(selector.occurrenceIndex);
+        if (!Number.isInteger(occ) || occ < 0 || occ >= blocks.length) {
+          return { status: 'needs_review', reason: 'heading_occurrence_changed' };
+        }
+        const candidate = blocks[occ];
+        if (!selector.expectedHeadingHash || sha256Text(text.slice(candidate.start, candidate.end).trim()) !== selector.expectedHeadingHash) {
+          return { status: 'needs_review', reason: 'heading_changed_or_ambiguous' };
+        }
+        return {
+          status: 'resolved',
+          resolvedSnippet: text.slice(candidate.start, candidate.end),
+          resolvedRange: { startLine: candidate.startLine, endLine: candidate.endLine, occurrenceIndex: occ },
+        };
+      }
       const matches = blocks.filter(({ start, end }) =>
         Boolean(selector.expectedHeadingHash) && sha256Text(text.slice(start, end).trim()) === selector.expectedHeadingHash);
       if (matches.length !== 1) return { status: 'needs_review', reason: 'heading_changed_or_ambiguous' };
@@ -645,6 +661,7 @@ export class MarkdownAdapter implements FormatAdapter {
         contextBeforeHash: selector.contextBeforeHash ? String(selector.contextBeforeHash) : undefined,
         contextAfterHash: selector.contextAfterHash ? String(selector.contextAfterHash) : undefined,
         occurrenceIndex: selector.occurrenceIndex !== undefined ? Number(selector.occurrenceIndex) : undefined,
+        requireOccurrenceIndex: selector.kind === 'md_text_range',
       });
     }
 

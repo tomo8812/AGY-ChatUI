@@ -3,10 +3,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { zipSync, strToU8 } from 'fflate';
+import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { createTestServer } from './helpers/test-harness.js';
 import { FormatAdapterRegistry } from '../src/artifacts/adapters/registry.js';
-import { readDocxAllParagraphTargets, readXlsxRangeTarget } from '../src/artifacts/adapters/ooxml-target.js';
+import {
+  readDocxAllParagraphTargets,
+  readXlsxRangeTarget,
+  readXlsxRowColTarget,
+  readXlsxSheetTarget,
+} from '../src/artifacts/adapters/ooxml-target.js';
 import { inspectPdfDocument, computePdfRegionDigest } from '../src/artifacts/adapters/pdf-target.js';
 import { sha256Hex } from '../../web/src/utils/sha256.js';
 import { auditRegions, decodePng } from '../../e2e/helpers/visualAudit.js';
@@ -799,5 +805,312 @@ describe('PR 3A Conformance Gap Fixes', () => {
     // Dynamic limits are STILL strictly enforced atomically on subsequent mutations!
     expect(() => store.set('extraList', Array.from({ length: 2005 }, (_, i) => i))).toThrow();
     expect(store.getStateValue('extraList')).toEqual([1, 2, 3]);
+  });
+
+  it('Workstream 1 (Markdown & Code): readRange targetHashes returns exact occurrenceIndex and adapters enforce it on re-resolution', async () => {
+    const server = await createTestServer({ installDocRuntime: 'off', sandboxMode: 'off', allowUnsandboxedDocWorkers: false });
+    try {
+      const userId = 'u-src';
+      const chatId = 'c-src';
+      const workspaceDir = fs.mkdtempSync(path.join(server.dataRoot, 'src-ws-'));
+      server.ctx.db.createUser({ id: userId, username: 'u-src', displayName: 'SRC', passwordHash: 'x', role: 'user', profileDir: workspaceDir });
+      server.ctx.db.createChat({ id: chatId, userId, projectId: null, title: 'SRC', workspaceDir, modelId: '', effortValue: '', projectContextVersion: 0 });
+
+      const codeV1 = [
+        'const header = true;',
+        'return compute();',
+        'const middleA = 1;',
+        'const middleB = 2;',
+        'return compute();',
+        'const footer = true;',
+      ].join('\n');
+      const createdCode = await server.ctx.artifactService.createArtifact({
+        userId, scopeKind: 'chat', chatId, relPath: 'app.ts', content: Buffer.from(codeV1, 'utf8'), actorKind: 'user', actorId: userId,
+      });
+
+      // Second occurrence is on line 5 -> occurrenceIndex must be 1, duplicateCount must be 2
+      const hashes = await server.ctx.artifactService.readRange(userId, createdCode.artifact.id, {
+        startLine: 5,
+        endLine: 5,
+        targetHashes: 'true',
+      }) as {
+        expectedSnippetHash: string;
+        contextBeforeHash: string;
+        contextAfterHash: string;
+        occurrenceIndex: number;
+        duplicateCount: number;
+      };
+      expect(hashes.occurrenceIndex).toBe(1);
+      expect(hashes.duplicateCount).toBe(2);
+
+      const codeAdapter = new FormatAdapterRegistry().resolve('app.ts', 'code');
+      const codeMeta = { filename: 'app.ts', relPath: 'app.ts', mimeType: 'text/typescript' };
+
+      // Missing occurrenceIndex on code_line_range MUST fail closed with needs_review
+      const missingOcc = codeAdapter.resolveTarget(Buffer.from(codeV1, 'utf8'), {
+        kind: 'code_line_range',
+        startLine: 5,
+        endLine: 5,
+        expectedSnippetHash: hashes.expectedSnippetHash,
+        contextBeforeHash: hashes.contextBeforeHash,
+        contextAfterHash: hashes.contextAfterHash,
+      }, codeMeta);
+      expect(missingOcc.status).toBe('needs_review');
+      expect(missingOcc.reason).toBe('missing_occurrence_index');
+
+      // Exact selector with occurrenceIndex=1 resolves cleanly
+      const validCodeRes = codeAdapter.resolveTarget(Buffer.from(codeV1, 'utf8'), {
+        kind: 'code_line_range',
+        startLine: 5,
+        endLine: 5,
+        expectedSnippetHash: hashes.expectedSnippetHash,
+        contextBeforeHash: hashes.contextBeforeHash,
+        contextAfterHash: hashes.contextAfterHash,
+        occurrenceIndex: hashes.occurrenceIndex,
+      }, codeMeta);
+      expect(validCodeRes.status).toBe('resolved');
+
+      // Inserting an extra identical line earlier shifts occurrenceIndex from 1 -> 2 => MUST return needs_review
+      const codeInsertedDup = [
+        'return compute();',
+        'const header = true;',
+        'return compute();',
+        'const middleA = 1;',
+        'const middleB = 2;',
+        'return compute();',
+        'const footer = true;',
+      ].join('\n');
+      const shiftedRes = codeAdapter.resolveTarget(Buffer.from(codeInsertedDup, 'utf8'), {
+        kind: 'code_line_range',
+        startLine: 5,
+        endLine: 5,
+        expectedSnippetHash: hashes.expectedSnippetHash,
+        contextBeforeHash: hashes.contextBeforeHash,
+        contextAfterHash: hashes.contextAfterHash,
+        occurrenceIndex: hashes.occurrenceIndex,
+      }, codeMeta);
+      expect(shiftedRes.status).toBe('needs_review');
+      expect(shiftedRes.reason).toBe('occurrence_index_changed');
+
+      // Same contract for Markdown md_text_range
+      const mdV1 = '# Title\n\nShared note\n\nSection A\n\nShared note\n\nEnd\n';
+      const createdMd = await server.ctx.artifactService.createArtifact({
+        userId, scopeKind: 'chat', chatId, relPath: 'doc.md', content: Buffer.from(mdV1, 'utf8'), actorKind: 'user', actorId: userId,
+      });
+      const mdHashes = await server.ctx.artifactService.readRange(userId, createdMd.artifact.id, {
+        startLine: 7,
+        endLine: 7,
+        targetHashes: 'true',
+      }) as {
+        expectedSnippetHash: string;
+        contextBeforeHash: string;
+        contextAfterHash: string;
+        occurrenceIndex: number;
+      };
+      expect(mdHashes.occurrenceIndex).toBe(1);
+      const mdAdapter = new FormatAdapterRegistry().resolve('doc.md', 'markdown');
+      const mdMeta = { filename: 'doc.md', relPath: 'doc.md', mimeType: 'text/markdown' };
+      expect(mdAdapter.resolveTarget(Buffer.from(mdV1, 'utf8'), {
+        kind: 'md_text_range',
+        startLine: 7,
+        endLine: 7,
+        expectedSnippetHash: mdHashes.expectedSnippetHash,
+        contextBeforeHash: mdHashes.contextBeforeHash,
+        contextAfterHash: mdHashes.contextAfterHash,
+      }, mdMeta).status).toBe('needs_review');
+      expect(mdAdapter.resolveTarget(Buffer.from(mdV1, 'utf8'), {
+        kind: 'md_text_range',
+        startLine: 7,
+        endLine: 7,
+        expectedSnippetHash: mdHashes.expectedSnippetHash,
+        contextBeforeHash: mdHashes.contextBeforeHash,
+        contextAfterHash: mdHashes.contextAfterHash,
+        occurrenceIndex: mdHashes.occurrenceIndex,
+      }, mdMeta).status).toBe('resolved');
+    } finally {
+      await server.cleanup();
+    }
+  });
+
+  it('Workstream 1 (DOCX, PDF text range & XLSX selectors): enforces optional blockIndex with paraId, pdf_text_range context/occurrence, and xlsx_row_col/xlsx_sheet/orderKeys', () => {
+    const registry = new FormatAdapterRegistry();
+
+    // 1. DOCX docx_paragraph with paraId and omitted blockIndex (Spec §5.2)
+    const docxBuf = buildMinimalDocx([
+      { text: 'Lead paragraph', paraId: '1111AAAA' },
+      { text: 'Target paragraph', paraId: '2222BBBB' },
+    ]);
+    const docxTargets = readDocxAllParagraphTargets(docxBuf);
+    const targetPara = docxTargets.paragraphs[1];
+    const docxAdapter = registry.resolve('spec.docx', 'docx');
+    const docxMeta = { filename: 'spec.docx', relPath: 'spec.docx', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' };
+    const paraIdOnlyRes = docxAdapter.resolveTarget(docxBuf, {
+      kind: 'docx_paragraph',
+      paraId: targetPara.paraId,
+      expectedBlockHash: targetPara.fingerprint,
+    }, docxMeta);
+    expect(paraIdOnlyRes.status).toBe('resolved');
+
+    // 2. PDF pdf_text_range with contextBeforeHash, contextAfterHash & occurrenceIndex
+    const pdfBuf = buildMinimalPdf([{ width: 600, height: 800, text: 'Alpha ITEM Beta ITEM Gamma' }]);
+    const pdfDoc = inspectPdfDocument(pdfBuf);
+    const page0 = pdfDoc.pages[0];
+    const secondIdx = page0.text.lastIndexOf('ITEM');
+    const slice = page0.text.slice(secondIdx, secondIdx + 4);
+    const before = page0.text.slice(Math.max(0, secondIdx - 64), secondIdx);
+    const after = page0.text.slice(secondIdx + 4, Math.min(page0.text.length, secondIdx + 4 + 64));
+    const sha = (s: string) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
+    const pdfAdapter = registry.resolve('text.pdf', 'pdf');
+    const pdfMeta = { filename: 'text.pdf', relPath: 'text.pdf', mimeType: 'application/pdf' };
+
+    expect(pdfAdapter.resolveTarget(pdfBuf, {
+      kind: 'pdf_text_range',
+      pageIndex: 0,
+      expectedPageCount: 1,
+      expectedPageContentHash: page0.pageContentHash,
+      textOffsetStart: secondIdx,
+      textOffsetEnd: secondIdx + 4,
+      expectedSnippetHash: sha(slice),
+      contextBeforeHash: sha(before),
+      contextAfterHash: sha(after),
+      occurrenceIndex: 1,
+    }, pdfMeta).status).toBe('resolved');
+
+    // Wrong occurrenceIndex -> needs_review
+    expect(pdfAdapter.resolveTarget(pdfBuf, {
+      kind: 'pdf_text_range',
+      pageIndex: 0,
+      expectedPageCount: 1,
+      expectedPageContentHash: page0.pageContentHash,
+      textOffsetStart: secondIdx,
+      textOffsetEnd: secondIdx + 4,
+      expectedSnippetHash: sha(slice),
+      contextBeforeHash: sha(before),
+      contextAfterHash: sha(after),
+      occurrenceIndex: 0,
+    }, pdfMeta).status).toBe('needs_review');
+
+    // 3. XLSX expectedOrderKeysHash, xlsx_row_col, and xlsx_sheet
+    const xlsxBuf = buildMinimalXlsx({
+      sharedStrings: ['Alpha', 'Beta'],
+      sheets: [{
+        name: 'Data',
+        rows: [
+          { r: 1, cells: [{ ref: 'A1', v: 0, sharedString: true }, { ref: 'B1', v: 10 }] },
+          { r: 2, cells: [{ ref: 'A2', v: 1, sharedString: true }, { ref: 'B2', v: 20 }] },
+        ],
+      }],
+    });
+    const xlsxAdapter = registry.resolve('data.xlsx', 'table');
+    const xlsxMeta = { filename: 'data.xlsx', relPath: 'data.xlsx', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' };
+    const rangeTarget = readXlsxRangeTarget(xlsxBuf, '1', 'A1:B2')!;
+    expect(xlsxAdapter.resolveTarget(xlsxBuf, {
+      kind: 'xlsx_range',
+      sheetId: '1',
+      rangeA1: 'A1:B2',
+      expectedSheetStructHash: rangeTarget.expectedSheetStructHash,
+      expectedRangeValuesHash: rangeTarget.expectedRangeValuesHash,
+      expectedOrderKeysHash: rangeTarget.expectedOrderKeysHash,
+    }, xlsxMeta).status).toBe('resolved');
+    expect(xlsxAdapter.resolveTarget(xlsxBuf, {
+      kind: 'xlsx_range',
+      sheetId: '1',
+      rangeA1: 'A1:B2',
+      expectedSheetStructHash: rangeTarget.expectedSheetStructHash,
+      expectedRangeValuesHash: rangeTarget.expectedRangeValuesHash,
+      expectedOrderKeysHash: '0'.repeat(64),
+    }, xlsxMeta).status).toBe('needs_review');
+
+    const rowTarget = readXlsxRowColTarget(xlsxBuf, '1', 'row', 0)!;
+    expect(xlsxAdapter.resolveTarget(xlsxBuf, {
+      kind: 'xlsx_row_col',
+      sheetId: '1',
+      axis: 'row',
+      index: 0,
+      expectedSheetStructHash: rowTarget.expectedSheetStructHash,
+      expectedSliceHash: rowTarget.expectedSliceHash,
+    }, xlsxMeta).status).toBe('resolved');
+
+    const sheetTarget = readXlsxSheetTarget(xlsxBuf, '1')!;
+    expect(xlsxAdapter.resolveTarget(xlsxBuf, {
+      kind: 'xlsx_sheet',
+      sheetId: '1',
+      expectedSheetStructHash: sheetTarget.expectedSheetStructHash,
+    }, xlsxMeta).status).toBe('resolved');
+  });
+
+  it('Workstream 5 (PERF-03 & Multi-Block Isolation): normal chat entry has zero static imports of heavy workspace/rich/editor packages, and multiple Rich blocks isolate updates cleanly', () => {
+    const repoRoot = path.resolve(import.meta.dirname, '../..');
+    const webSrc = path.join(repoRoot, 'web/src');
+    const visited = new Set<string>();
+    const staticPackages = new Set<string>();
+
+    const walkStatic = (absFile: string) => {
+      if (visited.has(absFile) || !fs.existsSync(absFile)) return;
+      visited.add(absFile);
+      const source = fs.readFileSync(absFile, 'utf8');
+      const sf = ts.createSourceFile(absFile, source, ts.ScriptTarget.Latest, true, absFile.endsWith('x') ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
+      const visit = (node: ts.Node) => {
+        if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier) && !node.importClause?.isTypeOnly) {
+          const bindings = node.importClause?.namedBindings;
+          const allTypeOnly = !node.importClause?.name && bindings && ts.isNamedImports(bindings) && bindings.elements.length > 0 && bindings.elements.every((e) => e.isTypeOnly);
+          if (!allTypeOnly) {
+            const spec = node.moduleSpecifier.text;
+            if (spec.startsWith('.')) {
+              const base = path.resolve(path.dirname(absFile), spec.replace(/\.js$/, ''));
+              for (const cand of [base, `${base}.ts`, `${base}.tsx`, path.join(base, 'index.ts'), path.join(base, 'index.tsx')]) {
+                if (fs.existsSync(cand) && fs.statSync(cand).isFile()) {
+                  walkStatic(cand);
+                  break;
+                }
+              }
+            } else {
+              staticPackages.add(spec);
+            }
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sf);
+    };
+
+    walkStatic(path.join(webSrc, 'main.tsx'));
+    const relVisited = [...visited].map((f) => path.relative(repoRoot, f).split(path.sep).join('/'));
+
+    // Normal chat entry must NOT statically load ArtifactWorkspace, RichRenderer, or heavy editor/chart/PDF libraries
+    expect(relVisited.some((f) => f.includes('ArtifactWorkspace'))).toBe(false);
+    expect(relVisited.some((f) => f.includes('RichRenderer'))).toBe(false);
+    for (const forbiddenPkg of ['d3', 'dagre', '@tiptap/react', '@codemirror/view', 'pdfjs-dist', '@tanstack/react-virtual']) {
+      expect([...staticPackages].some((p) => p === forbiddenPkg || p.startsWith(`${forbiddenPkg}/`))).toBe(false);
+    }
+
+    // Multiple Rich blocks operating concurrently isolate state updates & budgets
+    const makeBlock = (seed: number): RichDocumentV1 => ({
+      schemaVersion: 1,
+      state: { slider: seed, data: Array.from({ length: 100 }, (_, i) => ({ v: i + seed })) },
+      computed: {
+        active: '$state.slider * 2',
+        total: 'sum(pluck($state.data, "v"))',
+      },
+      root: {
+        id: `root-${seed}`,
+        type: 'stack',
+        direction: 'col',
+        children: [
+          { id: `kpi-a-${seed}`, type: 'kpi_card', label: 'Active', value: { expr: '$computed.active' } },
+          { id: `kpi-b-${seed}`, type: 'kpi_card', label: 'Total', value: { expr: '$computed.total' } },
+        ],
+      },
+    });
+    const stores = [new RichStateStore(makeBlock(1)), new RichStateStore(makeBlock(2)), new RichStateStore(makeBlock(3))];
+    const listeners = stores.map((s) => {
+      const fn = vi.fn();
+      s.subscribeProjection(['computed:active'], fn);
+      return fn;
+    });
+    for (let i = 2; i <= 51; i++) stores[0].set('slider', i);
+    expect(listeners[0]).toHaveBeenCalledTimes(50);
+    expect(listeners[1]).not.toHaveBeenCalled();
+    expect(listeners[2]).not.toHaveBeenCalled();
   });
 });

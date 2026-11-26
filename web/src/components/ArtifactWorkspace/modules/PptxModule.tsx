@@ -1,4 +1,5 @@
 import React,{useEffect,useRef,useState} from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { workspaceApi,supportsOperation,MAX_WORKSPACE_IMAGE_BYTES,type EditOperation } from '../../../api/workspace';
 import {ResponsiveCommandBar} from '../../shared-ui/layout/ResponsiveCommandBar';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
@@ -51,33 +52,58 @@ function useImage(blob:Blob|undefined){
 function Layer({blob,style,alt='',shapeId,zOrder,layerKind}:{blob:Blob;style?:React.CSSProperties;alt?:string;shapeId?:string;zOrder?:number;layerKind?:string}){
   const url=useImage(blob);return url?<img className="workspace-slide-layer" draggable={false} src={url} style={style} alt={alt} data-shape-id={shapeId} data-z-order={zOrder} data-layer-kind={layerKind}/>:null;
 }
-function MiniSlide({artifact,index,active,onClick,disabled}:{artifact:WorkspaceModuleProps['artifact'];index:number;active:boolean;onClick:()=>void;disabled?:boolean}){
-  const buttonRef=useRef<HTMLButtonElement>(null);
-  const [visible,setVisible]=useState(active||index<12);
-  useEffect(()=>{
-    if(active){
-      setVisible(true);
-      buttonRef.current?.scrollIntoView({block:'nearest',inline:'nearest'});
-    }
-  },[active]);
-  useEffect(()=>{
-    if(visible)return;
-    const el=buttonRef.current;
-    if(!el)return;
-    if(typeof IntersectionObserver==='undefined'){setVisible(true);return}
-    const observer=new IntersectionObserver(
-      entries=>{if(entries.some(entry=>entry.isIntersecting)){setVisible(true);observer.disconnect()}},
-      {rootMargin:'240px'},
-    );
-    observer.observe(el);
-    return()=>observer.disconnect();
-  },[visible]);
-  const r=useRevisionResource<Blob|null>(artifact,'thumb:'+index+':'+(visible?'1':'0'),async signal=>{
-    if(!visible)return null;
+function MiniSlide({artifact,index,active,onClick,disabled,style}:{artifact:WorkspaceModuleProps['artifact'];index:number;active:boolean;onClick:()=>void;disabled?:boolean;style?:React.CSSProperties}){
+  const r=useRevisionResource<Blob|null>(artifact,'thumb:'+index,async signal=>{
     return workspaceApi.render(artifact,{pageIndex:index},signal);
   });
   const url=useImage(r.ready?r.data??undefined:undefined);
-  return <button ref={buttonRef} type="button" className={'workspace-slide-nav-item '+(active?'active':'')} data-slide-index={index} aria-label={'スライド '+(index+1)} aria-pressed={active} disabled={disabled} onClick={onClick}>{url?<img src={url} alt=""/>:<span>{index+1}</span>}<small>{index+1}</small></button>;
+  return <button type="button" className={'workspace-slide-nav-item '+(active?'active':'')} style={style} data-slide-index={index} aria-label={'スライド '+(index+1)} aria-pressed={active} disabled={disabled} onClick={onClick}>{url?<img src={url} alt=""/>:<span>{index+1}</span>}<small>{index+1}</small></button>;
+}
+function SlideThumbnailRail({artifact,slides,activeSlideId,activeIndex,projected,onSelect}:{artifact:WorkspaceModuleProps['artifact'];slides:Slide[];activeSlideId?:string;activeIndex:number;projected:(Slide|null)[];onSelect:(slideId:string)=>void}){
+  const listRef=useRef<HTMLDivElement>(null);
+  const [compact,setCompact]=useState(()=>typeof window!=='undefined'&&typeof window.matchMedia==='function'?window.matchMedia('(max-width: 600px)').matches:false);
+  useEffect(()=>{
+    if(typeof window==='undefined'||typeof window.matchMedia!=='function')return;
+    const mq=window.matchMedia('(max-width: 600px)');
+    const update=()=>setCompact(mq.matches);
+    update();
+    mq.addEventListener?.('change',update);
+    return()=>mq.removeEventListener?.('change',update);
+  },[]);
+  const virtualizer=useVirtualizer({
+    count:slides.length,
+    getScrollElement:()=>listRef.current,
+    horizontal:compact,
+    estimateSize:()=>compact?82:84,
+    overscan:4,
+    initialRect:compact?{width:360,height:54}:{width:116,height:560},
+  });
+  useEffect(()=>{
+    if(activeIndex>=0&&activeIndex<slides.length){
+      virtualizer.scrollToIndex(activeIndex,{align:'auto'});
+    }
+  },[activeIndex,slides.length,compact,virtualizer]);
+  const items=virtualizer.getVirtualItems();
+  const totalSize=virtualizer.getTotalSize();
+  return <div ref={listRef} className="workspace-slide-nav-list" data-virtualized="true" data-total-slides={slides.length}>
+    <div className="workspace-slide-nav-track" style={compact?{width:totalSize+'px',height:'100%',position:'relative'}:{height:totalSize+'px',width:'100%',position:'relative'}}>
+      {items.map(vItem=>{
+        const s=slides[vItem.index];
+        if(!s)return null;
+        return <MiniSlide
+          key={s.id}
+          artifact={artifact}
+          index={vItem.index}
+          active={s.id===activeSlideId}
+          disabled={projected.indexOf(s)<0}
+          onClick={()=>onSelect(s.id)}
+          style={compact
+            ?{position:'absolute',top:0,left:0,width:'76px',height:'100%',transform:`translateX(${vItem.start}px)`}
+            :{position:'absolute',top:0,left:0,width:'100%',height:'78px',transform:`translateY(${vItem.start}px)`}}
+        />;
+      })}
+    </div>
+  </div>;
 }
 export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDraft,onTarget,target}:WorkspaceModuleProps){
   const [slideId,setSlideId]=useState('');
@@ -331,9 +357,14 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
         <input type="number" min={1} max={slides.length} aria-label="スライド番号へ移動" placeholder={`1–${slides.length}`} value={jumpInput} onChange={e=>setJumpInput(e.target.value)}/>
         <button type="submit" className="btn btn-secondary btn-xs">移動</button>
       </form>}
-      <div className="workspace-slide-nav-list">
-        {slides.map((s,slideIdx)=><MiniSlide key={s.id} artifact={artifact} index={slideIdx} active={s.id===slide?.id} disabled={projected.indexOf(s)<0} onClick={()=>{setSlideId(s.id);choose('')}}/>)}
-      </div>
+      <SlideThumbnailRail
+        artifact={artifact}
+        slides={slides}
+        activeSlideId={slide?.id}
+        activeIndex={index}
+        projected={projected}
+        onSelect={id=>{setSlideId(id);choose('')}}
+      />
     </nav>
     <UnifiedViewerZoomShell resetKey={artifact.id+':pptx'} controlsTop={<>{toolbar}{operationForm}</>} scrollClassName="workspace-pptx-scroll">
       {(structure.error||scene.error)&&<div className="error-box" role="alert">{structure.error||scene.error}<button type="button" onClick={()=>{structure.retry();scene.retry()}}>再試行</button></div>}

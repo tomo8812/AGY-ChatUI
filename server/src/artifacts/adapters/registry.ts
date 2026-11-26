@@ -29,6 +29,8 @@ import {
   readPptxSlideTargets,
   readPptxTargets,
   readXlsxRangeTarget,
+  readXlsxRowColTarget,
+  readXlsxSheetTarget,
   readXlsxWorkbookTargets,
 } from './ooxml-target.js';
 import { computePdfRegionDigest, inspectPdfDocument, readPdfPageTarget } from './pdf-target.js';
@@ -397,17 +399,56 @@ class DocumentFormatAdapter implements FormatAdapter {
       if (selector.kind === 'pdf_text_range') {
         const start = Number(selector.textOffsetStart);
         const end = Number(selector.textOffsetEnd);
-        if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end > page.text.length) {
+        const expectedSnippetHash = hex64(selector.expectedSnippetHash) ? String(selector.expectedSnippetHash) : null;
+        const expectedBeforeHash = hex64(selector.contextBeforeHash) ? String(selector.contextBeforeHash) : null;
+        const expectedAfterHash = hex64(selector.contextAfterHash) ? String(selector.contextAfterHash) : null;
+        const hasOccurrence = selector.occurrenceIndex !== undefined && selector.occurrenceIndex !== null;
+        const expectedOccurrence = hasOccurrence ? Number(selector.occurrenceIndex) : undefined;
+        if (
+          !expectedSnippetHash ||
+          !Number.isInteger(start) ||
+          !Number.isInteger(end) ||
+          start < 0 ||
+          end <= start ||
+          end > page.text.length ||
+          (hasOccurrence && (!Number.isInteger(expectedOccurrence) || (expectedOccurrence as number) < 0))
+        ) {
           return { status: 'needs_review', reason: 'pdf_text_range_changed' };
         }
         const slice = page.text.slice(start, end);
         const snippetHash = sha256Buffer(Buffer.from(slice, 'utf8'));
-        if (!hex64(selector.expectedSnippetHash) || snippetHash !== selector.expectedSnippetHash) {
+        if (snippetHash !== expectedSnippetHash) {
           return { status: 'needs_review', reason: 'pdf_text_range_changed' };
+        }
+        // Verify surrounding text context and exact occurrenceIndex on the page (Spec §5.2)
+        const ctxWindow = 64;
+        const beforeText = page.text.slice(Math.max(0, start - ctxWindow), start);
+        const afterText = page.text.slice(end, Math.min(page.text.length, end + ctxWindow));
+        if (expectedBeforeHash && sha256Buffer(Buffer.from(beforeText, 'utf8')) !== expectedBeforeHash) {
+          return { status: 'needs_review', reason: 'pdf_text_context_changed' };
+        }
+        if (expectedAfterHash && sha256Buffer(Buffer.from(afterText, 'utf8')) !== expectedAfterHash) {
+          return { status: 'needs_review', reason: 'pdf_text_context_changed' };
+        }
+        // Count occurrences of exact slice within page.text
+        const occurrences: number[] = [];
+        let searchPos = 0;
+        while (searchPos <= page.text.length - slice.length) {
+          const foundAt = page.text.indexOf(slice, searchPos);
+          if (foundAt < 0) break;
+          occurrences.push(foundAt);
+          searchPos = foundAt + 1;
+        }
+        const actualOcc = occurrences.indexOf(start);
+        if (expectedOccurrence !== undefined && actualOcc !== expectedOccurrence) {
+          return { status: 'needs_review', reason: 'pdf_text_occurrence_changed' };
+        }
+        if (occurrences.length > 1 && expectedOccurrence === undefined && (!expectedBeforeHash || !expectedAfterHash)) {
+          return { status: 'needs_review', reason: 'ambiguous_multiple_matches' };
         }
         return {
           status: 'resolved',
-          resolvedCoords: { pageIndex, textOffsetStart: start, textOffsetEnd: end },
+          resolvedCoords: { pageIndex, textOffsetStart: start, textOffsetEnd: end, occurrenceIndex: actualOcc },
           resolvedSnippet: slice,
         };
       }
@@ -427,18 +468,73 @@ class DocumentFormatAdapter implements FormatAdapter {
     }
 
     if (this.format === 'xlsx') {
-      if (selector.kind !== 'xlsx_range') {
-        return { status: 'needs_review', reason: 'unsupported_xlsx_selector' };
-      }
       const sheetId = typeof selector.sheetId === 'string' && selector.sheetId ? selector.sheetId : null;
-      const rangeA1 = typeof selector.rangeA1 === 'string' && selector.rangeA1 ? selector.rangeA1 : null;
       const expectedStructHash =
         typeof selector.expectedSheetStructHash === 'string' && selector.expectedSheetStructHash
           ? selector.expectedSheetStructHash
           : null;
+
+      if (selector.kind === 'xlsx_sheet') {
+        if (!sheetId || !expectedStructHash) {
+          return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+        }
+        try {
+          const wb = readXlsxWorkbookTargets(buffer);
+          const sheetExists = wb.sheets.some((s) => s.id === sheetId || s.name === sheetId || s.part === sheetId);
+          if (!sheetExists) return { status: 'stale', reason: 'sheet_not_found' };
+          const target = readXlsxSheetTarget(buffer, sheetId);
+          if (!target) return { status: 'stale', reason: 'sheet_not_found' };
+          if (target.expectedSheetStructHash !== expectedStructHash) {
+            return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+          }
+          return {
+            status: 'resolved',
+            resolvedRange: { sheetId: target.sheetId, sheetName: target.sheetName },
+            resolvedSnippet: target.sheetName,
+          };
+        } catch {
+          return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+        }
+      }
+
+      if (selector.kind === 'xlsx_row_col') {
+        const axis = selector.axis === 'row' || selector.axis === 'col' ? selector.axis : null;
+        const idx = Number(selector.index);
+        const expectedSliceHash =
+          typeof selector.expectedSliceHash === 'string' && selector.expectedSliceHash ? selector.expectedSliceHash : null;
+        if (!sheetId || !axis || !Number.isInteger(idx) || idx < 0 || !expectedStructHash || !expectedSliceHash) {
+          return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+        }
+        try {
+          const wb = readXlsxWorkbookTargets(buffer);
+          const sheetExists = wb.sheets.some((s) => s.id === sheetId || s.name === sheetId || s.part === sheetId);
+          if (!sheetExists) return { status: 'stale', reason: 'sheet_not_found' };
+          const target = readXlsxRowColTarget(buffer, sheetId, axis, idx);
+          if (!target) return { status: 'stale', reason: 'invalid_range' };
+          if (target.expectedSheetStructHash !== expectedStructHash || target.expectedSliceHash !== expectedSliceHash) {
+            return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+          }
+          return {
+            status: 'resolved',
+            resolvedRange: { sheetId: target.sheetId, sheetName: target.sheetName, axis: target.axis, index: target.index },
+            resolvedSnippet: target.snippet,
+          };
+        } catch {
+          return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+        }
+      }
+
+      if (selector.kind !== 'xlsx_range') {
+        return { status: 'needs_review', reason: 'unsupported_xlsx_selector' };
+      }
+      const rangeA1 = typeof selector.rangeA1 === 'string' && selector.rangeA1 ? selector.rangeA1 : null;
       const expectedValuesHash =
         typeof selector.expectedRangeValuesHash === 'string' && selector.expectedRangeValuesHash
           ? selector.expectedRangeValuesHash
+          : null;
+      const expectedOrderKeysHash =
+        typeof selector.expectedOrderKeysHash === 'string' && selector.expectedOrderKeysHash
+          ? selector.expectedOrderKeysHash
           : null;
       if (!sheetId || !rangeA1 || !expectedStructHash || !expectedValuesHash) {
         return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
@@ -457,6 +553,9 @@ class DocumentFormatAdapter implements FormatAdapter {
           return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
         }
         if (target.expectedRangeValuesHash !== expectedValuesHash) {
+          return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+        }
+        if (expectedOrderKeysHash && target.expectedOrderKeysHash !== expectedOrderKeysHash) {
           return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
         }
         return {
@@ -493,13 +592,17 @@ class DocumentFormatAdapter implements FormatAdapter {
         typeof selector.expectedBlockHash === 'string' && selector.expectedBlockHash
           ? selector.expectedBlockHash
           : null;
-      const blockIndex = Number(selector.blockIndex);
-      if (!expectedBlockHash || !Number.isInteger(blockIndex) || blockIndex < 0) {
+      const paraId = typeof selector.paraId === 'string' && selector.paraId ? selector.paraId : null;
+      const hasBlockIndex = selector.blockIndex !== undefined && selector.blockIndex !== null;
+      const blockIndex = hasBlockIndex ? Number(selector.blockIndex) : -1;
+      if (!expectedBlockHash) {
+        return { status: 'needs_review', reason: 'element_fingerprint_changed' };
+      }
+      if (!paraId && (!hasBlockIndex || !Number.isInteger(blockIndex) || blockIndex < 0)) {
         return { status: 'needs_review', reason: 'element_fingerprint_changed' };
       }
       try {
         const { paragraphs, byBlockIndex } = readDocxAllParagraphTargets(buffer);
-        const paraId = typeof selector.paraId === 'string' && selector.paraId ? selector.paraId : null;
 
         if (paraId) {
           const byId = paragraphs.filter((p) => p.paraId === paraId);
@@ -527,7 +630,8 @@ class DocumentFormatAdapter implements FormatAdapter {
 
         const hasBefore = typeof selector.contextBeforeHash === 'string' && selector.contextBeforeHash.length > 0;
         const hasAfter = typeof selector.contextAfterHash === 'string' && selector.contextAfterHash.length > 0;
-        const hadDuplicates = Number(selector.duplicateCount ?? 0) > 1;
+        const expectedDuplicateCount = selector.duplicateCount !== undefined ? Number(selector.duplicateCount) : undefined;
+        const hadDuplicates = Number(expectedDuplicateCount ?? 0) > 1;
         const hasOccurrence = Number.isInteger(Number(selector.occurrenceIndex)) && selector.occurrenceIndex !== undefined;
 
         if (atIndex && atIndex.fingerprint === expectedBlockHash) {
@@ -544,8 +648,10 @@ class DocumentFormatAdapter implements FormatAdapter {
             const identicalContextCount = matches.filter(
               (p) => p.contextBeforeHash === selector.contextBeforeHash && p.contextAfterHash === selector.contextAfterHash,
             ).length;
-            if (identicalContextCount > 1 && !hasOccurrence) {
-              return { status: 'needs_review', reason: 'ambiguous_duplicate_paragraph' };
+            if (identicalContextCount > 1) {
+              if (!hasOccurrence || (expectedDuplicateCount !== undefined && matches.length !== expectedDuplicateCount)) {
+                return { status: 'needs_review', reason: 'ambiguous_duplicate_paragraph' };
+              }
             }
           } else if (hasBefore && hasAfter && !beforeOk && !afterOk) {
             return { status: 'needs_review', reason: 'paragraph_context_changed' };
