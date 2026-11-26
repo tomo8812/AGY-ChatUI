@@ -5,8 +5,9 @@ import { workspaceApi,supportsOperation,MAX_WORKSPACE_IMAGE_BYTES } from '../../
 import {ResponsiveCommandBar} from '../../shared-ui/layout/ResponsiveCommandBar';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
 import { PdfCanvasViewer } from '../../shared-ui/document/PdfCanvasCore';
-import { artifactVersionKey,buildArtifactContentUrl,ByteLruCache } from '../../../utils/viewerCache';
+import { artifactVersionKey,buildArtifactContentUrl,ByteLruCache,docxHtmlCache } from '../../../utils/viewerCache';
 import { assertRevision,useRevisionResource } from '../useRevisionResource';
+import { loadDocxPreview } from '../../../utils/docxPreview';
 import type { WorkspaceModuleProps } from '../types';
 
 interface WordBlock {
@@ -97,12 +98,21 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     assertRevision(artifact,data);
     return data;
   });
+  const useHtml=mode==='view'&&!!capabilities&&!capabilities.directEditUiSupported&&!canRender;
+  const html=useRevisionResource(artifact,'docx:html:'+(useHtml&&resource.ready),async signal=>{
+    if(!useHtml||!resource.ready)return null;
+    const cached=docxHtmlCache.get(revisionKey);
+    if(cached!==undefined)return cached;
+    const response=await fetch(buildArtifactContentUrl(artifact),{credentials:'include',signal});
+    if(!response.ok)throw Error('文書を読み込めません。');
+    return loadDocxPreview(response,revisionKey);
+  });
   const blockCount=resource.data?.blockCount??resource.data?.blocks.length??0;
   const totalChunks=Math.max(1,Math.ceil(blockCount/CHUNK_SIZE));
   const selectedChunk=selected===null?-1:Math.floor(selected/CHUNK_SIZE);
   const targetChunk=typeof target?.selector.blockIndex==='number'?Math.floor(target.selector.blockIndex/CHUNK_SIZE):-1;
   const retained=useMemo(()=>new Set([...visibleChunks,selectedChunk,targetChunk]),[visibleChunks,selectedChunk,targetChunk]);
-  const displayed=(mode!=='view'||reading!=='page'||!canRender)&&!!resource.data;
+  const displayed=!useHtml&&(mode!=='view'||reading!=='page'||!canRender)&&!!resource.data;
   const activeChunks=loaded.revisionKey===revisionKey?loaded.chunks:undefined;
   const onVisibility=useCallback((index:number,visible:boolean)=>{
     setVisibleChunks(current=>{
@@ -282,6 +292,11 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
         }
       }}>{heading.text}</button>):<span className="muted-xs">見出しがありません。</span>}
   </nav>;
+
+  if(useHtml)return <UnifiedViewerZoomShell resetKey={revisionKey}>
+    {resource.error||html.error?<div role="alert" className="error-box">{resource.error||html.error}<button type="button" onClick={()=>{resource.retry();html.retry()}}>再試行</button></div>:
+      html.data!=null?<div className="docx-preview" dangerouslySetInnerHTML={{__html:html.data}}/>:<div className="workspace-loading">読み込み中…</div>}
+  </UnifiedViewerZoomShell>;
 
   if(mode==='view'&&reading==='page'&&canRender)return <div className="workspace-page-view">
     <div className="workspace-toolbar"><button className="btn btn-secondary btn-xs" type="button" onClick={()=>setReading('text')}>読取表示</button></div>

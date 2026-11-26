@@ -587,7 +587,37 @@ for(const vp of targets){
               ? expect(page.getByRole('combobox',{name:'シート',exact:true}).locator('option:checked')).toHaveText('New sheet')
               : expect(page.getByRole('button',{name:'New sheet',exact:true})).toHaveAttribute('aria-pressed','true');
             await activeSheet();
-            await page.getByRole('textbox',{name:'数式・セル値'}).fill('Created in the draft');
+            const gridCell=(addr:string)=>page.getByRole('gridcell',{name:addr,exact:true});
+            const formulaBar=page.getByRole('textbox',{name:'数式・セル値'});
+            const editCell=async(addr:string,value:string)=>{
+              await gridCell(addr).click();
+              await expect(formulaBar).toBeEditable();
+              await formulaBar.fill(value);
+            };
+            const selectSheet=async(name:string)=>{
+              if(vp.width===375)await page.getByRole('combobox',{name:'シート',exact:true}).selectOption({label:name});
+              else await page.getByRole('button',{name,exact:true}).click();
+            };
+            await editCell('A1','5');
+            await editCell('B1','=Sheet1!$A$1+A1');
+            await selectSheet('Sheet1');
+            await editCell('D1',"='New sheet'!B1");
+            await gridCell('A1').click();
+            for(const action of ['insert_row','insert_col']){
+              await openCommand(page,structureAction);
+              await structureAction.selectOption(action);
+              await page.getByRole('button',{name:'適用',exact:true}).click();
+            }
+            await editCell('B2','11');
+            await expect(gridCell('C2')).toHaveText('22',{timeout:30000});
+            await expect(gridCell('E2')).toHaveText('16');
+            await gridCell('C2').click();
+            await expect(formulaBar).toHaveValue('=B2*2');
+            await selectSheet('New sheet');
+            await gridCell('B1').click();
+            await expect(formulaBar).toHaveValue('=Sheet1!$B$2+A1',{timeout:30000});
+            await expect(gridCell('B1')).toHaveText('16');
+            await expect(gridCell('B1')).toHaveAttribute('data-formula-preview','true');
             await page.screenshot({path:info.outputPath('real-xlsx-draft-sheet.png')});
             await page.getByRole('button',{name:'保存',exact:true}).click();
             await expect(page.locator('.workspace-status')).toContainText('バージョン 3');
@@ -596,7 +626,7 @@ for(const vp of targets){
             const saved=workbook.sheets.find(sheet=>sheet.name==='New sheet');
             expect(saved).toBeDefined();
             expect(await svc.readRange(userId,artifact.id,{sheetId:saved!.id,rangeA1:'A1'})).toMatchObject({
-              cells:[{address:'A1',value:'Created in the draft'}],
+              cells:[{address:'A1',value:'5'}],
             });
             evidence.push({kind:'xlsx-edit-draft-sheet',revision:3});
           }
@@ -663,12 +693,13 @@ for(const vp of targets){
               await stageStructural(op,configure);
               await editDraft?.();
               await expect(page.locator('[data-slide-canvas]')).toHaveAttribute('data-preview-ready','true',{timeout:90000});
-              const image=page.getByRole('img',{name:'変更後のスライド'});
-              await expect.poll(()=>image.evaluate(el=>(el as HTMLImageElement).complete&&(el as HTMLImageElement).naturalWidth>0),{timeout:30000}).toBe(true);
+              const scene=await readySlide(page);
+              await expect(scene.locator('[data-layer-kind="background"]')).toBeVisible();
+              await expect(scene.locator('[data-layer-kind="draft-shape"]')).toHaveCount(0);
               expect(srv.ctx.db.getArtifact(userId,artifact.id)?.revision).toBe(revision);
               const previewPath=info.outputPath(op.replace('.','-')+'-draft-'+revision+'.png');
-              const data=await image.evaluate(async el=>Array.from(new Uint8Array(await (await fetch((el as HTMLImageElement).src)).arrayBuffer())));
-              fs.writeFileSync(previewPath,Buffer.from(data));
+              const chrome=await page.addStyleTag({content:'.workspace-shape-hit,.workspace-resize-handle{visibility:hidden!important}'});
+              try{await scene.screenshot({path:previewPath,scale:'css'});}finally{await chrome.evaluate(el=>el.remove())}
               await page.getByRole('button',{name:'保存',exact:true}).click();revision++;
               await expect(page.locator('.workspace-status')).toContainText('バージョン '+revision,{timeout:90000});
               await expect(page.locator('.workspace-status')).toContainText('保存済み');
@@ -683,7 +714,7 @@ for(const vp of targets){
             await saveStructural('pptx.add_shape',async()=>{
               await page.getByRole('textbox',{name:'追加図形テキスト'}).fill('Added by editor');
             },0,async()=>{
-              const newShape=page.locator('[data-shape-id^="pptx-structure:"]');
+              const newShape=page.locator('.workspace-shape-hit[data-shape-id^="pptx-structure:"]');
               await expect(newShape).toHaveClass(/selected/);
               await newShape.press('ArrowRight');
               await page.getByRole('textbox',{name:'図形テキスト'}).fill('Edited before saving');
@@ -716,12 +747,29 @@ for(const vp of targets){
               }
               await stageStructural('pptx.add_table',async()=>{await page.getByRole('textbox',{name:'追加表 1行 1列'}).fill('Table cell')});
               await saveStructural('pptx.add_image',async()=>{await page.getByLabel('スライド画像ファイル').setInputFiles({name:'sample.png',mimeType:'image/png',buffer:Buffer.from('iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAIAAABvFaqvAAAAIklEQVR4nGO8VKHLQA3ARBVTRg0aNWjUoFGDRg0aNYgiAACvzQGn6yar6wAAAABJRU5ErkJggg==','base64')})},0);
-              await saveStructural('pptx.add_slide',async()=>{},1);
+              await saveStructural('pptx.add_slide',async()=>{},0,async()=>{
+                await expect(page.getByRole('button',{name:'スライド 2',exact:true})).toHaveAttribute('aria-pressed','true');
+                const canvas=page.locator('[data-slide-canvas]');
+                const draftSlide=await canvas.getAttribute('data-slide-id');
+                expect(draftSlide).toMatch(/^pptx-structure:/);
+                await stageStructural('pptx.add_shape',async()=>{
+                  await page.getByRole('textbox',{name:'追加図形テキスト'}).fill('On the draft slide');
+                });
+                await page.getByRole('textbox',{name:'図形テキスト'}).fill('Edited on the draft slide');
+                await stageStructural('pptx.reorder_slide',async()=>{
+                  await page.getByRole('spinbutton',{name:'移動先スライド'}).fill('1');
+                });
+                await expect(canvas).toHaveAttribute('data-slide-id',draftSlide!);
+                await expect(page.getByRole('button',{name:'スライド 1',exact:true})).toHaveAttribute('aria-pressed','true');
+                await expect(page.getByRole('textbox',{name:'図形テキスト'})).toHaveValue('Edited on the draft slide');
+              });
               const structure=await svc.getStructure(userId,artifact.id);
-              expect(structure.slides).toHaveLength(2);
-              await expect(page.getByRole('button',{name:'スライド 2',exact:true})).toHaveAttribute('aria-pressed','true');
-              await saveStructural('pptx.reorder_slide',async()=>{await page.getByRole('spinbutton',{name:'移動先スライド'}).fill('1')},0);
+              const slideList=structure.slides as Array<{part:string}>;
+              expect(slideList).toHaveLength(2);
               await expect(page.getByRole('button',{name:'スライド 1',exact:true})).toHaveAttribute('aria-pressed','true');
+              expect(await svc.readRange(userId,artifact.id,{part:slideList[0].part})).toMatchObject({
+                shapes:expect.arrayContaining([expect.objectContaining({text:'Edited on the draft slide'})]),
+              });
               page.once('dialog',d=>void d.accept());
               await saveStructural('pptx.remove_slide',async()=>{},0);
               expect((await svc.getStructure(userId,artifact.id)).slides).toHaveLength(1);
@@ -755,3 +803,55 @@ for(const vp of targets){
     }
   });
 }
+
+test('Base ChatUI opens DOCX and XLSX and creates targets without the document runtime',async({page},info)=>{
+  test.skip(info.project.name!=='pc-chromium'||!fixtureDir);
+  const server=await createTestServer({installDocRuntime:'off',sandboxMode:'off',allowUnsandboxedDocWorkers:false});
+  try{
+    const client=new TestApiClient(server.baseUrl);
+    const signup=await client.request<{user:{id:string}}>('POST','/api/auth/register',{username:'pr3a-base',displayName:'Base ChatUI',password:'password123'});
+    const userId=signup.data.user.id,chatId='pr3a-base-chat';
+    const workspaceDir=fs.mkdtempSync(path.join(server.dataRoot,'base-office-'));
+    server.ctx.db.createChat({id:chatId,userId,projectId:null,title:'Office files',workspaceDir,modelId:'',effortValue:'',projectContextVersion:0});
+    await page.route(url=>url.origin==='http://127.0.0.1:4174'&&url.pathname.startsWith('/api/'),async route=>{
+      const url=new URL(route.request().url());
+      await route.fulfill({response:await route.fetch({url:server.baseUrl+url.pathname+url.search,headers:{
+        ...route.request().headers(),cookie:client.cookieHeader,'x-csrf-token':decodeURIComponent(client.csrfToken),
+      }})});
+    });
+    const artifacts:Record<string,ArtifactRecord>={};
+    for(const kind of ['docx','xlsx']){
+      const filename='sample.'+kind;
+      artifacts[kind]=(await server.ctx.artifactService.createArtifact({
+        userId,scopeKind:'chat',chatId,relPath:filename,content:fs.readFileSync(path.join(fixtureDir!,filename)),actorKind:'user',actorId:userId,
+      })).artifact;
+    }
+    await page.addInitScript(artifacts=>{
+      const kind=new URLSearchParams(location.search).get('kind')??'';
+      (window as Window&{__pr3aFixtureArtifact?:unknown}).__pr3aFixtureArtifact=artifacts[kind];
+    },artifacts);
+    for(const kind of ['docx','xlsx']){
+      await page.goto(base+'?kind='+kind);
+      await expect(page.getByRole('dialog',{name:'sample.'+kind})).toBeVisible();
+      await expect(page.getByRole('button',{name:'編集',exact:true})).toHaveCount(0);
+      if(kind==='docx')await expect(page.locator('.docx-preview')).toContainText('Keep table');
+      else {
+        await expect(page.getByRole('gridcell',{name:'A1',exact:true})).toHaveText('7');
+        await expect(page.getByRole('gridcell',{name:'B1',exact:true})).toHaveText('未評価');
+      }
+      await page.getByRole('button',{name:'依頼',exact:true}).click();
+      if(kind==='docx'){
+        await page.getByText('Introduction',{exact:true}).click();
+        await page.getByRole('button',{name:'選択段落を対象にする'}).click();
+      }else{
+        await page.getByRole('gridcell',{name:'A1',exact:true}).click();
+        await page.getByRole('button',{name:'セルを対象にする'}).click();
+      }
+      await page.getByRole('textbox',{name:'変更内容'}).fill('Review the selection');
+      await page.getByRole('button',{name:'依頼を追加'}).click();
+      await expect(page.locator('.workspace-request-item')).toContainText('Review the selection');
+      const [request]=server.ctx.editRequestService.listRequests(userId,chatId,{artifactId:artifacts[kind].id});
+      expect((await server.ctx.editRequestService.resolveRequestTarget(request)).status).toBe('resolved');
+    }
+  }finally{await server.cleanup()}
+});

@@ -2,6 +2,8 @@ import React, { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {useVirtualizer} from '@tanstack/react-virtual';
 import type { RichCellObject, RichPrimitive, RichDisplayNode } from '../../../../../shared/rich-schema';
 import { text } from '../runtime';
+import { RichBadge, toneClass } from './RichBadge';
+import { formatDisplayDate, parseDisplayDate } from './formatDate';
 type Node = Extract<RichDisplayNode,{type:'data_table'}>;
 type Row=Record<string,RichPrimitive|RichCellObject>;
 function cellValue(c:RichPrimitive|RichCellObject|undefined):RichPrimitive|undefined{
@@ -10,6 +12,10 @@ function cellValue(c:RichPrimitive|RichCellObject|undefined):RichPrimitive|undef
 function cellText(c:RichPrimitive|RichCellObject|undefined,column:Node['columns'][number]){
   const v=cellValue(c);
   if(v==null)return column.missingLabel??'—';
+  if(column.format==='date'&&(typeof v==='string'||typeof v==='number')){
+    const date=parseDisplayDate(v);
+    if(Number.isFinite(date))return formatDisplayDate(date)+(column.unit??'');
+  }
   if(typeof v==='number'&&Number.isFinite(v)){
     if(column.format==='percent')return new Intl.NumberFormat(undefined,{style:'percent',maximumFractionDigits:2}).format(v);
     if(column.format==='currency'){
@@ -66,7 +72,7 @@ export function RichDataTable({node,rows,onSelect}:{node:Node;rows:Row[];onSelec
       {...(onSelect?{onClick:()=>onSelect(row,index),tabIndex:0,onKeyDown:(e:React.KeyboardEvent)=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();onSelect(row,index)}}}:{})}>
       {node.columns.map(c=>{
         const cell=row[c.key];const meta=cell!==null&&typeof cell==='object'?cell:undefined;
-        return <td key={c.key} style={{textAlign:c.align}}><span>{cellText(cell,c)}</span>{meta&&<small className="rich-cell-meta">{[meta.missingReason,meta.sourceId,meta.asOf,meta.fetchedAt].filter(Boolean).join(' · ')}</small>}</td>;
+        return <td key={c.key} style={{textAlign:c.align}}>{c.format==='badge'&&cellValue(cell)!=null?<RichBadge tone={meta?.tone}>{cellText(cell,c)}</RichBadge>:<span className={toneClass(meta?.tone)}>{cellText(cell,c)}</span>}{meta&&<small className="rich-cell-meta">{[meta.missingReason,meta.sourceId,meta.asOf,meta.fetchedAt].filter(Boolean).join(' · ')}</small>}</td>;
       })}
     </tr>)}
     {virtual&&bottom>0&&<tr aria-hidden="true"><td colSpan={node.columns.length} className="rich-table-spacer" style={{height:bottom}}/></tr>}

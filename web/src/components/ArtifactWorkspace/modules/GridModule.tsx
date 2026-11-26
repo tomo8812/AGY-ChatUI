@@ -6,7 +6,7 @@ import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
 import { assertRevision,useRevisionResource } from '../useRevisionResource';
 import {artifactVersionKey,ByteLruCache} from '../../../utils/viewerCache';
 import type { GridDraftLocation, WorkspaceModuleProps } from '../types';
-import { gridAddress as address, gridAxisChanges, gridColumnName as colName, isGridStructureId, projectedGridIndex, savedGridOrigin } from '../gridDraft';
+import { gridAddress as address, gridAxisChanges, gridColumnName as colName, isGridStructureId, prepareGridOperations, projectedGridIndex, savedGridOrigin } from '../gridDraft';
 
 type Sheet={id:string;name:string;part:string};
 const CELL_MARKS = { bold: '太字', italic: '斜体', underline: '下線', strike: '取り消し線' } as const;
@@ -17,6 +17,7 @@ const horizontalAlignment={general:'標準',left:'左揃え',center:'中央揃�
 type HorizontalAlignment=keyof typeof horizontalAlignment;
 type Cell = Partial<Record<CellMark, boolean>> & {address:string;value:unknown;type?:string;formula?:string;formulaStatus?:string;horizontal?:string;fontColor?:string;backgroundColor?:string};
 type Coordinate={row:number;col:number};
+const hasFormula=(cell:Cell|undefined)=>cell?.formula!==undefined||!!cell?.formulaStatus;
 const FORMULA_STATUS:Record<string,string>={
   evaluated_lo:'再計算済み',
   cached_existing:'ファイルに保存された計算結果',
@@ -245,7 +246,7 @@ export function GridModule(props:WorkspaceModuleProps){
   };
   function original(r:number,c:number){
     const cell=raw(r,c);
-    return xlsx?cell?.formula?'='+cell.formula.replace(/^=/,''):String(cell?.value??''):
+    return xlsx?hasFormula(cell)?'='+String(cell?.formula??'').replace(/^=/,''):String(cell?.value??''):
       String(tile(r,c)?.rows?.[rowOrigin(r).index%ROWS]?.[colOrigin(c).index%COLS]??'');
   }
   const ready=structure.ready&&!!sheet&&(selectedTile===null||!!tile(current.row,current.col));
@@ -254,7 +255,43 @@ export function GridModule(props:WorkspaceModuleProps){
   const loading=structure.loading||keys.some(key=>!readTile(key));
   const latest=useRef({revisionKey,sheetId:sheet?.id,selectedRange,filter});latest.current={revisionKey,sheetId:sheet?.id,selectedRange,filter};
   const entries=useMemo(()=>new Map(draft?.entries.map(e=>[e.key,e])),[draft]);
-  function value(r:number,c:number){const e=entries.get(key(r,c));return e?.displayValue??String(e?.operation.value??original(r,c))}
+  const liveXlsxDraft=xlsx&&draft?.baseRevision===artifact.revision&&draft;
+  const structuralDraft=!!liveXlsxDraft&&structural.length>0;
+  const structuralOperations=useMemo(()=>structuralDraft&&draft
+    ?prepareGridOperations(draft.entries.filter(entry=>entry.operation.op!=='xlsx.set_cell_style')):[],[structuralDraft,draft]);
+  const structuralRange=address(rowAxis.start,colAxis.start)+':'+address(rowAxis.start+rowAxis.length-1,colAxis.start+colAxis.length-1);
+  const selectionInViewport=current.row>=rowAxis.start&&current.row<rowAxis.start+rowAxis.length&&
+    current.col>=colAxis.start&&current.col<colAxis.start+colAxis.length;
+  const activeAddress=address(current.row,current.col);
+  const structuralSignature=structuralDraft&&sheet
+    ?JSON.stringify([revisionKey,sheet.id,sheet.name,structuralRange,selectionInViewport?null:activeAddress,structuralOperations]):'';
+  const [structuralPreview,setStructuralPreview]=useState<{signature:string;cells:Map<string,Cell>;error?:string}|null>(null);
+  useEffect(()=>{
+    if(!structuralSignature||!sheet)return;
+    const controller=new AbortController();
+    const timer=window.setTimeout(async()=>{
+      const read=async(rangeA1:string)=>{
+        const result=await workspaceApi.xlsxDraftRange<{cells:Cell[]}>(artifact,{sheetName:sheet.name,rangeA1,operations:structuralOperations},controller.signal);
+        assertRevision(artifact,result);
+        return result.cells;
+      };
+      try{
+        const cells=await read(structuralRange);
+        if(!selectionInViewport)cells.push(...await read(activeAddress));
+        if(!controller.signal.aborted)setStructuralPreview({signature:structuralSignature,cells:new Map(cells.map(cell=>[cell.address,cell]))});
+      }catch(e){
+        if(!controller.signal.aborted)setStructuralPreview({signature:structuralSignature,cells:new Map(),error:e instanceof Error?e.message:'変更後の数式を読み込めません。'});
+      }
+    },350);
+    return()=>{window.clearTimeout(timer);controller.abort()};
+  },[structuralSignature,retry]);
+  const projectedFormulas=structuralPreview?.signature===structuralSignature?structuralPreview:null;
+  function value(r:number,c:number){
+    const cell=projectedFormulas?.cells.get(address(r,c));
+    if(cell?.formula)return '='+cell.formula.replace(/^=/,'');
+    const e=entries.get(key(r,c));
+    return e?.displayValue??String(e?.operation.value??original(r,c));
+  }
   const filteredRowRemoved=filter!==''&&(projectedGridIndex({index:sourceRow(current.row,current.col)},rowsChanged)===undefined||
     projectedGridIndex({index:current.col},colsChanged)===undefined);
   const cellEditLocked=editingLocked||filteredRowRemoved;
@@ -267,12 +304,12 @@ export function GridModule(props:WorkspaceModuleProps){
     const k=key(row,col);
     const gridLocation=location(row,col);
     const cellValue=formula?v:(/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(v)&&Number.isFinite(Number(v))?Number(v):v);
-    onDraft(artifact.revision,v===original(row,col)?null:{key:k,displayValue:v,label:sheet.name+' '+address(row,col),gridLocation,
+    onDraft(artifact.revision,!structuralDraft&&v===original(row,col)?null:{key:k,displayValue:v,label:sheet.name+' '+address(row,col),gridLocation,
       operation:xlsx?{op,sheetPart:sheet.part,address:address(gridLocation.row.index,gridLocation.col.index),value:cellValue}:{op,row:gridLocation.row.index,col:gridLocation.col.index,value:v}},k);
   }
-  const [formulaPreview,setFormulaPreview]=useState<{draft:NonNullable<typeof draft>;sheetId:string;cells:Map<string,string>}|null>(null);
+  const [formulaPreview,setFormulaPreview]=useState<{draft:NonNullable<typeof draft>;sheetId:string;cells:Map<string,string|null>}|null>(null);
   useEffect(()=>{
-    if(!xlsx||!sheet||!draft||rowsChanged.length||colsChanged.length||draft.baseRevision!==artifact.revision||mode!=='edit'||
+    if(!liveXlsxDraft||!sheet||!draft||structuralDraft||
       !structure.ready||visibleKeys.some(key=>!readTile(key)))return;
     const controller=new AbortController();
     const staged=new Map<string,FormulaCell>();
@@ -280,7 +317,7 @@ export function GridModule(props:WorkspaceModuleProps){
     const sources=new Map<string,Map<string,Cell>>();
     for(const key of visibleKeys){
       const tile=readTile(key)!;
-      for(const cell of tile.cells.values())if(cell.formula)formulas.add(cell.address);
+      for(const cell of tile.cells.values())if(hasFormula(cell))formulas.add(cell.address);
       sources.set(sheet.id+':'+key,tile.cells);
     }
     for(const e of draft.entries){
@@ -290,7 +327,7 @@ export function GridModule(props:WorkspaceModuleProps){
       staged.set(op.sheetPart+':'+op.address,{value:v,type:typeof v==='number'?'n':'inlineStr',formula});
       const c=parseAddress(op.address);
       if(op.sheetPart===sheet.part&&c&&visibleKeys.includes(tileKey(c.row,c.col))){
-        if(formula)formulas.add(op.address);else formulas.delete(op.address);
+        if(formula!==undefined)formulas.add(op.address);else formulas.delete(op.address);
       }
     }
     if(!formulas.size)return;
@@ -315,7 +352,19 @@ export function GridModule(props:WorkspaceModuleProps){
     });
     return()=>controller.abort();
   },[xlsx,sheet,draft,mode,structure.ready,cache,cacheVersion,visibleKeys.join(',')]);
-  const previews=!rowsChanged.length&&!colsChanged.length&&formulaPreview?.draft===draft&&formulaPreview?.sheetId===sheet?.id?formulaPreview.cells:new Map<string,string>();
+  const previews=liveXlsxDraft&&!structuralDraft&&formulaPreview?.draft===draft&&formulaPreview?.sheetId===sheet?.id?formulaPreview.cells:undefined;
+  function formulaDisplay(r:number,c:number,cell:Cell|undefined){
+    const addr=address(r,c),phase=entries.get(key(r,c))?.operation.op;
+    const projected=projectedFormulas?.cells.get(addr);
+    if(!hasFormula(projected)&&phase!=='xlsx.set_formula'&&(phase==='xlsx.set_cell'||!hasFormula(cell)))return null;
+    const local=previews?.get(addr);
+    if(typeof local==='string')return {text:local,preview:true,status:undefined};
+    const formulaStatus=draft?projected?.formulaStatus??'unevaluated_unsupported':cell?.formulaStatus;
+    const status=formulaStatus==='error_formula'?'error_formula':formulaStatus==='unevaluated_unsupported'?'unevaluated_unsupported':undefined;
+    const text=status==='unevaluated_unsupported'?'未評価':status==='error_formula'?String((projected??cell)?.value||'数式エラー'):
+      String((projected??cell)?.value??'');
+    return {text,preview:!!liveXlsxDraft&&formulaStatus==='evaluated_lo',status};
+  }
   function move(row:number,col:number,extend=false){
     row=Math.max(0,Math.min(rowCount-1,row));col=Math.max(0,Math.min(colCount-1,col));
     setSelected({row,col});if(!extend)setAnchor({row,col});
@@ -507,9 +556,8 @@ export function GridModule(props:WorkspaceModuleProps){
     }catch(e){if(!isStale())setPinError(e instanceof Error?e.message:'検索に失敗しました。')}
     finally{if(searchAbort.current===controller){searchAbort.current=null;setSearching(false)}}
   }
-  const activeFormulaStatus=raw(current.row,current.col)?.formulaStatus;
-  const formulaWarning=(activeFormulaStatus==='unevaluated_unsupported'||activeFormulaStatus==='error_formula')
-    && !entries.has(key(current.row,current.col)) && !previews.has(address(current.row,current.col));
+  const activeFormulaStatus=formulaDisplay(current.row,current.col,raw(current.row,current.col))?.status;
+  const formulaWarning=activeFormulaStatus!==undefined;
   const primary=<><span className="workspace-cell-address" title={selectedRange}>{selectedRange}</span><span aria-hidden="true">ƒx</span><input ref={formulaInput} className="workspace-formula" aria-label="数式・セル値" value={ready?value(current.row,current.col):''} readOnly={!inputEnabled} onChange={e=>change(e.target.value)}/>{formulaWarning&&<small title={FORMULA_STATUS[activeFormulaStatus]}>{activeFormulaStatus==='error_formula'?'数式エラー':'未評価'}</small>}{mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!ready||!inData} onClick={()=>void pin()}>セルを対象にする</button>}{mode==='edit'&&<>
       {xlsx&&markButton('bold')}
     </>}</>;
@@ -561,6 +609,9 @@ export function GridModule(props:WorkspaceModuleProps){
   </form>;
   return <UnifiedViewerZoomShell resetKey={artifact.id+':grid'} controlsTop={<>{toolbar}{filters}</>} controlsBottom={tabs}>
     {(structure.error||rangeError||pinError)&&<div role="alert" className="error-box">{structure.error||rangeError||pinError}<button type="button" onClick={()=>{structure.retry();setRetry(v=>v+1);setPinError('')}}>再試行</button></div>}
+    {projectedFormulas?.error&&<div role="status" className="workspace-toolbar workspace-toolbar-fields">
+      <span>{projectedFormulas.error}</span><button type="button" className="btn btn-secondary btn-xs" onClick={()=>setRetry(v=>v+1)}>再試行</button>
+    </div>}
     {structural.length>0&&<div className="workspace-toolbar workspace-toolbar-fields" role="status">
       <span>{filter?'絞り込み解除で行・列の変更を確認できます。':'行・列・シートの変更を編集中'}</span>
       {structural.map(entry=><span key={entry.key}>{entry.label}</span>)}
@@ -582,7 +633,19 @@ export function GridModule(props:WorkspaceModuleProps){
         <div role="row" className="workspace-grid-header" style={{height:CELL_HEIGHT}}><div role="columnheader" className="workspace-grid-corner" style={{width:HEADER}}/>{cols.map(c=><div key={colAxis.start+c.index} role="columnheader" className="workspace-grid-col" style={{left:c.start,width:c.size}}>{colName(colAxis.start+c.index)}</div>)}</div>
         {rows.map(r=>{const row=rowAxis.start+r.index;return <div key={row} role="row" aria-rowindex={row+2} className="workspace-grid-row" style={{top:r.start,height:r.size}}>
           <div role="rowheader" className="workspace-grid-rowhead" style={{width:HEADER}}>{(filter?sourceRow(row,current.col):row)+1}</div>
-          {cols.map(c=>{const col=colAxis.start+c.index,addr=address(filter?sourceRow(row,col):row,col),cell=raw(row,col),pending=entries.has(key(row,col)),active=row>=bounds.row0&&row<=bounds.row1&&col>=bounds.col0&&col<=bounds.col1,preview=previews.get(addr),loaded=baseTileKey(row,col)===null||!!tile(row,col);return <div key={col} role="gridcell" aria-colindex={col+2} aria-selected={active} aria-label={addr} aria-busy={!loaded} onClick={e=>{move(row,col,e.shiftKey);scroll.current?.focus({preventScroll:true})}} title={preview!==undefined?'未保存の数式プレビュー':cell?.formulaStatus?FORMULA_STATUS[cell.formulaStatus]:undefined} data-formula-preview={preview!==undefined?'true':undefined} className={'workspace-grid-cell'+(pending?' pending':'')} style={{left:c.start,width:c.size,...cellFontStyle(row,col)}}>{preview??(pending?value(row,col):!loaded?'…':xlsx?String(cell?.value??''):original(row,col))}</div>})}
+          {cols.map(c=>{
+            const col=colAxis.start+c.index,addr=address(filter?sourceRow(row,col):row,col),cell=raw(row,col);
+            const pending=entries.has(key(row,col)),active=row>=bounds.row0&&row<=bounds.row1&&col>=bounds.col0&&col<=bounds.col1;
+            const formula=xlsx?formulaDisplay(row,col,cell):null;
+            const loaded=baseTileKey(row,col)===null||!!tile(row,col);
+            return <div key={col} role="gridcell" aria-colindex={col+2} aria-selected={active} aria-label={addr} aria-busy={!loaded}
+              onClick={e=>{move(row,col,e.shiftKey);scroll.current?.focus({preventScroll:true})}}
+              title={formula?.preview?'未保存の数式プレビュー':formula?.status?FORMULA_STATUS[formula.status]:formula&&cell?.formulaStatus?FORMULA_STATUS[cell.formulaStatus]:undefined}
+              data-formula-preview={formula?.preview?'true':undefined} data-formula-status={formula?.status}
+              className={'workspace-grid-cell'+(pending?' pending':'')} style={{left:c.start,width:c.size,...cellFontStyle(row,col)}}>
+              {formula?.text??(pending?value(row,col):!loaded?'…':xlsx?String(cell?.value??''):original(row,col))}
+            </div>;
+          })}
         </div>})}
       </div>
     </div>}

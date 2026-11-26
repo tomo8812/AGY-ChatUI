@@ -199,8 +199,9 @@ export interface DocxParagraphTargetInfo {
   text: string;
 }
 
-export function readDocxAllParagraphTargets(bytes: Buffer): {
+export function readDocxAllParagraphTargets(bytes: Buffer, window?: { start: number; count: number }): {
   totalBlocks: number;
+  blocks: Array<{ blockIndex: number; type: string; text: string }>;
   paragraphs: DocxParagraphTargetInfo[];
   byBlockIndex: Map<number, DocxParagraphTargetInfo>;
 } {
@@ -210,6 +211,8 @@ export function readDocxAllParagraphTargets(bytes: Buffer): {
   const source = new TextDecoder('utf-8', { fatal: true }).decode(data);
   const parser = new SaxesParser({ xmlns: true });
   const blockFingerprints: string[] = [];
+  const blocks: Array<{ blockIndex: number; type: string; text: string }> = [];
+  let block: (typeof blocks)[number] | undefined;
   const rawParagraphs: Array<{ blockIndex: number; paraId?: string; fingerprint: string; text: string }> = [];
   const counts = new Map<string, number>();
   let depth = 0;
@@ -231,6 +234,9 @@ export function readDocxAllParagraphTargets(bytes: Buffer): {
       bodyDepth = depth;
     } else if (bodyDepth !== -1 && depth === bodyDepth + 1) {
       blockStart = tagStart;
+      if (window && blockFingerprints.length >= window.start && blockFingerprints.length < window.start + window.count) {
+        block = { blockIndex: blockFingerprints.length, type: tag.local, text: '' };
+      }
       if (tag.local === 'p' && tag.uri === WORD) {
         paragraph = {
           paraId: Object.values(tag.attributes).find(attr =>
@@ -239,10 +245,15 @@ export function readDocxAllParagraphTargets(bytes: Buffer): {
         };
       }
     }
-    if (paragraph && tag.local === 't' && tag.uri === WORD) textDepth = depth;
+    if ((paragraph || block) && tag.local === 't' && tag.uri === WORD) textDepth = depth;
   });
-  parser.on('text', text => { if (paragraph && textDepth !== -1) paragraph.text += text; });
-  parser.on('cdata', text => { if (paragraph && textDepth !== -1) paragraph.text += text; });
+  function appendText(text: string) {
+    if (textDepth === -1) return;
+    if (paragraph) paragraph.text += text;
+    if (block) block.text += text;
+  }
+  parser.on('text', appendText);
+  parser.on('cdata', appendText);
   parser.on('closetag', () => {
     if (depth === textDepth) textDepth = -1;
     if (bodyDepth !== -1 && depth === bodyDepth + 1) {
@@ -251,6 +262,10 @@ export function readDocxAllParagraphTargets(bytes: Buffer): {
         counts.set(fingerprint, (counts.get(fingerprint) ?? 0) + 1);
         rawParagraphs.push({ ...paragraph, blockIndex: blockFingerprints.length, fingerprint });
         paragraph = undefined;
+      }
+      if (block) {
+        blocks.push(block);
+        block = undefined;
       }
       blockFingerprints.push(fingerprint);
     }
@@ -282,7 +297,7 @@ export function readDocxAllParagraphTargets(bytes: Buffer): {
     paragraphs.push(entry);
     byBlockIndex.set(i, entry);
   }
-  return { totalBlocks: blockFingerprints.length, paragraphs, byBlockIndex };
+  return { totalBlocks: blockFingerprints.length, blocks, paragraphs, byBlockIndex };
 }
 
 export function readDocxParagraphTarget(bytes: Buffer, blockIndex: number): DocxParagraphTargetInfo | null {
@@ -465,6 +480,7 @@ export function readXlsxRangeTarget(
   bytes: Buffer,
   sheetSelector: string,
   rangeA1: string,
+  visit?: (row: number, col: number, value: string, formula: string | null) => void,
 ): XlsxRangeTargetResult | null {
   const wb = readXlsxWorkbookTargets(bytes);
   const sheet =
@@ -503,6 +519,10 @@ export function readXlsxRangeTarget(
   const snippetCells: XlsxRangeTargetResult['cells'] = [];
   let lastPosition = -1;
   const append = (row: number, col: number, entry?: CellEntry) => {
+    if (visit) {
+      if (entry) visit(row, col, entry.v, entry.f);
+      return;
+    }
     const a1 = `${colIndexToLetters(col)}${row + 1}`;
     rangeHash.update(JSON.stringify([a1, entry?.t ?? '', entry?.v ?? '', entry?.f ?? null, entry?.fAttrs ?? ''])).update('\n');
     if (col === parsedRange.col0) {
@@ -672,6 +692,19 @@ export function readXlsxRangeTarget(
     cells: snippetCells,
     snippet: snippetText,
   };
+}
+
+export function searchXlsxRange(bytes: Buffer, sheet: string, query: string, afterRow: number, afterCol: number) {
+  const needle = query.trim().toLowerCase();
+  let first: { row: number; col: number } | undefined;
+  let next: { row: number; col: number } | undefined;
+  const target = readXlsxRangeTarget(bytes, sheet, 'A1:XFD1048576', (row, col, value, formula) => {
+    if (!needle || (!value.toLowerCase().includes(needle) && !(formula && ('=' + formula).toLowerCase().includes(needle)))) return;
+    first ??= { row, col };
+    if (!next && (row > afterRow || (row === afterRow && col > afterCol))) next = { row, col };
+  });
+  if (!target) throw new ArtifactError('INVALID_INPUT', 'シートが見つかりません。', 400);
+  return { match: next ?? first ?? null };
 }
 
 export function readXlsxSheetTarget(

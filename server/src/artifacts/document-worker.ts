@@ -39,6 +39,8 @@ type WorkerAction =
   | { action: 'verify'; options?: DocumentVerifyOptions }
   | { action: 'range'; range: Record<string, unknown> }
   | { action: 'edit'; operations: AdapterOperation[] }
+  | { action: 'pptx_draft_layer'; operations: AdapterOperation[]; pageIndex: number; variant: 'background' | 'sprite'; draftShapeKey?: string }
+  | { action: 'xlsx_draft_range'; operations: AdapterOperation[]; sheetName: string; rangeA1: string }
   | { action: 'create'; params: Record<string, unknown> }
   | { action: 'render'; pageIndex?: number; timeSeconds?: number; variant?: 'background' | 'sprite'; shapeId?: number; cropSprite?: boolean; region?: RenderRegion }
   | { action: 'export'; targetFormat: string; region?: RenderRegion };
@@ -109,12 +111,12 @@ export class DocumentWorker {
     const scriptName = path.basename(workerScript);
     const smartartRecalc = format === 'pptx' && request.action === 'edit' &&
       request.operations.some((op) => op.op === 'pptx.smartart.add_or_remove_node');
-    const officeConversion = ((format === 'docx' || format === 'pptx' || format === 'xlsx') &&
+    const officeConversion = request.action === 'pptx_draft_layer' || ((format === 'docx' || format === 'pptx' || format === 'xlsx') &&
       (request.action === 'render' ||
         (request.action === 'export' && ['png', 'pdf'].includes(request.targetFormat)))) ||
       smartartRecalc ||
       (format === 'markdown' && request.action === 'export' && request.targetFormat === 'pdf') ||
-      (format === 'xlsx' && request.action === 'range' && request.range.evaluate === true) ||
+      (format === 'xlsx' && (request.action === 'xlsx_draft_range' || request.action === 'range' && request.range.evaluate === true)) ||
       ((format === 'pptx' || format === 'docx' || format === 'xlsx') && request.action === 'verify');
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-document-'));
     try {

@@ -37,7 +37,7 @@ export async function previewFormulas(options: {
 }) {
   const { rootSheet, sheets, formulas, loadCell, signal } = options;
   const byName = new Map(sheets.map(sheet => [sheet.name.toLowerCase(), sheet]));
-  const results = new Map<string, string>();
+  const results = new Map<string, string | null>();
   const values = new Map<string, Primitive>();
   const active = new Set<string>();
   const depParser = new FormulaParser.DepParser({ onVariable: () => { throw Error('Named references are unavailable'); } });
@@ -62,7 +62,7 @@ export async function previewFormulas(options: {
     if (values.has(identity)) return values.get(identity)!;
     if (--remainingReferences < 0 || active.size >= 64 || active.has(identity)) throw Error('Cyclic or excessive references');
     const cell = await loadCell(sheet, ref.row - 1, ref.col - 1);
-    if (!cell?.formula) {
+    if (cell?.formula === undefined) {
       if (cell?.type === 'e') throw Error('Invalid source cell');
       const numeric = cell?.type === 'n' || cell?.type == null && typeof cell?.value === 'number';
       const value = !cell ? null : cell.type === 'b' ? String(cell.value) === '1' :
@@ -71,7 +71,7 @@ export async function previewFormulas(options: {
       values.set(identity, value);
       return value;
     }
-    if (!allowed(cell.formula)) throw Error('Unsupported formula');
+    if (!cell.formula || !allowed(cell.formula)) throw Error('Unsupported formula');
     active.add(identity);
     try {
       const position = { ...ref, sheet: sheet.name };
@@ -107,7 +107,7 @@ export async function previewFormulas(options: {
     const ref = coordinates(candidate);
     if (!ref) continue;
     try { results.set(candidate, String(await read(ref, rootSheet) ?? '')); }
-    catch (error) { if (signal.aborted) throw error; results.set(candidate, '未評価'); }
+    catch (error) { if (signal.aborted) throw error; results.set(candidate, null); }
   }
   return results;
 }

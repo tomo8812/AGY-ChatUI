@@ -610,6 +610,8 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
 
   const draftBoundsSchema=z.tuple([z.number().finite().min(-14400).max(14400),z.number().finite().min(-14400).max(14400),z.number().finite().min(1).max(14400),z.number().finite().min(1).max(14400)]);
   const draftSlidePartSchema=z.string().regex(/^ppt\/slides\/[^/]+\.xml$/).max(200);
+  const draftPresentationKey=z.string().regex(/^pptx-structure:[1-9][0-9]{0,14}$/);
+  const draftElementLocation={slidePart:draftSlidePartSchema.optional(),draftSlideKey:draftPresentationKey.optional(),draftShapeKey:draftPresentationKey.optional()};
   const draftShapeId=z.number().int().positive().max(2147483647);
   const draftShapeStyle=z.object({
     bold:z.boolean().optional(),italic:z.boolean().optional(),fontSizePt:z.number().finite().min(6).max(200).optional(),
@@ -645,20 +647,22 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     z.object({op:z.literal('pptx.set_shape_text'),slidePart:draftSlidePartSchema,shapeId:draftShapeId,text:z.string().max(20000)}).strict(),
     z.object({op:z.literal('pptx.set_shape_bounds'),slidePart:draftSlidePartSchema,shapeId:draftShapeId,boundsPt:draftBoundsSchema}).strict(),
     draftShapeStyle.extend({op:z.literal('pptx.set_shape_style'),slidePart:draftSlidePartSchema,shapeId:draftShapeId}),
-    z.object({op:z.literal('pptx.add_shape'),slidePart:draftSlidePartSchema,kind:z.enum(['rectangle','ellipse','textbox']),boundsPt:draftBoundsSchema,text:z.string().max(20000),style:draftShapeStyle.optional()}).strict(),
-    z.object({op:z.literal('pptx.add_image'),slidePart:draftSlidePartSchema,boundsPt:draftBoundsSchema,imageBase64:z.string().min(1).max(8_000_000),style:draftShapeStyle.optional()}).strict(),
+    z.object({op:z.literal('pptx.add_shape'),...draftElementLocation,kind:z.enum(['rectangle','ellipse','textbox']),boundsPt:draftBoundsSchema,text:z.string().max(20000),style:draftShapeStyle.optional()}).strict(),
+    z.object({op:z.literal('pptx.add_image'),...draftElementLocation,boundsPt:draftBoundsSchema,imageBase64:z.string().min(1).max(8_000_000),style:draftShapeStyle.optional()}).strict(),
     draftTableCellSchema.extend({op:z.literal('pptx.set_table_cell'),slidePart:draftSlidePartSchema,shapeId:draftShapeId}),
-    z.object({op:z.literal('pptx.add_table'),slidePart:draftSlidePartSchema,boundsPt:draftBoundsSchema,rows:z.array(z.array(z.string().max(20_000)).min(1).max(30)).min(1).max(100)}).strict(),
+    z.object({op:z.literal('pptx.add_table'),...draftElementLocation,boundsPt:draftBoundsSchema,rows:z.array(z.array(z.string().max(20_000)).min(1).max(30)).min(1).max(100)}).strict(),
     z.object({op:z.literal('pptx.remove_shape'),slidePart:draftSlidePartSchema,shapeId:z.number().int().positive().max(2147483647)}).strict(),
-    z.object({op:z.literal('pptx.add_slide'),index:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),layoutPart:z.string().regex(/^ppt\/slideLayouts\/slideLayout[0-9]+\.xml$/)}).strict(),
+    z.object({op:z.literal('pptx.add_slide'),draftSlideKey:draftPresentationKey.optional(),index:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),layoutPart:z.string().regex(/^ppt\/slideLayouts\/slideLayout[0-9]+\.xml$/)}).strict(),
     z.object({op:z.literal('pptx.remove_slide'),index:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)}).strict(),
     z.object({op:z.literal('pptx.reorder_slide'),index:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),toIndex:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)}).strict(),
   ]);
   app.post('/api/files/:artifactId/render-draft-slide',async(req,reply)=>{
     const session=requireAuth(req,reply,db);if(!session)return;
     const parsed=z.object({expectedRevision:z.number().int().positive(),pageIndex:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
-      operation:draftSlideOperation.optional(),operations:z.array(draftSlideOperation).min(1).optional()}).strict()
-      .refine(body=>Boolean(body.operation)!==Boolean(body.operations)).safeParse(req.body);
+      operation:draftSlideOperation.optional(),operations:z.array(draftSlideOperation).min(1).optional(),
+      variant:z.enum(['background','sprite']).optional(),draftShapeKey:draftPresentationKey.optional()}).strict()
+      .refine(body=>Boolean(body.operation)!==Boolean(body.operations) && (!body.variant||!!body.operations) &&
+        Boolean(body.draftShapeKey)===(body.variant==='sprite')).safeParse(req.body);
     if(!parsed.success)return reply.code(400).send({error:'INVALID_INPUT'});
     const {artifactId}=req.params as {artifactId:string};
     try{
@@ -668,6 +672,29 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
       return reply.type('image/png').header('Cache-Control','private, no-store').header('X-Artifact-Revision',result.revision).header('X-Artifact-Sha256',result.sha256).send(result.png);
     }catch(error){return sendArtifactError(reply,error)}
   });
+  app.post('/api/files/:artifactId/xlsx-draft-range', async (req, reply) => {
+    const session = requireAuth(req, reply, db);
+    if (!session) return;
+    const parsed = z.object({
+      expectedRevision: z.number().int().positive(),
+      sheetName: z.string().min(1).max(31),
+      rangeA1: z.string().regex(/^[A-Z]{1,3}[1-9][0-9]{0,6}(?::[A-Z]{1,3}[1-9][0-9]{0,6})?$/),
+      operations: z.array(z.object({ op: z.enum([
+        'xlsx.set_cell', 'xlsx.set_formula', 'xlsx.mutate_rows', 'xlsx.mutate_columns',
+        'xlsx.add_sheet', 'xlsx.rename_sheet', 'xlsx.remove_empty_sheet',
+      ]) }).passthrough()).min(1),
+    }).strict().safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'INVALID_INPUT' });
+    const { artifactId } = req.params as { artifactId: string };
+    try {
+      const result = await artifactService.readXlsxDraftRange(session.user.id, artifactId, parsed.data,
+        buildLiveSessionAuthVerifier(req, db, session.user.id));
+      return reply.header('Cache-Control', 'private, no-store').send(result);
+    } catch (error) {
+      return sendArtifactError(reply, error);
+    }
+  });
+
   const editBodySchema = z.object({
     expectedRevision: z.number().int().min(1),
     operations: z.array(z.object({ op: z.string().min(1) }).passthrough()).min(1),

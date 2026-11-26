@@ -4,6 +4,8 @@ import { scaleLinear, scaleBand } from 'd3-scale';
 import { arc as d3Arc, line as d3Line, area as d3Area } from 'd3-shape';
 import type { RichChartNode, RichChartDatum } from '../../../../../shared/rich-schema';
 import type { RichEvalContext } from '../RichExprEvaluator';
+import { formatDisplayDate, parseDisplayDate } from '../display/formatDate';
+import { toneClass } from '../display/RichBadge';
 import { color, evaluate, num, safeArray, text, type RenderCycle, type SelectValue } from '../runtime';
 
 interface Point { x: string | number; y: number | null; label?: string; sourceId?: string; asOf?: string; missingReason?: string }
@@ -18,15 +20,22 @@ const pw = W - L - R;
 const ph = H - T - B;
 const fmt = (n: number) => new Intl.NumberFormat(undefined, { maximumFractionDigits: 2, notation: Math.abs(n) >= 100000 ? 'compact' : 'standard' }).format(n);
 const finite = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n);
-const timeFormat = new Intl.DateTimeFormat(undefined, { year: 'numeric', month: '2-digit', day: '2-digit' });
-/** Date-only values represent local calendar dates; explicit offsets represent instants. */
-export function parseChartTime(value: string | number): number {
-  const date = typeof value === 'number' ? new Date(value) : /^\d{4}-\d{2}-\d{2}$/.test(value)
-    ? new Date(value + 'T00:00:00') : new Date(value);
-  return date.getTime();
-}
-export function formatChartTime(value: number): string {
-  return Number.isFinite(new Date(value).getTime()) ? timeFormat.format(value) : '—';
+export const parseChartTime = parseDisplayDate;
+export const formatChartTime = formatDisplayDate;
+
+function axisFormatter(axis?: { unit?: string; format?: string; type?: string }) {
+  const spec = axis?.format;
+  let formatNumber = fmt;
+  if (spec && spec.length <= 48 && spec !== 'text' && !/\d{3}/.test(spec)) {
+    const presets: Record<string, string> = { percent: '.0%', number: ',.2~f', compact: '~s', integer: ',d' };
+    try { formatNumber = scaleLinear().tickFormat(5, Object.hasOwn(presets, spec) ? presets[spec] : spec); }
+    catch { /* Use the default number format for unknown specifications. */ }
+  }
+  return (value: number | string) => {
+    const label = axis?.type === 'time' ? formatChartTime(typeof value === 'number' ? value : parseChartTime(value), spec) :
+      typeof value === 'number' && spec !== 'text' ? formatNumber(value) : String(value);
+    return label + (axis?.unit ? ' ' + axis.unit : '');
+  };
 }
 interface PlotPoint { x:number; y:number; base:number }
 const linePath=d3Line<PlotPoint|null>().defined(p=>p!==null).x(p=>p!.x).y(p=>p!.y);
@@ -36,6 +45,9 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
   node: RichChartNode; context: RichEvalContext; cycle: RenderCycle; select: SelectValue; clipId: string;
 }) {
   const val = <T,>(v: T | { expr: string } | undefined) => evaluate<T>(v, context, cycle);
+  const formatX = axisFormatter(node.xAxis);
+  const formatLeft = axisFormatter(node.yAxis);
+  const formatRight = axisFormatter(node.yAxisRight);
   const categories = safeArray<string | number>(val(node.categories), cycle);
   const series: Series[] = node.series.map((s, index) => ({
     key: s.key, label: text(val(s.label), s.key), color: color(s.colorToken, index),
@@ -54,7 +66,7 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
     const data = { seriesKey: s.key, dataIndex: i, x: p.x, y: p.y };
     select(node.selectedPointBind, data, node.onPointSelect, { ...context, item: data, index: i });
   };
-  const details = (s: Series, p: Point) => [s.label, p.label ?? p.x, p.y === null ? p.missingReason ?? 'データなし' : fmt(p.y) + (s.unit ?? ''), p.sourceId ?? s.sourceId, p.asOf ?? s.asOf].filter(Boolean).join(' · ');
+  const details = (s: Series, p: Point) => [s.label, p.label ?? formatX(p.x), p.y === null ? p.missingReason ?? 'データなし' : s.unit ? fmt(p.y) + s.unit : (s.right ? formatRight : formatLeft)(p.y), p.sourceId ?? s.sourceId, p.asOf ?? s.asOf].filter(Boolean).join(' · ');
   const activate = (s: Series, p: Point, i: number) => interactive ? {
     role: 'button', tabIndex: 0, 'aria-label': details(s, p),
     onClick: () => choose(s, p, i), onKeyDown: (e: React.KeyboardEvent<SVGElement>) => {
@@ -127,8 +139,8 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
       const a = left[0] + ratio*(left[1]-left[0]);
       const b = right[0] + ratio*(right[1]-right[0]);
       const y = T+ph*(1-ratio), x = L+pw*ratio;
-      return horizontal ? <g key={i}><line x1={x} x2={x} y1={T} y2={T+ph} stroke="var(--border)" /><text x={x} y={T+ph+16} textAnchor="middle">{fmt(a)}</text></g> :
-        <g key={i}><line x1={L} x2={L+pw} y1={y} y2={y} stroke="var(--border)" /><text x={L-8} y={y+4} textAnchor="end">{fmt(a)}</text>{series.some(s=>s.right)&&<text x={W-R+8} y={y+4}>{fmt(b)}</text>}</g>;
+      return horizontal ? <g key={i}><line x1={x} x2={x} y1={T} y2={T+ph} stroke="var(--border)" /><text x={x} y={T+ph+16} textAnchor="middle">{formatLeft(a)}</text></g> :
+        <g key={i}><line x1={L} x2={L+pw} y1={y} y2={y} stroke="var(--border)" /><text x={L-8} y={y+4} textAnchor="end">{formatLeft(a)}</text>{series.some(s=>s.right)&&<text x={W-R+8} y={y+4}>{formatRight(b)}</text>}</g>;
     });
     const marks = series.map((s,j) => {
       const pts = prepared[j];
@@ -157,8 +169,8 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
     const labelStep=Math.max(1,Math.ceil(count/8));
     figure = <g className="rich-chart-axes" fill="currentColor" fontSize="12">
       {axes}
-      {!numericX && cat.map((x,i) => i%labelStep===0 && <text key={i} x={horizontal ? L-8 : L+(i+0.5)/count*pw} y={horizontal ? T+(i+0.5)/count*ph+4 : H-B+17} textAnchor={horizontal?'end':'middle'}>{String(x).slice(0,14)}</text>)}
-      {numericX && Array.from({length:5},(_,i)=>{const x=xmin+(xmax-xmin)*i/4;return <text key={i} x={L+pw*i/4} y={H-B+17} textAnchor="middle">{node.xAxis?.type==='time'?formatChartTime(x):fmt(x)}</text>})}
+      {!numericX && cat.map((x,i) => i%labelStep===0 && <text key={i} x={horizontal ? L-8 : L+(i+0.5)/count*pw} y={horizontal ? T+(i+0.5)/count*ph+4 : H-B+17} textAnchor={horizontal?'end':'middle'}>{formatX(x)}</text>)}
+      {numericX && Array.from({length:5},(_,i)=>{const x=xmin+(xmax-xmin)*i/4;return <text key={i} x={L+pw*i/4} y={H-B+17} textAnchor="middle">{formatX(x)}</text>})}
       <defs><clipPath id={clipId}><rect x={L} y={T} width={pw} height={ph}/></clipPath></defs>
       <g clipPath={'url(#'+clipId+')'}>{marks}
       {(node.referenceLines??[]).map((r,i)=>{
@@ -168,11 +180,11 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
         const vertical = horizontal ? r.axis==='y' : r.axis==='x';
         const pos = horizontal ? (r.axis==='y'?hx(num(v,0),false):T+(idx+0.5)/count*ph) : r.axis==='y'?y:x;
         if (!Number.isFinite(pos) || (r.axis==='x'&&!numericX&&idx<0)) return null;
-        return <g key={i}><line x1={vertical?pos:L} x2={vertical?pos:L+pw} y1={vertical?T:pos} y2={vertical?T+ph:pos} stroke="var(--text-muted)" strokeDasharray="5 4"/><text x={vertical?pos+3:L+4} y={vertical?T+14:pos-4}>{text(val(r.label))}</text></g>;
+        return <g key={i} className={'rich-chart-reference'+toneClass(r.tone)}><line x1={vertical?pos:L} x2={vertical?pos:L+pw} y1={vertical?T:pos} y2={vertical?T+ph:pos} stroke="currentColor" strokeDasharray="5 4"/><text x={vertical?pos+3:L+4} y={vertical?T+14:pos-4}>{text(val(r.label))}</text></g>;
       })}
       </g>
-      {node.xAxis?.label && <text x={W/2} y={H-5} textAnchor="middle">{node.xAxis.label}</text>}
-      {node.yAxis?.label && <text x={12} y={H/2} transform={'rotate(-90 12 '+H/2+')'} textAnchor="middle">{node.yAxis.label}</text>}
+      {(horizontal ? node.yAxis?.label : node.xAxis?.label) && <text x={W/2} y={H-5} textAnchor="middle">{horizontal ? node.yAxis?.label : node.xAxis?.label}</text>}
+      {(horizontal ? node.xAxis?.label : node.yAxis?.label) && <text x={12} y={H/2} transform={'rotate(-90 12 '+H/2+')'} textAnchor="middle">{horizontal ? node.xAxis?.label : node.yAxis?.label}</text>}
       {node.yAxisRight?.label && <text x={W-9} y={H/2} transform={'rotate(90 '+(W-9)+' '+H/2+')'} textAnchor="middle">{node.yAxisRight.label}</text>}
     </g>;
   }

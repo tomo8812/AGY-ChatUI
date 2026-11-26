@@ -24,6 +24,7 @@ import { MarkdownAdapter } from './markdown-adapter.js';
 import { MermaidAdapter } from './mermaid-adapter.js';
 import { SvgAdapter } from './svg-adapter.js';
 import {
+  parseA1Range,
   readDocxAllParagraphTargets,
   readDocxParagraphTarget,
   readPptxSlideTargets,
@@ -32,6 +33,7 @@ import {
   readXlsxRowColTarget,
   readXlsxSheetTarget,
   readXlsxWorkbookTargets,
+  searchXlsxRange,
 } from './ooxml-target.js';
 import { computePdfRegionDigest, inspectPdfDocument, readPdfPageTarget } from './pdf-target.js';
 
@@ -208,6 +210,10 @@ class DocumentFormatAdapter implements FormatAdapter {
         const constraint = documentFormatConstraint(this.format, ctx.filename ?? '', operation, ctx.previewKind, ctx.content);
         if (constraint) return { operation, availability: 'unsupported_by_format', scope, notes: constraint };
         const notes = LIMITED_OPERATIONS[operation];
+        if (!workerReady && this.hasOfficeReadFallback(ctx.filename ?? '') && ['structure', 'read_range'].includes(operation)) {
+          return { operation, availability: 'supported', scope, notes: this.format === 'xlsx' && operation === 'read_range'
+            ? 'セルと保存済みの計算結果を取得できます。再計算にはドキュメントランタイムが必要です。' : undefined };
+        }
         if (!workerReady || metadataOnly) {
           if (operation === 'structure' || operation === 'verify' ||
               (operation === 'render_png' && this.format === 'image' && /\.png$/i.test(ctx.filename ?? ''))) {
@@ -235,8 +241,17 @@ class DocumentFormatAdapter implements FormatAdapter {
     return operations;
   }
 
+  private hasOfficeReadFallback(filename: string): boolean {
+    return (this.format === 'xlsx' && /\.xlsx$/i.test(filename)) || (this.format === 'docx' && /\.docx$/i.test(filename));
+  }
+
   getStructure(buffer: Buffer, meta: AdapterFileMeta): Record<string, unknown> {
     if (this.format === 'pptx' && /\.pptx$/i.test(meta.filename)) return readPptxTargets(buffer);
+    if (this.hasOfficeReadFallback(meta.filename)) {
+      if (this.format === 'xlsx') return readXlsxWorkbookTargets(buffer);
+      const { totalBlocks } = readDocxAllParagraphTargets(buffer);
+      return { format: 'docx', blockCount: totalBlocks };
+    }
     return {
       format: this.format,
       filename: meta.filename,
@@ -245,7 +260,7 @@ class DocumentFormatAdapter implements FormatAdapter {
     };
   }
 
-  readRange(buffer: Buffer, range: Record<string, unknown>, _meta: AdapterFileMeta): Record<string, unknown> {
+  readRange(buffer: Buffer, range: Record<string, unknown>, meta: AdapterFileMeta): Record<string, unknown> {
     const isTargetMeta = range.targetMetadata === true || range.targetMetadata === 'true';
     if (this.format === 'pptx' && isTargetMeta && typeof range.part === 'string') {
       return readPptxSlideTargets(buffer, range.part);
@@ -258,6 +273,33 @@ class DocumentFormatAdapter implements FormatAdapter {
       const sheetSel = String(range.sheetId ?? range.sheetName ?? range.sheetPart ?? '');
       const target = readXlsxRangeTarget(buffer, sheetSel, range.rangeA1);
       return { target };
+    }
+    if (this.hasOfficeReadFallback(meta.filename)) {
+      if (this.format === 'docx') {
+        const start = Number(range.start ?? 0), count = Number(range.count ?? 50);
+        if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(count) || count < 1 || count > 100) {
+          throw new ArtifactError('INVALID_INPUT', '文書の読取範囲が無効です。', 400);
+        }
+        const { totalBlocks, blocks } = readDocxAllParagraphTargets(buffer, { start, count });
+        if (start > totalBlocks) throw new ArtifactError('INVALID_INPUT', '文書の読取範囲が無効です。', 400);
+        return { start, blockCount: totalBlocks, blocks, hasMore: start + count < totalBlocks };
+      }
+      const sheetId = String(range.sheetId ?? range.sheetName ?? range.sheetPart ?? readXlsxWorkbookTargets(buffer).sheets[0].id);
+      if (typeof range.gridSearch === 'string') {
+        return searchXlsxRange(buffer, sheetId, range.gridSearch, Number(range.afterRow ?? -1), Number(range.afterCol ?? -1));
+      }
+      const a1 = String(range.rangeA1 ?? 'A1');
+      const bounds = parseA1Range(a1);
+      if (!bounds || (bounds.row1 - bounds.row0 + 1) * (bounds.col1 - bounds.col0 + 1) > 1000) {
+        throw new ArtifactError('INVALID_INPUT', '1,000 セル以下の有効な範囲を指定してください。', 400);
+      }
+      const result = readXlsxRangeTarget(buffer, sheetId, a1);
+      if (!result) throw new ArtifactError('INVALID_INPUT', 'シートが見つかりません。', 400);
+      return { sheetId: result.sheetId, rangeA1: result.rangeA1, cells: result.cells.map(cell => {
+        if (cell.formula === undefined) return cell;
+        const formulaStatus = cell.value === '' ? 'unevaluated_unsupported' : cell.type === 'e' ? 'error_formula' : 'cached_existing';
+        return { ...cell, formulaStatus };
+      }) };
     }
     if (this.format === 'pdf' && isTargetMeta && range.pageIndex !== undefined) {
       const pageIndex = Number(range.pageIndex);

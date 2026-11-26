@@ -1,6 +1,7 @@
 import { ModalDialog } from './ModalDialog';
 import type { StructuredPatch } from 'diff';
 import DOMPurify from 'dompurify';
+import { loadDocxPreview } from '../utils/docxPreview';
 import hljs from 'highlight.js';
 import {PdfCanvasViewer} from './shared-ui/document/PdfCanvasCore';
 import React, { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
@@ -784,11 +785,8 @@ export const ArtifactViewerModal: React.FC<ArtifactViewerModalProps> = ({
         }
 
         if (kind === 'docx') {
-          const [buf, mammoth] = await Promise.all([res.arrayBuffer(), import('mammoth')]);
-          const result = await mammoth.convertToHtml({ arrayBuffer: buf });
+          const clean = await loadDocxPreview(res, versionKey);
           if (!active) return;
-          const clean = DOMPurify.sanitize(result.value);
-          docxHtmlCache.set(versionKey, clean);
           setSanitizedHtml(clean);
           setLoading(false);
           return;

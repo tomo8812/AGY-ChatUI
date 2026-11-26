@@ -2514,7 +2514,7 @@ def _xlsx_ui_color(node):
     return "#" + value[-6:].lower() if re.fullmatch(r"(?:[0-9A-Fa-f]{2})?[0-9A-Fa-f]{6}", value) else None
 
 
-def read_workbook_range(package, options):
+def read_workbook_range(package, options, max_cells=1000):
     sheet = next((sheet for sheet in workbook_sheets(package) if sheet["id"] == str(options["sheetId"])), None)
     if sheet is None:
         raise ValueError("Unknown worksheet")
@@ -2522,7 +2522,7 @@ def read_workbook_range(package, options):
     first_row, first_column = cell_coordinates(bounds[0])
     last_row, last_column = cell_coordinates(bounds[-1])
     if len(bounds) > 2 or first_row > last_row or first_column > last_column \
-            or (last_row - first_row + 1) * (last_column - first_column + 1) > 1000:
+            or (last_row - first_row + 1) * (last_column - first_column + 1) > max_cells:
         raise ValueError("Requested worksheet range is out of bounds")
 
     raw_cells = []
@@ -2553,7 +2553,7 @@ def read_workbook_range(package, options):
                         needed_ss.add(ss_idx)
                     elif cell_type == "inlineStr":
                         value = text_content(cell, SPREADSHEET)
-                    raw_cells.append((address, value, cell_type, ss_idx, formula.text if formula is not None else None, int(cell.get("s", "0"))))
+                    raw_cells.append((address, value, cell_type, ss_idx, (formula.text or "") if formula is not None else None, int(cell.get("s", "0"))))
             row_el.clear()
             parent = row_el.getparent()
             if parent is not None:
@@ -2618,8 +2618,8 @@ def read_workbook_range(package, options):
                   **cell_styles.get(style_index, {})}
         if formula_text is not None:
             record.update(formula=formula_text, formulaStatus=(
-                "error_formula" if cell_type == "e" else
-                "cached_existing" if value not in (None, "") else "unevaluated_unsupported"
+                "unevaluated_unsupported" if value in (None, "") else
+                "error_formula" if cell_type == "e" else "cached_existing"
             ))
         cells.append(record)
     return {"sheetId": sheet["id"], "rangeA1": options.get("rangeA1", "A1"), "cells": cells}
@@ -2628,6 +2628,7 @@ def read_workbook_range(package, options):
 SAFE_CALC_FUNCTIONS = {
     "ABS", "AND", "AVERAGE", "COUNT", "COUNTA", "IF", "IFERROR", "MAX", "MIN",
     "NOT", "OR", "ROUND", "ROUNDDOWN", "ROUNDUP", "SUM", "SUMIF", "SUMIFS",
+    "COUNTIF", "PRODUCT", "MOD", "SQRT", "POWER",
 }
 
 
@@ -2665,7 +2666,7 @@ def safe_to_evaluate_workbook(package):
     return True
 
 
-def evaluate_workbook_range(package, source, options, result):
+def evaluate_workbook_range(package, source, options, result, max_cells=1000):
     if not safe_to_evaluate_workbook(package):
         return result
     with tempfile.TemporaryDirectory(prefix="calc-", dir=Path.cwd()) as scratch:
@@ -2684,7 +2685,7 @@ def evaluate_workbook_range(package, source, options, result):
                                      if sheet["id"] == result["sheetId"])
                 sheet_id = next(sheet["id"] for sheet in workbook_sheets(evaluated)
                                 if sheet["name"] == original_name)
-                calculated = read_workbook_range(evaluated, {**options, "sheetId": sheet_id})
+                calculated = read_workbook_range(evaluated, {**options, "sheetId": sheet_id}, max_cells)
         except (OSError, ValueError, LookupError, zipfile.BadZipFile, subprocess.CalledProcessError):
             return result
     evaluated_cells = {cell["address"]: cell for cell in calculated["cells"]}
@@ -5262,6 +5263,7 @@ def pptx_append_shape(package, slide, tree, replacements, additions, operation):
         next(element.iter(tag(DRAWING, "blip"))).set(tag(OFFICE_REL, "embed"), rid)
     extension = tree.find(tag(PRESENTATION, "extLst"))
     tree.insert(tree.index(extension) if extension is not None else len(tree), element)
+    return properties.get("id")
 
 
 def pptx_edit_slide_list(package, replacements, additions, operation):
@@ -5291,6 +5293,7 @@ def pptx_edit_slide_list(package, replacements, additions, operation):
         slide = XML.Element(tag(PRESENTATION, "sldId"), id=str(slide_id))
         slide.set(tag(OFFICE_REL, "id"), rid)
         slides.insert(bounded_integer(operation.get("index", len(slides)), 0, len(slides)), slide)
+        return target
     else:
         current = bounded_integer(operation["index"], 0, len(slides) - 1)
         slide = slides[current]
@@ -5601,18 +5604,38 @@ def ensure_pptx_notes(package, slide, replacements, additions):
         return load_edit_part(package, replacements, additions, part)
 
 
+def validate_draft_pptx_key(key):
+    if not isinstance(key, str) or not re.fullmatch(r"pptx-structure:[1-9][0-9]{0,14}", key):
+        raise ValueError("Invalid draft presentation identity")
+
+
 def edit_presentation(package, operations, output):
     replacements = {}
     additions = {}
+    draft_slides = {}
+    draft_shapes = {}
     for operation in operations:
         op = operation["op"]
+        draft_slide = operation.get("draftSlideKey")
+        if draft_slide is not None:
+            validate_draft_pptx_key(draft_slide)
         if op in {"pptx.add_slide", "pptx.reorder_slide", "pptx.remove_slide"}:
-            pptx_edit_slide_list(package, replacements, additions, operation)
+            created = pptx_edit_slide_list(package, replacements, additions, operation)
+            if draft_slide is not None:
+                if created is None or draft_slide in draft_slides:
+                    raise ValueError("Invalid draft slide creation")
+                draft_slides[draft_slide] = created
             continue
         if op.startswith("chart."):
             edit_chart(package, "pptx", operation, replacements)
             continue
-        slide = operation["slidePart"]
+        element_addition = op in {"pptx.add_shape", "pptx.add_image", "pptx.add_table"}
+        if draft_slide is not None:
+            if not element_addition or draft_slide not in draft_slides or "slidePart" in operation:
+                raise ValueError("Unknown draft slide")
+            slide = draft_slides[draft_slide]
+        else:
+            slide = operation["slidePart"]
         if not re.fullmatch(r"ppt/slides/[^/]+\.xml", slide):
             raise ValueError("Invalid slide part")
         root = load_edit_part(package, replacements, additions, slide)
@@ -5623,8 +5646,15 @@ def edit_presentation(package, operations, output):
             edit_smartart_add_or_remove_node(package, operation, root, replacements, additions)
             continue
         tree = root.find(".//" + tag(PRESENTATION, "spTree"))
-        if op in {"pptx.add_shape", "pptx.add_image", "pptx.add_table"}:
-            pptx_append_shape(package, slide, tree, replacements, additions, operation)
+        if element_addition:
+            shape_key = operation.get("draftShapeKey")
+            if shape_key is not None:
+                validate_draft_pptx_key(shape_key)
+                if shape_key in draft_shapes:
+                    raise ValueError("Duplicate draft shape")
+            shape_id = pptx_append_shape(package, slide, tree, replacements, additions, operation)
+            if shape_key is not None:
+                draft_shapes[shape_key] = (slide, shape_id)
             continue
         if op == "pptx.group_shapes":
             pptx_group(tree, operation)
@@ -5776,6 +5806,7 @@ def edit_presentation(package, operations, output):
             raise ValueError("Unsupported presentation operation")
         replacements[slide] = root
     serialize_additions(package, replacements, additions, output, "pptx")
+    return draft_shapes
 
 
 SPREADSHEET_DRAWING = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
@@ -7212,6 +7243,37 @@ def process_document(request, source, output):
             return None
         if action == "verify":
             return verify_office(package, source, fmt, names, verify_options=request.get("options"))
+        if action == "pptx_draft_layer" and fmt == "pptx":
+            with tempfile.TemporaryDirectory(prefix="pptx-draft-", dir=Path.cwd()) as scratch:
+                draft_path = Path(scratch) / "draft.pptx"
+                shapes = edit_presentation(package, request["operations"], draft_path)
+                with zipfile.ZipFile(draft_path) as draft:
+                    if request["variant"] == "sprite":
+                        target = shapes.get(request["draftShapeKey"])
+                        presentation = parse_xml(draft.read(MAIN_PART["pptx"]))
+                        slides = presentation_slides(draft, presentation)
+                        index = bounded_integer(request["pageIndex"], 0, len(slides) - 1)
+                        if target is None or slides[index]["part"] != target[0]:
+                            raise ValueError("Draft shape does not belong to the selected slide")
+                        request = {**request, "shapeId": target[1], "cropSprite": True}
+                    render_presentation_layer(draft, request, output)
+            return None
+        if action == "xlsx_draft_range" and fmt == "xlsx":
+            with tempfile.TemporaryDirectory(prefix="xlsx-draft-", dir=Path.cwd()) as scratch:
+                draft_path = Path(scratch) / "draft.xlsx"
+                edit_workbook(package, request["operations"], draft_path)
+                with zipfile.ZipFile(draft_path) as draft:
+                    sheet = next((item for item in workbook_sheets(draft) if item["name"] == request["sheetName"]), None)
+                    if sheet is None:
+                        raise ValueError("Unknown draft worksheet")
+                    options = {"sheetId": sheet["id"], "rangeA1": request["rangeA1"]}
+                    result = read_workbook_range(draft, options, max_cells=8192)
+                    result["cells"] = [cell for cell in result["cells"] if "formulaStatus" in cell]
+                    for cell in result["cells"]:
+                        cell.update(value=None, formulaStatus="unevaluated_unsupported")
+                    if result["cells"]:
+                        evaluate_workbook_range(draft, draft_path, options, result, max_cells=8192)
+                    return result
         if action == "range" and fmt == "xlsx":
             options = request["range"]
             if "gridSearch" in options:

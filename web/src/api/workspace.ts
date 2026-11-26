@@ -31,6 +31,8 @@ export const workspaceApi={
   capabilities:(id:string,signal?:AbortSignal)=>apiFetch<WorkspaceCapabilities>(path(id,'capabilities'),{signal}),
   structure:<T extends object>(id:string,signal?:AbortSignal)=>apiFetch<T&RevisionResponse>(path(id,'structure'),{signal}),
   range:<T extends object>(id:string,query:Record<string,string|number|boolean>,signal?:AbortSignal)=>apiFetch<T&RevisionResponse>(path(id,'range')+'?'+new URLSearchParams(Object.entries(query).map(([k,v])=>[k,String(v)])),{signal}),
+  xlsxDraftRange:<T extends object>(artifact:ArtifactRecord,body:{sheetName:string;rangeA1:string;operations:EditOperation[]},signal:AbortSignal)=>
+    apiFetch<T&RevisionResponse>(path(artifact.id,'xlsx-draft-range'),{method:'POST',signal,body:{...body,expectedRevision:artifact.revision}}),
   async csvCell(artifact:ArtifactRecord,row:number,col:number,signal:AbortSignal):Promise<string>{
     const query=new URLSearchParams({gridCell:'true',startRow:String(row),endRow:String(row),startCol:String(col),endCol:String(col)});
     const res=await fetch(path(artifact.id,'range')+'?'+query,{signal,credentials:'include'});
@@ -66,7 +68,7 @@ export const workspaceApi={
       !res.headers.get('content-type')?.includes('image/png'))throw new ApiError(409,'ARTIFACT_CHANGED','ファイルが更新されました。');
     return res.blob();
   },
-  async renderDraftSlide(artifact:ArtifactRecord,query:{pageIndex:number;operations:EditOperation[]},signal?:AbortSignal):Promise<Blob>{
+  async renderDraftSlide(artifact:ArtifactRecord,query:{pageIndex:number;operations:EditOperation[];variant?:'background'|'sprite';draftShapeKey?:string},signal?:AbortSignal):Promise<Blob>{
     const res=await fetch(path(artifact.id,'render-draft-slide'),{method:'POST',credentials:'include',signal,
       headers:{'Content-Type':'application/json','x-csrf-token':getCsrfToken()},
       body:JSON.stringify({...query,expectedRevision:artifact.revision})});

@@ -3,11 +3,13 @@ import type { RichDocumentV1, RichNode, RichLayoutProps, RichAction, RichStateAc
 import type { ArtifactRecord } from '../../types';
 import { buildArtifactContentUrl } from '../../utils/viewerCache';
 import { MarkdownContent, MermaidBlock, CodeBlock } from '../MarkdownContent';
+import { UnifiedViewerZoomShell } from '../UnifiedViewerZoomShell';
 import { CheckIcon, CopyIcon, DownloadIcon, ExternalLinkIcon, FileIcon, SearchIcon, SettingsIcon, PlusIcon, CloseIcon, FolderIcon, GaugeIcon, ShieldIcon } from '../Icons';
 import { isValidHttpUrl, validateRichMarkdownContent, parseRichExpr, type ExprAst, type RichEvalContext } from './RichExprEvaluator';
 import { RichStateStore, type RichStateSnapshot } from './RichStateStore';
 import { runExplicitRichActions, type RichActionHost } from './RichActionRunner';
 import { BlockRenderAccounting, addNode, color, evaluate, expression, num, repeatContexts, safeArray, text, type RenderCycle, type SelectValue } from './runtime';
+import { RichBadge, toneClass } from './display/RichBadge';
 import './rich-ui.css';
 
 const RichChart=lazy(()=>import('./chart/RichChartRenderer').then(({renderRichChart})=>({
@@ -43,6 +45,7 @@ export interface RichRendererProps {
 const noArtifacts:readonly ArtifactRecord[]=[];
 const noActions:ArtifactHost={};
 const icons={check:CheckIcon,copy:CopyIcon,download:DownloadIcon,link:ExternalLinkIcon,file:FileIcon,search:SearchIcon,settings:SettingsIcon,plus:PlusIcon,x:CloseIcon,folder:FolderIcon,gauge:GaugeIcon,shield:ShieldIcon};
+const richIcon=(name:string|undefined)=>name&&Object.hasOwn(icons,name)?icons[name as keyof typeof icons]:null;
 const space={none:0,xs:4,sm:8,md:12,lg:20};
 function finiteBound(value:unknown,min:number,max:number,fallback:number){return Math.min(max,Math.max(min,num(value,fallback)))}
 function styleLayout(layout:RichLayoutProps|undefined):CSSProperties{
@@ -61,11 +64,56 @@ function styleLayout(layout:RichLayoutProps|undefined):CSSProperties{
     ...(layout.wrap!==undefined?{flexWrap:layout.wrap?'wrap':'nowrap'}:{}),
   } as CSSProperties;
 }
-const toneClass=(tone:unknown)=>['muted','info','success','warning','danger'].includes(String(tone))?' rich-tone-'+String(tone):'';
-function SourceAttribution({sources}:{sources:RichSourceEntry[]}){
-  return <div className="rich-sources">{sources.map(s=><div key={s.id} className="rich-source"><span className="rich-source-id">{s.id}</span>
+function responsiveLayout(layout:RichLayoutProps|undefined, pc:RichLayoutProps|undefined, mobile:RichLayoutProps|undefined){
+  const style:Record<string,string|number>={};
+  for(const [device,override] of [['pc',pc],['mobile',mobile]] as const){
+    const props={...layout,...override};
+    const resolved=styleLayout(props);
+    for(const property of ['alignItems','justifyContent','gap','padding','minWidth','maxWidth','flexGrow','flexShrink','flexWrap'] as const){
+      const value=resolved[property];
+      if(value!==undefined)style['--rich-'+device+'-'+property]=typeof value==='number'&&['gap','padding','maxWidth'].includes(property)?value+'px':value;
+    }
+    style['--rich-'+device+'-span']=resolved[('--rich-span-'+device) as keyof CSSProperties] as number??1;
+    style['--rich-'+device+'-display']=props.hideOn===device?'none':'block';
+  }
+  return style as CSSProperties;
+}
+function RichCarousel({width,indicators,children}:{width:number;indicators?:boolean;children:ReactNode}){
+  const track=useRef<HTMLDivElement>(null);
+  const [state,setState]=useState({count:0,active:0});
+  const items=()=>Array.from(track.current?.children??[]).filter((el):el is HTMLElement=>el instanceof HTMLElement&&el.getClientRects().length>0);
+  const update=()=>{
+    const el=track.current;
+    if(!el)return;
+    const visible=items();
+    const left=el.getBoundingClientRect().left;
+    const distances=visible.map(item=>Math.abs(item.getBoundingClientRect().left-left));
+    const active=Math.max(0,distances.indexOf(Math.min(...distances)));
+    setState(previous=>previous.count===visible.length&&previous.active===active?previous:{count:visible.length,active});
+  };
+  useEffect(()=>{
+    if(!indicators||!track.current)return;
+    const el=track.current;
+    const resize=new ResizeObserver(update);
+    const observeItems=()=>{resize.disconnect();resize.observe(el);for(const child of el.children)resize.observe(child);update()};
+    const changes=new MutationObserver(observeItems);
+    changes.observe(el,{childList:true});
+    observeItems();
+    return()=>{resize.disconnect();changes.disconnect()};
+  },[indicators]);
+  return <div><div ref={track} className={'rich-carousel'+(indicators&&state.count>1?' rich-carousel-track':'')} style={{'--rich-carousel-width':width+'px'} as CSSProperties} onScroll={indicators?update:undefined}>{children}</div>
+    {indicators&&state.count>1&&<div className="rich-carousel-indicators" aria-label="カルーセルの項目">{Array.from({length:state.count},(_,index)=><button
+      key={index} type="button" aria-label={`項目 ${index+1}`} data-index={index} aria-current={state.active===index?'true':undefined}
+      onClick={()=>{const el=track.current,item=items()[index];if(el&&item)el.scrollTo({left:el.scrollLeft+item.getBoundingClientRect().left-el.getBoundingClientRect().left})}}/>)}</div>}
+  </div>;
+}
+function SourceAttribution({sources,compact}:{sources:RichSourceEntry[];compact?:boolean}){
+  return <div className={'rich-sources'+(compact?' rich-sources-compact':'')}>{sources.map(s=><div key={s.id} className="rich-source"><span className="rich-source-id">{s.id}</span>
     {s.url&&isValidHttpUrl(s.url)?<a href={s.url} target="_blank" rel="noopener noreferrer">{s.name}</a>:<span>{s.name}</span>}
     <small>{[s.asOf&&'基準 '+s.asOf,s.fetchedAt&&'取得 '+s.fetchedAt,s.timezone,s.unit,s.currency,s.period,s.valueStatus,s.delayNotice].filter(Boolean).join(' · ')}</small></div>)}</div>;
+}
+function DiagramZoom({enabled,id,children}:{enabled?:boolean;id:string;children:ReactNode}){
+  return enabled?<div className="rich-diagram-zoom"><UnifiedViewerZoomShell resetKey={id} scrollClassName="rich-diagram-scroll">{children}</UnifiedViewerZoomShell></div>:<>{children}</>;
 }
 function Tabs({items,value,onChange}:{items:Array<{id:string;label:string;badge:string;content:ReactNode}>;value?:string;onChange?:(id:string)=>void}){
   const [local,setLocal]=useState(items[0]?.id??'');
@@ -245,9 +293,9 @@ const RichNodeView=React.memo(function RichNodePaint({node,local,path,environmen
       }
       case 'columns': body=<div className={'rich-columns'+(node.keepRowOnMobile?' rich-keep-row':'')} style={{...styleLayout(node.layout),'--rich-columns':node.children.map((_,i)=>'minmax(0,'+finiteBound(node.ratios?.[i],0.1,20,1)+'fr)').join(' ')} as CSSProperties}>{children(node.children)}</div>;break;
       case 'container':case 'card':body=<section className={'rich-panel rich-panel-'+(node.variant??'default')} style={styleLayout(node.layout)}>{node.type==='card'&&<>{(node.title||node.headerAction)&&<div className="rich-card-header"><strong>{label(v(node.title))}</strong>{node.headerAction&&renderNode(node.headerAction,c,path+'-header')}</div>}{node.subtitle&&<div className="muted-sm">{label(v(node.subtitle))}</div>}</>}{children(node.children)}{node.type==='card'&&node.footer&&renderNode(node.footer,c,path+'-footer')}</section>;break;
-      case 'responsive_box':body=<div className="rich-responsive-box" style={{...styleLayout(node.layout),'--rich-padding-pc':space[node.pc?.padding??'none']+'px','--rich-padding-mobile':space[node.mobile?.padding??'none']+'px','--rich-gap-pc':space[node.pc?.gap??'sm']+'px','--rich-gap-mobile':space[node.mobile?.gap??'sm']+'px'} as CSSProperties}>{children(node.children)}</div>;break;
+      case 'responsive_box':body=<div className="rich-responsive-box">{children(node.children)}</div>;break;
       case 'scroll_area':body=<div className="rich-scroll-area" style={{maxHeight:finiteBound(node.maxHeightPx,80,1200,400),overflowX:node.axis==='y'?'hidden':'auto',overflowY:node.axis==='x'?'hidden':'auto'}}>{children(node.children)}</div>;break;
-      case 'carousel':body=<div className="rich-carousel" style={{'--rich-carousel-width':finiteBound(node.itemMinWidthPx,120,500,220)+'px'} as CSSProperties}>{children(node.children)}</div>;break;
+      case 'carousel':body=<RichCarousel width={finiteBound(node.itemMinWidthPx,120,500,220)} indicators={node.showIndicators}>{children(node.children)}</RichCarousel>;break;
       case 'divider':body=<div role="separator" className={'rich-divider '+(node.orientation==='vertical'?'vertical':'')}>{node.label&&<span>{label(v(node.label))}</span>}</div>;break;
       case 'spacer':body=<div aria-hidden="true" style={{height:space[node.size]}}/>;break;
       case 'text':case 'caption':case 'note':case 'quote':case 'emphasis':{
@@ -256,8 +304,8 @@ const RichNodeView=React.memo(function RichNodePaint({node,local,path,environmen
       }
       case 'heading':{const Tag=([1,2,3,4].includes(node.level)?'h'+node.level:'h3') as 'h1'|'h2'|'h3'|'h4';body=<Tag className={'rich-heading'+toneClass(node.tone)}>{label(v(node.content))}</Tag>;break}
       case 'markdown':{const content=label(v(node.content));if(validateRichMarkdownContent(content))throw Error('表示できない文書です。');body=<MarkdownContent content={content} strictRich/>;break}
-      case 'icon':{const Icon=Object.prototype.hasOwnProperty.call(icons,node.name)?icons[node.name as keyof typeof icons]:null;body=Icon?<span aria-hidden={node.decorative===true} aria-label={node.decorative?undefined:label(v(node.ariaLabel))||node.name} role={node.decorative?undefined:'img'} className={toneClass(node.tone)}><Icon size={node.size==='lg'?24:node.size==='sm'?14:18}/></span>:<span className="muted-xs">{node.name}</span>;break}
-      case 'badge':case 'status':body=<span className={'rich-status'+toneClass(node.tone)}>{node.dot&&<i/>}{label(v(node.label))}</span>;break;
+      case 'icon':{const Icon=richIcon(node.name);body=Icon?<span aria-hidden={node.decorative===true} aria-label={node.decorative?undefined:label(v(node.ariaLabel))||node.name} role={node.decorative?undefined:'img'} className={toneClass(node.tone)}><Icon size={node.size==='lg'?24:node.size==='sm'?14:18}/></span>:<span className="muted-xs">{node.name}</span>;break}
+      case 'badge':case 'status':body=<RichBadge tone={node.tone} dot={node.dot}>{label(v(node.label))}</RichBadge>;break;
       case 'stat':case 'kpi_card':{const value=v(node.value);body=<div className={'rich-kpi'+(node.type==='stat'?' plain':'')}><span className="muted-sm">{label(v(node.label))}</span><div className="rich-kpi-value">{value==null?node.missingLabel??'—':label(value)}{value!=null&&node.unit&&<small> {label(v(node.unit))}</small>}</div>{value==null&&node.missingReason&&<small>{label(v(node.missingReason))}</small>}{node.delta&&<span className={v(node.deltaTone)==='positive'?'rich-tone-success':v(node.deltaTone)==='negative'?'rich-tone-danger':''}>{label(v(node.delta))}</span>}<small className="rich-cell-meta">{source(node.sourceId,label(v(node.asOf))||undefined,label(v(node.fetchedAt))||undefined)}</small>{children(node.children)}</div>;break}
       case 'progress':{const max=Math.max(0.00001,num(v(node.max),100)),value=Math.min(max,Math.max(0,num(v(node.value),0)));body=<label className={'rich-progress'+toneClass(node.tone)}><span>{label(v(node.label))}{node.showPercent&&' '+Math.round(value/max*100)+'%'}</span><progress max={max} value={value}/></label>;break}
       case 'list':case 'checklist':case 'steps':case 'timeline':{
@@ -267,12 +315,12 @@ const RichNodeView=React.memo(function RichNodePaint({node,local,path,environmen
         body=<Tag className={'rich-list rich-list-'+node.type}>{items.map((item,i)=>{const itemId=item.id??String(i);const checked=selected?selected.includes(itemId):Boolean(item.checked);return <li key={itemId}><div className="rich-list-row">{node.type==='checklist'&&(node.bindKey?<input type="checkbox" aria-label={item.title} checked={checked} onChange={e=>{const current=(selected??items.map((x,j)=>x.checked?x.id??String(j):null).filter(x=>x!==null));change(node.bindKey!,e.target.checked?[...current,itemId]:current.filter(x=>x!==itemId))}}/>:<span aria-hidden="true">{checked?'✓':'○'}</span>)}<div><strong>{item.title}</strong>{item.description&&<div>{item.description}</div>}<small className="rich-cell-meta">{[item.meta,item.status,source(item.sourceId,item.asOf)].filter(Boolean).join(' · ')}</small></div></div></li>})}{children(node.children)}</Tag>;break;
       }
       case 'data_table':{const rows=safeArray<Record<string,RichPrimitive|RichCellObject>>(v(node.rows),cycle,Math.max(1,node.columns?.length??1));body=<RichDataTable node={node} rows={rows} onSelect={node.selectedRowBind||node.onRowSelect?.length?(row,index)=>select(node.selectedRowBind,index,node.onRowSelect,{...c,item:row,index}):undefined}/>;break}
-      case 'source_attribution':body=<SourceAttribution sources={(doc.sources??[]).filter(s=>!node.sourceIds||node.sourceIds.includes(s.id))}/>;break;
+      case 'source_attribution':body=<SourceAttribution compact={node.compact} sources={(doc.sources??[]).filter(s=>!node.sourceIds||node.sourceIds.includes(s.id))}/>;break;
       case 'mermaid':body=<MermaidBlock code={label(v(node.code))} strictRich/>;break;
       case 'svg_scene':body=<SvgScene args={[node,c,cycle,unique,dispatch]} accounting={accounting} scopePath={path+':lazy'}/>;break;
       case 'node_edge_diagram':body=<NodeEdgeDiagram args={[node,c,cycle,select,unique]} accounting={accounting} scopePath={path+':lazy'}/>;break;
       case 'chart':body=<RichChart node={node} context={c} cycle={cycle} select={select} clipId={unique+'-clip'} accounting={accounting} scopePath={path+':lazy'}/>;break;
-      case 'button':body=<button type="button" className={'btn btn-'+(node.variant==='danger'?'danger-outline':node.variant??'secondary')} disabled={Boolean(node.disabledWhen&&expression(node.disabledWhen,c,cycle))} onClick={()=>explicit(node.onClick,c)}>{label(v(node.label))}</button>;break;
+      case 'button':{const Icon=richIcon(node.icon);body=<button type="button" className={'btn btn-'+(node.variant==='danger'?'danger-outline':node.variant??'secondary')} disabled={Boolean(node.disabledWhen&&expression(node.disabledWhen,c,cycle))} onClick={()=>explicit(node.onClick,c)}>{Icon&&<span aria-hidden="true" className="rich-button-icon"><Icon size={16}/></span>}{label(v(node.label))}</button>;break;}
       case 'clickable':case 'selectable_card':{const selected=Boolean(node.selectedWhen&&expression(node.selectedWhen,c,cycle));body=<div className={'rich-selectable'+(selected?' selected':'')} role="button" tabIndex={0} aria-pressed={selected} onClick={e=>{if(!(e.target as HTMLElement).closest('button,input,select,textarea,a,[role=button]:not(.rich-selectable)'))dispatch(node.onClick,c)}} onKeyDown={e=>{if(e.target===e.currentTarget&&(e.key==='Enter'||e.key===' ')){e.preventDefault();dispatch(node.onClick,c)}}}>{children(node.children)}</div>;break}
       case 'text_input':case 'textarea':case 'date_input':{const val=label(read(node.bind));const common={value:val,onChange:(e:React.ChangeEvent<HTMLInputElement|HTMLTextAreaElement>)=>change(node.bind,e.target.value,node.onChange)};body=<label className="field">{label(v(node.label))}{node.type==='textarea'?<textarea rows={4} maxLength={node.maxLength??50000} placeholder={node.placeholder} {...common}/>:node.type==='date_input'?<input type="date" min={node.min} max={node.max} {...common}/>:<input type="text" maxLength={node.maxLength??50000} placeholder={node.placeholder} {...common}/>}</label>;break}
       case 'number_input':case 'slider':{const min=num(v(node.min),0),max=Math.max(min,num(v(node.max),100)),step=Math.max(0.000001,num(v(node.step),1));const value=num(read(node.bind),min);body=<label className="field"><span>{label(v(node.label))}{node.type==='slider'&&<output> {value}{node.unit??''}</output>}</span><input type={node.type==='slider'?'range':'number'} value={value} min={min} max={max} step={step} onChange={e=>{const value=e.target.valueAsNumber;if(Number.isFinite(value))change(node.bind,Math.min(max,Math.max(min,value)),node.onChange)}}/></label>;break}
@@ -283,13 +331,17 @@ const RichNodeView=React.memo(function RichNodePaint({node,local,path,environmen
       case 'popover':case 'tooltip':body=<details className="rich-collapsible"><summary>{renderNode(node.trigger,c,path+'-trigger')}</summary>{Array.isArray(node.content)?children(node.content):label(v(node.content))}</details>;break;
       case 'form':body=<form className="rich-form" onSubmit={e=>{e.preventDefault();explicit(node.onSubmit,c)}}>{children(node.children)}<button className="btn btn-primary" type="submit">送信</button></form>;break;
       case 'editable_draft':body=<div className="rich-form"><label className="field">{label(v(node.label))}<textarea rows={6} value={label(read(node.bind))} onChange={e=>change(node.bind,e.target.value)}/></label>{node.format==='markdown'&&<MarkdownContent content={label(read(node.bind))} strictRich/>}{node.saveAction&&<button type="button" className="btn btn-secondary" onClick={()=>explicit([node.saveAction!],c)}>ファイルに保存</button>}</div>;break;
-      case 'code_block':body=<CodeBlock code={label(v(node.code))} language={node.language??''}/>;break;
+      case 'code_block':body=<CodeBlock code={label(v(node.code))} language={node.language??''} copyable={node.copyable}/>;break;
       case 'diff_block':body=<div className="rich-diff"><div><span className="muted-sm">変更前</span><CodeBlock code={label(v(node.oldText))} language={node.language??''}/></div><div><span className="muted-sm">変更後</span><CodeBlock code={label(v(node.newText))} language={node.language??''}/></div></div>;break;
       case 'math_block':{const tex=label(v(node.tex));body=<MarkdownContent strictRich content={node.displayMode===false?'$'+tex+'$':'$$\n'+tex+'\n$$'}/>;break}
-      case 'media_asset':{const alt=label(v(node.alt));let media:ReactNode;if(node.sourceKind==='inline_svg'&&node.svgScene)media=<SvgScene args={[node.svgScene,c,cycle,unique,dispatch]} accounting={accounting} scopePath={path+':lazy'}/>;else{const artifact=authorized.get(label(v(node.artifactId)));if(!artifact)throw Error('ファイルを表示できません。');const src=buildArtifactContentUrl(artifact);media=artifact.previewKind==='image'||artifact.previewKind==='svg'?<img alt={alt} src={src} loading="lazy"/>:artifact.previewKind==='video'?<video controls playsInline preload="metadata" src={src} aria-label={alt}/>:artifact.previewKind==='audio'?<audio controls preload="metadata" src={src} aria-label={alt}/>:<button type="button" className="btn btn-secondary" disabled={!host.openArtifact} onClick={()=>{void Promise.resolve(host.openArtifact?.(artifact.id)).catch(fail)}}>{artifact.filename}</button>}body=<figure className="rich-media">{media}{node.caption&&<figcaption>{label(v(node.caption))}</figcaption>}</figure>;break}
+      case 'media_asset':{const alt=label(v(node.alt));let media:ReactNode;if(node.sourceKind==='inline_svg'&&node.svgScene)media=<DiagramZoom enabled={node.svgScene.zoomable} id={unique}><SvgScene args={[node.svgScene,c,cycle,unique,dispatch]} accounting={accounting} scopePath={path+':lazy'}/></DiagramZoom>;else{const artifact=authorized.get(label(v(node.artifactId)));if(!artifact)throw Error('ファイルを表示できません。');const src=buildArtifactContentUrl(artifact);media=artifact.previewKind==='image'||artifact.previewKind==='svg'?<img alt={alt} src={src} loading="lazy"/>:artifact.previewKind==='video'?<video controls playsInline preload="metadata" src={src} aria-label={alt}/>:artifact.previewKind==='audio'?<audio controls preload="metadata" src={src} aria-label={alt}/>:<button type="button" className="btn btn-secondary" disabled={!host.openArtifact} onClick={()=>{void Promise.resolve(host.openArtifact?.(artifact.id)).catch(fail)}}>{artifact.filename}</button>}body=<figure className="rich-media">{media}{node.caption&&<figcaption>{label(v(node.caption))}</figcaption>}</figure>;break}
       default:body=<div className="error-box">この項目は表示できません。</div>;
     }
-    return <div ref={heavy?paintRef:undefined} onFocusCapture={heavy?()=>setVisible(true):undefined} className={'rich-node'+(node.layout?.hideOn?' rich-hide-'+node.layout.hideOn:'')} style={styleLayout(node.layout)} data-rich-node-id={node.id} aria-label={node.ariaLabel?label(v(node.ariaLabel)):undefined}><Suspense fallback={<span className="muted-xs" role="status">読み込み中…</span>}>{body}</Suspense></div>;
+    if(node.type==='mermaid'||node.type==='svg_scene'||node.type==='node_edge_diagram'){
+      body=<DiagramZoom enabled={node.zoomable} id={unique}>{body}</DiagramZoom>;
+    }
+    const responsive=node.type==='responsive_box';
+    return <div ref={heavy?paintRef:undefined} onFocusCapture={heavy?()=>setVisible(true):undefined} className={'rich-node'+(responsive?' rich-responsive-layout':node.layout?.hideOn?' rich-hide-'+node.layout.hideOn:'')} style={responsive?responsiveLayout(node.layout,node.pc,node.mobile):styleLayout(node.layout)} data-rich-node-id={node.id} aria-label={node.ariaLabel?label(v(node.ariaLabel)):undefined}><Suspense fallback={<span className="muted-xs" role="status">読み込み中…</span>}>{body}</Suspense></div>;
 });
 
 export function RichRenderer(props:RichRendererProps){

@@ -135,3 +135,4 @@
 
 .workspace-history-source{max-height:35dvh;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
 .workspace-cell-color{display:inline-flex;gap:4px;align-items:center;white-space:nowrap}
+.workspace-draft-shape{position:absolute;display:grid;place-items:center;overflow:hidden;border:1px dashed var(--border-strong);color:#222;pointer-events:none;white-space:pre-wrap}

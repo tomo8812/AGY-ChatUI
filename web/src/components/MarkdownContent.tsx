@@ -251,8 +251,8 @@ export const MermaidBlock: React.FC<{ code: string; streaming?: boolean; strictR
   }
 );
 
-export const CodeBlock: React.FC<{ language: string; code: string; streaming?: boolean }> = React.memo(
-  ({ language, code, streaming = false }) => {
+export const CodeBlock: React.FC<{ language: string; code: string; streaming?: boolean; copyable?: boolean }> = React.memo(
+  ({ language, code, streaming = false, copyable = true }) => {
     const [copied, setCopied] = useState(false);
     const [wrapped, setWrapped] = useState(false);
     const [collapsed, setCollapsed] = useState(false);
@@ -320,10 +320,10 @@ export const CodeBlock: React.FC<{ language: string; code: string; streaming?: b
             <button type="button" className="chip-btn" onClick={handleDownload} title="ファイルとして保存">
               <DownloadIcon size={13} />
             </button>
-            <button type="button" className="chip-btn" onClick={handleCopy}>
+            {copyable && <button type="button" className="chip-btn" onClick={handleCopy}>
               {copied ? <CheckIcon size={13} /> : <CopyIcon size={13} />}
               <span>{copied ? 'コピー済' : 'コピー'}</span>
-            </button>
+            </button>}
           </div>
         </div>
         {!collapsed && (

@@ -4498,7 +4498,10 @@ export class ArtifactService {
           ) as Record<string, unknown>;
           return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
         }
-        const fallback = adapter.readRange(Buffer.alloc(0), range, artifact);
+        const fallbackBytes = ((format === 'docx' && /\.docx$/i.test(artifact.filename)) ||
+          (format === 'xlsx' && /\.xlsx$/i.test(artifact.filename)))
+          ? this.readRevisionSnapshot({ artifact, revision, blobPath, sizeBytes }, DOCUMENT_WORKER_MAX_INPUT_BYTES).bytes : Buffer.alloc(0);
+        const fallback = adapter.readRange(fallbackBytes, range, artifact);
         return { ...fallback, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
       }
 
@@ -4527,6 +4530,25 @@ export class ArtifactService {
     } finally {
       pinned.releasePin();
     }
+  }
+
+  async readXlsxDraftRange(userId: string, artifactId: string, draft: {
+    expectedRevision: number; sheetName: string; rangeA1: string; operations: AdapterOperation[];
+  }, assertAuthorized: () => void | Promise<void>): Promise<Record<string, unknown>> {
+    await assertAuthorized();
+    const { artifact, revision, bytes } = this.readCurrentRevision(userId, artifactId, DOCUMENT_WORKER_MAX_INPUT_BYTES);
+    if (!/\.xlsx$/i.test(artifact.filename)) {
+      throw unsupportedOperationError('read_range', 'unsupported_by_format', 'An XLSX workbook is required.');
+    }
+    if (revision.revision !== draft.expectedRevision) {
+      throw new ArtifactError('ARTIFACT_CONFLICT', 'ファイルが更新されました。', 409);
+    }
+    const { operations, sheetName, rangeA1 } = draft;
+    const result = await this.documentWorker.run('xlsx', artifact.filename, bytes, {
+      action: 'xlsx_draft_range', operations, sheetName, rangeA1,
+    });
+    await assertAuthorized();
+    return { ...JSON.parse(result.toString('utf8')), artifactId, revision: revision.revision, sha256: revision.sha256 };
   }
 
   /** Revision-pinned, read-only document preview using the isolated document worker.
@@ -4623,6 +4645,7 @@ export class ArtifactService {
   /** Render the selected slide after applying the ordered draft to an isolated copy. */
   async renderPptxDraftSlide(userId:string,artifactId:string,draft:{
     expectedRevision:number;pageIndex:number;operation?:AdapterOperation;operations?:AdapterOperation[];
+    variant?:'background'|'sprite';draftShapeKey?:string;
   },assertAuthorized?:()=>void|Promise<void>):Promise<{png:Buffer;revision:number;sha256:string}>{
     await assertAuthorized?.();
     const {artifact,revision,bytes}=this.readCurrentRevision(userId,artifactId,DOCUMENT_WORKER_MAX_INPUT_BYTES);
@@ -4636,29 +4659,51 @@ export class ArtifactService {
     if (draft.operations) {
       const parts = new Set(structure.slides?.map(slide => slide.part));
       const layouts = new Set(structure.layouts?.map(layout => layout.part));
-      let count = structure.slides?.length ?? 0;
+      const slides = [...parts];
+      const draftSlideKeys = new Set<string>();
       for (const op of draft.operations) {
+        const index = Number(op.index);
         switch (op.op) {
-          case 'pptx.add_slide':
-            if (!layouts.has(String(op.layoutPart)) || Number(op.index) > count) throw new ArtifactError('INVALID_INPUT','Invalid slide insertion.',400);
-            count++;
+          case 'pptx.add_slide': {
+            const key = typeof op.draftSlideKey === 'string' ? op.draftSlideKey : '';
+            if (!layouts.has(String(op.layoutPart)) || index > slides.length || (key && draftSlideKeys.has(key))) {
+              throw new ArtifactError('INVALID_INPUT','Invalid slide insertion.',400);
+            }
+            if (key) draftSlideKeys.add(key);
+            slides.splice(index, 0, key);
             break;
+          }
           case 'pptx.remove_slide':
-            if (count <= 1 || Number(op.index) >= count) throw new ArtifactError('INVALID_INPUT','Cannot remove this slide.',400);
-            count--;
+            if (slides.length <= 1 || index >= slides.length) throw new ArtifactError('INVALID_INPUT','Cannot remove this slide.',400);
+            slides.splice(index, 1);
             break;
-          case 'pptx.reorder_slide':
-            if (Number(op.index) >= count || Number(op.toIndex) >= count) throw new ArtifactError('INVALID_INPUT','Invalid destination slide.',400);
+          case 'pptx.reorder_slide': {
+            const destination = Number(op.toIndex);
+            if (index >= slides.length || destination >= slides.length) throw new ArtifactError('INVALID_INPUT','Invalid destination slide.',400);
+            slides.splice(destination, 0, slides.splice(index, 1)[0]);
             break;
-          default:
-            if (!parts.has(String(op.slidePart))) throw new ArtifactError('INVALID_INPUT','Slide identity mismatch.',400);
+          }
+          default: {
+            const validTarget = typeof op.draftSlideKey === 'string'
+              ? op.slidePart === undefined && slides.includes(op.draftSlideKey)
+              : parts.has(String(op.slidePart));
+            if (!validTarget) throw new ArtifactError('INVALID_INPUT','Slide identity mismatch.',400);
+          }
         }
       }
-      if (draft.pageIndex >= count) throw new ArtifactError('INVALID_INPUT','Selected slide is unavailable.',400);
+      if (draft.pageIndex >= slides.length) throw new ArtifactError('INVALID_INPUT','Selected slide is unavailable.',400);
       await assertAuthorized?.();
-      const edited = await this.documentWorker.run('pptx', artifact.filename, bytes, {action:'edit',operations:draft.operations});
-      await assertAuthorized?.();
-      const png = await this.documentWorker.run('pptx', artifact.filename, edited, {action:'render',pageIndex:draft.pageIndex});
+      let png: Buffer;
+      if (draft.variant) {
+        png = await this.documentWorker.run('pptx', artifact.filename, bytes, {
+          action:'pptx_draft_layer', operations:draft.operations, pageIndex:draft.pageIndex,
+          variant:draft.variant, draftShapeKey:draft.draftShapeKey,
+        });
+      } else {
+        const edited = await this.documentWorker.run('pptx', artifact.filename, bytes, {action:'edit',operations:draft.operations});
+        await assertAuthorized?.();
+        png = await this.documentWorker.run('pptx', artifact.filename, edited, {action:'render',pageIndex:draft.pageIndex});
+      }
       await assertAuthorized?.(); this.assertRenderPng(png);
       return {png,revision:revision.revision,sha256:revision.sha256};
     }

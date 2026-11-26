@@ -285,6 +285,34 @@ describe('PR 3A Conformance Gap Fixes', () => {
       });
       const artId = created.artifact.id;
 
+      const service = server.ctx.artifactService;
+      const caps = service.getCapabilities(userId, artId);
+      expect(caps).toMatchObject({ runtimeProfile: 'base_chatui', sandboxIsolation: 'sandbox_required_blocked', directEditUiSupported: false, targetPinSupported: true });
+      for (const operation of ['view', 'structure', 'read_range', 'target_pin']) {
+        expect(caps.operations).toContainEqual(expect.objectContaining({ operation, availability: 'supported' }));
+      }
+      expect(caps.operations).toContainEqual(expect.objectContaining({ operation: 'xlsx.set_cell', availability: 'disabled_by_resource_tier' }));
+      expect(await service.getStructure(userId, artId)).toMatchObject({ sheets: [{ id: '1', name: 'Sales' }] });
+      expect(await service.readRange(userId, artId, { sheetId: '1', rangeA1: 'A2:B2', evaluate: true })).toMatchObject({
+        cells: [{ address: 'A2', value: 'Apple' }, { address: 'B2', value: '100', formula: '50*2', formulaStatus: 'cached_existing' }],
+        revision: created.artifact.revision,
+      });
+      expect(await service.readRange(userId, artId, { sheetId: '1', gridSearch: 'ORANGE' })).toMatchObject({ match: { row: 2, col: 0 } });
+      const docx = (await service.createArtifact({
+        userId, scopeKind: 'chat', chatId, relPath: 'view.docx', content: buildMinimalDocx([{ text: 'First paragraph' }, { text: 'Second paragraph' }]),
+        actorKind: 'user', actorId: userId,
+      })).artifact;
+      expect(service.getCapabilities(userId, docx.id)).toMatchObject({ directEditUiSupported: false, targetPinSupported: true,
+        operations: expect.arrayContaining(['view', 'structure', 'read_range', 'target_pin'].map(operation =>
+          expect.objectContaining({ operation, availability: 'supported' }))) });
+      expect(await service.getStructure(userId, docx.id)).toMatchObject({ format: 'docx', blockCount: expect.any(Number) });
+      expect(await service.readRange(userId, docx.id, { start: 1, count: 1 })).toMatchObject({
+        blocks: [{ blockIndex: 1, type: 'p', text: 'Second paragraph' }],
+      });
+      expect(await service.readRange(userId, docx.id, { targetBlockIndex: 1 })).toMatchObject({
+        target: { blockIndex: 1, text: 'Second paragraph', fingerprint: expect.stringMatching(/^[a-f0-9]{64}$/) },
+      });
+
       // Pure-JS Base ChatUI readRange(targetMetadata='true') works with installDocRuntime='off'
       const meta = await server.ctx.artifactService.readRange(userId, artId, {
         sheetId: '1',
