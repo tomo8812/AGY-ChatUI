@@ -90,6 +90,45 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
     srv.ctx.artifactService.setSameFsCheckOverride(undefined);
   });
 
+  it('recovers a retention-expired T6 event and preserves a T6 journal whose event was lost', async () => {
+    const srv = await createTestServer();
+    cleanups.push(srv.cleanup);
+    const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+    const chatId = (await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Outbox recovery' })).data.chat.id;
+    const { db, artifactService } = srv.ctx;
+    artifactService.commitFaultHook = stage => {
+      if (stage === 'after_T6') throw new Error('interrupted at T6');
+    };
+    for (const relPath of ['expired.txt', 'missing.txt']) {
+      await expect(artifactService.createArtifact({
+        userId, chatId, scopeKind: 'chat', relPath, actorKind: 'user', content: Buffer.from(relPath),
+      })).rejects.toThrow('interrupted at T6');
+    }
+    artifactService.commitFaultHook = undefined;
+    const journal = (relPath: string) => db.db.prepare(
+      'SELECT commit_id, sync_event_seq, state FROM artifact_commit_journal WHERE user_id = ? AND rel_path = ?',
+    ).get(userId, relPath);
+    const expired = journal('expired.txt')!;
+    const missing = journal('missing.txt')!;
+    db.db.prepare('DELETE FROM sync_events WHERE seq = ?').run(missing.sync_event_seq!);
+    db.db.exec('BEGIN IMMEDIATE;');
+    for (let i = 0; i < 2001; i++) {
+      db.insertSyncEventInTx({ userId, eventId: crypto.randomUUID(), type: 'test.retention', payload: {} });
+    }
+    db.db.exec('COMMIT;');
+    db.pruneSyncEvents(userId);
+    expect(db.db.prepare('SELECT 1 FROM sync_events WHERE seq = ?').get(expired.sync_event_seq!)).toBeUndefined();
+    expect(db.db.prepare('SELECT seq FROM artifact_commit_outbox_expirations WHERE commit_id = ?').get(expired.commit_id!))
+      .toMatchObject({ seq: expired.sync_event_seq });
+    const report = await artifactService.recoverOnStartup();
+    expect(report.commits).toMatchObject({ completedOutbox: 1, quarantined: 1 });
+    expect(journal('expired.txt')).toBeUndefined();
+    expect(journal('missing.txt')).toEqual(missing);
+    const retry = await artifactService.recoverOnStartup();
+    expect(retry.commits).toMatchObject({ completedOutbox: 0, quarantined: 1 });
+    expect(journal('missing.txt')).toEqual(missing);
+  });
+
   it('ARCH-05: T1..T7 pre/post fault injection tests converge cleanly and idempotently for create & update across isolated and non-isolated modes', async () => {
     const srv = await createTestServer();
     cleanups.push(srv.cleanup);

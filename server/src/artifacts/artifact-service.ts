@@ -869,10 +869,10 @@ export class ArtifactService {
     this.db.db
       .prepare(
         `UPDATE artifact_commit_journal
-         SET state = 'db_committed', sync_event_seq = ?, updated_at = ?
+         SET state = 'db_committed', sync_event_seq = ?, audit_note = ?, updated_at = ?
          WHERE commit_id = ?`
       )
-      .run(artEnvelope.seq, now, journal.commitId);
+      .run(envelopes[0].seq, JSON.stringify({ syncEvents: envelopes.map(({ seq, eventId }) => ({ seq, eventId })) }), now, journal.commitId);
 
     return { artifact, envelopes };
   }
@@ -2996,7 +2996,7 @@ export class ArtifactService {
     }
 
     const firstSeq = envelopes.length > 0 ? envelopes[0].seq : null;
-    const seqAudit = JSON.stringify({ syncEventSeqs: envelopes.map((e) => e.seq) });
+    const seqAudit = JSON.stringify({ syncEvents: envelopes.map(({ seq, eventId }) => ({ seq, eventId })) });
     this.db.db
       .prepare(
         `UPDATE artifact_commit_journal

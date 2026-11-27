@@ -411,6 +411,14 @@ export class AppDatabase {
         updated_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS artifact_commit_outbox_expirations (
+        commit_id TEXT NOT NULL REFERENCES artifact_commit_journal(commit_id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        event_id TEXT NOT NULL,
+        expired_at INTEGER NOT NULL,
+        PRIMARY KEY (commit_id, seq)
+      );
+
       CREATE TABLE IF NOT EXISTS artifact_dep_propagation_queue (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
@@ -2444,19 +2452,7 @@ export class AppDatabase {
         now
       );
 
-    // Prune older events for this user beyond the most recent 2000 rows to bound disk usage
     const seq = Number(res.lastInsertRowid);
-    if (userSeq % 100 === 0) {
-      this.db
-        .prepare(
-          `DELETE FROM sync_events
-           WHERE user_id = ? AND user_seq < COALESCE(
-             (SELECT user_seq FROM sync_events WHERE user_id = ? ORDER BY user_seq DESC LIMIT 1 OFFSET 2000),
-             0
-           )`
-        )
-        .run(params.userId, params.userId);
-    }
 
     return {
       seq,
@@ -2470,6 +2466,44 @@ export class AppDatabase {
       payload: params.payload,
       createdAt: now,
     };
+  }
+
+  pruneSyncEvents(userId: string): void {
+    const ownTransaction = !this.db.isTransaction;
+    if (ownTransaction) this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const cutoff = this.db.prepare(
+        'SELECT user_seq FROM sync_events WHERE user_id = ? ORDER BY user_seq DESC LIMIT 1 OFFSET 2000',
+      ).get(userId)?.user_seq;
+      if (typeof cutoff === 'number') {
+        // Old journals carry no event IDs, so their replay range stays retained
+        // until recovery can inspect it. New journals record exact expirations.
+        this.db.prepare(`
+          INSERT OR IGNORE INTO artifact_commit_outbox_expirations (commit_id, seq, event_id, expired_at)
+          SELECT journal.commit_id, event.seq, event.event_id, ?
+          FROM artifact_commit_journal journal
+          JOIN json_each(CASE WHEN json_valid(journal.audit_note) THEN journal.audit_note ELSE '{}' END, '$.syncEvents') ref
+          JOIN sync_events event
+            ON event.seq = json_extract(CASE WHEN ref.type = 'object' THEN ref.value END, '$.seq')
+           AND event.event_id = json_extract(CASE WHEN ref.type = 'object' THEN ref.value END, '$.eventId')
+           AND event.user_id = journal.user_id AND event.chat_id IS journal.chat_id AND event.project_id IS journal.project_id
+          WHERE journal.user_id = ? AND journal.state = 'db_committed' AND event.user_seq < ?
+        `).run(Date.now(), userId, cutoff);
+        this.db.prepare(`
+          DELETE FROM sync_events
+          WHERE user_id = ? AND user_seq < ? AND seq < COALESCE(
+            (SELECT MIN(sync_event_seq) FROM artifact_commit_journal
+             WHERE user_id = ? AND state = 'db_committed' AND
+               json_type(CASE WHEN json_valid(audit_note) THEN audit_note ELSE '{}' END, '$.syncEvents') IS NOT 'array'),
+            9223372036854775807
+          )
+        `).run(userId, cutoff, userId);
+      }
+      if (ownTransaction) this.db.exec('COMMIT;');
+    } catch (error) {
+      if (ownTransaction) this.db.exec('ROLLBACK;');
+      throw error;
+    }
   }
 
   appendSyncEvent(params: {

@@ -282,41 +282,62 @@ export function recoverPendingCommits(host: CommitRecoveryHost): RecoveryReport 
     report.rolledForward += 1;
   };
 
-  const broadcastPersistedSeqs = (userId: string, seqs: number[]) => {
-    for (const seq of seqs) {
-      const evRow = host.db.db
-        .prepare('SELECT * FROM sync_events WHERE seq = ? AND user_id = ?')
-        .get(seq, userId) as Record<string, unknown> | undefined;
-      if (evRow) {
-        host.hub.broadcastPersistedEvent({
-          seq: Number(evRow.seq),
-          userSeq: Number(evRow.user_seq ?? 0),
-          eventId: String(evRow.event_id),
-          userId: String(evRow.user_id),
-          type: String(evRow.event_type),
-          chatId: evRow.chat_id ? String(evRow.chat_id) : null,
-          projectId: evRow.project_id ? String(evRow.project_id) : null,
-          runId: evRow.run_id ? String(evRow.run_id) : null,
-          payload: JSON.parse(String(evRow.payload_json)),
-          createdAt: Number(evRow.created_at),
-        });
-      }
-    }
-  };
-
-  const extractDbCommittedSeqs = (j: ArtifactCommitJournalRow): number[] => {
-    if (j.auditNote) {
+  const readCommittedOutbox = (j: ArtifactCommitJournalRow) => {
+    let refs: Array<{ seq: unknown; eventId?: unknown }>;
+    if (j.auditNote !== null) {
       try {
-        const parsed = JSON.parse(j.auditNote) as { syncEventSeqs?: unknown };
-        if (Array.isArray(parsed.syncEventSeqs)) {
-          const valid = parsed.syncEventSeqs.filter((n): n is number => typeof n === 'number' && Number.isFinite(n));
-          if (valid.length > 0) return valid;
+        const audit = JSON.parse(j.auditNote);
+        if (Array.isArray(audit.syncEvents)) {
+          if (!audit.syncEvents.every((ref: unknown) => ref && typeof ref === 'object' &&
+            'eventId' in ref && typeof ref.eventId === 'string' && ref.eventId)) return null;
+          refs = audit.syncEvents;
+        } else if (Array.isArray(audit.syncEventSeqs)) {
+          refs = audit.syncEventSeqs.map((seq: unknown) => ({ seq }));
+        } else {
+          return null;
         }
       } catch {
-        // non-JSON audit note
+        return null;
+      }
+    } else {
+      if (j.syncEventSeq === null) return null;
+      refs = [{ seq: j.syncEventSeq }];
+    }
+    if (refs.length === 0) {
+      // A physical delete with no tracked artifact can legitimately emit no events.
+      return j.operationType === 'delete_sync_file' && j.syncEventSeq === null ? [] : null;
+    }
+    if (refs[0].seq !== j.syncEventSeq) return null;
+    const envelopes: ReturnType<AppDatabase['insertSyncEventInTx']>[] = [];
+    let previousSeq = 0;
+    for (const [i, { seq, eventId }] of refs.entries()) {
+      if (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq <= previousSeq) return null;
+      previousSeq = seq;
+      const ev = host.db.db.prepare('SELECT * FROM sync_events WHERE seq = ?').get(seq);
+      if (!ev) {
+        const expired = typeof eventId === 'string' && host.db.db.prepare(
+          'SELECT 1 FROM artifact_commit_outbox_expirations WHERE commit_id = ? AND seq = ? AND event_id = ?',
+        ).get(j.commitId, seq, eventId);
+        if (expired) continue;
+        return null;
+      }
+      if (ev.user_id !== j.userId || ev.chat_id !== j.chatId || ev.project_id !== j.projectId ||
+          (eventId !== undefined && eventId !== ev.event_id)) return null;
+      try {
+        const payload = JSON.parse(String(ev.payload_json));
+        if (!j.operationType.startsWith('delete_') && i === refs.length - 1 &&
+            (ev.event_type !== (j.isCreate ? 'artifact.created' : 'artifact.updated') ||
+            payload?.artifact?.id !== j.artifactId || payload.artifact.revision !== j.targetRevision)) return null;
+        envelopes.push({
+          seq, userSeq: Number(ev.user_seq), eventId: String(ev.event_id), userId: j.userId,
+          type: String(ev.event_type), chatId: j.chatId, projectId: j.projectId,
+          runId: ev.run_id ? String(ev.run_id) : null, payload, createdAt: Number(ev.created_at),
+        });
+      } catch {
+        return null;
       }
     }
-    return j.syncEventSeq !== null ? [j.syncEventSeq] : [];
+    return envelopes;
   };
 
   const rollForwardDeleteToT6 = (j: ArtifactCommitJournalRow, performPartialCleanup: boolean) => {
@@ -353,7 +374,15 @@ export function recoverPendingCommits(host: CommitRecoveryHost): RecoveryReport 
 
     // 1. db_committed: verify outbox sync_event(s) exist, broadcast if needed, delete completed journal
     if (j.state === 'db_committed') {
-      broadcastPersistedSeqs(j.userId, extractDbCommittedSeqs(j));
+      const outbox = readCommittedOutbox(j);
+      if (!outbox) {
+        // A gap in replay history cannot prove that this commit's event ever existed.
+        // Preserve the journal and completed revisions for diagnosis and retry.
+        console.error('[artifact-recovery] Cannot verify committed outbox', j.commitId, j.syncEventSeq);
+        report.quarantined += 1;
+        continue;
+      }
+      for (const envelope of outbox) host.hub.broadcastPersistedEvent(envelope);
       host.db.db.prepare('DELETE FROM artifact_commit_journal WHERE commit_id = ?').run(j.commitId);
       report.completedOutbox += 1;
       continue;

@@ -147,6 +147,9 @@ export class SyncHub {
 
   /** Broadcast an already-persisted outbox event (e.g., committed in ArtifactService Stage T6). */
   broadcastPersistedEvent(envelope: SyncEventEnvelope): void {
+    if (envelope.userSeq % 100 === 0 && !this.db.db.isTransaction) {
+      this.db.pruneSyncEvents(envelope.userId);
+    }
     const set = this.connections.get(envelope.userId);
     if (!set || set.size === 0) return;
     const json = JSON.stringify({
