@@ -20,9 +20,10 @@ export function inspectArtifactTarget<T>(job: InspectionJob): Promise<T> {
     const baseBytes = 'baseSnapshot' in job ? job.baseSnapshot?.sizeBytes ?? 0 : 0;
     const totalInputMb = (Math.min(sourceBytes, maxInput) + Math.min(baseBytes, maxInput)) / 1024 ** 2;
     const document = /\.(pdf|docx|pptx|xlsx)$/i.test(job.file.filename);
+    const media = ['audio', 'video', 'image'].includes(job.file.previewKind);
     // Small documents remain inspectable on Base hosts. The archive/parser
     // budgets still apply independently of this per-job RSS allowance.
-    const rssLimit = Math.min(MAX_INSPECTION_RSS_MB, Math.ceil((document ? 256 : 128) + totalInputMb * (document ? 100 : 24)));
+    const rssLimit = Math.min(MAX_INSPECTION_RSS_MB, Math.ceil((document || media ? 256 : 192) + totalInputMb * (document ? 100 : 24)));
     const physicalAvailable = readMemAvailableMb() ?? Infinity;
     const processAvailable = process.availableMemory() / 1024 ** 2;
     if (Math.min(physicalAvailable, processAvailable || Infinity) < rssLimit + 128) {

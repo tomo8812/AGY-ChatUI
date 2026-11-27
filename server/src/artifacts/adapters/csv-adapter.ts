@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { ArtifactError, unsupportedOperationError } from '../errors.js';
@@ -632,10 +633,31 @@ export class CsvAdapter implements FormatAdapter {
         selectedCounts.set(key, count + 1);
       }
     }
-    if (columnOnly) return sha256Text(JSON.stringify(rows));
     if (rowOnly) return sha256Text(JSON.stringify(rows.slice(startRow, endRow + 1)));
-    const startCol = Number(selector.startCol);
-    const endCol = Number(selector.endCol);
+    const startCol = Number(columnOnly ? selector.start : selector.startCol);
+    const endCol = Number(columnOnly ? selector.end : selector.endCol);
+    const distinctHeaders = new Set(rows[0]?.slice(startCol, endCol + 1));
+    const columns = new Map<number, ReturnType<typeof createHash>>();
+    for (const [rowIndex, row] of rows.entries()) {
+      for (const [col, cell] of row.entries()) {
+        if (rows[0]?.[col] !== undefined && !distinctHeaders.has(rows[0][col])) continue;
+        let hash = columns.get(col);
+        if (!hash) {
+          hash = createHash('sha256');
+          columns.set(col, hash);
+        }
+        hash.update(JSON.stringify([rowIndex, cell])).update('\n');
+      }
+    }
+    const signatures = new Map<string, number>();
+    const selected: string[] = [];
+    for (const [col, hash] of columns) {
+      const fingerprint = hash.digest('hex');
+      signatures.set(fingerprint, (signatures.get(fingerprint) ?? 0) + 1);
+      if (col >= startCol && col <= endCol) selected.push(fingerprint);
+    }
+    if (selected.length !== endCol - startCol + 1 || selected.some(fingerprint => signatures.get(fingerprint) !== 1)) return null;
+    if (columnOnly) return sha256Text(JSON.stringify(rows));
     return sha256Text(JSON.stringify(rows.map((row, index) =>
       index >= startRow && index <= endRow ? row : row.slice(startCol, endCol + 1))));
   }
