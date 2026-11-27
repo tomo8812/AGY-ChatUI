@@ -1378,6 +1378,10 @@ def update_workbook_cell(package, operation, replacements, additions=None):
             raise ValueError("Invalid typed cell value")
         numeric_literal = checked_xlsx_number(value)
     elif op == "xlsx.set_cell" and type(value) in (int, float):
+        # A JSON number above the safe-integer limit may already have rounded
+        # during REST or MCP decoding. Exact large numbers need a decimal lexeme.
+        if abs(value) > 2**53 - 1:
+            raise ValueError("Large XLSX numbers require a decimal string with valueType number")
         numeric_literal = checked_xlsx_number(str(value))
     if type(value) not in (str, bool, int, float, type(None)):
         raise ValueError("Expected a scalar cell value")

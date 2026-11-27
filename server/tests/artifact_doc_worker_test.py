@@ -605,6 +605,7 @@ class DocumentWorkerTest(unittest.TestCase):
             {"op": "xlsx.set_cell", "sheetPart": sheet_part, "address": "A3", "value": "1.2345e-12", "valueType": "number"},
             {"op": "xlsx.set_cell", "sheetPart": sheet_part, "address": "A4", "value": False},
             {"op": "xlsx.set_cell", "sheetPart": sheet_part, "address": "A5", "value": ""},
+            {"op": "xlsx.set_cell", "sheetPart": sheet_part, "address": "A6", "value": "1e17", "valueType": "number"},
         ])
         sheet = load_workbook(io.BytesIO(result)).active
         self.assertEqual((sheet["A1"].data_type, sheet["A1"].value), ("s", "9007199254740993"))
@@ -612,13 +613,18 @@ class DocumentWorkerTest(unittest.TestCase):
         self.assertEqual((sheet["A3"].data_type, sheet["A3"].value), ("n", 1.2345e-12))
         self.assertEqual((sheet["A4"].data_type, sheet["A4"].value), ("b", False))
         self.assertEqual((sheet["A5"].data_type, sheet["A5"].value), ("s", ""))
+        self.assertEqual((sheet["A6"].data_type, sheet["A6"].value), ("n", 1e17))
         original = self.source.read_bytes()
-        with self.assertRaises(subprocess.CalledProcessError):
-            self.run_worker("xlsx", "edit", operations=[
-                {"op": "xlsx.set_cell", "sheetPart": sheet_part, "address": "A1", "value": "9007199254740993", "valueType": "number"},
-            ])
-        self.assertEqual(self.source.read_bytes(), original)
-        self.assertFalse(self.result.exists())
+        for invalid_value in [
+            {"value": "9007199254740993", "valueType": "number"},
+            {"value": 100000000000000000},
+        ]:
+            with self.subTest(invalid_value=invalid_value), self.assertRaises(subprocess.CalledProcessError):
+                self.run_worker("xlsx", "edit", operations=[
+                    {"op": "xlsx.set_cell", "sheetPart": sheet_part, "address": "A1", **invalid_value},
+                ])
+            self.assertEqual(self.source.read_bytes(), original)
+            self.assertFalse(self.result.exists())
 
     def test_pdf_merges_source_pages_without_rewriting_sources(self):
         first = self.run_worker("pdf", "create", params={"pages": ["One"]})
