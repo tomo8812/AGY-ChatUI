@@ -4,6 +4,7 @@ export interface PdfPageSpec {
   width: number;
   height: number;
   label?: string;
+  rotate?: 90 | 180 | 270;
 }
 
 /**
@@ -40,7 +41,7 @@ export function buildSyntheticPdf(pages: readonly PdfPageSpec[]): Buffer {
     const pageObjId = objects.length + 1;
     pageObjIds.push(pageObjId);
     objects.push(
-      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${spec.width} ${spec.height}] /Resources << /Font << /F1 3 0 R >> >> /Contents ${contentObjId} 0 R >>`
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${spec.width} ${spec.height}]${spec.rotate ? ` /Rotate ${spec.rotate}` : ''} /Resources << /Font << /F1 3 0 R >> >> /Contents ${contentObjId} 0 R >>`
     );
   }
 

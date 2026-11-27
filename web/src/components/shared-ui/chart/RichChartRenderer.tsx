@@ -2,6 +2,7 @@ import React from 'react';
 import { extent, sum } from 'd3-array';
 import { scaleLinear, scaleBand } from 'd3-scale';
 import { arc as d3Arc, line as d3Line, area as d3Area } from 'd3-shape';
+import { resolveRichChartPoint } from '../../../../../shared/rich-chart-display';
 import type { RichChartNode, RichChartDatum } from '../../../../../shared/rich-schema';
 import type { RichEvalContext } from '../RichExprEvaluator';
 import { formatDisplayDate, parseDisplayDate } from '../display/formatDate';
@@ -55,11 +56,8 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
       node.chartType === 'scatter' ? 'scatter' : node.chartType.includes('area') ? 'area' :
       node.chartType.includes('bar') ? 'bar' : 'line',
     right: s.yAxisId === 'right', unit: s.unit, sourceId: s.sourceId, asOf: text(val(s.asOf)),
-    points: safeArray<number | null | RichChartDatum>(val(s.data), cycle).map((p, i) => {
-      const d = p && typeof p === 'object' ? p : { y: p };
-      return { ...d, x: 'x' in d && (typeof d.x === 'number' || typeof d.x === 'string') ? d.x : categories[i] ?? i + 1,
-        y: finite(d.y) ? d.y : null };
-    }),
+    points: safeArray<number | null | RichChartDatum>(val(s.data), cycle)
+      .map((point, index) => resolveRichChartPoint(point, categories, index)),
   }));
   const interactive = Boolean(node.selectedPointBind || node.onPointSelect?.length);
   const choose = (s: Series, p: Point, i: number) => {

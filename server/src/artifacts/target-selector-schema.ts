@@ -91,10 +91,10 @@ const fields = {
   audio_time_range: media,
   rich_block: { ...rich, expectedDocHash: hash },
   rich_node: { ...rich, nodeId: text, expectedNodeType: text, expectedNodeFingerprint: hash },
-  rich_repeat_item: { ...rich, repeatNodeId: text, itemKey: id.optional(), itemIndex: index, expectedItemHash: hash, expectedListOrderHash: hash },
+  rich_repeat_item: { ...rich, repeatNodeId: text, itemKey: id.optional(), itemIndex: index, expectedItemHash: hash, expectedListOrderHash: hash, expectedDisplayFingerprint: hash.optional() },
   rich_svg_element: { ...rich, svgNodeId: text, elementId: text.optional(), expectedTag: text, expectedElementFingerprint: hash },
-  rich_chart_series: { ...rich, chartNodeId: text, seriesKey: text, dataIndex: index.optional(), expectedSeriesFingerprint: hash },
-  rich_table_cell: { ...rich, tableNodeId: text, ...cell, col: text, expectedRowKey: id.optional(), expectedRowHash: hash.optional(), expectedRowOrderHash: hash.optional() },
+  rich_chart_series: { ...rich, chartNodeId: text, seriesKey: text, dataIndex: index.optional(), expectedSeriesFingerprint: hash, expectedDisplayFingerprint: hash.optional() },
+  rich_table_cell: { ...rich, tableNodeId: text, ...cell, col: text, expectedRowKey: id.optional(), expectedRowHash: hash.optional(), expectedRowOrderHash: hash.optional(), expectedDisplayFingerprint: hash.optional() },
 } satisfies Record<string, z.ZodRawShape>;
 
 const schemas = new Map(Object.entries(fields).map(([kind, shape]) =>
@@ -136,7 +136,7 @@ const futureOfficeSelectors = new Set([
 ]);
 
 export function selectorIsAvailable(selector: TargetSelector): boolean {
-  return !futureOfficeSelectors.has(selector.kind);
+  return selectorKindIsAvailable(selector.kind);
 }
 
 export function selectorMatchesFormat(selector: TargetSelector, format: string): boolean {
@@ -145,4 +145,24 @@ export function selectorMatchesFormat(selector: TargetSelector, format: string):
   if (format === 'media') return prefix === 'audio' || prefix === 'video';
   if (format === 'rich_block') return prefix === 'rich';
   return prefix === format;
+}
+
+
+export function selectorsForFormat(format: string, filename: string, previewKind: string): string[] {
+  // These legacy Office containers have viewers but cannot be resolved by the
+  // OOXML target readers. A file extension is checked on the same path as admission.
+  if ((format === 'pptx' || format === 'docx' || format === 'xlsx') &&
+      !filename.toLowerCase().endsWith('.' + format)) return [];
+  const accepted = format === 'markdown' ? 'md'
+    : format === 'media' ? previewKind : format === 'rich_block' ? 'rich' : format;
+  return Object.keys(fields).filter(kind => kind.startsWith(accepted + '_') &&
+    (format !== 'media' || accepted === 'audio' || accepted === 'video'));
+}
+
+export function selectorHasDirectUi(kind: string): boolean {
+  return /^(?:pptx_(?:slide|element)|docx_paragraph|xlsx_range|pdf_(?:page|pin|region|text_range)|csv_range|md_text_range|code_(?:line|char)_range)$/.test(kind);
+}
+
+export function selectorKindIsAvailable(kind: string): boolean {
+  return !futureOfficeSelectors.has(kind);
 }

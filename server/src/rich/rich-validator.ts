@@ -1363,7 +1363,7 @@ export function compileRichDynamicPlan(
 export function richTargetDisplayIdentity(
   plan: RichDynamicPlan,
   target: unknown,
-  context: { state: Record<string, unknown>; computed: Record<string, unknown>; theme: 'light' | 'dark' },
+  context: { state: Record<string, unknown>; computed: Record<string, unknown>; theme: 'light' | 'dark'; item?: unknown; index?: number; aliases?: Record<string, unknown> },
 ) {
   const deps = emptyDeps();
   const budget = createRichEvalBudget();

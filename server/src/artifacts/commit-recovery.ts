@@ -72,6 +72,7 @@ function parseStagingIsolationMode(raw: unknown): StagingIsolationKind | null {
 function mapJournalRow(r: Record<string, unknown>): ArtifactCommitJournalRow {
   return {
     commitId: String(r.commit_id),
+    finalization: r.finalization_json ? JSON.parse(String(r.finalization_json)) : undefined,
     artifactId: String(r.artifact_id),
     userId: String(r.user_id),
     chatId: r.chat_id ? String(r.chat_id) : null,
@@ -239,6 +240,11 @@ export function recoverPendingCommits(host: CommitRecoveryHost): RecoveryReport 
     markTerminal(j, 'ambiguous_quarantined', note, syncExternalAfter);
 
   const rollForwardToT6 = (j: ArtifactCommitJournalRow, rootDir: string | null) => {
+    if ((j.operationType === 'reflect_from_chat_working_copy' && !j.finalization?.updateWorkingCopyId) ||
+        (j.operationType === 'project_sync' && (!j.finalization?.sourceArtifactId || j.finalization.sourceBaseRevision == null))) {
+      markQuarantined(j, 'project_provenance_missing_from_legacy_journal');
+      return;
+    }
     let envelopes: ReturnType<AppDatabase['insertSyncEventInTx']>[];
     host.db.db.exec('BEGIN IMMEDIATE;');
     try {
@@ -294,16 +300,20 @@ export function recoverPendingCommits(host: CommitRecoveryHost): RecoveryReport 
         if (expired) continue;
         return null;
       }
-      if (ev.user_id !== j.userId || ev.chat_id !== j.chatId || ev.project_id !== j.projectId ||
-          (eventId !== undefined && eventId !== ev.event_id)) return null;
+      if (ev.user_id !== j.userId || (eventId !== undefined && eventId !== ev.event_id)) return null;
       try {
         const payload = JSON.parse(String(ev.payload_json));
+        const reflectedCopy = j.finalization?.updateWorkingCopyId &&
+          ev.event_type === 'artifact.updated' && ev.project_id === null && payload?.artifact?.chatId === ev.chat_id &&
+          payload.artifact.id === j.finalization.updateWorkingCopyId &&
+          payload.artifact.sourceArtifactId === j.artifactId && payload.artifact.sourceBaseRevision === j.targetRevision;
+        if (!reflectedCopy && (ev.chat_id !== j.chatId || ev.project_id !== j.projectId)) return null;
         if (!j.operationType.startsWith('delete_') && i === refs.length - 1 &&
             (ev.event_type !== (j.isCreate ? 'artifact.created' : 'artifact.updated') ||
             payload?.artifact?.id !== j.artifactId || payload.artifact.revision !== j.targetRevision)) return null;
         envelopes.push({
           seq, userSeq: Number(ev.user_seq), eventId: String(ev.event_id), userId: j.userId,
-          type: String(ev.event_type), chatId: j.chatId, projectId: j.projectId,
+          type: String(ev.event_type), chatId: ev.chat_id ? String(ev.chat_id) : null, projectId: ev.project_id ? String(ev.project_id) : null,
           runId: ev.run_id ? String(ev.run_id) : null, payload, createdAt: Number(ev.created_at),
         });
       } catch {
@@ -343,8 +353,8 @@ export function recoverPendingCommits(host: CommitRecoveryHost): RecoveryReport 
   };
 
   for (const raw of rows) {
-    const j = mapJournalRow(raw);
     try {
+      const j = mapJournalRow(raw);
 
       if (j.state === 'aborted' || j.state === 'ambiguous_quarantined') {
         const audit = JSON.parse(j.auditNote!);
@@ -519,7 +529,7 @@ export function recoverPendingCommits(host: CommitRecoveryHost): RecoveryReport 
     } catch (error) {
       // Preserve the journal so transient I/O errors can be retried without
       // reclassifying the commit or losing an external change.
-      console.error('[artifact-recovery] Commit recovery deferred', j.commitId, error);
+      console.error('[artifact-recovery] Commit recovery deferred', raw.commit_id, error);
       report.quarantined += 1;
     }
   }

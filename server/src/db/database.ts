@@ -885,6 +885,30 @@ export class AppDatabase {
     if (!journalCols.some((col) => col.name === 'staging_isolation_mode')) {
       this.db.exec('ALTER TABLE artifact_commit_journal ADD COLUMN staging_isolation_mode TEXT;');
     }
+    if (!journalCols.some((col) => col.name === 'finalization_json')) {
+      this.db.exec('ALTER TABLE artifact_commit_journal ADD COLUMN finalization_json TEXT;');
+    }
+    const provenanceCols = this.db.prepare('PRAGMA table_info(artifacts)').all();
+    if (!provenanceCols.some(col => col.name === 'deleted_source_artifact_id')) {
+      this.db.exec(`
+        BEGIN IMMEDIATE;
+        ALTER TABLE artifacts ADD COLUMN deleted_source_artifact_id TEXT;
+        ALTER TABLE artifacts ADD COLUMN deleted_source_base_revision INTEGER;
+        COMMIT;
+      `);
+    }
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS preserve_artifact_source_before_delete
+      BEFORE DELETE ON artifacts
+      BEGIN
+        UPDATE artifacts
+        SET deleted_source_artifact_id = OLD.id,
+            deleted_source_base_revision = source_base_revision,
+            source_artifact_id = NULL,
+            source_base_revision = NULL
+        WHERE source_artifact_id = OLD.id AND user_id = OLD.user_id;
+      END;
+    `);
     const requestCols = this.db.prepare('PRAGMA table_info(ai_edit_requests)').all();
     if (!requestCols.some(col => col.name === 'sort_order')) {
       this.db.exec(`
@@ -2264,10 +2288,8 @@ export class AppDatabase {
       deletedOnDisk: Boolean(r.deleted_on_disk),
       revision: r.revision !== undefined && r.revision !== null ? Number(r.revision) : 1,
       dependencyManifestHash: r.dependency_manifest_hash ? String(r.dependency_manifest_hash) : null,
-      sourceArtifactId: r.source_artifact_id ? String(r.source_artifact_id) : null,
-      sourceBaseRevision: r.source_base_revision !== undefined && r.source_base_revision !== null
-        ? Number(r.source_base_revision)
-        : null,
+      sourceArtifactId: (r.source_artifact_id ?? r.deleted_source_artifact_id ?? null) as string | null,
+      sourceBaseRevision: (r.source_base_revision ?? r.deleted_source_base_revision ?? null) as number | null,
       createdAt: Number(r.created_at),
       updatedAt: Number(r.updated_at),
     };

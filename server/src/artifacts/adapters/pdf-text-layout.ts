@@ -9,6 +9,7 @@ interface PdfTextItem {
 
 export interface PdfTextLayout {
   text: string;
+  runs: ReadonlyArray<{ itemIndex: number; start: number; text: string; trimStart: number }>;
   widthPt: number;
   heightPt: number;
   quadsForRange(start: number, end: number): number[][] | null;
@@ -21,17 +22,20 @@ export function pdfTextLayout(
   glyphFractions?: (item: PdfTextItem, from: number, to: number) => [number, number] | null,
 ): PdfTextLayout {
   let text = '';
-  const runs: Array<{ item: PdfTextItem; start: number; text: string; trimStart: number }> = [];
+  const runs: Array<{ item: PdfTextItem; itemIndex: number; start: number; text: string; trimStart: number }> = [];
+  let itemIndex = -1;
   for (const item of items) {
-    if (!('str' in item) || !item.str.trim()) continue;
+    if (!('str' in item)) continue;
+    itemIndex++;
+    if (!item.str.trim()) continue;
     const value = item.str.trim();
     if (text) text += ' ';
-    runs.push({ item, start: text.length, text: value, trimStart: item.str.length - item.str.trimStart().length });
+    runs.push({ item, itemIndex, start: text.length, text: value, trimStart: item.str.length - item.str.trimStart().length });
     text += value;
   }
 
   return {
-    text, widthPt: viewport.width, heightPt: viewport.height,
+    text, runs, widthPt: viewport.width, heightPt: viewport.height,
     quadsForRange(start, end) {
       if (start < 0 || end <= start || end > text.length) return null;
       const quads: number[][] = [];

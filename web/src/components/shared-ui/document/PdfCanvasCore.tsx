@@ -1,5 +1,6 @@
 import React,{useCallback,useEffect,useLayoutEffect,useMemo,useRef,useState} from 'react';
 import type * as PdfJsTypes from 'pdfjs-dist';
+import { pdfTextLayout } from '../../../../../server/src/artifacts/adapters/pdf-text-layout';
 import {PdfNavigationPanel,type PdfTextSelection} from './PdfNavigationPanel';
 import {useUnifiedViewerZoom,type ZoomAnchorAdapter} from '../../../hooks/useUnifiedViewerZoom';
 import {computeStepZoomScale} from '../../../utils/contentZoom';
@@ -132,8 +133,65 @@ export type PdfLocation={pageIndex:number;pageCount:number;x:number;y:number;wid
 type LocationSelection='pin'|'region';
 type SelectionPoint={x:number;y:number};
 
+type CanvasTextSelection = PdfTextSelection & { page: number };
+const canvasTextByLayer = new WeakMap<Element, string>();
+
+function PdfPageTextLayer({ doc, pageNumber }: { doc: PdfJsTypes.PDFDocumentProxy; pageNumber: number }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const container = ref.current!;
+    let canceled = false;
+    let layer: PdfJsTypes.TextLayer | undefined;
+    void (async () => {
+      const [pdfjs, page] = await Promise.all([loadPdfJs(), doc.getPage(pageNumber)]);
+      const textContent = await page.getTextContent();
+      if (canceled) return;
+      const viewport = page.getViewport({ scale: 1 });
+      container.style.setProperty('--pdf-user-unit', String(page.userUnit));
+      layer = new pdfjs.TextLayer({ container, textContentSource: textContent, viewport });
+      await layer.render();
+      if (canceled) return;
+      const layout = pdfTextLayout(textContent.items, viewport);
+      canvasTextByLayer.set(container, layout.text);
+      for (const run of layout.runs) {
+        const span = layer.textDivs[run.itemIndex];
+        if (!span || layer.textContentItemsStr[run.itemIndex]?.slice(run.trimStart, run.trimStart + run.text.length) !== run.text) continue;
+        span.dataset.pdfTextStart = String(run.start);
+        span.dataset.pdfTextTrim = String(run.trimStart);
+        span.dataset.pdfTextLength = String(run.text.length);
+      }
+    })().catch(() => { if (!canceled) container.replaceChildren(); });
+    return () => { canceled = true; layer?.cancel(); canvasTextByLayer.delete(container); container.replaceChildren(); };
+  }, [doc, pageNumber]);
+  return <div className="pdf-page-text-viewport"><div ref={ref} className="pdf-page-text" /></div>;
+}
+
+function readCanvasTextSelection(viewer: HTMLElement | null): CanvasTextSelection | null {
+  const selection = window.getSelection();
+  if (!viewer || !selection || selection.isCollapsed || selection.rangeCount !== 1) return null;
+  const range = selection.getRangeAt(0);
+  const endpoint = (node: Node, offset: number) => {
+    const element = node instanceof HTMLElement ? node : node.parentElement;
+    const span = element?.closest<HTMLElement>('[data-pdf-text-start]');
+    const layer = span?.closest('.pdf-page-text');
+    if (!span || !layer || !viewer.contains(layer) || (node !== span && node.parentNode !== span)) return null;
+    const rawOffset = node === span ? (offset === 0 ? 0 : span.textContent!.length) : offset;
+    const { pdfTextStart, pdfTextTrim, pdfTextLength } = span.dataset;
+    const local = Math.max(0, Math.min(Number(pdfTextLength), rawOffset - Number(pdfTextTrim)));
+    return { layer, position: Number(pdfTextStart) + local };
+  };
+  const from = endpoint(range.startContainer, range.startOffset);
+  const to = endpoint(range.endContainer, range.endOffset);
+  if (!from || !to || from.layer !== to.layer || from.position >= to.position) return null;
+  const page = Number(from.layer.closest<HTMLElement>('[data-page-number]')?.dataset.pageNumber);
+  if (!Number.isSafeInteger(page) || page <= 0) return null;
+  const text = canvasTextByLayer.get(from.layer)?.slice(from.position, to.position);
+  return text ? { text, start: from.position, end: to.position, page } : null;
+}
+
 interface PdfPageSlotProps {
   pageNum: number;
+  textDocument?: PdfJsTypes.PDFDocumentProxy;
   naturalWidth: number;
   naturalHeight: number;
   autoScale: number;
@@ -149,7 +207,7 @@ interface PdfPageSlotProps {
  * per-page inline styles.
  */
 const PdfPageSlot: React.FC<PdfPageSlotProps> = React.memo(
-  ({ pageNum, naturalWidth, naturalHeight, autoScale, registerPageEl, selectionMode, onLocation }) => {
+  ({ pageNum, textDocument, naturalWidth, naturalHeight, autoScale, registerPageEl, selectionMode, onLocation }) => {
     const slotRef = useRef<HTMLDivElement | null>(null);
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const start=useRef<SelectionPoint|null>(null);
@@ -202,6 +260,7 @@ const PdfPageSlot: React.FC<PdfPageSlotProps> = React.memo(
         style={slotStyle}
       >
         <canvas ref={setCanvasRef} />
+        {textDocument && <PdfPageTextLayer doc={textDocument} pageNumber={pageNum} />}
         {selectionMode&&<div
           className="pdf-location-overlay" role="button" tabIndex={0}
           aria-label={'ページ '+pageNum+(selectionMode==='pin'?'のピン位置':'の範囲')}
@@ -261,6 +320,7 @@ export const PdfCanvasViewer: React.FC<{
   onSelectLocation?:(location:PdfLocation,readPage:()=>Promise<string>)=>void;
 }> = React.memo(({ url, documentKey = url, onSelectPage, enhancedNavigation=false, selectionMode, onSelectLocation, jumpLocation }) => {
   const [navigation,setNavigation]=useState(false);
+  const [selectedPageText, setSelectedPageText] = useState<CanvasTextSelection | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
   const pagesListRef = useRef<HTMLDivElement | null>(null);
@@ -1070,7 +1130,7 @@ export const PdfCanvasViewer: React.FC<{
     minScale: manualMinScale,
     maxScale: PDF_MANUAL_MAX_SCALE,
     enableDragPan: true,
-    dragPanMode: 'direct',
+    dragPanMode: 'modifier-or-surface',
     onCommitScale: handleCommitScale,
     onGestureStart: handleGestureStart,
     onGestureEnd: handleGestureEnd,
@@ -1116,6 +1176,14 @@ export const PdfCanvasViewer: React.FC<{
     };
   }, []);
 
+  useEffect(() => {
+    setSelectedPageText(null);
+    if (!onSelectPage || selectionMode) return;
+    const capture = () => setSelectedPageText(readCanvasTextSelection(scrollRef.current));
+    document.addEventListener('selectionchange', capture);
+    return () => document.removeEventListener('selectionchange', capture);
+  }, [pdfDoc, Boolean(onSelectPage), selectionMode]);
+
   const readPageIdentity=async(index:number)=>{
     if(!pdfDoc)throw Error('PDF が読み込まれていません。');
     const page=await pdfDoc.getPage(index+1);
@@ -1157,6 +1225,12 @@ export const PdfCanvasViewer: React.FC<{
           {onSelectPage && <button type="button" className="btn btn-secondary btn-xs" disabled={!numPages}
             onClick={() => onSelectPage(pageNumRef.current - 1, numPages, undefined, ()=>readPageIdentity(pageNumRef.current-1))}>ページを対象にする</button>}
         </div>
+        {onSelectPage && selectedPageText && <button type="button" className="btn btn-secondary btn-xs"
+          onPointerDown={event => event.preventDefault()}
+          onClick={() => {
+            const index = selectedPageText.page - 1;
+            onSelectPage(index, numPages, selectedPageText, () => readPageIdentity(index));
+          }}>選択本文を対象にする</button>}
         <div className="pdf-toolbar-group pdf-zoom-group">
           <button
             type="button"
@@ -1221,6 +1295,7 @@ export const PdfCanvasViewer: React.FC<{
               <PdfPageSlot
                 key={`${url}:${spec.pageNum}`}
                 pageNum={spec.pageNum}
+                textDocument={Math.abs(spec.pageNum - pageNum) <= 2 ? pdfDoc : undefined}
                 naturalWidth={spec.naturalWidth}
                 naturalHeight={spec.naturalHeight}
                 autoScale={spec.autoScale}

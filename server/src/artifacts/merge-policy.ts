@@ -59,8 +59,11 @@ export function evaluateSemanticNonInterference(
   }
 
   const setA = new Set(keysA);
+  const sheetsWithCellsA = fmt === 'xlsx' ? new Set(keysA.filter(key => key.includes('#')).map(key => key.split('#')[0])) : null;
   for (const k of keysB) {
-    if (setA.has(k)) {
+    const overlap = setA.has(k) || (sheetsWithCellsA !== null &&
+      (k.includes('#') ? setA.has(k.split('#')[0]) : sheetsWithCellsA.has(k)));
+    if (overlap) {
       return { mergeable: false, reason: `overlapping_region_${k}` };
     }
   }

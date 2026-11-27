@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import type { AppDatabase } from '../db/database.js';
 import type { SyncHub } from '../sync/hub.js';
 import { detectArtifactFormat } from '../artifacts/adapters/registry.js';
+import { pointRegionPt } from '../artifacts/region-png.js';
 import type { ArtifactService } from '../artifacts/artifact-service.js';
 import { ArtifactError, unsupportedOperationError } from '../artifacts/errors.js';
 import type { TargetResolutionResult, TargetSelector } from '../artifacts/types.js';
@@ -165,7 +166,8 @@ export class EditRequestService {
       ? this.richContentService.getBlock(target.userId, target.chatId, target.richBlockId)?.uiStateSnapshot
       : null;
     const viewStateSnapshot = target.richBlockId ? readRichViewSnapshot(details.viewStateSnapshot ?? savedState) : null;
-    const result = await this.resolveRequestTarget({ ...target, viewStateSnapshot });
+    const { expectedDisplayFingerprint: _storedDisplay, ...submittedSelector } = target.selector;
+    const result = await this.resolveRequestTarget({ ...target, selector: submittedSelector, viewStateSnapshot });
     if (result.status !== 'resolved') throw targetConflict();
     const positions = [['startLine', 'startLine'], ['blockIndex', 'resolvedBlockIndex']] as const;
     for (const [selectorField, resolvedField] of positions) {
@@ -175,6 +177,16 @@ export class EditRequestService {
     let selector = target.selector;
     let contentCoords = result.resolvedCoords ?? null;
     let range = result.resolvedRange ?? null;
+    if (selector.kind === 'csv_row_col' && selector.expectedHeaderHash === undefined) {
+      const expectedHeaderHash = result.resolvedRange?.expectedHeaderHash;
+      if (typeof expectedHeaderHash !== 'string') throw targetConflict();
+      selector = { ...selector, expectedHeaderHash };
+    }
+    if (['rich_repeat_item', 'rich_chart_series', 'rich_table_cell'].includes(selector.kind)) {
+      const expectedDisplayFingerprint = result.resolvedRange?.displayFingerprint;
+      if (typeof expectedDisplayFingerprint !== 'string') throw targetConflict();
+      selector = { ...selector, expectedDisplayFingerprint };
+    }
     if (selector.kind === 'rich_table_cell' && result.resolvedRange) {
       selector = { ...selector, expectedRowHash: result.resolvedRange.rowHash, expectedRowOrderHash: result.resolvedRange.rowOrderHash };
     }
@@ -193,7 +205,8 @@ export class EditRequestService {
         throw targetConflict();
       }
       selector = { ...selector, pointPt: { xPt, yPt, widthPt, heightPt } };
-      contentCoords = { pageIndex, unit, xPt, yPt, widthPt, heightPt };
+      const point = { xPt, yPt, widthPt, heightPt };
+      contentCoords = { pageIndex, unit, ...point, region: pointRegionPt(point) };
       if (range) range = { ...range, selector };
     }
     return {

@@ -1,3 +1,4 @@
+import { parentPort, workerData } from 'node:worker_threads';
 import { inspectMediaMetadata, inspectVideoTarget } from './adapters/media-target.js';
 import { inspectPdfText } from './adapters/pdf-text-inspection.js';
 import fs from 'node:fs';
@@ -148,6 +149,7 @@ async function inspect(job: InspectionJob) {
     try {
       const base = job.baseSnapshot.sha256 === source.sha256 ? source.buffer : readSnapshot(job.baseSnapshot, maxBytes);
       const { headerHash } = adapter.getStructure(base, job.file);
+      if (typeof headerHash !== 'string') return { status: 'needs_review', reason: 'base_revision_target_unverified' };
       selector = { ...selector, expectedHeaderHash: headerHash };
       if (adapter.resolveTarget(base, selector, job.file).status !== 'resolved') {
         return { status: 'needs_review', reason: 'base_revision_target_unverified' };
@@ -163,7 +165,11 @@ async function inspect(job: InspectionJob) {
     try {
       const latest = openContainedRegularFileNoFollow(job.rootDir, job.file.relPath);
       try {
-        if (fingerprintsMatch(source.fingerprint, latest.fingerprint)) return result;
+        if (fingerprintsMatch(source.fingerprint, latest.fingerprint)) {
+          return selector !== job.selector
+            ? { ...result, resolvedRange: { ...result.resolvedRange, expectedHeaderHash: selector.expectedHeaderHash } }
+            : result;
+        }
       } finally {
         fs.closeSync(latest.fd);
       }
@@ -175,10 +181,14 @@ async function inspect(job: InspectionJob) {
   return result;
 }
 
-process.once('message', async (job: InspectionJob) => {
-  let response;
+
+export type InspectionResponse = { result: unknown } |
+  { error: { code: string; message: string; statusCode: number; details?: Record<string, unknown> } };
+
+if (parentPort) {
+  let response: InspectionResponse;
   try {
-    const result = await inspect(job);
+    const result = await inspect(workerData as InspectionJob);
     if (Buffer.byteLength(JSON.stringify(result)) > MAX_INSPECTION_OUTPUT_BYTES) {
       throw new ArtifactError('TARGET_INSPECTION_OUTPUT_LIMIT', '対象の解析結果が上限を超えました。', 413);
     }
@@ -188,5 +198,6 @@ process.once('message', async (job: InspectionJob) => {
       ? { code: error.code, message: error.message, statusCode: error.statusCode, details: error.details }
       : { code: 'TARGET_INSPECTION_FAILED', message: '対象の構造を読み取れません。', statusCode: 422 } };
   }
-  process.send!(response, () => process.disconnect());
-});
+  parentPort.postMessage(response);
+  parentPort.close();
+}

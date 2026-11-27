@@ -3,6 +3,16 @@ import type { AppDatabase } from '../db/database.js';
 import { ArtifactError } from './errors.js';
 import type { ActorKind } from './types.js';
 
+// T1 links the request and journal atomically. A linked request can only be
+// released by recovery after a verified rollback and its cleanup.
+const UNJOURNALED = `commit_id IS NULL AND NOT EXISTS (
+  SELECT 1 FROM artifact_commit_journal j
+  WHERE j.user_id = artifact_idempotency.user_id
+    AND j.idempotency_scope_key = artifact_idempotency.scope_key
+    AND j.idempotency_key = artifact_idempotency.idempotency_key
+    AND (j.state NOT IN ('aborted') OR j.audit_note LIKE '{"recoveryCleanup":%')
+)`;
+
 const DEFAULT_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 
 export function canonicalJson(value: unknown): string {
@@ -54,7 +64,7 @@ export class IdempotencyFlightCoordinator {
   }
 
   private mapKey(userId: string, scopeKey: string, idempotencyKey: string): string {
-    return `${userId}|${scopeKey}|${idempotencyKey}`;
+    return JSON.stringify([userId, scopeKey, idempotencyKey]);
   }
 
   /**
@@ -67,9 +77,7 @@ export class IdempotencyFlightCoordinator {
         `DELETE FROM artifact_idempotency
          WHERE status = 'in_progress'
            AND server_boot_id != ?
-           AND (commit_id IS NULL OR NOT EXISTS (
-             SELECT 1 FROM artifact_commit_journal j WHERE j.commit_id = artifact_idempotency.commit_id
-           ))`
+           AND ${UNJOURNALED}`
       )
       .run(this.serverBootId);
     return Number(info.changes);
@@ -95,6 +103,20 @@ export class IdempotencyFlightCoordinator {
     const now = Date.now();
     let mode: 'run' | 'wait_inflight' | 'replay_completed' = 'run';
     let cachedResponseJson: string | null = null;
+    const replay = async (result: T): Promise<T> => {
+      await params.reverifyAuth();
+      const saved = (result as { artifact?: { id: string; scopeKind: string; chatId: string | null; projectId: string | null } })?.artifact;
+      if (saved) {
+        const live = this.db.getArtifact(params.userId, saved.id);
+        if (!live || live.lifecycleState !== 'active' || live.deletedOnDisk ||
+            live.scopeKind !== saved.scopeKind || live.chatId !== saved.chatId || live.projectId !== saved.projectId ||
+            (live.chatId && !this.db.getChat(params.userId, live.chatId)) ||
+            (live.projectId && !this.db.getProject(params.userId, live.projectId))) {
+          throw new ArtifactError('NOT_FOUND', '対象の成果物が見つからないか権限がありません。', 404);
+        }
+      }
+      return result;
+    };
 
     this.db.db.exec('BEGIN IMMEDIATE;');
     try {
@@ -148,12 +170,12 @@ export class IdempotencyFlightCoordinator {
             mode = 'wait_inflight';
             this.db.db.exec('COMMIT;');
           } else {
-            // Stale row from previous boot that had no journal — overwrite and execute
-            this.db.db
+            const claimed = this.db.db
               .prepare(
                 `UPDATE artifact_idempotency
-                 SET server_boot_id = ?, commit_id = NULL, updated_at = ?, expires_at = ?
-                 WHERE user_id = ? AND scope_key = ? AND idempotency_key = ?`
+                 SET server_boot_id = ?, updated_at = ?, expires_at = ?
+                 WHERE user_id = ? AND scope_key = ? AND idempotency_key = ?
+                   AND ${UNJOURNALED}`
               )
               .run(
                 this.serverBootId,
@@ -163,11 +185,25 @@ export class IdempotencyFlightCoordinator {
                 params.scopeKey,
                 params.idempotencyKey
               );
+            if (Number(claimed.changes) !== 1) {
+              throw new ArtifactError('IDEMPOTENCY_IN_PROGRESS', '前回の保存処理の復旧が完了していません。', 409);
+            }
             mode = 'run';
             this.db.db.exec('COMMIT;');
           }
         }
       } else {
+        // Recovery may already have rolled back the DB row while its durable
+        // journal still records pending cleanup.
+        const pending = this.db.db.prepare(`
+          SELECT state FROM artifact_commit_journal
+          WHERE user_id = ? AND idempotency_scope_key = ? AND idempotency_key = ?
+            AND (state != 'aborted' OR audit_note LIKE '{"recoveryCleanup":%')
+        `).get(params.userId, params.scopeKey, params.idempotencyKey);
+        if (pending?.state === 'ambiguous_quarantined') {
+          throw new ArtifactError('ARTIFACT_AMBIGUOUS_QUARANTINED', '前回の保存結果は隔離されています。', 409);
+        }
+        if (pending) throw new ArtifactError('IDEMPOTENCY_IN_PROGRESS', '前回の保存処理の復旧が完了していません。', 409);
         this.db.db
           .prepare(
             `INSERT INTO artifact_idempotency (
@@ -199,9 +235,7 @@ export class IdempotencyFlightCoordinator {
     }
 
     if (mode === 'replay_completed') {
-      // Live DB authorization re-verification before returning cached completed result
-      await params.reverifyAuth();
-      return JSON.parse(cachedResponseJson ?? '{}') as T;
+      return replay(JSON.parse(cachedResponseJson ?? '{}') as T);
     }
 
     if (mode === 'wait_inflight') {
@@ -219,8 +253,7 @@ export class IdempotencyFlightCoordinator {
           );
         }
         const awaited = (await flight.promise) as T;
-        await params.reverifyAuth();
-        return awaited;
+        return replay(awaited);
       }
       // Fallback: if in-memory flight already finished between tx and map check, check DB again
       const latest = this.db.db
@@ -232,8 +265,7 @@ export class IdempotencyFlightCoordinator {
         | { status: string; response_json: string | null }
         | undefined;
       if (latest?.status === 'completed') {
-        await params.reverifyAuth();
-        return JSON.parse(latest.response_json ?? '{}') as T;
+        return replay(JSON.parse(latest.response_json ?? '{}') as T);
       }
       throw new ArtifactError('IDEMPOTENCY_IN_PROGRESS', '同一リクエストが処理中です。再試行してください。', 409);
     }
@@ -292,11 +324,7 @@ export class IdempotencyFlightCoordinator {
             `DELETE FROM artifact_idempotency
              WHERE user_id = ? AND scope_key = ? AND idempotency_key = ?
                AND status = 'in_progress'
-               AND (commit_id IS NULL OR NOT EXISTS (
-                 SELECT 1 FROM artifact_commit_journal j
-                 WHERE j.commit_id = artifact_idempotency.commit_id
-                   AND j.state NOT IN ('aborted')
-               ))`
+               AND ${UNJOURNALED}`
           )
           .run(params.userId, params.scopeKey, params.idempotencyKey);
       } catch {

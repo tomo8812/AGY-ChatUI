@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { resolveRichChartPoint } from '../../../shared/rich-chart-display.js';
 import type { RichBlockRecord, RichDocumentV1, RichNode, RichSvgElement } from '../../../shared/rich-schema.js';
 import { targetSelectorSchema } from '../artifacts/target-selector-schema.js';
 import { canonicalJson } from '../artifacts/idempotency-coordinator.js';
@@ -83,18 +84,44 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
       : evaluateRichDynamicState(docPlan, { state: docState, theme: view.theme, authorizedArtifactIds });
     if (!validation.valid) return null;
     const ancestors = selected.ancestors.map(({ id, type, visibleWhen, repeat }) => ({ id, type, visibleWhen, repeat }));
-    return richTargetDisplayIdentity(docPlan, { node: selected.node, ancestors }, {
-      state: docState, computed: validation.computed, theme: view.theme,
-    });
+    const displayContext = { state: docState, computed: validation.computed, theme: view.theme };
+    const repeat = selected.node.repeat;
+    if (kind === 'rich_table_cell' && selected.node.type === 'data_table') {
+      const { rows, columns, ...table } = selected.node;
+      const column = columns.find(column => column.key === selector.col);
+      if (!column) return null;
+      // The row hash and order are checked independently. A change elsewhere
+      // in the table does not change the selected column's display contract.
+      return richTargetDisplayIdentity(docPlan, { table, column, ancestors }, displayContext);
+    }
+    if (kind === 'rich_repeat_item' && repeat) {
+      const items = evaluateRichExpr(repeat.itemsExpr, displayContext);
+      const index = Number(selector.itemIndex);
+      if (!Array.isArray(items) || index >= items.length) return null;
+      const item = items[index];
+      const instance = { ...displayContext, item, index, aliases: { [repeat.as]: item } };
+      if (selected.node.visibleWhen && !evaluateRichExpr(selected.node.visibleWhen, instance)) return null;
+      const { repeat: _repeat, ...template } = selected.node;
+      return richTargetDisplayIdentity(docPlan, { template, repeat, ancestors }, instance);
+    }
+    return richTargetDisplayIdentity(docPlan, { node: selected.node, ancestors }, displayContext);
   };
 
-  const displayMatchesBase = () => {
-    if (selector.baseRevision === block.revision) return true;
-    if (!baseDocument) return false;
-    const previous = displayIdentity(baseDocument);
-    const current = displayIdentity(block.document);
-    return previous !== null && current !== null && sha256(previous) === sha256(current);
+  const displayFingerprint = (doc: RichDocumentV1) => {
+    try {
+      const identity = displayIdentity(doc);
+      return identity === null ? null : sha256(identity);
+    } catch {
+      return null;
+    }
   };
+
+  const matchesDisplay = (current: string | null) => {
+    if (!current || (selector.expectedDisplayFingerprint !== undefined && selector.expectedDisplayFingerprint !== current)) return false;
+    return selector.baseRevision === block.revision || (baseDocument !== undefined && displayFingerprint(baseDocument) === current);
+  };
+
+  const displayMatchesBase = () => selector.baseRevision === block.revision || matchesDisplay(displayFingerprint(block.document));
 
   if (kind === 'rich_node') {
     const node = target?.node;
@@ -124,6 +151,7 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
         !evaluateRichExpr(repeatNode.visibleWhen, {
           ...context, item: items[itemIndex], index: itemIndex, aliases: { [repeatNode.repeat.as]: items[itemIndex] },
         })) return { status: 'needs_review', reason: 'rich_target_hidden' };
+    const currentDisplay = displayFingerprint(block.document);
     const expectedItemHash = selector.expectedItemHash;
     const expectedListOrderHash = selector.expectedListOrderHash;
     const keyOf = (item: unknown) => {
@@ -153,7 +181,8 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
       if (selector.baseRevision !== block.revision && items.filter(item => sha256(item) === curHash).length !== 1) {
         return { status: 'needs_review', reason: 'ambiguous_multiple_matches' };
       }
-      return { status: 'resolved', resolvedSnippet: JSON.stringify(curItem), resolvedRange: { itemIndex } };
+      if (!matchesDisplay(currentDisplay)) return { status: 'needs_review', reason: 'repeat_display_changed' };
+      return { status: 'resolved', resolvedSnippet: JSON.stringify(curItem), resolvedRange: { itemIndex, displayFingerprint: currentDisplay } };
     }
 
     // Case B: keyField present -> check uniqueness of itemKey and item hash
@@ -187,10 +216,11 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
       };
     }
 
+    if (!matchesDisplay(currentDisplay)) return { status: 'needs_review', reason: 'repeat_display_changed' };
     return {
       status: 'resolved',
       resolvedSnippet: JSON.stringify(foundItem),
-      resolvedRange: { itemIndex: foundIdx, itemKey },
+      resolvedRange: { itemIndex: foundIdx, itemKey, displayFingerprint: currentDisplay },
     };
   }
 
@@ -222,11 +252,20 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
       : evaluateRichExpr(series.data.expr, context);
     if (!Array.isArray(data)) return { status: 'needs_review', reason: 'chart_data_unavailable' };
     const fingerprint = sha256({ ...series, data });
-    if (fingerprint !== selector.expectedSeriesFingerprint) return { status: 'needs_review', reason: 'chart_series_changed' };
+    const currentDisplay = displayFingerprint(block.document);
+    if (fingerprint !== selector.expectedSeriesFingerprint || !matchesDisplay(currentDisplay)) return { status: 'needs_review', reason: 'chart_series_changed' };
     const index = selector.dataIndex as number | undefined;
     if (index !== undefined && index >= data.length) return { status: 'stale', reason: 'chart_point_not_found' };
-    return { status: 'resolved', resolvedSnippet: JSON.stringify(index === undefined ? { ...series, data } : data[index]),
-      resolvedRange: { seriesKey: series.key, ...(index === undefined ? {} : { dataIndex: index }) } };
+    const categories = Array.isArray(chartNode.categories) ? chartNode.categories
+      : chartNode.categories ? evaluateRichExpr(chartNode.categories.expr, context) : [];
+    if (!Array.isArray(categories)) return { status: 'needs_review', reason: 'chart_categories_unavailable' };
+    const points = data.map((value, index) => resolveRichChartPoint(value, categories, index));
+    return { status: 'resolved', resolvedSnippet: JSON.stringify({
+      seriesKey: series.key, unit: series.unit, xAxis: chartNode.xAxis,
+      yAxis: series.yAxisId === 'right' ? chartNode.yAxisRight : chartNode.yAxis,
+      data: index === undefined ? points : points[index],
+    }),
+      resolvedRange: { seriesKey: series.key, displayFingerprint: currentDisplay, ...(index === undefined ? {} : { dataIndex: index }) } };
 
   }
 
@@ -259,8 +298,12 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
       return { status: 'needs_review', reason: 'table_row_changed' };
     }
     const cell = row?.[colKey] ?? null;
-    if (sha256(cell) !== selector.expectedCellHash) return { status: 'needs_review', reason: 'table_cell_changed' };
-    return { status: 'resolved', resolvedSnippet: JSON.stringify(cell), resolvedRange: { row: rowIdx, col: colKey, rowHash, rowOrderHash } };
+    const currentDisplay = displayFingerprint(block.document);
+    if (sha256(cell) !== selector.expectedCellHash || !matchesDisplay(currentDisplay)) {
+      return { status: 'needs_review', reason: 'table_cell_changed' };
+    }
+    const column = tableNode.columns.find(column => column.key === colKey);
+    return { status: 'resolved', resolvedSnippet: JSON.stringify({ column, value: cell }), resolvedRange: { row: rowIdx, col: colKey, rowHash, rowOrderHash, displayFingerprint: currentDisplay } };
 
   }
 

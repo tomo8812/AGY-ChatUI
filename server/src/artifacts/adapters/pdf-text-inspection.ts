@@ -15,7 +15,11 @@ export async function inspectPdfText(bytes: Buffer, pageIndex: number, start?: n
       cMapPacked: true,
       wasmUrl: path.join(directory, 'wasm') + path.sep,
       useSystemFonts: false,
+      useWasm: false,
+      isOffscreenCanvasSupported: false,
+      isImageDecoderSupported: false,
       disableFontFace: true,
+      maxImageSize: 1,
       stopAtErrors: true,
     });
     cleanup = () => task.destroy();

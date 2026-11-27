@@ -28,6 +28,7 @@ export interface PdfPageTargetInfo {
   widthPt: number;
   heightPt: number;
   pageContentHash: string;
+  rotationIndependentHash: string;
   text: string;
   items: PdfPositionedItem[];
   annotations: PdfAnnotationTarget[];
@@ -987,6 +988,8 @@ function inspectPageTree(reader: PdfReader, targetPageIndex?: number): PdfDocume
       widthPt,
       heightPt,
       pageContentHash,
+      rotationIndependentHash: sha256(JSON.stringify([mediaBox, cropBox, userUnit, streamHashes, resourcesHash,
+        annotations.map(annotation => annotation.fingerprint)])),
       text,
       items,
       annotations,

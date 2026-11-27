@@ -157,9 +157,12 @@ export class ArtifactUndoService {
       const stored = parseOpPayload(revision.operationPayload)?.semanticScope;
       return { ...stored, format: params.format, structuralChange: stored?.structuralChange || stored?.kind === 'structural' };
     };
+    const replayKind = parseOpPayload(target.operationPayload)?.semanticScope?.kind;
+    const replayable = params.format === 'csv' || ((params.format === 'pptx' || params.format === 'xlsx') &&
+      replayKind === 'office_parts_v1') || (params.format === 'pdf' && replayKind === 'pdf_rotation_v1');
     if (history.uncertain.some(revision => revision.revision > target.revision) ||
         [...after.values()].some(revision => !evaluateSemanticNonInterference(scope(target), scope(revision)).mergeable) ||
-        (!direct && (params.format !== 'csv' || current.dependencyManifestHash !== expected.dependencyManifestHash))) {
+        (!direct && (!replayable || current.dependencyManifestHash !== expected.dependencyManifestHash))) {
       return { reason: 'semantic_conflict', revision: target.revision };
     }
     return { plan: { target, parent, current, direct } };

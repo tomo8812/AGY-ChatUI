@@ -9,6 +9,10 @@ import { canonicalJson } from '../src/artifacts/idempotency-coordinator.js';
 import { FormatAdapterRegistry } from '../src/artifacts/adapters/registry.js';
 import { targetSelectorSchema } from '../src/artifacts/target-selector-schema.js';
 import { ResourceGovernor } from '../src/artifacts/resource-governor.js';
+import { DocumentWorker } from '../src/artifacts/document-worker.js';
+import { readPptxSlideTargets } from '../src/artifacts/adapters/ooxml-target.js';
+import { strToU8, zipSync } from 'fflate';
+import { buildSyntheticPng } from '../../e2e/fixtures/syntheticAssets.js';
 import { loadConfig } from '../src/config.js';
 import { createTestServer, registerAndBindAgy, seedAuthenticatedMockProfile, TestApiClient } from './helpers/test-harness.js';
 
@@ -374,4 +378,113 @@ it('rechecks dynamic Rich node and SVG display against the saved view and base r
     expect(request.viewStateSnapshot).toEqual(viewStateSnapshot);
     expect(await ctx.editRequestService.resolveRequestTarget(request)).toMatchObject({ status: 'needs_review' });
   }
+});
+
+it('anchors rich chart, repeat and table selections to their evaluated display', async () => {
+  const server = await createTestServer();
+  cleanups.push(server.cleanup);
+  const { client, userId } = await registerAndBindAgy(server.baseUrl, 'display-owner', 'user:display-owner@gmail.com');
+  const { data: { chat: { id: chatId } } } = await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Display identity' });
+  const { richContentService: rich, editRequestService: requests } = server.ctx;
+  const item = { id: 'first', value: 4 };
+  const series = { key: 'value', label: 'Amount', data: [4, 5] };
+  const chart = { id: 'chart', type: 'chart', chartType: 'bar', categories: ['March', 'April'], series: [series], yAxis: { unit: 'JPY' } };
+  const repeat = { id: 'repeat', type: 'text', content: { expr: 'formatNumber($item.value + $computed.adjustment)' },
+    repeat: { itemsExpr: '$state.items', as: 'item', keyField: 'id' } };
+  const table = { id: 'table', type: 'data_table', columns: [{ key: 'value', label: 'Amount', format: 'number', unit: 'JPY' }], rows: [item] };
+  const document = {
+    schemaVersion: 1, state: { items: [item], unrelated: 0 }, computed: { adjustment: '1' },
+    root: { id: 'root', type: 'stack', children: [chart, repeat, table] },
+  };
+  const { block } = rich.createBlock({ userId, chatId, document });
+  const create = (selector: { kind: string; [key: string]: unknown }) => requests.createRequest({
+    userId, chatId, targetKind: 'rich_block', richBlockId: block.id, instruction: 'Update selected content',
+    selector: { ...selector, baseRevision: 1, blockId: block.id },
+  });
+  const chartRequest = await create({
+    kind: 'rich_chart_series', chartNodeId: chart.id, dataIndex: 0, seriesKey: series.key,
+    expectedSeriesFingerprint: hash(canonicalJson(series)),
+  });
+  const repeatRequest = await create({
+    kind: 'rich_repeat_item', repeatNodeId: repeat.id, itemIndex: 0, itemKey: item.id,
+    expectedItemHash: hash(canonicalJson(item)), expectedListOrderHash: hash(canonicalJson([item.id])),
+  });
+  const tableRequest = await create({
+    kind: 'rich_table_cell', tableNodeId: table.id, row: 0, col: 'value', expectedCellHash: hash('4'),
+  });
+  const all = [chartRequest, repeatRequest, tableRequest];
+  rich.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 1, patchState: { unrelated: 1 } });
+  for (const request of all) {
+    expect(request.selector.expectedDisplayFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    expect(await requests.resolveRequestTarget(request)).toMatchObject({ status: 'resolved' });
+  }
+  rich.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 2, document: {
+    ...document, computed: { adjustment: '2' }, root: { ...document.root, children: [
+      { ...chart, categories: [...chart.categories].reverse(), yAxis: { unit: 'USD' } },
+      repeat,
+      { ...table, columns: [{ ...table.columns[0], label: 'Ratio', format: 'percent' }] },
+    ] },
+  } });
+  for (const request of all) {
+    expect(await requests.resolveRequestTarget(request)).toMatchObject({ status: 'needs_review' });
+  }
+  rich.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 3, document: {
+    ...document, root: { ...document.root, children: [chart, { ...repeat, content: 'Replacement template' }, table] },
+  } });
+  expect(await requests.resolveRequestTarget(repeatRequest)).toMatchObject({ status: 'needs_review', reason: 'repeat_display_changed' });
+
+});
+
+it('returns a verified PPTX point crop as an MCP image and retains the target in Base ChatUI', async () => {
+  const srv = await createTestServer({ installDocRuntime: 'off', sandboxMode: 'off', allowUnsandboxedDocWorkers: false });
+  cleanups.push(srv.cleanup);
+  const { ctx } = srv;
+  const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'pptx-pin', 'user:pptx-pin@gmail.com');
+  const { data: { chat: { id: chatId } } } = await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'PPTX region' });
+  const p = 'http://schemas.openxmlformats.org/presentationml/2006/main';
+  const r = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  const a = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+  const slidePart = 'ppt/slides/slide1.xml';
+  const bytes = Buffer.from(zipSync({
+    'ppt/presentation.xml': strToU8(`<p:presentation xmlns:p="${p}" xmlns:r="${r}"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="9144000" cy="5143500"/></p:presentation>`),
+    'ppt/_rels/presentation.xml.rels': strToU8(`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${r}/slide" Target="slides/slide1.xml"/></Relationships>`),
+    [slidePart]: strToU8(`<p:sld xmlns:p="${p}" xmlns:a="${a}"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="4"/></p:nvSpPr><p:txBody><a:p><a:r><a:t>Slide content</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>`),
+  }));
+  const { artifact } = await ctx.artifactService.createArtifact({
+    userId, chatId, scopeKind: 'chat', relPath: 'points.pptx', actorKind: 'user', content: bytes,
+  });
+  const slide = readPptxSlideTargets(bytes, slidePart);
+  const selector = targetSelectorSchema.parse({
+    kind: 'pptx_slide', baseRevision: 1, slideId: slide.slideId, expectedSlideHash: slide.slideHash,
+    pointPt: { xPt: 717, yPt: 5, widthPt: 720, heightPt: 405 },
+  });
+  const pin = await ctx.editRequestService.createRequest({
+    userId, chatId, targetKind: 'artifact', artifactId: artifact.id, selector, instruction: 'Change the heading',
+  });
+  expect((await client.request('POST', `/api/chats/${chatId}/edit-requests/send-batch`, {
+    requestIds: [pin.id], clientMessageId: randomUUID(),
+  })).status).toBe(200);
+  const image = buildSyntheticPng(39, 41);
+  const worker = vi.spyOn(DocumentWorker.prototype, 'run').mockResolvedValue(image);
+  const base = await ctx.editRequestService.getForAgent(userId, chatId, pin.id);
+  expect(base).toMatchObject({ userInstruction: 'Change the heading', untrustedTargetContent: { selectedContentSnapshot: 'Slide content' } });
+  expect(base.regionImagePngBase64).toBeUndefined();
+  expect(worker).not.toHaveBeenCalled();
+  vi.spyOn(DocumentWorker.prototype, 'available', 'get').mockReturnValue(true);
+  const binding = await ctx.mcpService.bindBuiltinArtifactServer({ userId, chatId, tentativeTurn: () => null }, []);
+  const { url, headers } = binding!.server;
+  const mcp = new Client({ name: 'pptx-point-test', version: '1' });
+  await mcp.connect(new StreamableHTTPClientTransport(new URL(url), {
+    requestInit: { headers: Object.fromEntries(headers.map(({ name, value }) => [name, value])) },
+  }));
+  try {
+    const result = await mcp.callTool({ name: 'edit_request_get', arguments: { requestId: pin.id } });
+    expect(result.content).toMatchObject([{ type: 'text' }, { type: 'image', mimeType: 'image/png', data: image.toString('base64') }]);
+    expect(worker).toHaveBeenCalledWith('pptx', 'points.pptx', bytes, {
+      action: 'render', pageIndex: 0, region: { x: 681, y: 0, width: 39, height: 41, unit: 'pt' },
+    }, [], expect.anything());
+  } finally {
+    await mcp.close();
+  }
+  await expect.poll(() => ctx.db.getActiveRunForChat(userId, chatId), { timeout: 12_000 }).toBeNull();
 });

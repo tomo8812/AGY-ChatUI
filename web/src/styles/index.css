@@ -3591,6 +3591,50 @@ details[open] > .activity-summary > .activity-chevron {
   height: 100%;
 }
 
+.pdf-page-text-viewport {
+  position: absolute;
+  inset: 0;
+  overflow: clip;
+  --pdf-text-scale: var(--page-auto-scale, 1);
+  pointer-events: none;
+}
+.pdf-pages-list[data-fit-mode='manual'] .pdf-page-text-viewport {
+  --pdf-text-scale: var(--pdf-scale, 1);
+}
+.pdf-page-text {
+  position: absolute;
+  inset: 0;
+  overflow: clip;
+  line-height: 1;
+  text-align: initial;
+  transform-origin: 0 0;
+  user-select: text;
+  -webkit-user-select: text;
+  -webkit-text-size-adjust: none;
+  text-size-adjust: none;
+  --total-scale-factor: calc(var(--pdf-text-scale) * var(--pdf-user-unit, 1));
+  --scale-round-x: 1px;
+  --scale-round-y: 1px;
+}
+.pdf-page-text[data-main-rotation='90'] { transform: rotate(90deg) translateY(-100%); }
+.pdf-page-text[data-main-rotation='180'] { transform: rotate(180deg) translate(-100%, -100%); }
+.pdf-page-text[data-main-rotation='270'] { transform: rotate(270deg) translateX(-100%); }
+.pdf-page-text :is(span, br) {
+  position: absolute;
+  color: transparent;
+  white-space: pre;
+  cursor: text;
+  pointer-events: auto;
+  transform-origin: 0 0;
+}
+.pdf-page-text span {
+  font-size: calc(var(--total-scale-factor) * var(--min-font-size, 1) * var(--font-height, 0px));
+  transform: rotate(var(--rotate, 0deg)) scaleX(var(--scale-x, 1)) scale(calc(1 / var(--min-font-size, 1)));
+}
+.pdf-page-text ::selection {
+  background: rgba(45, 100, 255, 0.3);
+}
+
 .viewer-table-scroll {
   overflow: auto;
   min-height: 0;

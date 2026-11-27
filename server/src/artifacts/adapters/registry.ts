@@ -1,3 +1,5 @@
+import { pointRegionPt } from '../region-png.js';
+import { selectorHasDirectUi, selectorKindIsAvailable, selectorsForFormat } from '../target-selector-schema.js';
 import { describeImageRegion, readImageDimensions } from './image-target.js';
 import path from 'node:path';
 import type { PreviewKind } from '../../types.js';
@@ -203,7 +205,6 @@ class DocumentFormatAdapter implements FormatAdapter {
     const metadataOnly = Boolean(documentFormatConstraint(this.format, ctx.filename ?? '', 'input', ctx.previewKind, ctx.content));
     const operations: OperationCapability[] = [
       { operation: 'view', availability: 'supported', scope: 'ui_view_only' },
-      { operation: 'target_pin', availability: 'supported', scope: 'mcp_and_ui' },
       ...DOCUMENT_ACTIONS[this.format].map((operation): OperationCapability => {
         const workspaceExport = operation.startsWith('export:') && ['pptx', 'docx', 'xlsx', 'pdf'].includes(this.format);
         const scope = DIRECT_EDITOR_OPERATIONS.has(operation) || operation === 'structure' || operation === 'read_range' || workspaceExport
@@ -234,22 +235,9 @@ class DocumentFormatAdapter implements FormatAdapter {
         return { operation, availability: notes ? 'partial' : 'supported', scope, notes };
       }),
     ];
-    const officeSelectors = this.format === 'pptx' ? ['pptx_slide', 'pptx_element']
-      : this.format === 'docx' ? ['docx_paragraph']
-      : this.format === 'xlsx' ? ['xlsx_range', 'xlsx_row_col', 'xlsx_sheet'] : [];
-    if (this.hasOfficeReadFallback(ctx.filename ?? '') || this.format === 'pptx' && /\.pptx$/i.test(ctx.filename ?? '')) {
-      operations.push(...officeSelectors.map((kind): OperationCapability => ({
-        operation: `target_pin:${kind}`, availability: 'supported',
-        scope: kind === 'xlsx_row_col' || kind === 'xlsx_sheet' ? 'mcp_only' : 'mcp_and_ui',
-      })));
-    }
     if (this.format === 'pdf') operations.push({
       operation: 'edit_body_reflow', availability: 'unsupported_by_format', scope: 'mcp_only',
       notes: 'PDF の既存本文削除・リフロー編集は形式方針により非対応です。注釈および新規オーバーレイを追加できます。',
-    });
-    if (this.format === 'media' && ctx.previewKind === 'video') operations.push({
-      operation: 'target_pin:video_frame_region', availability: 'supported',
-      scope: 'mcp_only',
     });
     if (this.format === 'media') operations.push({
       operation: 'create', availability: 'unsupported_by_format', scope: 'mcp_only',
@@ -691,7 +679,8 @@ class DocumentFormatAdapter implements FormatAdapter {
               !Number.isFinite(xPt) || !Number.isFinite(yPt) || xPt < 0 || yPt < 0 || xPt > widthPt || yPt > heightPt) {
             return { status: 'needs_review', reason: 'slide_point_out_of_bounds' };
           }
-          slideCoords = { pageIndex, unit: 'pt', xPt, yPt, widthPt, heightPt };
+          const point = { xPt, yPt, widthPt, heightPt };
+          slideCoords = { pageIndex, unit: 'pt', ...point, region: pointRegionPt(point) };
         }
         return fingerprint && fingerprint === expected
           ? {
@@ -845,6 +834,29 @@ export class FormatAdapterRegistry {
       !documentFormatConstraint(adapter.format, params.filename, 'input', params.previewKind, params.content) &&
       !documentFormatConstraint(adapter.format, params.filename, 'input_edit', params.previewKind, params.content) &&
       (!adapter.requiresExternalWorker || (params.runtimeProfile !== 'base_chatui' && params.sandboxIsolation !== 'sandbox_required_blocked'));
+    const selectors = adapter.targetPinSupported ? selectorsForFormat(adapter.format, params.filename, params.previewKind) : [];
+    const supported = selectors.filter(selectorKindIsAvailable);
+    const selectorOperations = selectors.map((kind): OperationCapability => ({
+      operation: 'target_pin:' + kind,
+      availability: selectorKindIsAvailable(kind) ? 'supported' : 'unsupported_by_format',
+      scope: selectorHasDirectUi(kind) ? 'mcp_and_ui' : 'mcp_only',
+      notes: selectorKindIsAvailable(kind) ? undefined : 'この対象指定は現在の実装範囲外です。',
+    }));
+    const operations = adapter.getOperations({
+      runtimeProfile: params.runtimeProfile,
+      filename: params.filename,
+      previewKind: params.previewKind,
+      sandboxAvailable: params.sandboxIsolation !== 'sandbox_required_blocked',
+      strictSandbox: params.sandboxIsolation === 'bwrap',
+      content: params.content,
+    }).filter(entry => entry.operation !== 'target_pin' || !adapter.targetPinSupported);
+    if (adapter.targetPinSupported) {
+      operations.push({
+        operation: 'target_pin',
+        availability: !supported.length ? 'unsupported_by_format' : supported.length < selectors.length ? 'partial' : 'supported',
+        scope: supported.some(selectorHasDirectUi) ? 'mcp_and_ui' : 'mcp_only',
+      }, ...selectorOperations);
+    }
     return {
       format: adapter.format,
       previewKind: params.previewKind,
@@ -852,15 +864,8 @@ export class FormatAdapterRegistry {
       sandboxIsolation: params.sandboxIsolation,
       stagingIsolation: params.stagingIsolation,
       directEditUiSupported: directEditSupported,
-      targetPinSupported: adapter.targetPinSupported,
-      operations: adapter.getOperations({
-        runtimeProfile: params.runtimeProfile,
-        filename: params.filename,
-        previewKind: params.previewKind,
-        sandboxAvailable: params.sandboxIsolation !== 'sandbox_required_blocked',
-        strictSandbox: params.sandboxIsolation === 'bwrap',
-        content: params.content,
-      }),
+      targetPinSupported: supported.length > 0,
+      operations,
     };
   }
 }

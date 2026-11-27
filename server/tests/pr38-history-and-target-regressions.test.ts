@@ -172,3 +172,99 @@ it('bounds target inspection for both revision snapshots and live files with an 
     file, rootDir: dir, expectedSha256: sha256, selector: { kind: 'code_line_range', baseRevision: 1 },
   })).resolves.toMatchObject({ status: 'needs_review', reason: 'target_content_unavailable' });
 });
+
+it('blocks concurrent resends from a different boot until a deferred commit can recover', async () => {
+  const { artifactService: artifacts, db, userId, chatId } = await workspace();
+  const input = {
+    userId, chatId, scopeKind: 'chat' as const, relPath: 'deferred.txt', actorKind: 'user' as const,
+    idempotencyKey: 'deferred', content: Buffer.from('once'),
+  };
+  artifacts.commitFaultHook = stage => { if (stage === 'after_T5') throw Error('restart before T6'); };
+  await expect(artifacts.createArtifact(input)).rejects.toThrow('restart before T6');
+  artifacts.commitFaultHook = undefined;
+  db.db.prepare("UPDATE artifact_idempotency SET server_boot_id = 'previous-boot' WHERE idempotency_key = ?").run(input.idempotencyKey);
+  db.db.exec(`CREATE TRIGGER fail_t6 BEFORE INSERT ON artifact_revisions
+    BEGIN SELECT RAISE(ABORT, 'simulated DB failure'); END;`);
+  await artifacts.recoverOnStartup();
+  expect(artifacts.idempotency.recoverStaleIdempotency()).toBe(0);
+  await Promise.all([0, 1].map(async () => {
+    await expect(artifacts.createArtifact(input)).rejects.toMatchObject({ code: 'IDEMPOTENCY_IN_PROGRESS' });
+  }));
+  db.db.exec('DROP TRIGGER fail_t6');
+  await artifacts.recoverOnStartup();
+  const [{ artifact }, replay] = await Promise.all([artifacts.createArtifact(input), artifacts.createArtifact(input)]);
+  expect(replay.artifact.id).toBe(artifact.id);
+  expect(artifacts.listHistory(userId, artifact.id)).toHaveLength(1);
+});
+
+it('checks live session authorization and artifact lifecycle before replaying a creation', async () => {
+  const { artifactService: artifacts, db, userId, chatId } = await workspace();
+  let authorized = true;
+  const input = {
+    userId, chatId, scopeKind: 'chat' as const, relPath: 'replay.txt', actorKind: 'user' as const,
+    idempotencyKey: 'replay', content: Buffer.from('secret'),
+    assertAuthorized: () => { if (!authorized) throw new Error('session expired'); },
+  };
+  const { artifact } = await artifacts.createArtifact(input);
+  authorized = false;
+  await expect(artifacts.createArtifact(input)).rejects.toThrow('session expired');
+  authorized = true;
+  db.db.prepare("UPDATE artifacts SET lifecycle_state = 'deleted' WHERE id = ?").run(artifact.id);
+  await expect(artifacts.createArtifact(input)).rejects.toMatchObject({ statusCode: 404 });
+});
+
+it('shares project provenance across T6 recovery, metadata-only synchronization and project deletion', async () => {
+  const { artifactService: artifacts, db, client, userId, chatId } = await workspace();
+  const { data: { project } } = await client.request<{ project: { id: string } }>('POST', '/api/projects', { name: 'Provenance' });
+  const { artifact: original } = await artifacts.uploadProjectFile({
+    userId, projectId: project.id, filename: 'sync.txt', buffer: Buffer.from('original'),
+  });
+  const { artifact: copy } = await artifacts.createProjectWorkingCopyInChat({
+    userId, projectId: project.id, projectArtifactId: original.id, chatId,
+  });
+  const replace = (artifactId: string, expectedRevision: number, content: string) => artifacts.replaceArtifactBytes({
+    userId, artifactId, expectedRevision, newBuffer: Buffer.from(content),
+    actorKind: 'user', actorId: userId, operationType: 'replace', operationSummary: 'Replace',
+  });
+  await replace(copy.id, 1, 'edited');
+  const reflect = () => artifacts.reflectWorkingCopyToProject({
+    userId, workingCopyArtifactId: copy.id, actorKind: 'user',
+  });
+  artifacts.commitFaultHook = stage => { if (stage === 'after_T5') throw Error('restart after rename'); };
+  await expect(reflect()).rejects.toThrow('restart after rename');
+  artifacts.commitFaultHook = undefined;
+  await artifacts.recoverOnStartup();
+  expect(db.getArtifact(userId, original.id)).toMatchObject({ revision: 2 });
+  expect(db.getArtifact(userId, copy.id)).toMatchObject({ revision: 2, sourceBaseRevision: 2 });
+
+  await replace(original.id, 2, 'different');
+  await replace(original.id, 3, 'edited');
+  await expect(artifacts.syncProjectFilesToChat({ userId, chatId, projectId: project.id })).resolves.toEqual(['.project-context/sync.txt']);
+  expect(db.getArtifact(userId, copy.id)).toMatchObject({ revision: 2, sourceBaseRevision: 4 });
+
+  expect((await client.request('DELETE', '/api/projects/' + project.id)).status).toBeLessThan(300);
+  expect(db.getArtifact(userId, copy.id)).toMatchObject({ sourceArtifactId: original.id, sourceBaseRevision: 4 });
+  await expect(reflect()).rejects.toMatchObject({ statusCode: 409, code: 'ARTIFACT_CONFLICT' });
+});
+
+it.each([false, true])('rechecks project sync authorization at T3 (existing copy: %s)', async existing => {
+  const { artifactService: artifacts, db, client, userId, chatId } = await workspace();
+  const { data: { project } } = await client.request<{ project: { id: string } }>('POST', '/api/projects', { name: 'Sync auth' });
+  const upload = (text: string) => artifacts.uploadProjectFile({
+    userId, projectId: project.id, filename: 'sync.txt', buffer: Buffer.from(text),
+  });
+  if (existing) {
+    await upload('previous');
+    await artifacts.syncProjectFilesToChat({ userId, chatId, projectId: project.id });
+  }
+  await upload('new');
+  let authorized = true;
+  artifacts.commitFaultHook = stage => { if (stage === 'before_T3') authorized = false; };
+  await expect(artifacts.syncProjectFilesToChat({
+    userId, chatId, projectId: project.id,
+    assertAuthorized: () => { if (!authorized) throw new Error('session expired'); },
+  })).rejects.toThrow('session expired');
+  artifacts.commitFaultHook = undefined;
+  await artifacts.recoverOnStartup();
+  expect(db.findArtifactByRelPath(userId, chatId, '.project-context/sync.txt')?.revision).toBe(existing ? 1 : undefined);
+});

@@ -2,18 +2,23 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
-import { zipSync, strToU8 } from 'fflate';
+import { unzipSync, zipSync, strToU8 } from 'fflate';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { createTestServer } from './helpers/test-harness.js';
 import { FormatAdapterRegistry } from '../src/artifacts/adapters/registry.js';
+import { DocumentWorker } from '../src/artifacts/document-worker.js';
 import {
+  proveOfficeEditScope,
+  replayOfficeEdit,
   readDocxAllParagraphTargets,
   readPptxSlideTargets,
   readXlsxRangeTarget,
   readXlsxRowColTarget,
   readXlsxSheetTarget,
 } from '../src/artifacts/adapters/ooxml-target.js';
+import { provePdfRotationScope, replayPdfRotation } from '../src/artifacts/adapters/pdf-history.js';
+import { buildSyntheticPdf } from '../../e2e/fixtures/syntheticAssets.js';
 import { inspectPdfText } from '../src/artifacts/adapters/pdf-text-inspection.js';
 import { targetSelectorSchema } from '../src/artifacts/target-selector-schema.js';
 import { inspectPdfDocument, computePdfRegionDigest, readPdfPageTarget } from '../src/artifacts/adapters/pdf-target.js';
@@ -290,10 +295,14 @@ describe('PR 3A Conformance Gap Fixes', () => {
       const service = server.ctx.artifactService;
       const caps = service.getCapabilities(userId, artId);
       expect(caps).toMatchObject({ runtimeProfile: 'base_chatui', sandboxIsolation: 'sandbox_required_blocked', directEditUiSupported: false, targetPinSupported: true });
-      for (const operation of ['view', 'structure', 'read_range', 'target_pin']) {
+      for (const operation of ['view', 'structure', 'read_range', 'target_pin:xlsx_range', 'target_pin:xlsx_row_col', 'target_pin:xlsx_sheet']) {
         expect(caps.operations).toContainEqual(expect.objectContaining({ operation, availability: 'supported' }));
       }
-      expect(caps.operations).toContainEqual(expect.objectContaining({ operation: 'xlsx.set_cell', availability: 'disabled_by_resource_tier' }));
+      expect(caps.operations).toEqual(expect.arrayContaining([
+        expect.objectContaining({ operation: 'target_pin', availability: 'partial' }),
+        expect.objectContaining({ operation: 'target_pin:xlsx_chart', availability: 'unsupported_by_format' }),
+        expect.objectContaining({ operation: 'xlsx.set_cell', availability: 'disabled_by_resource_tier' }),
+      ]));
       expect(await service.getStructure(userId, artId)).toMatchObject({ sheets: [{ id: '1', name: 'Sales' }] });
       expect(await service.readRange(userId, artId, { sheetId: '1', rangeA1: 'A2:B2', evaluate: true })).toMatchObject({
         cells: [{ address: 'A2', value: 'Apple' }, { address: 'B2', value: '100', formula: '50*2', formulaStatus: 'cached_existing' }],
@@ -305,7 +314,7 @@ describe('PR 3A Conformance Gap Fixes', () => {
         actorKind: 'user', actorId: userId,
       })).artifact;
       expect(service.getCapabilities(userId, docx.id)).toMatchObject({ directEditUiSupported: false, targetPinSupported: true,
-        operations: expect.arrayContaining(['view', 'structure', 'read_range', 'target_pin'].map(operation =>
+        operations: expect.arrayContaining(['view', 'structure', 'read_range', 'target_pin:docx_paragraph'].map(operation =>
           expect.objectContaining({ operation, availability: 'supported' }))) });
       expect(await service.getStructure(userId, docx.id)).toMatchObject({ format: 'docx', blockCount: expect.any(Number) });
       expect(await service.readRange(userId, docx.id, { start: 1, count: 1 })).toMatchObject({
@@ -497,6 +506,11 @@ describe('PR 3A Conformance Gap Fixes', () => {
       const svc = server.ctx.artifactService;
       await expect(svc.resolveTargetOnArtifact(userId, created.artifact.id, publishedRowSelector))
         .resolves.toMatchObject({ status: 'resolved' });
+      const stored = await server.ctx.editRequestService.createRequest({
+        userId, chatId, targetKind: 'artifact', artifactId: created.artifact.id, selector: publishedRowSelector,
+        instruction: 'Review the data rows',
+      });
+      expect(stored.selector.expectedHeaderHash).toBe(_headerHash);
       await svc.replaceArtifactBytes({
         userId, artifactId: created.artifact.id, expectedRevision: 1, actorKind: 'user', actorId: userId,
         newBuffer: Buffer.from('Student,Points\nAlice,90\nBob,80\n'), operationType: 'replace', operationSummary: 'Update headers',
@@ -1351,4 +1365,92 @@ it('binds edits on a new worksheet to the sheet created earlier in the same draf
     { op: 'xlsx.add_sheet', name: 'New sheet', draftSheetKey: sheet },
     { op: 'xlsx.set_cell', address: 'A1', value: 'Draft value', draftSheetKey: sheet },
   ]);
+});
+
+it('replays disjoint workbook cells as new revisions while preserving another actor’s values', async () => {
+  const srv = await createTestServer();
+  try {
+    const { db, artifactService: artifacts } = srv.ctx;
+    const userId = 'xlsx-undo-user';
+    const chatId = 'xlsx-undo-chat';
+    const workspaceDir = fs.mkdtempSync(path.join(srv.dataRoot, 'xlsx-undo-'));
+    db.createUser({ id: userId, username: 'xlsx-undo', displayName: 'Undo', passwordHash: 'unused', role: 'user', profileDir: workspaceDir });
+    db.createChat({ id: chatId, userId, title: 'Undo', workspaceDir, projectId: null, modelId: '', effortValue: '', projectContextVersion: 0 });
+    const build = (a: number, b: number, emitDeclaration = true) => {
+      const parts = unzipSync(buildMinimalXlsx({ sheets: [{
+        name: 'Data', rows: [{ r: 1, cells: [{ ref: 'A1', v: a }, { ref: 'B1', v: b }] }],
+      }] }));
+      for (const part of ['xl/workbook.xml', 'xl/_rels/workbook.xml.rels', 'xl/worksheets/sheet1.xml']) {
+        let text = Buffer.from(parts[part]).toString('utf8');
+        if (part === 'xl/workbook.xml') text = text.replace('</workbook>', '<definedNames/></workbook>');
+        if (!emitDeclaration) text = text.replace(/^<\?xml[^>]+>\s*/, '');
+        parts[part] = strToU8(text);
+      }
+      return Buffer.from(zipSync(parts));
+    };
+    const { artifact } = await artifacts.createArtifact({ userId, chatId, scopeKind: 'chat', relPath: 'values.xlsx',
+      actorKind: 'user', actorId: userId, content: build(1, 2, false) });
+    const worker = vi.spyOn(DocumentWorker.prototype, 'run')
+      .mockResolvedValueOnce(build(10, 2)).mockResolvedValueOnce(build(10, 20)).mockResolvedValueOnce(build(30, 20));
+    const edit = (revision: number, address: string, value: number, actorKind: 'user' | 'ai') => artifacts.editArtifact({
+      userId, artifactId: artifact.id, expectedRevision: revision, actorKind, actorId: actorKind === 'user' ? userId : 'agent',
+      operations: [{ op: 'xlsx.set_cell', address, value, sheetPart: 'xl/worksheets/sheet1.xml' }],
+    });
+    const change = (direction: 'undo' | 'redo') => artifacts[direction]({ userId, artifactId: artifact.id, actorKind: 'user', actorId: userId });
+    const values = () => readXlsxRangeTarget(fs.readFileSync(path.join(workspaceDir, 'values.xlsx')), '1', 'A1:B1')!.cells.map(cell => cell.value);
+    await edit(1, 'A1', 10, 'user');
+    await edit(2, 'B1', 20, 'ai');
+    expect(artifacts.listHistory(userId, artifact.id)[0].operationPayload).toMatchObject({
+      semanticScope: { regionKeys: ['xl/worksheets/sheet1.xml#B1'] },
+    });
+    expect(await change('undo')).toMatchObject({ artifact: { revision: 4 } });
+    expect(values()).toEqual(['1', '20']);
+    expect(await change('redo')).toMatchObject({ artifact: { revision: 5 } });
+    expect(values()).toEqual(['10', '20']);
+    await edit(5, 'A1', 30, 'ai');
+    await expect(change('undo')).rejects.toMatchObject({ code: 'UNDO_SEMANTIC_CONFLICT' });
+    expect(values()).toEqual(['30', '20']);
+    expect(worker).toHaveBeenCalledTimes(3);
+  } finally {
+    vi.restoreAllMocks();
+    await srv.cleanup();
+  }
+});
+
+
+it('proves and validates inverse PDF rotation across a different page rotation', async () => {
+  const makePdf = (first?: 90, second?: 90) => buildSyntheticPdf([
+    { width: 595, height: 842, label: 'first', rotate: first },
+    { width: 595, height: 842, label: 'second', rotate: second },
+  ]);
+  const base = makePdf();
+  const first = makePdf(90);
+  const live = makePdf(90, 90);
+  const input = [{ op: 'pdf.rotate_page', pageIndex: 0, degrees: 90 }];
+  const scope = provePdfRotationScope(base, first, input);
+  expect(scope).toEqual({ kind: 'pdf_rotation_v1', regionKeys: ['0'] });
+  const rollback = vi.fn(async () => makePdf(undefined, 90));
+  await expect(replayPdfRotation(live, first, base, scope!.regionKeys, rollback)).resolves.toEqual(makePdf(undefined, 90));
+  expect(rollback).toHaveBeenCalledWith([{ op: 'pdf.rotate_page', pageIndex: 0, degrees: -90 }]);
+  await expect(replayPdfRotation(live, first, base, scope!.regionKeys, async () => base))
+    .rejects.toMatchObject({ code: 'UNDO_SEMANTIC_CONFLICT' });
+});
+
+
+it('replays a PPTX shape edit on its original slide and retains another edited slide', () => {
+  const makePresentation = (first: string, second: string) => Buffer.from(zipSync({
+    'ppt/presentation.xml': strToU8('<presentation/>'),
+    'ppt/slides/slide1.xml': strToU8('<slide>' + first + '</slide>'),
+    'ppt/slides/slide2.xml': strToU8('<slide>' + second + '</slide>'),
+  }));
+  const base = makePresentation('Old heading', 'Old content');
+  const first = makePresentation('New heading', 'Old content');
+  const live = makePresentation('New heading', 'Updated content');
+  const scope = proveOfficeEditScope('pptx', base, first, [{ op: 'pptx.set_shape_text' }]);
+  expect(scope).toEqual({ kind: 'office_parts_v1', regionKeys: ['ppt/slides/slide1.xml'] });
+  const merged = unzipSync(replayOfficeEdit('pptx', live, first, base, scope!.regionKeys));
+  expect(Buffer.from(merged['ppt/slides/slide1.xml']).toString()).toBe('<slide>Old heading</slide>');
+  expect(Buffer.from(merged['ppt/slides/slide2.xml']).toString()).toBe('<slide>Updated content</slide>');
+  expect(() => replayOfficeEdit('pptx', makePresentation('Other heading', 'Updated content'), first, base, scope!.regionKeys))
+    .toThrow(expect.objectContaining({ code: 'UNDO_SEMANTIC_CONFLICT' }));
 });

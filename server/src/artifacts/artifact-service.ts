@@ -1,5 +1,7 @@
-import { validateRegionPng } from './region-png.js';
-import { selectorIsAvailable, selectorMatchesFormat, targetSelectorSchema } from './target-selector-schema.js';
+import { provePdfRotationScope, replayPdfRotation } from './adapters/pdf-history.js';
+import { proveOfficeEditScope, replayOfficeEdit } from './adapters/ooxml-target.js';
+import { pointRegionPt, validateRegionPng } from './region-png.js';
+import { selectorIsAvailable, selectorMatchesFormat, selectorsForFormat, targetSelectorSchema } from './target-selector-schema.js';
 import { inspectArtifactTarget } from './target-inspection.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -66,6 +68,7 @@ import type {
   AdapterVerifyResult,
   ArtifactCapabilitiesResponse,
   ArtifactCommitJournalRow,
+  CommitFinalization,
   ArtifactDependencyEntry,
   ArtifactRestoreBatchRecord,
   ArtifactRevisionRecord,
@@ -442,6 +445,16 @@ export class ArtifactService {
     return this.db.getArtifact(artifact.userId, artifact.id) ?? artifact;
   }
 
+  private hasUnresolvedFileCommit(artifact: Pick<ArtifactRecord, 'userId' | 'scopeKind' | 'chatId' | 'projectId' | 'relPath'>): boolean {
+    return Boolean(this.db.db.prepare(`
+      SELECT 1 FROM artifact_commit_journal
+      WHERE user_id = ? AND scope_kind = ? AND chat_id IS ? AND project_id IS ?
+        AND (rel_path = ? OR ? = '' OR (operation_type IN ('delete_chat', 'delete_project') AND rel_path = ''))
+        AND (state IN ('prepared', 'replacing', 'file_replaced')
+             OR (state IN ('aborted', 'ambiguous_quarantined') AND audit_note LIKE '{"recoveryCleanup":%'))
+    `).get(artifact.userId, artifact.scopeKind, artifact.chatId, artifact.projectId, artifact.relPath, artifact.relPath));
+  }
+
   private recordExternalSyncOnRecovery(params: {
     userId: string;
     artifactId: string;
@@ -450,7 +463,7 @@ export class ArtifactService {
     strict?: boolean;
   }): boolean {
     const artifact = this.db.getArtifact(params.userId, params.artifactId);
-    if (!artifact) return false;
+    if (!artifact || (!params.strict && this.hasUnresolvedFileCommit(artifact))) return false;
 
     const now = Date.now();
     let read: ReturnType<typeof readContainedRegularFileNoFollowStable>;
@@ -594,35 +607,54 @@ export class ArtifactService {
     return true;
   }
 
+  private inImmediateTransaction<T>(run: () => T): T {
+    this.db.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const result = run();
+      this.db.db.exec('COMMIT;');
+      return result;
+    } catch (error) {
+      this.db.db.exec('ROLLBACK;');
+      throw error;
+    }
+  }
+
+  private updateReflectedWorkingCopyInTx(original: ArtifactRecord, workingCopyId: string, now: number) {
+    const changed = this.db.db.prepare(`
+      UPDATE artifacts SET source_base_revision = ?, updated_at = ?
+      WHERE id = ? AND user_id = ? AND scope_kind = 'chat' AND lifecycle_state = 'active'
+        AND source_artifact_id = ? AND source_base_revision IS NOT ?
+    `).run(original.revision, now, workingCopyId, original.userId, original.id, original.revision);
+    if (Number(changed.changes) === 0) return null;
+    const artifact = this.db.getArtifact(original.userId, workingCopyId)!;
+    return this.db.insertSyncEventInTx({
+      userId: original.userId, eventId: crypto.randomUUID(), type: 'artifact.updated', chatId: artifact.chatId,
+      payload: { artifact }, createdAt: now,
+    });
+  }
+
   /**
    * Stage T6 transactional finalization shared between normal commit path and crash recovery roll-forward.
    */
   private finalizeStageT6InTx(
     journal: ArtifactCommitJournalRow,
-    opts: {
-      suppressDependencyPropagation?: boolean;
-      extraArtifactFields?: {
-        filename?: string;
-        mimeType?: string;
-        previewKind?: ArtifactRecord['previewKind'];
-        source?: ArtifactRecord['source'];
-        messageId?: string | null;
-        runId?: string | null;
-        sourceArtifactId?: string | null;
-        sourceBaseRevision?: number | null;
-      };
-      idempotencyResponseBuilder?: (artifact: ArtifactRecord) => unknown;
-      updateWorkingCopyId?: string;
-    } = {}
+    opts: { suppressDependencyPropagation?: boolean } = {}
   ): { artifact: ArtifactRecord; envelopes: SyncEventEnvelope[] } {
+    const fields = journal.finalization;
     const now = Date.now();
     const existing = this.db.getArtifactInternal(journal.artifactId);
-    const filename = opts.extraArtifactFields?.filename ?? existing?.filename ?? path.basename(journal.relPath);
-    const detected = detectMimeAndPreviewKind(filename, opts.extraArtifactFields?.mimeType ?? existing?.mimeType);
-    const mimeType = opts.extraArtifactFields?.mimeType ?? existing?.mimeType ?? detected.mimeType;
-    const previewKind = opts.extraArtifactFields?.previewKind ?? existing?.previewKind ?? detected.previewKind;
+    if ((!journal.isCreate && (!existing || existing.lifecycleState !== 'active' || existing.revision !== journal.parentRevision)) ||
+        (existing && (existing.userId !== journal.userId || existing.chatId !== journal.chatId ||
+          existing.projectId !== journal.projectId || existing.relPath !== journal.relPath ||
+          (journal.isCreate && existing.lifecycleState !== 'pending_create')))) {
+      throw artifactConflictError('保存元の版を確認できません。', { artifactId: journal.artifactId });
+    }
+    const filename = fields?.filename ?? existing?.filename ?? path.basename(journal.relPath);
+    const detected = detectMimeAndPreviewKind(filename, fields?.mimeType ?? existing?.mimeType);
+    const mimeType = fields?.mimeType ?? existing?.mimeType ?? detected.mimeType;
+    const previewKind = fields?.previewKind ?? existing?.previewKind ?? detected.previewKind;
     const source =
-      opts.extraArtifactFields?.source ??
+      fields?.source ??
       existing?.source ??
       (journal.scopeKind === 'project' ? 'project_upload' : 'user_edit');
 
@@ -657,11 +689,11 @@ export class ArtifactService {
           mimeType,
           previewKind,
           source,
-          opts.extraArtifactFields?.messageId ?? null,
-          opts.extraArtifactFields?.runId ?? null,
+          fields?.messageId ?? null,
+          fields?.runId ?? null,
           journal.diffPatch,
-          opts.extraArtifactFields?.sourceArtifactId ?? null,
-          opts.extraArtifactFields?.sourceBaseRevision ?? null,
+          fields?.sourceArtifactId ?? null,
+          fields?.sourceBaseRevision ?? null,
           now,
           journal.artifactId,
           journal.userId
@@ -682,8 +714,8 @@ export class ArtifactService {
           journal.scopeKind,
           journal.chatId,
           journal.projectId,
-          opts.extraArtifactFields?.messageId ?? null,
-          opts.extraArtifactFields?.runId ?? null,
+          fields?.messageId ?? null,
+          fields?.runId ?? null,
           journal.relPath,
           filename,
           mimeType,
@@ -694,8 +726,8 @@ export class ArtifactService {
           journal.diffPatch,
           journal.targetRevision,
           journal.newDependencyManifestHash,
-          opts.extraArtifactFields?.sourceArtifactId ?? null,
-          opts.extraArtifactFields?.sourceBaseRevision ?? null,
+          fields?.sourceArtifactId ?? null,
+          fields?.sourceBaseRevision ?? null,
           now,
           now
         );
@@ -759,7 +791,7 @@ export class ArtifactService {
     }
 
     // Enqueue persistent dependency propagation unless suppressed by batch restore
-    if (!opts.suppressDependencyPropagation) {
+    if (!(fields?.suppressDependencyPropagation ?? opts.suppressDependencyPropagation)) {
       this.db.db
         .prepare(
           `INSERT INTO artifact_dep_propagation_queue (
@@ -805,12 +837,9 @@ export class ArtifactService {
         },
         now
       );
-      if (opts.updateWorkingCopyId) {
-        this.db.db
-          .prepare(
-            'UPDATE artifacts SET source_base_revision = ?, updated_at = ? WHERE id = ? AND user_id = ?'
-          )
-          .run(artifact.revision, now, opts.updateWorkingCopyId, journal.userId);
+      if (fields?.updateWorkingCopyId) {
+        const event = this.updateReflectedWorkingCopyInTx(artifact, fields.updateWorkingCopyId, now);
+        if (event) envelopes.push(event);
       }
       const latestProj = this.db.getProject(journal.userId, journal.projectId);
       if (latestProj) {
@@ -847,10 +876,11 @@ export class ArtifactService {
 
     // Finalize idempotency row inside same tx
     if (journal.idempotencyScopeKey && journal.idempotencyKey) {
-      const respObj = opts.idempotencyResponseBuilder
-        ? opts.idempotencyResponseBuilder(artifact)
-        : { artifact, noOp: false };
-      this.db.db
+      const respObj = { artifact, noOp: false,
+        ...(journal.operationType === 'edit' || journal.operationType === 'batch_edit'
+          ? { summary: fields?.responseSummary ?? journal.operationSummary } : {}),
+      };
+      const completed = this.db.db
         .prepare(
           `UPDATE artifact_idempotency
            SET status = 'completed',
@@ -860,7 +890,8 @@ export class ArtifactService {
                no_op = 0,
                response_json = ?,
                updated_at = ?
-           WHERE user_id = ? AND scope_key = ? AND idempotency_key = ?`
+           WHERE user_id = ? AND scope_key = ? AND idempotency_key = ?
+             AND status = 'in_progress' AND commit_id = ? AND request_fingerprint IS ?`
         )
         .run(
           journal.commitId,
@@ -870,8 +901,13 @@ export class ArtifactService {
           now,
           journal.userId,
           journal.idempotencyScopeKey,
-          journal.idempotencyKey
+          journal.idempotencyKey,
+          journal.commitId,
+          journal.requestFingerprint
         );
+      if (Number(completed.changes) !== 1) {
+        throw new ArtifactError('ARTIFACT_CONFLICT', '保存結果と冪等要求の対応を確認できません。', 409);
+      }
     }
 
     // Atomically mark batch restore item committed inside the exact same Stage T6 transaction (ARCH-04 / ARCH-07)
@@ -934,6 +970,7 @@ export class ArtifactService {
     actorId: string | null;
     operationType: string;
     operationSummary: string;
+    responseSummary?: string;
     operationPayload?: Record<string, unknown> | null;
     batchId?: string | null;
     batchSeq?: number | null;
@@ -949,6 +986,9 @@ export class ArtifactService {
     assertAuthorizedBeforeCommit: () => void | Promise<void>;
   }): Promise<{ artifact: ArtifactRecord; noOp: boolean }> {
     const normalizedRel = normalizeRelPath(params.relPath);
+    if (this.hasUnresolvedFileCommit({ ...params, relPath: normalizedRel })) {
+      throw new ArtifactError('IDEMPOTENCY_IN_PROGRESS', '前回の保存処理の復旧が完了していません。', 409);
+    }
     const stagingDir = this.blobManager.getUserStagingDir(params.userId);
     this.assertSameFilesystem(stagingDir, params.rootDir);
     const stagingIsolation = this.getStagingIsolation();
@@ -968,7 +1008,38 @@ export class ArtifactService {
       newSha256 === params.expectedPrevSha256 &&
       depScan.manifestHash === params.prevDepHash
     ) {
-      const current = this.db.getArtifact(params.userId, params.artifactId)!;
+      await params.assertAuthorizedBeforeCommit();
+      const current = this.db.getArtifact(params.userId, params.artifactId);
+      if (!current || current.revision !== params.parentRevision || !params.expectedPrevFingerprint) {
+        throw artifactConflictError('保存対象の版が変更されました。', { artifactId: params.artifactId });
+      }
+      const latest = readContainedRegularFileNoFollowStable(params.rootDir, normalizedRel);
+      if (latest.sha256 !== newSha256 || !fingerprintsMatch(latest.fingerprint, params.expectedPrevFingerprint)) {
+        throw new ExternalConcurrentWriteError('保存直前にファイルの外部変更を検出しました。');
+      }
+      if (params.sourceArtifactId && params.sourceBaseRevision != null &&
+          (current.sourceArtifactId !== params.sourceArtifactId || current.sourceBaseRevision !== params.sourceBaseRevision)) {
+        const updated = this.inImmediateTransaction(() => {
+          const now = Date.now();
+          this.db.db.prepare(`
+            UPDATE artifacts SET source_artifact_id = ?, source_base_revision = ?, updated_at = ?
+            WHERE id = ? AND user_id = ?
+          `).run(params.sourceArtifactId!, params.sourceBaseRevision!, now, current.id, params.userId);
+          const artifact = this.db.getArtifact(params.userId, current.id)!;
+          const event = this.db.insertSyncEventInTx({
+            userId: params.userId, eventId: crypto.randomUUID(), type: 'artifact.updated', chatId: artifact.chatId,
+            projectId: artifact.projectId, payload: { artifact }, createdAt: now,
+          });
+          return { artifact, event };
+        });
+        this.hub.broadcastPersistedEvent(updated.event);
+        return { artifact: updated.artifact, noOp: true };
+      }
+      if (params.updateWorkingCopyId) {
+        const workingCopyId = params.updateWorkingCopyId;
+        const event = this.inImmediateTransaction(() => this.updateReflectedWorkingCopyInTx(current, workingCopyId, Date.now()));
+        if (event) this.hub.broadcastPersistedEvent(event);
+      }
       if (params.batchId) {
         this.db.db.exec('BEGIN IMMEDIATE;');
         try {
@@ -998,6 +1069,14 @@ export class ArtifactService {
       return { artifact: current, noOp: true };
     }
 
+    const finalization: CommitFinalization = {
+      filename: params.filename, mimeType: params.mimeType, previewKind: params.previewKind,
+      source: params.source, messageId: params.messageId, runId: params.runId,
+      sourceArtifactId: params.sourceArtifactId, sourceBaseRevision: params.sourceBaseRevision,
+      updateWorkingCopyId: params.updateWorkingCopyId,
+      responseSummary: params.responseSummary,
+      suppressDependencyPropagation: params.suppressDependencyPropagation,
+    };
     const diffPatch = maybeTextDiff(normalizedRel, params.prevBuffer, params.newBuffer);
     const commitId = crypto.randomUUID();
     const privateStagePath = path.join(stagingDir, `${commitId}.stage`);
@@ -1077,8 +1156,8 @@ export class ArtifactService {
                actor_kind, actor_id, operation_type, operation_summary, operation_payload_json,
                batch_id, batch_seq, staging_isolation_mode,
                idempotency_scope_key, idempotency_key, request_fingerprint, diff_patch,
-               state, audit_note, sync_event_seq, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', NULL, NULL, ?, ?)`
+               state, audit_note, sync_event_seq, created_at, updated_at, finalization_json
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', NULL, NULL, ?, ?, ?)`
           )
           .run(
             commitId,
@@ -1113,17 +1192,23 @@ export class ArtifactService {
             params.requestFingerprint ?? null,
             diffPatch,
             t1Now,
-            t1Now
+            t1Now,
+            JSON.stringify(finalization)
           );
 
         if (params.idempotencyScopeKey && params.idempotencyKey) {
-          this.db.db
+          const linked = this.db.db
             .prepare(
               `UPDATE artifact_idempotency
                SET commit_id = ?, updated_at = ?
-               WHERE user_id = ? AND scope_key = ? AND idempotency_key = ?`
+               WHERE user_id = ? AND scope_key = ? AND idempotency_key = ?
+                 AND status = 'in_progress' AND commit_id IS NULL AND server_boot_id = ? AND request_fingerprint IS ?`
             )
-            .run(commitId, t1Now, params.userId, params.idempotencyScopeKey, params.idempotencyKey);
+            .run(commitId, t1Now, params.userId, params.idempotencyScopeKey, params.idempotencyKey,
+              this.idempotency.serverBootId, params.requestFingerprint ?? null);
+          if (Number(linked.changes) !== 1) {
+            throw new ArtifactError('IDEMPOTENCY_IN_PROGRESS', '冪等要求を保存処理に関連付けられません。', 409);
+          }
         }
 
         this.db.db.exec('COMMIT;');
@@ -1268,6 +1353,7 @@ export class ArtifactService {
       // ---- T6: Single BEGIN IMMEDIATE transaction committing DB + revisions + deps + idempotency + outbox + batch item ----
       const journalObj: ArtifactCommitJournalRow = {
         commitId,
+        finalization,
         artifactId: params.artifactId,
         userId: params.userId,
         chatId: params.chatId,
@@ -1310,20 +1396,7 @@ export class ArtifactService {
       let envelopes: SyncEventEnvelope[] = [];
       this.db.db.exec('BEGIN IMMEDIATE;');
       try {
-        const res = this.finalizeStageT6InTx(journalObj, {
-          suppressDependencyPropagation: params.suppressDependencyPropagation,
-          extraArtifactFields: {
-            filename: params.filename,
-            mimeType: params.mimeType,
-            previewKind: params.previewKind,
-            source: params.source,
-            messageId: params.messageId,
-            runId: params.runId,
-            sourceArtifactId: params.sourceArtifactId,
-            sourceBaseRevision: params.sourceBaseRevision,
-          },
-          updateWorkingCopyId: params.updateWorkingCopyId,
-        });
+        const res = this.finalizeStageT6InTx(journalObj);
         committedArtifact = res.artifact;
         envelopes = res.envelopes;
         this.db.db.exec('COMMIT;');
@@ -1359,8 +1432,6 @@ export class ArtifactService {
                 .prepare("DELETE FROM artifacts WHERE id = ? AND lifecycle_state = 'pending_create'")
                 .run(params.artifactId);
             }
-            this.db.db.prepare('DELETE FROM artifact_idempotency WHERE user_id = ? AND commit_id = ?')
-              .run(params.userId, commitId);
             this.db.db.prepare("UPDATE artifact_commit_journal SET state = 'aborted', audit_note = ?, updated_at = ? WHERE commit_id = ?")
               .run(JSON.stringify({ recoveryCleanup: 'aborted_before_replace', needsExternalSync: false }), Date.now(), commitId);
             this.db.db.exec('COMMIT;');
@@ -1370,8 +1441,12 @@ export class ArtifactService {
           }
           try {
             removeStageAndSync(privateStagePath);
-            this.db.db.prepare('UPDATE artifact_commit_journal SET audit_note = ? WHERE commit_id = ?')
-              .run('aborted_before_replace', commitId);
+            this.inImmediateTransaction(() => {
+              this.db.db.prepare('DELETE FROM artifact_idempotency WHERE user_id = ? AND commit_id = ?')
+                .run(params.userId, commitId);
+              this.db.db.prepare('UPDATE artifact_commit_journal SET audit_note = ? WHERE commit_id = ?')
+                .run('aborted_before_replace', commitId);
+            });
           } catch {
             // Startup can finish the durably recorded cleanup.
           }
@@ -1496,6 +1571,7 @@ export class ArtifactService {
     const scopeKey = `create:${params.scopeKind}:${scopeId}`;
 
     const reverifyAuth = async () => {
+      await params.assertAuthorized?.();
       const rootDir = this.resolveScopeRootDir(
         params.userId,
         params.scopeKind,
@@ -1505,7 +1581,6 @@ export class ArtifactService {
       if (!rootDir) {
         throw new ArtifactError('NOT_FOUND', '対象のチャットまたはプロジェクトが見つからないか権限がありません。', 404);
       }
-      await params.assertAuthorized?.();
     };
 
     const adapter = this.registry.resolve(filename, detected.previewKind);
@@ -1538,7 +1613,10 @@ export class ArtifactService {
       reverifyAuth,
       run: async () => {
         const pathLockKey = `path:${params.userId}:${params.scopeKind}:${scopeId}:${relPath}`;
-        const out = await this.lockManager.withLock(pathLockKey, async () => {
+        const out = await this.lockManager.withLocks([
+          pathLockKey,
+          ...(params.sourceArtifactId ? [`artifact:${params.sourceArtifactId}`] : []),
+        ], async () => {
           const rootDir = this.resolveScopeRootDir(
             params.userId,
             params.scopeKind,
@@ -2937,18 +3015,6 @@ export class ArtifactService {
           })
         );
       }
-      // Detach source_artifact_id & source_base_revision on any chat copies before ON DELETE CASCADE
-      // removes project artifacts, preserving CHECK(source_base_revision IS NULL OR source_artifact_id IS NOT NULL).
-      this.db.db
-        .prepare(
-          `UPDATE artifacts
-           SET source_artifact_id = NULL, source_base_revision = NULL, updated_at = ?
-           WHERE user_id = ?
-             AND source_artifact_id IN (
-               SELECT id FROM artifacts WHERE project_id = ? AND user_id = ?
-             )`
-        )
-        .run(now, journal.userId, payload.projectId, journal.userId);
       this.db.deleteProject(journal.userId, payload.projectId);
       envelopes.push(
         this.db.insertSyncEventInTx({
@@ -3000,16 +3066,6 @@ export class ArtifactService {
           })
         );
       }
-      this.db.db
-        .prepare(
-          `UPDATE artifacts
-           SET source_artifact_id = NULL, source_base_revision = NULL, updated_at = ?
-           WHERE user_id = ?
-             AND source_artifact_id IN (
-               SELECT id FROM artifacts WHERE chat_id = ? AND user_id = ?
-             )`
-        )
-        .run(now, journal.userId, payload.chatId, journal.userId);
       this.db.deleteChat(journal.userId, payload.chatId);
       envelopes.push(
         this.db.insertSyncEventInTx({
@@ -3047,8 +3103,12 @@ export class ArtifactService {
     artifactId: string;
     relPath: string;
     operationSummary: string;
+    assertAuthorized?: () => void | Promise<void>;
     payload: NonNullable<ReturnType<ArtifactService['parseDeleteJournalPayload']>>;
   }): Promise<{ envelopes: SyncEventEnvelope[] }> {
+    if (this.hasUnresolvedFileCommit(params)) {
+      throw new ArtifactError('IDEMPOTENCY_IN_PROGRESS', '前回の保存処理の復旧が完了していません。', 409);
+    }
     const commitId = crypto.randomUUID();
     const now = Date.now();
     const stagingIsolation = this.getStagingIsolation();
@@ -3149,6 +3209,7 @@ export class ArtifactService {
       await this.commitFaultHook?.('after_T1', faultCtx);
 
       await this.commitFaultHook?.('before_T3', faultCtx);
+      await params.assertAuthorized?.();
       // T3: Transition to 'replacing' immediately before FS deletion
       this.db.db
         .prepare("UPDATE artifact_commit_journal SET state = 'replacing', updated_at = ? WHERE commit_id = ?")
@@ -3421,6 +3482,24 @@ export class ArtifactService {
    * Creates or refreshes a chat working copy `.project-context/<relPath>` from a project original artifact,
    * recording `source_artifact_id` and `source_base_revision` (`PIN-03`, `NEG-10`).
    */
+  private async assertProjectSource(
+    original: ArtifactRecord,
+    observedSha256: string,
+    assertAuthorized?: () => void | Promise<void>,
+  ): Promise<void> {
+    await assertAuthorized?.();
+    const live = this.db.getArtifact(original.userId, original.id);
+    const project = live?.projectId ? this.db.getProject(original.userId, live.projectId) : null;
+    if (live && project && !live.deletedOnDisk && live.revision === original.revision && observedSha256 === live.sha256) {
+      try {
+        if (readContainedRegularFileNoFollowStable(project.storageDir, live.relPath).sha256 === observedSha256) return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+    throw artifactConflictError('同期元のプロジェクト原本が変更されました。', { artifactId: original.id });
+  }
+
   async createProjectWorkingCopyInChat(params: {
     userId: string;
     projectId: string;
@@ -3439,6 +3518,7 @@ export class ArtifactService {
       throw new ArtifactError('NOT_FOUND', 'プロジェクト原本ファイルが見つかりません。', 404);
     }
     const read = readContainedRegularFileNoFollowStable(project.storageDir, projArt.relPath);
+    const assertAuthorized = () => this.assertProjectSource(projArt, read.sha256, params.assertAuthorized);
     const workingRelPath = normalizeRelPath(`.project-context/${projArt.relPath}`);
     const existingWorkingCopy = this.db.findArtifactByRelPath(params.userId, params.chatId, workingRelPath);
 
@@ -3457,7 +3537,7 @@ export class ArtifactService {
         actorKind: 'user',
         actorId: params.userId,
         operationSummary: `Created chat working copy of project file ${projArt.relPath}`,
-        assertAuthorized: params.assertAuthorized,
+        assertAuthorized,
       });
       return { artifact: created.artifact };
     }
@@ -3473,7 +3553,7 @@ export class ArtifactService {
       operationSummary: `Refreshed working copy from project rev ${projArt.revision}`,
       sourceArtifactId: projArt.id,
       sourceBaseRevision: projArt.revision,
-      assertAuthorized: params.assertAuthorized,
+      assertAuthorized,
     });
     return { artifact: updated.artifact };
   }
@@ -3531,6 +3611,7 @@ export class ArtifactService {
           artifactId: liveArt?.id ?? `sync:${params.chatId}:${wsRel}`,
           relPath: wsRel,
           operationSummary: `Remove obsolete synced project file ${wsRel}`,
+          assertAuthorized: params.assertAuthorized,
           payload: {
             kind: 'delete_sync_file',
             chatId: params.chatId,
@@ -3554,47 +3635,53 @@ export class ArtifactService {
       if (!projArt) {
         projArt = this.db.findProjectArtifactByRelPath(params.userId, params.projectId, pf.relPath);
       }
-      if (!projArt) continue;
+      if (!projArt || projArt.scopeKind !== 'project' || projArt.projectId !== params.projectId) continue;
+      const original = projArt;
 
       const workingRelPath = normalizeRelPath(`.project-context/${pf.relPath}`);
+      let read: ReturnType<typeof readContainedRegularFileNoFollowStable>;
       try {
-        const read = readContainedRegularFileNoFollowStable(project.storageDir, pf.relPath);
-        const existing = this.db.findArtifactByRelPath(params.userId, params.chatId, workingRelPath);
-        if (!existing) {
-          await this.createArtifact({
-            userId: params.userId,
-            scopeKind: 'chat',
-            chatId: params.chatId,
-            relPath: workingRelPath,
-            filename: pf.filename,
-            mimeType: pf.mimeType,
-            content: read.buffer,
-            source: 'project_copy',
-            sourceArtifactId: projArt.id,
-            sourceBaseRevision: projArt.revision,
-            actorKind: 'system',
-            actorId: null,
-            operationSummary: `Synced project file ${pf.relPath}`,
-          });
-        } else if (existing.sha256 !== read.sha256 || existing.sourceBaseRevision !== projArt.revision) {
-          // Ensure disk file reflects updated project original and record revision
-          await this.replaceArtifactBytes({
-            userId: params.userId,
-            artifactId: existing.id,
-            expectedRevision: existing.revision,
-            newBuffer: read.buffer,
-            actorKind: 'system',
-            actorId: null,
-            operationType: 'project_sync',
-            operationSummary: `Synced project file ${pf.relPath} (rev ${projArt.revision})`,
-            sourceArtifactId: projArt.id,
-            sourceBaseRevision: projArt.revision,
-          });
-        }
-        syncedPaths.push(workingRelPath);
-      } catch {
-        // skip missing project source on disk
+        read = readContainedRegularFileNoFollowStable(project.storageDir, pf.relPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw error;
       }
+      const assertAuthorized = () => this.assertProjectSource(original, read.sha256, params.assertAuthorized);
+      const existing = this.db.findArtifactByRelPath(params.userId, params.chatId, workingRelPath);
+      if (!existing) {
+        await this.createArtifact({
+          userId: params.userId,
+          scopeKind: 'chat',
+          chatId: params.chatId,
+          relPath: workingRelPath,
+          filename: pf.filename,
+          mimeType: pf.mimeType,
+          content: read.buffer,
+          source: 'project_copy',
+          sourceArtifactId: projArt.id,
+          sourceBaseRevision: projArt.revision,
+          assertAuthorized,
+          actorKind: 'system',
+          actorId: null,
+          operationSummary: `Synced project file ${pf.relPath}`,
+        });
+      } else if (existing.sha256 !== read.sha256 || existing.sourceBaseRevision !== projArt.revision || existing.sourceArtifactId !== projArt.id) {
+        // Ensure disk file reflects updated project original and record revision
+        await this.replaceArtifactBytes({
+          userId: params.userId,
+          artifactId: existing.id,
+          expectedRevision: existing.revision,
+          newBuffer: read.buffer,
+          actorKind: 'system',
+          actorId: null,
+          operationType: 'project_sync',
+          operationSummary: `Synced project file ${pf.relPath} (rev ${projArt.revision})`,
+          sourceArtifactId: projArt.id,
+          sourceBaseRevision: projArt.revision,
+          assertAuthorized,
+        });
+      }
+      syncedPaths.push(workingRelPath);
     }
     return syncedPaths;
   }
@@ -3624,6 +3711,9 @@ export class ArtifactService {
       throw new ArtifactError('NOT_FOUND', '作業コピー成果物が見つかりません。', 404);
     }
     if (!workingCopy.sourceArtifactId || workingCopy.sourceBaseRevision === null) {
+      if (workingCopy.source === 'project_copy') {
+        throw artifactConflictError('反映先のプロジェクト原本を確認できません。', { conflictKind: 'project_original_deleted' });
+      }
       throw new ArtifactError('NOT_A_PROJECT_WORKING_COPY', 'この成果物はプロジェクト原本の作業コピーではありません。', 400);
     }
 
@@ -3631,25 +3721,12 @@ export class ArtifactService {
     const expectedProjRev = params.expectedProjectRevision ?? workingCopy.sourceBaseRevision;
 
     const projectOriginal = this.db.getArtifact(params.userId, projectArtifactId);
-    if (!projectOriginal || projectOriginal.scopeKind !== 'project' || !projectOriginal.projectId) {
+    if (!projectOriginal || projectOriginal.deletedOnDisk || projectOriginal.scopeKind !== 'project' || !projectOriginal.projectId) {
       throw artifactConflictError('反映先のプロジェクト原本が削除されているため反映できません。', {
         conflictKind: 'project_original_deleted',
         sourceArtifactId: projectArtifactId,
         expectedProjectRevision: expectedProjRev,
       });
-    }
-
-    if (projectOriginal.revision !== expectedProjRev) {
-      throw artifactConflictError(
-        `作業コピー作成後にプロジェクト原本が更新されています（基準版: ${expectedProjRev}, 最新版: ${projectOriginal.revision}）。差分を確認してください。`,
-        {
-          conflictKind: 'project_original_modified',
-          sourceArtifactId: projectOriginal.id,
-          expectedProjectRevision: expectedProjRev,
-          currentProjectRevision: projectOriginal.revision,
-          currentProjectSha256: projectOriginal.sha256,
-        }
-      );
     }
 
     const workingBuf = this.readActiveArtifactBytes(workingCopy);
@@ -3668,7 +3745,16 @@ export class ArtifactService {
       operationSummary: `Reflected changes from chat working copy ${workingCopy.id}`,
       idempotencyKey: params.idempotencyKey,
       updateWorkingCopyId: workingCopy.id,
-      assertAuthorized: params.assertAuthorized,
+      requestedProjectRevision: params.expectedProjectRevision,
+      assertAuthorized: async () => {
+        await params.assertAuthorized?.();
+        const live = this.db.getArtifact(params.userId, workingCopy.id);
+        if (!live || live.deletedOnDisk || live.revision !== workingCopy.revision ||
+            live.sourceArtifactId !== projectOriginal.id ||
+            !this.readActiveArtifactBytes(live)?.equals(workingBuf)) {
+          throw artifactConflictError('反映元の作業コピーが変更されました。', { artifactId: workingCopy.id });
+        }
+      },
     });
 
     const updatedWorkingCopy = this.db.getArtifact(params.userId, workingCopy.id)!;
@@ -3694,6 +3780,7 @@ export class ArtifactService {
     sourceArtifactId?: string | null;
     sourceBaseRevision?: number | null;
     updateWorkingCopyId?: string;
+    requestedProjectRevision?: number;
     alreadyLocked?: boolean;
     assertAuthorized?: () => void | Promise<void>;
   } & ({
@@ -3725,9 +3812,11 @@ export class ArtifactService {
       actorKind: params.actorKind,
       actorId: params.actorId,
       operationType: params.operationType,
-      target: { artifactId: params.artifactId },
-      operations: params.historyDirection ? null : { sha256: crypto.createHash('sha256').update(params.newBuffer).digest('hex') },
-      baseRevision: params.historyDirection ? null : params.expectedRevision,
+      target: { artifactId: params.artifactId, workingCopyId: params.updateWorkingCopyId },
+      operations: params.historyDirection || params.updateWorkingCopyId
+        ? null : { sha256: crypto.createHash('sha256').update(params.newBuffer).digest('hex') },
+      baseRevision: params.historyDirection ? null : params.updateWorkingCopyId
+        ? params.requestedProjectRevision ?? null : params.expectedRevision,
     });
 
     const executeLocked = async () => {
@@ -3762,7 +3851,7 @@ export class ArtifactService {
       }
 
       const mutation = params.historyDirection
-        ? this.planActorHistoryMutation(current, prevRead, params.actorKind, params.actorId, params.historyDirection)
+        ? await this.planActorHistoryMutation(current, prevRead, params.actorKind, params.actorId, params.historyDirection)
         : params;
       if (current.revision !== mutation.expectedRevision) {
         throw artifactConflictError(
@@ -3772,6 +3861,11 @@ export class ArtifactService {
             expectedRevision: mutation.expectedRevision,
             currentRevision: current.revision,
             currentSha256: current.sha256,
+            ...(params.updateWorkingCopyId ? {
+              conflictKind: 'project_original_modified', sourceArtifactId: current.id,
+              expectedProjectRevision: mutation.expectedRevision, currentProjectRevision: current.revision,
+              currentProjectSha256: current.sha256,
+            } : {}),
           }
         );
       }
@@ -3806,8 +3900,8 @@ export class ArtifactService {
         idempotencyScopeKey: params.idempotencyKey ? scopeKey : null,
         idempotencyKey: params.idempotencyKey ?? null,
         requestFingerprint: fingerprint,
-        sourceArtifactId: params.sourceArtifactId ?? current.sourceArtifactId,
-        sourceBaseRevision: params.sourceBaseRevision ?? current.sourceBaseRevision,
+        sourceArtifactId: params.sourceArtifactId,
+        sourceBaseRevision: params.sourceBaseRevision,
         suppressDependencyPropagation: params.suppressDependencyPropagation,
         updateWorkingCopyId: params.updateWorkingCopyId,
         assertAuthorizedBeforeCommit: reverifyAuth,
@@ -3825,7 +3919,11 @@ export class ArtifactService {
       run: async () => {
         const out = params.alreadyLocked
           ? await executeLocked()
-          : await this.lockManager.withLock(`artifact:${params.artifactId}`, executeLocked);
+          : await this.lockManager.withLocks([
+            `artifact:${params.artifactId}`,
+            ...(params.updateWorkingCopyId ? [`artifact:${params.updateWorkingCopyId}`] : []),
+            ...(params.sourceArtifactId ? [`artifact:${params.sourceArtifactId}`] : []),
+          ], executeLocked);
         return {
           result: out,
           alreadyCommittedInTx: !out.noOp,
@@ -3970,8 +4068,11 @@ export class ArtifactService {
             actorId: params.actorId ?? null,
             operationType: params.operations.length > 1 ? 'batch_edit' : 'edit',
             operationSummary: params.operationSummary ?? editResult.summary,
+            responseSummary: editResult.summary,
             operationPayload: {
-              semanticScope: editResult.semanticScope ?? null,
+              semanticScope: editResult.semanticScope ??
+                (adapter.format === 'pdf' ? provePdfRotationScope(prevRead.buffer, editResult.buffer, params.operations)
+                  : proveOfficeEditScope(adapter.format, prevRead.buffer, editResult.buffer, params.operations)) ?? null,
               operations: params.operations,
               editRequestIds: params.editRequestIds,
             },
@@ -4835,7 +4936,8 @@ export class ArtifactService {
   async renderPng(
     userId: string,
     artifactId: string,
-    options: { pageIndex?: number; timeSeconds?: number; frameSample?: {timestampSec: number; sha256: string}; variant?: 'background' | 'sprite'; shapeId?: number; cropSprite?: boolean; region?: { x: number; y: number; width: number; height: number; unit?: 'norm' | 'px' | 'pt' } } = {}
+    options: { pageIndex?: number; timeSeconds?: number; frameSample?: {timestampSec: number; sha256: string}; variant?: 'background' | 'sprite'; shapeId?: number; cropSprite?: boolean; region?: { x: number; y: number; width: number; height: number; unit?: 'norm' | 'px' | 'pt' } } = {},
+    expectedRevision?: number,
   ): Promise<{ png: Buffer; revision: number; sha256: string }> {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', 'Artifact not found.', 404);
@@ -4861,6 +4963,9 @@ export class ArtifactService {
     const constraint = documentFormatConstraint(format, artifact.filename, 'render_png', artifact.previewKind);
     if (constraint) throw unsupportedOperationError('render_png', 'unsupported_by_format', constraint);
     const snapshot = this.readCurrentRevision(userId, artifactId, DOCUMENT_WORKER_MAX_INPUT_BYTES);
+    if (expectedRevision !== undefined && snapshot.revision.revision !== expectedRevision) {
+      throw artifactConflictError('描画対象の版が変更されました。', { artifactId, expectedRevision });
+    }
     const source = snapshot.bytes;
     const dependencies = isWebRenderFormat(format) || format === 'svg'
       ? this.readRenderDependencies(snapshot.artifact, snapshot.revision.revision, DOCUMENT_WORKER_MAX_INPUT_BYTES - source.length)
@@ -5114,18 +5219,17 @@ export class ArtifactService {
     let options: Options;
     if (selector.kind === 'pptx_element' && Number.isSafeInteger(coords.shapeId) && Number(coords.shapeId) > 0) {
       options = { pageIndex: Number(coords.pageIndex), shapeId: Number(coords.shapeId), variant: 'sprite', cropSprite: true };
+    } else if (selector.kind === 'pptx_slide' && selector.pointPt && coords.unit === 'pt') {
+      const pageIndex = coords.pageIndex;
+      const region = pointRegionPt(coords);
+      if (typeof pageIndex !== 'number' || !Number.isSafeInteger(pageIndex) || pageIndex < 0 || !region) return null;
+      options = { pageIndex, region };
     } else if ((selector.kind === 'pdf_region' || selector.kind === 'pdf_pin') && Array.isArray(coords.rectPt)) {
-      let [x, y, width, height] = coords.rectPt as number[];
-      if (selector.kind === 'pdf_pin') {
-        const right = Math.min(Number(coords.widthPt), x + 36);
-        const bottom = Math.min(Number(coords.heightPt), y + 36);
-        x = Math.max(0, x - 36);
-        y = Math.max(0, y - 36);
-        width = right - x;
-        height = bottom - y;
-      }
-      if (!(width > 0 && height > 0)) return null;
-      options = { pageIndex: Number(coords.pageIndex), region: { x, y, width, height, unit: 'pt' } };
+      const [x, y, width, height] = coords.rectPt as number[];
+      const region = selector.kind === 'pdf_pin' ? pointRegionPt({ ...coords, xPt: x, yPt: y })
+        : { x, y, width, height, unit: 'pt' as const };
+      if (!region || !(region.width > 0 && region.height > 0)) return null;
+      options = { pageIndex: Number(coords.pageIndex), region };
     } else if (selector.kind === 'pdf_text_range' && Array.isArray(coords.quadsPt)) {
       const xs = (coords.quadsPt as number[][]).flatMap(quad => quad.filter((_, index) => index % 2 === 0));
       const ys = (coords.quadsPt as number[][]).flatMap(quad => quad.filter((_, index) => index % 2 === 1));
@@ -5144,7 +5248,7 @@ export class ArtifactService {
     } else {
       return null;
     }
-    const result = await this.renderPng(userId, artifactId, options);
+    const result = await this.renderPng(userId, artifactId, options, expectedRevision);
     return result.revision === expectedRevision && validateRegionPng(result.png) ? result.png : null;
   }
 
@@ -5164,7 +5268,9 @@ export class ArtifactService {
     if (!targetSelectorSchema.safeParse(selector).success || !selectorMatchesFormat(selector, adapter.format)) {
       return { status: 'needs_review', reason: 'invalid_target_selector' };
     }
-    if (!selectorIsAvailable(selector)) return { status: 'needs_review', reason: 'unsupported_selector_kind' };
+    if (!selectorIsAvailable(selector) || !selectorsForFormat(adapter.format, artifact.filename, artifact.previewKind).includes(selector.kind)) {
+      return { status: 'needs_review', reason: 'unsupported_selector_kind' };
+    }
     if (adapter.format === 'media' && !selector.kind.startsWith(artifact.previewKind + '_')) {
       return { status: 'needs_review', reason: 'invalid_target_selector' };
     }
@@ -5388,7 +5494,7 @@ export class ArtifactService {
     return this.undoService.getUndoState({ userId, artifactId: artifact.id, format, actorKind, actorId });
   }
 
-  private planActorHistoryMutation(
+  private async planActorHistoryMutation(
     artifact: ArtifactRecord,
     file: ReturnType<typeof readContainedRegularFileNoFollowStable> | null,
     actorKind: ActorKind,
@@ -5415,9 +5521,20 @@ export class ArtifactService {
     const from = read(direction === 'undo' ? target : parent);
     const to = read(direction === 'undo' ? parent : target);
     const scope = target.operationPayload?.semanticScope as { kind?: string; regionKeys?: string[] } | undefined;
+    let newBuffer = to;
+    if (!direct) {
+      if (format === 'pptx' || format === 'xlsx') {
+        newBuffer = replayOfficeEdit(format, file.buffer, from, to, scope?.regionKeys ?? []);
+      } else if (format === 'pdf') {
+        newBuffer = await replayPdfRotation(file.buffer, from, to, scope?.regionKeys ?? [], operations =>
+          this.documentWorker.run('pdf', artifact.filename, file.buffer, { action: 'edit', operations }));
+      } else {
+        newBuffer = replayCsvCellEdit(artifact.filename, file.buffer, from, to, scope?.regionKeys);
+      }
+    }
     return {
       expectedRevision: artifact.revision,
-      newBuffer: direct ? to : replayCsvCellEdit(artifact.filename, file.buffer, from, to, scope?.regionKeys),
+      newBuffer,
       operationSummary: `${direction === 'undo' ? 'Undo' : 'Redo'} revision ${target.revision}`,
       operationPayload: {
         operationReplayVersion: 1,

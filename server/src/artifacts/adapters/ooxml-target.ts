@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
 import { posix } from 'node:path';
-import { unzipSync } from 'fflate';
+import { unzipSync, zipSync } from 'fflate';
 import { SaxesParser } from 'saxes';
 import { ArtifactError } from '../errors.js';
+import type { AdapterOperation } from '../types.js';
 import { validateXmlWellFormedness, type XmlParsedElement } from './xml-validator.js';
 
 const PRESENTATION = 'http://schemas.openxmlformats.org/presentationml/2006/main';
@@ -22,10 +23,10 @@ function invalidPackage(): never {
   throw new ArtifactError('INVALID_OFFICE_PACKAGE', '文書の構造を読み取れません。', 422);
 }
 
-function readParts(bytes: Buffer, names: ReadonlySet<string>) {
+function readParts(bytes: Buffer, names: ReadonlySet<string> | null, maxBytes = MAX_PACKAGE_BYTES) {
   try {
     if (bytes.length < 22) invalidPackage();
-    let remaining = MAX_PACKAGE_BYTES;
+    let remaining = maxBytes;
     const declared = new Set<string>();
     return unzipSync(bytes, { filter: entry => {
       const { name, originalSize, size } = entry;
@@ -37,7 +38,7 @@ function readParts(bytes: Buffer, names: ReadonlySet<string>) {
       declared.add(name);
       remaining -= originalSize;
       if (remaining < 0) invalidPackage();
-      return names.has(name);
+      return names === null || names.has(name);
     } });
   } catch { return invalidPackage(); }
 }
@@ -752,4 +753,180 @@ export function readXlsxRowColTarget(
     : `${colIndexToLetters(start)}1:${colIndexToLetters(end)}1048576`;
   const range = readXlsxRangeTarget(bytes, sheetSelector, rangeA1);
   return range && { ...range, axis, start, end };
+}
+
+
+type ReplayableOfficeFormat = 'pptx' | 'xlsx';
+const MAX_HISTORY_PACKAGE_BYTES = 32 * 1024 * 1024;
+const SLIDE_PART = /^ppt\/slides\/slide[0-9]+\.xml$/;
+const SHEET_PART = /^xl\/worksheets\/sheet[0-9]+\.xml$/;
+const PPTX_LOCAL_OPERATIONS = new Set(['pptx.set_shape_text', 'pptx.move_shape', 'pptx.set_shape_bounds']);
+
+function readReplayPackage(format: ReplayableOfficeFormat, bytes: Buffer) {
+  const entries = readParts(bytes, null, MAX_HISTORY_PACKAGE_BYTES);
+  if (Object.keys(entries).some(name => name.startsWith('_xmlsignatures/'))) return null;
+  if (format === 'xlsx') {
+    // Permit sheet-level replay only in workbooks without formulas, references
+    // stored outside cells, or workbook features that can derive data from them.
+    const allowed = /^(?:\[Content_Types\]\.xml|_rels\/\.rels|docProps\/(?:app|core)\.xml|xl\/(?:workbook\.xml|_rels\/workbook\.xml\.rels|sharedStrings\.xml|styles\.xml|theme\/theme[0-9]+\.xml))$/;
+    if (Object.keys(entries).some(name => !SHEET_PART.test(name) && !allowed.test(name))) return null;
+    const workbook = xml(entries['xl/workbook.xml'], SPREADSHEET, 'workbook');
+    if (workbook.elements.some(node => node.name === 'definedName' || node.name === 'externalReferences')) return null;
+    const sheetChildren = new Set(['sheetPr', 'dimension', 'sheetViews', 'sheetFormatPr', 'cols', 'sheetData',
+      'sheetProtection', 'mergeCells', 'printOptions', 'pageMargins', 'pageSetup', 'headerFooter']);
+    for (const name of Object.keys(entries).filter(name => SHEET_PART.test(name))) {
+      const sheet = xml(entries[name], SPREADSHEET, 'worksheet');
+      if (sheet.elements.some(node => node.name === 'f' || (node.parentIndex === 0 && !sheetChildren.has(node.name)))) return null;
+    }
+  }
+  return entries;
+}
+
+function withoutUtf8XmlDeclaration(source: string): string {
+  return source.replace(/^<\?xml\s+version=(["'])1\.0\1(?:\s+encoding=(["'])utf-8\2)?\s*\?>\r?\n?/i, '');
+}
+
+function equalWorkbookPart(name: string, before: Uint8Array, after: Uint8Array): boolean {
+  if (name !== 'xl/workbook.xml' && name !== 'xl/_rels/workbook.xml.rels') return false;
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  return withoutUtf8XmlDeclaration(decoder.decode(before)) === withoutUtf8XmlDeclaration(decoder.decode(after));
+}
+
+function officePartDifferences(
+  format: ReplayableOfficeFormat,
+  before: NonNullable<ReturnType<typeof readReplayPackage>>,
+  after: NonNullable<ReturnType<typeof readReplayPackage>>,
+): string[] | null {
+  const keys = Object.keys(before);
+  if (keys.length !== Object.keys(after).length) return null;
+  const pattern = format === 'pptx' ? SLIDE_PART : SHEET_PART;
+  const changed: string[] = [];
+  for (const key of keys) {
+    if (!Object.hasOwn(after, key)) return null;
+    const original = before[key];
+    if (Buffer.from(original.buffer, original.byteOffset, original.byteLength).equals(after[key])) continue;
+    if (format === 'xlsx' && equalWorkbookPart(key, original, after[key])) continue;
+    if (!pattern.test(key)) return null;
+    changed.push(key);
+  }
+  return changed.sort();
+}
+
+function readReplayCells(bytes: Uint8Array) {
+  const { source, elements } = xml(bytes, SPREADSHEET, 'worksheet');
+  const cells = new Map<string, XmlParsedElement>();
+  const skeleton: string[] = [];
+  let offset = 0;
+  for (const cell of elements) {
+    if (cell.name !== 'c' || cell.namespace !== SPREADSHEET || cell.parentIndex === null) continue;
+    const row = elements[cell.parentIndex];
+    if (row.name !== 'row' || row.parentIndex === null || elements[row.parentIndex].name !== 'sheetData') return null;
+    const address = cell.attrs.r;
+    if (!address || !/^[A-Z]{1,3}[1-9][0-9]{0,6}$/.test(address) || cells.has(address)) return null;
+    skeleton.push(source.slice(offset, cell.start), address);
+    cells.set(address, cell);
+    offset = cell.end;
+  }
+  skeleton.push(source.slice(offset));
+  skeleton[0] = withoutUtf8XmlDeclaration(skeleton[0]);
+  return { source, cells, skeletonHash: digest(JSON.stringify(skeleton)) };
+}
+
+function xlsxCellDifferences(before: Uint8Array, after: Uint8Array): string[] | null {
+  const base = readReplayCells(before);
+  const edited = readReplayCells(after);
+  if (!base || !edited || base.skeletonHash !== edited.skeletonHash) return null;
+  return [...base.cells].filter(([address, cell]) =>
+    snippet(base.source, cell) !== snippet(edited.source, edited.cells.get(address)!)).map(([address]) => address);
+}
+
+function applyXlsxCellReplacements(
+  live: Uint8Array, before: Uint8Array, after: Uint8Array, addresses: string[],
+) {
+  const current = readReplayCells(live);
+  const base = readReplayCells(before);
+  const edited = readReplayCells(after);
+  if (!current || !base || !edited || current.skeletonHash !== base.skeletonHash) return null;
+  const patches: Array<{ start: number; end: number; value: string }> = [];
+  for (const address of addresses) {
+    const cell = current.cells.get(address);
+    const prior = base.cells.get(address);
+    const next = edited.cells.get(address);
+    if (!cell || !prior || !next || snippet(current.source, cell) !== snippet(base.source, prior)) return null;
+    patches.push({ start: cell.start, end: cell.end, value: snippet(edited.source, next) });
+  }
+  const chunks: string[] = [];
+  let offset = 0;
+  for (const { start, end, value } of patches.sort((a, b) => a.start - b.start)) {
+    chunks.push(current.source.slice(offset, start), value);
+    offset = end;
+  }
+  chunks.push(current.source.slice(offset));
+  return Buffer.from(chunks.join(''));
+}
+
+function officeReplayRegions(
+  format: ReplayableOfficeFormat,
+  from: NonNullable<ReturnType<typeof readReplayPackage>>,
+  to: NonNullable<ReturnType<typeof readReplayPackage>>,
+) {
+  return officePartDifferences(format, from, to)?.flatMap(part => {
+    const cells = format === 'xlsx' ? xlsxCellDifferences(from[part], to[part]) : null;
+    return cells?.length ? cells.map(cell => part + '#' + cell) : [part];
+  }).sort();
+}
+
+export function proveOfficeEditScope(format: string, before: Buffer, after: Buffer, operations: AdapterOperation[]) {
+  if (format !== 'pptx' && format !== 'xlsx') return undefined;
+  if (operations.length === 0 || operations.some(({ op }) =>
+    format === 'pptx' ? !PPTX_LOCAL_OPERATIONS.has(op) : op !== 'xlsx.set_cell')) return undefined;
+  try {
+    const previous = readReplayPackage(format, before);
+    const next = readReplayPackage(format, after);
+    const regionKeys = previous && next && officeReplayRegions(format, previous, next);
+    if (regionKeys?.length) return { kind: 'office_parts_v1', regionKeys };
+  } catch {
+    // A valid edit can still lack sufficient proof for replay across other edits.
+  }
+  return undefined;
+}
+
+export function replayOfficeEdit(
+  format: ReplayableOfficeFormat, currentBytes: Buffer, fromBytes: Buffer, toBytes: Buffer, expectedParts: string[],
+): Buffer {
+  try {
+    const current = readReplayPackage(format, currentBytes);
+    const from = readReplayPackage(format, fromBytes);
+    const to = readReplayPackage(format, toBytes);
+    if (current && from && to) {
+      const regions = officeReplayRegions(format, from, to);
+      if (regions?.length && JSON.stringify(regions) === JSON.stringify(expectedParts)) {
+        const byPart = new Map<string, string[]>();
+        for (const region of regions) {
+          const [part, cell] = region.split('#');
+          const cells = byPart.get(part) ?? [];
+          if (cell) cells.push(cell);
+          byPart.set(part, cells);
+        }
+        for (const [part, cells] of byPart) {
+          if (!Object.hasOwn(current, part)) throw new Error('Missing package part');
+          if (cells.length) {
+            const patched = applyXlsxCellReplacements(current[part], from[part], to[part], cells);
+            if (!patched) throw new Error('Cell snapshot mismatch');
+            current[part] = patched;
+          } else {
+            const before = from[part];
+            if (!Buffer.from(before.buffer, before.byteOffset, before.byteLength).equals(current[part])) {
+              throw new Error('Package part snapshot mismatch');
+            }
+            current[part] = to[part];
+          }
+        }
+        return Buffer.from(zipSync(current, { level: 0 }));
+      }
+    }
+  } catch {
+    // Do not write a new revision if the current package cannot be verified.
+  }
+  throw new ArtifactError('UNDO_SEMANTIC_CONFLICT', '他の更新と競合するため、この操作を安全に変更できません。', 409);
 }

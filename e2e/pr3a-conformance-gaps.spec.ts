@@ -53,7 +53,6 @@ async function assertNoHorizontalOverflow(page: Page) {
 }
 
 test('Base ChatUI non-localhost HTTP (no crypto.subtle): PDF & CSV target pinning resolves via real server Pure-JS hashes', async ({ page }, info) => {
-  test.skip(info.project.name !== 'pc-chromium');
   test.setTimeout(120_000);
 
   const consoleErrors: string[] = [];
@@ -95,7 +94,7 @@ test('Base ChatUI non-localhost HTTP (no crypto.subtle): PDF & CSV target pinnin
 
     const pdfBytes = buildSyntheticPdf([
       { width: 595, height: 842, label: 'Quarterly Summary Page 1' },
-      { width: 595, height: 842, label: 'Appendix Page 2' },
+      { width: 595, height: 842, label: 'Appendix Page 2', rotate: 90 },
     ]);
     const pdfArt = await create('report.pdf', pdfBytes);
     const csvArt = await create('metrics.csv', Buffer.from('Metric,Value\nUsers,120\nRevenue,540\n'));
@@ -146,6 +145,36 @@ test('Base ChatUI non-localhost HTTP (no crypto.subtle): PDF & CSV target pinnin
     await expect(page.locator('canvas').first()).toBeVisible({ timeout: 30_000 });
     expect(await page.evaluate(() => typeof window.crypto.subtle)).toBe('undefined');
     await page.getByRole('button', { name: '依頼', exact: true }).click();
+    const pageText = page.locator('.pdf-page-slot[data-page-number="1"] .pdf-page-text [data-pdf-text-start]').first();
+    await expect(pageText).toHaveText('Quarterly Summary Page 1');
+    if (info.project.name === 'pc-chromium') {
+      await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+      const bounds = (await pageText.boundingBox())!;
+      const y = bounds.y + bounds.height / 2;
+      await page.mouse.move(bounds.x + 0.5, y);
+      await page.mouse.down();
+      await page.mouse.move(bounds.x + bounds.width - 0.5, y, { steps: 12 });
+      await page.mouse.up();
+      await expect.poll(() => page.evaluate(() => window.getSelection()?.toString())).toBe('Quarterly Summary Page 1');
+      await page.keyboard.press('Control+c');
+      await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('Quarterly Summary Page 1');
+    } else {
+      await pageText.evaluate(span => {
+        const range = document.createRange();
+        range.selectNodeContents(span);
+        window.getSelection()!.removeAllRanges();
+        window.getSelection()!.addRange(range);
+      });
+      expect(await page.evaluate(() => window.getSelection()?.toString())).toBe('Quarterly Summary Page 1');
+    }
+    await page.getByRole('button', { name: '選択本文を対象にする' }).click({ noWaitAfter: true });
+    await expect(page.locator('.workspace-selection')).toContainText('選択本文');
+    await page.getByRole('textbox', { name: '変更内容' }).fill('Verify the selected text');
+    await page.getByRole('button', { name: '依頼を追加' }).click();
+    await expect(page.locator('.workspace-request-item')).toHaveCount(1);
+    const [textRequest] = server.ctx.editRequestService.listRequests(userId, chatId, { artifactId: pdfArt.id });
+    expect(textRequest.selector).toMatchObject({ kind: 'pdf_text_range', textOffsetStart: 0, textOffsetEnd: 24 });
+    expect((await server.ctx.editRequestService.resolveRequestTarget(textRequest)).status).toBe('resolved');
     await page.getByRole('combobox', { name: 'PDF の選択方法' }).selectOption('region');
     const pdfRegionBtn = page.getByRole('button', { name: 'ページ 1の範囲', exact: true });
     await pdfRegionBtn.focus();
@@ -157,16 +186,25 @@ test('Base ChatUI non-localhost HTTP (no crypto.subtle): PDF & CSV target pinnin
     await expect(page.locator('.workspace-selection')).toContainText('領域');
     await page.getByRole('textbox', { name: '変更内容' }).fill('Verify heading region on page 1');
     await page.getByRole('button', { name: '依頼を追加' }).click();
-    await expect(page.locator('.workspace-request-item')).toHaveCount(1);
+    await expect(page.locator('.workspace-request-item')).toHaveCount(2);
 
     const pdfRequests = server.ctx.editRequestService.listRequests(userId, chatId, { artifactId: pdfArt.id });
-    expect(pdfRequests).toHaveLength(1);
-    expect(pdfRequests[0].selector.kind).toBe('pdf_region');
-    const pdfSel = pdfRequests[0].selector as { expectedPageContentHash?: string; expectedRegionDigest?: string };
+    expect(pdfRequests).toHaveLength(2);
+    const regionRequest = pdfRequests.find(request => request.selector.kind === 'pdf_region')!;
+    const pdfSel = regionRequest.selector as { expectedPageContentHash?: string; expectedRegionDigest?: string };
     expect(pdfSel.expectedPageContentHash).toMatch(/^[0-9a-f]{64}$/);
     expect(pdfSel.expectedPageContentHash).not.toBe(pdfArt.sha256);
     expect(pdfSel.expectedRegionDigest).toMatch(/^[0-9a-f]{64}$/);
-    expect((await server.ctx.editRequestService.resolveRequestTarget(pdfRequests[0])).status).toBe('resolved');
+    expect((await server.ctx.editRequestService.resolveRequestTarget(regionRequest)).status).toBe('resolved');
+
+    await page.getByRole('button', { name: '次', exact: true }).click({ noWaitAfter: true });
+    await page.getByRole('button', { name: '拡大', exact: true }).click({ noWaitAfter: true });
+    const rotatedLayer = page.locator('.pdf-page-slot[data-page-number="2"] .pdf-page-text');
+    await expect(rotatedLayer).toHaveAttribute('data-main-rotation', '90');
+    const rotatedText = rotatedLayer.locator('[data-pdf-text-start]').first();
+    await expect(rotatedText).toHaveText('Appendix Page 2');
+    const rotatedBounds = (await rotatedText.boundingBox())!;
+    expect(rotatedBounds.height).toBeGreaterThan(rotatedBounds.width);
 
     // 2. CSV target pinning with mandatory expectedRowCount/expectedColCount/expectedHeaderHash/expectedRangeValuesHash
     await page.goto(BASE_HARNESS + '?kind=csv');

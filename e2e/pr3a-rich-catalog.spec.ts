@@ -185,3 +185,29 @@ test('responsive_box aligns its content across PC and iPhone viewports', async (
     }).toBe(true);
   }
 });
+
+test('zoomable node-edge diagrams keep node selection at PC and iPhone sizes', async ({ page }, info) => {
+  const node = children.find(node => node.id === 'network')!;
+  const fixture: RichDocumentV1 = {
+    schemaVersion: 1,
+    state: { node: '' },
+    root: { id: 'root', type: 'stack', direction: 'col', children: [
+      node,
+      { id: 'selected', type: 'text', content: { expr: '$state.node' } },
+    ] },
+  };
+  await page.addInitScript(value => { window.__pr3aFixtureRichDocument = value; }, fixture);
+  await page.goto('http://127.0.0.1:4174/?kind=rich-catalog');
+  const diagram = page.locator('[data-rich-node-id="network"]');
+  const zoom = diagram.getByRole('button', { name: '拡大', exact: true });
+  const destination = diagram.getByRole('button', { name: 'Destination' });
+  if (info.project.name === 'iphone-webkit') {
+    await zoom.tap();
+    await destination.tap();
+  } else {
+    await zoom.click();
+    await destination.click();
+  }
+  await expect.poll(async () => Number(await diagram.locator('[data-viewer-zoom-surface]').getAttribute('data-zoom-scale'))).toBeGreaterThan(1);
+  await expect(page.locator('[data-rich-node-id="selected"]')).toHaveText('b');
+});

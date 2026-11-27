@@ -110,7 +110,9 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
     return()=>controller.abort();
   },[artifact.id,artifact.previewKind,revisionKey]);
   const canEdit=artifact.revision!==undefined&&module.editOperations.some(op=>supportsOperation(caps,op));
-  const canPin=Boolean(artifact.chatId&&artifact.revision!==undefined&&caps?.targetPinSupported&&module.canPin);
+  const selectorCapabilities = caps?.operations.filter(item => item.operation.startsWith('target_pin:')) ?? [];
+  const canPin = Boolean(artifact.chatId && artifact.revision !== undefined && caps?.targetPinSupported && module.canPin &&
+    (!selectorCapabilities.length || selectorCapabilities.some(item => item.scope === 'mcp_and_ui' && item.availability === 'supported')));
   const changed=Boolean(draft&&draft.baseRevision!==artifact.revision);
   const close=()=>{if(busy)return;if(!draft||window.confirm('未保存の変更を破棄して閉じますか？'))onClose()};
   const onDraft=useCallback((baseRevision:number,entry:DraftEntry|null,key:string)=>{
