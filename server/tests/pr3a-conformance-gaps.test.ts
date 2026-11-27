@@ -162,6 +162,7 @@ function buildMinimalDocx(paragraphs: Array<{ text: string; paraId?: string }>):
 
 function buildMinimalPdf(
   pages: Array<{ width: number; height: number; rotate?: number; text: string; compressed?: boolean }>,
+  catalogExtras = '',
 ): Buffer {
   const objects: Buffer[] = [];
   const addObj = (body: string | Buffer): number => {
@@ -198,7 +199,7 @@ function buildMinimalPdf(
     pageIds.push(pageId);
   }
 
-  objects[catalogId - 1] = Buffer.from(`${catalogId} 0 obj\n<< /Type /Catalog /Pages ${pagesId} 0 R >>\nendobj\n`, 'ascii');
+  objects[catalogId - 1] = Buffer.from(`${catalogId} 0 obj\n<< /Type /Catalog /Pages ${pagesId} 0 R ${catalogExtras} >>\nendobj\n`, 'ascii');
   objects[pagesId - 1] = Buffer.from(
     `${pagesId} 0 obj\n<< /Type /Pages /Count ${pageIds.length} /Kids [${pageIds.map((id) => `${id} 0 R`).join(' ')}] >>\nendobj\n`,
     'ascii',
@@ -299,10 +300,10 @@ describe('PR 3A Conformance Gap Fixes', () => {
         expect(caps.operations).toContainEqual(expect.objectContaining({ operation, availability: 'supported' }));
       }
       expect(caps.operations).toEqual(expect.arrayContaining([
-        expect.objectContaining({ operation: 'target_pin', availability: 'partial' }),
-        expect.objectContaining({ operation: 'target_pin:xlsx_chart', availability: 'unsupported_by_format' }),
+        expect.objectContaining({ operation: 'target_pin', availability: 'partial', notes: expect.stringMatching(/PR3B:.*xlsx_chart/) }),
         expect.objectContaining({ operation: 'xlsx.set_cell', availability: 'disabled_by_resource_tier' }),
       ]));
+      expect(caps.operations.some(operation => operation.operation === 'target_pin:xlsx_chart')).toBe(false);
       expect(await service.getStructure(userId, artId)).toMatchObject({ sheets: [{ id: '1', name: 'Sales' }] });
       expect(await service.readRange(userId, artId, { sheetId: '1', rangeA1: 'A2:B2', evaluate: true })).toMatchObject({
         cells: [{ address: 'A2', value: 'Apple' }, { address: 'B2', value: '100', formula: '50*2', formulaStatus: 'cached_existing' }],
@@ -1453,4 +1454,80 @@ it('replays a PPTX shape edit on its original slide and retains another edited s
   expect(Buffer.from(merged['ppt/slides/slide2.xml']).toString()).toBe('<slide>Updated content</slide>');
   expect(() => replayOfficeEdit('pptx', makePresentation('Other heading', 'Updated content'), first, base, scope!.regionKeys))
     .toThrow(expect.objectContaining({ code: 'UNDO_SEMANTIC_CONFLICT' }));
+});
+
+it('binds a PDF page to the catalog optional-content configuration', () => {
+  const pages = [{ width: 600, height: 800, text: 'Layer target' }];
+  const optionalContent = (state: string) => '/OCProperties << /OCGs [<< /Type /OCG /Name (Layer) >>] /D << /BaseState /' + state + ' >> >>';
+  const visible = buildMinimalPdf(pages, optionalContent('ON'));
+  const hidden = buildMinimalPdf(pages, optionalContent('OFF'));
+  const before = readPdfPageTarget(visible, 0)!;
+  expect(readPdfPageTarget(hidden, 0)?.pageContentHash).not.toBe(before.pageContentHash);
+  const adapter = new FormatAdapterRegistry().resolve('layers.pdf', 'pdf');
+  const selector = { kind: 'pdf_page', baseRevision: 1, pageIndex: 0, expectedPageCount: 1, expectedPageContentHash: before.pageContentHash };
+  expect(adapter.resolveTarget(visible, selector, { filename: 'layers.pdf', previewKind: 'pdf' }).status).toBe('resolved');
+  expect(adapter.resolveTarget(hidden, selector, { filename: 'layers.pdf', previewKind: 'pdf' }).status).toBe('needs_review');
+});
+
+it('binds a DOCX paragraph to external link destinations and embedded media bytes', () => {
+  const rel = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  const word = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+  const packageBytes = (target: string, contents: string) => Buffer.from(zipSync({
+    'word/document.xml': strToU8(`<w:document xmlns:w="${word}" xmlns:r="${rel}"><w:body><w:p><w:hyperlink r:id="hyper"><w:r><w:t>Open</w:t></w:r></w:hyperlink><w:r><w:drawing r:embed="image"/></w:r></w:p></w:body></w:document>`),
+    'word/_rels/document.xml.rels': strToU8(`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="hyper" Type="${rel}/hyperlink" Target="${target}" TargetMode="External"/><Relationship Id="image" Type="${rel}/image" Target="media/image.png"/></Relationships>`),
+    'word/media/image.png': strToU8(contents),
+  }));
+  const initial = packageBytes('https://example.test/before', 'image before');
+  const target = readDocxAllParagraphTargets(initial).paragraphs[0];
+  const adapter = new FormatAdapterRegistry().resolve('links.docx', 'docx');
+  const selector = {
+    kind: 'docx_paragraph', baseRevision: 1, blockIndex: 0, expectedBlockHash: target.fingerprint,
+    contextBeforeHash: target.contextBeforeHash, contextAfterHash: target.contextAfterHash,
+  };
+  const meta = { filename: 'links.docx', previewKind: 'docx' as const };
+  expect(adapter.resolveTarget(initial, selector, meta).status).toBe('resolved');
+  expect(adapter.resolveTarget(packageBytes('https://example.test/after', 'image before'), selector, meta).status).toBe('needs_review');
+  expect(adapter.resolveTarget(packageBytes('https://example.test/before', 'image after'), selector, meta).status).toBe('needs_review');
+});
+
+
+it('rechecks the original XLSX row identity when the selected amount did not change', async () => {
+  const server = await createTestServer({ installDocRuntime: 'off', sandboxMode: 'off', allowUnsandboxedDocWorkers: false });
+  try {
+    const userId = 'grid-context-user', chatId = 'grid-context-chat';
+    const workspaceDir = fs.mkdtempSync(path.join(server.dataRoot, 'grid-context-'));
+    server.ctx.db.createUser({ id: userId, username: userId, displayName: 'Grid', passwordHash: 'x', role: 'user', profileDir: workspaceDir });
+    server.ctx.db.createChat({ id: chatId, userId, projectId: null, title: 'Grid', workspaceDir, modelId: '', effortValue: '', projectContextVersion: 0 });
+    const book = (first: number, second: number) => buildMinimalXlsx({ sharedStrings: ['Alice', 'Bob'], sheets: [{
+      name: 'Sheet1', rows: [
+        { r: 1, cells: [{ ref: 'A1', v: first, sharedString: true }, { ref: 'B1', v: 10 }] },
+        { r: 2, cells: [{ ref: 'A2', v: second, sharedString: true }, { ref: 'B2', v: 10 }] },
+      ],
+    }] });
+    const service = server.ctx.artifactService;
+    const { artifact } = await service.createArtifact({ userId, chatId, scopeKind: 'chat', relPath: 'grid.xlsx',
+      actorKind: 'user', content: book(0, 1) });
+    const { target } = await service.readRange(userId, artifact.id, { sheetId: '1', rangeA1: 'B1', targetMetadata: true }) as {
+      target: { expectedSheetStructHash: string; expectedRangeValuesHash: string };
+    };
+    const selector = { kind: 'xlsx_range', baseRevision: 1, sheetId: '1', rangeA1: 'B1',
+      expectedSheetStructHash: target.expectedSheetStructHash, expectedRangeValuesHash: target.expectedRangeValuesHash };
+    expect(await service.resolveTargetOnArtifact(userId, artifact.id, selector)).toMatchObject({ status: 'resolved' });
+    await service.replaceArtifactBytes({ userId, artifactId: artifact.id, expectedRevision: 1, newBuffer: book(1, 0),
+      actorKind: 'user', actorId: userId, operationType: 'test', operationSummary: 'Swap equal-value rows' });
+    expect(await service.resolveTargetOnArtifact(userId, artifact.id, selector)).toMatchObject({ status: 'needs_review' });
+  } finally {
+    await server.cleanup();
+  }
+});
+
+it('uses verified vertical font metrics in the rotated page viewport and rejects absent metrics', async () => {
+  const { pdfTextLayout } = await import('../src/artifacts/adapters/pdf-text-layout.js');
+  const items = [{ str: '縦書', dir: 'ttb', width: 10, height: 20, transform: [10, 0, 0, 10, 40, 70], fontName: 'vertical' }];
+  const viewport = { width: 100, height: 200, convertToViewportPoint: (x: number, y: number) => [y, x] };
+  const styles = { vertical: { ascent: 0.8, vertical: true } };
+  expect(pdfTextLayout(items, viewport).quadsForRange(0, 2)).toBeNull();
+  expect(pdfTextLayout(items, viewport, undefined, styles).quadsForRange(0, 2)).toEqual([[70, 48, 50, 48, 70, 38, 50, 38]]);
+  expect(pdfTextLayout(items, viewport, undefined, styles).quadsForRange(0, 1)).toBeNull();
+  expect(pdfTextLayout(items, viewport, () => [0, 0.5], styles).quadsForRange(0, 1)).toEqual([[70, 48, 60, 48, 70, 38, 60, 38]]);
 });

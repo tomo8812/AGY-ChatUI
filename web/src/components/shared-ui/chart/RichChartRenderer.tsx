@@ -1,9 +1,9 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { extent, sum } from 'd3-array';
 import { scaleLinear, scaleBand } from 'd3-scale';
 import { arc as d3Arc, line as d3Line, area as d3Area } from 'd3-shape';
 import { resolveRichChartPoint } from '../../../../../shared/rich-chart-display';
-import type { RichChartNode, RichChartDatum } from '../../../../../shared/rich-schema';
+import type { RichChartNode, RichChartDatum, RichSourceEntry } from '../../../../../shared/rich-schema';
 import type { RichEvalContext } from '../RichExprEvaluator';
 import { formatDisplayDate, parseDisplayDate } from '../display/formatDate';
 import { toneClass } from '../display/RichBadge';
@@ -42,8 +42,29 @@ interface PlotPoint { x:number; y:number; base:number }
 const linePath=d3Line<PlotPoint|null>().defined(p=>p!==null).x(p=>p!.x).y(p=>p!.y);
 const areaPath=d3Area<PlotPoint|null>().defined(p=>p!==null).x(p=>p!.x).y0(p=>p!.base).y1(p=>p!.y);
 const slicePath=d3Arc();
-export function renderRichChart({ node, context, cycle, select, clipId }: {
-  node: RichChartNode; context: RichEvalContext; cycle: RenderCycle; select: SelectValue; clipId: string;
+function ChartPointDetails({ points, caption, describe }: {
+  points: Array<{ series: Series; point: Point }>;
+  caption: string;
+  describe: (series: Series, point: Point) => string;
+}) {
+  const [page, setPage] = useState(0);
+  const pageSize = 100;
+  const lastPage = Math.ceil(points.length / pageSize) - 1;
+  const current = Math.min(page, lastPage);
+  if (!points.length) return null;
+  return <details className="muted-xs"><summary>{caption} {points.length} 件</summary>
+    <ol start={current * pageSize + 1}>{points.slice(current * pageSize, (current + 1) * pageSize).map(({ series, point }, index) =>
+      <li key={index}>{describe(series, point)}</li>)}</ol>
+    {lastPage > 0 && <div className="rich-chart-page-controls">
+      <button type="button" disabled={current === 0} onClick={() => setPage(current - 1)}>前へ</button>
+      <span aria-live="polite">{current + 1} / {lastPage + 1}</span>
+      <button type="button" disabled={current === lastPage} onClick={() => setPage(current + 1)}>次へ</button>
+    </div>}
+  </details>;
+}
+
+export function renderRichChart({ node, context, cycle, select, clipId, sources }: {
+  node: RichChartNode; context: RichEvalContext; cycle: RenderCycle; select: SelectValue; clipId: string; sources?: RichSourceEntry[];
 }) {
   const val = <T,>(v: T | { expr: string } | undefined) => evaluate<T>(v, context, cycle);
   const formatX = axisFormatter(node.xAxis);
@@ -64,7 +85,18 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
     const data = { seriesKey: s.key, dataIndex: i, x: p.x, y: p.y };
     select(node.selectedPointBind, data, node.onPointSelect, { ...context, item: data, index: i });
   };
-  const details = (s: Series, p: Point) => [s.label, p.label ?? formatX(p.x), p.y === null ? p.missingReason ?? 'データなし' : s.unit ? fmt(p.y) + s.unit : (s.right ? formatRight : formatLeft)(p.y), p.sourceId ?? s.sourceId, p.asOf ?? s.asOf].filter(Boolean).join(' · ');
+  const sourceById = new Map(sources?.map(source => [source.id, source]));
+  const attribution = (id?: string, asOf?: string) => {
+    const source = id ? sourceById.get(id) : undefined;
+    return [source?.name ?? id, source?.url, source?.fetchedAt && '取得 ' + source.fetchedAt,
+      (asOf || source?.asOf) && '基準 ' + (asOf || source?.asOf)].filter(Boolean).join(' · ');
+  };
+  const details = (s: Series, p: Point) => {
+    const sourceId = p.sourceId ?? s.sourceId;
+    return [s.label, p.label ?? formatX(p.x),
+      p.y === null ? p.missingReason ?? 'データなし' : s.unit ? fmt(p.y) + s.unit : (s.right ? formatRight : formatLeft)(p.y),
+      attribution(sourceId, p.asOf ?? (sourceId === s.sourceId ? s.asOf : undefined))].filter(Boolean).join(' · ');
+  };
   const activate = (s: Series, p: Point, i: number) => interactive ? {
     role: 'button', tabIndex: 0, 'aria-label': details(s, p),
     onClick: () => choose(s, p, i), onKeyDown: (e: React.KeyboardEvent<SVGElement>) => {
@@ -72,9 +104,16 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
     },
   } : {};
   const title = text(val(node.title));
-  const missing = series.flatMap(s => s.points.filter(p => p.y === null).map(p => details(s, p)));
+  const attributed: Array<{ series: Series; point: Point }> = [];
+  const missing: typeof attributed = [];
+  for (const s of series) {
+    for (const p of s.points) {
+      if (p.y === null) missing.push({ series: s, point: p });
+      else if (p.sourceId || p.asOf || s.sourceId || s.asOf) attributed.push({ series: s, point: p });
+    }
+  }
   let figure: React.ReactNode;
-  let legend: React.ReactNode = series.map(s => <span key={s.key}><i style={{ background: s.color }} />{s.label}{s.sourceId && <small> · {s.sourceId}</small>}</span>);
+  let legend: React.ReactNode = series.map(s => <span key={s.key}><i style={{ background: s.color }} />{s.label}{(s.sourceId || s.asOf) && <small> · {attribution(s.sourceId, s.asOf)}</small>}</span>);
   if (node.chartType === 'pie' || node.chartType === 'donut') {
     const slices = series.flatMap(s => s.points.map((p, i) => ({ s, p, i })));
     const total = sum(slices, ({p}) => Math.max(0,p.y??0));
@@ -102,6 +141,7 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
     const plotSize = horizontal ? ph : pw;
     const barSeries = series.filter(s => s.type === 'bar');
     const hasBars = barSeries.length > 0;
+    const barAxes = [...new Set(barSeries.map(series => series.right))];
     const hasRightAxis = series.some(s=>s.right);
     const band = scaleBand<string | number>().domain(cat).range([plotStart,plotStart+plotSize]);
     let gap = xmax-xmin;
@@ -160,8 +200,9 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
     const marks = series.map((s,j) => {
       const pts = prepared[j];
       if (s.type === 'bar') {
-        const barWidth = slot*0.8/(stacked ? 1 : Math.max(1,barSeries.length));
-        const offset = -slot*0.4 + (stacked ? 0 : barSeries.indexOf(s)*barWidth) + barWidth*0.025;
+        const barWidth = slot*0.8/(stacked ? barAxes.length : barSeries.length);
+        const group = stacked ? barAxes.indexOf(s.right) : barSeries.indexOf(s);
+        const offset = -slot*0.4 + group*barWidth + barWidth*0.025;
         return pts.map((p,i) => {
           if (!p) return null;
           const x1=hx(p.base,s.right), x2=hx(p.top,s.right);
@@ -210,6 +251,7 @@ export function renderRichChart({ node, context, cycle, select, clipId }: {
     {node.legend==='top' && <div className="rich-chart-legend">{legend}</div>}
     <svg viewBox={'0 0 '+W+' '+H} role={interactive?'group':'img'} aria-label={title||'グラフ'} style={{width:'100%',maxHeight:Math.max(120,Math.min(720,node.heightPx??400))}}>{figure}</svg>
     {node.legend!=='top' && node.legend!=='none' && <div className="rich-chart-legend">{legend}</div>}
-    {missing.length>0 && <details className="muted-xs"><summary>欠損値 {missing.length} 件</summary><ul>{missing.slice(0,100).map((m,i)=><li key={i}>{m}</li>)}</ul>{missing.length>100&&<p>ほか {missing.length-100} 件</p>}</details>}
+    <ChartPointDetails caption="出典付きデータ点" points={attributed} describe={details}/>
+    <ChartPointDetails caption="欠損値" points={missing} describe={details}/>
   </figure>;
 }

@@ -1,15 +1,16 @@
-# Artifact Platform 機能棚卸し・適合性マトリクス（PR 2 時点）
+# Artifact Platform 機能棚卸し・適合性マトリクス（PR 3A）
 
-本書は設計・実装計画書（4.1〜4.3 節、第 10 章、第 11 章）に対する **PR 2（`feat/artifact-platform-pr2`）時点の全機能・全操作の棚卸しおよび要件トレーサビリティ台帳** である（設計書 11.1 節 `docs/artifact-platform-conformance.md`）。
+本書は設計書 §11.1 の要件トレーサビリティ台帳。PR 1・PR 2 の履歴と PR 3A の実装・検証を収録する。
 
 ## 1. スコープおよびステータス定義
 
-- **対象フェーズ**: PR 1（Core 基盤・単一 DB・復旧・軽量リッチ UI コア・アーキテクチャ検査）＋ PR 2（Rich 6 形式アダプター・高度 OOXML/PDF・22 ツール内蔵 MCP・外部ワーカーランタイム）
-- **PR 3A / PR 3B / PR 4 境界**: 統合ビューアー UI（`web/src/components/ArtifactWorkspace/*`）・共通 UI コンポーネント（`web/src/components/shared-ui/*`）・旧 `ArtifactViewerModal.tsx` 撤去は設計書第 10 章に従い PR 3A 以降に属し、本 PR では前倒し実装を行わない。既存の `ArtifactService` 単一ゲートウェイ・`FormatAdapter` 隔離・`DocumentWorker` / `DocWorkerSandbox` アーキテクチャを維持する。
+- **PR 1〜PR 3A**は、Core 基盤、形式別アダプターと内蔵 MCP、共通 UI、基本 Artifact 編集、PR 3A 対象セレクターを含む。
+- **PR 3B**は、残りの形式と詳細セレクター、全起動経路、チャットへのリッチ回答統合を担当する。
+- **PR 4**は、旧モーダル撤去と最終監査を担当する。
 - **ステータス 4 区分**:
   - **対応済み**: 設計書の要求仕様通りに実装・動作確認が完了。
-  - **部分実装**: コア機能または主要サブセットは実装・検証済みだが、形式固有の構造保護制約（例: SmartArt `chMax` 上限超過やスタブ `layoutDef` の安全拒否、保護ノード非破壊拒否）や PR 3A 以降の UI 側未実装が残るもの。
-  - **未実装**: まだ未実装のもの（PR 3A / PR 3B / PR 4 で実装予定の UI・最終監査項目を含む。PR 2 必須バックエンド/MCP 機能に未実装残置は 0 件）。
+  - **部分実装**: コア機能または主要サブセットは実装・検証済みだが、形式固有の構造保護制約（例: SmartArt `chMax` 上限超過やスタブ `layoutDef` の安全拒否、保護ノード非破壊拒否）や後続フェーズの UI 側未実装が残るもの。
+  - **未実装**: まだ未実装のもの（PR 3B・PR 4 予定の UI・最終監査項目を含む）。
   - **設計上許容された非対応**: 設計書 4.1〜4.3 節の形式方針または実ファイル技術調査に基づき、`unsupported_by_format` として非対応と確定したもの。
 
 ### 検証環境区分（設計書 11.2 節・未実行テスト非計上ルール）
@@ -29,7 +30,7 @@
 | --- | --- | --- | --- |
 | **PPTX 文字溢れ・枠外・重なり検査** | **PR 2（本 PR）** | 各図形の段落/フォントサイズ/行折り返しと `a:xfrm` 寸法からテキスト高さ超過（`PPTX_TEXT_OVERFLOW`）を算出し（20 スライド超過時は超過分を `unverified` 明示）、スライド外はみ出し（`PPTX_SHAPE_OUT_OF_BOUNDS`）・図形重なり（`PPTX_SHAPE_OVERLAP`）と合わせて検出する。 | `server/scripts/artifact_doc_worker.py` (`verify_pptx_text_overflow`, `verify_office`) |
 | **PPTX サーバー側レイヤー分解視覚整合（SSIM / MAE）** | **PR 2（本 PR）** | `render_presentation_layer` が生成する背景プレート PNG と各透過スプライト PNG（空プレースホルダーの透過扱い含む）をサーバー側で合成し、LibreOffice Impress が出力した原本スライド全体 PNG とグレースケール 8×8 ブロック SSIM / MAE を比較検証する（チェック ID: `layer_visual_consistency`、`verificationLayer: "server_side_layer_decomposition"`）。`options: { slideIndices, maxSlides, maxShapesPerSlide }` により任意スライドを対象化可能とし、各スライドを **`verified` / `failed` / `skipped_resource_limit` / `unverified`** の 4 状態＋根拠（SSIM/MAE・図形数・予算理由）で返却する。**一部スライドのみ検証成功した場合は文書全体の成功（`passed`）として扱わず、`layer_visual_consistency: "unverified"`・`coverage: "partial"` を返す。** | `server/scripts/artifact_doc_worker.py` (`verify_pptx_layer_visual_consistency`, `compute_image_ssim_and_mae`), `server/src/artifacts/artifact-service.ts` (`verifyArtifact`), `server/src/mcp/builtin-artifact-mcp.ts` (`artifact_verify`), `server/src/routes/file-routes.ts` |
-| **PPTX UI レイヤー分離キャンバス視覚一致（`UX-07`）** | **PR 3A（次フェーズ）** | ブラウザ上の `PptxModule.tsx` レイヤー分離キャンバス（背景プレート＋DOM/SVG 要素＋透過スプライト）の描画結果と、確定後 LibreOffice PNG との bbox＋SSIM 視覚一致およびゴースト 0 件を検証する。PR 2 のサーバー側レイヤー分解検証とは別レイヤーとして区別する。 | `web/src/components/ArtifactWorkspace/modules/PptxModule.tsx`（PR 3A） |
+| **PPTX UI レイヤー分離キャンバス視覚一致（`UX-07`）** | **PR 3A** | ブラウザ上の `PptxModule.tsx` レイヤー分離キャンバス（背景プレート＋DOM/SVG 要素＋透過スプライト）の描画結果と、確定後 LibreOffice PNG との bbox＋SSIM 視覚一致およびゴースト 0 件を検証する。PR 2 のサーバー側レイヤー分解検証とは別レイヤーとして区別する。 | `web/src/components/ArtifactWorkspace/modules/PptxModule.tsx`（PR 3A） |
 | **DOCX レイアウト品質検査** | **PR 2（本 PR）** | `sectPr` 余白・ページ幅と表/図形幅の超過（`docx_margin_overflow`）、過度な埋め込み画像サイズ（`docx_oversized_embed`）、LibreOffice PDF 出力の空白ページ（`docx_blank_page`）および保護ノード・リンク整合を検査する（チェック ID: `layout_quality`）。 | `server/scripts/artifact_doc_worker.py` (`verify_docx_layout_quality`) |
 | **XLSX 数式 4 区分評価・文字切れ検査** | **PR 2（本 PR）** | 隔離コピーの LibreOffice Calc 再計算で数式セルを `evaluated_lo` / `cached_existing` / `unevaluated_unsupported` / `error_formula` の 4 区分で評価し（`formula_values`）、さらに列幅メトリクス＋LibreOffice PDF 出力の `###` 検出により数値/文字列の文字切れ（`text_truncation`）を検証する。 | `server/scripts/artifact_doc_worker.py` (`verify_workbook_formulas`, `verify_xlsx_text_truncation`) |
 
@@ -98,7 +99,7 @@
 | `chart.create` / `update_title_and_legend` / `update_series_data`（埋込 XLSX＋キャッシュ同時同期） / `update_series_style` / `add_or_remove_series` | **部分実装**（棒/縦棒/折線/円/ドーナツ/面/散布/複合・第 2 軸対応；3D 特殊曲面等は非対応） | `server/scripts/artifact_doc_worker.py` (`edit_chart`) | `VERIFIED (REAL RUNTIME)` (`test_pptx_chart_updates_match_embedded_workbook`) |
 | `render_png`（領域指定対応） / `export:pdf` / `export:png` | **対応済み** | `server/scripts/artifact_doc_worker.py` (`render_presentation_layer`, `render_office`, `crop_png_region`) | `VERIFIED (REAL RUNTIME)` (`artifact_doc_worker_test.py`) |
 | `verify`（OOXML 構造・文字溢れ・枠外・重なり・任意スライド指定可能なサーバー側レイヤー分解 SSIM/MAE 4 状態検証） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`verify_pptx_text_overflow`, `verify_pptx_layer_visual_consistency`, `verify_office`), `server/src/mcp/builtin-artifact-mcp.ts` (`artifact_verify`), `server/src/routes/file-routes.ts` | `VERIFIED (REAL RUNTIME)` (`test_pptx_visual_consistency_arbitrary_slides_and_resource_budgets`, `test_office_verification_detects_pptx_overflow_docx_layout_and_xlsx_truncation`, `builtin-artifact-mcp.test.ts` Full Runtime＋strict `bwrap` テスト) |
-| レイヤー分離キャンバス直接編集 UI（`PptxModule.tsx`） | **未実装**（PR 3A 計画対象） | `web/src/components/ArtifactWorkspace/modules/PptxModule.tsx`（PR 3A） | PR 3A 検証ゲート対象 |
+| レイヤー分離キャンバス直接編集 UI（`PptxModule.tsx`） | **部分実装**（PR 3A の基本操作を実装） | `web/src/components/ArtifactWorkspace/modules/PptxModule.tsx`（PR 3A） | PR 3A 検証ゲート対象 |
 
 ### 4.3 DOCX（`FUNC-02`）
 
@@ -115,7 +116,7 @@
 | `docx.add_header_footer`（`sectionIndex`/`overwrite`） / `docx.edit_header_footer` / `docx.add_footnote` / `docx.edit_footnote`（複数ラン対応） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`edit_word_document`) | `VERIFIED (REAL RUNTIME)` (`test_docx_edits_word_parts_and_preserves_unrelated_xml`) |
 | `render_png`（領域指定対応） / `export:pdf` / `export:md` / `export:html` | **対応済み** | `server/scripts/artifact_doc_worker.py` (`render_word`, `export_word`, `crop_png_region`) | `VERIFIED (REAL RUNTIME)` (`artifact_doc_worker_test.py`) |
 | `verify`（OOXML 構造・余白溢れ・空白ページ・過大埋込画像・リンク整合） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`verify_docx_layout_quality`, `verify_document`) | `VERIFIED (REAL RUNTIME)` (`test_office_verification_pptx_overflow_ssim_docx_layout_xlsx_truncation`) |
-| Tiptap 直接編集 UI（`DocxModule.tsx`） | **未実装**（PR 3A 計画対象） | `web/src/components/ArtifactWorkspace/modules/DocxModule.tsx`（PR 3A） | PR 3A 検証ゲート対象 |
+| Tiptap 直接編集 UI（`DocxModule.tsx`） | **部分実装**（PR 3A の基本操作を実装） | `web/src/components/ArtifactWorkspace/modules/DocxModule.tsx`（PR 3A） | PR 3A 検証ゲート対象 |
 
 ### 4.4 XLSX（`FUNC-03`）
 
@@ -133,7 +134,7 @@
 | `render_png`（領域指定対応） / `export:pdf` / `export:png` / `export:csv` | **対応済み** | `server/scripts/artifact_doc_worker.py` (`render_workbook`, `export_workbook`, `crop_png_region`) | `VERIFIED (REAL RUNTIME)` (`artifact_doc_worker_test.py`) |
 | `verify`（OOXML 構造・LibreOffice 数式 4 区分評価・参照エラー・文字切れ/`###` 検証） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`verify_workbook_formulas`, `verify_xlsx_text_truncation`, `verify_document`) | `VERIFIED (REAL RUNTIME)` (`test_office_verification_pptx_overflow_ssim_docx_layout_xlsx_truncation`, `test_verification_reports_structural_findings_and_unverified_checks`) |
 | レガシー `.xls` 編集・変換 | **設計上許容された非対応** | `server/src/artifacts/adapters/registry.ts` (`documentFormatConstraint`) | `VERIFIED (REAL RUNTIME)` (`artifact-capabilities.test.ts`) |
-| 2D 仮想グリッド直接編集 UI（`XlsxModule.tsx`） | **未実装**（PR 3A 計画対象） | `web/src/components/ArtifactWorkspace/modules/XlsxModule.tsx`（PR 3A） | PR 3A 検証ゲート対象 |
+| 2D 仮想グリッド直接編集 UI（`GridModule.tsx`） | **部分実装**（PR 3A の基本操作を実装） | `web/src/components/ArtifactWorkspace/modules/GridModule.tsx`（PR 3A） | PR 3A 検証ゲート対象 |
 
 ### 4.5 CSV / TSV（`FUNC-04`）
 
@@ -143,7 +144,7 @@
 | `verify`（文字コード/BOM/NUL 検査・引用符閉鎖・列数整合、Pure-JS） | **対応済み** | `server/src/artifacts/adapters/csv-adapter.ts` (`CsvAdapter.verify`) | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts`) |
 | `export:xlsx`（Pure-JS OOXML `.xlsx` 生成・`Base ChatUI` 稼働・先頭ゼロ/数式文字列の安全エスケープ）／`export:json` / `export:csv` / `export:tsv` | **対応済み** | `server/src/artifacts/adapters/csv-adapter.ts` (`buildXlsxFromRows`, `exportAs`) | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts`: Base ChatUI 出力＋Full Runtime Python/LibreOffice 検証合格) |
 | `render_png`（表 PNG 描画・CSV/TSV 切替・CJK フォント・領域指定対応、Compact/Full Runtime） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`render_csv_table`, `crop_png_region`), `server/src/artifacts/artifact-service.ts` (`renderPng`) | `VERIFIED (REAL RUNTIME)` (`test_csv_table_png_render_and_region_cropping_across_formats`, `builtin-artifact-mcp.test.ts` Full Runtime テスト) |
-| 2D 仮想グリッド直接編集 UI（`CsvModule.tsx`） | **未実装**（PR 3A 計画対象） | `web/src/components/ArtifactWorkspace/modules/CsvModule.tsx`（PR 3A） | PR 3A 検証ゲート対象 |
+| 2D 仮想グリッド直接編集 UI（`GridModule.tsx`） | **部分実装**（PR 3A の基本操作を実装） | `web/src/components/ArtifactWorkspace/modules/GridModule.tsx`（PR 3A） | PR 3A 検証ゲート対象 |
 
 ### 4.6 PDF（`FUNC-05`）
 
@@ -156,7 +157,7 @@
 | `verify`（`qpdf --check` 構造検証・テキスト抽出検証・暗号化検出・前版とのテキスト/幾何/描画 SSIM・MAE 差分検証 `pdf_diff`） | **対応済み** | `server/scripts/artifact_doc_worker.py` (`_verify_pdf`), `server/src/artifacts/artifact-service.ts` (`verifyArtifact`) | `VERIFIED (REAL RUNTIME)` (`test_pdf_structure_encryption_diff_verification_and_rich_overlays`, `builtin-artifact-mcp.test.ts` Full Runtime テスト) |
 | `render_png`（`pdftoppm`＋領域指定対応） / `export:png` / `export:txt` | **対応済み** | `server/scripts/artifact_doc_worker.py` (`render_pdf`, `export_pdf`, `crop_png_region`) | `VERIFIED (REAL RUNTIME)` (`test_csv_table_png_render_and_region_cropping_across_formats`, `artifact_doc_worker_test.py`) |
 | 既存本文の実削除・置換・リフロー（`edit_body_reflow` / `pdf.delete_text` / `pdf.reflow_text`） | **設計上許容された非対応** | `server/src/artifacts/adapters/registry.ts`, `server/scripts/artifact_doc_worker.py` (`UnsupportedByFormatError`) | `VERIFIED (REAL RUNTIME)` (`test_pdf_structure_encryption_diff_verification_and_rich_overlays`, `artifact-capabilities.test.ts`) |
-| 閲覧特化 UI（`PdfModule.tsx`、直接編集 UI は設計上非提供） | **未実装**（PR 3A 計画対象） | `web/src/components/ArtifactWorkspace/modules/PdfModule.tsx`（PR 3A） | PR 3A 検証ゲート対象 |
+| 閲覧特化 UI（`PdfModule.tsx`、直接編集 UI は設計上非提供） | **部分実装**（PR 3A の基本操作を実装） | `web/src/components/ArtifactWorkspace/modules/PdfModule.tsx`（PR 3A） | PR 3A 検証ゲート対象 |
 
 ### 4.7 画像・SVG・HTML・Markdown・コード・Diff・Mermaid・動画/音声・Binary・軽量リッチ回答
 
@@ -174,7 +175,7 @@
 | **Mermaid（`FUNC-12`）** | `export:svg`（実 `mermaid.render()` SVG 出力） / `export:png` / `render_png`（領域指定対応、Full Runtime） | **対応済み** | `server/scripts/artifact_web_renderer.mjs`, `server/src/artifacts/artifact-service.ts` (`exportArtifact`, `renderPng`) | `VERIFIED (REAL RUNTIME)` (`builtin-artifact-mcp.test.ts` Full Runtime テスト) |
 | **動画/音声（`FUNC-13`）** | `structure` / `verify` / `render_png`（映像フレーム＋領域指定対応；音声のみは `unsupported_by_format`） / `media.trim`（1 連続区間） | **部分実装**（音声の映像フレーム抽出・非対応コンテナは設計上 `unsupported_by_format`） | `server/scripts/artifact_doc_worker.py` (`handle_media`), `server/src/artifacts/adapters/registry.ts` | `VERIFIED (REAL RUNTIME)` (`artifact_doc_worker_test.py`, `artifact-capabilities.test.ts`) |
 | **Binary（`FUNC-14`）** | `get_structure`（メタ・SHA-256 のみ）；`create` / `edit` / `target_pin` は非対応明示 | **設計上許容された非対応**（閲覧・DL・履歴復元のみ） | `server/src/artifacts/adapters/binary-adapter.ts` (`BinaryAdapter`) | `VERIFIED (REAL RUNTIME)` (`artifact-capabilities.test.ts`) |
-| **軽量リッチ回答（`FUNC-15`）** | サーバー・MCP 6 ツール・静的/動的上限・循環検出・SQLite 版管理・Artifact 保存（Pure-JS） | **対応済み**（UI 共通描画コンポーネントは PR 3A 計画対象） | `server/src/rich/rich-content-service.ts`, `server/src/rich/rich-validator.ts`, `server/src/rich/rich-expr-evaluator.ts`, `server/src/routes/rich-routes.ts` | `VERIFIED (REAL RUNTIME)` (`rich-security-negative.test.ts`, `builtin-artifact-mcp.test.ts`) |
+| **軽量リッチ回答（`FUNC-15`）** | サーバー・MCP 6 ツール・静的/動的上限・循環検出・SQLite 版管理・Artifact 保存（Pure-JS） | **部分実装**（PR 3A 共通描画を実装。チャット統合は PR 3B） | `server/src/rich/rich-content-service.ts`, `server/src/rich/rich-validator.ts`, `server/src/rich/rich-expr-evaluator.ts`, `server/src/routes/rich-routes.ts` | `VERIFIED (REAL RUNTIME)` (`rich-security-negative.test.ts`, `builtin-artifact-mcp.test.ts`) |
 
 ### 構造編集の操作契約
 
@@ -269,7 +270,7 @@ Node.js 24 の単発計測では、上限付近の YAML（511 KiB）で CPU 10 m
 | `ARCH-08` | **部分実装**（サーバー側配信済み・`viewerCache.ts` は PR 3A 拡張予定） | PR 1 / 3A | `server/src/routes/file-routes.ts`, `web/src/utils/viewerCache.ts` | `VERIFIED (REAL RUNTIME)` (`artifact-revision-reads.test.ts`, `viewer-cache.test.ts`) |
 | `ARCH-09` | **部分実装**（サーバー `user_seq` 実装済み・`ws.ts` 再同期拡張は PR 3A） | PR 1 / 3A | `server/src/sync/hub.ts`, `web/src/api/ws.ts` | `VERIFIED (REAL RUNTIME)` (`concurrency-and-sync.test.ts`) |
 | `ARCH-10` | **対応済み** | PR 1 / 2 | `server/src/artifacts/adapters/registry.ts`, `server/src/artifacts/adapters/*` | `VERIFIED (REAL RUNTIME)` (`architecture-conformance.test.ts` `NEG-02`) |
-| `ARCH-11` | **未実装**（PR 3A/3B UI 構成対象） | PR 3A / 3B | `web/src/components/ArtifactWorkspace/*`（PR 3A） | PR 3A / 4 ゲート対象 |
+| `ARCH-11` | **部分実装**（PR 3A 共通シェルを実装。全起動経路は PR 3B） | PR 3A / 3B | `web/src/components/ArtifactWorkspace/*`（PR 3A） | PR 3A / 4 ゲート対象 |
 | `ARCH-12` | **未実装**（PR 3B/4 移行・撤去対象） | PR 3B / 4 | `web/src/App.tsx`, `web/src/components/ArtifactViewerModal.tsx`（PR 4 撤去） | PR 3B / 4 ゲート対象 |
 | `ARCH-13` | **対応済み** | PR 1 / 2 | `server/src/artifacts/render-cache.ts`, `server/src/artifacts/sandbox-worker.ts` | `VERIFIED (REAL RUNTIME)` (`sandbox-and-drafts.test.ts`, `builtin-artifact-mcp.test.ts` strict `bwrap` テスト) |
 | `ARCH-14` | **対応済み** | PR 1 | `server/src/artifacts/undo-service.ts`, `server/src/artifacts/merge-policy.ts` | `VERIFIED (REAL RUNTIME)` (`artifact-core-durability.test.ts`) |
@@ -382,7 +383,29 @@ HEAD `807e4ff` 以降の設計書（4.3 節、5.2 節、6.2 節、7.1 節、PIN-
 | --- | --- |
 | 5.2・PIN-02 | Markdown／コードの行・文字範囲は必須の SHA-256 と前後文脈、出現順を検証する。同じ文脈で一致する候補が複数ある場合は `needs_review` とする。DOCX は一意の段落 ID または内容と文脈の一意一致が必要。PPTX はスライドの構造と、レイアウト・マスター・テーマ・画像・グラフ・埋め込みパートなどの依存関係を照合する。PDF と PPTX の旧フィンガープリントは、新方式との照合時に再確認が必要になる。 |
 | 4.2・PERF-01 | OOXML の展開安全予算は 2,000 エントリ、200 MiB、圧縮比 100 倍。XLSX の広範囲は SAX で実セルだけを順序付きでハッシュ化する。旧形式の範囲ハッシュも照合できる。PDF はページツリーを反復走査して全枝の件数と循環を確認し、選択ページだけの本文・資源・注釈を処理する。本文選択はページ内オフセット、文脈、PDF.js の位置を含むセレクターとして保存する。展開は対象処理全体の 200 MiB 予算内で行う。 |
-| 5.2・PERF-01／06 | 対象照合は ACP や外部レンダラーと独立の Node.js ワーカースレッドに移した。処理を 1 並列に保ち、材料となる版とディスク内容を照合する。行範囲の出現照合は線形のパターン照合を使い、抜粋の表示上限を超える範囲も全文をハッシュ化する。DOCX は表示付近とアクティブな選択を描画し、計測済みの高さと容量制限付きキャッシュでスクロールと下書きを維持する。 |
+| 5.2・PERF-01／06 | 対象照合は ACP や外部レンダラーと独立した専用 Node.js プロセスで実行する。処理を 1 並列に保ち、材料となる版とディスク内容を照合する。行範囲の出現照合は線形のパターン照合を使い、抜粋の表示上限を超える範囲も全文をハッシュ化する。DOCX は表示付近とアクティブな選択を描画し、計測済みの高さと容量制限付きキャッシュでスクロールと下書きを維持する。 |
 | 7.1・UX-01／02 | ソース編集、Word 書式、表移動の補助操作は表示幅に応じて開閉式のコマンドメニューへ移す。DOCX の見出しジャンプ、描画範囲外のアンマウントと復帰、表検索の途中でのシート切替をブラウザーで検証する。 |
 
 ブラウザー検証は実ドキュメント処理とビューポートエミュレーションを併用する。CI の `pr3a-browser-captures` は Compact／Full の結果をディレクトリ別に保存し、`pr3a-evidence.json` にプロファイル、解像度、操作、Revision、PPTX の bbox 領域別 MAE／SSIM、移動・削除後の比較を記録する。露出したレイアウト背景とマスターヘッダーの画素は背景の基準で、下段の SVG 図形は図形の基準で照合する。対象は Chromium 1280×720・1440×900・1920×1080 と WebKit 375×812・430×932。ブラウザーハーネスの Office 操作は開発／CI 用の明示的な非隔離構成で実行する。物理 iPhone と実 `agy` の確認は §11.2 の環境区分に従う。
+
+
+## 11. PR #38 の設計契約修正
+
+確認起点は PR #38 の `95747dee77a5cb22485f621b92f0f632f43d13cb`。実行結果は下記の検証区分と対象コミットの Checks を参照。
+
+| 要件・指摘 | 実装と検証経路 |
+| --- | --- |
+| PIN-02 · A-01、A-02 | PDF のページハッシュは Catalog の Optional Content とフォーム、ページの描画グループ、継承リソース、ページの内容・注釈を結合する。DOCX は段落の参照 ID、関係の種類と参照先、埋め込みパートとその依存を結合する。外部リンクはパッケージに記録された宛先を照合する。関係未解決時は対象を確定できない。回帰テストは `pr3a-conformance-gaps.test.ts`。 |
+| PIN-02 · A-03 | XLSX・CSV・TSV の再解決は保存した元 Revision と現版の選択範囲、および行・列の文脈を照合する。CSV/TSV の対象行が同じ内容で複数存在する場合は再確認が必要。元版を取得できない場合も対象を確定できない。実 Revision の回帰テストは `pr38-history-and-target-regressions.test.ts` と `pr3a-conformance-gaps.test.ts`。 |
+| PIN-02、PIN-05、MCP-15 · A-04、A-05、V-01 | `target-resolver.ts` は系列候補の一意性、評価値、出典の実体、親スロットと所属タブを照合する。 `edit_request_get` は `untrustedTargetContent` に依頼時の状態・テーマ・抜粋と現在の抜粋を収録する。 `userInstruction` と再解決状態は別フィールド。保存時の照合後も、依頼完了はユーザーが確認する。HTTP MCP の回帰テストは `pr38-edit-request-contract.test.ts`。 |
+| RICH-02、RICH-03、RICH-05〜08、SEC-08、NEG-07 · B-01、B-02、C-01〜04 | `rich-node-contract.ts` と `rich-validator.ts` をサーバーとブラウザで使用する。リテラルと評価後の型、出典・系列・タブ・SVG の ID、図解の接続、保存アクションの種類を検証する。二軸の積み上げ棒は軸ごとに描画枠を確保し、欠損と出典をページ送りで表示する。図解はラベルを折り返し、全項目も閲覧できる。コード下書きは言語を指定して共通エディターを遅延読み込みする。 |
+| FUNC-01、UX-07、PIN-01 · D-02 | `PptxModule.tsx` は Base の変換 PDF 経路と、Compact/Full のキャンバス経路で全体・点・要素指定を提供する。キャンバスでは回転・反転した境界、透過スプライトの描画境界、グループの子座標変換を使用する。編集後の LibreOffice との画素一致は `pr3a-real.spec.ts` の対象。 |
+| FUNC-05、PIN-02 · D-01、V-03 | PDF.js の UTF-16 本文範囲とページ座標を照合する。縦書きは確認できたフォントメトリクス、部分選択は一意に照合できるグリフ境界を使用する。照合不能な複雑グリフや混在方向の部分選択は取得できない場合がある。並べ替えは同じページ参照を保つ。ページラベルなど安全に保持できない入力は拒否する。実 PDF の目次・内部リンク・フォーム・添付・注釈・メタデータ・Optional Content と描画比較は `artifact_doc_worker_test.py`。 |
+| FUNC-10、PIN-01 · D-03 | `SourceEditor.tsx` から 1-based UTF-16 の排他的終端で文字範囲を指定できる。CRLF はハッシュ計算時に正規化。サロゲートペアを分割する境界は拒否する。複数行の範囲と抜粋・文脈の照合は `pr38-history-and-target-regressions.test.ts`。 |
+| FUNC-03 · D-04 | `GridModule.tsx` は元セルの型を尊重し、数値入力の文字列を `valueType: "number"` でワーカーに渡す。 `artifact_doc_worker.py` は Excel の有効桁数を超える数値を編集前に拒否する。元の文字列、先頭ゼロ、空文字、真偽値、数式の区分を維持する。 |
+| MCP-12、MCP-02 · E-01、E-02 | 単一復元は現在版と参照版の依存パスの和集合を比較する。対象セレクターの能力 API は既定の列挙値を維持し、後続 Office セレクターは集約操作の `notes` に PR 3B として記載する。 |
+| PERF-01、SEC-05 · V-02 | 専用解析プロセスは同時に 1 件を扱う。32 MiB 入力、4 MiB 応答、30 秒の期限と Linux RSS の監視がある。RSS は入力・形式に応じて算出し 640 MiB を上限とする。OOXML の 200 MiB 展開上限も適用する。監視周期より短い RSS スパイクの厳密な遮断と、物理低 RAM ホストでの全形式同時負荷は未検証。 |
+
+**検証区分**。実ファイル・SQLite・実 HTTP MCP・実ビルドは `VERIFIED (REAL RUNTIME)`。Playwright とモック ACP は `VERIFIED (MOCK / EMULATION)`。実 `agy acp`、物理 iPhone、Microsoft Office の再編集は `UNVERIFIED (REQUIRES REAL AGY / PHYSICAL IPHONE)` または対応する実環境が必要。検証対象コミットの [CI と UI 実行結果](https://github.com/tomo8812/AGY-ChatUI/pull/38/checks) を参照。
+
+ローカル検証では、関連サーバースイート 68 件、対象 Python 実ファイル検証 3 件、Chromium のリッチ UI 回帰 5 件が通過した。縦書き CID フォントを使った PDF では 5 文字全体と先頭 2 文字の座標を取得した。これらはテスト対象とした条件に限定される。Compact/Full の LibreOffice 描画一致と WebKit の結果は該当コミットの CI で確認する。

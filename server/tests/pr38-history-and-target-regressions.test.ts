@@ -268,3 +268,73 @@ it.each([false, true])('rechecks project sync authorization at T3 (existing copy
   await artifacts.recoverOnStartup();
   expect(db.findArtifactByRelPath(userId, chatId, '.project-context/sync.txt')?.revision).toBe(existing ? 1 : undefined);
 });
+
+it.each(['csv', 'tsv'])('checks the original record outside a selected %s value before allowing re-resolution', async extension => {
+  const { artifactService: artifacts, userId, chatId } = await workspace();
+  const delimiter = extension === 'tsv' ? '\t' : ',';
+  const bytes = (...rows: string[][]) => Buffer.from(rows.map(row => row.join(delimiter)).join('\n') + '\n');
+  const { artifact } = await artifacts.createArtifact({
+    userId, chatId, scopeKind: 'chat', relPath: 'sales.' + extension, actorKind: 'user',
+    content: bytes(['Name', 'Amount'], ['Alice', '10'], ['Bob', '10']),
+  });
+  const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+  const selector = {
+    kind: 'csv_range', baseRevision: 1, startRow: 1, endRow: 1, startCol: 1, endCol: 1,
+    expectedRowCount: 3, expectedColCount: 2,
+    expectedRangeValuesHash: hash([['10']]), expectedHeaderHash: hash(['Name', 'Amount']),
+  };
+  const replace = (expectedRevision: number, newBuffer: Buffer) => artifacts.replaceArtifactBytes({
+    userId, artifactId: artifact.id, expectedRevision, newBuffer, operationType: 'test',
+    actorKind: 'user', actorId: userId, operationSummary: 'Replace rows',
+  });
+  await replace(1, bytes(['Name', 'Amount'], ['Alice', '10'], ['Carol', '10']));
+  expect(await artifacts.resolveTargetOnArtifact(userId, artifact.id, selector)).toMatchObject({ status: 'resolved' });
+  await replace(2, bytes(['Name', 'Amount'], ['Bob', '10'], ['Alice', '10']));
+  expect(await artifacts.resolveTargetOnArtifact(userId, artifact.id, selector)).toMatchObject({ status: 'needs_review' });
+});
+
+it('captures CRLF character selections with UTF-16 columns and refuses half of a surrogate pair', async () => {
+  const { artifactService: artifacts, userId, chatId } = await workspace();
+  const { artifact } = await artifacts.createArtifact({
+    userId, chatId, scopeKind: 'chat', relPath: 'bounds.ts', actorKind: 'user',
+    content: Buffer.from('before\r\nx😀日本\r\n右左\r\nafter'),
+  });
+  const bounds = { startLine: 2, startCol: 2, endLine: 3, endCol: 2 };
+  const result = await artifacts.readRange(userId, artifact.id, { ...bounds, targetHashes: true });
+  expect(result.text).toBe('😀日本\n右');
+  const selector = {
+    kind: 'code_char_range', baseRevision: 1, ...bounds, occurrenceIndex: result.occurrenceIndex,
+    expectedSnippetHash: result.expectedSnippetHash, contextBeforeHash: result.contextBeforeHash, contextAfterHash: result.contextAfterHash,
+  };
+  expect(await artifacts.resolveTargetOnArtifact(userId, artifact.id, selector)).toMatchObject({
+    status: 'resolved', resolvedSnippet: '😀日本\n右', resolvedRange: bounds,
+  });
+  await expect(artifacts.readRange(userId, artifact.id, { ...bounds, startCol: 3, targetHashes: true })).rejects.toMatchObject({ statusCode: 400 });
+});
+
+it('reports added, removed and changed dependency paths for a single revision restore', async () => {
+  const { artifactService: artifacts, userId, chatId } = await workspace();
+  const create = (relPath: string, content: string) => artifacts.createArtifact({
+    userId, chatId, scopeKind: 'chat', relPath, actorKind: 'user', content: Buffer.from(content),
+  });
+  await create('before.css', 'body {color: red}');
+  await create('after.css', 'body {color: blue}');
+  const { artifact: shared } = await create('shared.css', 'p {color: red}');
+  const { artifact: page } = await create('index.html', '<link rel="stylesheet" href="before.css"><link rel="stylesheet" href="shared.css">');
+  await artifacts.replaceArtifactBytes({ userId, artifactId: shared.id, expectedRevision: 1,
+    newBuffer: Buffer.from('p {color: blue}'), actorKind: 'user', actorId: userId,
+    operationType: 'replace', operationSummary: 'Update shared stylesheet',
+  });
+  const current = artifacts.listHistory(userId, page.id)[0].revision;
+  await artifacts.replaceArtifactBytes({ userId, artifactId: page.id, expectedRevision: current,
+    newBuffer: Buffer.from('<link rel="stylesheet" href="after.css"><link rel="stylesheet" href="shared.css">'),
+    actorKind: 'user', actorId: userId, operationType: 'replace', operationSummary: 'Change stylesheet',
+  });
+  const restored = await artifacts.restoreRevision({ userId, artifactId: page.id, targetRevision: 1, actorKind: 'user' });
+  expect(restored.dependencyDiff).toEqual([
+    { relPath: 'after.css', currentSha256: expect.any(String), targetSha256: null },
+    { relPath: 'before.css', currentSha256: null, targetSha256: expect.any(String) },
+    { relPath: 'shared.css', currentSha256: expect.any(String), targetSha256: expect.any(String) },
+  ]);
+  expect(restored.dependencyDiff[2].currentSha256).not.toBe(restored.dependencyDiff[2].targetSha256);
+});

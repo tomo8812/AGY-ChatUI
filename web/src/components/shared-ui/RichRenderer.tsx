@@ -13,6 +13,13 @@ import { RichPopover, RichTooltip, originatesInControl, type RichPopoverTrigger 
 import { RichBadge, toneClass } from './display/RichBadge';
 import './rich-ui.css';
 
+const DraftCodeEditor = lazy(() => import('./editor/SourceEditor').then(({ SourceEditor }) => ({ default: SourceEditor })));
+function CodeDraft({ language, value, onChange }: { language?: string; value: string; onChange: (value: string) => void }) {
+  const editorRef = useRef<import('./editor/SourceEditor').SourceEditorHandle | null>(null);
+  return <Suspense fallback={<span role="status">エディターを読み込み中…</span>}>
+    <DraftCodeEditor editorRef={editorRef} language={language ?? 'text'} readOnly={false} value={value} onChange={onChange}/>
+  </Suspense>;
+}
 const RichChart=lazy(()=>import('./chart/RichChartRenderer').then(({renderRichChart})=>({
   default:(props:Parameters<typeof renderRichChart>[0]&{accounting:BlockRenderAccounting;scopePath:string})=>{
     const cycle=props.accounting.beginScope(props.scopePath);
@@ -391,7 +398,7 @@ const RichNodePaint=React.memo(function RichNodePaint({node,local,path,environme
       case 'mermaid':body=<MermaidBlock code={label(v(node.code))} strictRich/>;break;
       case 'svg_scene':body=<SvgScene args={[node,c,cycle,unique,dispatch]} accounting={accounting} scopePath={path+':lazy'}/>;break;
       case 'node_edge_diagram':body=<NodeEdgeDiagram args={[node,c,cycle,select,unique]} accounting={accounting} scopePath={path+':lazy'}/>;break;
-      case 'chart':body=<RichChart node={node} context={c} cycle={cycle} select={select} clipId={unique+'-clip'} accounting={accounting} scopePath={path+':lazy'}/>;break;
+      case 'chart':body=<RichChart node={node} sources={doc.sources} context={c} cycle={cycle} select={select} clipId={unique+'-clip'} accounting={accounting} scopePath={path+':lazy'}/>;break;
       case 'button':{
         const Icon=richIcon(node.icon);
         body=<button type="button" ref={popoverTrigger?.ref} aria-expanded={popoverTrigger?.expanded} aria-controls={popoverTrigger?.controls}
@@ -438,7 +445,9 @@ const RichNodePaint=React.memo(function RichNodePaint({node,local,path,environme
         break;
       }
       case 'form':body=<form className="rich-form" onSubmit={e=>{e.preventDefault();explicit(node.onSubmit,c)}}>{children(node.children)}<button className="btn btn-primary" type="submit">送信</button></form>;break;
-      case 'editable_draft':body=<div className="rich-form"><label className="field">{label(v(node.label))}<textarea rows={6} value={label(read(node.bind))} onChange={e=>change(node.bind,e.target.value)}/></label>{node.format==='markdown'&&<MarkdownContent content={label(read(node.bind))} strictRich/>}{node.saveAction&&<button type="button" className="btn btn-secondary" onClick={()=>explicit([node.saveAction!],c)}>ファイルに保存</button>}</div>;break;
+      case 'editable_draft':body=<div className="rich-form">{node.format==='code'
+        ?<div className="field">{label(v(node.label))}<CodeDraft language={node.language} value={label(read(node.bind))} onChange={value=>change(node.bind,value)}/></div>
+        :<label className="field">{label(v(node.label))}<textarea rows={6} value={label(read(node.bind))} onChange={e=>change(node.bind,e.target.value)}/></label>}{node.format==='markdown'&&<MarkdownContent content={label(read(node.bind))} strictRich/>}{node.saveAction&&<button type="button" className="btn btn-secondary" onClick={()=>{if(node.saveAction?.type==='save_to_artifact')explicit([node.saveAction],c);else fail()}}>ファイルに保存</button>}</div>;break;
       case 'code_block':body=<CodeBlock code={label(v(node.code))} language={node.language??''} copyable={node.copyable}/>;break;
       case 'diff_block':body=<div className="rich-diff"><div><span className="muted-sm">変更前</span><CodeBlock code={label(v(node.oldText))} language={node.language??''}/></div><div><span className="muted-sm">変更後</span><CodeBlock code={label(v(node.newText))} language={node.language??''}/></div></div>;break;
       case 'math_block':{const tex=label(v(node.tex));body=<MarkdownContent strictRich content={node.displayMode===false?'$'+tex+'$':'$$\n'+tex+'\n$$'}/>;break}

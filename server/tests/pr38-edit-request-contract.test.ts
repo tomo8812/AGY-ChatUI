@@ -356,7 +356,7 @@ it('rechecks dynamic Rich node and SVG display against the saved view and base r
   const document = {
     schemaVersion: 1 as const, state: { value: 2, unrelated: 5 },
     computed: { total: '$state.value + 1' },
-    root: { id: 'root', type: 'stack' as const, children: [text, plot] },
+    root: { id: 'root', type: 'stack' as const, direction: 'col' as const, children: [text, plot] },
   };
   const { block } = ctx.richContentService.createBlock({ userId, chatId, document });
   const viewStateSnapshot = { state: { value: 4 }, theme: 'dark' };
@@ -387,19 +387,20 @@ it('anchors rich chart, repeat and table selections to their evaluated display',
   const { data: { chat: { id: chatId } } } = await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Display identity' });
   const { richContentService: rich, editRequestService: requests } = server.ctx;
   const item = { id: 'first', value: 4 };
-  const series = { key: 'value', label: 'Amount', data: [4, 5] };
+  const series = { key: 'value', label: 'Amount', sourceId: 'market', data: [4, 5] };
   const chart = { id: 'chart', type: 'chart', chartType: 'bar', categories: ['March', 'April'], series: [series], yAxis: { unit: 'JPY' } };
   const repeat = { id: 'repeat', type: 'text', content: { expr: 'formatNumber($item.value + $computed.adjustment)' },
     repeat: { itemsExpr: '$state.items', as: 'item', keyField: 'id' } };
   const table = { id: 'table', type: 'data_table', columns: [{ key: 'value', label: 'Amount', format: 'number', unit: 'JPY' }], rows: [item] };
   const document = {
-    schemaVersion: 1, state: { items: [item], unrelated: 0 }, computed: { adjustment: '1' },
-    root: { id: 'root', type: 'stack', children: [chart, repeat, table] },
+    schemaVersion: 1, sources: [{ id: 'market', name: 'Market report', fetchedAt: '2026-11-25T12:00:00Z' }], state: { items: [item], unrelated: 0 }, computed: { adjustment: '1' },
+    root: { id: 'root', type: 'stack', direction: 'col', children: [chart, repeat, table] },
   };
   const { block } = rich.createBlock({ userId, chatId, document });
   const create = (selector: { kind: string; [key: string]: unknown }) => requests.createRequest({
     userId, chatId, targetKind: 'rich_block', richBlockId: block.id, instruction: 'Update selected content',
     selector: { ...selector, baseRevision: 1, blockId: block.id },
+    viewStateSnapshot: { state: { unrelated: 2 }, theme: 'dark' },
   });
   const chartRequest = await create({
     kind: 'rich_chart_series', chartNodeId: chart.id, dataIndex: 0, seriesKey: series.key,
@@ -413,12 +414,40 @@ it('anchors rich chart, repeat and table selections to their evaluated display',
     kind: 'rich_table_cell', tableNodeId: table.id, row: 0, col: 'value', expectedCellHash: hash('4'),
   });
   const all = [chartRequest, repeatRequest, tableRequest];
+  expect((await client.request('POST', `/api/chats/${chatId}/edit-requests/send-batch`, {
+    requestIds: all.map(request => request.id), clientMessageId: randomUUID(),
+  })).status).toBe(200);
+  const binding = await server.ctx.mcpService.bindBuiltinArtifactServer({ userId, chatId, tentativeTurn: () => null }, []);
+  const { url, headers } = binding!.server;
+  const mcp = new Client({ name: 'rich-capture', version: '1' });
+  await mcp.connect(new StreamableHTTPClientTransport(new URL(url), {
+    requestInit: { headers: Object.fromEntries(headers.map(({ name, value }) => [name, value])) },
+  }));
+  try {
+    const result = await mcp.callTool({ name: 'edit_request_get', arguments: { requestId: chartRequest.id } });
+    const [text] = result.content as Array<{ text: string }>;
+    const payload = JSON.parse(text.text);
+    expect(payload).toMatchObject({ userInstruction: 'Update selected content',
+      untrustedTargetContent: { viewStateSnapshot: { state: { unrelated: 2 }, theme: 'dark' } },
+      reResolution: { status: 'resolved' },
+    });
+    expect(payload.reResolution).not.toHaveProperty('resolvedSnippet');
+    expect(JSON.parse(payload.untrustedTargetContent.selectedContentSnapshot)).toMatchObject({
+      label: 'Amount', data: { x: 'March', y: 4 }, sources: document.sources,
+    });
+  } finally {
+    await mcp.close();
+  }
   rich.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 1, patchState: { unrelated: 1 } });
   for (const request of all) {
     expect(request.selector.expectedDisplayFingerprint).toMatch(/^[0-9a-f]{64}$/);
     expect(await requests.resolveRequestTarget(request)).toMatchObject({ status: 'resolved' });
   }
   rich.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 2, document: {
+    ...document, sources: [{ ...document.sources[0], fetchedAt: '2026-11-26T12:00:00Z' }],
+  } });
+  expect(await requests.resolveRequestTarget(chartRequest)).toMatchObject({ status: 'needs_review' });
+  rich.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 3, document: {
     ...document, computed: { adjustment: '2' }, root: { ...document.root, children: [
       { ...chart, categories: [...chart.categories].reverse(), yAxis: { unit: 'USD' } },
       repeat,
@@ -428,7 +457,7 @@ it('anchors rich chart, repeat and table selections to their evaluated display',
   for (const request of all) {
     expect(await requests.resolveRequestTarget(request)).toMatchObject({ status: 'needs_review' });
   }
-  rich.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 3, document: {
+  rich.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 4, document: {
     ...document, root: { ...document.root, children: [chart, { ...repeat, content: 'Replacement template' }, table] },
   } });
   expect(await requests.resolveRequestTarget(repeatRequest)).toMatchObject({ status: 'needs_review', reason: 'repeat_display_changed' });
@@ -487,4 +516,31 @@ it('returns a verified PPTX point crop as an MCP image and retains the target in
     await mcp.close();
   }
   await expect.poll(() => ctx.db.getActiveRunForChat(userId, chatId), { timeout: 12_000 }).toBeNull();
+});
+
+it('requires reconfirmation when the same rich node is moved to a different tab', async () => {
+  const { resolveRichBlockTarget } = await import('../src/edit-requests/target-resolver.js');
+  const node = { id: 'record', type: 'text' as const, content: 'Same value' };
+  const document = {
+    schemaVersion: 1 as const,
+    root: { id: 'tabs', type: 'tabs' as const, items: [
+      { id: 'first', label: 'Quarter', content: [node] }, { id: 'second', label: 'Quarter', content: [] },
+    ] },
+  };
+  const block = {
+    id: 'block', revision: 1, document, userId: 'user', chatId: 'chat',
+    confirmedMessageId: null, tentativeMessageId: null, runId: null, toolCallId: null,
+    bindingState: 'unattached' as const, createdSeq: 1, schemaVersion: 1, title: 'Report', uiStateSnapshot: null,
+    referencedArtifactIds: [], sizeBytes: 0, createdAt: 0, updatedAt: 0,
+  };
+  const selector = { kind: 'rich_node', baseRevision: 1, blockId: block.id, nodeId: node.id,
+    expectedNodeType: node.type, expectedNodeFingerprint: hash(canonicalJson(node)) };
+  expect(resolveRichBlockTarget(block, selector)).toMatchObject({ status: 'resolved' });
+  const moved = {
+    ...document, root: { ...document.root, items: [
+      { ...document.root.items[0], content: [] }, { ...document.root.items[1], content: [node] },
+    ] },
+  };
+  expect(resolveRichBlockTarget({ ...block, revision: 2, document: moved }, selector, undefined, undefined, document))
+    .toMatchObject({ status: 'needs_review' });
 });

@@ -101,6 +101,41 @@ export function createLineMatcher(pattern: readonly string[]): (line: string) =>
   };
 }
 
+/** Source columns are 1-based UTF-16 offsets with an exclusive end. */
+export function sourceCharSlice(line: string, from: number, to = line.length): string | undefined {
+  if (from < 0 || to < from || to > line.length) return undefined;
+  const splitsPair = (offset: number) =>
+    offset > 0 && line.charCodeAt(offset - 1) >= 0xd800 && line.charCodeAt(offset - 1) <= 0xdbff &&
+    line.charCodeAt(offset) >= 0xdc00 && line.charCodeAt(offset) <= 0xdfff;
+  return splitsPair(from) || splitsPair(to) ? undefined : line.slice(from, to);
+}
+
+export function createSourceCharMatcher(pattern: readonly string[], from: number, to: number) {
+  const span = pattern.length;
+  const inner = span > 2 ? createLineMatcher(pattern.slice(1, -1)) : undefined;
+  return (lines: readonly string[], index: number) => {
+    if (inner && index === 0) {
+      for (let j = 1; j < span - 2; j++) inner(lines[j]);
+    }
+    if (inner && !inner(lines[index + span - 2])) return false;
+    if (span === 1) return sourceCharSlice(lines[index], from, to) === pattern[0];
+    return sourceCharSlice(lines[index], from) === pattern[0] &&
+      sourceCharSlice(lines[index + span - 1], 0, to) === pattern[span - 1];
+  };
+}
+
+export function sourceRangeContext(
+  lines: readonly string[], index: number, span: number, startCol?: number, endCol?: number,
+) {
+  const before = lines.slice(Math.max(0, index - 2), index).join('\n');
+  const after = lines.slice(index + span, index + span + 2).join('\n');
+  if (startCol === undefined || endCol === undefined) return { before, after };
+  return {
+    before: [before, lines[index].slice(0, startCol - 1)].filter(Boolean).join('\n'),
+    after: [lines[index + span - 1].slice(endCol - 1), after].filter(Boolean).join('\n'),
+  };
+}
+
 export function resolveTextSnippetByContext(params: {
   text: string;
   startLine?: unknown;
@@ -117,6 +152,7 @@ export function resolveTextSnippetByContext(params: {
   videoFrame?: VideoFrameTarget;
   startCol?: number;
   endCol?: number;
+  allowLegacyCharContext?: boolean;
 }): TargetResolutionResult {
   const { startLine: start, endLine: end, expectedSnippetHash, contextBeforeHash, contextAfterHash } = params;
   if (!isSha256(expectedSnippetHash)) return { status: 'needs_review', reason: 'missing_expected_snippet_hash' };
@@ -138,20 +174,24 @@ export function resolveTextSnippetByContext(params: {
   const lines = splitLines(params.text);
   const span = end - start + 1;
   const lastStart = lines.length - span;
-  const before = (i: number) => lines.slice(Math.max(0, i - 2), i).join('\n');
-  const after = (i: number) => lines.slice(i + span, i + span + 2).join('\n');
+  const contextAt = (i: number) => sourceRangeContext(lines, i, span, params.startCol, params.endCol);
   const snippetAt = (i: number) => {
     const segment = lines.slice(i, i + span);
     if (params.startCol !== undefined && params.endCol !== undefined) {
-      if (params.startCol - 1 > segment[0].length || params.endCol - 1 > segment[span - 1].length) return undefined;
-      segment[span - 1] = segment[span - 1].slice(0, params.endCol - 1);
-      segment[0] = segment[0].slice(params.startCol - 1);
+      const first = sourceCharSlice(segment[0], params.startCol - 1, span === 1 ? params.endCol - 1 : undefined);
+      const last = span === 1 ? first : sourceCharSlice(segment[span - 1], 0, params.endCol - 1);
+      if (first === undefined || last === undefined) return undefined;
+      segment[0] = first;
+      segment[span - 1] = last;
     }
     return segment.join('\n');
   };
-  const contextMatches = (i: number) =>
-    (params.matchRange?.(i + 1, i + span) ?? true) && sha256Text(before(i)) === contextBeforeHash &&
-    sha256Text(after(i)) === contextAfterHash;
+  const contextMatches = (i: number) => {
+    if (!(params.matchRange?.(i + 1, i + span) ?? true)) return false;
+    const matches = ({ before, after }: ReturnType<typeof contextAt>) =>
+      sha256Text(before) === contextBeforeHash && sha256Text(after) === contextAfterHash;
+    return matches(contextAt(i)) || (params.allowLegacyCharContext && matches(sourceRangeContext(lines, i, span)));
+  };
   if (lastStart < 0) return { status: 'stale', reason: 'line_range_out_of_bounds' };
 
   let snippet = params.snippetHint;
@@ -194,18 +234,9 @@ export function resolveTextSnippetByContext(params: {
     const startOffset = params.startCol - 1;
     const endOffset = params.endCol! - 1;
     if (pattern.length !== span) return { status: 'needs_review', reason: 'invalid_snippet_span' };
-    const sameEdges = (i: number) => span === 1
-      ? lines[i].slice(startOffset, endOffset) === pattern[0] && endOffset <= lines[i].length
-      : lines[i].slice(startOffset) === pattern[0] && lines[i + span - 1].slice(0, endOffset) === pattern[span - 1] &&
-        startOffset <= lines[i].length && endOffset <= lines[i + span - 1].length;
-    const inner = span > 2 ? createLineMatcher(pattern.slice(1, -1)) : undefined;
+    const matches = createSourceCharMatcher(pattern, startOffset, endOffset);
     for (let index = 0; index <= lastStart; index++) {
-      const endOfInner = index + span - 2;
-      // Prime the interior matcher for the first candidate, then advance it once per line.
-      if (inner && index === 0) {
-        for (let j = 1; j < endOfInner; j++) inner(lines[j]);
-      }
-      if ((!inner || inner(lines[endOfInner])) && sameEdges(index) && !register(index)) {
+      if (matches(lines, index) && !register(index)) {
         return { status: 'needs_review', reason: 'ambiguous_multiple_matches' };
       }
     }
@@ -214,10 +245,11 @@ export function resolveTextSnippetByContext(params: {
   if (occurrence !== undefined && occurrence !== match.occurrenceIndex) {
     return { status: 'needs_review', reason: 'occurrence_index_changed' };
   }
+  const { before, after } = contextAt(match.index);
   return {
     status: 'resolved',
     resolvedSnippet: snippet,
-    surroundingContext: `${before(match.index)}\n---\n${after(match.index)}`,
+    surroundingContext: `${before}\n---\n${after}`,
     resolvedRange: {
       startLine: match.index + 1, endLine: match.index + span, occurrenceIndex: match.occurrenceIndex,
       ...(params.startCol !== undefined ? { startCol: params.startCol, endCol: params.endCol } : {}),

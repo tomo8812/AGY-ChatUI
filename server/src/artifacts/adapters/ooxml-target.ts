@@ -189,6 +189,63 @@ export function readPptxSlideTargets(bytes: Buffer, part: string) {
   return { slideId: slide.id, shapes, slideHash };
 }
 
+function docxRelationshipFingerprints(bytes: Buffer, documentPart: string, relations?: Uint8Array) {
+  const cache = new Map<string, string>();
+  const active = new Set<string>();
+  const entries = (data?: Uint8Array) => {
+    const byId = new Map<string, Record<string, string>>();
+    if (!data) return byId;
+    for (const element of xml(data, PACKAGE_REL, 'Relationships').elements) {
+      if (element.namespace !== PACKAGE_REL || element.name !== 'Relationship') continue;
+      const { Id, Target, Type, TargetMode } = element.attrs;
+      if (!Id || byId.has(Id) || !Target || !Type ||
+          (TargetMode !== undefined && TargetMode !== 'Internal' && TargetMode !== 'External')) invalidPackage();
+      byId.set(Id, element.attrs);
+    }
+    return byId;
+  };
+  const hashRelation = (from: string, relation: Record<string, string>): string => {
+    const { Target, Type, TargetMode } = relation;
+    if (TargetMode === 'External') {
+      // Hyperlinks contribute their recorded destinations. Linked media cannot
+      // be verified from package bytes and must be selected again.
+      if (!Type.endsWith('/hyperlink')) invalidPackage();
+      return digest(Type, TargetMode, Target);
+    }
+    const target = decodeURIComponent(Target.split('#', 1)[0]);
+    if (!target || /[\\:\0]/.test(target)) invalidPackage();
+    const part = posix.resolve('/', posix.dirname(from), target).slice(1);
+    return digest(Type, Target, hashPart(part));
+  };
+  const hashPart = (part: string): string => {
+    const cached = cache.get(part);
+    if (cached) return cached;
+    if (active.has(part) || active.size >= 32) return invalidPackage();
+    active.add(part);
+    try {
+      const relationPath = relationshipsPath(part);
+      const parts = readParts(bytes, new Set([part, relationPath]));
+      if (!parts[part]) invalidPackage();
+      const nested = [...entries(parts[relationPath])].sort(([a], [b]) => a.localeCompare(b));
+      const hash = digest(part, parts[part], ...nested.flatMap(([id, relation]) => [id, hashRelation(part, relation)]));
+      cache.set(part, hash);
+      return hash;
+    } finally {
+      active.delete(part);
+    }
+  };
+  const documentRelations = entries(relations);
+  const implicit = new Set(['styles', 'numbering', 'theme', 'fontTable', 'settings']);
+  const shared = [...documentRelations.values()]
+    .filter(relation => implicit.has(relation.Type.split('/').at(-1)!))
+    .map(relation => hashRelation(documentPart, relation)).sort();
+  return (ids: Set<string>) => [...shared, ...[...ids].sort().flatMap(id => {
+    const relation = documentRelations.get(id);
+    if (!relation) return invalidPackage();
+    return [id, hashRelation(documentPart, relation)];
+  })];
+}
+
 export interface DocxParagraphTargetInfo {
   blockIndex: number;
   paraId?: string;
@@ -207,7 +264,10 @@ export function readDocxAllParagraphTargets(bytes: Buffer, window?: { start: num
   byBlockIndex: Map<number, DocxParagraphTargetInfo>;
 } {
   const name = 'word/document.xml';
-  const data = readParts(bytes, new Set([name]))[name];
+  const relationPath = relationshipsPath(name);
+  const parts = readParts(bytes, new Set([name, relationPath]));
+  const data = parts[name];
+  const dependencies = docxRelationshipFingerprints(bytes, name, parts[relationPath]);
   if (!data) return invalidPackage();
   const source = new TextDecoder('utf-8', { fatal: true }).decode(data);
   const parser = new SaxesParser({ xmlns: true });
@@ -221,6 +281,7 @@ export function readDocxAllParagraphTargets(bytes: Buffer, window?: { start: num
   let foundBody = false;
   let tagStart = 0;
   let blockStart = 0;
+  const relationshipIds = new Set<string>();
   let paragraph: { paraId?: string; text: string } | undefined;
   let textDepth = -1;
   parser.on('error', invalidPackage);
@@ -235,6 +296,7 @@ export function readDocxAllParagraphTargets(bytes: Buffer, window?: { start: num
       bodyDepth = depth;
     } else if (bodyDepth !== -1 && depth === bodyDepth + 1) {
       blockStart = tagStart;
+      relationshipIds.clear();
       if (window && blockFingerprints.length >= window.start && blockFingerprints.length < window.start + window.count) {
         block = { blockIndex: blockFingerprints.length, type: tag.local, text: '' };
       }
@@ -244,6 +306,11 @@ export function readDocxAllParagraphTargets(bytes: Buffer, window?: { start: num
             attr.local === 'paraId' && attr.uri === 'http://schemas.microsoft.com/office/word/2010/wordml')?.value,
           text: '',
         };
+      }
+    }
+    if (bodyDepth !== -1 && depth > bodyDepth) {
+      for (const attribute of Object.values(tag.attributes)) {
+        if (attribute.uri === OFFICE_REL) relationshipIds.add(attribute.value);
       }
     }
     if ((paragraph || block) && tag.local === 't' && tag.uri === WORD) textDepth = depth;
@@ -258,17 +325,23 @@ export function readDocxAllParagraphTargets(bytes: Buffer, window?: { start: num
   parser.on('closetag', () => {
     if (depth === textDepth) textDepth = -1;
     if (bodyDepth !== -1 && depth === bodyDepth + 1) {
-      const fingerprint = digest(source.slice(blockStart, parser.position));
-      if (paragraph) {
+      const blockXml = source.slice(blockStart, parser.position);
+      let fingerprint: string | undefined;
+      try {
+        fingerprint = digest(blockXml, ...dependencies(relationshipIds));
+      } catch (error) {
+        if (!(error instanceof ArtifactError) && !(error instanceof URIError)) throw error;
+      }
+      if (paragraph && fingerprint) {
         counts.set(fingerprint, (counts.get(fingerprint) ?? 0) + 1);
         rawParagraphs.push({ ...paragraph, blockIndex: blockFingerprints.length, fingerprint });
-        paragraph = undefined;
       }
+      paragraph = undefined;
       if (block) {
         blocks.push(block);
         block = undefined;
       }
-      blockFingerprints.push(fingerprint);
+      blockFingerprints.push(fingerprint ?? digest('unresolved-relationship', blockXml));
     }
     if (depth === bodyDepth) bodyDepth = -1;
     depth--;
@@ -324,6 +397,7 @@ export interface XlsxRangeTargetResult {
   rangeA1: string;
   expectedSheetStructHash: string;
   expectedRangeValuesHash: string;
+  targetContextHash: string;
   expectedOrderKeysHash: string;
   cells: Array<{ address: string; value: string; formula?: string; type?: string }>;
   snippet: string;
@@ -501,6 +575,7 @@ export function readXlsxRangeTarget(
     fAttrs: string;
   }
   const rangeHash = createHash('sha256').update(`range:${sheet.id}:${parsedRange.canonical}\n`);
+  const contextHash = createHash('sha256').update(`context:${sheet.id}:${parsedRange.canonical}\n`);
   const orderKeysHash = createHash('sha256').update(`order:${sheet.id}:${parsedRange.canonical}\n`);
   if (!dense) {
     rangeHash.update('sparse-v1\n');
@@ -525,6 +600,7 @@ export function readXlsxRangeTarget(
   const rangeCells = new Map<string, CellEntry>();
   const sharedFormulaMasters = new Map<string, string>();
   const selectedSharedFormulas = new Set<string>();
+  const contextualSharedFormulas = new Set<string>();
 
   const parser = new SaxesParser({ xmlns: true, position: false });
   let currentRowNum = 0;
@@ -536,6 +612,7 @@ export function readXlsxRangeTarget(
   let cellCol = -1;
   let cellType = '';
   let cellInRange = false;
+  let cellInContext = false;
 
   let inV = false;
   let inF = false;
@@ -589,11 +666,10 @@ export function readXlsxRangeTarget(
         cellRef = `${colIndexToLetters(cellCol)}${cellRow + 1}`;
       }
       structHash.update(`c:${cellRef}\n`);
-      cellInRange =
-        cellRow >= parsedRange.row0 &&
-        cellRow <= parsedRange.row1 &&
-        cellCol >= parsedRange.col0 &&
-        cellCol <= parsedRange.col1;
+      const selectedRow = cellRow >= parsedRange.row0 && cellRow <= parsedRange.row1;
+      const selectedColumn = cellCol >= parsedRange.col0 && cellCol <= parsedRange.col1;
+      cellInRange = selectedRow && selectedColumn;
+      cellInContext = !visit && (selectedRow || selectedColumn);
       vBuf = '';
       fBuf = '';
       fAttrs = '';
@@ -604,15 +680,16 @@ export function readXlsxRangeTarget(
       const kind = attrStr(attrs, 't');
       const ref = attrStr(attrs, 'ref');
       const id = attrStr(attrs, 'si');
-      inF = cellInRange || (!visit && kind === 'shared');
-      hasFormula = cellInRange;
+      inF = cellInRange || cellInContext || (!visit && kind === 'shared');
+      hasFormula = cellInRange || cellInContext;
       fAttrs = `${kind}|${ref}|${id}`;
       if (!visit && kind === 'shared') {
         if (!id) invalidPackage();
         sharedFormulaId = id;
         if (cellInRange) selectedSharedFormulas.add(id);
+        if (cellInContext) contextualSharedFormulas.add(id);
       }
-    } else if (inCell && cellInRange) {
+    } else if (inCell && (cellInRange || cellInContext)) {
       if (local === 'v') {
         inV = true;
       } else if (local === 'is') {
@@ -626,8 +703,8 @@ export function readXlsxRangeTarget(
   parser.on('text', (text) => {
     if (!inCell) return;
     if (inF) fBuf += text;
-    else if (cellInRange && inV) vBuf += text;
-    else if (cellInRange && inIs && inIsT) isBuf += text;
+    else if ((cellInRange || cellInContext) && inV) vBuf += text;
+    else if ((cellInRange || cellInContext) && inIs && inIsT) isBuf += text;
   });
 
   parser.on('closetag', (tag) => {
@@ -643,7 +720,7 @@ export function readXlsxRangeTarget(
     else if (local === 't') inIsT = false;
     else if (local === 'is') inIs = false;
     else if (local === 'c' && inCell) {
-      if (cellInRange) {
+      if (cellInRange || cellInContext) {
         let resolvedValue = vBuf;
         if (cellType === 's') {
           const idx = Number(vBuf);
@@ -657,6 +734,11 @@ export function readXlsxRangeTarget(
           f: hasFormula ? fBuf : null,
           fAttrs: hasFormula ? fAttrs : '',
         };
+        if (cellInContext) contextHash.update(JSON.stringify([cellRow, cellCol, entry])).update('\n');
+        if (!cellInRange) {
+          inCell = false;
+          return;
+        }
         if (dense) {
           const key = `${cellRow}:${cellCol}`;
           if (rangeCells.has(key)) invalidPackage();
@@ -692,6 +774,12 @@ export function readXlsxRangeTarget(
     orderKeysHash.update('shared:').update(definition).update('\n');
   }
 
+  for (const id of [...contextualSharedFormulas].sort()) {
+    const definition = sharedFormulaMasters.get(id);
+    if (!definition) invalidPackage();
+    contextHash.update(definition).update('\n');
+  }
+
   const snippetText = snippetCells
     .map((c) => `${c.address} ${c.formula !== undefined ? '=' + c.formula : c.value}`)
     .join('\n');
@@ -699,6 +787,7 @@ export function readXlsxRangeTarget(
   return {
     sheetId: sheet.id,
     sheetName: sheet.name,
+    targetContextHash: contextHash.digest('hex'),
     sheetPart: sheet.part,
     rangeA1: parsedRange.canonical,
     expectedSheetStructHash: structHash.digest('hex'),
@@ -707,6 +796,58 @@ export function readXlsxRangeTarget(
     cells: snippetCells,
     snippet: snippetText,
   };
+}
+
+/** Check whether the sheet bytes distinguish selected rows and columns without stable record IDs. */
+export function xlsxGridTargetIsUnique(bytes: Buffer, selector: {
+  sheetId: string; rangeA1?: string; axis?: 'row' | 'col'; start?: number; end?: number;
+}) {
+  const range = selector.rangeA1 === undefined ? null : parseA1Range(selector.rangeA1);
+  const rowBounds = selector.axis === 'row' ? [selector.start!, selector.end!] : range ? [range.row0, range.row1] : null;
+  const colBounds = selector.axis === 'col' ? [selector.start!, selector.end!] : range ? [range.col0, range.col1] : null;
+  const rows = new Map<string, number>();
+  const selectedRows = new Set<string>();
+  const columns = new Map<number, ReturnType<typeof createHash>>();
+  let currentRow = -1;
+  let rowHash = createHash('sha256');
+  const recordRow = () => {
+    if (currentRow < 0 || !rowBounds) return;
+    const signature = rowHash.digest('hex');
+    rows.set(signature, Math.min(2, (rows.get(signature) ?? 0) + 1));
+    if (currentRow >= rowBounds[0] && currentRow <= rowBounds[1]) selectedRows.add(signature);
+  };
+  const workbook = readXlsxRangeTarget(bytes, selector.sheetId, 'A1:XFD1048576', (row, col, value, formula) => {
+    if (rowBounds) {
+      if (row !== currentRow) {
+        recordRow();
+        rowHash = createHash('sha256');
+        currentRow = row;
+      }
+      rowHash.update(JSON.stringify([col, value, formula])).update('\n');
+    }
+    if (colBounds) {
+      let hash = columns.get(col);
+      if (!hash) {
+        hash = createHash('sha256');
+        columns.set(col, hash);
+      }
+      hash.update(JSON.stringify([row, value, formula])).update('\n');
+    }
+  });
+  if (!workbook) return false;
+  recordRow();
+  if (rowBounds && (selectedRows.size !== rowBounds[1] - rowBounds[0] + 1 ||
+      [...selectedRows].some(signature => rows.get(signature) !== 1))) return false;
+  if (!colBounds) return true;
+  const colCounts = new Map<string, number>();
+  const selectedColumns: string[] = [];
+  for (const [col, hash] of columns) {
+    const signature = hash.digest('hex');
+    colCounts.set(signature, Math.min(2, (colCounts.get(signature) ?? 0) + 1));
+    if (col >= colBounds[0] && col <= colBounds[1]) selectedColumns.push(signature);
+  }
+  return selectedColumns.length === colBounds[1] - colBounds[0] + 1 &&
+    selectedColumns.every(signature => colCounts.get(signature) === 1);
 }
 
 export function searchXlsxRange(bytes: Buffer, sheet: string, query: string, afterRow: number, afterCol: number) {

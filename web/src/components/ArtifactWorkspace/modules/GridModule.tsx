@@ -1,3 +1,4 @@
+import { isExactXlsxNumber } from '../../../../../shared/xlsx-number';
 import { useTargetSelection } from '../useTargetSelection';
 import React,{useEffect,useLayoutEffect,useMemo,useRef,useState} from 'react';
 import {previewFormulas,type FormulaCell} from '../formulaPreview';
@@ -296,21 +297,41 @@ export function GridModule(props:WorkspaceModuleProps){
   const filteredRowRemoved=filter!==''&&(projectedGridIndex({index:sourceRow(current.row,current.col)},rowsChanged)===undefined||
     projectedGridIndex({index:current.col},colsChanged)===undefined);
   const cellEditLocked=editingLocked||filteredRowRemoved;
-  function change(v:string){
+  const [cellInputOverride,setCellInputOverride]=useState<{key:string;type:string}|null>(null);
+  const activeCellKey=revisionKey+'::'+key(current.row,current.col);
+  const activeInputCell=raw(current.row,current.col);
+  const declaredCellType=activeInputCell?.type;
+  const cellInputType=cellInputOverride?.key===activeCellKey?cellInputOverride.type:
+    hasFormula(activeInputCell)?'auto':
+    declaredCellType==='b'||typeof activeInputCell?.value==='boolean'?'boolean':
+    (declaredCellType==='n'||declaredCellType==null)&&activeInputCell?.value!=null?'number':
+    typeof activeInputCell?.value==='string'?'text':'auto';
+  function change(v:string, inputType=cellInputType, explicitType=false){
     if(!ready||cellEditLocked||artifact.revision===undefined||!sheet||!editableCoordinate)return;
     const {row,col}=current;
-    const formula=xlsx&&v.startsWith('=');
+    const formula=xlsx&&inputType!=='text'&&v.startsWith('=');
     const op=xlsx?(formula?'xlsx.set_formula':'xlsx.set_cell'):'set_cell';
     if(!supportsOperation(capabilities,xlsx?op:'edit'))return;
     const k=key(row,col);
     const gridLocation=location(row,col);
-    const cellValue=formula?v:(/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(v)&&Number.isFinite(Number(v))?Number(v):v);
-    onDraft(artifact.revision,!structuralDraft&&v===original(row,col)?null:{key:k,displayValue:v,label:sheet.name+' '+address(row,col),gridLocation,
-      operation:xlsx?{op,sheetPart:sheet.part,address:address(gridLocation.row.index,gridLocation.col.index),value:cellValue}:{op,row:gridLocation.row.index,col:gridLocation.col.index,value:v}},k);
+    const automaticNumber=/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
+    const typedNumber=!formula&&v!==''&&(inputType==='number'||inputType==='auto'&&automaticNumber.test(v));
+    const typedBoolean=!formula&&v!==''&&inputType==='boolean';
+    const validBoolean=/^(?:true|false|0|1)$/i.test(v);
+    const cellValue=v===''&&inputType!=='text'?null:typedBoolean&&validBoolean?(v.toLowerCase()==='true'||v==='1'):v;
+    onDraft(artifact.revision,!structuralDraft&&v===original(row,col)&&!explicitType&&cellInputOverride?.key!==activeCellKey?null:{
+      key:k,displayValue:v,label:sheet.name+' '+address(row,col),gridLocation,
+      operation:xlsx?{op,sheetPart:sheet.part,address:address(gridLocation.row.index,gridLocation.col.index),value:cellValue,
+        ...(typedNumber?{valueType:'number'}:{}),...(typedBoolean&&!validBoolean?{valueType:'boolean'}:{})}:
+        {op,row:gridLocation.row.index,col:gridLocation.col.index,value:v},
+    },k);
   }
+  const invalidTypedCell=(entry:DraftEntry)=>entry.operation.valueType==='boolean'||
+    entry.operation.valueType==='number'&&!isExactXlsxNumber(String(entry.operation.value));
+  const invalidCellDraft=xlsx&&draft?.entries.some(invalidTypedCell);
   const [formulaPreview,setFormulaPreview]=useState<{draft:NonNullable<typeof draft>;sheetId:string;cells:Map<string,string|null>}|null>(null);
   useEffect(()=>{
-    if(!liveXlsxDraft||!sheet||!draft||structuralDraft||
+    if(!liveXlsxDraft||!sheet||!draft||structuralDraft||invalidCellDraft||
       !structure.ready||visibleKeys.some(key=>!readTile(key)))return;
     const controller=new AbortController();
     const staged=new Map<string,FormulaCell>();
@@ -325,7 +346,7 @@ export function GridModule(props:WorkspaceModuleProps){
       const op=e.operation;
       if(typeof op.sheetPart!=='string'||typeof op.address!=='string'||!['xlsx.set_formula','xlsx.set_cell'].includes(op.op))continue;
       const v=op.value,formula=op.op==='xlsx.set_formula'?String(v).replace(/^=/,''):undefined;
-      staged.set(op.sheetPart+':'+op.address,{value:v,type:typeof v==='number'?'n':'inlineStr',formula});
+      staged.set(op.sheetPart+':'+op.address,{value:v,type:op.valueType==='number'||typeof v==='number'?'n':typeof v==='boolean'?'b':'inlineStr',formula});
       const c=parseAddress(op.address);
       if(op.sheetPart===sheet.part&&c&&visibleKeys.includes(tileKey(c.row,c.col))){
         if(formula!==undefined)formulas.add(op.address);else formulas.delete(op.address);
@@ -581,7 +602,15 @@ export function GridModule(props:WorkspaceModuleProps){
   }
   const activeFormulaStatus=formulaDisplay(current.row,current.col,raw(current.row,current.col))?.status;
   const formulaWarning=activeFormulaStatus!==undefined;
-  const primary=<><span className="workspace-cell-address" title={selectedRange}>{selectedRange}</span><span aria-hidden="true">ƒx</span><input ref={formulaInput} className="workspace-formula" aria-label="数式・セル値" value={ready?value(current.row,current.col):''} readOnly={!inputEnabled} onChange={e=>change(e.target.value)}/>{formulaWarning&&<small title={FORMULA_STATUS[activeFormulaStatus]}>{activeFormulaStatus==='error_formula'?'数式エラー':'未評価'}</small>}{mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!ready||!inData} onClick={()=>void pin()}>セルを対象にする</button>}{mode==='edit'&&<>
+  const primary=<><span className="workspace-cell-address" title={selectedRange}>{selectedRange}</span><span aria-hidden="true">ƒx</span><input ref={formulaInput} className="workspace-formula" aria-label="数式・セル値" value={ready?value(current.row,current.col):''} readOnly={!inputEnabled} onChange={e=>change(e.target.value)}/>{xlsx&&mode==='edit'&&<select aria-label="セル入力形式" className="compact-select" disabled={!inputEnabled} value={cellInputType}
+      onChange={event=>{
+        const type=event.target.value;
+        setCellInputOverride({key:activeCellKey,type});
+        change(value(current.row,current.col),type,true);
+      }}>
+      <option value="auto">自動</option><option value="text">文字列</option>
+      <option value="number">数値</option><option value="boolean">真偽値</option>
+    </select>}{invalidCellDraft&&<small role="alert" title="正確に保存するには文字列形式を選択してください。">セルの入力形式または数値精度を確認してください。</small>}{formulaWarning&&<small title={FORMULA_STATUS[activeFormulaStatus]}>{activeFormulaStatus==='error_formula'?'数式エラー':'未評価'}</small>}{mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!ready||!inData} onClick={()=>void pin()}>セルを対象にする</button>}{mode==='edit'&&<>
       {xlsx&&markButton('bold')}
     </>}</>;
   const secondary=mode==='edit'?<>

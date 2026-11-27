@@ -20,6 +20,7 @@ export function pdfTextLayout(
   items: Array<PdfTextItem | { type: string }>,
   viewport: { width: number; height: number; convertToViewportPoint(x: number, y: number): number[] },
   glyphFractions?: (item: PdfTextItem, from: number, to: number) => [number, number] | null,
+  styles?: Record<string, { ascent?: number; descent?: number; vertical?: boolean }>,
 ): PdfTextLayout {
   let text = '';
   const runs: Array<{ item: PdfTextItem; itemIndex: number; start: number; text: string; trimStart: number }> = [];
@@ -47,16 +48,25 @@ export function pdfTextLayout(
         const { item } = run;
         const [a, b, c, d, x, y] = item.transform;
         const horizontal = Math.hypot(a, b), vertical = Math.hypot(c, d);
-        if (!horizontal || !vertical || !item.width || !item.height || item.dir === 'ttb') return null;
+        const isVertical = item.dir === 'ttb';
+        const length = isVertical ? item.height : item.width;
+        const thickness = isVertical ? item.width : item.height;
+        if (!horizontal || !vertical || length <= 0 || thickness <= 0) return null;
         const fractions: [number, number] | null = from === 0 && to === item.str.length
           ? [0, 1] : glyphFractions?.(item, from + run.trimStart, to + run.trimStart) ?? null;
         if (!fractions) return null;
         const [left, right] = fractions;
         const point = (fraction: number, height: number) => viewport.convertToViewportPoint(
-          x + a * item.width * fraction / horizontal + c * height / vertical,
-          y + b * item.width * fraction / horizontal + d * height / vertical,
+          x + (isVertical ? b : a) * length * fraction / horizontal + (isVertical ? a / horizontal : c / vertical) * height,
+          y + (isVertical ? -a : b) * length * fraction / horizontal + (isVertical ? b / horizontal : d / vertical) * height,
         );
-        const quad = [...point(left, item.height), ...point(right, item.height), ...point(left, 0), ...point(right, 0)];
+        const style = styles?.[item.fontName];
+        const ascent = style?.ascent ?? (style?.descent === undefined ? undefined : 1 + style.descent);
+        if (isVertical && (!style?.vertical || ascent === undefined || !Number.isFinite(ascent) || ascent <= 0 ||
+            Math.abs((a * c + b * d) / (horizontal * vertical)) > 1e-6)) return null;
+        const top = isVertical ? vertical * ascent! : thickness;
+        const bottom = isVertical ? top - vertical : 0;
+        const quad = [...point(left, top), ...point(right, top), ...point(left, bottom), ...point(right, bottom)];
         if (quad.some((value, i) => !Number.isFinite(value) || value < 0 || value > (i % 2 ? viewport.height : viewport.width))) return null;
         quads.push(quad);
       }

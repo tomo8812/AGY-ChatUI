@@ -62,22 +62,25 @@ export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget
     for(const n of nodes){const len=n.length;if(!start&&at<pos+len){start=n;startOffset=at-pos}if(start&&at+query.length<=pos+len){end=n;endOffset=at+query.length-pos;break}pos+=len}
     if(start&&end&&startOffset>=0&&endOffset<=end.length){const range=document.createRange();range.setStart(start,startOffset);range.setEnd(end,endOffset);const selection=window.getSelection();selection?.removeAllRanges();selection?.addRange(range);start.parentElement?.scrollIntoView({block:'nearest',inline:'nearest'});searchOffset.current=at+query.length}
   }
-  async function selectLines(){
+  async function selectLines(characters=false){
     if(!resource.ready||artifact.revision===undefined||!editor.current)return;
-    const {startLine:start,endLine:end}=editor.current.getSelection();
+    const bounds=characters?editor.current.getCharacterSelection():editor.current.getSelection();
+    if(!bounds){setPinError('対象にする文字を選択してください。');return}
+    const {startLine:start,endLine:end}=bounds;
     const isCurrent=selection.begin();
     try{
-      const result=await workspaceApi.range<{text:string;before:string;after:string;expectedSnippetHash:string;contextBeforeHash:string;contextAfterHash:string;occurrenceIndex:number}>(artifact.id,{startLine:start,endLine:end,targetHashes:true});
+      const result=await workspaceApi.range<{text:string;before:string;after:string;expectedSnippetHash:string;contextBeforeHash:string;contextAfterHash:string;occurrenceIndex:number}>(artifact.id,{...bounds,targetHashes:true});
       if(!isCurrent())return;
       assertRevision(artifact,result);
       if(!Number.isInteger(result.occurrenceIndex)||result.occurrenceIndex<0)throw Error('Invalid occurrenceIndex');
-      onTarget({baseRevision:artifact.revision,label:start+'–'+end+' 行',selector:{kind:markdown?'md_text_range':'code_line_range',startLine:start,endLine:end,expectedSnippetHash:result.expectedSnippetHash,contextBeforeHash:result.contextBeforeHash,contextAfterHash:result.contextAfterHash,occurrenceIndex:result.occurrenceIndex},range:{startLine:start,endLine:end},selectedContentSnapshot:result.text.slice(0,50_000),surroundingContext:(result.before+'\n---\n'+result.after).slice(0,20_000)});
+      onTarget({baseRevision:artifact.revision,label:characters?start+'–'+end+' 行の選択文字列':start+'–'+end+' 行',selector:{kind:characters?'code_char_range':markdown?'md_text_range':'code_line_range',...bounds,...(characters?{contextVersion:2}:{}),expectedSnippetHash:result.expectedSnippetHash,contextBeforeHash:result.contextBeforeHash,contextAfterHash:result.contextAfterHash,occurrenceIndex:result.occurrenceIndex},range:{...bounds},selectedContentSnapshot:result.text.slice(0,50_000),surroundingContext:(result.before+'\n---\n'+result.after).slice(0,20_000)});
       setPinError('');
     }catch{if(isCurrent())setPinError('選択対象の識別情報を作成できませんでした。')}
   }
   const primary=mode==='pin'?<>
     <button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready} onClick={()=>editor.current?.selectAll()}>全選択</button>
     <button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready} onClick={()=>void selectLines()}>選択行を対象にする</button>
+    {!markdown&&<button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready} onClick={()=>void selectLines(true)}>選択文字を対象にする</button>}
   </>:<>
     <input className="workspace-command-input" aria-label="検索" placeholder="検索" value={query}
       onChange={e=>{setQuery(e.target.value);searchOffset.current=0}} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();find()}}}/>

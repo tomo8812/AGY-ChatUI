@@ -151,7 +151,7 @@ function PdfPageTextLayer({ doc, pageNumber }: { doc: PdfJsTypes.PDFDocumentProx
       layer = new pdfjs.TextLayer({ container, textContentSource: textContent, viewport });
       await layer.render();
       if (canceled) return;
-      const layout = pdfTextLayout(textContent.items, viewport);
+      const layout = pdfTextLayout(textContent.items, viewport, undefined, textContent.styles);
       canvasTextByLayer.set(container, layout.text);
       for (const run of layout.runs) {
         const span = layer.textDivs[run.itemIndex];

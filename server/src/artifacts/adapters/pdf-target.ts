@@ -963,9 +963,16 @@ function inspectPageTree(reader: PdfReader, targetPageIndex?: number): PdfDocume
     }
 
     const resourcesHash = reader.hashPageDependency(inh.resources);
+    const displayDependencies = [
+      reader.hashPageDependency(catalog['/OCProperties']),
+      reader.hashPageDependency(catalog['/AcroForm']),
+      reader.hashPageDependency(dict['/Group']),
+      reader.hashPageDependency(dict['/Contents']),
+    ];
     const pageContentHash = sha256(
       JSON.stringify({
-        v: 2,
+        v: 3,
+        displayDependencies,
         mediaBox,
         cropBox,
         rotate,
@@ -988,7 +995,7 @@ function inspectPageTree(reader: PdfReader, targetPageIndex?: number): PdfDocume
       widthPt,
       heightPt,
       pageContentHash,
-      rotationIndependentHash: sha256(JSON.stringify([mediaBox, cropBox, userUnit, streamHashes, resourcesHash,
+      rotationIndependentHash: sha256(JSON.stringify([mediaBox, cropBox, userUnit, streamHashes, resourcesHash, displayDependencies,
         annotations.map(annotation => annotation.fingerprint)])),
       text,
       items,

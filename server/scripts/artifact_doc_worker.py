@@ -1371,6 +1371,14 @@ def update_workbook_cell(package, operation, replacements, additions=None):
     address = operation["address"]
     value = operation.get("value")
     cell_coordinates(address)
+    numeric_literal = None
+    value_type = operation.get("valueType")
+    if value_type is not None:
+        if op != "xlsx.set_cell" or value_type != "number" or not isinstance(value, str):
+            raise ValueError("Invalid typed cell value")
+        numeric_literal = checked_xlsx_number(value)
+    elif op == "xlsx.set_cell" and type(value) in (int, float):
+        numeric_literal = checked_xlsx_number(str(value))
     if type(value) not in (str, bool, int, float, type(None)):
         raise ValueError("Expected a scalar cell value")
     assert_editable_cell(sheet, address)
@@ -1394,6 +1402,10 @@ def update_workbook_cell(package, operation, replacements, additions=None):
         formula = XML.Element(tag(SPREADSHEET, "f"))
         formula.text = value[1:]
         cell.insert(0, formula)
+    elif numeric_literal is not None:
+        value_element = XML.Element(tag(SPREADSHEET, "v"))
+        cell.insert(0, value_element)
+        value_element.text = numeric_literal
     elif isinstance(value, str):
         if len(value.encode("utf-16-le")) > 65534:
             raise ValueError("Cell value exceeds the Excel limit")
@@ -1412,6 +1424,24 @@ def update_workbook_cell(package, operation, replacements, additions=None):
         else:
             value_element.text = json.dumps(value, allow_nan=False)
     replacements[sheet_name] = sheet
+
+
+def checked_xlsx_number(literal):
+    from decimal import Decimal
+
+    if len(literal) > 128 or not re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]{1,4})?", literal):
+        raise ValueError("Invalid XLSX number")
+    value = Decimal(literal)
+    digits = ''.join(map(str, value.as_tuple().digits)).rstrip('0')
+    if value.is_zero():
+        return "0"
+    if len(digits) > 15 or not -308 <= value.adjusted() <= 308:
+        raise ValueError("XLSX number cannot be stored at the requested precision; use text")
+    binary = float(value)
+    if (not math.isfinite(binary) or abs(binary) < 2.2250738585072014e-308
+            or Decimal(str(binary)) != value):
+        raise ValueError("XLSX number cannot be stored at the requested precision; use text")
+    return literal
 
 
 def write_package(package, replacements, output, fmt, removed=(), additions=None):
@@ -2069,18 +2099,18 @@ def process_pdf(request, source, output):
             order = operation["order"]
             if len(order) != len(writer.pages) or sorted(order) != list(range(len(writer.pages))):
                 raise ValueError("The page order must be a complete permutation")
+            from pypdf.generic import ArrayObject, NameObject
             page_tree = writer._pages.get_object()
-            if page_tree["/Count"] == len(page_tree["/Kids"]):
-                from pypdf.generic import ArrayObject, NameObject
-                children = page_tree["/Kids"]
-                page_tree[NameObject("/Kids")] = ArrayObject(children[index] for index in order)
-            else:
-                rebuilt = PdfWriter()
-                for index in order:
-                    rebuilt.add_page(writer.pages[index])
-                if writer.metadata:
-                    rebuilt.add_metadata(dict(writer.metadata))
-                writer = rebuilt
+            pages = list(writer.pages)
+            references = [page.indirect_reference for page in pages]
+            if (page_tree["/Count"] != len(pages) or list(page_tree["/Kids"]) != references
+                    or None in references or len(set(references)) != len(pages)
+                    or "/PageLabels" in writer.root_object):
+                raise UnsupportedByFormatError(
+                    "Reordering this page tree could change document-level references or page labels."
+                )
+            writer.flattened_pages[:] = [pages[index] for index in order]
+            page_tree[NameObject("/Kids")] = ArrayObject(references[index] for index in order)
         else:
             index = bounded_integer(operation["pageIndex"], 0, len(writer.pages) - 1)
             if op == "pdf.remove_page":

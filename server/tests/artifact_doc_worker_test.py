@@ -547,6 +547,79 @@ class DocumentWorkerTest(unittest.TestCase):
             with Image.open(io.BytesIO(self.run_worker("pdf", "render", pageIndex=0))) as page:
                 self.assertEqual(page.format, "PNG")
 
+    def test_pdf_reordering_preserves_catalog_and_page_references(self):
+        from pypdf import PdfWriter
+        from pypdf.annotations import Link
+        from pypdf.generic import ArrayObject, DictionaryObject, NameObject
+        from reportlab.pdfgen.canvas import Canvas
+
+        document = io.BytesIO()
+        canvas = Canvas(document)
+        canvas.drawString(100, 700, "First")
+        canvas.acroForm.textfield(name="memo", value="Keep me", x=100, y=600)
+        canvas.showPage()
+        canvas.drawString(100, 700, "Second")
+        canvas.showPage()
+        canvas.save()
+        writer = PdfWriter(clone_from=PdfReader(io.BytesIO(document.getvalue())))
+        writer.add_outline_item("First destination", 0)
+        writer.add_attachment("data.txt", b"Attachment")
+        writer.add_metadata({"/Title": "Document title"})
+        writer.add_annotation(0, Link(rect=(10, 10, 30, 30), target_page_index=1))
+        writer.root_object[NameObject("/OCProperties")] = DictionaryObject({
+            NameObject("/OCGs"): ArrayObject([]),
+            NameObject("/D"): DictionaryObject({NameObject("/BaseState"): NameObject("/ON")}),
+        })
+        writer.write(self.source)
+        before_png = self.run_worker("pdf", "render", pageIndex=1) if shutil.which("pdftoppm") else None
+        result = self.run_worker("pdf", "edit", operations=[
+            {"op": "pdf.reorder_pages", "order": [1, 0]},
+            {"op": "pdf.add_note", "pageIndex": 1, "rect": [40, 40, 60, 60], "text": "After reorder"},
+        ])
+        reordered = PdfReader(io.BytesIO(result))
+        self.assertIn("Second", reordered.pages[0].extract_text())
+        self.assertIn("First", reordered.pages[1].extract_text())
+        self.assertEqual(reordered.get_destination_page_number(reordered.outline[0]), 1)
+        annotations = [ref.get_object() for ref in reordered.pages[1]["/Annots"]]
+        link = next(annotation for annotation in annotations if annotation["/Subtype"] == "/Link")
+        self.assertEqual(link["/Dest"][0], reordered.pages[0].indirect_reference)
+        self.assertTrue(any(annotation.get("/Contents") == "After reorder" for annotation in annotations))
+        self.assertEqual(reordered.get_fields()["memo"]["/V"], "Keep me")
+        self.assertEqual(reordered.attachments["data.txt"], [b"Attachment"])
+        self.assertEqual(reordered.metadata.title, "Document title")
+        self.assertEqual(reordered.root_object["/OCProperties"]["/D"]["/BaseState"], "/ON")
+        if before_png is not None:
+            self.source.write_bytes(result)
+            after_png = self.run_worker("pdf", "render", pageIndex=0)
+            with Image.open(io.BytesIO(before_png)) as before, Image.open(io.BytesIO(after_png)) as after:
+                self.assertIsNone(ImageChops.difference(before, after).getbbox())
+
+    def test_xlsx_cell_input_preserves_explicit_text_and_rejects_precision_loss(self):
+        workbook = Workbook()
+        workbook.active["A1"] = "00123"
+        workbook.save(self.source)
+        sheet_part = "xl/worksheets/sheet1.xml"
+        result = self.run_worker("xlsx", "edit", operations=[
+            {"op": "xlsx.set_cell", "sheetPart": sheet_part, "address": "A1", "value": "9007199254740993"},
+            {"op": "xlsx.set_cell", "sheetPart": sheet_part, "address": "A2", "value": "00123"},
+            {"op": "xlsx.set_cell", "sheetPart": sheet_part, "address": "A3", "value": "1.2345e-12", "valueType": "number"},
+            {"op": "xlsx.set_cell", "sheetPart": sheet_part, "address": "A4", "value": False},
+            {"op": "xlsx.set_cell", "sheetPart": sheet_part, "address": "A5", "value": ""},
+        ])
+        sheet = load_workbook(io.BytesIO(result)).active
+        self.assertEqual((sheet["A1"].data_type, sheet["A1"].value), ("s", "9007199254740993"))
+        self.assertEqual((sheet["A2"].data_type, sheet["A2"].value), ("s", "00123"))
+        self.assertEqual((sheet["A3"].data_type, sheet["A3"].value), ("n", 1.2345e-12))
+        self.assertEqual((sheet["A4"].data_type, sheet["A4"].value), ("b", False))
+        self.assertEqual((sheet["A5"].data_type, sheet["A5"].value), ("s", ""))
+        original = self.source.read_bytes()
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.run_worker("xlsx", "edit", operations=[
+                {"op": "xlsx.set_cell", "sheetPart": sheet_part, "address": "A1", "value": "9007199254740993", "valueType": "number"},
+            ])
+        self.assertEqual(self.source.read_bytes(), original)
+        self.assertFalse(self.result.exists())
+
     def test_pdf_merges_source_pages_without_rewriting_sources(self):
         first = self.run_worker("pdf", "create", params={"pages": ["One"]})
         second = self.run_worker("pdf", "create", params={"pages": ["Two", "Three"]})

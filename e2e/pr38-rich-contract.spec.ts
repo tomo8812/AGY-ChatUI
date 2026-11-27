@@ -1,8 +1,8 @@
 import { expect, test, type Page } from '@playwright/test';
 import type { RichChartNode, RichDocumentV1, RichNode } from '../shared/rich-schema';
 
-async function mount(page: Page, children: RichNode[], state: RichDocumentV1['state'] = {}) {
-  const document: RichDocumentV1 = { schemaVersion: 1, state, root: { id: 'root', type: 'stack', direction: 'col', children } };
+async function mount(page: Page, children: RichNode[], state: RichDocumentV1['state'] = {}, sources?: RichDocumentV1['sources']) {
+  const document: RichDocumentV1 = { schemaVersion: 1, state, sources, root: { id: 'root', type: 'stack', direction: 'col', children } };
   await page.addInitScript(value => {
     (window as Window & { __pr3aFixtureRichDocument?: RichDocumentV1 }).__pr3aFixtureRichDocument = value;
   }, document);
@@ -189,4 +189,41 @@ test('validates inline SVG definitions on state changes and namespaces definitio
   await expect(stop).toHaveAttribute('stop-opacity', '0.25');
   await page.getByRole('button', { name: 'Set valid opacity' }).click();
   await expect(stop).toHaveAttribute('stop-opacity', '0.75');
+});
+
+test('keeps two stacked axes selectable and exposes all missing point sources and code drafts', async ({ page }) => {
+  await mount(page, [
+    { id: 'stacks', type: 'chart', chartType: 'stacked_bar', categories: ['A', 'B'], selectedPointBind: 'selected',
+      series: [
+        { key: 'left', label: 'Left', data: [3, -2], sourceId: 'first' },
+        { key: 'left-2', label: 'Left stacked', data: [2, -1] },
+        { key: 'right', label: 'Right', data: [100, -90], yAxisId: 'right', sourceId: 'second' },
+      ], yAxisRight: { unit: 'kg' } },
+    { id: 'missing', type: 'chart', chartType: 'line', series: [{ key: 'a', label: 'Value', sourceId: 'first',
+      data: Array.from({ length: 101 }, (_, i) => ({ y: null, missingReason: 'Missing ' + (i + 1),
+        ...(i === 100 ? { sourceId: 'second', asOf: '2026-11-26' } : {}) })),
+    }] },
+    { id: 'draft', type: 'editable_draft', format: 'code', language: 'typescript', bind: 'code', label: 'Draft' },
+    { id: 'echo', type: 'text', content: { expr: '$state.code' } },
+  ], { selected: null, code: 'const a = 1;' }, [
+    { id: 'first', name: 'Original report', fetchedAt: '2026-11-24T00:00:00Z' },
+    { id: 'second', name: 'Updated report', fetchedAt: '2026-11-25T00:00:00Z' },
+  ]);
+  const chart = page.locator('[data-rich-node-id="stacks"]');
+  const left = chart.getByRole('button', { name: /^Left · A/ });
+  const right = chart.getByRole('button', { name: /^Right · A/ });
+  const leftBounds = await left.boundingBox(), rightBounds = await right.boundingBox();
+  expect(leftBounds).not.toBeNull();
+  expect(rightBounds).not.toBeNull();
+  expect(leftBounds!.x + leftBounds!.width).toBeLessThan(rightBounds!.x);
+  await left.click();
+  await right.click();
+  const missing = page.locator('[data-rich-node-id="missing"]');
+  await missing.locator('summary').click();
+  await missing.getByRole('button', { name: '次へ' }).click();
+  await expect(missing.getByText(/Missing 101.*Updated report.*2026-11-25.*2026-11-26/)).toBeVisible();
+  const editor = page.locator('[data-rich-node-id="draft"]').getByRole('textbox', { name: 'ソース' });
+  await expect(editor).toContainText('const a = 1;');
+  await editor.fill('const b = 2;');
+  await expect(page.locator('[data-rich-node-id="echo"]')).toHaveText('const b = 2;');
 });

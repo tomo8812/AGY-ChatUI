@@ -616,6 +616,30 @@ export class CsvAdapter implements FormatAdapter {
     throw unsupportedOperationError(`export:${fmt}`, 'unsupported_by_format', `CSV export to '${fmt}' is unsupported.`);
   }
 
+  targetContextHash(buffer: Buffer, selector: TargetSelector, meta: AdapterFileMeta): string | null {
+    const rows = parseCsvRows(buffer.toString('utf8'), detectDelimiter(meta.filename));
+    const columnOnly = selector.kind === 'csv_row_col' && selector.axis === 'col';
+    const rowOnly = selector.kind === 'csv_row_col' && selector.axis === 'row';
+    const startRow = Number(selector.kind === 'csv_range' ? selector.startRow : selector.start);
+    const endRow = Number(selector.kind === 'csv_range' ? selector.endRow : selector.end);
+    if (!columnOnly) {
+      const selectedCounts = new Map(rows.slice(startRow, endRow + 1).map(row => [JSON.stringify(row), 0]));
+      for (const row of rows) {
+        const key = JSON.stringify(row);
+        const count = selectedCounts.get(key);
+        if (count === undefined) continue;
+        if (count > 0) return null;
+        selectedCounts.set(key, count + 1);
+      }
+    }
+    if (columnOnly) return sha256Text(JSON.stringify(rows));
+    if (rowOnly) return sha256Text(JSON.stringify(rows.slice(startRow, endRow + 1)));
+    const startCol = Number(selector.startCol);
+    const endCol = Number(selector.endCol);
+    return sha256Text(JSON.stringify(rows.map((row, index) =>
+      index >= startRow && index <= endRow ? row : row.slice(startCol, endCol + 1))));
+  }
+
   resolveTarget(buffer: Buffer, selector: TargetSelector, meta: AdapterFileMeta): TargetResolutionResult {
     const delimiter = detectDelimiter(meta.filename);
     const rows = parseCsvRows(buffer.toString('utf8'), delimiter);

@@ -151,6 +151,7 @@ export interface SourceEditorHandle {
   selectLines:(start:number,end:number)=>void;
   findNext:(query:string)=>boolean;
   getSelection:()=>{startLine:number;endLine:number};
+  getCharacterSelection:()=>{startLine:number;startCol:number;endLine:number;endCol:number}|null;
   wrapSelection:(before:string,after:string)=>void;
 }
 interface Props {onSelectionChange?:()=>void;value:string;readOnly:boolean;language:string;onChange:(value:string)=>void;editorRef:React.RefObject<SourceEditorHandle|null>}
@@ -198,6 +199,12 @@ export function SourceEditor({onSelectionChange,value,readOnly,language,onChange
       getSelection:()=>{
         const {from,to}=instance.state.selection.main;
         return {startLine:instance.state.doc.lineAt(from).number,endLine:instance.state.doc.lineAt(Math.max(from,to-1)).number};
+      },
+      getCharacterSelection:()=>{
+        const {from,to}=instance.state.selection.main;
+        if(from===to)return null;
+        const first=instance.state.doc.lineAt(from),last=instance.state.doc.lineAt(to);
+        return {startLine:first.number,startCol:from-first.from+1,endLine:last.number,endCol:to-last.from+1};
       },
       wrapSelection:(before,after)=>{
         if(instance.state.readOnly)return;

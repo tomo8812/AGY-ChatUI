@@ -1,3 +1,4 @@
+import { MAX_INSPECTION_INPUT_BYTES } from '../target-inspection-limits.js';
 import { pointRegionPt } from '../region-png.js';
 import { selectorHasDirectUi, selectorKindIsAvailable, selectorsForFormat } from '../target-selector-schema.js';
 import { describeImageRegion, readImageDimensions } from './image-target.js';
@@ -602,7 +603,7 @@ class DocumentFormatAdapter implements FormatAdapter {
           }
           return {
             status: 'resolved',
-            resolvedRange: { sheetId: target.sheetId, sheetName: target.sheetName, axis: target.axis, start: target.start, end: target.end },
+            resolvedRange: { sheetId: target.sheetId, sheetName: target.sheetName, axis: target.axis, start: target.start, end: target.end, targetContextHash: target.targetContextHash },
             resolvedSnippet: target.snippet,
           };
         } catch {
@@ -646,7 +647,7 @@ class DocumentFormatAdapter implements FormatAdapter {
         }
         return {
           status: 'resolved',
-          resolvedRange: { sheetId: target.sheetId, sheetName: target.sheetName, rangeA1: target.rangeA1 },
+          resolvedRange: { sheetId: target.sheetId, sheetName: target.sheetName, rangeA1: target.rangeA1, targetContextHash: target.targetContextHash },
           resolvedSnippet: target.snippet,
         };
       } catch {
@@ -836,12 +837,16 @@ export class FormatAdapterRegistry {
       (!adapter.requiresExternalWorker || (params.runtimeProfile !== 'base_chatui' && params.sandboxIsolation !== 'sandbox_required_blocked'));
     const selectors = adapter.targetPinSupported ? selectorsForFormat(adapter.format, params.filename, params.previewKind) : [];
     const supported = selectors.filter(selectorKindIsAvailable);
-    const selectorOperations = selectors.map((kind): OperationCapability => ({
+    const selectorOperations = supported.map((kind): OperationCapability => ({
       operation: 'target_pin:' + kind,
-      availability: selectorKindIsAvailable(kind) ? 'supported' : 'unsupported_by_format',
+      availability: 'supported',
       scope: selectorHasDirectUi(kind) ? 'mcp_and_ui' : 'mcp_only',
-      notes: selectorKindIsAvailable(kind) ? undefined : 'この対象指定は現在の実装範囲外です。',
     }));
+    const deferredSelectors = selectors.filter(kind => !selectorKindIsAvailable(kind));
+    const targetNotes = [
+      `対象解析の入力上限: ${MAX_INSPECTION_INPUT_BYTES / 1024 ** 2} MiB。メモリ不足時は一時的に利用できません。`,
+      ...(deferredSelectors.length ? ['PR3B: ' + deferredSelectors.join(', ')] : []),
+    ].join(' ');
     const operations = adapter.getOperations({
       runtimeProfile: params.runtimeProfile,
       filename: params.filename,
@@ -855,6 +860,7 @@ export class FormatAdapterRegistry {
         operation: 'target_pin',
         availability: !supported.length ? 'unsupported_by_format' : supported.length < selectors.length ? 'partial' : 'supported',
         scope: supported.some(selectorHasDirectUi) ? 'mcp_and_ui' : 'mcp_only',
+        notes: targetNotes,
       }, ...selectorOperations);
     }
     return {

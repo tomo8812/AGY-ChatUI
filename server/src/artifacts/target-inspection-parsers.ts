@@ -1,11 +1,12 @@
-import { parentPort, workerData } from 'node:worker_threads';
 import { inspectMediaMetadata, inspectVideoTarget } from './adapters/media-target.js';
 import { inspectPdfText } from './adapters/pdf-text-inspection.js';
 import fs from 'node:fs';
 import { MAX_INSPECTION_INPUT_BYTES, MAX_INSPECTION_OUTPUT_BYTES } from './target-inspection-limits.js';
 import type { PreviewKind } from '../types.js';
 import { fingerprintsMatch, openContainedRegularFileNoFollow, readContainedRegularFileNoFollowStable } from '../files/workspace.js';
-import { createLineMatcher, sha256Buffer, sha256Text, splitLines } from './adapters/base.js';
+import { createLineMatcher, createSourceCharMatcher, sourceCharSlice, sourceRangeContext, sha256Buffer, sha256Text, splitLines } from './adapters/base.js';
+import { xlsxGridTargetIsUnique } from './adapters/ooxml-target.js';
+import { CsvAdapter } from './adapters/csv-adapter.js';
 import { FormatAdapterRegistry } from './adapters/registry.js';
 import { ArtifactError } from './errors.js';
 import type { TargetSelector } from './types.js';
@@ -21,6 +22,7 @@ interface FileMeta {
   relPath: string;
   mimeType: string;
   previewKind: PreviewKind;
+  sizeBytes?: number;
 }
 
 export type InspectionJob = { file: FileMeta; maxBytes?: number } & (
@@ -61,15 +63,30 @@ function describeSourceTarget(bytes: Buffer, range: Record<string, unknown>) {
   const lines = splitLines(bytes.toString('utf8'));
   if (endLine > lines.length) throw new ArtifactError('INVALID_INPUT', '選択範囲が存在しません。', 400);
   const selected = lines.slice(startLine - 1, endLine);
+  const { startCol, endCol } = range;
+  const hasColumns = startCol !== undefined || endCol !== undefined;
+  if (hasColumns) {
+    if (typeof startCol !== 'number' || !Number.isSafeInteger(startCol) || startCol < 1 ||
+        typeof endCol !== 'number' || !Number.isSafeInteger(endCol) || endCol < 1 ||
+        (startLine === endLine && startCol >= endCol)) {
+      throw new ArtifactError('INVALID_INPUT', '選択範囲が存在しません。', 400);
+    }
+    const first = sourceCharSlice(selected[0], startCol - 1, selected.length === 1 ? endCol - 1 : undefined);
+    const last = selected.length === 1 ? first : sourceCharSlice(selected.at(-1)!, 0, endCol - 1);
+    if (first === undefined || last === undefined) throw new ArtifactError('INVALID_INPUT', '選択範囲が存在しません。', 400);
+    selected[0] = first;
+    selected[selected.length - 1] = last;
+  }
   const text = selected.join('\n');
-  const before = lines.slice(Math.max(0, startLine - 3), startLine - 1).join('\n');
-  const after = lines.slice(endLine, endLine + 2).join('\n');
+  const { before, after } = sourceRangeContext(lines, startLine - 1, selected.length,
+    typeof startCol === 'number' ? startCol : undefined, typeof endCol === 'number' ? endCol : undefined);
   const matches = createLineMatcher(selected);
+  const matchChars = hasColumns ? createSourceCharMatcher(selected, Number(startCol) - 1, Number(endCol) - 1) : null;
   let occurrenceIndex = 0;
   let duplicateCount = 0;
-  for (let i = 0; i < lines.length; i++) {
-    if (!matches(lines[i])) continue;
-    if (i + 1 === endLine) occurrenceIndex = duplicateCount;
+  for (let i = 0; i < (matchChars ? lines.length - selected.length + 1 : lines.length); i++) {
+    if (!(matchChars ? matchChars(lines, i) : matches(lines[i]))) continue;
+    if (matchChars ? i + 1 === startLine : i + 1 === endLine) occurrenceIndex = duplicateCount;
     duplicateCount++;
   }
   // Excerpts share the existing source range response budget. All selected
@@ -125,12 +142,12 @@ async function inspect(job: InspectionJob) {
   if (source.sha256 !== job.expectedSha256) return { status: 'needs_review', reason: 'revision_content_changed' };
   let snippetHint = job.snippetHint;
   const { startLine, endLine, kind } = job.selector;
-  if (job.baseSnapshot && (snippetHint === undefined || sha256Text(snippetHint) !== job.selector.expectedSnippetHash) && (kind === 'code_line_range' || kind === 'md_text_range') &&
+  if (job.baseSnapshot && (snippetHint === undefined || sha256Text(snippetHint) !== job.selector.expectedSnippetHash) && (kind === 'code_line_range' || kind === 'code_char_range' || kind === 'md_text_range') &&
       typeof startLine === 'number' && typeof endLine === 'number' &&
       Number.isSafeInteger(startLine) && Number.isSafeInteger(endLine) && startLine > 0 && endLine >= startLine) {
     try {
       const base = readSnapshot(job.baseSnapshot, maxBytes);
-      snippetHint = splitLines(base.toString('utf8')).slice(startLine - 1, endLine).join('\n');
+      snippetHint = describeSourceTarget(base, job.selector).text;
     } catch {
       // The resolver can still use an independently hash-verified snapshot or current match.
     }
@@ -144,24 +161,49 @@ async function inspect(job: InspectionJob) {
   const media = adapter.format === 'media' && !video
     ? await inspectMediaMetadata(source.buffer, job.file.filename, job.file.mimeType) : video;
   let selector = job.selector;
-  if (selector.kind === 'csv_row_col' && selector.expectedHeaderHash === undefined) {
-    if (!job.baseSnapshot) return { status: 'needs_review', reason: 'base_revision_content_unavailable' };
+  const isGridTarget = ['csv_range', 'csv_row_col', 'xlsx_range', 'xlsx_row_col'].includes(selector.kind);
+  let baseGrid: Buffer | undefined;
+  if (isGridTarget && job.baseSnapshot) {
     try {
-      const base = job.baseSnapshot.sha256 === source.sha256 ? source.buffer : readSnapshot(job.baseSnapshot, maxBytes);
-      const { headerHash } = adapter.getStructure(base, job.file);
-      if (typeof headerHash !== 'string') return { status: 'needs_review', reason: 'base_revision_target_unverified' };
-      selector = { ...selector, expectedHeaderHash: headerHash };
-      if (adapter.resolveTarget(base, selector, job.file).status !== 'resolved') {
-        return { status: 'needs_review', reason: 'base_revision_target_unverified' };
-      }
+      baseGrid = job.baseSnapshot.sha256 === source.sha256 ? source.buffer : readSnapshot(job.baseSnapshot, maxBytes);
     } catch {
       return { status: 'needs_review', reason: 'base_revision_content_unavailable' };
     }
+  }
+  if (selector.kind === 'csv_row_col' && selector.expectedHeaderHash === undefined) {
+    if (!baseGrid) return { status: 'needs_review', reason: 'base_revision_content_unavailable' };
+    const { headerHash } = adapter.getStructure(baseGrid, job.file);
+    if (typeof headerHash !== 'string') return { status: 'needs_review', reason: 'base_revision_target_unverified' };
+    selector = { ...selector, expectedHeaderHash: headerHash };
   }
   const result = adapter.resolveTarget(source.buffer, selector, {
     ...job.file, snippetHint, pdfTextLayout, mediaDurationSeconds: media?.durationSeconds, videoFrame: video?.frame,
   });
   if (result.status === 'resolved') {
+    if (baseGrid && baseGrid !== source.buffer) {
+      const original = adapter.resolveTarget(baseGrid, selector, job.file);
+      if (original.status !== 'resolved') return { status: 'needs_review', reason: 'base_revision_target_unverified' };
+      const archivedContext = adapter instanceof CsvAdapter
+        ? adapter.targetContextHash(baseGrid, selector, job.file) : original.resolvedRange?.targetContextHash;
+      const currentContext = adapter instanceof CsvAdapter
+        ? adapter.targetContextHash(source.buffer, selector, job.file) : result.resolvedRange?.targetContextHash;
+      const sameContext = typeof archivedContext === 'string' && archivedContext === currentContext;
+      if (!sameContext) return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+      if (selector.kind === 'xlsx_range' || selector.kind === 'xlsx_row_col') {
+        const grid = {
+          sheetId: String(selector.sheetId),
+          ...(selector.kind === 'xlsx_range' ? { rangeA1: String(selector.rangeA1) } :
+            { axis: selector.axis === 'row' ? 'row' as const : 'col' as const, start: Number(selector.start), end: Number(selector.end) }),
+        };
+        try {
+          if (!xlsxGridTargetIsUnique(baseGrid, grid) || !xlsxGridTargetIsUnique(source.buffer, grid)) {
+            return { status: 'needs_review', reason: 'ambiguous_multiple_matches' };
+          }
+        } catch {
+          return { status: 'needs_review', reason: 'target_context_could_not_be_verified' };
+        }
+      }
+    }
     try {
       const latest = openContainedRegularFileNoFollow(job.rootDir, job.file.relPath);
       try {
@@ -185,10 +227,10 @@ async function inspect(job: InspectionJob) {
 export type InspectionResponse = { result: unknown } |
   { error: { code: string; message: string; statusCode: number; details?: Record<string, unknown> } };
 
-if (parentPort) {
+if (process.send) process.once('message', async (job: InspectionJob) => {
   let response: InspectionResponse;
   try {
-    const result = await inspect(workerData as InspectionJob);
+    const result = await inspect(job);
     if (Buffer.byteLength(JSON.stringify(result)) > MAX_INSPECTION_OUTPUT_BYTES) {
       throw new ArtifactError('TARGET_INSPECTION_OUTPUT_LIMIT', '対象の解析結果が上限を超えました。', 413);
     }
@@ -198,6 +240,5 @@ if (parentPort) {
       ? { code: error.code, message: error.message, statusCode: error.statusCode, details: error.details }
       : { code: 'TARGET_INSPECTION_FAILED', message: '対象の構造を読み取れません。', statusCode: 422 } };
   }
-  parentPort.postMessage(response);
-  parentPort.close();
-}
+  process.send!(response, () => process.disconnect());
+});

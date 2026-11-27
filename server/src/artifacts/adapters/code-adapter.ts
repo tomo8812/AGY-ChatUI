@@ -195,7 +195,8 @@ export class CodeAdapter implements FormatAdapter {
         occurrenceIndex: selector.occurrenceIndex,
         snippetHint: _meta.snippetHint,
         requireOccurrenceIndex: true,
-        ...(charRange ? { startCol: startCol as number, endCol: endCol as number } : {}),
+        ...(charRange ? { startCol: startCol as number, endCol: endCol as number,
+          allowLegacyCharContext: selector.contextVersion !== 2 } : {}),
       });
     }
 

@@ -4701,7 +4701,10 @@ export class ArtifactService {
         if (range.targetHashes === true || range.targetHashes === 'true') {
           const data = await inspectArtifactTarget<Record<string, unknown>>({
             file: artifact,
-            range: { sourceTarget: true, startLine: Number(range.startLine), endLine: Number(range.endLine) },
+            range: { sourceTarget: true, startLine: Number(range.startLine), endLine: Number(range.endLine),
+              ...(format === 'code' && (range.startCol !== undefined || range.endCol !== undefined)
+                ? { startCol: Number(range.startCol), endCol: Number(range.endCol) } : {}),
+            },
             snapshot: { path: blobPath, sha256: revision.sha256, sizeBytes },
           });
           return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
@@ -5295,13 +5298,15 @@ export class ArtifactService {
     let baseSnapshot;
     let releasePin;
     const needsCsvBase = selector.kind === 'csv_row_col' && selector.expectedHeaderHash === undefined;
-    if (selector.kind === 'code_line_range' || selector.kind === 'md_text_range' || needsCsvBase) {
+    const needsGridBase = baseRevision !== artifact.revision &&
+      ['csv_range', 'csv_row_col', 'xlsx_range', 'xlsx_row_col'].includes(selector.kind);
+    if (selector.kind === 'code_line_range' || selector.kind === 'code_char_range' || selector.kind === 'md_text_range' || needsCsvBase || needsGridBase) {
       try {
         const base = this.getRevisionContentBlob(userId, artifactId, baseRevision);
         releasePin = this.blobManager.pinBlob(userId, base.revision.sha256);
         baseSnapshot = { path: base.blobPath, sizeBytes: base.sizeBytes, sha256: base.revision.sha256 };
       } catch {
-        if (needsCsvBase) return { status: 'needs_review', reason: 'base_revision_content_unavailable' };
+        if (needsCsvBase || needsGridBase) return { status: 'needs_review', reason: 'base_revision_content_unavailable' };
         // A legacy source request can still resolve from a hash-verified snippet and context.
       }
     }
@@ -5415,12 +5420,14 @@ export class ArtifactService {
       .prepare('SELECT rel_path, sha256 FROM artifact_revision_deps WHERE artifact_id = ? AND revision = ?')
       .all(artifact.id, artifact.revision) as Array<{ rel_path: string; sha256: string | null }>;
     const curMap = new Map(currentDeps.map((d) => [d.rel_path, d.sha256]));
-    const dependencyDiff = targetDeps
-      .filter((td) => curMap.get(td.rel_path) !== td.sha256)
-      .map((td) => ({
-        relPath: td.rel_path,
-        targetSha256: td.sha256,
-        currentSha256: curMap.get(td.rel_path) ?? null,
+    const targetMap = new Map(targetDeps.map((d) => [d.rel_path, d.sha256]));
+    const dependencyPaths = new Set([...targetMap.keys(), ...curMap.keys()]);
+    const dependencyDiff = [...dependencyPaths].sort()
+      .filter((relPath) => targetMap.get(relPath) !== curMap.get(relPath))
+      .map((relPath) => ({
+        relPath,
+        targetSha256: targetMap.get(relPath) ?? null,
+        currentSha256: curMap.get(relPath) ?? null,
       }));
 
     const res = await this.replaceArtifactBytes({

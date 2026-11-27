@@ -61,6 +61,8 @@ export interface AgentEditRequestPayload {
   untrustedTargetContent: {
     selectedContentSnapshot: string;
     surroundingContext: string | null;
+    viewStateSnapshot: Record<string, unknown> | null;
+    currentTarget: { selectedContent: string | null; surroundingContext: string | null };
   };
   selector: TargetSelector;
   range: Record<string, unknown> | null;
@@ -182,7 +184,7 @@ export class EditRequestService {
       if (typeof expectedHeaderHash !== 'string') throw targetConflict();
       selector = { ...selector, expectedHeaderHash };
     }
-    if (['rich_repeat_item', 'rich_chart_series', 'rich_table_cell'].includes(selector.kind)) {
+    if (['rich_node', 'rich_svg_element', 'rich_repeat_item', 'rich_chart_series', 'rich_table_cell'].includes(selector.kind)) {
       const expectedDisplayFingerprint = result.resolvedRange?.displayFingerprint;
       if (typeof expectedDisplayFingerprint !== 'string') throw targetConflict();
       selector = { ...selector, expectedDisplayFingerprint };
@@ -689,6 +691,7 @@ export class EditRequestService {
       if (png && !this.artifactService.matchesCurrentArtifactFile(userId, req.artifactId, revision)) throw targetConflict();
       if (png) regionImagePngBase64 = png.toString('base64');
     }
+    const { resolvedSnippet, surroundingContext, ...resolution } = reResolution;
     return {
       id: req.id,
       targetKind: req.targetKind,
@@ -700,13 +703,18 @@ export class EditRequestService {
       status,
       userInstruction: req.instruction,
       untrustedTargetContent: {
-        selectedContentSnapshot: reResolution.resolvedSnippet?.slice(0, 50_000) ?? req.selectedContentSnapshot,
-        surroundingContext: reResolution.surroundingContext?.slice(0, 20_000) ?? req.surroundingContext,
+        selectedContentSnapshot: req.selectedContentSnapshot,
+        surroundingContext: req.surroundingContext,
+        viewStateSnapshot: req.viewStateSnapshot,
+        currentTarget: {
+          selectedContent: resolvedSnippet?.slice(0, 50_000) ?? null,
+          surroundingContext: surroundingContext?.slice(0, 20_000) ?? null,
+        },
       },
       selector: req.selector,
       range: reResolution.resolvedRange ?? null,
       contentCoords: reResolution.resolvedCoords ?? null,
-      reResolution,
+      reResolution: resolution,
       ...(regionImagePngBase64 ? { regionImagePngBase64 } : {}),
     };
   }
