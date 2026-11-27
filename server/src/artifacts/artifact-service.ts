@@ -1,3 +1,4 @@
+import { validateRegionPng } from './region-png.js';
 import { selectorMatchesFormat, targetSelectorSchema } from './target-selector-schema.js';
 import { inspectArtifactTarget } from './target-inspection.js';
 import crypto from 'node:crypto';
@@ -3815,6 +3816,8 @@ export class ArtifactService {
     artifactId: string;
     expectedRevision: number;
     operations: AdapterOperation[];
+    editRequestIds?: string[];
+    assertEditRequestsCurrent?: () => void;
     actorKind: ActorKind;
     actorId?: string | null;
     idempotencyKey?: string;
@@ -3841,7 +3844,7 @@ export class ArtifactService {
       actorKind: params.actorKind,
       actorId: params.actorId ?? null,
       operationType: params.operations.length > 1 ? 'batch_edit' : 'edit',
-      target: { artifactId: params.artifactId },
+      target: { artifactId: params.artifactId, ...(params.editRequestIds?.length && { editRequestIds: [...params.editRequestIds].sort() }) },
       operations: params.operations,
       baseRevision: params.expectedRevision,
     });
@@ -3891,6 +3894,7 @@ export class ArtifactService {
             );
           }
 
+          params.assertEditRequestsCurrent?.();
           if (isDocumentFormat(adapter.format)) {
             const supported = DOCUMENT_ACTIONS[adapter.format];
             const unsupported = params.operations.find(({ op }) => !supported.includes(op) || !op.includes('.') || op.endsWith('.get_structure'));
@@ -3935,11 +3939,15 @@ export class ArtifactService {
             operationPayload: {
               semanticScope: editResult.semanticScope ?? null,
               operations: params.operations,
+              editRequestIds: params.editRequestIds,
             },
             idempotencyScopeKey: params.idempotencyKey ? scopeKey : null,
             idempotencyKey: params.idempotencyKey ?? null,
             requestFingerprint: fingerprint,
-            assertAuthorizedBeforeCommit: reverifyAuth,
+            assertAuthorizedBeforeCommit: async () => {
+              await reverifyAuth();
+              params.assertEditRequestsCurrent?.();
+            },
           });
 
           return {
@@ -4068,13 +4076,21 @@ export class ArtifactService {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
     const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
+    if (adapter.format === 'media' && !this.documentWorker.available) return this.readRange(userId, artifactId, { targetMetadata: true });
     const maxBytes = isDocumentFormat(adapter.format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
     const { bytes: buf, revision } = this.readCurrentRevision(userId, artifactId, maxBytes);
     const format = adapter.format;
-    const structure = this.documentWorker.available && isDocumentFormat(format) &&
+    const structure: Record<string, unknown> = this.documentWorker.available && isDocumentFormat(format) &&
       !documentFormatConstraint(format, artifact.filename, 'input')
       ? JSON.parse((await this.documentWorker.run(format, artifact.filename, buf, { action: 'structure' })).toString('utf8'))
       : adapter.getStructure(buf, artifact);
+    if (format === 'media') {
+      const target = await this.readRange(userId, artifactId, { targetMetadata: true });
+      if (target.revision !== revision.revision) {
+        throw new ArtifactError('ARTIFACT_CONFLICT', 'File revision changed during media inspection.', 409);
+      }
+      structure.durationSeconds = target.durationSeconds;
+    }
     return {
       ...structure,
       artifactId: artifact.id,
@@ -4331,9 +4347,12 @@ export class ArtifactService {
     let matchLength=0, fieldMatched=false;
     let firstMatch:{row:number;col:number}|null=null, nextMatch:{row:number;col:number}|null=null;
     const targetHashes = range.targetHashes === true || range.targetHashes === 'true';
-    let headerRow: string[] | null = null;
+    const hashOnly = range.hashOnly === true && targetHashes && !filter && !fullCell && !searchQuery && !dimensionsOnly;
+    const valuesDigest = crypto.createHash('sha256').update('[');
+    const headerDigest = crypto.createHash('sha256').update('[');
+    let hashedRows = 0, hashedFields = 0;
     const collectHeader = () => targetHashes && rowIndex === 0 && !filter;
-    let currentHeaderRow: string[] = [];
+    let headerField = '';
     const collectRow = () => !fullCell && !dimensionsOnly && !searchQuery && visibleRow() >= startRow && visibleRow() <= targetEndRow;
     const collectField = () => collectRow() && fieldCount >= startCol && fieldCount <= requestedEndCol;
     const isRequestedCell = () => fullCell && rowIndex === startRow && fieldCount === startCol;
@@ -4350,15 +4369,16 @@ export class ArtifactService {
         field += ch;
         return;
       }
-      if ((collectField() || collectHeader()) && !rowTruncated) {
+      if (collectHeader()) headerField += ch;
+      if (hashOnly) {
+        if (collectField()) field += ch;
+        return;
+      }
+      if (collectField() && !rowTruncated) {
         const cp=ch.codePointAt(0)!;
         const bytes=cp===34||cp===92||[8,9,10,12,13].includes(cp)?2:cp<32?6:cp<128?1:cp<2048?2:cp<65536?3:4;
-        if (collectField()) {
-          if(fitsField(fieldBytes+bytes)){field+=ch;fieldBytes+=bytes;}
-          else {rowTruncated=true;field='';}
-        } else if (collectHeader() && field.length < 65536) {
-          field += ch;
-        }
+        if (fitsField(fieldBytes+bytes)) {field+=ch;fieldBytes+=bytes;}
+        else {rowTruncated=true;field='';}
       }
     }
     function commitField() {
@@ -4377,9 +4397,14 @@ export class ArtifactService {
       }
       matchLength=0;fieldMatched=false;
       if (collectHeader()) {
-        currentHeaderRow.push(field);
+        headerDigest.update(fieldCount ? ',' : '').update(JSON.stringify(headerField));
+        headerField = '';
       }
-      if (collectField()&&!rowTruncated) {
+      if (hashOnly) {
+        if (fieldCount === 0 && collectRow()) valuesDigest.update(hashedRows ? ',[' : '[');
+        if (collectField()) valuesDigest.update(hashedFields++ ? ',' : '').update(JSON.stringify(field));
+      }
+      if (!hashOnly && collectField()&&!rowTruncated) {
         if(fitsField(fieldBytes)){rowBytes+=(currentRow.length?1:0)+2+fieldBytes;currentRow.push(field);}
         else rowTruncated=true;
       }
@@ -4389,11 +4414,11 @@ export class ArtifactService {
     function commitRow(): boolean {
       commitField();
       observedMaxCols = Math.max(observedMaxCols, fieldCount);
-      if (collectHeader() && headerRow === null) {
-        headerRow = currentHeaderRow;
-        currentHeaderRow = [];
-      }
-      if (collectRow() && (!filter || rowMatches)) {
+      if (hashOnly && collectRow()) {
+        valuesDigest.update(']');
+        hashedRows++;
+        hashedFields = 0;
+      } else if (collectRow() && (!filter || rowMatches)) {
         if (rowTruncated) {truncated = true; stoppedEarly = true; truncatedSourceRow = rowIndex;}
         else {
           collectedBytes += rowBytes+(rows.length?1:0);
@@ -4448,6 +4473,10 @@ export class ArtifactService {
       if (!stoppedEarly && pendingCr) { pendingCr = false; feed('\r'); }
       if (!stoppedEarly && (fieldHasValue || fieldCount > 0)) commitRow();
     }
+    if (hashOnly) return {
+      totalRows: rowIndex, totalCols: observedMaxCols,
+      headerHash: headerDigest.update(']').digest('hex'), valuesHash: valuesDigest.update(']').digest('hex'),
+    };
     if (fullCell) return { cellText };
     if (searchQuery) return {match:nextMatch??firstMatch,totalBytes};
     if (dimensionsOnly) return { totalRows: visibleRow(), totalCols: observedMaxCols, totalBytes };
@@ -4459,7 +4488,7 @@ export class ArtifactService {
       ...(!stoppedEarly ? { totalRows: visibleRow() } : {}),
       totalCols: observedMaxCols, totalBytes, hasMore: stoppedEarly, truncated, rows,
       ...(filter ? { sourceRows, truncatedSourceRow } : {}),
-      ...(targetHashes ? { headerHash: crypto.createHash('sha256').update(JSON.stringify(headerRow ?? [])).digest('hex') } : {}),
+      ...(targetHashes ? { headerHash: headerDigest.update(']').digest('hex') } : {}),
       valuesHash: crypto.createHash('sha256').update(JSON.stringify(rows)).digest('hex'),
     };
   }
@@ -4475,12 +4504,21 @@ export class ArtifactService {
       if (
         (format === 'pptx' && isTargetMeta) ||
         (format === 'docx' && range.targetBlockIndex !== undefined) ||
-        (format === 'xlsx' && isTargetMeta && typeof range.rangeA1 === 'string') ||
+        (format === 'xlsx' && isTargetMeta) ||
+        (format === 'image' && isTargetMeta) ||
         (format === 'pdf' && isTargetMeta && range.pageIndex !== undefined)
       ) {
         const data = await inspectArtifactTarget<Record<string, unknown>>({
           file: artifact, range, maxBytes: DOCUMENT_WORKER_MAX_INPUT_BYTES,
           snapshot: { path: blobPath, sha256: revision.sha256, sizeBytes },
+        });
+        return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+      }
+
+      if (format === 'media' && isTargetMeta) {
+        const data = await inspectArtifactTarget<Record<string, unknown>>({
+          file: artifact, range: { mediaStructure: true, timestampSec: range.timestampSec },
+          maxBytes: DOCUMENT_WORKER_MAX_INPUT_BYTES, snapshot: { path: blobPath, sha256: revision.sha256, sizeBytes },
         });
         return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
       }
@@ -4503,6 +4541,23 @@ export class ArtifactService {
       }
 
       if (format === 'csv') {
+        const slice = range.axis === 'row' || range.axis === 'col';
+        if (isTargetMeta && slice) {
+          const start = Number(range.start), end = Number(range.end);
+          if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start) {
+            throw new ArtifactError('INVALID_INPUT', 'Invalid CSV row or column range.', 400);
+          }
+          const bounds = range.axis === 'row'
+            ? { startRow: start, endRow: end }
+            : { startCol: start, endCol: end, endRow: Number.MAX_SAFE_INTEGER };
+          const data = await this.streamCsvRangeFromBlob(blobPath, sizeBytes, artifact.filename, { ...bounds, targetHashes: true, hashOnly: true });
+          const limit = range.axis === 'row' ? Number(data.totalRows) : Number(data.totalCols);
+          const target = !data.truncated && end < limit ? {
+            axis: range.axis, start, end, expectedRowCount: data.totalRows, expectedColCount: data.totalCols,
+            expectedHeaderHash: data.headerHash, expectedRangeValuesHash: data.valuesHash,
+          } : null;
+          return { target, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+        }
         const data = await this.streamCsvRangeFromBlob(blobPath, sizeBytes, artifact.filename, range);
         return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
       }
@@ -4746,7 +4801,7 @@ export class ArtifactService {
   async renderPng(
     userId: string,
     artifactId: string,
-    options: { pageIndex?: number; timeSeconds?: number; variant?: 'background' | 'sprite'; shapeId?: number; cropSprite?: boolean; region?: { x: number; y: number; width: number; height: number; unit?: 'norm' | 'px' | 'pt' } } = {}
+    options: { pageIndex?: number; timeSeconds?: number; frameSample?: {timestampSec: number; sha256: string}; variant?: 'background' | 'sprite'; shapeId?: number; cropSprite?: boolean; region?: { x: number; y: number; width: number; height: number; unit?: 'norm' | 'px' | 'pt' } } = {}
   ): Promise<{ png: Buffer; revision: number; sha256: string }> {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', 'Artifact not found.', 404);
@@ -4988,44 +5043,63 @@ export class ArtifactService {
     return { artifact: created.artifact, exported };
   }
 
-  private async verifyImageTarget(artifact: ArtifactRecord, selector: TargetSelector): Promise<TargetResolutionResult> {
-    const { userId, id } = artifact;
+  matchesCurrentArtifactFile(userId: string, artifactId: string, revision: number): boolean {
+    const artifact = this.db.getArtifact(userId, artifactId);
+    if (!artifact || artifact.deletedOnDisk || artifact.revision !== revision) return false;
+    const root = this.resolveScopeRootDir(userId, artifact.scopeKind, artifact.chatId, artifact.projectId);
+    if (!root) return false;
     try {
-      const image = await this.renderPng(userId, id);
-      const width = image.png.readUInt32BE(16);
-      const height = image.png.readUInt32BE(20);
-      if (image.revision !== artifact.revision || image.sha256 !== artifact.sha256 || width !== selector.expectedWidthPx || height !== selector.expectedHeightPx) {
-        return { status: 'needs_review', reason: 'image_dimensions_changed' };
-      }
-      let region;
-      if (selector.kind === 'image_pin') {
-        region = { unit: 'px' as const, x: Math.min(width - 1, Math.floor(Number(selector.xNorm) * width)),
-          y: Math.min(height - 1, Math.floor(Number(selector.yNorm) * height)), width: 1, height: 1 };
-      } else if (selector.kind === 'image_rect') {
-        region = { unit: 'norm' as const, x: Number(selector.xNorm), y: Number(selector.yNorm),
-          width: Number(selector.wNorm), height: Number(selector.hNorm) };
-      } else {
-        const points = selector.pointsNorm as Array<[number, number]>;
-        let left = 1, top = 1, right = 0, bottom = 0;
-        for (const [x, y] of points) {
-          left = Math.min(left, x);
-          top = Math.min(top, y);
-          right = Math.max(right, x);
-          bottom = Math.max(bottom, y);
+      const before = openContainedRegularFileNoFollow(root, artifact.relPath);
+      try {
+        if (sha256Fd(before.fd).sha256 !== artifact.sha256) return false;
+        const after = openContainedRegularFileNoFollow(root, artifact.relPath);
+        try {
+          return fingerprintsMatch(before.fingerprint, after.fingerprint);
+        } finally {
+          fs.closeSync(after.fd);
         }
-        if (left === right || top === bottom) return { status: 'needs_review', reason: 'invalid_image_region' };
-        region = { unit: 'norm' as const, x: left, y: top, width: right - left, height: bottom - top };
+      } finally {
+        fs.closeSync(before.fd);
       }
-      const cropped = await this.renderPng(userId, id, { region });
-      if (cropped.revision !== artifact.revision || cropped.sha256 !== artifact.sha256 ||
-          crypto.createHash('sha256').update(cropped.png).digest('hex') !== selector.expectedRegionSha256) {
-        return { status: 'needs_review', reason: 'image_region_changed' };
-      }
-      return { status: 'resolved', resolvedCoords: { selector, region } };
-    } catch (error) {
-      if (error instanceof ArtifactError && error.code === 'RESOURCE_BUSY') throw error;
-      return { status: 'needs_review', reason: 'image_region_unavailable' };
+    } catch {
+      return false;
     }
+  }
+
+  async renderTargetRegion(
+    userId: string, artifactId: string, expectedRevision: number,
+    selector: TargetSelector, resolution: TargetResolutionResult,
+  ): Promise<Buffer | null> {
+    if (!this.documentWorker.available || resolution.status !== 'resolved' || !resolution.resolvedCoords) return null;
+    const coords = resolution.resolvedCoords;
+    type Options = Parameters<ArtifactService['renderPng']>[2];
+    let options: Options;
+    if (selector.kind === 'pptx_element' && Number.isSafeInteger(coords.shapeId) && Number(coords.shapeId) > 0) {
+      options = { pageIndex: Number(coords.pageIndex), shapeId: Number(coords.shapeId), variant: 'sprite', cropSprite: true };
+    } else if ((selector.kind === 'pdf_region' || selector.kind === 'pdf_pin') && Array.isArray(coords.rectPt)) {
+      const [x, y, width, height] = coords.rectPt as number[];
+      if (!width || !height) return null;
+      options = { pageIndex: Number(coords.pageIndex), region: { x, y, width, height, unit: 'pt' } };
+    } else if (selector.kind === 'pdf_text_range' && Array.isArray(coords.quadsPt)) {
+      const xs = (coords.quadsPt as number[][]).flatMap(quad => quad.filter((_, index) => index % 2 === 0));
+      const ys = (coords.quadsPt as number[][]).flatMap(quad => quad.filter((_, index) => index % 2 === 1));
+      const x = xs.reduce((left, value) => Math.min(left, value), Infinity);
+      const y = ys.reduce((top, value) => Math.min(top, value), Infinity);
+      const width = xs.reduce((right, value) => Math.max(right, value), x) - x;
+      const height = ys.reduce((bottom, value) => Math.max(bottom, value), y) - y;
+      if (!width || !height) return null;
+      options = { pageIndex: Number(coords.pageIndex), region: { x, y, width, height, unit: 'pt' } };
+    } else if (selector.kind.startsWith('image_') && coords.region) {
+      options = { region: coords.region as NonNullable<Options>['region'] };
+    } else if (selector.kind === 'video_frame_region' && coords.region) {
+      options = { region: coords.region as NonNullable<Options>['region'], frameSample: {
+        timestampSec: Number(coords.packetTimestampSec), sha256: String(coords.packetSha256),
+      } };
+    } else {
+      return null;
+    }
+    const result = await this.renderPng(userId, artifactId, options);
+    return result.revision === expectedRevision && validateRegionPng(result.png) ? result.png : null;
   }
 
   async resolveTargetOnArtifact(
@@ -5069,23 +5143,9 @@ export class ArtifactService {
       }
     }
     try {
-      let resolution = await inspectArtifactTarget<TargetResolutionResult>({
+      const resolution = await inspectArtifactTarget<TargetResolutionResult>({
         file: artifact, rootDir, selector, expectedSha256: artifact.sha256, maxBytes, snippetHint, baseSnapshot,
       });
-      if (resolution.reason === 'image_region_unconfirmed' && adapter.format === 'image') {
-        resolution = await this.verifyImageTarget(artifact, selector);
-      }
-      if (resolution.reason === 'media_duration_unconfirmed' && adapter.format === 'media') {
-        try {
-          const structure = await this.getStructure(userId, artifactId);
-          if (structure.revision === artifact.revision && structure.sha256 === artifact.sha256 &&
-              structure.durationSeconds === selector.expectedDurationSec) {
-            resolution = { status: 'resolved', resolvedCoords: { startSec: selector.startSec, endSec: selector.endSec } };
-          }
-        } catch (error) {
-          if (error instanceof ArtifactError && error.code === 'RESOURCE_BUSY') throw error;
-        }
-      }
       const latest = this.db.getArtifact(userId, artifactId);
       if (!latest) return { status: 'stale', reason: 'artifact_file_missing' };
       if (latest.revision !== artifact.revision) return { status: 'needs_review', reason: 'revision_changed_during_resolution' };

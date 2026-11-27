@@ -804,7 +804,7 @@ for(const vp of targets){
   });
 }
 
-test('Base ChatUI opens DOCX and XLSX and creates targets without the document runtime',async({page},info)=>{
+test('Base ChatUI opens DOCX, XLSX and PDF and creates targets without the document runtime',async({page},info)=>{
   test.skip(info.project.name!=='pc-chromium'||!fixtureDir);
   const server=await createTestServer({installDocRuntime:'off',sandboxMode:'off',allowUnsandboxedDocWorkers:false});
   try{
@@ -820,7 +820,7 @@ test('Base ChatUI opens DOCX and XLSX and creates targets without the document r
       }})});
     });
     const artifacts:Record<string,ArtifactRecord>={};
-    for(const kind of ['docx','xlsx']){
+    for(const kind of ['docx','xlsx','pdf']){
       const filename='sample.'+kind;
       artifacts[kind]=(await server.ctx.artifactService.createArtifact({
         userId,scopeKind:'chat',chatId,relPath:filename,content:fs.readFileSync(path.join(fixtureDir!,filename)),actorKind:'user',actorId:userId,
@@ -830,12 +830,12 @@ test('Base ChatUI opens DOCX and XLSX and creates targets without the document r
       const kind=new URLSearchParams(location.search).get('kind')??'';
       (window as Window&{__pr3aFixtureArtifact?:unknown}).__pr3aFixtureArtifact=artifacts[kind];
     },artifacts);
-    for(const kind of ['docx','xlsx']){
+    for(const kind of ['docx','xlsx','pdf']){
       await page.goto(base+'?kind='+kind);
       await expect(page.getByRole('dialog',{name:'sample.'+kind})).toBeVisible();
       await expect(page.getByRole('button',{name:'編集',exact:true})).toHaveCount(0);
       if(kind==='docx')await expect(page.locator('.docx-preview')).toContainText('Keep table');
-      else {
+      if(kind==='xlsx'){
         await expect(page.getByRole('gridcell',{name:'A1',exact:true})).toHaveText('7');
         await expect(page.getByRole('gridcell',{name:'B1',exact:true})).toHaveText('未評価');
       }
@@ -843,9 +843,18 @@ test('Base ChatUI opens DOCX and XLSX and creates targets without the document r
       if(kind==='docx'){
         await page.getByText('Introduction',{exact:true}).click();
         await page.getByRole('button',{name:'選択段落を対象にする'}).click();
-      }else{
+      }else if(kind==='xlsx'){
         await page.getByRole('gridcell',{name:'A1',exact:true}).click();
         await page.getByRole('button',{name:'セルを対象にする'}).click();
+      }else{
+        await page.getByRole('button',{name:'ナビゲーション',exact:true}).click();
+        await page.getByRole('button',{name:'本文',exact:true}).click();
+        const textBox=page.getByRole('textbox',{name:'ページ本文'});
+        await expect(textBox).toHaveValue('First page');
+        await textBox.evaluate((el:HTMLTextAreaElement)=>el.setSelectionRange(0,5));
+        await page.getByRole('button',{name:'選択本文を対象にする'}).click();
+        await expect(page.locator('.workspace-selection')).toContainText('選択本文');
+        await page.locator('.pdf-navigation-panel').getByRole('button',{name:'閉じる',exact:true}).click();
       }
       await page.getByRole('textbox',{name:'変更内容'}).fill('Review the selection');
       await page.getByRole('button',{name:'依頼を追加'}).click();

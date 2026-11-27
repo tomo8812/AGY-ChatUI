@@ -6,7 +6,9 @@ import {
   evaluateRichDynamicState,
   evaluateRichExpr,
   RichExprError,
-  RICH_LIMITS,
+  assertRichStateLimit,
+  cloneRichStateValue,
+  mergeRichState,
   validateRichDocument,
   type RichDynamicPlan,
   type RichDynamicStats,
@@ -29,35 +31,6 @@ export interface RichStateSnapshot {
 const forbidden = new Set(['__proto__', 'constructor', 'prototype']);
 const own = (o: object, key: string) => Object.prototype.hasOwnProperty.call(o, key);
 
-function isPrimitive(value: unknown): value is string | number | boolean | null {
-  return value === null || typeof value === 'string' || typeof value === 'boolean' ||
-    (typeof value === 'number' && Number.isFinite(value));
-}
-function isPrimitiveRecord(value: unknown): value is Record<string, string | number | boolean | null> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const proto = Object.getPrototypeOf(value);
-  return (proto === Object.prototype || proto === null) &&
-    Object.entries(value).every(([key, item]) => !forbidden.has(key) && isPrimitive(item));
-}
-function cloneValue(value: unknown): RichStateValue {
-  if (isPrimitive(value)) return value;
-  if (isPrimitiveRecord(value)) return Object.freeze({ ...value });
-  if (Array.isArray(value) && value.length <= RICH_LIMITS.maxArrayPoints) {
-    if (value.every(isPrimitive)) return Object.freeze([...value]) as unknown as RichStateValue;
-    if (value.every(isPrimitiveRecord)) {
-      return Object.freeze(value.map(item => Object.freeze({ ...item }))) as unknown as RichStateValue;
-    }
-  }
-  throw new RichExprError('RICH_INVALID_STATE_VALUE', 'Invalid state value.');
-}
-
-function assertStateLimit(state: State): void {
-  const bytes = new TextEncoder().encode(JSON.stringify(state)).byteLength;
-  if (bytes > RICH_LIMITS.maxStateBytes) {
-    throw new RichExprError('RICH_STATE_TOO_LARGE', 'State exceeds the byte limit.', 422);
-  }
-}
-
 /** Store one independent rich block. A failed mutation never publishes partial state. */
 export class RichStateStore {
   private readonly document: RichDocumentV1;
@@ -72,18 +45,12 @@ export class RichStateStore {
   private computedStepsByKey: Map<string, number> | undefined;
   private versionCounter = 0;
 
-  constructor(document: RichDocumentV1, authorizedArtifactIds: Iterable<string> = [], theme: Theme = 'light') {
+  constructor(document: RichDocumentV1, authorizedArtifactIds: Iterable<string> = [], theme: Theme = 'light', restoredState?: State | null) {
     this.document = JSON.parse(JSON.stringify(document)) as RichDocumentV1;
     this.authorized = new Set(authorizedArtifactIds);
-    this.initial = Object.create(null) as State;
-    for (const [key, value] of Object.entries(this.document.state ?? {})) {
-      if (forbidden.has(key)) throw new RichExprError('RICH_INVALID_STATE_KEY', 'Invalid state key.');
-      this.initial[key] = cloneValue(value);
-    }
-    Object.freeze(this.initial);
+    this.initial = Object.freeze(mergeRichState(this.document.state));
 
     // Run full static + initial dynamic validation once at construction time.
-    assertStateLimit(this.initial);
     const initialValidation = validateRichDocument({ ...this.document, state: this.initial }, {
       authorizedArtifactIds: this.authorized,
       theme,
@@ -100,11 +67,23 @@ export class RichStateStore {
     // avoid whole-document JSON serialization, static re-validation, AST
     // re-parsing, and untouched computed/subtree re-evaluation.
     this.plan = compileRichDynamicPlan(this.document, undefined);
-    const initialEval = evaluateRichDynamicState(this.plan, {
-      state: this.initial,
-      theme,
-      authorizedArtifactIds: this.authorized,
+    const evaluate = (state: State) => evaluateRichDynamicState(this.plan, {
+      state, theme, authorizedArtifactIds: this.authorized,
     });
+    let state = this.initial;
+    let initialEval = evaluate(state);
+    if (restoredState) {
+      try {
+        const restored = Object.freeze(mergeRichState(this.initial, restoredState));
+        const evaluation = evaluate(restored);
+        if (evaluation.valid) {
+          state = restored;
+          initialEval = evaluation;
+        }
+      } catch (error) {
+        if (!(error instanceof RichExprError)) throw error;
+      }
+    }
     if (!initialEval.valid) {
       throw new RichExprError(
         initialEval.primaryErrorCode ?? 'RICH_INVALID_STATE',
@@ -116,7 +95,7 @@ export class RichStateStore {
     this.computedStepsByKey = initialEval.computedStepsByKey;
     this.versionCounter = 1;
     this.snapshot = Object.freeze({
-      state: this.initial,
+      state,
       computed: Object.freeze(initialEval.computed),
       theme,
       version: this.versionCounter,
@@ -199,7 +178,7 @@ export class RichStateStore {
   }
 
   private validateAndPublish(state: State, theme: Theme): void {
-    assertStateLimit(state);
+    assertRichStateLimit(state);
     const previous = this.snapshot;
     const result = evaluateRichDynamicState(this.plan, {
       state,
@@ -264,8 +243,8 @@ export class RichStateStore {
     const next: State = Object.assign(Object.create(null), this.snapshot.state);
     const theme = this.snapshot.theme;
     const budget = createRichEvalBudget();
-    if (binding) next[binding.key] = cloneValue(binding.value);
-    assertStateLimit(next);
+    if (binding) next[binding.key] = cloneRichStateValue(binding.value);
+    assertRichStateLimit(next);
     for (const action of actions) {
       const evalValue = (expr: string) => evaluateRichExpr(expr, {
         ...local, state: next, computed: this.computeForActions(next, theme, budget), theme,
@@ -273,7 +252,7 @@ export class RichStateStore {
       switch (action.type) {
         case 'set_state':
           this.assertKey(action.key);
-          next[action.key] = cloneValue(evalValue(action.valueExpr));
+          next[action.key] = cloneRichStateValue(evalValue(action.valueExpr));
           break;
         case 'toggle_state':
           this.assertKey(action.key);
@@ -288,7 +267,7 @@ export class RichStateStore {
           const min = action.min ?? -Infinity;
           const max = action.max ?? Infinity;
           if (min > max) throw new RichExprError('RICH_INVALID_STATE_VALUE', 'Invalid increment limits.');
-          next[action.key] = cloneValue(Math.max(min, Math.min(max, current + delta)));
+          next[action.key] = cloneRichStateValue(Math.max(min, Math.min(max, current + delta)));
           break;
         }
         case 'reset_state':
@@ -300,7 +279,7 @@ export class RichStateStore {
         default:
           throw new RichExprError('RICH_SIDE_EFFECT_FORBIDDEN', 'State events cannot execute side effects.');
       }
-      assertStateLimit(next);
+      assertRichStateLimit(next);
     }
     this.validateAndPublish(next, theme);
   }

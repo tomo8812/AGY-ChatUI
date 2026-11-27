@@ -16,7 +16,7 @@ describe('Explicit rich actions',()=>{
     expect(open).toHaveBeenCalledWith('https://example.com/','_blank','noopener,noreferrer');
     expect(open).toHaveBeenCalledWith('allowed');
     expect(save).toHaveBeenCalledWith('notes.md','md','test');
-    expect(send).toHaveBeenCalledWith('test');expect(pin).toHaveBeenCalledWith('text');
+    expect(send).toHaveBeenCalledWith('test');expect(pin).toHaveBeenCalledWith('text', { state: { value: 2 }, theme: 'light' });
   });
   it('cancels a chain when confirmation is denied',async()=>{
     const store=makeStore(),send=vi.fn(),save=vi.fn(),confirm=vi.fn(()=>false);

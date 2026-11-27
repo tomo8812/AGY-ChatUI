@@ -1,13 +1,13 @@
 import type { RichAction, RichSideEffectAction, RichStateAction } from '../../../../shared/rich-schema';
 import { createRichEvalBudget,evaluateRichExpr,isValidHttpUrl,validateSafeFilename, type RichEvalContext } from './RichExprEvaluator';
-import type { RichStateStore } from './RichStateStore';
+import type { RichStateSnapshot, RichStateStore } from './RichStateStore';
 
 export interface RichActionHost {
   authorizeArtifact: (id:string)=>boolean;
   openArtifact?: (id:string)=>void|Promise<void>;
   saveArtifact?: (filename:string,format:Extract<RichSideEffectAction,{type:'save_to_artifact'}>['format'],content:string)=>void|Promise<void>;
   submitToChat?: (text:string)=>void|Promise<void>;
-  startPinEdit?: (targetNodeId?:string)=>void|Promise<void>;
+  startPinEdit?: (targetNodeId: string | undefined, view: Pick<RichStateSnapshot, 'state' | 'theme'>)=>void|Promise<void>;
 }
 function isStateAction(action:RichAction):action is RichStateAction{
   return action.type==='set_state'||action.type==='toggle_state'||action.type==='increment_state'||action.type==='reset_state';
@@ -59,7 +59,12 @@ export async function runExplicitRichActions(actions:readonly RichAction[],store
         await host.submitToChat(message);
         break;
       }
-      case 'start_pin_edit': if(!host.startPinEdit)throw Error('対象指定できません。');await host.startPinEdit(action.targetNodeId);break;
+      case 'start_pin_edit': {
+        if(!host.startPinEdit)throw Error('対象指定できません。');
+        const {state,theme}=store.getSnapshot();
+        await host.startPinEdit(action.targetNodeId,{state,theme});
+        break;
+      }
       default:throw Error('操作が無効です。');
     }
   }

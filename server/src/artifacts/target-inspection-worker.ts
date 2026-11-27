@@ -1,3 +1,5 @@
+import { inspectMediaMetadata, inspectVideoTarget } from './adapters/media-target.js';
+import { inspectPdfText } from './adapters/pdf-text-inspection.js';
 import fs from 'node:fs';
 import { parentPort, workerData } from 'node:worker_threads';
 import type { PreviewKind } from '../types.js';
@@ -73,13 +75,35 @@ function describeSourceTarget(bytes: Buffer, range: Record<string, unknown>) {
   };
 }
 
-function inspect(job: InspectionJob) {
+async function inspect(job: InspectionJob) {
   const adapter = new FormatAdapterRegistry().resolve(job.file.filename, job.file.previewKind);
   if ('range' in job) {
     const bytes = readSnapshot(job.snapshot, job.maxBytes);
-    return job.range.sourceTarget === true && ['code', 'markdown', 'html', 'svg', 'mermaid', 'diff'].includes(adapter.format)
-      ? describeSourceTarget(bytes, job.range)
-      : adapter.readRange(bytes, job.range, job.file);
+    if (job.range.sourceTarget === true && ['code', 'markdown', 'html', 'svg', 'mermaid', 'diff'].includes(adapter.format)) {
+      return describeSourceTarget(bytes, job.range);
+    }
+    if (adapter.format === 'media' && job.range.mediaStructure === true) {
+      const timestamp = job.range.timestampSec === undefined ? undefined : Number(job.range.timestampSec);
+      const video = job.file.previewKind === 'video' ? await inspectVideoTarget(bytes, job.snapshot.sha256, timestamp) : null;
+      if (timestamp !== undefined && job.file.previewKind === 'video') {
+        const frame = video?.frame;
+        return { target: frame ? {
+          timestampSec: timestamp, expectedDurationSec: frame.expectedDurationSec, expectedWidthPx: frame.expectedWidthPx,
+          expectedHeightPx: frame.expectedHeightPx, expectedFrameSha256: frame.expectedFrameSha256,
+        } : null };
+      }
+      return { format: 'media', filename: job.file.filename, sizeBytes: bytes.length,
+        ...(video ?? await inspectMediaMetadata(bytes, job.file.filename, job.file.mimeType)) };
+    }
+    const info = adapter.readRange(bytes, job.range, job.file);
+    if (adapter.format === 'pdf' && (job.range.textTarget === true || job.range.textTarget === 'true') && info.target && typeof info.target === 'object') {
+      const start = Number(job.range.textOffsetStart), end = Number(job.range.textOffsetEnd);
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end <= start) return { target: null };
+      const layout = await inspectPdfText(bytes, Number(job.range.pageIndex), start, end);
+      const quadsPt = layout?.quadsForRange(start, end);
+      return { target: layout && quadsPt ? { ...info.target, text: layout.text, quadsPt } : null };
+    }
+    return info;
   }
 
   let source: ReturnType<typeof readContainedRegularFileNoFollowStable>;
@@ -102,8 +126,18 @@ function inspect(job: InspectionJob) {
       // The resolver can still use an independently hash-verified snapshot or current match.
     }
   }
-  const result = adapter.resolveTarget(source.buffer, job.selector, { ...job.file, snippetHint });
-  if (result.status === 'resolved' || result.reason === 'image_region_unconfirmed' || result.reason === 'media_duration_unconfirmed') {
+  const pdfTextLayout = job.selector.kind === 'pdf_text_range'
+    ? await inspectPdfText(source.buffer, Number(job.selector.pageIndex), Number(job.selector.textOffsetStart), Number(job.selector.textOffsetEnd))
+    : undefined;
+  const video = job.file.previewKind === 'video'
+    ? await inspectVideoTarget(source.buffer, source.sha256, job.selector.kind === 'video_frame_region' ? Number(job.selector.timestampSec) : undefined)
+    : null;
+  const media = adapter.format === 'media' && !video
+    ? await inspectMediaMetadata(source.buffer, job.file.filename, job.file.mimeType) : video;
+  const result = adapter.resolveTarget(source.buffer, job.selector, {
+    ...job.file, snippetHint, pdfTextLayout, mediaDurationSeconds: media?.durationSeconds, videoFrame: video?.frame,
+  });
+  if (result.status === 'resolved') {
     try {
       const latest = openContainedRegularFileNoFollow(job.rootDir, job.file.relPath);
       try {
@@ -120,7 +154,7 @@ function inspect(job: InspectionJob) {
 }
 
 try {
-  parentPort!.postMessage({ result: inspect(workerData as InspectionJob) });
+  parentPort!.postMessage({ result: await inspect(workerData as InspectionJob) });
 } catch (error) {
   parentPort!.postMessage({ error: error instanceof ArtifactError
     ? { code: error.code, message: error.message, statusCode: error.statusCode, details: error.details }

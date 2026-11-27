@@ -660,14 +660,13 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       actorKind: 'user',
       actorId: userId,
     });
-    const imageSelector = {
-      kind: 'image_pin', baseRevision: 1, xNorm: 0.5, yNorm: 0.5, expectedWidthPx: 1, expectedHeightPx: 1,
-      expectedImageSha256: sha256(imgBuf1), expectedRegionSha256: sha256(imgBuf1),
-    };
-    // The 1x1 fixture has the same cropped pixel and full rendition.
-    const render = vi.spyOn(srv.ctx.artifactService, 'renderPng').mockResolvedValue({
-      revision: 1, sha256: sha256(imgBuf1), png: imgBuf1,
+    const imageGeometry = { kind: 'image_pin', xNorm: 0.5, yNorm: 0.5 };
+    const { target: imageTarget } = await srv.ctx.artifactService.readRange(userId, imgArt.artifact.id, {
+      ...imageGeometry, targetMetadata: true,
     });
+    const { region, ...fingerprints } = imageTarget as Record<string, unknown>;
+    const imageSelector = { ...imageGeometry, ...fingerprints, baseRevision: 1 };
+    const render = vi.spyOn(srv.ctx.artifactService, 'renderPng').mockRejectedValue(new Error('no renderer'));
     let imgReq;
     try {
       const input = { userId, chatId, targetKind: 'artifact' as const, artifactId: imgArt.artifact.id, instruction: 'brighten center' };
@@ -675,9 +674,8 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
         ...input, selector: { ...imageSelector, expectedRegionSha256: sha256('wrong region') },
       })).rejects.toMatchObject({ code: 'TARGET_CONTENT_DRIFT' });
       imgReq = await srv.ctx.editRequestService.createRequest({ ...input, selector: imageSelector });
-      expect(render).toHaveBeenLastCalledWith(userId, imgArt.artifact.id, {
-        region: { unit: 'px', x: 0, y: 0, width: 1, height: 1 },
-      });
+      expect(imgReq.contentCoords).toEqual({ region });
+      expect(render).not.toHaveBeenCalled();
     } finally {
       render.mockRestore();
     }
@@ -877,11 +875,19 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
     expect(reconfirmed.status).toBe('draft');
     await requests.sendBatch({ userId, chatId, requestIds: [reqRich.id] });
 
+    await requests.getForAgent(userId, chatId, reqRich.id);
+    const target = srv.ctx.richContentService.getBlock(userId, chatId, reqRich.richBlockId!)!;
+    requests.assertAgentMutation({ userId, chatId, targetKind: 'rich_block', targetId: target.id,
+      editRequestIds: [reqRich.id], expectedRevision: target.revision });
+    srv.ctx.richContentService.updateBlock({
+      userId, chatId, blockId: target.id, expectedRevision: target.revision,
+      actorKind: 'ai', actorId: userId, editRequestIds: [reqRich.id], title: 'Changed by the requested edit',
+    });
     const applied = srv.ctx.editRequestService.markAppliedByAgent({
       userId,
       chatId,
       requestId: reqRich.id,
-      appliedRevision: 2,
+      appliedRevision: target.revision + 1,
     });
     expect(applied.status).toBe('applied_unverified'); // NEVER auto-resolved!
 

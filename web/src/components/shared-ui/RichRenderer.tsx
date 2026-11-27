@@ -1,5 +1,5 @@
 import React, { lazy, Suspense, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react';
-import type { RichDocumentV1, RichNode, RichLayoutProps, RichAction, RichStateAction, RichSourceEntry, RichCellObject, RichPrimitive } from '../../../../shared/rich-schema';
+import type { RichBlockRecord, RichDocumentV1, RichNode, RichLayoutProps, RichAction, RichStateAction, RichSourceEntry, RichCellObject, RichPrimitive } from '../../../../shared/rich-schema';
 import type { ArtifactRecord } from '../../types';
 import { buildArtifactContentUrl } from '../../utils/viewerCache';
 import { MarkdownContent, MermaidBlock, CodeBlock } from '../MarkdownContent';
@@ -42,6 +42,7 @@ export interface RichRendererProps {
   chatId: string;
   artifacts?: readonly ArtifactRecord[];
   actions?: ArtifactHost;
+  uiStateSnapshot?: RichBlockRecord['uiStateSnapshot'];
 }
 const noArtifacts:readonly ArtifactRecord[]=[];
 const noActions:ArtifactHost={};
@@ -212,13 +213,14 @@ function RichTitle({value,store,accounting}:{value:RichDocumentV1['title'];store
   const cycle=accounting.beginScope('title');
   return value?<div className="rich-document-title">{text(evaluate(value,store.context(),cycle))}</div>:null;
 }
-function RichRendererInner({document:doc,userId,chatId,artifacts=noArtifacts,actions=noActions}:RichRendererProps){
+function RichRendererInner({document:doc,userId,chatId,artifacts=noArtifacts,actions=noActions,uiStateSnapshot}:RichRendererProps){
   const theme=useTheme();
   const authorized=useMemo(()=>new Map(artifacts.filter(a=>a.userId===userId&&a.chatId===chatId).map(a=>[a.id,a])),[artifacts,userId,chatId]);
   // Revision changes to an authorized file must not reset unrelated local control state.
   const authKey=useMemo(()=>JSON.stringify([...authorized.keys()].sort()),[authorized]);
   const docKey=useMemo(()=>JSON.stringify(doc),[doc]);
-  const store=useMemo(()=>new RichStateStore(JSON.parse(docKey) as RichDocumentV1,JSON.parse(authKey) as string[],theme),[docKey,authKey,userId,chatId]);
+  const snapshotKey=useMemo(()=>JSON.stringify(uiStateSnapshot??null),[uiStateSnapshot]);
+  const store=useMemo(()=>new RichStateStore(JSON.parse(docKey) as RichDocumentV1,JSON.parse(authKey) as string[],theme,JSON.parse(snapshotKey)),[docKey,authKey,userId,chatId,snapshotKey]);
   const accounting=useMemo(()=>new BlockRenderAccounting(),[store]);
   const [error,setError]=useState<string|null>(null);
   const activeAction=useRef<AbortController|null>(null);
@@ -439,7 +441,7 @@ const RichNodePaint=React.memo(function RichNodePaint({node,local,path,environme
       case 'code_block':body=<CodeBlock code={label(v(node.code))} language={node.language??''} copyable={node.copyable}/>;break;
       case 'diff_block':body=<div className="rich-diff"><div><span className="muted-sm">変更前</span><CodeBlock code={label(v(node.oldText))} language={node.language??''}/></div><div><span className="muted-sm">変更後</span><CodeBlock code={label(v(node.newText))} language={node.language??''}/></div></div>;break;
       case 'math_block':{const tex=label(v(node.tex));body=<MarkdownContent strictRich content={node.displayMode===false?'$'+tex+'$':'$$\n'+tex+'\n$$'}/>;break}
-      case 'media_asset':{const alt=label(v(node.alt));let media:ReactNode;if(node.sourceKind==='inline_svg'&&node.svgScene)media=<DiagramZoom enabled={node.svgScene.zoomable} id={unique}><SvgScene args={[node.svgScene,c,cycle,unique,dispatch]} accounting={accounting} scopePath={path+':lazy'}/></DiagramZoom>;else{const artifact=authorized.get(label(v(node.artifactId)));if(!artifact)throw Error('ファイルを表示できません。');const src=buildArtifactContentUrl(artifact);media=artifact.previewKind==='image'||artifact.previewKind==='svg'?<img alt={alt} src={src} loading="lazy"/>:artifact.previewKind==='video'?<video controls playsInline preload="metadata" src={src} aria-label={alt}/>:artifact.previewKind==='audio'?<audio controls preload="metadata" src={src} aria-label={alt}/>:<button type="button" className="btn btn-secondary" disabled={!host.openArtifact} onClick={()=>{void Promise.resolve(host.openArtifact?.(artifact.id)).catch(fail)}}>{artifact.filename}</button>}body=<figure className="rich-media">{media}{node.caption&&<figcaption>{label(v(node.caption))}</figcaption>}</figure>;break}
+      case 'media_asset':{const alt=label(v(node.alt));let media:ReactNode;if(node.sourceKind==='inline_svg'&&node.svgScene)media=<RichNodeView node={node.svgScene} local={local} path={path+':svgScene'} environment={environment}/>;else{const artifact=authorized.get(label(v(node.artifactId)));if(!artifact)throw Error('ファイルを表示できません。');const src=buildArtifactContentUrl(artifact);media=artifact.previewKind==='image'||artifact.previewKind==='svg'?<img alt={alt} src={src} loading="lazy"/>:artifact.previewKind==='video'?<video controls playsInline preload="metadata" src={src} aria-label={alt}/>:artifact.previewKind==='audio'?<audio controls preload="metadata" src={src} aria-label={alt}/>:<button type="button" className="btn btn-secondary" disabled={!host.openArtifact} onClick={()=>{void Promise.resolve(host.openArtifact?.(artifact.id)).catch(fail)}}>{artifact.filename}</button>}body=<figure className="rich-media">{media}{node.caption&&<figcaption>{label(v(node.caption))}</figcaption>}</figure>;break}
       default:body=<div className="error-box">この項目は表示できません。</div>;
     }
     if(node.type==='mermaid'||node.type==='svg_scene'||node.type==='node_edge_diagram'){

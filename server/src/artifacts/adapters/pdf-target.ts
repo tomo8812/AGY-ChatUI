@@ -622,13 +622,13 @@ function parseBox(val: PdfVal | undefined, reader: PdfReader): [number, number, 
   const y0 = Math.min(nums[1], nums[3]);
   const x1 = Math.max(nums[0], nums[2]);
   const y1 = Math.max(nums[1], nums[3]);
-  return [round2(x0), round2(y0), round2(x1), round2(y1)];
+  return x1 > x0 && y1 > y0 ? [x0, y0, x1, y1] : null;
 }
 
 function normalizeRotate(val: PdfVal | undefined, reader: PdfReader): number {
   const raw = Number(reader.resolve(val) ?? 0);
-  if (!Number.isFinite(raw)) return 0;
-  const norm = ((Math.round(raw / 90) * 90) % 360 + 360) % 360;
+  if (!Number.isFinite(raw) || raw % 90 !== 0) return 0;
+  const norm = (raw % 360 + 360) % 360;
   return norm === 90 || norm === 180 || norm === 270 ? norm : 0;
 }
 
@@ -874,14 +874,12 @@ function inspectPageTree(reader: PdfReader, targetPageIndex?: number): PdfDocume
     if (!isDict(node) || visited.has(node)) return null;
     visited.add(node);
 
+    const userUnit = Number(reader.resolve(node['/UserUnit']));
     const nextInh: Inherited = {
       mediaBox: parseBox(node['/MediaBox'], reader) ?? inh.mediaBox,
       cropBox: parseBox(node['/CropBox'], reader) ?? inh.cropBox,
       rotate: node['/Rotate'] !== undefined ? normalizeRotate(node['/Rotate'], reader) : inh.rotate,
-      userUnit:
-        node['/UserUnit'] !== undefined && Number.isFinite(Number(reader.resolve(node['/UserUnit'])))
-          ? Math.max(0.01, Number(reader.resolve(node['/UserUnit'])))
-          : inh.userUnit,
+      userUnit: Number.isFinite(userUnit) && userUnit > 0 ? userUnit : inh.userUnit,
       resources: node['/Resources'] !== undefined ? node['/Resources'] : inh.resources,
     };
 
@@ -907,13 +905,19 @@ function inspectPageTree(reader: PdfReader, targetPageIndex?: number): PdfDocume
   if (!pageCount) return null;
   const pages = selected.map(({ dict, inh, pageIndex }) => {
     const mediaBox: [number, number, number, number] = inh.mediaBox ?? [0, 0, 612, 792];
-    const cropBox: [number, number, number, number] = inh.cropBox ?? mediaBox;
+    const requestedCropBox = inh.cropBox ?? mediaBox;
+    const intersectedCropBox: [number, number, number, number] = [
+      Math.max(mediaBox[0], requestedCropBox[0]), Math.max(mediaBox[1], requestedCropBox[1]),
+      Math.min(mediaBox[2], requestedCropBox[2]), Math.min(mediaBox[3], requestedCropBox[3]),
+    ];
+    const cropBox = intersectedCropBox[2] > intersectedCropBox[0] && intersectedCropBox[3] > intersectedCropBox[1]
+      ? intersectedCropBox : mediaBox;
     const rotate = inh.rotate;
     const userUnit = inh.userUnit;
     const rawW = (cropBox[2] - cropBox[0]) * userUnit;
     const rawH = (cropBox[3] - cropBox[1]) * userUnit;
-    const widthPt = round2(rotate === 90 || rotate === 270 ? rawH : rawW);
-    const heightPt = round2(rotate === 90 || rotate === 270 ? rawW : rawH);
+    const widthPt = rotate === 90 || rotate === 270 ? rawH : rawW;
+    const heightPt = rotate === 90 || rotate === 270 ? rawW : rawH;
 
     // Resolve and decode /Contents stream(s)
     const contentsVal = reader.resolve(dict['/Contents']);
@@ -965,8 +969,8 @@ function inspectPageTree(reader: PdfReader, targetPageIndex?: number): PdfDocume
         cropBox,
         rotate,
         userUnit: round2(userUnit),
-        widthPt,
-        heightPt,
+        widthPt: round2(widthPt),
+        heightPt: round2(heightPt),
         streamHashes,
         resourcesHash,
         annots: annotations.map((a) => a.fingerprint),
@@ -992,11 +996,22 @@ function inspectPageTree(reader: PdfReader, targetPageIndex?: number): PdfDocume
   return { pageCount, pages };
 }
 
+export function pdfRectInPage(
+  page: Pick<PdfPageTargetInfo, 'widthPt' | 'heightPt'>,
+  [x, y, w, h]: [number, number, number, number],
+): boolean {
+  if (![x, y, w, h].every(n => Number.isFinite(n) && n >= 0) || (w === 0) !== (h === 0)) return false;
+  // Limit tolerance to floating-point addition at the page edge.
+  return x <= page.widthPt && y <= page.heightPt &&
+    x + w <= page.widthPt + Number.EPSILON * page.widthPt &&
+    y + h <= page.heightPt + Number.EPSILON * page.heightPt;
+}
+
 export function computePdfRegionDigest(
   page: PdfPageTargetInfo,
   rectPt: [number, number, number, number],
 ): string {
-  const [rx, ry, rw, rh] = rectPt.map(round2) as [number, number, number, number];
+  const [rx, ry, rw, rh] = rectPt;
   const isPin = rw === 0 && rh === 0;
   const tol = isPin ? 12 : 2;
   const x0 = rx - tol;
@@ -1012,10 +1027,10 @@ export function computePdfRegionDigest(
 
   return sha256(
     JSON.stringify({
-      v: 1,
+      v: 2,
       pageContentHash: page.pageContentHash,
-      widthPt: page.widthPt,
-      heightPt: page.heightPt,
+      widthPt: round2(page.widthPt),
+      heightPt: round2(page.heightPt),
       rotate: page.rotate,
       rectPt: [rx, ry, rw, rh],
       items: intersecting.map((it) => [it.kind, it.x, it.y, it.w, it.h, it.value]),
@@ -1039,7 +1054,7 @@ export function readPdfPageTarget(
 } | null {
   const doc = inspectPdfDocument(buffer, pageIndex);
   const page = doc?.pages[0];
-  if (!page) return null;
+  if (!page || (rectPt && !pdfRectInPage(page, rectPt))) return null;
   return {
     pageIndex: page.pageIndex,
     pageCount: page.pageCount,

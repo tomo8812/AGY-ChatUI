@@ -10,7 +10,7 @@ export interface WorkspaceCapabilities {format:WorkspaceFormat;directEditUiSuppo
 export interface WorkspaceTableCellEdit {row:number;column:number;text:string}
 export type EditOperation={op:string;[key:string]:unknown};
 export interface RevisionResponse {artifactId:string;revision:number;sha256:string}
-export interface WorkspaceTarget {selector:{kind:string;[key:string]:unknown};baseRevision:number;label:string;selectedContentSnapshot?:string;surroundingContext?:string;regionImagePngBase64?:string;range?:Record<string,unknown>;contentCoords?:Record<string,unknown>}
+export interface WorkspaceTarget {selector:{kind:string;[key:string]:unknown};baseRevision:number;label:string;selectedContentSnapshot?:string;surroundingContext?:string;range?:Record<string,unknown>;contentCoords?:Record<string,unknown>}
 export interface EditRequestRecord {id:string;artifactId:string|null;instruction:string;status:string;selector:WorkspaceTarget['selector'];baseRevision:number;selectedContentSnapshot:string}
 const editRequestListeners = new Set<(chatId: string) => void>();
 export function notifyEditRequestsChanged(chatId: string): void {
@@ -25,7 +25,6 @@ function requestTarget(target: WorkspaceTarget) {
     selector: { ...target.selector, baseRevision: target.baseRevision },
     range: target.range, contentCoords: target.contentCoords,
     selectedContentSnapshot: target.selectedContentSnapshot, surroundingContext: target.surroundingContext,
-    regionImagePngBase64: target.regionImagePngBase64,
   };
 }
 const path=(id:string,suffix:string)=>'/api/files/'+encodeURIComponent(id)+'/'+suffix;
@@ -64,17 +63,6 @@ export const workspaceApi={
     if(!res.headers.get('content-type')?.includes('image/png'))throw new Error('画像形式が無効です。');
     return res.blob();
   },
-  async renderRegion(artifact:ArtifactRecord,pageIndex:number,rect:{x:number;y:number;width:number;height:number},unit:'norm'|'pt'){
-    const blob=await workspaceApi.render(artifact,{
-      pageIndex,regionX:rect.x,regionY:rect.y,regionWidth:rect.width,regionHeight:rect.height,regionUnit:unit,
-    });
-    return new Promise<string>((resolve,reject)=>{
-      const reader=new FileReader();
-      reader.onload=()=>resolve(String(reader.result).split(',')[1]);
-      reader.onerror=reject;
-      reader.readAsDataURL(blob);
-    });
-  },
   async renderDraftSprite(artifact:ArtifactRecord,query:{pageIndex:number;shapeId:number;cropSprite?:boolean;text?:string;boundsPt?:[number,number,number,number];style?:{bold?:boolean;italic?:boolean;fontSizePt?:number;fontColor?:string;fill?:string};cells?:WorkspaceTableCellEdit[]},signal?:AbortSignal):Promise<Blob>{
     const res=await fetch(path(artifact.id,'render-draft-sprite'),{method:'POST',credentials:'include',signal,
       headers:{'Content-Type':'application/json','x-csrf-token':getCsrfToken()},
@@ -106,6 +94,8 @@ export const workspaceApi={
   createRequest:(chatId:string,artifactId:string,target:WorkspaceTarget,instruction:string)=>apiFetch<{request:EditRequestRecord}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests',{method:'POST',body:{
     targetKind:'artifact',artifactId,...requestTarget(target),instruction,
   }}),
+  sendRequests:(chatId:string,requestIds:string[],clientMessageId:string)=>apiFetch<{batchId:string;requests:EditRequestRecord[]}>(
+    '/api/chats/'+encodeURIComponent(chatId)+'/edit-requests/send-batch',{method:'POST',body:{requestIds,clientMessageId}}),
   reorderRequests:(chatId:string,orderedIds:string[])=>apiFetch<{requests:EditRequestRecord[]}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests/reorder',{method:'POST',body:{orderedIds}}),
   updateRequest:(chatId:string,id:string,instruction:string)=>apiFetch<{request:EditRequestRecord}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests/'+encodeURIComponent(id),{method:'PATCH',body:{instruction}}),
   reconfirmRequest:(chatId:string,id:string,target:WorkspaceTarget)=>{

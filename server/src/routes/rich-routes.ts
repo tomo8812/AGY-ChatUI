@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import type { RichNode, RichStateValue } from '../../../shared/rich-schema.js';
+import { RichExprError } from '../rich/rich-expr-evaluator.js';
 import { isArtifactError } from '../artifacts/errors.js';
 import { RichContentError, type RichContentService } from '../rich/rich-content-service.js';
 import { requireAuth, type RouteDeps } from './auth-routes.js';
@@ -16,6 +17,9 @@ function sendRichError(reply: FastifyReply, err: unknown) {
       message: err.message,
       ...(err.details ? { details: err.details } : {}),
     });
+  }
+  if (err instanceof RichExprError) {
+    return reply.code(err.statusCode).send({ error: err.code, message: err.message });
   }
   if (isArtifactError(err)) {
     return reply.code(err.statusCode).send({
@@ -161,7 +165,7 @@ export async function registerRichRoutes(app: FastifyInstance, deps: RichRouteDe
     const session = requireAuth(req, reply, db);
     if (!session) return;
     const { chatId, blockId } = req.params as { chatId: string; blockId: string };
-    const parsed = z.object({ uiState: z.record(z.unknown()) }).safeParse(req.body);
+    const parsed = z.object({ uiState: z.record(z.unknown()), theme: z.enum(['light', 'dark']).optional(), expectedRevision: z.number().int().positive().optional() }).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: 'INVALID_INPUT' });
 
     try {
@@ -169,7 +173,7 @@ export async function registerRichRoutes(app: FastifyInstance, deps: RichRouteDe
         session.user.id,
         chatId,
         blockId,
-        parsed.data.uiState as Record<string, RichStateValue>
+        parsed.data.uiState, parsed.data.theme, parsed.data.expectedRevision
       );
       return { block };
     } catch (err) {

@@ -2,44 +2,24 @@ import React,{useEffect,useRef,useState} from 'react';
 import type {PDFDocumentProxy,RenderTask} from 'pdfjs-dist';
 type OutlineItem={title:string;page?:number;depth:number};
 type SearchHit={page:number;excerpt:string};
-async function getPageText(doc:PDFDocumentProxy,pageNumber:number){
+import { pdfTextLayout } from '../../../../../server/src/artifacts/adapters/pdf-text-layout';
+
+async function getPageTextLayout(doc:PDFDocumentProxy,pageNumber:number){
   const page=await doc.getPage(pageNumber);
-  const content=await page.getTextContent();
-  return content.items.map(item=>'str'in item?item.str+(item.hasEOL?'\n':' '):'').join('').trim();
+  return pdfTextLayout((await page.getTextContent()).items,page.getViewport({scale:1}));
+}
+async function getPageText(doc:PDFDocumentProxy,pageNumber:number){
+  return (await getPageTextLayout(doc,pageNumber)).text;
 }
 export interface PdfTextSelection {
   text:string;
-  quadsPt:number[][];
+  start:number;
+  end:number;
 }
-
 async function getSelectedTextGeometry(doc:PDFDocumentProxy,pageNumber:number,expected:string,start:number,end:number):Promise<PdfTextSelection>{
-  const page=await doc.getPage(pageNumber);
-  const viewport=page.getViewport({scale:1});
-  const content=await page.getTextContent();
-  const items=content.items.filter(item=>'str'in item);
-  const raw=items.map(item=>item.str+(item.hasEOL?'\n':' ')).join('');
-  if(raw.trim()!==expected)throw Error('ページ本文が変更されました。');
-  const trimOffset=raw.length-raw.trimStart().length;
-  let offset=-trimOffset;
-  const quadsPt:number[][]=[];
-  for(const item of items){
-    const length=item.str.length;
-    const from=Math.max(0,start-offset),to=Math.min(length,end-offset);
-    offset+=length+1;
-    if(to<=from||!item.width||!item.height)continue;
-    const [a,b,c,d,x,y]=item.transform;
-    const horizontal=Math.hypot(a,b),vertical=Math.hypot(c,d);
-    if(!horizontal||!vertical)continue;
-    const left=item.dir==='rtl'?1-to/length:from/length;
-    const right=item.dir==='rtl'?1-from/length:to/length;
-    const point=(fraction:number,height:number)=>viewport.convertToViewportPoint(
-      x+a*item.width*fraction/horizontal+c*height/vertical,
-      y+b*item.width*fraction/horizontal+d*height/vertical,
-    ).map(value=>Math.round(value*100)/100);
-    quadsPt.push([...point(left,item.height),...point(right,item.height),...point(left,0),...point(right,0)]);
-  }
-  if(!quadsPt.length)throw Error('選択本文の位置を確認できません。');
-  return {text:expected.slice(start,end),quadsPt};
+  const layout=await getPageTextLayout(doc,pageNumber);
+  if(layout.text!==expected)throw Error('ページ本文が変更されました。');
+  return {text:expected.slice(start,end),start,end};
 }
 
 function Thumbnail({doc,page,onClick,active}:{doc:PDFDocumentProxy;page:number;onClick:()=>void;active:boolean}){

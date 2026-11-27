@@ -13,6 +13,7 @@ export function EditRequestPanel({artifact,target,onClear}:{artifact:ArtifactRec
   const [editing,setEditing]=useState<string|null>(null);
   const [editedInstruction,setEditedInstruction]=useState('');
   const alive=useRef(false),mutation=useRef(false);
+  const sendAttempt=useRef<{ids:string;messageId:string}|null>(null);
   const listController=useRef<AbortController|null>(null);
   const latestTarget=useRef(target);latestTarget.current=target;
   useEffect(()=>{alive.current=true;return()=>{alive.current=false;listController.current?.abort()}},[]);
@@ -81,6 +82,19 @@ export function EditRequestPanel({artifact,target,onClear}:{artifact:ArtifactRec
     const chatId=artifact.chatId;
     void mutate(async()=>{await workspaceApi.reorderRequests(chatId,orderedIds)});
   };
+  const send=()=>{
+    const chatId=artifact.chatId;
+    if(!chatId||drafts.length===0)return;
+    const requestIds=drafts.map(request=>request.id);
+    const ids=JSON.stringify(requestIds);
+    if(sendAttempt.current?.ids!==ids)sendAttempt.current={ids,messageId:crypto.randomUUID()};
+    const messageId=sendAttempt.current.messageId;
+    void mutate(async()=>{
+      const result=await workspaceApi.sendRequests(chatId,requestIds,messageId);
+      if(alive.current)setRequests(prev=>prev.map(request=>result.requests.find(sent=>sent.id===request.id)??request));
+      sendAttempt.current=null;
+    });
+  };
   const disabled=busy||loading;
   return <div className="workspace-edit-requests">
     <h3>編集依頼</h3>
@@ -88,6 +102,7 @@ export function EditRequestPanel({artifact,target,onClear}:{artifact:ArtifactRec
       {target.baseRevision!==artifact.revision?<p className="warn-banner">ファイルが更新されました。対象を選び直してください。</p>:<><label className="field">変更内容<textarea rows={4} maxLength={10000} value={instruction} readOnly={busy} onChange={e=>setInstruction(e.target.value)}/></label><button className="btn btn-primary btn-sm" type="button" disabled={disabled||!instruction.trim()} onClick={create}>依頼を追加</button></>}</>:<p className="muted-sm">変更したい範囲を選択してください。</p>}
     {error&&<div className="error-box" role="alert">{error}<button type="button" className="btn btn-secondary btn-xs" disabled={busy} onClick={()=>{setError(null);setRefresh(v=>v+1)}}>再読込</button></div>}
     {loading&&<p className="muted-xs">読み込み中…</p>}
+    {drafts.length>0&&<button type="button" className="btn btn-primary btn-sm" disabled={disabled||editing!==null} onClick={send}>編集依頼を一括送信</button>}
     {requests.map(req=><div className="workspace-request-item" key={req.id}>
       {editing===req.id?<><label className="field">依頼の修正<textarea rows={3} maxLength={10000} value={editedInstruction} readOnly={busy} onChange={e=>setEditedInstruction(e.target.value)}/></label><div className="workspace-request-actions"><button type="button" className="btn btn-secondary btn-xs" disabled={disabled||!editedInstruction.trim()} onClick={()=>update(req.id)}>修正を保存</button><button type="button" className="btn btn-ghost btn-xs" disabled={busy} onClick={()=>setEditing(null)}>取消</button></div></>:<div>{req.instruction}</div>}
       <small>{req.status==='draft'?'未送信':req.status==='applied_unverified'?'確認待ち':req.status==='resolved'?'確認済み':req.status==='sent'?'送信済み':'再確認が必要'} · v{req.baseRevision}</small>

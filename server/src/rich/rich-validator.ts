@@ -1,9 +1,11 @@
+import { mapRichNodeChildren } from './rich-node-tree.js';
 import type {
   RichAction,
   RichDocumentV1,
   RichNode,
   RichSideEffectAction,
   RichStateAction,
+  RichStateValue,
   RichSvgElement,
   RichValue,
 } from '../../../shared/rich-schema.js';
@@ -312,6 +314,57 @@ export function topologicalSortComputed(
   return { order, asts, cycle };
 }
 
+const forbidden = new Set(['__proto__', 'constructor', 'prototype']);
+
+function isPrimitive(value: unknown): value is string | number | boolean | null {
+  return value === null || typeof value === 'string' || typeof value === 'boolean' ||
+    (typeof value === 'number' && Number.isFinite(value));
+}
+function isPrimitiveRecord(value: unknown): value is Record<string, string | number | boolean | null> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return (proto === Object.prototype || proto === null) &&
+    Object.entries(value).every(([key, item]) => !forbidden.has(key) && isPrimitive(item));
+}
+export function cloneRichStateValue(value: unknown): RichStateValue {
+  if (isPrimitive(value)) return value;
+  if (isPrimitiveRecord(value)) return Object.freeze({ ...value });
+  if (Array.isArray(value) && value.length <= RICH_LIMITS.maxArrayPoints) {
+    if (value.every(isPrimitive)) return Object.freeze([...value]) as unknown as RichStateValue;
+    if (value.every(isPrimitiveRecord)) {
+      return Object.freeze(value.map(item => Object.freeze({ ...item }))) as unknown as RichStateValue;
+    }
+  }
+  throw new RichExprError('RICH_INVALID_STATE_VALUE', 'Invalid state value.');
+}
+
+export function assertRichStateLimit(state: Record<string, RichStateValue>): void {
+  const arrayPoints = Object.values(state).reduce<number>((points, item) => points + (Array.isArray(item) ? item.length : 0), 0);
+  if (arrayPoints > RICH_LIMITS.maxArrayPoints) {
+    throw new RichExprError('RICH_ARRAY_LIMIT_EXCEEDED', 'State exceeds the array point limit.', 422);
+  }
+  const bytes = new TextEncoder().encode(JSON.stringify(state)).byteLength;
+  if (bytes > RICH_LIMITS.maxStateBytes) {
+    throw new RichExprError('RICH_STATE_TOO_LARGE', 'State exceeds the byte limit.', 422);
+  }
+}
+
+export function mergeRichState(
+  defaults: Record<string, RichStateValue> = {},
+  snapshot?: Record<string, unknown> | null,
+): Record<string, RichStateValue> {
+  const state: Record<string, RichStateValue> = Object.create(null);
+  for (const [key, value] of Object.entries(defaults)) {
+    if (forbidden.has(key)) throw new RichExprError('RICH_INVALID_STATE_KEY', 'Invalid state key.');
+    state[key] = cloneRichStateValue(snapshot && Object.hasOwn(snapshot, key) ? snapshot[key] : value);
+  }
+  for (const key of Object.keys(snapshot ?? {})) {
+    if (!Object.hasOwn(state, key)) throw new RichExprError('RICH_UNDECLARED_STATE_KEY', 'State key is not declared.');
+  }
+  assertRichStateLimit(state);
+  return state;
+}
+
 export interface ValidateRichDocumentOptions {
   authorizedArtifactIds?: Set<string>;
   locale?: string;
@@ -376,17 +429,17 @@ export function validateRichDocument(
     return fail('RICH_INVALID_SCHEMA', '$.root', 'Document root node is required.');
   }
 
-  const declaredStateKeys = new Set<string>(Object.keys(doc.state ?? {}));
-  const initialState: Record<string, unknown> = { ...(doc.state ?? {}) };
-  const stateBytes = new TextEncoder().encode(JSON.stringify(initialState)).byteLength;
-  if (stateBytes > RICH_LIMITS.maxStateBytes) {
-    return fail(
-      'RICH_STATE_TOO_LARGE',
-      '$.state',
-      `Initial state size (${stateBytes} bytes) exceeds limit of ${RICH_LIMITS.maxStateBytes} bytes.`,
-      422
-    );
+  let initialState: Record<string, RichStateValue>;
+  try {
+    if (doc.state !== undefined && (!doc.state || typeof doc.state !== 'object' || Array.isArray(doc.state))) {
+      return fail('RICH_INVALID_STATE_VALUE', '$.state', 'State must be an object.');
+    }
+    initialState = mergeRichState(doc.state);
+  } catch (error) {
+    if (!(error instanceof RichExprError)) throw error;
+    return fail(error.code, '$.state', error.message, error.statusCode);
   }
+  const declaredStateKeys = new Set(Object.keys(initialState));
 
   // Count array points inside initial state
   let totalArrayPoints = 0;
@@ -862,10 +915,8 @@ export function validateRichDocument(
             checkRichValueStatic(node.artifactId, `${p}.artifactId`);
           }
         } else if (sk === 'inline_svg') {
-          if (!node.svgScene || typeof node.svgScene !== 'object') {
+          if (!node.svgScene || typeof node.svgScene !== 'object' || (node.svgScene as RichNode).type !== 'svg_scene') {
             issues.push({ code: 'RICH_INVALID_SCHEMA', path: `${p}.svgScene`, message: 'media_asset(inline_svg) requires svgScene.', severity: 'error' });
-          } else {
-            validateSvgSceneStatic(node.svgScene as Record<string, unknown>, `${p}.svgScene`, nextRepeatDepth);
           }
         }
         break;
@@ -920,8 +971,8 @@ export function validateRichDocument(
         } else {
           for (let i = 0; i < node.items.length; i++) {
             const tab = node.items[i] as Record<string, unknown>;
-            if (Array.isArray(tab.content)) {
-              tab.content.forEach((child, j) => validateNodeStatic(child, `${p}.items[${i}].content[${j}]`, depth + 1, nextRepeatDepth));
+            if (!tab || typeof tab !== 'object' || !Array.isArray(tab.content)) {
+              issues.push({ code: 'RICH_INVALID_SCHEMA', path: `${p}.items[${i}]`, message: 'Tab content must be an array.', severity: 'error' });
             }
           }
         }
@@ -934,12 +985,10 @@ export function validateRichDocument(
       }
       case 'popover':
       case 'tooltip': {
-        if (node.trigger) validateNodeStatic(node.trigger, `${p}.trigger`, depth + 1, nextRepeatDepth);
-        if (Array.isArray(node.content)) {
-          node.content.forEach((child, i) => validateNodeStatic(child, `${p}.content[${i}]`, depth + 1, nextRepeatDepth));
-        } else {
-          checkRichValueStatic(node.content, `${p}.content`);
+        if (!node.trigger) {
+          issues.push({ code: 'RICH_INVALID_SCHEMA', path: `${p}.trigger`, message: 'A trigger node is required.', severity: 'error' });
         }
+        if (!Array.isArray(node.content)) checkRichValueStatic(node.content, `${p}.content`);
         break;
       }
       case 'editable_draft': {
@@ -958,16 +1007,10 @@ export function validateRichDocument(
       }
     }
 
-    // Recurse common child containers
-    if (Array.isArray(node.children)) {
-      node.children.forEach((child, i) => validateNodeStatic(child, `${p}.children[${i}]`, depth + 1, nextRepeatDepth));
-    }
-    if (node.headerAction) {
-      validateNodeStatic(node.headerAction, `${p}.headerAction`, depth + 1, nextRepeatDepth);
-    }
-    if (node.footer) {
-      validateNodeStatic(node.footer, `${p}.footer`, depth + 1, nextRepeatDepth);
-    }
+    mapRichNodeChildren(node as unknown as RichNode, (child, childPath) => {
+      validateNodeStatic(child, `${p}.${childPath}`, depth + 1, nextRepeatDepth);
+      return child;
+    });
   };
 
   validateNodeStatic(doc.root, '$.root', 1, 0);
@@ -1273,12 +1316,9 @@ export function compileRichDynamicPlan(
       addRichValDeps(node.content, deps);
     } else if (node.type === 'mermaid') {
       addRichValDeps(node.code, deps);
-    } else if (node.type === 'svg_scene' || (node.type === 'media_asset' && node.sourceKind === 'inline_svg')) {
-      const scene = node.type === 'svg_scene' ? node : node.svgScene;
-      if (scene) {
-        for (const def of scene.defs ?? []) visitSvgDefinitionValues(def, (_name, value) => addRichValDeps(value, deps));
-        for (const el of scene.elements) addSvgElementDeps(el, deps);
-      }
+    } else if (node.type === 'svg_scene') {
+      for (const def of node.defs ?? []) visitSvgDefinitionValues(def, (_name, value) => addRichValDeps(value, deps));
+      for (const el of node.elements) addSvgElementDeps(el, deps);
     } else if (node.type === 'media_asset' && node.artifactId !== undefined) {
       addRichValDeps(node.artifactId, deps);
     } else if (node.type === 'button') {
@@ -1289,29 +1329,10 @@ export function compileRichDynamicPlan(
       addActionsDeps([node.saveAction], deps);
     }
 
-    const anyNode = node as unknown as Record<string, unknown>;
-    if (Array.isArray(anyNode.children)) {
-      for (const child of anyNode.children) {
-        mergeDeps(deps, collectNodeDeps(child as RichNode));
-      }
-    }
-    if (node.type === 'tabs' && Array.isArray(node.items)) {
-      for (const item of node.items) {
-        if (Array.isArray(item?.content)) {
-          for (const child of item.content) mergeDeps(deps, collectNodeDeps(child));
-        }
-      }
-    }
-    if (node.type === 'card') {
-      if (node.headerAction) mergeDeps(deps, collectNodeDeps(node.headerAction));
-      if (node.footer) mergeDeps(deps, collectNodeDeps(node.footer));
-    }
-    if (node.type === 'popover' || node.type === 'tooltip') {
-      if (node.trigger) mergeDeps(deps, collectNodeDeps(node.trigger));
-      if (Array.isArray(node.content)) {
-        for (const child of node.content) mergeDeps(deps, collectNodeDeps(child));
-      }
-    }
+    mapRichNodeChildren(node, child => {
+      mergeDeps(deps, collectNodeDeps(child));
+      return child;
+    });
 
     subtreeDeps.set(node, deps);
     return deps;
@@ -1764,8 +1785,6 @@ export function evaluateRichDynamicState(
               });
             }
           }
-        } else if (node.sourceKind === 'inline_svg' && node.svgScene) {
-          evalSvgScenePost(node.svgScene, `${p}.svgScene`, ctx);
         }
       } else if (node.type === 'button') {
         evalActionsPost(node.onClick, `${p}.onClick`, ctx, localArtifacts);
@@ -1775,34 +1794,10 @@ export function evaluateRichDynamicState(
         evalActionsPost([node.saveAction], `${p}.saveAction`, ctx, localArtifacts);
       }
 
-      const anyNode = node as unknown as Record<string, unknown>;
-      if (Array.isArray(anyNode.children)) {
-        for (let i = 0; i < anyNode.children.length; i++) {
-          evalNodePost(anyNode.children[i] as RichNode, `${p}.children[${i}]`, ctx, inRepeatScope, localArtifacts);
-        }
-      }
-      if (node.type === 'tabs' && Array.isArray(node.items)) {
-        for (let i = 0; i < node.items.length; i++) {
-          const tabContent = node.items[i]?.content;
-          if (Array.isArray(tabContent)) {
-            for (let j = 0; j < tabContent.length; j++) {
-              evalNodePost(tabContent[j], `${p}.items[${i}].content[${j}]`, ctx, inRepeatScope, localArtifacts);
-            }
-          }
-        }
-      }
-      if (node.type === 'card') {
-        if (node.headerAction) evalNodePost(node.headerAction, `${p}.headerAction`, ctx, inRepeatScope, localArtifacts);
-        if (node.footer) evalNodePost(node.footer, `${p}.footer`, ctx, inRepeatScope, localArtifacts);
-      }
-      if (node.type === 'popover' || node.type === 'tooltip') {
-        if (node.trigger) evalNodePost(node.trigger, `${p}.trigger`, ctx, inRepeatScope, localArtifacts);
-        if (Array.isArray(node.content)) {
-          for (let i = 0; i < node.content.length; i++) {
-            evalNodePost(node.content[i], `${p}.content[${i}]`, ctx, inRepeatScope, localArtifacts);
-          }
-        }
-      }
+      mapRichNodeChildren(node, (child, childPath) => {
+        evalNodePost(child, `${p}.${childPath}`, ctx, inRepeatScope, localArtifacts);
+        return child;
+      });
 
       if (canMemoize) {
         nextSubtreeCache.set(p, {

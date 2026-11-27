@@ -168,7 +168,7 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
   await registerChatRoutes(app, { ...sharedRouteDeps, acp, scheduler, skillService });
   await registerFileRoutes(app, sharedRouteDeps);
   await registerRichRoutes(app, { ...sharedRouteDeps, richContentService });
-  await registerEditRequestRoutes(app, { ...sharedRouteDeps, editRequestService });
+  await registerEditRequestRoutes(app, { ...sharedRouteDeps, editRequestService, scheduler });
   await registerQuotaRoutes(app, { ...sharedRouteDeps, quotaService });
   await registerNotificationRoutes(app, { ...sharedRouteDeps, pushService });
   await registerSkillRoutes(app, { ...sharedRouteDeps, skillService, acp });

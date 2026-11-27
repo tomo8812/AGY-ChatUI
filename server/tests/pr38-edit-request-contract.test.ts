@@ -1,7 +1,8 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { afterEach, expect, it, vi } from 'vitest';
-import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { randomUUID, createHash } from 'node:crypto';
 import { EditRequestService, type AiEditRequestRecord } from '../src/edit-requests/edit-request-service.js';
 import { canonicalJson } from '../src/artifacts/idempotency-coordinator.js';
 import { FormatAdapterRegistry } from '../src/artifacts/adapters/registry.js';
@@ -47,7 +48,8 @@ it('validates source pins through REST, rolls back reorder and state events, and
   const first = created.data.request;
   const second = (await post({ ...input, instruction: 'Second' })).data.request;
   expect(first.selectedContentSnapshot).toBe('old choice');
-  expect(first.regionImageBlobSha256).toBeTruthy();
+  expect(first.regionImageBlobSha256).toBeNull();
+  expect(first.contentCoords).toBeNull();
   expect(() => ctx.editRequestService.resolveByUser(userId, chatId, first.id)).toThrow();
   expect(() => ctx.editRequestService.markAppliedByAgent({ userId, chatId, requestId: first.id, appliedRevision: 1 }))
     .toThrow(expect.objectContaining({ code: 'EDIT_REQUEST_NOT_SENT' }));
@@ -72,8 +74,14 @@ it('validates source pins through REST, rolls back reorder and state events, and
   const listed = (await otherDevice.request<{ requests: AiEditRequestRecord[] }>('GET', base)).data.requests;
   expect(listed.map(r => [r.id, r.createdAt])).toEqual([[second.id, second.createdAt], [first.id, first.createdAt]]);
 
-  const submit = () => client.request('POST', base + '/send-batch', { requestIds: [first.id] });
-  expect((await submit()).status).toBe(200);
+  const submit = (clientMessageId = randomUUID()) => client.request<{ batchId: string; requests: AiEditRequestRecord[] }>(
+    'POST', base + '/send-batch', { requestIds: [first.id], clientMessageId },
+  );
+  const messageId = randomUUID();
+  const originalBatch = await submit(messageId);
+  expect(originalBatch.status, JSON.stringify(originalBatch.data)).toBe(200);
+  expect(originalBatch.data.requests[0].sentMessageId).toBe(ctx.db.findMessageByClientId(userId, chatId, messageId)?.id);
+  expect((await submit(messageId)).data.batchId).toBe(originalBatch.data.batchId);
   const failedEvent = vi.fn();
   const revalidationFault = vi.spyOn(ctx.db, 'insertSyncEventInTx').mockImplementation(event => {
     const envelope = insert(event);
@@ -91,7 +99,8 @@ it('validates source pins through REST, rolls back reorder and state events, and
   await expect.poll(() => failedEvent.mock.calls.length, { timeout: 12_000 }).toBe(1);
   expect(ctx.editRequestService.getRequest(userId, chatId, first.id)?.status).toBe('sent');
   revalidationFault.mockRestore();
-  await ctx.editRequestService.revalidateForArtifact(userId, artifact.id, 2);
+  const drifted = await ctx.editRequestService.getForAgent(userId, chatId, first.id);
+  expect(drifted).toMatchObject({ status: 'needs_review', reResolution: { status: 'needs_review' } });
   expect(ctx.editRequestService.getRequest(userId, chatId, first.id)?.status).toBe('needs_review');
   expect((await submit()).status).toBe(409);
   const reconfirm = (newBaseRevision: number, newSelector: Record<string, unknown>) =>
@@ -120,7 +129,16 @@ it('validates source pins through REST, rolls back reorder and state events, and
     expect(JSON.parse(content[0].text)).toMatchObject({
       status: 'sent', untrustedTargetContent: { selectedContentSnapshot: 'new choice' }, reResolution: { status: 'resolved' },
     });
-    const applied = await mcp.callTool({ name: 'edit_request_mark_applied', arguments: { requestId: first.id, appliedRevision: 2 } });
+    const unproven = await mcp.callTool({ name: 'edit_request_mark_applied', arguments: { requestId: first.id, appliedRevision: 2 } });
+    expect(unproven.isError).toBe(true);
+    const mutation = await mcp.callTool({ name: 'artifact_edit', arguments: {
+      artifactId: artifact.id, expectedRevision: 2, editRequestIds: [first.id], idempotencyKey: 'apply-first-request',
+      operation: { op: 'replace_source', content: 'new before\ncorrected choice\nnew after' },
+    } });
+    expect(mutation.isError, JSON.stringify(mutation)).not.toBe(true);
+    await ctx.editRequestService.revalidateForArtifact(userId, artifact.id, 3);
+    expect(ctx.editRequestService.getRequest(userId, chatId, first.id)?.status).toBe('sent');
+    const applied = await mcp.callTool({ name: 'edit_request_mark_applied', arguments: { requestId: first.id, appliedRevision: 3 } });
     expect(applied.isError).not.toBe(true);
     expect(ctx.editRequestService.getRequest(userId, chatId, first.id)?.status).toBe('applied_unverified');
   } finally {
@@ -200,4 +218,86 @@ it('requires the exact selector fields and refuses a whole-file digest as proof 
     kind: 'code_char_range', baseRevision: 1, startLine: 1, endLine: 2, startCol: 10, endCol: 3,
     expectedSnippetHash: hash('snippet'), contextBeforeHash: hash('before'), contextAfterHash: hash('after'), occurrenceIndex: 0,
   }).success).toBe(true);
+});
+
+
+it('uses Base ChatUI media duration and verifies the exact time range against source bytes', async () => {
+  const srv = await createTestServer({ installDocRuntime: 'off', sandboxMode: 'off', allowUnsandboxedDocWorkers: false });
+  cleanups.push(srv.cleanup);
+  const { ctx } = srv;
+  const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+  const chatId = (await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Media target' })).data.chat.id;
+  const wav = Buffer.alloc(44 + 16_000);
+  wav.write('RIFF', 0); wav.writeUInt32LE(wav.length - 8, 4);
+  wav.write('WAVEfmt ', 8); wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(8000, 24); wav.writeUInt32LE(16000, 28);
+  wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34);
+  wav.write('data', 36); wav.writeUInt32LE(wav.length - 44, 40);
+  const { artifact } = await ctx.artifactService.createArtifact({
+    userId, chatId, scopeKind: 'chat', relPath: 'clip.wav', content: wav, actorKind: 'user',
+  });
+  const structure = await ctx.artifactService.getStructure(userId, artifact.id);
+  expect(structure).toMatchObject({ durationSeconds: 1, revision: 1, sha256: artifact.sha256 });
+  const selector = targetSelectorSchema.parse({ kind: 'audio_time_range', baseRevision: 1,
+    startSec: 0.1, endSec: 1, expectedDurationSec: structure.durationSeconds, expectedMediaSha256: structure.sha256 });
+  expect(await ctx.artifactService.resolveTargetOnArtifact(userId, artifact.id, selector)).toMatchObject({
+    status: 'resolved', resolvedCoords: { startSec: 0.1, endSec: 1 },
+  });
+  expect(await ctx.artifactService.resolveTargetOnArtifact(userId, artifact.id, { ...selector, endSec: 1.01 }))
+    .toMatchObject({ status: 'needs_review' });
+
+  const { artifact: video } = await ctx.artifactService.createArtifact({
+    userId, chatId, scopeKind: 'chat', relPath: 'frames.mp4',
+    content: readFileSync(new URL('./fixtures/target-frame-red-blue.mp4', import.meta.url)), actorKind: 'user',
+  });
+  const targetRange = (timestampSec: number) => ctx.artifactService.readRange(userId, video.id, { targetMetadata: true, timestampSec });
+  const first = await targetRange(0.25), second = await targetRange(1.25);
+  expect(first.target).toMatchObject({ timestampSec: 0.25, expectedDurationSec: 2, expectedWidthPx: 32, expectedHeightPx: 24 });
+  expect((first.target as Record<string, unknown>).expectedFrameSha256).not.toBe((second.target as Record<string, unknown>).expectedFrameSha256);
+  const frameSelector = targetSelectorSchema.parse({ ...(first.target as object), kind: 'video_frame_region', baseRevision: 1,
+    rectNorm: [0.25, 0.25, 0.5, 0.5] });
+  expect(await ctx.artifactService.resolveTargetOnArtifact(userId, video.id, frameSelector)).toMatchObject({
+    status: 'resolved', resolvedCoords: { frameStartSec: 0, frameDurationSec: 0.5 },
+  });
+  expect(await ctx.artifactService.resolveTargetOnArtifact(userId, video.id, { ...frameSelector, timestampSec: 1.25 }))
+    .toMatchObject({ status: 'needs_review' });
+
+  const request = await ctx.editRequestService.createRequest({
+    userId, chatId, targetKind: 'artifact', artifactId: video.id, selector: frameSelector, instruction: 'Update the selected frame',
+  });
+  await ctx.editRequestService.sendBatch({ userId, chatId, requestIds: [request.id] });
+  const payload = await ctx.editRequestService.getForAgent(userId, chatId, request.id);
+  expect(payload).toMatchObject({ status: 'sent', targetRevision: 1, reResolution: { status: 'resolved' } });
+  expect(payload.regionImagePngBase64).toBeUndefined();
+});
+
+it('validates persisted rich state and resolves a table cell against its captured state and row order', async () => {
+  const srv = await createTestServer();
+  cleanups.push(srv.cleanup);
+  const { ctx } = srv;
+  const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+  const chatId = (await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Rich targets' })).data.chat.id;
+  const rows = [{ name: 'first', value: 'same' }, { name: 'second', value: 'same' }];
+  const document = { schemaVersion: 1, state: { items: rows }, root: {
+    id: 'table', type: 'data_table', columns: [{ key: 'value', label: 'Value' }],
+    rows: { expr: '$theme == "dark" ? $state.items : []' },
+  } };
+  const { block } = ctx.richContentService.createBlock({ userId, chatId, document });
+  const statePath = `/api/chats/${chatId}/rich-blocks/${block.id}/ui-state`;
+  expect((await client.request('PUT', statePath, { uiState: { undeclared: true } })).status).toBe(400);
+  expect((await client.request('PUT', statePath, { uiState: { items: [...rows].reverse() }, theme: 'dark', expectedRevision: 1 })).status).toBe(200);
+  const request = await ctx.editRequestService.createRequest({
+    userId, chatId, targetKind: 'rich_block', richBlockId: block.id, instruction: 'Update first row',
+    selector: { kind: 'rich_table_cell', baseRevision: 1, blockId: block.id, tableNodeId: 'table',
+      row: 0, col: 'value', expectedCellHash: hash('same') },
+    viewStateSnapshot: { state: { items: rows }, theme: 'dark' },
+  });
+  expect(request.selector.expectedRowHash).toBe(hash(canonicalJson(rows[0])));
+  expect((await ctx.editRequestService.resolveRequestTarget(request)).status).toBe('resolved');
+
+  ctx.richContentService.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 1, document: {
+    ...document, root: { ...document.root, rows: [...rows].reverse() },
+  } });
+  expect(ctx.editRequestService.getRequest(userId, chatId, request.id)?.status).toBe('needs_review');
 });

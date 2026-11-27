@@ -833,6 +833,15 @@ export class AppDatabase {
       }
     }
 
+    const editRequestColumns = this.db.prepare('PRAGMA table_info(ai_edit_requests)').all();
+    if (!editRequestColumns.some(column => column.name === 'agent_base_revision')) {
+      this.db.exec('ALTER TABLE ai_edit_requests ADD COLUMN agent_base_revision INTEGER');
+    }
+    const richRevisionColumns = this.db.prepare('PRAGMA table_info(rich_block_revisions)').all();
+    if (!richRevisionColumns.some(column => column.name === 'edit_request_ids_json')) {
+      this.db.exec("ALTER TABLE rich_block_revisions ADD COLUMN edit_request_ids_json TEXT NOT NULL DEFAULT '[]'");
+    }
+
     // Add sync_events.user_seq if absent and backfill monotonically per user
     const syncCols = this.db.prepare('PRAGMA table_info(sync_events)').all() as Array<{ name: string }>;
     if (!syncCols.some((col) => col.name === 'user_seq')) {

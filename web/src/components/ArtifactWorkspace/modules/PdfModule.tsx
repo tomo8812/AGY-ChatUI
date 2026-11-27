@@ -7,8 +7,6 @@ import { workspaceApi,type WorkspaceTarget } from '../../../api/workspace';
 import { assertRevision } from '../useRevisionResource';
 import type { WorkspaceModuleProps } from '../types';
 
-function round2(value:number){return Math.round(value*100)/100}
-
 interface PdfTargetMetaResponse{
   target:{
     pageIndex:number;
@@ -19,16 +17,16 @@ interface PdfTargetMetaResponse{
     pageContentHash:string;
     text:string;
     regionDigest?:string;
+    quadsPt?:number[][];
   }|null;
 }
 
-export function PdfModule({artifact,mode,capabilities,onTarget}:WorkspaceModuleProps){
+export function PdfModule({artifact,mode,onTarget}:WorkspaceModuleProps){
   const [selection,setSelection]=useState<'page'|'pin'|'region'>('page');
   const [error,setError]=useState('');
   const latest=useRef({key:artifactVersionKey(artifact),mode});
   latest.current={key:artifactVersionKey(artifact),mode};
   const generation=useRef(0);
-  const workerReady=capabilities?.operations.some(op=>op.operation==='render_png'&&op.availability==='supported');
   async function capture(pageIndex:number,pageCount:number,selectedText?:PdfTextSelection,readPage?:()=>Promise<string>,location?:PdfLocation){
     if(artifact.revision===undefined)return;
     const identity=latest.current.key,ticket=++generation.current;
@@ -36,8 +34,8 @@ export function PdfModule({artifact,mode,capabilities,onTarget}:WorkspaceModuleP
     try {
       const pin=Boolean(location&&location.width===0&&location.height===0);
       const rectPt=location
-        ?[round2(location.x*location.pageWidth),round2(location.y*location.pageHeight),
-          round2(location.width*location.pageWidth),round2(location.height*location.pageHeight)]
+        ?[location.x*location.pageWidth,location.y*location.pageHeight,
+          location.width*location.pageWidth,location.height*location.pageHeight]
         :undefined;
       let pageHash:string|undefined,regionDigest:string|undefined,resolvedPageCount=pageCount,snippet=selectedText?.text;
       let meta:Awaited<ReturnType<typeof workspaceApi.range<PdfTargetMetaResponse>>>|null=null;
@@ -45,6 +43,7 @@ export function PdfModule({artifact,mode,capabilities,onTarget}:WorkspaceModuleP
         meta=await workspaceApi.range<PdfTargetMetaResponse>(artifact.id,{
           targetMetadata:'true',
           pageIndex,
+          ...(selectedText?{textTarget:true,textOffsetStart:selectedText.start,textOffsetEnd:selectedText.end}:{}),
           ...(rectPt?{rectPt:JSON.stringify(rectPt)}:{}),
         });
       }catch{/* Fall back to client-side HTTP-safe hashing if metadata endpoint is unavailable in mock harness. */}
@@ -65,20 +64,19 @@ export function PdfModule({artifact,mode,capabilities,onTarget}:WorkspaceModuleP
         expectedPageContentHash:pageHash,
       };
       let contentCoords:Record<string,unknown>|undefined;
-      let regionImagePngBase64:string|undefined;
       if(selectedText){
-        const pageText=meta?.target?.text;
-        const selected=selectedText.text.replace(/\s+/g,' ').trim();
-        const start=pageText?.indexOf(selected)??-1;
-        if(!pageText||!selected||start<0||pageText.indexOf(selected,start+1)>=0)throw Error('選択本文をページ内で一意に確認できません。');
-        const end=start+selected.length;
+        const pageText=meta?.target?.text,quadsPt=meta?.target?.quadsPt;
+        const {text:selected,start,end}=selectedText;
+        if(!pageText||!quadsPt||!selected||pageText.slice(start,end)!==selected)throw Error('ページ内の選択本文を確認できません。');
+        let occurrenceIndex=0;
+        for(let offset=pageText.indexOf(selected);offset>=0&&offset<start;offset=pageText.indexOf(selected,offset+1))occurrenceIndex++;
         selector.kind='pdf_text_range';
-        contentCoords={pageIndex,unit:'pt',quadsPt:selectedText.quadsPt};
+        contentCoords={pageIndex,unit:'pt',quadsPt};
         Object.assign(selector,{
-          quadsPt:selectedText.quadsPt,
+          quadsPt,
           textOffsetStart:start,textOffsetEnd:end,expectedSnippetHash:sha256Hex(selected),
           contextBeforeHash:sha256Hex(pageText.slice(Math.max(0,start-64),start)),
-          contextAfterHash:sha256Hex(pageText.slice(end,end+64)),occurrenceIndex:0,
+          contextAfterHash:sha256Hex(pageText.slice(end,end+64)),occurrenceIndex,
         });
       }
       if(location&&rectPt){
@@ -86,15 +84,11 @@ export function PdfModule({artifact,mode,capabilities,onTarget}:WorkspaceModuleP
         contentCoords={pageIndex,unit:'pt',...(pin?{xPt:rectPt[0],yPt:rectPt[1]}:{rectPt})};
         const digest=regionDigest??sha256Hex(JSON.stringify([pageHash,rectPt]));
         Object.assign(selector,pin?{xPt:rectPt[0],yPt:rectPt[1]}:{rectPt},{expectedRegionDigest:digest});
-        if(workerReady&&!pin){
-          try{
-            regionImagePngBase64=await workspaceApi.renderRegion(artifact,pageIndex,{x:location.x,y:location.y,width:location.width,height:location.height},'norm');
-          }catch{/* A pinned document and its coordinates remain sufficient to create a request. */}
-        }
+
       }
       if(latest.current.key!==identity||latest.current.mode!=='pin'||ticket!==generation.current)return;
       onTarget({baseRevision:artifact.revision,label:'ページ '+(pageIndex+1)+(location?(selector.kind==='pdf_pin'?' / ピン':' / 領域'):selectedText?' / 選択本文':''),
-        selectedContentSnapshot:snippet?.slice(0,50_000),selector,contentCoords,regionImagePngBase64});
+        selectedContentSnapshot:snippet?.slice(0,50_000),selector,contentCoords});
     }catch(e){
       if(latest.current.key===identity&&ticket===generation.current)setError(e instanceof Error?e.message:'ページを選択できませんでした。');
     }

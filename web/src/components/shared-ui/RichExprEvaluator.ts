@@ -6,7 +6,7 @@ export {
 } from '../../../../server/src/rich/rich-expr-evaluator';
 export type { ExprAst, RichEvalContext, RichEvalBudget } from '../../../../server/src/rich/rich-expr-evaluator';
 export {
-  RICH_LIMITS, topologicalSortComputed, validateRichDocument,
+  RICH_LIMITS, assertRichStateLimit, cloneRichStateValue, mergeRichState, topologicalSortComputed, validateRichDocument,
   compileRichDynamicPlan, evaluateRichDynamicState,
   validateRichMarkdownContent, validateRichMermaidCode,
   isValidHttpUrl, validateSafeFilename,

@@ -14,6 +14,8 @@ import {
   readXlsxRowColTarget,
   readXlsxSheetTarget,
 } from '../src/artifacts/adapters/ooxml-target.js';
+import { inspectPdfText } from '../src/artifacts/adapters/pdf-text-inspection.js';
+import { targetSelectorSchema } from '../src/artifacts/target-selector-schema.js';
 import { inspectPdfDocument, computePdfRegionDigest, readPdfPageTarget } from '../src/artifacts/adapters/pdf-target.js';
 import { sha256Hex } from '../../web/src/utils/sha256.js';
 import { auditRegions, decodePng } from '../../e2e/helpers/visualAudit.js';
@@ -483,6 +485,13 @@ describe('PR 3A Conformance Gap Fixes', () => {
       expect(adapter.resolveTarget(Buffer.from('Name,Score,Rank\nAlice,90,1\nBob,80,2\n'), fullSelector, csvMeta).status).toBe('needs_review');
       // Header change (selected rows 1..2 unchanged!) -> needs_review
       expect(adapter.resolveTarget(Buffer.from('Student,Points\nAlice,90\nBob,80\n'), fullSelector, csvMeta).status).toBe('needs_review');
+      const { target } = await server.ctx.artifactService.readRange(userId, created.artifact.id, {
+        targetMetadata: true, axis: 'row', start: 1, end: 2,
+      });
+      const rowSelector = targetSelectorSchema.parse({ ...(target as object), kind: 'csv_row_col', baseRevision: created.artifact.revision });
+      expect(adapter.resolveTarget(Buffer.from('Name,Score\nAlice,90\nBob,80\n'), rowSelector, csvMeta).status).toBe('resolved');
+      expect(adapter.resolveTarget(Buffer.from('Student,Points\nAlice,90\nBob,80\n'), rowSelector, csvMeta))
+        .toMatchObject({ status: 'needs_review', reason: 'header_changed' });
       // Row order swap inside selected range -> needs_review
       expect(adapter.resolveTarget(Buffer.from('Name,Score\nBob,80\nAlice,90\n'), fullSelector, csvMeta).status).toBe('needs_review');
     } finally {
@@ -524,6 +533,25 @@ describe('PR 3A Conformance Gap Fixes', () => {
       expect(typeof meta.target?.pageContentHash).toBe('string');
       expect(typeof meta.target?.regionDigest).toBe('string');
       expect(meta.target?.pageContentHash).not.toBe(created.artifact.sha256);
+
+      const selected = 'Revenue', start = 'Page One Revenue 100'.indexOf(selected), end = start + selected.length;
+      const { target: textTarget } = await server.ctx.artifactService.readRange(userId, created.artifact.id, {
+        pageIndex: 0, textTarget: true, textOffsetStart: start, textOffsetEnd: end, targetMetadata: true,
+      });
+      const layout = textTarget as { text: string; quadsPt: number[][] };
+      expect(layout.quadsPt).toHaveLength(1);
+      const selector = targetSelectorSchema.parse({
+        kind: 'pdf_text_range', baseRevision: created.artifact.revision, pageIndex: 0,
+        expectedPageCount: 2, expectedPageContentHash: meta.target!.pageContentHash,
+        textOffsetStart: start, textOffsetEnd: end, occurrenceIndex: 0, quadsPt: layout.quadsPt,
+        expectedSnippetHash: sha256Hex(selected), contextBeforeHash: sha256Hex(layout.text.slice(0, start)),
+        contextAfterHash: sha256Hex(layout.text.slice(end)),
+      });
+      expect(await server.ctx.artifactService.resolveTargetOnArtifact(userId, created.artifact.id, selector))
+        .toMatchObject({ status: 'resolved', resolvedSnippet: selected });
+      expect((await server.ctx.artifactService.readRange(userId, created.artifact.id, {
+        pageIndex: 0, rectPt: '[594,10,1.001,1]', targetMetadata: true,
+      })).target).toBeNull();
 
       const adapter = new FormatAdapterRegistry().resolve('report.pdf', 'pdf');
       const regionSelector = {
@@ -972,7 +1000,7 @@ describe('PR 3A Conformance Gap Fixes', () => {
     }
   });
 
-  it('Workstream 1 (DOCX, PDF text range & XLSX selectors): enforces optional blockIndex with paraId, pdf_text_range context/occurrence, and xlsx_row_col/xlsx_sheet/orderKeys', () => {
+  it('Workstream 1 (DOCX, PDF text range & XLSX selectors): enforces optional blockIndex with paraId, pdf_text_range context/occurrence, and xlsx_row_col/xlsx_sheet/orderKeys', async () => {
     const registry = new FormatAdapterRegistry();
 
     // 1. DOCX docx_paragraph with paraId and omitted blockIndex (Spec §5.2)
@@ -1001,35 +1029,23 @@ describe('PR 3A Conformance Gap Fixes', () => {
     const after = page0.text.slice(secondIdx + 4, Math.min(page0.text.length, secondIdx + 4 + 64));
     const sha = (s: string) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
     const pdfAdapter = registry.resolve('text.pdf', 'pdf');
-    const pdfMeta = { filename: 'text.pdf', relPath: 'text.pdf', mimeType: 'application/pdf' };
-
+    const pdfTextLayout = await inspectPdfText(pdfBuf, 0, secondIdx, secondIdx + 4);
+    const quadsPt = pdfTextLayout?.quadsForRange(secondIdx, secondIdx + 4);
+    expect(quadsPt).toHaveLength(1);
+    const pdfMeta = { filename: 'text.pdf', relPath: 'text.pdf', mimeType: 'application/pdf', pdfTextLayout };
+    const textSelector = {
+      kind: 'pdf_text_range', baseRevision: 1, pageIndex: 0, expectedPageCount: 1,
+      expectedPageContentHash: page0.pageContentHash, quadsPt,
+      textOffsetStart: secondIdx, textOffsetEnd: secondIdx + 4,
+      expectedSnippetHash: sha(slice), contextBeforeHash: sha(before), contextAfterHash: sha(after), occurrenceIndex: 1,
+    };
+    expect(pdfAdapter.resolveTarget(pdfBuf, targetSelectorSchema.parse(textSelector), pdfMeta).status).toBe('resolved');
+    expect(pdfAdapter.resolveTarget(pdfBuf, { ...textSelector, occurrenceIndex: 0 }, pdfMeta).status).toBe('needs_review');
     expect(pdfAdapter.resolveTarget(pdfBuf, {
-      kind: 'pdf_text_range',
-      pageIndex: 0,
-      expectedPageCount: 1,
-      expectedPageContentHash: page0.pageContentHash,
-      quadsPt: [[72, 70, 100, 70, 72, 90, 100, 90]],
-      textOffsetStart: secondIdx,
-      textOffsetEnd: secondIdx + 4,
-      expectedSnippetHash: sha(slice),
-      contextBeforeHash: sha(before),
-      contextAfterHash: sha(after),
-      occurrenceIndex: 1,
-    }, pdfMeta).status).toBe('resolved');
-
-    // Wrong occurrenceIndex -> needs_review
+      ...textSelector, quadsPt: pdfTextLayout?.quadsForRange(page0.text.indexOf('ITEM'), page0.text.indexOf('ITEM') + 4),
+    }, pdfMeta).status).toBe('needs_review');
     expect(pdfAdapter.resolveTarget(pdfBuf, {
-      kind: 'pdf_text_range',
-      pageIndex: 0,
-      expectedPageCount: 1,
-      expectedPageContentHash: page0.pageContentHash,
-      quadsPt: [[72, 70, 100, 70, 72, 90, 100, 90]],
-      textOffsetStart: secondIdx,
-      textOffsetEnd: secondIdx + 4,
-      expectedSnippetHash: sha(slice),
-      contextBeforeHash: sha(before),
-      contextAfterHash: sha(after),
-      occurrenceIndex: 0,
+      ...textSelector, quadsPt: quadsPt!.map(quad => quad.map(point => point - 1000)),
     }, pdfMeta).status).toBe('needs_review');
 
     // 3. XLSX expectedOrderKeysHash, xlsx_row_col, and xlsx_sheet
@@ -1063,15 +1079,23 @@ describe('PR 3A Conformance Gap Fixes', () => {
       expectedOrderKeysHash: '0'.repeat(64),
     }, xlsxMeta).status).toBe('needs_review');
 
-    const rowTarget = readXlsxRowColTarget(xlsxBuf, '1', 'row', 0)!;
-    expect(xlsxAdapter.resolveTarget(xlsxBuf, {
+    const rowTarget = readXlsxRowColTarget(xlsxBuf, '1', 'row', 0, 1)!;
+    const rowSelector = targetSelectorSchema.parse({
       kind: 'xlsx_row_col',
       sheetId: '1',
       axis: 'row',
-      index: 0,
+      baseRevision: 1,
+      start: 0,
+      end: 1,
       expectedSheetStructHash: rowTarget.expectedSheetStructHash,
-      expectedSliceHash: rowTarget.expectedSliceHash,
-    }, xlsxMeta).status).toBe('resolved');
+      expectedRangeValuesHash: rowTarget.expectedRangeValuesHash,
+    });
+    expect(xlsxAdapter.resolveTarget(xlsxBuf, rowSelector, xlsxMeta).status).toBe('resolved');
+    const drift = buildMinimalXlsx({ sharedStrings: ['Alpha', 'Beta'], sheets: [{ name: 'Sheet1', rows: [
+      { r: 1, cells: [{ ref: 'A1', v: 1, sharedString: true }, { ref: 'B1', v: 10 }] },
+      { r: 2, cells: [{ ref: 'A2', v: 0, sharedString: true }, { ref: 'B2', v: 20 }] },
+    ] }] });
+    expect(xlsxAdapter.resolveTarget(drift, rowSelector, xlsxMeta).status).toBe('needs_review');
 
     const sheetTarget = readXlsxSheetTarget(xlsxBuf, '1')!;
     expect(xlsxAdapter.resolveTarget(xlsxBuf, {

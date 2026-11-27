@@ -2041,12 +2041,19 @@ def process_pdf(request, source, output):
     if action == "render" or (action == "export" and request["targetFormat"] == "png"):
         index = bounded_integer(request.get("pageIndex", 0), 0, count - 1)
         page_obj = reader.pages[index]
-        page_size_pt = (float(page_obj.mediabox.width), float(page_obj.mediabox.height))
+        media, crop = page_obj.mediabox, page_obj.cropbox
+        width = min(float(media.right), float(crop.right)) - max(float(media.left), float(crop.left))
+        height = min(float(media.top), float(crop.top)) - max(float(media.bottom), float(crop.bottom))
+        if width <= 0 or height <= 0:
+            width, height = float(media.width), float(media.height)
+        unit = float(page_obj.user_unit)
+        unit = unit if math.isfinite(unit) and unit > 0 else 1
+        page_size_pt = (width * unit, height * unit)
         if int(page_obj.rotation or 0) % 180 == 90:
             page_size_pt = (page_size_pt[1], page_size_pt[0])
         prefix = str(output) + "-image"
         subprocess.run(["pdftoppm", "-f", str(index + 1), "-l", str(index + 1), "-scale-to", "2048",
-                        "-singlefile", "-png", str(source), prefix], check=True)
+                        "-cropbox", "-singlefile", "-png", str(source), prefix], check=True)
         Path(prefix + ".png").replace(output)
         crop_png_region(output, request.get("region"), page_size_pt=page_size_pt)
         return None
@@ -2114,6 +2121,26 @@ def media_info(source, demuxer):
     return {"format": "media", "durationSeconds": duration, "streams": data["streams"]}
 
 
+def verified_video_packet_pts(source, demuxer, sample):
+    timestamp = float(sample["timestampSec"])
+    digest = str(sample["sha256"])
+    if not math.isfinite(timestamp) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("Invalid video sample fingerprint")
+    interval = f"{timestamp - 1:.9f}%{timestamp + 1:.9f}"
+    completed = subprocess.run(
+        ["ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-f", demuxer,
+         "-select_streams", "v:0", "-read_intervals", interval, "-show_packets", "-show_data_hash", "sha256",
+         "-show_entries", "packet=pts,pts_time,data_hash", "-of", "json", str(source)],
+        capture_output=True, check=True,
+    )
+    packets = json.loads(completed.stdout).get("packets", [])
+    at_timestamp = [packet for packet in packets if "pts" in packet and "pts_time" in packet
+                    and abs(float(packet["pts_time"]) - timestamp) <= 0.00000051]
+    if len(at_timestamp) != 1 or str(at_timestamp[0].get("data_hash", "")).lower() != f"sha256:{digest}":
+        raise ValueError("Video frame packet could not be verified")
+    return int(at_timestamp[0]["pts"])
+
+
 def process_media(request, source, output):
     extension = request["filename"].rsplit(".", 1)[-1].lower()
     muxer = {"mp4": "mp4", "webm": "webm", "mp3": "mp3", "wav": "wav", "m4a": "ipod",
@@ -2126,13 +2153,25 @@ def process_media(request, source, output):
     if action == "verify":
         return {"ok": True, "issues": [], "metrics": options}
     command = ["ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file,pipe",
-               "-threads", "2", "-f", demuxer, "-i", str(source)]
+               "-threads", "2", "-f", demuxer]
+    sample = request.get("frameSample") if action == "render" else None
+    if sample is not None:
+        pts = verified_video_packet_pts(source, demuxer, sample)
+        command += ["-copyts"]
+        if float(sample["timestampSec"]) > 2:
+            command += ["-seek_timestamp", "1", "-ss", str(float(sample["timestampSec"]) - 2)]
+    command += ["-i", str(source)]
     if action == "render":
-        timestamp = float(request.get("timeSeconds", 0))
-        if not 0 <= timestamp <= options["durationSeconds"]:
-            raise ValueError("Frame timestamp is out of bounds")
-        command += ["-ss", str(timestamp), "-map", "0:v:0", "-frames:v", "1",
-                    "-vf", "scale=2048:2048:force_original_aspect_ratio=decrease", "-f", "image2", "-c:v", "png"]
+        filters = "scale=2048:2048:force_original_aspect_ratio=decrease"
+        if sample is not None:
+            filters = f"select=eq(pts\\,{pts}),{filters}"
+        else:
+            timestamp = float(request.get("timeSeconds", 0))
+            if not 0 <= timestamp <= options["durationSeconds"]:
+                raise ValueError("Frame timestamp is out of bounds")
+            command += ["-ss", str(timestamp)]
+        command += ["-map", "0:v:0", "-frames:v", "1", "-fps_mode", "vfr",
+                    "-vf", filters, "-f", "image2", "-c:v", "png"]
     elif action == "edit":
         operations = request["operations"]
         if len(operations) != 1 or operations[0]["op"] != "media.trim":

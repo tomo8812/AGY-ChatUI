@@ -53,7 +53,7 @@ const fields = {
   xlsx_defined_name: { name: text, expectedFormulaHash: hash },
   csv_range: { startRow: index, endRow: index, startCol: index, endCol: index,
     expectedRowCount: positive, expectedColCount: positive, expectedRangeValuesHash: hash, expectedHeaderHash: hash },
-  csv_row_col: { ...slice, expectedRowCount: positive, expectedColCount: positive, expectedRangeValuesHash: hash },
+  csv_row_col: { ...slice, expectedRowCount: positive, expectedColCount: positive, expectedRangeValuesHash: hash, expectedHeaderHash: hash },
   pdf_page: page,
   pdf_text_range: { ...page, ...snippet, textOffsetStart: index, textOffsetEnd: positive,
     quadsPt: z.array(z.tuple([num, num, num, num, num, num, num, num])).min(1) },
@@ -92,7 +92,7 @@ const fields = {
   rich_repeat_item: { ...rich, repeatNodeId: text, itemKey: id.optional(), itemIndex: index, expectedItemHash: hash, expectedListOrderHash: hash },
   rich_svg_element: { ...rich, svgNodeId: text, elementId: text.optional(), expectedTag: text, expectedElementFingerprint: hash },
   rich_chart_series: { ...rich, chartNodeId: text, seriesKey: text, dataIndex: index.optional(), expectedSeriesFingerprint: hash },
-  rich_table_cell: { ...rich, tableNodeId: text, ...cell, col: text, expectedRowKey: id.optional() },
+  rich_table_cell: { ...rich, tableNodeId: text, ...cell, col: text, expectedRowKey: id.optional(), expectedRowHash: hash.optional(), expectedRowOrderHash: hash.optional() },
 } satisfies Record<string, z.ZodRawShape>;
 
 const schemas = new Map(Object.entries(fields).map(([kind, shape]) =>

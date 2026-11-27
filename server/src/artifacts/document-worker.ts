@@ -42,7 +42,7 @@ type WorkerAction =
   | { action: 'pptx_draft_layer'; operations: AdapterOperation[]; pageIndex: number; variant: 'background' | 'sprite'; draftShapeKey?: string }
   | { action: 'xlsx_draft_range'; operations: AdapterOperation[]; sheetName: string; rangeA1: string }
   | { action: 'create'; params: Record<string, unknown> }
-  | { action: 'render'; pageIndex?: number; timeSeconds?: number; variant?: 'background' | 'sprite'; shapeId?: number; cropSprite?: boolean; region?: RenderRegion }
+  | { action: 'render'; pageIndex?: number; timeSeconds?: number; frameSample?: {timestampSec: number; sha256: string}; variant?: 'background' | 'sprite'; shapeId?: number; cropSprite?: boolean; region?: RenderRegion }
   | { action: 'export'; targetFormat: string; region?: RenderRegion };
 
 export type DocumentInputSource = Buffer | { path: string; sizeBytes: number };

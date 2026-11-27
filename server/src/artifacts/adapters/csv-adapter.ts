@@ -620,17 +620,17 @@ export class CsvAdapter implements FormatAdapter {
       return { status: 'needs_review', reason: 'col_count_changed' };
     }
 
-    if (selector.kind === 'csv_range') {
-      if (typeof selector.expectedHeaderHash !== 'string' || !selector.expectedHeaderHash) {
-        return { status: 'needs_review', reason: 'missing_expected_header_hash' };
-      }
-      if (headerHash !== selector.expectedHeaderHash) {
-        return { status: 'needs_review', reason: 'header_changed' };
-      }
-      if (typeof selector.expectedRangeValuesHash !== 'string' || !selector.expectedRangeValuesHash) {
-        return { status: 'needs_review', reason: 'missing_expected_range_values_hash' };
-      }
+    if (typeof selector.expectedHeaderHash !== 'string' || !selector.expectedHeaderHash) {
+      return { status: 'needs_review', reason: 'missing_expected_header_hash' };
+    }
+    if (headerHash !== selector.expectedHeaderHash) {
+      return { status: 'needs_review', reason: 'header_changed' };
+    }
+    if (typeof selector.expectedRangeValuesHash !== 'string' || !selector.expectedRangeValuesHash) {
+      return { status: 'needs_review', reason: 'missing_expected_range_values_hash' };
+    }
 
+    if (selector.kind === 'csv_range') {
       const sr = Number(selector.startRow);
       const er = Number(selector.endRow);
       const sc = Number(selector.startCol);
@@ -653,14 +653,8 @@ export class CsvAdapter implements FormatAdapter {
       };
     }
 
-    // csv_row_col
-    if (selector.expectedHeaderHash !== undefined && headerHash !== String(selector.expectedHeaderHash)) {
-      return { status: 'needs_review', reason: 'header_changed' };
-    }
-    if (typeof selector.expectedRangeValuesHash !== 'string' || !selector.expectedRangeValuesHash) {
-      return { status: 'needs_review', reason: 'missing_expected_range_values_hash' };
-    }
-    const axis = String(selector.axis ?? 'row');
+    const { axis } = selector;
+    if (axis !== 'row' && axis !== 'col') return { status: 'stale', reason: 'range_out_of_bounds' };
     const start = Number(selector.start);
     const end = Number(selector.end);
     if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start) {

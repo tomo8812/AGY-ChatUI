@@ -342,22 +342,11 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
       const element=shapeId?metadata.shapes.find(item=>item.id===shapeId):undefined;
       if(shapeId&&!element)throw Error('選択した要素を識別できません。');
       const pageIndex=savedSlides.findIndex(item=>item.id===targetSlide.id),label='スライド '+(pageIndex+1);
-      let regionImagePngBase64:string|undefined;
-      const boundsFromScene=shapeId&&data?.shapes.find(item=>item.id===shapeId)?.transform?.geomBoundsPt;
-      if(workerReady&&boundsFromScene&&size){
-        const x=Math.max(0,boundsFromScene.x),y=Math.max(0,boundsFromScene.y);
-        const width=Math.min(size.widthPt,boundsFromScene.x+boundsFromScene.width)-x;
-        const height=Math.min(size.heightPt,boundsFromScene.y+boundsFromScene.height)-y;
-        if(width>0&&height>0){
-          try{regionImagePngBase64=await workspaceApi.renderRegion(artifact,pageIndex,{x,y,width,height},'pt')}
-          catch{/* The selected structure remains available when cropping fails. */}
-        }
-      }
       if(!isCurrent())return;
       onTarget({baseRevision:artifact.revision,label:element?label+' / '+element.name:label,
         selector:element?{kind:'pptx_element',slideId:targetSlide.id,shapeId:Number(element.id),groupPath:element.groupPath,expectedElementFingerprint:element.fingerprint}
           :{kind:'pptx_slide',slideId:targetSlide.id,expectedSlideHash:metadata.slideHash},
-        selectedContentSnapshot:element?.text.slice(0,50_000),contentCoords,regionImagePngBase64});
+        selectedContentSnapshot:element?.text.slice(0,50_000),contentCoords});
     }catch(e){if(isCurrent())setOperationError(e instanceof Error?e.message:'対象を識別できません。')}
   }
   const primary=<><span className="workspace-slide-counter" title="スライド番号">{index+1} / {slides.length}</span>

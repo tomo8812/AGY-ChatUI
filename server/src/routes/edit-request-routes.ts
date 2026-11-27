@@ -1,3 +1,4 @@
+import type { ExecutionScheduler } from '../acp/scheduler.js';
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { isArtifactError } from '../artifacts/errors.js';
@@ -7,6 +8,7 @@ import { requireAuth, type RouteDeps } from './auth-routes.js';
 
 export interface EditRequestRouteDeps extends RouteDeps {
   editRequestService: EditRequestService;
+  scheduler: ExecutionScheduler;
 }
 
 function sendEditRequestError(reply: FastifyReply, err: unknown) {
@@ -40,15 +42,12 @@ function parseSelector(selector: unknown, baseRevision?: number) {
   );
 }
 
-function targetInput<T extends { regionImagePngBase64?: string | null }>({ regionImagePngBase64, ...data }: T) {
-  return {
-    ...data,
-    regionImagePngBuffer: regionImagePngBase64 ? Buffer.from(regionImagePngBase64, 'base64') : null,
-  };
+function targetInput<T extends { regionImagePngBase64?: string | null }>({ regionImagePngBase64: _legacyImage, ...data }: T) {
+  return data;
 }
 
 export async function registerEditRequestRoutes(app: FastifyInstance, deps: EditRequestRouteDeps): Promise<void> {
-  const { db, editRequestService } = deps;
+  const { db, editRequestService, scheduler } = deps;
 
   app.get('/api/chats/:chatId/edit-requests', async (req, reply) => {
     const session = requireAuth(req, reply, db);
@@ -171,15 +170,26 @@ export async function registerEditRequestRoutes(app: FastifyInstance, deps: Edit
       .object({
         requestIds: z.array(z.string().min(1)).min(1),
         sentMessageId: z.string().optional().nullable(),
+        clientMessageId: z.string().uuid().optional(),
       })
       .safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: 'INVALID_INPUT' });
+    if (parsed.data.clientMessageId && db.getAgyProfile(session.user.id)?.authStatus !== 'authenticated') {
+      return reply.code(403).send({ error: 'AGY_AUTH_REQUIRED', message: 'Antigravity認証が必要です。' });
+    }
     try {
+      const clientMessageId = parsed.data.clientMessageId;
       return await editRequestService.sendBatch({
         userId: session.user.id,
         chatId,
         requestIds: parsed.data.requestIds,
         sentMessageId: parsed.data.sentMessageId,
+        ...(clientMessageId && { submit: {
+          clientMessageId,
+          enqueue: (text, persist) => scheduler.enqueueTurn({
+            userId: session.user.id, chatId, userText: text, attachments: [], clientMessageId, persistWithMessage: persist,
+          }),
+        } }),
       });
     } catch (err) {
       return sendEditRequestError(reply, err);
