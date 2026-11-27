@@ -26,7 +26,7 @@ export function inspectArtifactTarget<T>(job: InspectionJob): Promise<T> {
     const rssLimit = Math.min(MAX_INSPECTION_RSS_MB, Math.ceil((document || media ? 256 : 192) + totalInputMb * (document ? 100 : 24)));
     const physicalAvailable = readMemAvailableMb() ?? Infinity;
     const processAvailable = process.availableMemory() / 1024 ** 2;
-    if (Math.min(physicalAvailable, processAvailable || Infinity) < rssLimit + 128) {
+    if (Math.min(physicalAvailable, processAvailable) < rssLimit + 128) {
       reject(new ArtifactError('RESOURCE_BUSY', '対象の解析に必要なメモリが不足しています。', 503));
       return;
     }

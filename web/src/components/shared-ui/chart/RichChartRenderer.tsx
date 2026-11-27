@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { extent, sum } from 'd3-array';
 import { scaleLinear, scaleBand } from 'd3-scale';
 import { arc as d3Arc, line as d3Line, area as d3Area } from 'd3-shape';
-import { resolveRichChartPoint } from '../../../../../shared/rich-chart-display';
+import { resolveRichChartPoint, richChartAxisPosition } from '../../../../../shared/rich-chart-display';
 import type { RichChartNode, RichChartDatum, RichSourceEntry } from '../../../../../shared/rich-schema';
 import type { RichEvalContext } from '../RichExprEvaluator';
 import { formatDisplayDate, parseDisplayDate } from '../display/formatDate';
@@ -130,9 +130,7 @@ export function renderRichChart({ node, context, cycle, select, clipId, sources 
     const stacked = node.chartType === 'stacked_bar' || node.chartType === 'stacked_area';
     const horizontal = node.chartType === 'hbar';
     const numericX = node.xAxis?.type === 'number' || node.xAxis?.type === 'time';
-    const xn = (x: string | number) => node.xAxis?.type === 'time'
-      ? parseChartTime(x)
-      : typeof x === 'number' || x.trim() ? Number(x) : NaN;
+    const xn = (x: string | number) => richChartAxisPosition(x, node.xAxis?.type === 'time' ? 'time' : 'number');
     const dataX = series.flatMap(s => s.points.map(p => p.x));
     const cat = [...new Set([...categories, ...dataX])];
     const xvals = numericX ? [...new Set(cat.map(xn).filter(finite))].sort((a,b)=>a-b) : [];

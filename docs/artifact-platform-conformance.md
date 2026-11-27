@@ -408,4 +408,4 @@ HEAD `807e4ff` 以降の設計書（4.3 節、5.2 節、6.2 節、7.1 節、PIN-
 
 **検証区分**。実ファイル・SQLite・実 HTTP MCP・実ビルドは `VERIFIED (REAL RUNTIME)`。Playwright とモック ACP は `VERIFIED (MOCK / EMULATION)`。実 `agy acp`、物理 iPhone、Microsoft Office の再編集は `UNVERIFIED (REQUIRES REAL AGY / PHYSICAL IPHONE)` または対応する実環境が必要。検証対象コミットの [CI と UI 実行結果](https://github.com/tomo8812/AGY-ChatUI/pull/38/checks) を参照。
 
-ローカル検証では、関連サーバースイート 68 件、所属タブの追加回帰 1 件、対象 Python 実ファイル検証 3 件、Chromium と iPhone ビューポートの WebKit でそれぞれリッチ UI 回帰 5 件が通過した。縦書き CID フォントを使った PDF では 5 文字全体と先頭 2 文字の座標を取得した。これらはテスト対象とした条件に限定される。Compact/Full の LibreOffice 描画一致を含むブラウザ全体の実行結果は、該当コミットの CI を参照する。
+ローカル検証では、関連サーバースイート 68 件、所属タブの追加回帰 1 件、Python 実ファイル検証 37 件（1 件スキップ）、Chromium と iPhone ビューポートの WebKit でそれぞれリッチ UI 回帰 5 件が通過した。実 PDF で縦書き CID フォントと RTL の部分選択を確認した。正規化で複数文字となる合字はグリフ全体の選択だけが成立することを確認した。ネストしたページツリーの再並べ替えでは目次、添付、メタデータを確認した。これらはテスト対象とした条件に限定される。Compact/Full の LibreOffice 描画一致を含むブラウザ全体の実行結果は、該当コミットの CI を参照する。

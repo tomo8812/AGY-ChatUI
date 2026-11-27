@@ -616,7 +616,16 @@ export function validateRichDocument(
           checkExprSyntax(sa.filenameExpr, `${ap}.filenameExpr`);
           checkExprSyntax(sa.contentExpr, `${ap}.contentExpr`);
         }
-        if (act.type === 'submit_to_chat') checkExprSyntax((act as { textExpr?: unknown }).textExpr, `${ap}.textExpr`);
+        if (act.type === 'submit_to_chat') {
+          checkExprSyntax(act.textExpr, `${ap}.textExpr`);
+          if (act.requireConfirm !== undefined && typeof act.requireConfirm !== 'boolean') {
+            issues.push({ code: 'RICH_INVALID_ACTION', path: `${ap}.requireConfirm`, message: 'Expected a boolean.', severity: 'error' });
+          }
+        }
+        if (act.type === 'start_pin_edit' && act.targetNodeId !== undefined &&
+            (typeof act.targetNodeId !== 'string' || !act.targetNodeId.trim())) {
+          issues.push({ code: 'RICH_INVALID_ACTION', path: `${ap}.targetNodeId`, message: 'Expected a node ID.', severity: 'error' });
+        }
       } else if (STATE_ACTION_TYPES.has(act.type as RichStateAction['type'])) {
         if (act.type === 'set_state') {
           const sa = act as Extract<RichStateAction, { type: 'set_state' }>;
@@ -629,10 +638,18 @@ export function validateRichDocument(
           if (!declaredStateKeys.has(key)) {
             issues.push({ code: 'RICH_UNDECLARED_STATE_KEY', path: `${ap}.key`, message: `State key '${key}' is not declared in document.state.`, severity: 'error' });
           }
-          if (act.type === 'increment_state' && act.deltaExpr !== undefined) {
-            checkExprSyntax(act.deltaExpr, `${ap}.deltaExpr`);
+          if (act.type === 'increment_state') {
+            if (act.deltaExpr !== undefined) checkExprSyntax(act.deltaExpr, `${ap}.deltaExpr`);
+            if ([act.min, act.max].some(value => value !== undefined && !Number.isFinite(value)) ||
+                (act.min ?? -Infinity) > (act.max ?? Infinity)) {
+              issues.push({ code: 'RICH_INVALID_ACTION', path: ap, message: 'Invalid increment bounds.', severity: 'error' });
+            }
           }
-        } else if (act.type === 'reset_state' && Array.isArray(act.keys)) {
+        } else if (act.type === 'reset_state' && act.keys !== undefined) {
+          if (!Array.isArray(act.keys)) {
+            issues.push({ code: 'RICH_INVALID_ACTION', path: `${ap}.keys`, message: 'Expected a list of state keys.', severity: 'error' });
+            continue;
+          }
           for (const k of act.keys) {
             if (!declaredStateKeys.has(k)) {
               issues.push({ code: 'RICH_UNDECLARED_STATE_KEY', path: `${ap}.keys`, message: `State key '${k}' is not declared in document.state.`, severity: 'error' });

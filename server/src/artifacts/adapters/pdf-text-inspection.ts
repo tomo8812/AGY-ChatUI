@@ -50,22 +50,29 @@ export async function inspectPdfText(bytes: Buffer, pageIndex: number, start?: n
         if (font?.isType3Font) continue;
         const scale = state.size * (font?.fontMatrix?.[0] ?? 0.001);
         const vertical = font?.vertical === true;
-        let text = '', advance = 0;
+        let text = '', normalizedText = '', advance = 0;
         const glyphText: string[] = [];
         const offsets = new Map<number, number>([[0, 0]]);
+        const normalizedOffsets = new Map<number, number>([[0, 0]]);
         for (const glyph of glyphs) {
           if (typeof glyph === 'number') {
             advance += (vertical ? glyph : -glyph) * state.size / 1000;
           } else {
             offsets.set(text.length, advance);
+            normalizedOffsets.set(normalizedText.length, advance);
             text += glyph.unicode;
             glyphText.push(glyph.unicode);
+            // A normalized ligature contributes one pair of glyph boundaries.
+            normalizedText += glyph.unicode.normalize('NFKC');
             advance += (vertical ? -(glyph.vmetric?.[0] ?? -glyph.width) : glyph.width) * scale + state.charSpacing + (glyph.isSpace ? state.wordSpacing : 0);
             offsets.set(text.length, advance);
+            normalizedOffsets.set(normalizedText.length, advance);
           }
         }
         if (!text || !Number.isFinite(advance) || advance <= 0) continue;
-        for (const [offset, position] of offsets) offsets.set(offset, position / advance);
+        for (const positions of [offsets, normalizedOffsets]) {
+          for (const [offset, position] of positions) positions.set(offset, position / advance);
+        }
         const register = (direction: string, value: string, positions: Map<number, number>) => {
           const key = JSON.stringify([state.font, direction, value]);
           const existing = runs.get(key);
@@ -73,6 +80,7 @@ export async function inspectPdfText(bytes: Buffer, pageIndex: number, start?: n
           else runs.set(key, [positions]);
         };
         register(vertical ? 'ttb' : 'ltr', text, offsets);
+        if (text !== normalizedText) register(vertical ? 'ttb' : 'ltr', normalizedText, normalizedOffsets);
         if (!vertical && glyphText.every(value => /^[\p{Script=Hebrew}\p{Script=Arabic}]+$/u.test(value))) {
           let logicalOffset = 0, physicalOffset = text.length;
           const reversed = new Map<number, number>([[0, 1]]);

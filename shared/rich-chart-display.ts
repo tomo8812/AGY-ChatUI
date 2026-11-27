@@ -4,6 +4,16 @@ export function isRichChartCoordinate(value: unknown): value is string | number 
   return typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value));
 }
 
+export function parseRichChartTime(value: string | number): number {
+  if (typeof value === 'number') return new Date(value).getTime();
+  return new Date(/^\d{4}-\d{2}-\d{2}$/.test(value) ? value + 'T00:00:00' : value).getTime();
+}
+
+export function richChartAxisPosition(value: string | number, axisType: 'number' | 'time'): number {
+  if (axisType === 'time') return parseRichChartTime(value);
+  return typeof value === 'number' || value.trim() ? Number(value) : NaN;
+}
+
 export function isRichChartPoint(value: unknown): value is number | null | RichChartDatum {
   if (value === null || typeof value === 'number' && Number.isFinite(value)) return true;
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;

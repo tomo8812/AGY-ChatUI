@@ -502,7 +502,12 @@ it('rejects invalid literal and evaluated chart points, ambiguous sources and gr
   const doc = (root: unknown, state?: Record<string, unknown>, sources?: unknown[]) => ({ schemaVersion: 1, root, state, sources });
   const chart = { id: 'chart', type: 'chart', chartType: 'bar', series: [{ key: 'price', label: 'Price', data: [1, null] }] };
   const invalidPoint = [{ y: '1' }];
+  const dated = { ...chart, xAxis: { type: 'time' }, categories: ['2026-11-27'] };
   expect(validateRichDocument(doc(chart)).valid).toBe(true);
+  expect(validateRichDocument(doc(dated)).valid).toBe(true);
+  expect(validateRichDocument(doc({ ...dated, categories: ['invalid date'] })).valid).toBe(false);
+  expect(validateRichDocument(doc({ ...dated, series: [{ ...chart.series[0], data: { expr: '$state.points' } }] },
+    { points: [{ x: 'invalid date', y: 4 }] })).valid).toBe(false);
   expect(validateRichDocument(doc({ ...chart, series: [chart.series[0], chart.series[0]] })).valid).toBe(false);
   expect(validateRichDocument(doc({ ...chart, series: [{ ...chart.series[0], data: invalidPoint }] })).valid).toBe(false);
   expect(validateRichDocument(doc({ ...chart, series: [{ ...chart.series[0], data: { expr: '$state.points' } }] },

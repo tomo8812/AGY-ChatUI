@@ -1,4 +1,4 @@
-import { isRichChartCoordinate, isRichChartPoint } from '../../../shared/rich-chart-display.js';
+import { isRichChartCoordinate, isRichChartPoint, richChartAxisPosition } from '../../../shared/rich-chart-display.js';
 import type { RichNode } from '../../../shared/rich-schema.js';
 
 type Check = (value: unknown) => boolean;
@@ -75,7 +75,7 @@ const contracts: Record<RichNode['type'], NodeContract> = {
   }, optionalValues: { title: string } },
   node_edge_diagram: { required: { diagramLayout: oneOf('dag_tb', 'dag_lr', 'radial', 'manual') },
     values: { nodes: Array.isArray, edges: Array.isArray }, optional: { zoomable: boolean } },
-  chart: { optional: { heightPx: number, legend: oneOf('top', 'bottom', 'none'), connectNulls: boolean }, optionalValues: { title: string, categories: array(isRichChartCoordinate) } },
+  chart: { optional: { heightPx: number, legend: oneOf('top', 'bottom', 'none'), connectNulls: boolean }, optionalValues: { title: string } },
   button: { values: activeText, optional: { variant: oneOf('primary', 'secondary', 'ghost', 'danger'), icon: string, disabledWhen: nonEmpty } },
   clickable, selectable_card: clickable,
   text_input: textInput, textarea: textInput,
@@ -132,6 +132,9 @@ export function visitRichNodeValues(node: RichNode, visit: (value: unknown, chec
   }
   if (node.type === 'chart' && Array.isArray(node.series)) {
     const xAxis = node.xAxis;
+    const checkX: Check = value => isRichChartCoordinate(value) &&
+      (xAxis?.type !== 'number' && xAxis?.type !== 'time' || Number.isFinite(richChartAxisPosition(value, xAxis.type)));
+    if (node.categories !== undefined) visit(node.categories, array(checkX), 'categories');
     if (xAxis !== undefined) visit(xAxis, value => object(value) && validOptional(value, {
       label: string, unit: string, format: string, type: oneOf('category', 'number', 'time'),
     }), 'xAxis');
@@ -139,7 +142,8 @@ export function visitRichNodeValues(node: RichNode, visit: (value: unknown, chec
       if (!series || typeof series !== 'object') return;
       const base = `series[${index}]`;
       visit(series.label, string, base + '.label');
-      visit(series.data, array(isRichChartPoint), base + '.data');
+      visit(series.data, array(point => isRichChartPoint(point) &&
+        (!point || typeof point !== 'object' || point.x === undefined || checkX(point.x))), base + '.data');
       if (series.asOf !== undefined) visit(series.asOf, string, base + '.asOf');
     });
     for (const [path, axis] of [['yAxis', node.yAxis], ['yAxisRight', node.yAxisRight]] as const) {
@@ -154,7 +158,7 @@ export function visitRichNodeValues(node: RichNode, visit: (value: unknown, chec
       if (Array.isArray(node.referenceLines)) node.referenceLines.forEach((line, index) => {
         if (!line || typeof line !== 'object') return;
         const base = `referenceLines[${index}]`;
-        visit(line.value, line.axis === 'y' ? number : isRichChartCoordinate, base + '.value');
+        visit(line.value, line.axis === 'y' ? number : checkX, base + '.value');
         if (line.label !== undefined) visit(line.label, string, base + '.label');
       });
     }

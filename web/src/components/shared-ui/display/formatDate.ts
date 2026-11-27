@@ -1,10 +1,7 @@
 const defaultFormat = new Intl.DateTimeFormat(undefined, { year: 'numeric', month: '2-digit', day: '2-digit' });
 const shortMonth = new Intl.DateTimeFormat(undefined, { month: 'short' });
 
-export function parseDisplayDate(value: string | number): number {
-  if (typeof value === 'number') return new Date(value).getTime();
-  return new Date(/^\d{4}-\d{2}-\d{2}$/.test(value) ? value + 'T00:00:00' : value).getTime();
-}
+export { parseRichChartTime as parseDisplayDate } from '../../../../../shared/rich-chart-display';
 
 export function formatDisplayDate(value: number, format?: string): string {
   const date = new Date(value);
