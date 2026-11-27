@@ -140,8 +140,7 @@ export class HtmlAdapter implements FormatAdapter {
 
   resolveTarget(buffer: Buffer, selector: TargetSelector, _meta: AdapterFileMeta): TargetResolutionResult {
     const text = buffer.toString('utf8');
-    if (selector.kind === 'html_dom_element' ||
-        (selector.kind === 'html_text_range' && typeof selector.cssSelector === 'string')) {
+    if (selector.kind === 'html_dom_element' || selector.kind === 'html_text_range') {
       const cssSelector = String(selector.cssSelector ?? '').trim();
       const expectedTag = selector.expectedTag ? String(selector.expectedTag).toLowerCase() : null;
       let found: ReturnType<typeof selectHtmlElements>;
@@ -163,7 +162,24 @@ export class HtmlAdapter implements FormatAdapter {
           return { status: 'needs_review', reason: 'invalid_text_range' };
         }
         const content = el.textContent.slice(charStart, charEnd);
-        if (sha256Text(content) !== selector.expectedSnippetHash || el.textContent.indexOf(content) !== el.textContent.lastIndexOf(content)) return { status: 'needs_review', reason: 'text_range_changed' };
+        const contextMatches = (offset: number) => {
+          const end = offset + content.length;
+          return sha256Text(el.textContent.slice(Math.max(0, offset - 64), offset)) === selector.contextBeforeHash &&
+            sha256Text(el.textContent.slice(end, end + 64)) === selector.contextAfterHash;
+        };
+        if (sha256Text(content) !== selector.expectedSnippetHash || !contextMatches(charStart)) {
+          return { status: 'needs_review', reason: 'text_range_changed' };
+        }
+        let occurrence = 0;
+        for (let offset = el.textContent.indexOf(content); offset >= 0; offset = el.textContent.indexOf(content, offset + 1)) {
+          if (offset === charStart && occurrence !== selector.occurrenceIndex) {
+            return { status: 'needs_review', reason: 'text_occurrence_changed' };
+          }
+          if (offset !== charStart && contextMatches(offset)) {
+            return { status: 'needs_review', reason: 'ambiguous_multiple_matches' };
+          }
+          occurrence++;
+        }
         return { status: 'resolved', resolvedSnippet: content, resolvedRange: { charStart, charEnd } };
       }
       if ((expectedTag && el.tag.toLowerCase() !== expectedTag) || el.fingerprint !== selector.expectedElementFingerprint) {
@@ -172,7 +188,7 @@ export class HtmlAdapter implements FormatAdapter {
       return { status: 'resolved', resolvedSnippet: text.slice(el.start, el.end) };
     }
 
-    if (selector.kind === 'html_source_range' || selector.kind === 'html_text_range') {
+    if (selector.kind === 'html_source_range') {
       return resolveTextSnippetByContext({
         text,
         startLine: Number(selector.startLine ?? 1),
