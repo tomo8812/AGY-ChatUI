@@ -901,6 +901,7 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
     );
     expect(userResolved.status).toBe(200);
     expect(userResolved.data.request.status).toBe('resolved');
+    await expect.poll(() => srv.ctx.db.getActiveRunForChat(userId, chatId), { timeout: 12_000 }).toBeNull();
   }, 45_000);
 
   it('ARCH-08, ARCH-09 & Basic 8 Adapters: supports immutable revision Range serving, WS user_seq/pong/snapshot, and Pure-JS CRUD/verify/export', async () => {

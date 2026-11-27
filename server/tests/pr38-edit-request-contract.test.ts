@@ -162,6 +162,7 @@ it('validates source pins through REST, rolls back reorder and state events, and
   expect(ctx.editRequestService.getRequest(userId, chatId, first.id)?.status).toBe('applied_unverified');
   writeFileSync(targetFile, 'new before\ncorrected choice\nnew after');
   expect((await ctx.editRequestService.resolveByUser(userId, chatId, first.id)).status).toBe('resolved');
+  await expect.poll(() => ctx.db.getActiveRunForChat(userId, chatId), { timeout: 12_000 }).toBeNull();
   client.closeWs();
   otherDevice.closeWs();
 }, 50_000);
@@ -289,6 +290,7 @@ it('uses Base ChatUI media duration and verifies the exact time range against so
   const payload = await ctx.editRequestService.getForAgent(userId, chatId, request.id);
   expect(payload).toMatchObject({ status: 'sent', targetRevision: 1, reResolution: { status: 'resolved' } });
   expect(payload.regionImagePngBase64).toBeUndefined();
+  await expect.poll(() => ctx.db.getActiveRunForChat(userId, chatId), { timeout: 12_000 }).toBeNull();
 });
 
 it('validates persisted rich state and resolves a table cell against its captured state and row order', async () => {
