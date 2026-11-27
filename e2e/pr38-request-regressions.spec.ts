@@ -1,8 +1,9 @@
 import { expect, test } from '@playwright/test';
 import { createTestServer, seedAuthenticatedMockProfile, TestApiClient } from '../server/tests/helpers/test-harness.js';
 
-test('LAN HTTP submits a UUID and discards source selections returned out of order', async ({ page }, info) => {
+test('LAN HTTP submits the latest target and compares applied revisions', async ({ page }, info) => {
   test.skip(info.project.name !== 'pc-chromium');
+  test.setTimeout(90_000);
   const server = await createTestServer({ INSTALL_DOC_RUNTIME: '0' });
   try {
     const client = new TestApiClient(server.baseUrl);
@@ -73,6 +74,22 @@ test('LAN HTTP submits a UUID and discards source selections returned out of ord
     expect(id).toMatch(/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
     expect(server.ctx.editRequestService.getRequest(userId, chat.id, request.id)?.sentMessageId)
       .toBe(server.ctx.db.findMessageByClientId(userId, chat.id, id)?.id);
+
+    await server.ctx.editRequestService.getForAgent(userId, chat.id, request.id);
+    const edited = await server.ctx.artifactService.editArtifact({
+      userId, artifactId: artifact.id, expectedRevision: 1,
+      actorKind: 'ai', actorId: userId, editRequestIds: [request.id],
+      operations: [{ op: 'replace_source', content: 'First target\nChanged target\nThird target' }],
+    });
+    server.ctx.editRequestService.markAppliedByAgent({ userId, chatId: chat.id, requestId: request.id, appliedRevision: 2 });
+    await page.evaluate(value => window.__pr3aApplyArtifactUpdate?.(value), edited.artifact);
+    await expect(page.locator('.workspace-request-item')).toContainText('確認待ち');
+    await page.getByRole('button', { name: '変更前後を比較' }).click();
+    const comparison = page.getByRole('dialog', { name: '変更前後のバージョン' });
+    await expect(comparison.getByRole('button', { name: '依頼時 v1' })).toBeEnabled();
+    await expect(comparison.getByRole('button', { name: '適用時 v2' })).toBeEnabled();
+    await expect(comparison).toContainText('Second target');
+    await expect(comparison).toContainText('Changed target');
 
     await page.goto(lan + '/?kind=rich');
     expect(await page.evaluate(() => typeof navigator.clipboard)).toBe('undefined');

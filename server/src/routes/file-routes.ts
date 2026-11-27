@@ -272,6 +272,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
 
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('X-Artifact-Revision', String(revision.revision));
+    reply.header('X-Artifact-Sha256', revision.sha256);
     reply.header(
       'Content-Location',
       isConvertedPdf
