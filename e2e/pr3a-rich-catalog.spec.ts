@@ -89,13 +89,6 @@ test('browser renders the rich UI node catalog and runs each explicit action',as
   const indicator=richNode('carousel').getByRole('button',{name:'項目 2'});
   await indicator.click();
   await expect(indicator).toHaveAttribute('aria-current','true');
-  await expect(richNode('responsive').locator('.rich-responsive-box')).toHaveCSS('padding','20px');
-  await expect(richNode('responsive').locator('.rich-responsive-box')).toHaveCSS('align-items','flex-end');
-  await expect(richNode('responsive')).toHaveCSS('max-width','480px');
-  await page.setViewportSize({width:390,height:844});
-  await expect(richNode('responsive').locator('.rich-responsive-box')).toHaveCSS('padding','8px');
-  await expect(richNode('responsive').locator('.rich-responsive-box')).toHaveCSS('align-items','center');
-  await page.setViewportSize({width:1280,height:720});
   await expect(richNode('sources').locator('.rich-sources-compact')).toContainText('Measurements');
   await expect(richNode('table').locator('.rich-status.rich-tone-success')).toHaveText('Ready');
   await expect(richNode('table').locator('.rich-tone-info')).toHaveText('Row item');
@@ -161,4 +154,34 @@ test('browser renders the rich UI node catalog and runs each explicit action',as
   await expect(page.getByRole('slider')).toHaveValue('2');
   await expect(page.getByRole('alert')).toHaveCount(0);
   await page.screenshot({path:info.outputPath('rich-catalog.png'),fullPage:true});
+});
+
+
+test('responsive_box aligns its content across PC and iPhone viewports', async ({page}, info) => {
+  const layout: RichDocumentV1 = { schemaVersion: 1, root: children.find(node => node.id === 'responsive')! };
+  await page.addInitScript((document) => { window.__pr3aFixtureRichDocument = document; }, layout);
+  await page.goto('http://127.0.0.1:4174/?kind=rich-catalog');
+  const wrapper = page.locator('[data-rich-node-id="responsive"]');
+  const responsive = wrapper.locator('.rich-responsive-box');
+  const placement = () => responsive.evaluate(box => {
+    const child = box.firstElementChild!.getBoundingClientRect();
+    const parent = box.getBoundingClientRect();
+    const style = getComputedStyle(box);
+    return {
+      left: child.left - parent.left - parseFloat(style.paddingLeft),
+      right: parent.right - child.right - parseFloat(style.paddingRight),
+    };
+  });
+  const desktop = info.project.name === 'pc-chromium';
+  const sizes = desktop ? [{width:1280,height:720},{width:1440,height:900},{width:1920,height:1080}]
+    : [{width:375,height:812},{width:430,height:932}];
+  for (const size of sizes) {
+    await page.setViewportSize(size);
+    await expect(responsive).toHaveCSS('padding', desktop ? '20px' : '8px');
+    if (desktop) await expect(wrapper).toHaveCSS('max-width','480px');
+    await expect.poll(async () => {
+      const {left, right} = await placement();
+      return (desktop ? Math.abs(right) <= 1 : Math.abs(left - right) <= 1) && left > 10;
+    }).toBe(true);
+  }
 });

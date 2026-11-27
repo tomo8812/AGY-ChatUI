@@ -26,7 +26,7 @@ function collectTsFiles(dir: string): string[] {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       out.push(...collectTsFiles(full));
-    } else if (entry.isFile() && entry.name.endsWith('.ts') && !entry.name.endsWith('.d.ts')) {
+    } else if (entry.isFile() && /\.tsx?$/.test(entry.name) && !entry.name.endsWith('.d.ts')) {
       out.push(full);
     }
   }
@@ -38,7 +38,7 @@ function collectTsFiles(dir: string): string[] {
  * so negative self-tests (`NEG-01`, `NEG-02`, `NEG-05`, `NEG-11`) run the exact same compiler AST analyzer.
  */
 function createInMemoryProgram(virtualOverrides: Map<string, string> = new Map()): ts.Program {
-  const realFiles = collectTsFiles(SERVER_SRC);
+  const realFiles = [...collectTsFiles(SERVER_SRC), ...collectTsFiles(path.join(REPO_ROOT, 'web/src/components/shared-ui'))];
   const normalizedOverrides = new Map<string, string>();
   for (const [k, v] of virtualOverrides) {
     normalizedOverrides.set(path.resolve(k), v);
@@ -460,47 +460,42 @@ function checkAdapterIsolationConformance(program: ts.Program): Violation[] {
 }
 
 /**
- * RICH-ARCH-07 / NEG-05: Strict ban on dynamic code execution (eval / new Function / vm) inside `server/src/rich/`.
+ * RICH-ARCH-07 / NEG-05: Strict ban on dynamic code execution inside the rich UI runtime.
  * Scoped strictly to Rich UI modules (never restricts existing HTML sandbox or ACP).
  */
 function checkRichCodeExecutionBan(program: ts.Program): Violation[] {
   const violations: Violation[] = [];
   for (const sf of program.getSourceFiles()) {
     const rel = relToRepo(sf.fileName);
-    if (!rel.startsWith('server/src/rich/')) continue;
+    if (!rel.startsWith('server/src/rich/') && !rel.startsWith('web/src/components/shared-ui/')) continue;
 
+    const dynamicConstructors = new Set(['eval', 'Function', 'AsyncFunction', 'GeneratorFunction', 'AsyncGeneratorFunction']);
+    const runtimeModules = new Set(['vm', 'node:vm', 'child_process', 'node:child_process']);
     const visit = (node: ts.Node) => {
-      if (ts.isCallExpression(node)) {
-        if (ts.isIdentifier(node.expression) && (node.expression.text === 'eval' || node.expression.text === 'Function')) {
-          violations.push({
-            rule: 'RICH-ARCH-07',
-            file: rel,
-            line: lineOf(sf, node),
-            message: `Forbidden dynamic code execution '${node.expression.text}()' inside rich UI module.`,
-          });
+      const report = (message: string) => violations.push({ rule: 'RICH-ARCH-07', file: rel, line: lineOf(sf, node), message });
+      if (ts.isJsxOpeningLikeElement(node) && node.tagName.getText(sf).toLowerCase() === 'script') {
+        report('Forbidden script element in rich UI.');
+      }
+      if (ts.isIdentifier(node) && ['dangerouslySetInnerHTML', 'innerHTML', 'outerHTML'].includes(node.text)) {
+        report('Rich UI must render structured content without raw HTML sinks.');
+      }
+      if (ts.isCallExpression(node) && node.arguments[0] && ts.isStringLiteralLike(node.arguments[0]) &&
+          node.arguments[0].text.toLowerCase() === 'script') {
+        const callee = node.expression;
+        if ((ts.isPropertyAccessExpression(callee) && callee.name.text === 'createElement') ||
+            (ts.isIdentifier(callee) && callee.text === 'createElement')) report('Forbidden script element in rich UI.');
+      }
+      if (ts.isIdentifier(node) && dynamicConstructors.has(node.text)) {
+        report(`Forbidden dynamic code execution reference '${node.text}' in rich UI.`);
+      }
+      if (ts.isStringLiteralLike(node)) {
+        if (runtimeModules.has(node.text)) report(`Forbidden runtime module '${node.text}' in rich UI.`);
+        else if (dynamicConstructors.has(node.text) && ts.isElementAccessExpression(node.parent)) {
+          report(`Forbidden dynamic code execution reference '${node.text}' in rich UI.`);
         }
       }
-      if (ts.isNewExpression(node)) {
-        if (ts.isIdentifier(node.expression) && node.expression.text === 'Function') {
-          violations.push({
-            rule: 'RICH-ARCH-07',
-            file: rel,
-            line: lineOf(sf, node),
-            message: `Forbidden 'new Function()' inside rich UI module.`,
-          });
-        }
-      }
-      if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
-        const spec = node.moduleSpecifier.text;
-        if (spec === 'node:vm' || spec === 'vm' || spec === 'node:child_process' || spec === 'child_process') {
-          violations.push({
-            rule: 'RICH-ARCH-07',
-            file: rel,
-            line: lineOf(sf, node),
-            message: `Forbidden runtime module '${spec}' inside Pure-JS rich UI module.`,
-          });
-        }
-      }
+      if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword &&
+          !node.arguments.every(ts.isStringLiteralLike)) report('Rich UI imports must name a static module.');
       ts.forEachChild(node, visit);
     };
     visit(sf);
@@ -941,7 +936,16 @@ describe('Architecture Conformance & Negative Self-Tests (ARCH-01, ARCH-10, ARCH
     const violations = checkRichCodeExecutionBan(program);
     expect(violations.length).toBe(2);
     expect(violations.some((v) => v.message.includes('eval'))).toBe(true);
-    expect(violations.some((v) => v.message.includes('new Function'))).toBe(true);
+    expect(violations.some((v) => v.message.includes("'Function'"))).toBe(true);
+    const frontend = createInMemoryProgram(new Map([
+      [path.join(REPO_ROOT, 'web/src/components/shared-ui/__neg05.tsx'),
+        'const evaluate = globalThis["eval"]; export const result = evaluate("1"); export const tag = <script />;'],
+      [path.join(REPO_ROOT, 'web/src/__neg05-outside-rich.ts'), 'export const result = eval("1");'],
+    ]));
+    expect(checkRichCodeExecutionBan(frontend)).toEqual([
+      expect.objectContaining({ rule: 'RICH-ARCH-07', file: 'web/src/components/shared-ui/__neg05.tsx', message: expect.stringContaining('eval') }),
+      expect.objectContaining({ rule: 'RICH-ARCH-07', file: 'web/src/components/shared-ui/__neg05.tsx', message: expect.stringContaining('script element') }),
+    ]);
   });
 
   it('NEG-11: fails fixture-hygiene check when production code imports a test fixture', () => {
