@@ -482,7 +482,7 @@ for(const vp of targets){
             expect(request.regionImageBlobSha256).toBeNull();
             await srv.ctx.editRequestService.sendBatch({userId,chatId,requestIds:[request.id]});
             const target=await srv.ctx.editRequestService.getForAgent(userId,chatId,request.id);
-            expect(target).toMatchObject({status:'sent',targetRevision:artifact.revision,
+            expect(target).toMatchObject({status:'sent',targetRevision:request.baseRevision,
               reResolution:{status:'resolved',resolvedCoords:{pageIndex:expect.any(Number),shapeId:request.selector.shapeId}}});
             expect(target.regionImagePngBase64).toEqual(expect.any(String));
             const region=decodePng(Buffer.from(target.regionImagePngBase64!,'base64'));
