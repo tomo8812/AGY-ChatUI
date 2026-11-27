@@ -42,9 +42,10 @@ export default defineConfig({
       const root=path.resolve(import.meta.dirname,'..');
       assertProductionModulePaths(ids,root);
       for(const id of new Set(ids)){
-        const file=id.split('?')[0];
+        const file=id.split(/[?#]/)[0];
+        if(!path.isAbsolute(file)||!/\.[cm]?[jt]sx?$/.test(file))continue;
         const rel=path.relative(root,file).split(path.sep).join('/');
-        if(!/^(?:web\/src|shared)\//.test(rel)||!/\.[cm]?[jt]sx?$/.test(file))continue;
+        if(rel.startsWith('../')||rel.split('/').includes('node_modules'))continue;
         assertProductionModuleContent(rel,fs.readFileSync(file,'utf8'));
       }
     },
