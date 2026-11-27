@@ -5,7 +5,7 @@ import { detectArtifactFormat } from '../artifacts/adapters/registry.js';
 import type { ArtifactService } from '../artifacts/artifact-service.js';
 import { ArtifactError, unsupportedOperationError } from '../artifacts/errors.js';
 import type { TargetResolutionResult, TargetSelector } from '../artifacts/types.js';
-import { selectorMatchesFormat, targetSelectorSchema } from '../artifacts/target-selector-schema.js';
+import { selectorIsAvailable, selectorMatchesFormat, targetSelectorSchema } from '../artifacts/target-selector-schema.js';
 import type { RichContentService } from '../rich/rich-content-service.js';
 import { RichExprError } from '../rich/rich-expr-evaluator.js';
 import { resolveRichBlockTarget } from './target-resolver.js';
@@ -113,10 +113,17 @@ export class EditRequestService {
   ) {
     // Older clients could persist a selector without its content fingerprint.
     const legacyRows = this.db.db.prepare(`SELECT * FROM ai_edit_requests
-      WHERE status IN ('draft', 'sent', 'stale')`).all();
+      WHERE status IN ('draft', 'sent', 'stale')
+         OR (status = 'applied_unverified' AND sent_message_id IS NULL)`).all();
     for (const row of legacyRows) {
       const request = this.mapRow(row);
-      if (!selectorIsValid(request)) {
+      if (['sent', 'applied_unverified'].includes(request.status) && !request.sentMessageId) {
+        this.updateAndPublish(request, () => {
+          this.db.db.prepare(`UPDATE ai_edit_requests SET status = 'needs_review', batch_id = NULL,
+            agent_base_revision = NULL, applied_revision = NULL, updated_at = ? WHERE id = ?`)
+            .run(Date.now(), request.id);
+        }, { status: 'needs_review', reason: 'missing_sent_message' });
+      } else if (!selectorIsValid(request) || !selectorIsAvailable(request.selector)) {
         this.persistRevalidation(request, { status: 'needs_review', reason: 'invalid_target_selector' });
       }
     }
@@ -150,6 +157,9 @@ export class EditRequestService {
 
   private async verifyAnchor(target: AnchoredTarget, details: TargetDetails): Promise<TargetDetails & { selector: TargetSelector }> {
     if (!selectorIsValid(target)) throw new ArtifactError('INVALID_INPUT', '対象指定が無効です。', 400);
+    if (!selectorIsAvailable(target.selector)) {
+      throw new ArtifactError('UNSUPPORTED_TARGET_SELECTOR', 'この種類の対象指定は利用できません。', 422);
+    }
     if (this.currentRevision(target) !== target.baseRevision) throw targetConflict();
     const savedState = target.richBlockId
       ? this.richContentService.getBlock(target.userId, target.chatId, target.richBlockId)?.uiStateSnapshot
@@ -436,8 +446,7 @@ export class EditRequestService {
     userId: string;
     chatId: string;
     requestIds: string[];
-    sentMessageId?: string | null;
-    submit?: {
+    submit: {
       clientMessageId: string;
       enqueue: (text: string, persist: (messageId: string) => ReturnType<AppDatabase['insertSyncEventInTx']>) => void;
     };
@@ -447,7 +456,6 @@ export class EditRequestService {
       throw new ArtifactError('INVALID_INPUT', '送信対象の依頼を重複せずに指定してください。', 400);
     }
     const replay = () => {
-      if (!params.submit) return null;
       const message = this.db.findMessageByClientId(params.userId, params.chatId, params.submit.clientMessageId);
       if (!message) return null;
       const batch = this.db.db.prepare('SELECT batch_id FROM ai_edit_request_batches WHERE user_id = ? AND chat_id = ? AND sent_message_id = ?')
@@ -470,11 +478,10 @@ export class EditRequestService {
         if (existingBatch) return existingBatch;
         this.requireStatus(request, 'draft');
       }
-      const revision = this.currentRevision(request);
       const version = this.currentRevision(request);
       const resolution = await this.resolveRequestTarget(request);
       if (resolution.status !== 'resolved') {
-        this.persistRevalidation(request, resolution, revision);
+        this.persistRevalidation(request, resolution, version);
         throw targetConflict();
       }
       checked.push({ request, version });
@@ -489,7 +496,7 @@ export class EditRequestService {
     const updated: AiEditRequestRecord[] = [];
     const completedWhileChecking = replay();
     if (completedWhileChecking) return completedWhileChecking;
-    const persist = (sentMessageId: string | null) => {
+    const persist = (sentMessageId: string) => {
       this.db.db
         .prepare('INSERT INTO ai_edit_request_batches (batch_id, user_id, chat_id, sent_message_id, created_at) VALUES (?, ?, ?, ?, ?)')
         .run(batchId, params.userId, params.chatId, sentMessageId, now);
@@ -519,22 +526,9 @@ export class EditRequestService {
       });
     };
 
-    if (params.submit) {
-      const text = '次の対象指定の編集依頼を適用してください。\n' +
-        checked.map(({ request }) => `${request.id}\n${request.instruction}`).join('\n\n');
-      params.submit.enqueue(text, persist);
-    } else {
-      this.db.db.exec('BEGIN IMMEDIATE;');
-      let envelope;
-      try {
-        envelope = persist(params.sentMessageId ?? null);
-        this.db.db.exec('COMMIT;');
-      } catch (error) {
-        this.db.db.exec('ROLLBACK;');
-        throw error;
-      }
-      this.hub.broadcastPersistedEvent(envelope);
-    }
+    const text = '次の対象指定の編集依頼を適用してください。\n' +
+      checked.map(({ request }) => `${request.id}\n${request.instruction}`).join('\n\n');
+    params.submit.enqueue(text, persist);
     return { batchId, requests: updated };
   }
 
@@ -546,6 +540,7 @@ export class EditRequestService {
     snippetHint = req.selectedContentSnapshot,
   ): Promise<TargetResolutionResult> {
     if (!selectorIsValid(req)) return { status: 'needs_review', reason: 'invalid_target_selector' };
+    if (!selectorIsAvailable(req.selector)) return { status: 'needs_review', reason: 'unsupported_selector_kind' };
     if (req.targetKind === 'rich_block') return this.resolveRichRequestTarget(req);
     const revision = this.currentRevision(req);
     if (revision === undefined || !req.artifactId) return { status: 'stale', reason: 'target_deleted' };
@@ -556,14 +551,16 @@ export class EditRequestService {
     if (!selectorIsValid(req) || !req.richBlockId) return { status: 'needs_review', reason: 'invalid_target_selector' };
     const block = this.richContentService.getBlock(req.userId, req.chatId, req.richBlockId);
     if (!block) return { status: 'stale', reason: 'rich_block_deleted' };
-    if (req.baseRevision > block.revision || (block.revision !== req.baseRevision && !this.db.db.prepare(
-      'SELECT 1 FROM rich_block_revisions WHERE rich_block_id = ? AND user_id = ? AND chat_id = ? AND revision = ?'
-    ).get(block.id, req.userId, req.chatId, req.baseRevision))) {
+    const baseRow = block.revision === req.baseRevision ? null : this.db.db.prepare(
+      'SELECT document_json FROM rich_block_revisions WHERE rich_block_id = ? AND user_id = ? AND chat_id = ? AND revision = ?'
+    ).get(block.id, req.userId, req.chatId, req.baseRevision);
+    if (req.baseRevision > block.revision || (block.revision !== req.baseRevision && typeof baseRow?.document_json !== 'string')) {
       return { status: 'needs_review', reason: 'invalid_base_revision' };
     }
     try {
       return resolveRichBlockTarget(block, req.selector, readRichViewSnapshot(req.viewStateSnapshot),
-        this.richContentService.getAuthorizedArtifactIds(req.userId, req.chatId));
+        this.richContentService.getAuthorizedArtifactIds(req.userId, req.chatId),
+        typeof baseRow?.document_json === 'string' ? JSON.parse(baseRow.document_json) : undefined);
     } catch (error) {
       if (error instanceof RichExprError) return { status: 'needs_review', reason: 'rich_target_evaluation_failed' };
       throw error;
@@ -609,7 +606,7 @@ export class EditRequestService {
   }): void {
     for (const id of params.editRequestIds ?? []) {
       const request = this.getRequest(params.userId, params.chatId, id);
-      if (!request?.batchId || request.status !== 'sent' || request.targetKind !== params.targetKind ||
+      if (!request?.batchId || !request.sentMessageId || request.status !== 'sent' || request.targetKind !== params.targetKind ||
           (request.artifactId ?? request.richBlockId) !== params.targetId ||
           this.currentRevision(request) !== params.expectedRevision ||
           (this.agentBaseRevision(request) !== params.expectedRevision && !this.hasAgentLineage(request, params.expectedRevision))) {
@@ -623,7 +620,7 @@ export class EditRequestService {
    */
   async getForAgent(userId: string, chatId: string, requestId: string): Promise<AgentEditRequestPayload> {
     const req = this.getRequest(userId, chatId, requestId);
-    if (!req?.batchId) throw new ArtifactError('NOT_FOUND', '送信済みの編集依頼が見つかりません。', 404);
+    if (!req?.batchId || !req.sentMessageId) throw new ArtifactError('NOT_FOUND', '送信済みの編集依頼が見つかりません。', 404);
     const revision = this.currentRevision(req);
     const inProgress = req.status === 'sent' && revision !== undefined && this.hasAgentLineage(req, revision) &&
       (!req.artifactId || this.artifactService.matchesCurrentArtifactFile(userId, req.artifactId, revision));
@@ -696,7 +693,7 @@ export class EditRequestService {
         existing.appliedRevision === params.appliedRevision) return existing;
     return this.updateAndPublish(existing, () => {
       this.assertCurrentRequest(existing);
-      if (existing.status !== 'sent') {
+      if (existing.status !== 'sent' || !existing.sentMessageId) {
         throw new ArtifactError('EDIT_REQUEST_NOT_SENT', '送信済みの編集依頼だけが適用を記録できます。', 409);
       }
       if (!Number.isSafeInteger(params.appliedRevision) || params.appliedRevision < existing.baseRevision ||
@@ -718,16 +715,20 @@ export class EditRequestService {
   }
 
   /** User-only confirmation transitioning to `resolved` (`PIN-06`). */
-  resolveByUser(userId: string, chatId: string, requestId: string): AiEditRequestRecord {
+  async resolveByUser(userId: string, chatId: string, requestId: string): Promise<AiEditRequestRecord> {
     const existing = this.getRequest(userId, chatId, requestId);
     if (!existing) throw new ArtifactError('NOT_FOUND', '編集依頼が見つかりません。', 404);
-    return this.updateAndPublish(existing, () => {
+    const confirm = () => this.updateAndPublish(existing, () => {
       this.assertCurrentRequest(existing);
       this.requireStatus(existing, 'applied_unverified');
-      if (this.currentRevision(existing) !== existing.appliedRevision) throw targetConflict();
+      if (existing.appliedRevision === null || this.currentRevision(existing) !== existing.appliedRevision ||
+          (existing.artifactId && !this.artifactService.matchesCurrentArtifactFile(userId, existing.artifactId, existing.appliedRevision))) {
+        throw targetConflict();
+      }
       this.db.db.prepare("UPDATE ai_edit_requests SET status = 'resolved', updated_at = ? WHERE id = ?")
         .run(Date.now(), existing.id);
     });
+    return existing.artifactId ? this.artifactService.withArtifactLock(existing.artifactId, confirm) : confirm();
   }
 
   async reconfirmByUser(params: TargetDetails & {

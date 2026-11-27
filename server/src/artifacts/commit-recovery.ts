@@ -51,6 +51,7 @@ export interface CommitRecoveryHost {
     artifactId: string;
     rootDir: string;
     relPath: string;
+    strict?: boolean;
   }): boolean;
 }
 
@@ -116,7 +117,7 @@ function inspectTargetFile(rootDir: string | null, relPath: string): {
   sha256: string | null;
   unreadableOrTampered: boolean;
 } {
-  if (!rootDir || !fs.existsSync(rootDir)) {
+  if (!rootDir) {
     return { exists: false, ino: null, sha256: null, unreadableOrTampered: false };
   }
   try {
@@ -141,31 +142,31 @@ function inspectTargetFile(rootDir: string | null, relPath: string): {
   }
 }
 
-function inspectStageFile(stagePath: string): { exists: boolean; ino: string | null; sha256: string | null } {
+function inspectStageFile(stagePath: string): { state: 'present' | 'missing' | 'unreadable'; ino?: string; sha256?: string } {
   try {
-    const fd = fs.openSync(stagePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const fd = fs.openSync(stagePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     try {
-      const st = fs.fstatSync(fd, { bigint: true });
-      if (!st.isFile()) return { exists: false, ino: null, sha256: null };
-      const { sha256 } = sha256Fd(fd);
-      return { exists: true, ino: st.ino.toString(), sha256 };
+      const stat = fs.fstatSync(fd, { bigint: true });
+      if (!stat.isFile()) return { state: 'unreadable' };
+      return { state: 'present', ino: stat.ino.toString(), sha256: sha256Fd(fd).sha256 };
     } finally {
       fs.closeSync(fd);
     }
-  } catch {
-    return { exists: false, ino: null, sha256: null };
+  } catch (error) {
+    return { state: (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'unreadable' };
   }
 }
 
-function removeStageAndSync(stagePath: string): void {
+export function removeStageAndSync(stagePath: string): void {
+  if (!stagePath) return;
   try {
-    if (fs.existsSync(stagePath)) {
-      fs.unlinkSync(stagePath);
-      fsyncDir(path.dirname(stagePath));
-    }
-  } catch {
-    // ignore
+    fs.unlinkSync(stagePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
+  const directory = path.dirname(stagePath);
+  // A previous recovery may have unlinked the stage before fsync.
+  if (fs.existsSync(directory)) fsyncDir(directory);
 }
 
 /**
@@ -183,102 +184,74 @@ export function recoverPendingCommits(host: CommitRecoveryHost): RecoveryReport 
     .prepare(
       `SELECT * FROM artifact_commit_journal
        WHERE state IN ('prepared', 'replacing', 'file_replaced', 'db_committed')
+          OR (state IN ('aborted', 'ambiguous_quarantined') AND audit_note LIKE '{"recoveryCleanup":%')
        ORDER BY created_at ASC`
     )
     .all() as Array<Record<string, unknown>>;
 
-  const markAborted = (j: ArtifactCommitJournalRow, note: string) => {
+  const syncExternal = (j: ArtifactCommitJournalRow, rootDir: string | null) => {
+    if (!rootDir) throw new Error('Cannot resolve scope for commit recovery');
+    host.recordExternalSyncOnRecovery({
+      userId: j.userId, artifactId: j.artifactId, rootDir, relPath: j.relPath, strict: true,
+    });
+  };
+
+  const finishTerminal = (j: ArtifactCommitJournalRow, note: string, needsExternalSync: boolean) => {
+    if (needsExternalSync) {
+      syncExternal(j, host.resolveScopeRootDir(j.userId, j.scopeKind, j.chatId, j.projectId));
+    }
     removeStageAndSync(j.privateStagePath);
+    host.db.db.prepare('UPDATE artifact_commit_journal SET audit_note = ? WHERE commit_id = ?')
+      .run(note, j.commitId);
+  };
+
+  const markTerminal = (j: ArtifactCommitJournalRow, state: 'aborted' | 'ambiguous_quarantined',
+    note: string, syncExternalAfter: boolean) => {
+    const needsExternalSync = syncExternalAfter && !j.isCreate;
     const now = Date.now();
     host.db.db.exec('BEGIN IMMEDIATE;');
     try {
       if (j.isCreate) {
-        host.db.db
-          .prepare("DELETE FROM artifacts WHERE id = ? AND lifecycle_state = 'pending_create'")
-          .run(j.artifactId);
+        host.db.db.prepare("DELETE FROM artifacts WHERE id = ? AND lifecycle_state = 'pending_create'").run(j.artifactId);
       }
-      if (j.idempotencyScopeKey && j.idempotencyKey) {
-        host.db.db
-          .prepare(
-            'DELETE FROM artifact_idempotency WHERE user_id = ? AND scope_key = ? AND idempotency_key = ?'
-          )
-          .run(j.userId, j.idempotencyScopeKey, j.idempotencyKey);
+      if (state === 'aborted') {
+        host.db.db.prepare('DELETE FROM artifact_idempotency WHERE commit_id = ? AND user_id = ?')
+          .run(j.commitId, j.userId);
+      } else {
+        host.db.db.prepare(`UPDATE artifact_idempotency SET status = 'ambiguous_quarantined', updated_at = ?
+          WHERE commit_id = ? AND user_id = ?`).run(now, j.commitId, j.userId);
       }
-      host.db.db
-        .prepare("UPDATE artifact_commit_journal SET state = 'aborted', audit_note = ?, updated_at = ? WHERE commit_id = ?")
-        .run(note, now, j.commitId);
+      host.db.db.prepare('UPDATE artifact_commit_journal SET state = ?, audit_note = ?, updated_at = ? WHERE commit_id = ?')
+        .run(state, JSON.stringify({ recoveryCleanup: note, needsExternalSync }), now, j.commitId);
       host.db.db.exec('COMMIT;');
     } catch (err) {
       host.db.db.exec('ROLLBACK;');
       throw err;
     }
-    report.aborted += 1;
+    finishTerminal(j, note, needsExternalSync);
+    if (state === 'aborted') report.aborted += 1;
+    else report.quarantined += 1;
   };
 
-  const markQuarantined = (j: ArtifactCommitJournalRow, note: string, syncExternalAfter = false, rootDir: string | null = null) => {
-    removeStageAndSync(j.privateStagePath);
-    const now = Date.now();
-    host.db.db.exec('BEGIN IMMEDIATE;');
-    try {
-      if (j.isCreate) {
-        host.db.db
-          .prepare("DELETE FROM artifacts WHERE id = ? AND lifecycle_state = 'pending_create'")
-          .run(j.artifactId);
-      }
-      if (j.idempotencyScopeKey && j.idempotencyKey) {
-        host.db.db
-          .prepare(
-            `UPDATE artifact_idempotency
-             SET status = 'ambiguous_quarantined', updated_at = ?
-             WHERE user_id = ? AND scope_key = ? AND idempotency_key = ?`
-          )
-          .run(now, j.userId, j.idempotencyScopeKey, j.idempotencyKey);
-      }
-      host.db.db
-        .prepare(
-          "UPDATE artifact_commit_journal SET state = 'ambiguous_quarantined', audit_note = ?, updated_at = ? WHERE commit_id = ?"
-        )
-        .run(note, now, j.commitId);
-      host.db.db.exec('COMMIT;');
-    } catch (err) {
-      host.db.db.exec('ROLLBACK;');
-      throw err;
-    }
-    if (syncExternalAfter && !j.isCreate && rootDir) {
-      host.recordExternalSyncOnRecovery({
-        userId: j.userId,
-        artifactId: j.artifactId,
-        rootDir,
-        relPath: j.relPath,
-      });
-    }
-    report.quarantined += 1;
-  };
+  const markAborted = (j: ArtifactCommitJournalRow, note: string, syncExternalAfter = false) =>
+    markTerminal(j, 'aborted', note, syncExternalAfter);
+  const markQuarantined = (j: ArtifactCommitJournalRow, note: string, syncExternalAfter = false) =>
+    markTerminal(j, 'ambiguous_quarantined', note, syncExternalAfter);
 
-  const rollForwardToT6 = (j: ArtifactCommitJournalRow, syncExternalAfter = false, rootDir: string | null = null) => {
-    removeStageAndSync(j.privateStagePath);
-    let envelopes: ReturnType<AppDatabase['insertSyncEventInTx']>[] = [];
+  const rollForwardToT6 = (j: ArtifactCommitJournalRow, rootDir: string | null) => {
+    let envelopes: ReturnType<AppDatabase['insertSyncEventInTx']>[];
     host.db.db.exec('BEGIN IMMEDIATE;');
     try {
-      const finalized = host.finalizeStageT6InTx(j, { suppressDependencyPropagation: Boolean(j.batchId) });
-      envelopes = finalized.envelopes;
+      envelopes = host.finalizeStageT6InTx(j, { suppressDependencyPropagation: Boolean(j.batchId) }).envelopes;
       host.db.db.exec('COMMIT;');
     } catch (err) {
       host.db.db.exec('ROLLBACK;');
       throw err;
     }
-    for (const env of envelopes) {
-      host.hub.broadcastPersistedEvent(env);
-    }
+    removeStageAndSync(j.privateStagePath);
+    for (const env of envelopes) host.hub.broadcastPersistedEvent(env);
+    syncExternal(j, rootDir);
     host.db.db.prepare('DELETE FROM artifact_commit_journal WHERE commit_id = ?').run(j.commitId);
-    if (syncExternalAfter && rootDir) {
-      host.recordExternalSyncOnRecovery({
-        userId: j.userId,
-        artifactId: j.artifactId,
-        rootDir,
-        relPath: j.relPath,
-      });
-    }
     report.rolledForward += 1;
   };
 
@@ -343,12 +316,12 @@ export function recoverPendingCommits(host: CommitRecoveryHost): RecoveryReport 
   const rollForwardDeleteToT6 = (j: ArtifactCommitJournalRow, performPartialCleanup: boolean) => {
     if (performPartialCleanup) {
       if (!host.performVerifiedPartialDeleteCleanup) {
-        markQuarantined(j, 'delete_partial_cleanup_unavailable', false, null);
+        markQuarantined(j, 'delete_partial_cleanup_unavailable');
         return;
       }
       const cleaned = host.performVerifiedPartialDeleteCleanup(j);
       if (!cleaned.ok) {
-        markQuarantined(j, `delete_partial_cleanup_aborted:${cleaned.reason}`, false, null);
+        markQuarantined(j, `delete_partial_cleanup_aborted:${cleaned.reason}`);
         return;
       }
     }
@@ -371,174 +344,183 @@ export function recoverPendingCommits(host: CommitRecoveryHost): RecoveryReport 
 
   for (const raw of rows) {
     const j = mapJournalRow(raw);
+    try {
 
-    // 1. db_committed: verify outbox sync_event(s) exist, broadcast if needed, delete completed journal
-    if (j.state === 'db_committed') {
-      const outbox = readCommittedOutbox(j);
-      if (!outbox) {
-        // A gap in replay history cannot prove that this commit's event ever existed.
-        // Preserve the journal and completed revisions for diagnosis and retry.
-        console.error('[artifact-recovery] Cannot verify committed outbox', j.commitId, j.syncEventSeq);
-        report.quarantined += 1;
+      if (j.state === 'aborted' || j.state === 'ambiguous_quarantined') {
+        const audit = JSON.parse(j.auditNote!);
+        finishTerminal(j, audit.recoveryCleanup, audit.needsExternalSync);
         continue;
       }
-      for (const envelope of outbox) host.hub.broadcastPersistedEvent(envelope);
-      host.db.db.prepare('DELETE FROM artifact_commit_journal WHERE commit_id = ?').run(j.commitId);
-      report.completedOutbox += 1;
-      continue;
-    }
 
-    // 1b. Journaled delete operations (delete_project_file, delete_project, delete_sync_file, delete_chat)
-    if (j.operationType.startsWith('delete_') && host.finalizeDeleteStageT6InTx) {
-      const inspection: DeleteTargetInspection = host.inspectDeleteTarget
-        ? host.inspectDeleteTarget(j)
-        : { status: 'indeterminate', detail: 'no_delete_inspector' };
-
-      if (j.state === 'prepared') {
-        if (inspection.status === 'intact' || (inspection.absentAtT1 && inspection.status === 'deleted')) {
-          markAborted(j, 'delete_aborted_before_unlink');
-        } else {
-          markQuarantined(j, `delete_prepared_${inspection.status}:${inspection.detail}`, false, null);
+      // 1. db_committed: verify outbox sync_event(s) exist, broadcast if needed, delete completed journal
+      if (j.state === 'db_committed') {
+        const outbox = readCommittedOutbox(j);
+        if (!outbox) {
+          // A gap in replay history cannot prove that this commit's event ever existed.
+          // Preserve the journal and completed revisions for diagnosis and retry.
+          console.error('[artifact-recovery] Cannot verify committed outbox', j.commitId, j.syncEventSeq);
+          report.quarantined += 1;
+          continue;
         }
+        removeStageAndSync(j.privateStagePath);
+        for (const envelope of outbox) host.hub.broadcastPersistedEvent(envelope);
+        if (!j.operationType.startsWith('delete_')) {
+          syncExternal(j, host.resolveScopeRootDir(j.userId, j.scopeKind, j.chatId, j.projectId));
+        }
+        host.db.db.prepare('DELETE FROM artifact_commit_journal WHERE commit_id = ?').run(j.commitId);
+        report.completedOutbox += 1;
         continue;
       }
 
+      // 1b. Journaled delete operations (delete_project_file, delete_project, delete_sync_file, delete_chat)
+      if (j.operationType.startsWith('delete_') && host.finalizeDeleteStageT6InTx) {
+        const inspection: DeleteTargetInspection = host.inspectDeleteTarget
+          ? host.inspectDeleteTarget(j)
+          : { status: 'indeterminate', detail: 'no_delete_inspector' };
+
+        if (j.state === 'prepared') {
+          if (inspection.status === 'intact' || (inspection.absentAtT1 && inspection.status === 'deleted')) {
+            markAborted(j, 'delete_aborted_before_unlink');
+          } else {
+            markQuarantined(j, `delete_prepared_${inspection.status}:${inspection.detail}`);
+          }
+          continue;
+        }
+
+        if (j.state === 'file_replaced') {
+          if (inspection.status === 'deleted') {
+            // FS deletion already completed before T5; finalize DB only without touching FS.
+            rollForwardDeleteToT6(j, false);
+          } else if (inspection.status === 'externally_recreated') {
+            // Original target was already deleted before T5, and a new external file/dir now occupies the path.
+            // Finalize DB deletion of the old record WITHOUT touching the externally recreated FS target.
+            rollForwardDeleteToT6(j, false);
+          } else {
+            // Target still intact, partially deleted, or indeterminate despite T5 -> quarantine, NEVER blindly re-delete.
+            markQuarantined(j, `delete_file_replaced_${inspection.status}:${inspection.detail}`);
+          }
+          continue;
+        }
+
+        if (j.state === 'replacing') {
+          if (inspection.status === 'intact') {
+            markAborted(j, 'delete_aborted_target_still_intact');
+          } else if (inspection.status === 'deleted') {
+            // T4 already finished deleting the target before crashing prior to T5; finalize DB without FS re-delete.
+            rollForwardDeleteToT6(j, false);
+          } else if (inspection.status === 'partially_deleted') {
+            // Subtree deletion crashed mid-way and every remaining entry matches the T1 snapshot:
+            // complete identity-verified cleanup of remaining T1 entries only, then finalize T6.
+            rollForwardDeleteToT6(j, true);
+          } else if (inspection.status === 'externally_recreated' && inspection.absentAtT1) {
+            // Target was already absent before T1, so any current entry is provably a brand-new external creation:
+            // finalize old DB record deletion without touching the new FS target.
+            rollForwardDeleteToT6(j, false);
+          } else {
+            // externally_recreated (with existedAtT1=true) or indeterminate -> quarantine, NEVER unconditionally re-delete.
+            markQuarantined(j, `delete_replacing_${inspection.status}:${inspection.detail}`);
+          }
+          continue;
+        }
+      }
+
+      // ARCH-05 & SEC-10: Use ONLY the isolation mode recorded at commit time (T1).
+      // If unknown/null or non_isolated_same_uid, NEVER assume mount isolation.
+      const isMountIsolated = j.stagingIsolationMode === 'bwrap_mount_isolated';
+      const rootDir = host.resolveScopeRootDir(j.userId, j.scopeKind, j.chatId, j.projectId);
+      if (!rootDir) throw new Error('Cannot resolve scope for commit recovery');
+      const stage = inspectStageFile(j.privateStagePath);
+      const target = inspectTargetFile(rootDir, j.relPath);
+
+      // 2. file_replaced: placement succeeded -> roll forward to Stage T6 (+ external_sync if subsequently changed)
       if (j.state === 'file_replaced') {
-        if (inspection.status === 'deleted') {
-          // FS deletion already completed before T5; finalize DB only without touching FS.
-          rollForwardDeleteToT6(j, false);
-        } else if (inspection.status === 'externally_recreated') {
-          // Original target was already deleted before T5, and a new external file/dir now occupies the path.
-          // Finalize DB deletion of the old record WITHOUT touching the externally recreated FS target.
-          rollForwardDeleteToT6(j, false);
+        rollForwardToT6(j, rootDir);
+        continue;
+      }
+
+      // 3. prepared: link/rename has not been entered yet
+      if (j.state === 'prepared') {
+        const targetUnchanged = j.isCreate
+          ? !target.exists
+          : target.exists && !target.unreadableOrTampered && target.sha256 === j.expectedPrevSha256;
+        const stageIntact =
+          j.stageIno === null ||
+          (stage.state === 'present' && stage.ino === j.stageIno && stage.sha256 === j.newSha256);
+
+        if (targetUnchanged && stageIntact) {
+          markAborted(j, 'prepared_aborted_before_replace');
         } else {
-          // Target still intact, partially deleted, or indeterminate despite T5 -> quarantine, NEVER blindly re-delete.
-          markQuarantined(j, `delete_file_replaced_${inspection.status}:${inspection.detail}`, false, null);
+          markQuarantined(
+            j,
+            !stageIntact ? 'prepared_stage_tampered_or_missing' : 'prepared_target_changed',
+            !j.isCreate && !targetUnchanged
+          );
         }
         continue;
       }
 
-      if (j.state === 'replacing') {
-        if (inspection.status === 'intact') {
-          markAborted(j, 'delete_aborted_target_still_intact');
-        } else if (inspection.status === 'deleted') {
-          // T4 already finished deleting the target before crashing prior to T5; finalize DB without FS re-delete.
-          rollForwardDeleteToT6(j, false);
-        } else if (inspection.status === 'partially_deleted') {
-          // Subtree deletion crashed mid-way and every remaining entry matches the T1 snapshot:
-          // complete identity-verified cleanup of remaining T1 entries only, then finalize T6.
-          rollForwardDeleteToT6(j, true);
-        } else if (inspection.status === 'externally_recreated' && inspection.absentAtT1) {
-          // Target was already absent before T1, so any current entry is provably a brand-new external creation:
-          // finalize old DB record deletion without touching the new FS target.
-          rollForwardDeleteToT6(j, false);
-        } else {
-          // externally_recreated (with existedAtT1=true) or indeterminate -> quarantine, NEVER unconditionally re-delete.
-          markQuarantined(j, `delete_replacing_${inspection.status}:${inspection.detail}`, false, null);
-        }
-        continue;
-      }
-    }
-
-    // ARCH-05 & SEC-10: Use ONLY the isolation mode recorded at commit time (T1).
-    // If unknown/null or non_isolated_same_uid, NEVER assume mount isolation.
-    const isMountIsolated = j.stagingIsolationMode === 'bwrap_mount_isolated';
-    const rootDir = host.resolveScopeRootDir(j.userId, j.scopeKind, j.chatId, j.projectId);
-    const stage = inspectStageFile(j.privateStagePath);
-    const target = inspectTargetFile(rootDir, j.relPath);
-
-    // 2. file_replaced: placement succeeded -> roll forward to Stage T6 (+ external_sync if subsequently changed)
-    if (j.state === 'file_replaced') {
-      const changedAfter =
-        !target.exists ||
-        target.unreadableOrTampered ||
-        target.sha256 !== j.newSha256;
-      rollForwardToT6(j, changedAfter, rootDir);
-      continue;
-    }
-
-    // 3. prepared: link/rename has not been entered yet
-    if (j.state === 'prepared') {
-      const targetUnchanged = j.isCreate
-        ? !target.exists
-        : target.exists && !target.unreadableOrTampered && target.sha256 === j.expectedPrevSha256;
-      const stageIntact =
-        j.stageIno === null ||
-        (stage.exists && stage.ino === j.stageIno && stage.sha256 === j.newSha256);
-
-      if (targetUnchanged && stageIntact) {
-        markAborted(j, 'prepared_aborted_before_replace');
-      } else {
-        markQuarantined(
-          j,
-          !stageIntact ? 'prepared_stage_tampered_or_missing' : 'prepared_target_changed',
-          !j.isCreate && !targetUnchanged,
-          rootDir
-        );
-      }
-      continue;
-    }
-
-    // 4. replacing (is_create = 1)
-    if (j.state === 'replacing' && j.isCreate) {
-      if (
-        !target.unreadableOrTampered &&
-        target.exists &&
-        j.stageIno !== null &&
-        target.ino === j.stageIno &&
-        target.sha256 === j.newSha256
-      ) {
-        rollForwardToT6(j, false, rootDir);
-      } else {
-        // ALL other cases for replacing(is_create=1) MUST be quarantined (cannot distinguish post-link external delete)
-        markQuarantined(j, 'replacing_create_ambiguous_state', false, rootDir);
-      }
-      continue;
-    }
-
-    // 5. replacing (is_create = 0)
-    if (j.state === 'replacing' && !j.isCreate) {
-      if (stage.exists) {
-        const targetMatchesPrev =
-          target.exists && !target.unreadableOrTampered && target.sha256 === j.expectedPrevSha256;
-        if (targetMatchesPrev) {
-          if (isMountIsolated) {
-            markAborted(j, 'replacing_update_not_performed_isolated');
-          } else {
-            markQuarantined(j, 'replacing_update_stage_present_non_isolated', false, rootDir);
-          }
-        } else {
-          if (isMountIsolated) {
-            markAborted(j, 'replacing_update_not_performed_external_change_isolated');
-            if (rootDir) {
-              host.recordExternalSyncOnRecovery({
-                userId: j.userId,
-                artifactId: j.artifactId,
-                rootDir,
-                relPath: j.relPath,
-              });
-            }
-          } else {
-            markQuarantined(j, 'replacing_update_external_change_non_isolated', true, rootDir);
-          }
-        }
-      } else {
-        // Stage absent
-        const targetMatchesNew =
+      // 4. replacing (is_create = 1)
+      if (j.state === 'replacing' && j.isCreate) {
+        if (
           !target.unreadableOrTampered &&
           target.exists &&
           j.stageIno !== null &&
           target.ino === j.stageIno &&
-          target.sha256 === j.newSha256;
-        if (targetMatchesNew) {
-          rollForwardToT6(j, false, rootDir);
-        } else if (isMountIsolated) {
-          // Rename completed before subsequent external modification/deletion
-          rollForwardToT6(j, true, rootDir);
+          target.sha256 === j.newSha256
+        ) {
+          rollForwardToT6(j, rootDir);
         } else {
-          markQuarantined(j, 'replacing_update_stage_absent_mismatch_non_isolated', true, rootDir);
+          // ALL other cases for replacing(is_create=1) MUST be quarantined (cannot distinguish post-link external delete)
+          markQuarantined(j, 'replacing_create_ambiguous_state');
+        }
+        continue;
+      }
+
+      // 5. replacing (is_create = 0)
+      if (j.state === 'replacing' && !j.isCreate) {
+        if (stage.state !== 'missing') {
+          if (stage.state !== 'present' || stage.ino !== j.stageIno || stage.sha256 !== j.newSha256) {
+            markQuarantined(j, 'replacing_stage_unreadable_or_tampered', true);
+            continue;
+          }
+          const targetMatchesPrev =
+            target.exists && !target.unreadableOrTampered && target.sha256 === j.expectedPrevSha256;
+          if (targetMatchesPrev) {
+            if (isMountIsolated) {
+              markAborted(j, 'replacing_update_not_performed_isolated');
+            } else {
+              markQuarantined(j, 'replacing_update_stage_present_non_isolated');
+            }
+          } else {
+            if (isMountIsolated) {
+              markAborted(j, 'replacing_update_not_performed_external_change_isolated', true);
+            } else {
+              markQuarantined(j, 'replacing_update_external_change_non_isolated', true);
+            }
+          }
+        } else {
+          // Stage absent
+          const targetMatchesNew =
+            !target.unreadableOrTampered &&
+            target.exists &&
+            j.stageIno !== null &&
+            target.ino === j.stageIno &&
+            target.sha256 === j.newSha256;
+          if (targetMatchesNew) {
+            rollForwardToT6(j, rootDir);
+          } else if (isMountIsolated) {
+            // Rename completed before subsequent external modification/deletion
+            rollForwardToT6(j, rootDir);
+          } else {
+            markQuarantined(j, 'replacing_update_stage_absent_mismatch_non_isolated', true);
+          }
         }
       }
+    } catch (error) {
+      // Preserve the journal so transient I/O errors can be retried without
+      // reclassifying the commit or losing an external change.
+      console.error('[artifact-recovery] Commit recovery deferred', j.commitId, error);
+      report.quarantined += 1;
     }
   }
 

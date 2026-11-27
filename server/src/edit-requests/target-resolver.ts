@@ -1,10 +1,10 @@
 import crypto from 'node:crypto';
-import type { RichBlockRecord, RichNode, RichSvgElement } from '../../../shared/rich-schema.js';
+import type { RichBlockRecord, RichDocumentV1, RichNode, RichSvgElement } from '../../../shared/rich-schema.js';
 import { targetSelectorSchema } from '../artifacts/target-selector-schema.js';
 import { canonicalJson } from '../artifacts/idempotency-coordinator.js';
 import type { TargetResolutionResult, TargetSelector } from '../artifacts/types.js';
 import { evaluateRichExpr } from '../rich/rich-expr-evaluator.js';
-import { compileRichDynamicPlan, evaluateRichDynamicState, mergeRichState } from '../rich/rich-validator.js';
+import { compileRichDynamicPlan, evaluateRichDynamicState, mergeRichState, richTargetDisplayIdentity } from '../rich/rich-validator.js';
 import { mapRichNodeChildren } from '../rich/rich-node-tree.js';
 
 function sha256(val: unknown): string {
@@ -22,10 +22,13 @@ function findRichNodeById(root: RichNode, targetId: string, ancestors: RichNode[
   return match;
 }
 
-function* svgElements(elements: RichSvgElement[]): Generator<RichSvgElement> {
+function* svgElements(
+  elements: RichSvgElement[],
+  parents: RichSvgElement[] = [],
+): Generator<{ element: RichSvgElement; parents: RichSvgElement[] }> {
   for (const element of elements) {
-    yield element;
-    if (element.children) yield* svgElements(element.children);
+    yield { element, parents };
+    if (element.children) yield* svgElements(element.children, [...parents, element]);
   }
 }
 
@@ -37,6 +40,7 @@ function* svgElements(elements: RichSvgElement[]): Generator<RichSvgElement> {
 export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetSelector,
   view: { state: Record<string, unknown>; theme: 'light' | 'dark' } = { state: {}, theme: 'light' },
   authorizedArtifactIds?: Set<string>,
+  baseDocument?: RichDocumentV1,
 ): TargetResolutionResult {
   if (!targetSelectorSchema.safeParse(selector).success || selector.blockId !== block.id ||
       selector.baseRevision === undefined || selector.baseRevision > block.revision) {
@@ -69,13 +73,36 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
     }
   }
 
+  const displayIdentity = (doc: RichDocumentV1) => {
+    if (!target || typeof targetId !== 'string') return null;
+    const selected = doc === block.document ? target : findRichNodeById(doc.root, targetId);
+    if (!selected) return null;
+    const docPlan = doc === block.document ? plan : compileRichDynamicPlan(doc, undefined);
+    const docState = doc === block.document ? state : mergeRichState(doc.state, view.state);
+    const validation = doc === block.document ? evaluation
+      : evaluateRichDynamicState(docPlan, { state: docState, theme: view.theme, authorizedArtifactIds });
+    if (!validation.valid) return null;
+    const ancestors = selected.ancestors.map(({ id, type, visibleWhen, repeat }) => ({ id, type, visibleWhen, repeat }));
+    return richTargetDisplayIdentity(docPlan, { node: selected.node, ancestors }, {
+      state: docState, computed: validation.computed, theme: view.theme,
+    });
+  };
+
+  const displayMatchesBase = () => {
+    if (selector.baseRevision === block.revision) return true;
+    if (!baseDocument) return false;
+    const previous = displayIdentity(baseDocument);
+    const current = displayIdentity(block.document);
+    return previous !== null && current !== null && sha256(previous) === sha256(current);
+  };
+
   if (kind === 'rich_node') {
     const node = target?.node;
     if (!node) return { status: 'stale', reason: 'rich_node_not_found' };
     const expectedType = selector.expectedNodeType;
     const expectedFp = selector.expectedNodeFingerprint;
     const currentFp = sha256(node);
-    if (node.type !== expectedType || currentFp !== expectedFp) {
+    if (node.type !== expectedType || currentFp !== expectedFp || !displayMatchesBase()) {
       return { status: 'needs_review', reason: 'rich_node_replaced_or_modified' };
     }
     return { status: 'resolved', resolvedSnippet: JSON.stringify(node).slice(0, 500) };
@@ -172,11 +199,15 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
     if (!svgNode || svgNode.type !== 'svg_scene') return { status: 'stale', reason: 'svg_node_not_found' };
     const elements = [...svgElements(svgNode.elements)];
     const matches = selector.elementId === undefined
-      ? elements.filter(el => el.tag === selector.expectedTag && sha256(el) === selector.expectedElementFingerprint)
-      : elements.filter(el => el.id === selector.elementId);
+      ? elements.filter(({ element }) => element.tag === selector.expectedTag && sha256(element) === selector.expectedElementFingerprint)
+      : elements.filter(({ element }) => element.id === selector.elementId);
     if (!matches.length) return { status: 'stale', reason: 'svg_element_not_found' };
-    const [el] = matches;
-    if (matches.length !== 1 || el.tag !== selector.expectedTag || sha256(el) !== selector.expectedElementFingerprint) {
+    const [{ element: el, parents }] = matches;
+    const path = [...parents, el];
+    if (path.some(element => element.repeat || (element.visibleWhen && !evaluateRichExpr(element.visibleWhen, context)))) {
+      return { status: 'needs_review', reason: 'svg_element_hidden_or_repeated' };
+    }
+    if (matches.length !== 1 || el.tag !== selector.expectedTag || sha256(el) !== selector.expectedElementFingerprint || !displayMatchesBase()) {
       return { status: 'needs_review', reason: 'svg_element_replaced_or_modified' };
     }
     return { status: 'resolved', resolvedSnippet: JSON.stringify(el) };

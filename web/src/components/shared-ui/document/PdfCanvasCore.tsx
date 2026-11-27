@@ -256,9 +256,10 @@ export const PdfCanvasViewer: React.FC<{
   documentKey?: string;
   onSelectPage?: (pageIndex: number, pageCount: number, selectedText?: PdfTextSelection, readPage?:()=>Promise<string>) => void;
   enhancedNavigation?: boolean;
+  jumpLocation?:Record<string,unknown>;
   selectionMode?:LocationSelection;
   onSelectLocation?:(location:PdfLocation,readPage:()=>Promise<string>)=>void;
-}> = React.memo(({ url, documentKey = url, onSelectPage, enhancedNavigation=false, selectionMode, onSelectLocation }) => {
+}> = React.memo(({ url, documentKey = url, onSelectPage, enhancedNavigation=false, selectionMode, onSelectLocation, jumpLocation }) => {
   const [navigation,setNavigation]=useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
@@ -861,19 +862,19 @@ export const PdfCanvasViewer: React.FC<{
   }, []);
 
   const scrollToPage = useCallback(
-    (targetPage: number) => {
+    (targetPage: number, offsetRatio = 0) => {
       if (numPages <= 0) return;
       const clamped = Math.max(1, Math.min(numPages, targetPage));
       pageNumRef.current = clamped;
       setPageNum(clamped);
-      programmaticScrollRef.current = { targetPage: clamped, offsetRatio: 0 };
+      programmaticScrollRef.current = { targetPage: clamped, offsetRatio };
       const container = scrollRef.current;
       const targetEl = pageElementsRef.current.get(clamped);
       if (container && targetEl) {
         const containerRect = container.getBoundingClientRect();
         const targetRect = targetEl.getBoundingClientRect();
         const paddingTop = parseFloat(window.getComputedStyle(container).paddingTop) || 0;
-        const nextTop = container.scrollTop + (targetRect.top - containerRect.top) - paddingTop;
+        const nextTop = container.scrollTop + (targetRect.top - containerRect.top) - paddingTop + offsetRatio * targetRect.height;
         container.scrollTo({ top: Math.max(0, nextTop), behavior: 'instant' });
         rememberScrollPosition(container);
       }
@@ -883,6 +884,18 @@ export const PdfCanvasViewer: React.FC<{
     },
     [numPages]
   );
+
+  useLayoutEffect(()=>{
+    if(!jumpLocation)return;
+    const page=jumpLocation.pageIndex;
+    if(typeof page!=='number'||!Number.isSafeInteger(page)||page<0||page>=numPages)return;
+    const rect=jumpLocation.rectPt;
+    const quads=jumpLocation.quadsPt;
+    const y=typeof jumpLocation.yPt==='number'?jumpLocation.yPt:Array.isArray(rect)?Number(rect[1]):
+      Array.isArray(quads)&&Array.isArray(quads[0])?Number(quads[0][1]):0;
+    const height=Number(jumpLocation.heightPt);
+    scrollToPage(page+1,height>0&&Number.isFinite(y)?Math.min(1,Math.max(0,y/height)):0);
+  },[jumpLocation,numPages,scrollToPage]);
 
   const cancelProgrammaticScrollLock = useCallback(() => {
     programmaticScrollRef.current = null;

@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import ts from 'typescript';
 import {describe,it,expect} from 'vitest';
-import {assertProductionModulePaths} from '../../web/build/production-boundary.js';
+import {assertProductionModulePaths,assertProductionModuleContent} from '../../web/build/production-boundary.js';
 
 const ROOT=path.resolve(import.meta.dirname,'../..');
 const WEB=path.join(ROOT,'web/src');
@@ -101,5 +101,13 @@ describe('PR3A frontend architecture boundaries',()=>{
     const fixture=path.join(ROOT,'e2e/fixtures/syntheticAssets.ts');
     expect(()=>assertProductionModulePaths([fixture],ROOT)).toThrow('test-only modules');
     expect(()=>assertProductionModulePaths([path.join(ROOT,'web/src/components/ArtifactWorkspace/index.tsx'),path.join(ROOT,'node_modules/lib/tests/asset.js')],ROOT)).not.toThrow();
+  });
+  it('NEG-11: detects hard-coded sample content inside an otherwise ordinary product module',()=>{
+    const module='web/src/components/Overview.tsx';
+    expect(()=>assertProductionModuleContent(module, "const headline={city:'Tokyo',temperature:25,condition:'Sunny'}")).toThrow('fixed demo data');
+    expect(()=>assertProductionModuleContent(module, "const prices=[{ticker:'TEST',price:42,change:2}]")).toThrow('fixed demo data');
+    expect(()=>assertProductionModuleContent(module, "const sample={schemaVersion:1,root:{type:'text',content:'Fixed demo'}}")).toThrow('fixed demo data');
+    expect(()=>assertProductionModuleContent(module, "const demoRows=[['Sample', 42]]")).toThrow('fixed demo data');
+    expect(()=>assertProductionModuleContent(module, "const columns=['Temperature','Condition']; const view={schemaVersion:1,root:reply.root};")).not.toThrow();
   });
 });

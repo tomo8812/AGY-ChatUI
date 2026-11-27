@@ -30,7 +30,9 @@ const rich = { blockId: text };
 const duplicateInfo = { occurrenceIndex: index.optional(), duplicateCount: positive.optional() };
 
 const fields = {
-  pptx_slide: { ...slide, expectedSlideHash: hash },
+  pptx_slide: { ...slide, expectedSlideHash: hash, pointPt: z.object({
+    xPt: nonnegative, yPt: nonnegative, widthPt: num.positive(), heightPt: num.positive(),
+  }).strict().optional() },
   pptx_element: { ...shape, groupPath: z.array(id).optional(), expectedElementFingerprint: hash },
   pptx_text_range: { ...shape, ...chars, ...context, expectedTextHash: hash },
   pptx_table_cell: { ...shape, ...cell },
@@ -53,7 +55,7 @@ const fields = {
   xlsx_defined_name: { name: text, expectedFormulaHash: hash },
   csv_range: { startRow: index, endRow: index, startCol: index, endCol: index,
     expectedRowCount: positive, expectedColCount: positive, expectedRangeValuesHash: hash, expectedHeaderHash: hash },
-  csv_row_col: { ...slice, expectedRowCount: positive, expectedColCount: positive, expectedRangeValuesHash: hash, expectedHeaderHash: hash },
+  csv_row_col: { ...slice, expectedRowCount: positive, expectedColCount: positive, expectedRangeValuesHash: hash, expectedHeaderHash: hash.optional() },
   pdf_page: page,
   pdf_text_range: { ...page, ...snippet, textOffsetStart: index, textOffsetEnd: positive,
     quadsPt: z.array(z.tuple([num, num, num, num, num, num, num, num])).min(1) },
@@ -126,6 +128,16 @@ export const targetSelectorSchema = z.custom<TargetSelector>((value: unknown) =>
   }
   return true;
 }, 'Invalid TargetSelector');
+
+const futureOfficeSelectors = new Set([
+  'pptx_text_range', 'pptx_table_cell', 'pptx_chart', 'pptx_smartart_node', 'pptx_notes', 'pptx_region',
+  'docx_text_range', 'docx_table_cell', 'docx_image', 'docx_page_setup', 'docx_header_footer', 'docx_page_region',
+  'xlsx_chart', 'xlsx_defined_name',
+]);
+
+export function selectorIsAvailable(selector: TargetSelector): boolean {
+  return !futureOfficeSelectors.has(selector.kind);
+}
 
 export function selectorMatchesFormat(selector: TargetSelector, format: string): boolean {
   const prefix = selector.kind.split('_')[0];

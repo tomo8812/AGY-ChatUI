@@ -1,3 +1,4 @@
+import { copyTextToClipboard } from '../../utils/clipboard';
 import type { RichAction, RichSideEffectAction, RichStateAction } from '../../../../shared/rich-schema';
 import { createRichEvalBudget,evaluateRichExpr,isValidHttpUrl,validateSafeFilename, type RichEvalContext } from './RichExprEvaluator';
 import type { RichStateSnapshot, RichStateStore } from './RichStateStore';
@@ -7,6 +8,7 @@ export interface RichActionHost {
   openArtifact?: (id:string)=>void|Promise<void>;
   saveArtifact?: (filename:string,format:Extract<RichSideEffectAction,{type:'save_to_artifact'}>['format'],content:string)=>void|Promise<void>;
   submitToChat?: (text:string)=>void|Promise<void>;
+  onCopy?: () => void;
   startPinEdit?: (targetNodeId: string | undefined, view: Pick<RichStateSnapshot, 'state' | 'theme'>)=>void|Promise<void>;
 }
 function isStateAction(action:RichAction):action is RichStateAction{
@@ -32,7 +34,10 @@ export async function runExplicitRichActions(actions:readonly RichAction[],store
     flush();
     if(!active())return;
     switch(action.type){
-      case 'copy_text': await navigator.clipboard.writeText(boundedText(val(action.textExpr),50000));break;
+      case 'copy_text':
+        if (!await copyTextToClipboard(boundedText(val(action.textExpr),50000))) throw Error('コピーできませんでした。');
+        if (active()) host.onCopy?.();
+        break;
       case 'open_external_url': {
         const url=boundedText(val(action.urlExpr),2048);
         if(!isValidHttpUrl(url))throw Error('リンク先が無効です。');

@@ -1,3 +1,4 @@
+import { useTargetSelection } from '../useTargetSelection';
 import React,{useEffect,useRef,useState} from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { workspaceApi,supportsOperation,MAX_WORKSPACE_IMAGE_BYTES,type EditOperation, type WorkspaceTableCellEdit } from '../../../api/workspace';
@@ -105,15 +106,13 @@ function SlideThumbnailRail({artifact,slides,activeSlideId,activeIndex,onSelect}
     </div>
   </div>;
 }
-export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDraft,onTarget,target}:WorkspaceModuleProps){
+export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDraft,onTarget,beginTargetSelection,target,jumpTarget}:WorkspaceModuleProps){
   const [slideId,setSlideId]=useState('');
   const [selected,setSelected]=useState('');
   const [baseShape,setBaseShape]=useState('');
   const [canvasText,setCanvasText]=useState(false);
   const sequence=useRef(0);
-  const pinRequest=useRef(0);
-  const latestPin=useRef({revision:artifact.revision,slideId,mode});
-  latestPin.current={revision:artifact.revision,slideId,mode};
+  const pinSelection=useTargetSelection(beginTargetSelection,JSON.stringify([slideId,selected,baseShape]));
   const [operationKind,setOperationKind]=useState('');
   const [shapeText,setShapeText]=useState('');
   const [shapeKind,setShapeKind]=useState<'rectangle'|'ellipse'|'textbox'>('rectangle');
@@ -329,11 +328,17 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     chooseOperation('');
   }
   const choose=(id:string)=>{setSelected(id);setCanvasText(false);setDrag(null);setResize(null);resizePointer.current=null};
+  React.useLayoutEffect(()=>{
+    if(!jumpTarget)return;
+    const selectedSlide=savedSlides.find(item=>item.id===String(jumpTarget.selector.slideId));
+    if(!selectedSlide)return;
+    if(jumpTarget.selector.kind==='pptx_element'&&typeof jumpTarget.coords?.shapeId!=='number')return;
+    const selectedShape=typeof jumpTarget.coords?.shapeId==='number'?String(jumpTarget.coords.shapeId):'';
+    setSlideId(selectedSlide.id);setBaseShape(selectedShape);choose(selectedShape);
+  },[jumpTarget,structure.ready]);
   async function pin(targetSlide:Slide,shapeId?:string,contentCoords?:Record<string,unknown>){
     if(artifact.revision===undefined)return;
-    const previous=latestPin.current,request=++pinRequest.current;
-    const isCurrent=()=>pinRequest.current===request&&latestPin.current.revision===previous.revision&&
-      latestPin.current.slideId===previous.slideId&&latestPin.current.mode==='pin';
+    const isCurrent=pinSelection.begin();
     setOperationError('');
     try {
       const metadata=await workspaceApi.range<TargetSlide>(artifact.id,{part:targetSlide.part,targetMetadata:true});
@@ -345,7 +350,9 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
       if(!isCurrent())return;
       onTarget({baseRevision:artifact.revision,label:element?label+' / '+element.name:label,
         selector:element?{kind:'pptx_element',slideId:targetSlide.id,shapeId:Number(element.id),groupPath:element.groupPath,expectedElementFingerprint:element.fingerprint}
-          :{kind:'pptx_slide',slideId:targetSlide.id,expectedSlideHash:metadata.slideHash},
+          :{kind:'pptx_slide',slideId:targetSlide.id,expectedSlideHash:metadata.slideHash,
+            ...(contentCoords && size ? {pointPt:{xPt:contentCoords.xPt,yPt:contentCoords.yPt,
+              widthPt:size.widthPt,heightPt:size.heightPt}} : {})},
         selectedContentSnapshot:element?.text.slice(0,50_000),contentCoords});
     }catch(e){if(isCurrent())setOperationError(e instanceof Error?e.message:'対象を識別できません。')}
   }
@@ -406,7 +413,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
       <button type="button" className="btn btn-secondary btn-xs" disabled={!slide||!targetStructure.ready} onClick={()=>{if(slide)void pin(slide,baseShape||undefined)}}>構造を対象にする</button>
     </div>}
     {mode==='pin'&&(operationError||structure.error||targetStructure.error)&&<p className="error-box" role="alert">{operationError||structure.error||targetStructure.error}</p>}
-    <PdfCanvasViewer documentKey={artifact.id} url={buildArtifactContentUrl(artifact,{convertedPdf:true})}
+    <PdfCanvasViewer jumpLocation={jumpTarget?.coords} documentKey={artifact.id} url={buildArtifactContentUrl(artifact,{convertedPdf:true})}
       selectionMode={mode==='pin'?'pin':undefined}
       onSelectLocation={mode==='pin'?location=>{
         const clicked=slides[location.pageIndex];if(!clicked)return;

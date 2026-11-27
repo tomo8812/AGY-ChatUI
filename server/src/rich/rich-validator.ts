@@ -1359,6 +1359,52 @@ export function compileRichDynamicPlan(
   };
 }
 
+/** Project the inputs that determine a target's display using the rendering evaluator. */
+export function richTargetDisplayIdentity(
+  plan: RichDynamicPlan,
+  target: unknown,
+  context: { state: Record<string, unknown>; computed: Record<string, unknown>; theme: 'light' | 'dark' },
+) {
+  const deps = emptyDeps();
+  const budget = createRichEvalBudget();
+  const values: unknown[] = [];
+  const visit = (value: unknown, repeated = false): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, repeated);
+    } else if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      if (typeof record.bind === 'string') deps.stateKeys.add(record.bind);
+      for (const [key, child] of Object.entries(record)) {
+        if (typeof child === 'string' && (key === 'expr' || key === 'visibleWhen' || key.endsWith('Expr'))) {
+          const ast = plan.getAst(child);
+          collectAstDeps(ast, deps);
+          if (key === 'expr' && !repeated && !record.repeat) values.push(evaluateRichAst(ast, context, budget));
+        } else {
+          visit(child, repeated || Boolean(record.repeat));
+        }
+      }
+    }
+  };
+  visit(target);
+  const computedKeys = new Set<string>();
+  const includeComputed = (key: string) => {
+    if (computedKeys.has(key)) return;
+    computedKeys.add(key);
+    const dependency = plan.computedDeps.get(key);
+    if (!dependency) return;
+    mergeDeps(deps, dependency);
+    for (const name of dependency.usesAllComputed ? plan.computedOrder : dependency.computedKeys) includeComputed(name);
+  };
+  for (const key of deps.usesAllComputed ? plan.computedOrder : deps.computedKeys) includeComputed(key);
+  const stateKeys = deps.usesAllState ? new Set([...Object.keys(plan.doc.state ?? {}), ...Object.keys(context.state)]) : deps.stateKeys;
+  return {
+    target, values,
+    ...(deps.usesTheme ? { theme: context.theme } : {}),
+    state: [...stateKeys].sort().map(key => [key, plan.doc.state?.[key] ?? null, context.state[key] ?? null]),
+    computed: [...computedKeys].sort().map(key => [key, plan.doc.computed?.[key] ?? null, context.computed[key] ?? null]),
+  };
+}
+
 export function evaluateRichDynamicState(
   plan: RichDynamicPlan,
   opts: {

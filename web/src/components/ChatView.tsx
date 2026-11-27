@@ -1,3 +1,4 @@
+import { copyTextToClipboard } from '../utils/clipboard';
 import React, { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ApiError, api } from '../api/client';
@@ -87,29 +88,6 @@ interface LongPressMenuState {
   source: HTMLElement;
   alignEnd: boolean;
   isTouch: boolean;
-}
-
-async function copyTextToClipboard(text: string): Promise<void> {
-  if (!text) return;
-  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-    try {
-      await navigator.clipboard.writeText(text);
-      return;
-    } catch {
-      // Fallback below
-    }
-  }
-  if (typeof document !== 'undefined') {
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    ta.setAttribute('readonly', '');
-    ta.style.position = 'fixed';
-    ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand('copy');
-    document.body.removeChild(ta);
-  }
 }
 
 function formatContextPercent(used: number, size: number): string {
@@ -1230,7 +1208,7 @@ const MessageRow: React.FC<{
     }, [clearLongPress]);
 
     const handleCopy = useCallback(async () => {
-      await copyTextToClipboard(answer);
+      if (!await copyTextToClipboard(answer)) return;
       setCopied(true);
       setTimeout(() => setCopied(false), 1600);
     }, [answer]);

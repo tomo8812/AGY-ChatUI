@@ -11,7 +11,12 @@ export interface WorkspaceTableCellEdit {row:number;column:number;text:string}
 export type EditOperation={op:string;[key:string]:unknown};
 export interface RevisionResponse {artifactId:string;revision:number;sha256:string}
 export interface WorkspaceTarget {selector:{kind:string;[key:string]:unknown};baseRevision:number;label:string;selectedContentSnapshot?:string;surroundingContext?:string;range?:Record<string,unknown>;contentCoords?:Record<string,unknown>}
-export interface EditRequestRecord {id:string;artifactId:string|null;instruction:string;status:string;selector:WorkspaceTarget['selector'];baseRevision:number;selectedContentSnapshot:string}
+export interface EditRequestRecord {id:string;artifactId:string|null;instruction:string;status:string;selector:WorkspaceTarget['selector'];baseRevision:number;appliedRevision:number|null;selectedContentSnapshot:string}
+export interface EditRequestLocation {
+  request: EditRequestRecord;
+  targetRevision: number;
+  reResolution: {status:string;resolvedRange?:Record<string,unknown>;resolvedCoords?:Record<string,unknown>};
+}
 const editRequestListeners = new Set<(chatId: string) => void>();
 export function notifyEditRequestsChanged(chatId: string): void {
   for (const listener of editRequestListeners) listener(chatId);
@@ -91,6 +96,8 @@ export const workspaceApi={
     return apiFetch<{artifact:ArtifactRecord;noOp:boolean;summary:string}>(path(id,'edit'),{method:'POST',body:{expectedRevision,operations,idempotencyKey}});
   },
   listRequests:(chatId:string,artifactId:string,signal?:AbortSignal)=>apiFetch<{requests:EditRequestRecord[]}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests?'+new URLSearchParams({artifactId}),{signal}),
+  requestLocation:(chatId:string,id:string)=>apiFetch<EditRequestLocation>(
+    '/api/chats/'+encodeURIComponent(chatId)+'/edit-requests/'+encodeURIComponent(id)),
   createRequest:(chatId:string,artifactId:string,target:WorkspaceTarget,instruction:string)=>apiFetch<{request:EditRequestRecord}>('/api/chats/'+encodeURIComponent(chatId)+'/edit-requests',{method:'POST',body:{
     targetKind:'artifact',artifactId,...requestTarget(target),instruction,
   }}),

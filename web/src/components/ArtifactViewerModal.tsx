@@ -219,7 +219,7 @@ const MediaZoomViewer: React.FC<MediaZoomViewerProps> = React.memo(({ src, alt, 
   );
 });
 
-const DiffPatchView: React.FC<{ versionKey: string; patch: string }> = React.memo(({ versionKey, patch }) => {
+export const DiffPatchView: React.FC<{ versionKey: string; patch: string }> = React.memo(({ versionKey, patch }) => {
   const cacheKey = `${versionKey}:diff`;
   const [files, setFiles] = useState<ParsedDiff[] | null>(
     () => (diffPatchCache.get(cacheKey) as ParsedDiff[] | undefined) ?? null

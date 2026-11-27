@@ -841,7 +841,9 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
     await expect(srv.ctx.editRequestService.createRequest({
       userId, chatId, targetKind: 'rich_block', richBlockId: richCreated.block.id, selector: noIndex, instruction: 'invalid',
     })).rejects.toMatchObject({ code: 'INVALID_INPUT' });
-    await srv.ctx.editRequestService.sendBatch({ userId, chatId, requestIds: [reqRich.id] });
+    expect((await alice.request('POST', `/api/chats/${chatId}/edit-requests/send-batch`, {
+      requestIds: [reqRich.id], clientMessageId: crypto.randomUUID(),
+    })).status).toBe(200);
 
     // Swap array order r2, r1
     srv.ctx.richContentService.updateBlock({
@@ -873,7 +875,9 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       newSelector: { ...reqRich.selector, baseRevision: 2, itemIndex: 1, expectedListOrderHash: sha256(JSON.stringify(['r2', 'r1'])) },
     });
     expect(reconfirmed.status).toBe('draft');
-    await requests.sendBatch({ userId, chatId, requestIds: [reqRich.id] });
+    expect((await alice.request('POST', `/api/chats/${chatId}/edit-requests/send-batch`, {
+      requestIds: [reqRich.id], clientMessageId: crypto.randomUUID(),
+    })).status).toBe(200);
 
     await requests.getForAgent(userId, chatId, reqRich.id);
     const target = srv.ctx.richContentService.getBlock(userId, chatId, reqRich.richBlockId!)!;

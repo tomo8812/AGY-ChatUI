@@ -7,6 +7,11 @@ export interface GridAxisOrigin {index:number;insertedBy?:string}
 export interface GridDraftLocation {sheetId:string;row:GridAxisOrigin;col:GridAxisOrigin;after?:string}
 export interface DraftEntry {key:string;operation:EditOperation;label:string;displayValue?:string;gridLocation?:GridDraftLocation}
 export interface WorkspaceDraft {baseRevision:number;entries:DraftEntry[]}
+export interface WorkspaceJump {
+  selector: WorkspaceTarget['selector'];
+  range?: Record<string, unknown>;
+  coords?: Record<string, unknown>;
+}
 export interface WorkspaceModuleProps {
   artifact:ArtifactRecord;
   mode:WorkspaceMode;
@@ -16,6 +21,8 @@ export interface WorkspaceModuleProps {
   onDraft:(baseRevision:number,entry:DraftEntry|null,key:string)=>void;
   target:WorkspaceTarget|null;
   onTarget:(target:WorkspaceTarget|null)=>void;
+  jumpTarget?:WorkspaceJump;
+  beginTargetSelection:()=>()=>boolean;
 }
 export interface WorkspaceModule {
   Component:ComponentType<WorkspaceModuleProps>;

@@ -1,7 +1,7 @@
 import { inspectMediaMetadata, inspectVideoTarget } from './adapters/media-target.js';
 import { inspectPdfText } from './adapters/pdf-text-inspection.js';
 import fs from 'node:fs';
-import { parentPort, workerData } from 'node:worker_threads';
+import { MAX_INSPECTION_INPUT_BYTES, MAX_INSPECTION_OUTPUT_BYTES } from './target-inspection-limits.js';
 import type { PreviewKind } from '../types.js';
 import { fingerprintsMatch, openContainedRegularFileNoFollow, readContainedRegularFileNoFollowStable } from '../files/workspace.js';
 import { createLineMatcher, sha256Buffer, sha256Text, splitLines } from './adapters/base.js';
@@ -27,16 +27,23 @@ export type InspectionJob = { file: FileMeta; maxBytes?: number } & (
   | { selector: TargetSelector; rootDir: string; expectedSha256: string; snippetHint?: string; baseSnapshot?: Snapshot }
 );
 
-function readSnapshot(snapshot: Snapshot, maxBytes?: number) {
-  if (maxBytes !== undefined && snapshot.sizeBytes > maxBytes) {
+function readSnapshot(snapshot: Snapshot, maxBytes: number) {
+  if (!Number.isSafeInteger(snapshot.sizeBytes) || snapshot.sizeBytes < 0 || snapshot.sizeBytes > maxBytes) {
     throw new ArtifactError('DOC_WORKER_INPUT_TOO_LARGE', 'Document input exceeds the worker size limit.', 413);
   }
-  const fd = fs.openSync(snapshot.path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  const fd = fs.openSync(snapshot.path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   try {
     const stat = fs.fstatSync(fd);
     if (stat.isFile() && stat.size === snapshot.sizeBytes) {
-      const bytes = fs.readFileSync(fd);
-      if (bytes.length === snapshot.sizeBytes && sha256Buffer(bytes) === snapshot.sha256) return bytes;
+      const bytes = Buffer.allocUnsafe(snapshot.sizeBytes);
+      let offset = 0;
+      while (offset < bytes.length) {
+        const count = fs.readSync(fd, bytes, offset, bytes.length - offset, offset);
+        if (!count) break;
+        offset += count;
+      }
+      if (offset === snapshot.sizeBytes && fs.fstatSync(fd).size === snapshot.sizeBytes &&
+          sha256Buffer(bytes) === snapshot.sha256) return bytes;
     }
   } finally {
     fs.closeSync(fd);
@@ -76,9 +83,10 @@ function describeSourceTarget(bytes: Buffer, range: Record<string, unknown>) {
 }
 
 async function inspect(job: InspectionJob) {
+  const maxBytes = Math.min(job.maxBytes ?? MAX_INSPECTION_INPUT_BYTES, MAX_INSPECTION_INPUT_BYTES);
   const adapter = new FormatAdapterRegistry().resolve(job.file.filename, job.file.previewKind);
   if ('range' in job) {
-    const bytes = readSnapshot(job.snapshot, job.maxBytes);
+    const bytes = readSnapshot(job.snapshot, maxBytes);
     if (job.range.sourceTarget === true && ['code', 'markdown', 'html', 'svg', 'mermaid', 'diff'].includes(adapter.format)) {
       return describeSourceTarget(bytes, job.range);
     }
@@ -108,7 +116,7 @@ async function inspect(job: InspectionJob) {
 
   let source: ReturnType<typeof readContainedRegularFileNoFollowStable>;
   try {
-    source = readContainedRegularFileNoFollowStable(job.rootDir, job.file.relPath, { maxBytes: job.maxBytes });
+    source = readContainedRegularFileNoFollowStable(job.rootDir, job.file.relPath, { maxBytes });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { status: 'stale', reason: 'artifact_file_missing' };
     return { status: 'needs_review', reason: 'target_content_unavailable' };
@@ -120,7 +128,7 @@ async function inspect(job: InspectionJob) {
       typeof startLine === 'number' && typeof endLine === 'number' &&
       Number.isSafeInteger(startLine) && Number.isSafeInteger(endLine) && startLine > 0 && endLine >= startLine) {
     try {
-      const base = readSnapshot(job.baseSnapshot, job.maxBytes);
+      const base = readSnapshot(job.baseSnapshot, maxBytes);
       snippetHint = splitLines(base.toString('utf8')).slice(startLine - 1, endLine).join('\n');
     } catch {
       // The resolver can still use an independently hash-verified snapshot or current match.
@@ -134,7 +142,21 @@ async function inspect(job: InspectionJob) {
     : null;
   const media = adapter.format === 'media' && !video
     ? await inspectMediaMetadata(source.buffer, job.file.filename, job.file.mimeType) : video;
-  const result = adapter.resolveTarget(source.buffer, job.selector, {
+  let selector = job.selector;
+  if (selector.kind === 'csv_row_col' && selector.expectedHeaderHash === undefined) {
+    if (!job.baseSnapshot) return { status: 'needs_review', reason: 'base_revision_content_unavailable' };
+    try {
+      const base = job.baseSnapshot.sha256 === source.sha256 ? source.buffer : readSnapshot(job.baseSnapshot, maxBytes);
+      const { headerHash } = adapter.getStructure(base, job.file);
+      selector = { ...selector, expectedHeaderHash: headerHash };
+      if (adapter.resolveTarget(base, selector, job.file).status !== 'resolved') {
+        return { status: 'needs_review', reason: 'base_revision_target_unverified' };
+      }
+    } catch {
+      return { status: 'needs_review', reason: 'base_revision_content_unavailable' };
+    }
+  }
+  const result = adapter.resolveTarget(source.buffer, selector, {
     ...job.file, snippetHint, pdfTextLayout, mediaDurationSeconds: media?.durationSeconds, videoFrame: video?.frame,
   });
   if (result.status === 'resolved') {
@@ -153,10 +175,18 @@ async function inspect(job: InspectionJob) {
   return result;
 }
 
-try {
-  parentPort!.postMessage({ result: await inspect(workerData as InspectionJob) });
-} catch (error) {
-  parentPort!.postMessage({ error: error instanceof ArtifactError
-    ? { code: error.code, message: error.message, statusCode: error.statusCode, details: error.details }
-    : { code: 'TARGET_INSPECTION_FAILED', message: '対象の構造を読み取れません。', statusCode: 422 } });
-}
+process.once('message', async (job: InspectionJob) => {
+  let response;
+  try {
+    const result = await inspect(job);
+    if (Buffer.byteLength(JSON.stringify(result)) > MAX_INSPECTION_OUTPUT_BYTES) {
+      throw new ArtifactError('TARGET_INSPECTION_OUTPUT_LIMIT', '対象の解析結果が上限を超えました。', 413);
+    }
+    response = { result };
+  } catch (error) {
+    response = { error: error instanceof ArtifactError
+      ? { code: error.code, message: error.message, statusCode: error.statusCode, details: error.details }
+      : { code: 'TARGET_INSPECTION_FAILED', message: '対象の構造を読み取れません。', statusCode: 422 } };
+  }
+  process.send!(response, () => process.disconnect());
+});

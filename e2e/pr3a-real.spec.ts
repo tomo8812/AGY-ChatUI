@@ -2,7 +2,7 @@ import {expect,test,type Page,type TestInfo} from '@playwright/test';
 import fs from 'node:fs';
 import path from 'node:path';
 import {execFileSync} from 'node:child_process';
-import {createTestServer,TestApiClient} from '../server/tests/helpers/test-harness.js';
+import {createTestServer,seedAuthenticatedMockProfile,TestApiClient} from '../server/tests/helpers/test-harness.js';
 import type {ArtifactRecord} from '../web/src/types';
 import {auditRegions,computeRegionMetrics,decodePng,type RegionAuditSpec} from './helpers/visualAudit.js';
 
@@ -158,6 +158,7 @@ for(const vp of targets){
       const reg=await client.request<{user:{id:string}}>('POST','/api/auth/register',{username:'pr3a-real',displayName:'PR3A Real',password:'password123'});
       expect(reg.status).toBe(201);
       const userId=reg.data.user.id,chatId='pr3a-real-chat';
+      seedAuthenticatedMockProfile(srv.ctx,userId);
       const dir=fs.mkdtempSync(path.join(srv.dataRoot,'browser-workspace-'));
       srv.ctx.db.createChat({id:chatId,userId,projectId:null,title:'PR3A Real Files',workspaceDir:dir,modelId:'',effortValue:'',projectContextVersion:0});
       const svc=srv.ctx.artifactService;
@@ -480,7 +481,9 @@ for(const vp of targets){
           if(item.kind==='pptx'){
             const request=requests[0];
             expect(request.regionImageBlobSha256).toBeNull();
-            await srv.ctx.editRequestService.sendBatch({userId,chatId,requestIds:[request.id]});
+            expect((await client.request('POST',`/api/chats/${chatId}/edit-requests/send-batch`,{
+              requestIds:[request.id],clientMessageId:crypto.randomUUID(),
+            })).status).toBe(200);
             const target=await srv.ctx.editRequestService.getForAgent(userId,chatId,request.id);
             expect(target).toMatchObject({status:'sent',targetRevision:request.baseRevision,
               reResolution:{status:'resolved',resolvedCoords:{pageIndex:expect.any(Number),shapeId:request.selector.shapeId}}});
@@ -506,6 +509,20 @@ for(const vp of targets){
           await page.evaluate(()=>{document.documentElement.dataset.theme='light'});
 
           if(item.kind==='pdf'){
+            if(vp.width===1280){
+              const pinMeta=await svc.readRange(userId,artifact.id,{targetMetadata:true,pageIndex:1,rectPt:'[2,3,0,0]'});
+              const source=pinMeta.target as {pageCount:number;pageContentHash:string;regionDigest:string};
+              const selector={kind:'pdf_pin',baseRevision:artifact.revision,pageIndex:1,xPt:2,yPt:3,
+                expectedPageCount:source.pageCount,expectedPageContentHash:source.pageContentHash,expectedRegionDigest:source.regionDigest};
+              const resolution=await svc.resolveTargetOnArtifact(userId,artifact.id,selector);
+              expect(resolution).toMatchObject({status:'resolved',resolvedCoords:{xPt:2,yPt:3,rectPt:[2,3,0,0]}});
+              const png=await svc.renderTargetRegion(userId,artifact.id,artifact.revision!,selector,resolution);
+              expect(png).not.toBeNull();
+              const crop=decodePng(png!);
+              expect(crop.width).toBeGreaterThan(1);expect(crop.height).toBeGreaterThan(1);
+              expect(crop.width).toBeLessThan(200);expect(crop.height).toBeLessThan(200);
+              evidence.push({kind:'pdf-pin-crop',width:crop.width,height:crop.height});
+            }
             await page.getByRole('combobox',{name:'PDF の選択方法'}).selectOption('region');
             const region=page.getByRole('button',{name:'ページ 2の範囲',exact:true});
             await region.focus();await region.press('Enter');await region.press('ArrowRight');await region.press('ArrowDown');await region.press('Enter');

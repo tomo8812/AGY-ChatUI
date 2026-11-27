@@ -50,6 +50,22 @@ export function PdfNavigationPanel({doc,page,onJump,onSelectText,onClose}:{doc:P
   const [error,setError]=useState('');
   const task=useRef<AbortController|null>(null);
   const textBox=useRef<HTMLTextAreaElement>(null);
+  const selectionGeneration=useRef(0);
+  useEffect(()=>()=>{selectionGeneration.current++},[doc,page,tab,text,Boolean(onSelectText)]);
+  const selectText=()=>{
+    const field=textBox.current;
+    if(!field||!onSelectText)return;
+    const {selectionStart:start,selectionEnd:end}=field;
+    const generation=++selectionGeneration.current;
+    if(start===end){setError('本文の範囲を選択してください。');return}
+    const current=()=>generation===selectionGeneration.current&&textBox.current===field&&
+      field.selectionStart===start&&field.selectionEnd===end;
+    void getSelectedTextGeometry(doc,page,text,start,end).then(result=>{
+      if(current())onSelectText(result,page);
+    },(error:unknown)=>{
+      if(current())setError(error instanceof Error?error.message:'本文を選択できません。');
+    });
+  };
   useEffect(()=>setJump(String(page)),[page]);
   useEffect(()=>{
     setOutline(null);setHits([]);setText('');setScan({done:0,running:false,truncated:false,errors:0});setError('');
@@ -122,6 +138,6 @@ export function PdfNavigationPanel({doc,page,onJump,onSelectText,onClose}:{doc:P
       <p className="muted-xs" role="status">{scan.done} / {doc.numPages} ページ · {hits.length} 件{scan.truncated?'（途中まで）':''}{scan.errors?' · 読取不可 '+scan.errors+' ページ':''}</p>
       <div className="pdf-panel-results">{hits.map(hit=><button key={hit.page} type="button" onClick={()=>onJump(hit.page)}><strong>ページ {hit.page}</strong><span>{hit.excerpt}</span></button>)}</div>
     </>}
-    {tab==='text'&&<><p className="muted-xs">ページ {page} の本文</p><textarea ref={textBox} aria-label="ページ本文" readOnly value={text} placeholder={textLoading?'読み込み中…':'テキストがありません。'} rows={6}/>{onSelectText&&<button className="btn btn-secondary btn-xs" type="button" disabled={!text} onClick={()=>{const el=textBox.current;if(el){const selection=text.slice(el.selectionStart,el.selectionEnd);if(selection)void getSelectedTextGeometry(doc,page,text,el.selectionStart,el.selectionEnd).then(result=>onSelectText(result,page),err=>setError(err instanceof Error?err.message:'本文を選択できません。'));else setError('本文の範囲を選択してください。')}}}>選択本文を対象にする</button>}</>}
+    {tab==='text'&&<><p className="muted-xs">ページ {page} の本文</p><textarea ref={textBox} aria-label="ページ本文" readOnly value={text} placeholder={textLoading?'読み込み中…':'テキストがありません。'} rows={6}/>{onSelectText&&<button className="btn btn-secondary btn-xs" type="button" disabled={!text} onClick={selectText}>選択本文を対象にする</button>}</>}
   </section>;
 }

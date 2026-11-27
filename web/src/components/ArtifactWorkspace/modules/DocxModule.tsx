@@ -1,3 +1,4 @@
+import { useTargetSelection } from '../useTargetSelection';
 import React,{useCallback,useEffect,useMemo,useRef,useState} from 'react';
 import type {Editor} from '@tiptap/react';
 import {WordParagraphEditor,type WordRun,type WordMark} from '../../shared-ui/editor/WordParagraphEditor';
@@ -67,7 +68,7 @@ function WordChunk({index,count,blocks,onVisibility,renderBlock}:WordChunkProps)
   </div>;
 }
 
-export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDraft,onTarget,target}:WorkspaceModuleProps){
+export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDraft,onTarget,beginTargetSelection,target,jumpTarget}:WorkspaceModuleProps){
   const [reading,setReading]=useState<'page'|'text'>('page');
   const pdfCap=capabilities?.operations.find(op=>op.operation==='export:pdf');
   const canRender=pdfCap?.availability==='supported'||pdfCap?.availability==='partial';
@@ -194,9 +195,10 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   };
   const editableSelection=Boolean(block?.editableText||selectedAddition);
 
+  const pinSelection=useTargetSelection(beginTargetSelection,String(selected));
   async function pinParagraph(selectedBlock:WordBlock){
     if(artifact.revision===undefined||selectedBlock.type!=='p')return;
-    const identity=artifact.revision;
+    const identity=artifact.revision,isCurrent=pinSelection.begin();
     try{
       const result=await workspaceApi.range<{
         target:{
@@ -209,7 +211,7 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
         }|null;
       }>(artifact.id,{targetBlockIndex:selectedBlock.blockIndex});
       assertRevision(artifact,result);
-      if(latest.current.revisionKey!==revisionKey||latest.current.mode!=='pin'||latest.current.selected!==selectedBlock.blockIndex)return;
+      if(!isCurrent())return;
       if(!result.target)throw Error('段落を識別できません。');
       onTarget({
         baseRevision:identity,
@@ -226,7 +228,7 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
         },
         selectedContentSnapshot:selectedBlock.text.slice(0,50_000),
       });
-    }catch(e){setImageError(e instanceof Error?e.message:'段落を識別できません。')}
+    }catch(e){if(isCurrent())setImageError(e instanceof Error?e.message:'段落を識別できません。')}
   }
 
   const primary=<>
@@ -281,15 +283,24 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
 
   const toolbar=<ResponsiveCommandBar primary={<>{primary}{mode!=='edit'&&outlineButton}</>} secondary={secondary} minInlineWidth={1050}/>;
 
+  const revealBlock=(index:number)=>{
+    activeEditor.current=null;
+    setActiveAddition(null);
+    setSelected(index);
+    if(!revealHeading(index)){
+      jumpBlock.current=index;
+      const targetChunk=Math.floor(index/CHUNK_SIZE);
+      canvas.current?.querySelector<HTMLElement>('[data-word-chunk="'+targetChunk+'"]')?.scrollIntoView({block:'nearest'});
+    }
+  };
+  React.useLayoutEffect(()=>{
+    const index=jumpTarget?.range?.resolvedBlockIndex;
+    if(resource.ready&&typeof index==='number'&&index>=0&&index<blockCount)revealBlock(index);
+  },[jumpTarget,resource.ready,blockCount]);
   const outline=outlineOpen&&<nav className="workspace-source-outline" aria-label="文書の見出し">
     {resource.data?.headings?.length?resource.data.headings.map(heading=><button type="button" key={heading.blockIndex}
       style={{paddingInlineStart:heading.level*8}} onClick={()=>{
-        setSelected(heading.blockIndex);setOutlineOpen(false);
-        if(!revealHeading(heading.blockIndex)){
-          jumpBlock.current=heading.blockIndex;
-          const targetChunk=Math.floor(heading.blockIndex/CHUNK_SIZE);
-          canvas.current?.querySelector<HTMLElement>('[data-word-chunk="'+targetChunk+'"]')?.scrollIntoView({block:'nearest'});
-        }
+        revealBlock(heading.blockIndex);setOutlineOpen(false);
       }}>{heading.text}</button>):<span className="muted-xs">見出しがありません。</span>}
   </nav>;
 

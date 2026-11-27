@@ -234,6 +234,15 @@ class DocumentFormatAdapter implements FormatAdapter {
         return { operation, availability: notes ? 'partial' : 'supported', scope, notes };
       }),
     ];
+    const officeSelectors = this.format === 'pptx' ? ['pptx_slide', 'pptx_element']
+      : this.format === 'docx' ? ['docx_paragraph']
+      : this.format === 'xlsx' ? ['xlsx_range', 'xlsx_row_col', 'xlsx_sheet'] : [];
+    if (this.hasOfficeReadFallback(ctx.filename ?? '') || this.format === 'pptx' && /\.pptx$/i.test(ctx.filename ?? '')) {
+      operations.push(...officeSelectors.map((kind): OperationCapability => ({
+        operation: `target_pin:${kind}`, availability: 'supported',
+        scope: kind === 'xlsx_row_col' || kind === 'xlsx_sheet' ? 'mcp_only' : 'mcp_and_ui',
+      })));
+    }
     if (this.format === 'pdf') operations.push({
       operation: 'edit_body_reflow', availability: 'unsupported_by_format', scope: 'mcp_only',
       notes: 'PDF の既存本文削除・リフロー編集は形式方針により非対応です。注釈および新規オーバーレイを追加できます。',
@@ -480,7 +489,8 @@ class DocumentFormatAdapter implements FormatAdapter {
         }
         return {
           status: 'resolved',
-          resolvedCoords: { pageIndex, rectPt: rectangle, widthPt: page.widthPt, heightPt: page.heightPt },
+          resolvedCoords: { pageIndex, rectPt: rectangle, widthPt: page.widthPt, heightPt: page.heightPt, rotate: page.rotate,
+            ...(selector.kind === 'pdf_pin' ? { xPt: rectangle[0], yPt: rectangle[1] } : {}) },
           resolvedSnippet: page.text,
         };
       }
@@ -534,7 +544,8 @@ class DocumentFormatAdapter implements FormatAdapter {
         }
         return {
           status: 'resolved',
-          resolvedCoords: { pageIndex, textOffsetStart: start, textOffsetEnd: end, occurrenceIndex: actualOcc, quadsPt: actualQuads },
+          resolvedCoords: { pageIndex, textOffsetStart: start, textOffsetEnd: end, occurrenceIndex: actualOcc, quadsPt: actualQuads,
+            widthPt: page.widthPt, heightPt: page.heightPt, rotate: page.rotate },
           resolvedSnippet: slice,
           surroundingContext: pageText.slice(Math.max(0, start - 64), start) + '\n---\n' + pageText.slice(end, end + 64),
         };
@@ -657,8 +668,10 @@ class DocumentFormatAdapter implements FormatAdapter {
 
     if (this.format === 'pptx' && ['pptx_slide', 'pptx_element'].includes(selector.kind)) {
       try {
-        const { slides } = readPptxTargets(buffer);
-        const pageIndex = slides.findIndex(slide => slide.id === String(selector.slideId));
+        const { slides, slideSize } = readPptxTargets(buffer);
+        const matchingSlides = slides.filter(slide => slide.id === String(selector.slideId));
+        if (matchingSlides.length > 1) return { status: 'needs_review', reason: 'ambiguous_slide_id' };
+        const pageIndex = slides.indexOf(matchingSlides[0]);
         const slide = slides[pageIndex];
         if (!slide) return { status: 'stale', reason: 'slide_not_found' };
         const metadata = readPptxSlideTargets(buffer, slide.part);
@@ -668,11 +681,20 @@ class DocumentFormatAdapter implements FormatAdapter {
           : null;
         const fingerprint = element ? (element.length === 1 ? element[0].fingerprint : null) : metadata.slideHash;
         const expected = element ? selector.expectedElementFingerprint : selector.expectedSlideHash;
+        let slideCoords: Record<string, unknown> = { pageIndex };
+        if (selector.kind === 'pptx_slide' && selector.pointPt !== undefined) {
+          const { xPt, yPt, widthPt, heightPt } = selector.pointPt as Record<string, number>;
+          if (!slideSize || widthPt !== slideSize.widthPt || heightPt !== slideSize.heightPt ||
+              !Number.isFinite(xPt) || !Number.isFinite(yPt) || xPt < 0 || yPt < 0 || xPt > widthPt || yPt > heightPt) {
+            return { status: 'needs_review', reason: 'slide_point_out_of_bounds' };
+          }
+          slideCoords = { pageIndex, unit: 'pt', xPt, yPt, widthPt, heightPt };
+        }
         return fingerprint && fingerprint === expected
           ? {
             status: 'resolved', resolvedRange: { selector },
             resolvedCoords: element && metadata.shapes.filter(shape => shape.id === element[0].id).length === 1
-              ? { pageIndex, shapeId: Number(element[0].id) } : { pageIndex },
+              ? { pageIndex, shapeId: Number(element[0].id) } : slideCoords,
             resolvedSnippet: element ? element[0].text : metadata.shapes.map(shape => shape.text).filter(Boolean).join('\n'),
           }
           : { status: 'needs_review', reason: 'element_fingerprint_changed' };

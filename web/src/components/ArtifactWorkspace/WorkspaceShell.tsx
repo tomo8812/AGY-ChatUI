@@ -1,18 +1,19 @@
-import React,{Suspense,useCallback,useEffect,useRef,useState} from 'react';
+import React,{Suspense,useCallback,useEffect,useLayoutEffect,useRef,useState} from 'react';
 import type { ArtifactRecord } from '../../types';
 import { api,ApiError } from '../../api/client';
-import { supportsOperation,workspaceApi,type WorkspaceCapabilities,type WorkspaceRevision,type WorkspaceTarget } from '../../api/workspace';
+import { supportsOperation,workspaceApi,type EditRequestRecord,type WorkspaceCapabilities,type WorkspaceRevision,type WorkspaceTarget } from '../../api/workspace';
 import { artifactVersionKey,buildArtifactContentUrl,isStaleArtifactVersion,notifyArtifactUpdated } from '../../utils/viewerCache';
 import { ModalDialog } from '../ModalDialog';
 import { CloseIcon,DownloadIcon } from '../Icons';
-import type { DraftEntry,WorkspaceDraft,WorkspaceMode,WorkspaceModule } from './types';
+import type { DraftEntry,WorkspaceDraft,WorkspaceMode,WorkspaceModule, WorkspaceJump } from './types';
+import { newRequestId } from '../../utils/requestId';
+import { RequestRevisionComparison } from './RequestRevisionComparison';
 import { EditRequestPanel } from './EditRequestPanel';
 import './workspace.css';
 
 export interface WorkspaceShellProps {artifact:ArtifactRecord;module:WorkspaceModule;onClose:()=>void;onArtifactChanged?:(artifact:ArtifactRecord)=>void}
 const inspectorLabels={details:'ファイル詳細',verify:'品質検証',history:'バージョン履歴',export:'エクスポート',diff:'差分'} as const;
 
-function newId(){return globalThis.crypto?.randomUUID?.()??String(Date.now())+'-'+Math.random().toString(36).slice(2)}
 function historicalArtifact(artifact:ArtifactRecord,version:WorkspaceRevision):ArtifactRecord{
   const {revision,sha256,sizeBytes,dependencyManifestHash}=version;
   return {...artifact,revision,sha256,sizeBytes,dependencyManifestHash};
@@ -29,6 +30,29 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
   const [capError,setCapError]=useState<string|null>(null);
   const [draft,setDraft]=useState<WorkspaceDraft|null>(null);
   const [target,setTarget]=useState<WorkspaceTarget|null>(null);
+  const [jumpTarget,setJumpTarget]=useState<{revisionKey:string;target:WorkspaceJump}|null>(null);
+  const [comparison,setComparison]=useState<EditRequestRecord|null>(null);
+  const targetGeneration=useRef(0);
+  useLayoutEffect(()=>()=>{targetGeneration.current++},[revisionKey,mode]);
+  const clearTarget=()=>{targetGeneration.current++;setTarget(null);setJumpTarget(null)};
+  const beginTargetSelection=()=>{
+    const generation=++targetGeneration.current;
+    return ()=>mode==='pin'&&generation===targetGeneration.current;
+  };
+  const jumpToRequest=async(request:EditRequestRecord)=>{
+    if(!artifact.chatId)return;
+    const isCurrent=beginTargetSelection();
+    try{
+      setError(null);
+      const result=await workspaceApi.requestLocation(artifact.chatId,request.id);
+      if(!isCurrent())return;
+      const {request:anchored,reResolution,targetRevision}=result;
+      if(anchored.artifactId!==artifact.id||targetRevision!==artifact.revision||reResolution.status!=='resolved'){
+        throw Error('対象を特定できませんでした。');
+      }
+      setJumpTarget({revisionKey,target:{selector:anchored.selector,range:reResolution.resolvedRange,coords:reResolution.resolvedCoords}});
+    }catch(e){if(isCurrent())setError(e instanceof Error?e.message:'対象を特定できませんでした。')}
+  };
   const [busy,setBusy]=useState(false);
   const [error,setError]=useState<string|null>(null);
   const [conflict,setConflict]=useState(false);
@@ -113,8 +137,8 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
     busyRef.current=true;setBusy(true);setError(null);
     const ops=module.prepareOperations?.(draft.entries)??draft.entries.map(item=>item.operation);
     const signature=JSON.stringify([expectedRevision,ops]);
-    if(pendingAttempt.current?.signature!==signature)pendingAttempt.current={signature,key:newId()};
     try{
+      if(pendingAttempt.current?.signature!==signature)pendingAttempt.current={signature,key:newRequestId()};
       const result=await workspaceApi.edit(artifact.id,expectedRevision,ops,pendingAttempt.current.key);
       if(!mounted.current)return;
       if(result.artifact.id!==artifact.id||result.artifact.userId!==artifact.userId)throw Error('保存結果を確認できませんでした。');
@@ -130,6 +154,7 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
   const discard=()=>{if(!draft||window.confirm('未保存の変更を破棄しますか？')){setDraft(null);setConflict(false);pendingAttempt.current=null}};
   const changeMode=(value:WorkspaceMode)=>{
     if(value==='pin'&&draft&&mode!=='pin'){setChooseRequestVersion(true);return}
+    if(value!==mode)clearTarget();
     setError(null);setMode(value);setMenu(false);
   };
   const restoreVersion=async(revision:WorkspaceRevision)=>{
@@ -138,8 +163,8 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
     if(!window.confirm(confirmation+(draft?' 未保存の変更は保持されます。':'')))return;
     busyRef.current=true;setBusy(true);setError(null);
     const signature=JSON.stringify([revisionKey,revision.revision]);
-    if(restoreAttempt.current?.signature!==signature)restoreAttempt.current={signature,key:newId()};
     try{
+      if(restoreAttempt.current?.signature!==signature)restoreAttempt.current={signature,key:newRequestId()};
       const {artifact:next}=await workspaceApi.restore(artifact.id,revision.revision,restoreAttempt.current.key);
       if(!mounted.current)return;
       if(next.id!==artifact.id||next.userId!==artifact.userId)throw Error('復元結果を確認できませんでした。');
@@ -156,9 +181,9 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
   const exportFile=async(format:string)=>{
     if(exporting||!exportFormats.includes(format))return;
     const signature=JSON.stringify([revisionKey,format]);
-    if(exportAttempt.current?.signature!==signature)exportAttempt.current={signature,key:newId()};
     setExporting(true);setExported(null);setError(null);
     try{
+      if(exportAttempt.current?.signature!==signature)exportAttempt.current={signature,key:newRequestId()};
       const result=await workspaceApi.exportArtifact(artifact.id,format,exportAttempt.current.key);
       if(mounted.current){setExported(result.artifact);exportAttempt.current=null}
     }catch(e){
@@ -192,9 +217,9 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
       {changed&&<div className="warn-banner workspace-conflict-banner">ファイルが別の操作で更新されました。未保存の変更は保持されています。 <button type="button" className="btn btn-secondary btn-xs" onClick={()=>setConflict(true)}>確認</button></div>}
       {error&&<div className="error-box" role="alert">{error}<button type="button" className="btn btn-ghost btn-xs" onClick={()=>setError(null)}>閉じる</button></div>}
       <div className="workspace-main">
-        <div className="workspace-canvas"><Suspense fallback={<p role="status">読み込み中…</p>}><Module artifact={artifact} mode={mode} capabilities={caps} draft={mode==='pin'?null:draft} editingLocked={busy||changed||!canEdit||!capsReady} onDraft={onDraft} target={target} onTarget={setTarget}/></Suspense></div>
+        <div className="workspace-canvas"><Suspense fallback={<p role="status">読み込み中…</p>}><Module artifact={artifact} mode={mode} capabilities={caps} draft={mode==='pin'?null:draft} editingLocked={busy||changed||!canEdit||!capsReady} onDraft={onDraft} target={target} onTarget={setTarget} beginTargetSelection={beginTargetSelection} jumpTarget={mode==='pin'&&jumpTarget?.revisionKey===revisionKey?jumpTarget.target:undefined}/></Suspense></div>
         {(mode==='pin'||inspector)&&<aside className="workspace-inspector">
-          {mode==='pin'?<EditRequestPanel artifact={artifact} target={target} onClear={()=>setTarget(null)}/>:<><div className="row-between"><strong>{inspector&&inspectorLabels[inspector]}</strong><button type="button" className="icon-btn" aria-label="パネルを閉じる" onClick={()=>{setInspector(null);setPreviewVersion(null);setPreviewText(null);setDiffRevision(null)}}><CloseIcon/></button></div>{inspector==='details'?<dl><dt>名前</dt><dd>{artifact.filename}</dd><dt>種類</dt><dd>{artifact.mimeType}</dd><dt>サイズ</dt><dd>{artifact.sizeBytes.toLocaleString()} B</dd><dt>バージョン</dt><dd>{artifact.revision??'—'}</dd></dl>:inspector==='diff'?<pre className="workspace-history-source">{artifact.diffPatch}</pre>:inspector==='history'?<>
+          {mode==='pin'?<EditRequestPanel artifact={artifact} target={target} onClear={clearTarget} onJump={request=>void jumpToRequest(request)} onCompare={setComparison}/>:<><div className="row-between"><strong>{inspector&&inspectorLabels[inspector]}</strong><button type="button" className="icon-btn" aria-label="パネルを閉じる" onClick={()=>{setInspector(null);setPreviewVersion(null);setPreviewText(null);setDiffRevision(null)}}><CloseIcon/></button></div>{inspector==='details'?<dl><dt>名前</dt><dd>{artifact.filename}</dd><dt>種類</dt><dd>{artifact.mimeType}</dd><dt>サイズ</dt><dd>{artifact.sizeBytes.toLocaleString()} B</dd><dt>バージョン</dt><dd>{artifact.revision??'—'}</dd></dl>:inspector==='diff'?<pre className="workspace-history-source">{artifact.diffPatch}</pre>:inspector==='history'?<>
             {historyError?<p role="alert">{historyError}</p>:!history?<p role="status">読み込み中…</p>:history.length===0?<p>履歴がありません。</p>:
               history.map(version=><div key={version.revision} className="workspace-check">
                 <strong>バージョン {version.revision}{version.revision===artifact.revision?'（現在）':''}</strong>
@@ -232,6 +257,7 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
         <span className="muted-xs" role="status">{busy?'保存中…':draft?'未保存の変更 '+draft.entries.length+' 件':'保存済み'}</span>
         {draft&&<><button type="button" className="btn btn-ghost btn-xs" disabled={busy} onClick={discard}>破棄</button><button type="button" className="btn btn-primary btn-xs" disabled={busy||(!changed&&(!capsReady||!canEdit))} onClick={()=>changed?setConflict(true):void save()}>保存</button></>}
       </footer>
+      {comparison&&<RequestRevisionComparison artifact={artifact} request={comparison} onClose={()=>setComparison(null)}/>}
       {chooseRequestVersion&&<ModalDialog label="依頼するバージョン" size="workspace-request-version" onClose={()=>{if(!busy)setChooseRequestVersion(false)}}>
         <div><h3>依頼するバージョン</h3><p>保存済みのバージョン {artifact.revision} に依頼する場合も、未保存の変更は保持されます。</p>
           <div className="row-actions">

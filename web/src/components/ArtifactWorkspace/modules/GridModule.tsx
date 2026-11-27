@@ -1,3 +1,4 @@
+import { useTargetSelection } from '../useTargetSelection';
 import React,{useEffect,useLayoutEffect,useMemo,useRef,useState} from 'react';
 import {previewFormulas,type FormulaCell} from '../formulaPreview';
 import { workspaceApi,supportsOperation } from '../../../api/workspace';
@@ -71,7 +72,7 @@ async function csvTile(artifact:WorkspaceModuleProps['artifact'],r0:number,r1:nu
   return {rows:[[await workspaceApi.csvCell(artifact,sourceRow,c0,signal)]],sourceRows:filter?[sourceRow]:undefined};
 }
 export function GridModule(props:WorkspaceModuleProps){
-  const {artifact,mode,draft,capabilities,editingLocked,onDraft,onTarget}=props;
+  const {artifact,mode,draft,capabilities,editingLocked,onDraft,onTarget,beginTargetSelection,jumpTarget}=props;
   const xlsx=/\.xlsx$/i.test(artifact.filename);
   const [sheetId,setSheetId]=useState('');
   const pendingSheetSelection=useRef<{name:string;revision:number}|null>(null);
@@ -383,10 +384,32 @@ export function GridModule(props:WorkspaceModuleProps){
     if(parts.length>2||!first||!last||first.row>=rowCount||last.row>=rowCount||first.col>=colCount||last.col>=colCount){setPinError('有効なセル範囲を入力してください。');return}
     setPinError('');move(last.row,last.col);setAnchor(first);setJump('');
   }
+  const appliedJump=useRef<typeof jumpTarget>(undefined);
+  useLayoutEffect(()=>{
+    const target=jumpTarget?.range;
+    if(!target||!structure.ready||appliedJump.current===jumpTarget)return;
+    if(typeof target.sheetId==='string'&&sheet?.id!==target.sheetId){
+      if(sheets.some(candidate=>candidate.id===target.sheetId))setSheetId(target.sheetId);
+      return;
+    }
+    const parts=typeof target.rangeA1==='string'?target.rangeA1.split(':'):null;
+    const first=parts?parseAddress(parts[0]):target.axis==='row'?{row:Number(target.start),col:0}:
+      target.axis==='col'?{row:0,col:Number(target.start)}:jumpTarget?.selector.kind==='xlsx_sheet'?{row:0,col:0}:
+      {row:Number(target.startRow),col:Number(target.startCol)};
+    const last=parts?parseAddress(parts[1]??parts[0]):target.axis==='row'?{row:Number(target.end),col:colCount-1}:
+      target.axis==='col'?{row:rowCount-1,col:Number(target.end)}:jumpTarget?.selector.kind==='xlsx_sheet'?first:
+      {row:Number(target.endRow),col:Number(target.endCol)};
+    if(!first||!last||![first.row,first.col,last.row,last.col].every(Number.isSafeInteger)||
+      first.row<0||first.col<0||last.row<first.row||last.col<first.col||last.row>=rowCount||last.col>=colCount)return;
+    appliedJump.current=jumpTarget;
+    move(first.row,first.col);
+    setSelected(last);setAnchor(first);
+  },[jumpTarget,structure.ready,sheet?.id,rowCount,colCount]);
+  const pinSelection=useTargetSelection(beginTargetSelection,JSON.stringify([sheet?.id,selectedRange]));
   async function pin(){
     if(!ready||artifact.revision===undefined||!sheet||!inData)return;
     const {row0,row1,col0,col1}=bounds;
-    const rangeLabel=selectedRange,identity=latest.current;
+    const rangeLabel=selectedRange,isCurrent=pinSelection.begin();
     let snippet:string|undefined;
     try{
       let selector:Record<string,unknown>&{kind:string};
@@ -424,10 +447,10 @@ export function GridModule(props:WorkspaceModuleProps){
         };
         snippet=meta.target.snippet||(row0===row1&&col0===col1?original(row0,col0):undefined);
       }
-      if(latest.current.revisionKey!==identity.revisionKey||latest.current.sheetId!==identity.sheetId||latest.current.selectedRange!==identity.selectedRange)return;
+      if(!isCurrent())return;
       onTarget({baseRevision:artifact.revision,label:sheet.name+' '+rangeLabel,selector,selectedContentSnapshot:snippet?.slice(0,50_000)});
       setPinError('');
-    }catch{setPinError('選択対象を識別できませんでした。')}
+    }catch{if(isCurrent())setPinError('選択対象を識別できませんでした。')}
   }
   const inputEnabled=ready&&editableCoordinate&&mode==='edit'&&!cellEditLocked;
   const structuralEnabled=ready&&editableCoordinate&&mode==='edit'&&!editingLocked&&artifact.revision!==undefined;

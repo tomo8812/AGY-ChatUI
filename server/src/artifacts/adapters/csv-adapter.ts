@@ -304,6 +304,26 @@ export function serializeCsvRows(rows: string[][], delimiter: string): string {
     .join('\n');
 }
 
+/** Apply only the cells changed by an original edit, with values checked against the current file. */
+export function replayCsvCellEdit(filename: string, currentBytes: Buffer, fromBytes: Buffer, toBytes: Buffer, keys: unknown): Buffer {
+  const conflict = () => new ArtifactError('UNDO_SEMANTIC_CONFLICT', '対象セルを安全に変更できません。', 409);
+  const delimiter = detectDelimiter(filename);
+  const parse = (bytes: Buffer) => parseCsvRows(bytes.toString('utf8'), delimiter);
+  const [current, from, to] = [currentBytes, fromBytes, toBytes].map(parse);
+  if (!Array.isArray(keys) || !keys.length || from.length !== to.length || current.length !== from.length ||
+      from.some((row, ri) => row.length !== to[ri].length || row.length !== current[ri].length) ||
+      from[0]?.some((value, ci) => value !== current[0][ci])) throw conflict();
+  const allowed = new Set(keys);
+  for (const [ri, row] of from.entries()) {
+    for (const [ci, value] of row.entries()) {
+      if (value === to[ri][ci]) continue;
+      if (ri === 0 || !allowed.has(`r${ri}c${ci}`) || current[ri][ci] !== value) throw conflict();
+      current[ri][ci] = to[ri][ci];
+    }
+  }
+  return Buffer.from(serializeCsvRows(current, delimiter) + '\n', 'utf8');
+}
+
 export class CsvAdapter implements FormatAdapter {
   readonly format = 'csv' as const;
   readonly previewKind = 'table' as const;
@@ -401,6 +421,7 @@ export class CsvAdapter implements FormatAdapter {
         if (!Number.isInteger(r) || r < 0 || !Number.isInteger(c) || c < 0) {
           throw new ArtifactError('INVALID_OPERATION', 'set_cell requires non-negative integer row and col.', 400);
         }
+        structural ||= r === 0 || r >= rows.length || c >= rows[r].length;
         while (rows.length <= r) rows.push([]);
         while (rows[r].length <= c) rows[r].push('');
         rows[r][c] = String(op.value ?? '');
@@ -412,6 +433,7 @@ export class CsvAdapter implements FormatAdapter {
           const srcRow = op.values[dr];
           if (!Array.isArray(srcRow)) continue;
           const r = startRow + dr;
+          structural ||= r === 0 || r >= rows.length || startCol + srcRow.length > rows[r].length;
           while (rows.length <= r) rows.push([]);
           for (let dc = 0; dc < srcRow.length; dc++) {
             const c = startCol + dc;

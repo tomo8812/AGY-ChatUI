@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vite';
-import {assertProductionModulePaths} from './build/production-boundary';
+import {assertProductionModulePaths,assertProductionModuleContent} from './build/production-boundary';
 
 function resolveWebBuildVersion(): string {
   const fromEnv = (process.env.VITE_APP_VERSION || process.env.APP_VERSION || '').trim();
@@ -39,7 +39,14 @@ export default defineConfig({
     apply:'build',
     generateBundle(_options,bundle){
       const ids=Object.values(bundle).flatMap(chunk=>chunk.type==='chunk'?Object.keys(chunk.modules):[]);
-      assertProductionModulePaths(ids,path.resolve(import.meta.dirname,'..'));
+      const root=path.resolve(import.meta.dirname,'..');
+      assertProductionModulePaths(ids,root);
+      for(const id of new Set(ids)){
+        const file=id.split('?')[0];
+        const rel=path.relative(root,file).split(path.sep).join('/');
+        if(!/^(?:web\/src|shared)\//.test(rel)||!/\.[cm]?[jt]sx?$/.test(file))continue;
+        assertProductionModuleContent(rel,fs.readFileSync(file,'utf8'));
+      }
     },
   }],
   define: {

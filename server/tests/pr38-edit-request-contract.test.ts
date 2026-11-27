@@ -1,7 +1,8 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { afterEach, expect, it, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { EditRequestService, type AiEditRequestRecord } from '../src/edit-requests/edit-request-service.js';
 import { canonicalJson } from '../src/artifacts/idempotency-coordinator.js';
@@ -9,7 +10,7 @@ import { FormatAdapterRegistry } from '../src/artifacts/adapters/registry.js';
 import { targetSelectorSchema } from '../src/artifacts/target-selector-schema.js';
 import { ResourceGovernor } from '../src/artifacts/resource-governor.js';
 import { loadConfig } from '../src/config.js';
-import { createTestServer, registerAndBindAgy, TestApiClient } from './helpers/test-harness.js';
+import { createTestServer, registerAndBindAgy, seedAuthenticatedMockProfile, TestApiClient } from './helpers/test-harness.js';
 
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aMFAAAAAASUVORK5CYII=', 'base64');
@@ -50,7 +51,7 @@ it('validates source pins through REST, rolls back reorder and state events, and
   expect(first.selectedContentSnapshot).toBe('old choice');
   expect(first.regionImageBlobSha256).toBeNull();
   expect(first.contentCoords).toBeNull();
-  expect(() => ctx.editRequestService.resolveByUser(userId, chatId, first.id)).toThrow();
+  await expect(ctx.editRequestService.resolveByUser(userId, chatId, first.id)).rejects.toThrow();
   expect(() => ctx.editRequestService.markAppliedByAgent({ userId, chatId, requestId: first.id, appliedRevision: 1 }))
     .toThrow(expect.objectContaining({ code: 'EDIT_REQUEST_NOT_SENT' }));
 
@@ -77,7 +78,17 @@ it('validates source pins through REST, rolls back reorder and state events, and
   const submit = (clientMessageId = randomUUID()) => client.request<{ batchId: string; requests: AiEditRequestRecord[] }>(
     'POST', base + '/send-batch', { requestIds: [first.id], clientMessageId },
   );
+  expect((await client.request('POST', base + '/send-batch', { requestIds: [first.id] })).status).toBe(400);
+  expect(ctx.editRequestService.getRequest(userId, chatId, first.id)?.status).toBe('draft');
   const messageId = randomUUID();
+  const beforeSend = vi.spyOn(ctx.db, 'insertSyncEventInTx').mockImplementation(event => {
+    if (event.type === 'edit_request.batch_sent') throw Error('failed to persist batch event');
+    return insert(event);
+  });
+  expect((await submit(messageId)).status).toBeGreaterThanOrEqual(400);
+  expect(ctx.db.findMessageByClientId(userId, chatId, messageId)).toBeNull();
+  expect(ctx.editRequestService.getRequest(userId, chatId, first.id)?.status).toBe('draft');
+  beforeSend.mockRestore();
   const originalBatch = await submit(messageId);
   expect(originalBatch.status, JSON.stringify(originalBatch.data)).toBe(200);
   expect(originalBatch.data.requests[0].sentMessageId).toBe(ctx.db.findMessageByClientId(userId, chatId, messageId)?.id);
@@ -144,7 +155,13 @@ it('validates source pins through REST, rolls back reorder and state events, and
   } finally {
     await mcp.close();
   }
-  expect(ctx.editRequestService.resolveByUser(userId, chatId, first.id).status).toBe('resolved');
+  const targetFile = path.join(ctx.db.getChat(userId, chatId)!.workspaceDir, artifact.relPath);
+  writeFileSync(targetFile, 'out-of-band modification');
+  await expect(ctx.editRequestService.resolveByUser(userId, chatId, first.id))
+    .rejects.toMatchObject({ code: 'TARGET_CONTENT_DRIFT' });
+  expect(ctx.editRequestService.getRequest(userId, chatId, first.id)?.status).toBe('applied_unverified');
+  writeFileSync(targetFile, 'new before\ncorrected choice\nnew after');
+  expect((await ctx.editRequestService.resolveByUser(userId, chatId, first.id)).status).toBe('resolved');
   client.closeWs();
   otherDevice.closeWs();
 }, 50_000);
@@ -266,7 +283,9 @@ it('uses Base ChatUI media duration and verifies the exact time range against so
   const request = await ctx.editRequestService.createRequest({
     userId, chatId, targetKind: 'artifact', artifactId: video.id, selector: frameSelector, instruction: 'Update the selected frame',
   });
-  await ctx.editRequestService.sendBatch({ userId, chatId, requestIds: [request.id] });
+  expect((await client.request('POST', `/api/chats/${chatId}/edit-requests/send-batch`, {
+    requestIds: [request.id], clientMessageId: randomUUID(),
+  })).status).toBe(200);
   const payload = await ctx.editRequestService.getForAgent(userId, chatId, request.id);
   expect(payload).toMatchObject({ status: 'sent', targetRevision: 1, reResolution: { status: 'resolved' } });
   expect(payload.regionImagePngBase64).toBeUndefined();
@@ -312,4 +331,45 @@ it('uses the root SVG viewBox to reject targets outside its visible coordinate r
   expect(adapter.resolveTarget(bytes, selector, meta).status).toBe('resolved');
   expect(adapter.resolveTarget(bytes, { ...selector, rectViewBox: [-10, -20, 50.01, 60] }, meta))
     .toMatchObject({ status: 'needs_review', reason: 'svg_region_out_of_bounds' });
+});
+
+it('rechecks dynamic Rich node and SVG display against the saved view and base revision', async () => {
+  const srv = await createTestServer();
+  cleanups.push(srv.cleanup);
+  const { ctx } = srv;
+  const client = new TestApiClient(srv.baseUrl);
+  const { data: { user } } = await client.request<{ user: { id: string } }>('POST', '/api/auth/register', {
+    username: 'rich-fingerprint', displayName: 'Rich fixture', password: 'password123',
+  });
+  const userId = user.id;
+  seedAuthenticatedMockProfile(ctx, userId);
+  const { data: { chat: { id: chatId } } } = await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Rich target identity' });
+  const text = { id: 'summary', type: 'text' as const, content: { expr: 'formatNumber($computed.total)' } };
+  const circle = { id: 'mark', tag: 'circle' as const, attrs: { cx: 15, cy: 15, r: { expr: '$computed.total' } } };
+  const plot = { id: 'plot', type: 'svg_scene' as const, viewBox: '0 0 30 30', elements: [circle] };
+  const document = {
+    schemaVersion: 1 as const, state: { value: 2, unrelated: 5 },
+    computed: { total: '$state.value + 1' },
+    root: { id: 'root', type: 'stack' as const, children: [text, plot] },
+  };
+  const { block } = ctx.richContentService.createBlock({ userId, chatId, document });
+  const viewStateSnapshot = { state: { value: 4 }, theme: 'dark' };
+  const makeRequest = (selector: { kind: string; [key: string]: unknown }) => ctx.editRequestService.createRequest({
+    userId, chatId, richBlockId: block.id, targetKind: 'rich_block', instruction: 'Confirm selected display',
+    selector: { ...selector, kind: selector.kind, baseRevision: 1, blockId: block.id }, viewStateSnapshot,
+  });
+  const node = await makeRequest({ kind: 'rich_node', nodeId: text.id, expectedNodeType: text.type,
+    expectedNodeFingerprint: hash(canonicalJson(text)) });
+  const svg = await makeRequest({ kind: 'rich_svg_element', svgNodeId: plot.id, elementId: circle.id, expectedTag: circle.tag,
+    expectedElementFingerprint: hash(canonicalJson(circle)) });
+  ctx.richContentService.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 1, patchState: { unrelated: 12 } });
+  for (const request of [node, svg]) {
+    expect(await ctx.editRequestService.resolveRequestTarget(request)).toMatchObject({ status: 'resolved' });
+  }
+  ctx.richContentService.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 2,
+    document: { ...document, computed: { total: '$state.value + 2' } } });
+  for (const request of [node, svg]) {
+    expect(request.viewStateSnapshot).toEqual(viewStateSnapshot);
+    expect(await ctx.editRequestService.resolveRequestTarget(request)).toMatchObject({ status: 'needs_review' });
+  }
 });

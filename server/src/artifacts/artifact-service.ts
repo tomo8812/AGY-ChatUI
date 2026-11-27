@@ -1,5 +1,5 @@
 import { validateRegionPng } from './region-png.js';
-import { selectorMatchesFormat, targetSelectorSchema } from './target-selector-schema.js';
+import { selectorIsAvailable, selectorMatchesFormat, targetSelectorSchema } from './target-selector-schema.js';
 import { inspectArtifactTarget } from './target-inspection.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -43,13 +43,14 @@ import {
   type DocumentVerifyOptions,
 } from './document-worker.js';
 import { detectArtifactFormat, documentFormatConstraint, DOCUMENT_ACTIONS, FormatAdapterRegistry } from './adapters/registry.js';
+import { replayCsvCellEdit } from './adapters/csv-adapter.js';
 import { codeVerificationChecks } from './adapters/code-adapter.js';
 import { HTML_VERIFICATION_CHECKS } from './adapters/html-validator.js';
 import { SVG_VERIFICATION_CHECKS } from './adapters/svg-verifier.js';
 import { MAX_TEXT_VERIFY_BYTES, MAX_VERIFY_NODES, skippedTextVerification, textVerificationReport } from './adapters/text-verification.js';
 import { executeRestoreBundle, getRestoreBatchRecord, recoverPendingRestoreBatches } from './batch-restore.js';
 import { PerUserBlobManager, type BlobLease } from './blob-store.js';
-import { recoverPendingCommits, type DeleteTargetInspection, type RecoveryReport } from './commit-recovery.js';
+import { recoverPendingCommits, removeStageAndSync, type DeleteTargetInspection, type RecoveryReport } from './commit-recovery.js';
 import { scanArtifactDependencies } from './dependency-manifest.js';
 import { drainDepPropagationQueue } from './dep-propagation.js';
 import { artifactConflictError, ArtifactError, unsupportedOperationError } from './errors.js';
@@ -446,13 +447,24 @@ export class ArtifactService {
     artifactId: string;
     rootDir: string;
     relPath: string;
+    strict?: boolean;
   }): boolean {
     const artifact = this.db.getArtifact(params.userId, params.artifactId);
     if (!artifact) return false;
 
     const now = Date.now();
+    let read: ReturnType<typeof readContainedRegularFileNoFollowStable>;
     try {
-      const read = readContainedRegularFileNoFollowStable(params.rootDir, params.relPath);
+      read = readContainedRegularFileNoFollowStable(params.rootDir, params.relPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        if (params.strict) throw err;
+        return false;
+      }
+      return this.recordExternalDeletion(artifact, now);
+    }
+
+    try {
       const depScan = !path.isAbsolute(params.relPath)
         ? scanArtifactDependencies({
             rootDir: params.rootDir,
@@ -463,7 +475,7 @@ export class ArtifactService {
         : { deps: [], depBuffers: new Map<string, Buffer>(), manifestHash: null };
 
       if (
-        read.sha256 === artifact.sha256 &&
+        !artifact.deletedOnDisk && read.sha256 === artifact.sha256 &&
         read.sizeBytes === artifact.sizeBytes &&
         depScan.manifestHash === artifact.dependencyManifestHash
       ) {
@@ -555,14 +567,31 @@ export class ArtifactService {
         for (const l of leases) l.release();
       }
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        // File disappeared on disk -> mark deleted_on_disk = 1
-        this.db.db
-          .prepare('UPDATE artifacts SET deleted_on_disk = 1, updated_at = ? WHERE id = ? AND user_id = ?')
-          .run(now, artifact.id, params.userId);
-      }
+      if (params.strict) throw err;
       return false;
     }
+  }
+
+  private recordExternalDeletion(artifact: ArtifactRecord, now: number): boolean {
+    if (artifact.deletedOnDisk) return false;
+    let envelope: SyncEventEnvelope;
+    this.db.db.exec('BEGIN IMMEDIATE;');
+    try {
+      this.db.db.prepare('UPDATE artifacts SET deleted_on_disk = 1, updated_at = ? WHERE id = ? AND user_id = ?')
+        .run(now, artifact.id, artifact.userId);
+      envelope = this.db.insertSyncEventInTx({
+        userId: artifact.userId, eventId: crypto.randomUUID(), type: 'artifact.updated',
+        chatId: artifact.chatId, projectId: artifact.projectId,
+        payload: { artifact: this.db.getArtifact(artifact.userId, artifact.id), reason: 'external_sync' },
+        createdAt: now,
+      });
+      this.db.db.exec('COMMIT;');
+    } catch (error) {
+      this.db.db.exec('ROLLBACK;');
+      throw error;
+    }
+    this.hub.broadcastPersistedEvent(envelope);
+    return true;
   }
 
   /**
@@ -982,7 +1011,6 @@ export class ArtifactService {
     };
 
     const leases: BlobLease[] = [];
-    let stageFileCreated = false;
     let journalInserted = false;
 
     try {
@@ -1121,7 +1149,6 @@ export class ArtifactService {
         fs.fsyncSync(stageFd);
         const st = fs.fstatSync(stageFd, { bigint: true });
         stageIno = st.ino.toString();
-        stageFileCreated = true;
       } finally {
         fs.closeSync(stageFd);
       }
@@ -1202,11 +1229,9 @@ export class ArtifactService {
             );
           }
           fs.unlinkSync(privateStagePath);
-          stageFileCreated = false;
           fsyncDir(stagingDir);
         } else {
           fs.renameSync(privateStagePath, verifiedTargetViaProc);
-          stageFileCreated = false;
           fs.fsyncSync(dirFd);
           fsyncDir(stagingDir);
           if (stagingIsolation === 'non_isolated_same_uid') {
@@ -1327,13 +1352,6 @@ export class ArtifactService {
           .prepare('SELECT state FROM artifact_commit_journal WHERE commit_id = ?')
           .get(commitId) as { state: string } | undefined;
         if (row?.state === 'prepared') {
-          if (stageFileCreated) {
-            try {
-              fs.unlinkSync(privateStagePath);
-            } catch {
-              // ignore
-            }
-          }
           this.db.db.exec('BEGIN IMMEDIATE;');
           try {
             if (params.isCreate) {
@@ -1341,12 +1359,21 @@ export class ArtifactService {
                 .prepare("DELETE FROM artifacts WHERE id = ? AND lifecycle_state = 'pending_create'")
                 .run(params.artifactId);
             }
-            this.db.db
-              .prepare("UPDATE artifact_commit_journal SET state = 'aborted', updated_at = ? WHERE commit_id = ?")
-              .run(Date.now(), commitId);
+            this.db.db.prepare('DELETE FROM artifact_idempotency WHERE user_id = ? AND commit_id = ?')
+              .run(params.userId, commitId);
+            this.db.db.prepare("UPDATE artifact_commit_journal SET state = 'aborted', audit_note = ?, updated_at = ? WHERE commit_id = ?")
+              .run(JSON.stringify({ recoveryCleanup: 'aborted_before_replace', needsExternalSync: false }), Date.now(), commitId);
             this.db.db.exec('COMMIT;');
           } catch {
             this.db.db.exec('ROLLBACK;');
+            throw err;
+          }
+          try {
+            removeStageAndSync(privateStagePath);
+            this.db.db.prepare('UPDATE artifact_commit_journal SET audit_note = ? WHERE commit_id = ?')
+              .run('aborted_before_replace', commitId);
+          } catch {
+            // Startup can finish the durably recorded cleanup.
           }
         }
       }
@@ -3657,13 +3684,9 @@ export class ArtifactService {
   async replaceArtifactBytes(params: {
     userId: string;
     artifactId: string;
-    expectedRevision: number;
-    newBuffer: Buffer;
     actorKind: ActorKind;
     actorId: string | null;
     operationType: string;
-    operationSummary: string;
-    operationPayload?: Record<string, unknown> | null;
     batchId?: string | null;
     batchSeq?: number | null;
     suppressDependencyPropagation?: boolean;
@@ -3673,7 +3696,15 @@ export class ArtifactService {
     updateWorkingCopyId?: string;
     alreadyLocked?: boolean;
     assertAuthorized?: () => void | Promise<void>;
-  }): Promise<{ artifact: ArtifactRecord; noOp: boolean }> {
+  } & ({
+    expectedRevision: number;
+    newBuffer: Buffer;
+    operationSummary: string;
+    operationPayload?: Record<string, unknown> | null;
+    historyDirection?: never;
+  } | {
+    historyDirection: 'undo' | 'redo';
+  })): Promise<{ artifact: ArtifactRecord; noOp: boolean }> {
     const scopeKey = `artifact:${params.artifactId}`;
     const reverifyAuth = async () => {
       await params.assertAuthorized?.();
@@ -3695,8 +3726,8 @@ export class ArtifactService {
       actorId: params.actorId,
       operationType: params.operationType,
       target: { artifactId: params.artifactId },
-      operations: { sha256: crypto.createHash('sha256').update(params.newBuffer).digest('hex') },
-      baseRevision: params.expectedRevision,
+      operations: params.historyDirection ? null : { sha256: crypto.createHash('sha256').update(params.newBuffer).digest('hex') },
+      baseRevision: params.historyDirection ? null : params.expectedRevision,
     });
 
     const executeLocked = async () => {
@@ -3730,12 +3761,15 @@ export class ArtifactService {
         current = this.db.getArtifact(params.userId, params.artifactId)!;
       }
 
-      if (current.revision !== params.expectedRevision) {
+      const mutation = params.historyDirection
+        ? this.planActorHistoryMutation(current, prevRead, params.actorKind, params.actorId, params.historyDirection)
+        : params;
+      if (current.revision !== mutation.expectedRevision) {
         throw artifactConflictError(
-          `成果物の版が競合しています（期待: ${params.expectedRevision}, 現在: ${current.revision}）。`,
+          `成果物の版が競合しています（期待: ${mutation.expectedRevision}, 現在: ${current.revision}）。`,
           {
             artifactId: current.id,
-            expectedRevision: params.expectedRevision,
+            expectedRevision: mutation.expectedRevision,
             currentRevision: current.revision,
             currentSha256: current.sha256,
           }
@@ -3761,12 +3795,12 @@ export class ArtifactService {
         expectedPrevFingerprint: prevRead?.fingerprint ?? null,
         prevBuffer: prevRead?.buffer ?? null,
         prevDepHash: current.dependencyManifestHash,
-        newBuffer: params.newBuffer,
+        newBuffer: mutation.newBuffer,
         actorKind: params.actorKind,
         actorId: params.actorId,
         operationType: params.operationType,
-        operationSummary: params.operationSummary,
-        operationPayload: params.operationPayload,
+        operationSummary: mutation.operationSummary,
+        operationPayload: mutation.operationPayload,
         batchId: params.batchId,
         batchSeq: params.batchSeq,
         idempotencyScopeKey: params.idempotencyKey ? scopeKey : null,
@@ -5043,6 +5077,10 @@ export class ArtifactService {
     return { artifact: created.artifact, exported };
   }
 
+  withArtifactLock<T>(artifactId: string, run: () => T | Promise<T>): Promise<T> {
+    return this.lockManager.withLock(`artifact:${artifactId}`, async () => run());
+  }
+
   matchesCurrentArtifactFile(userId: string, artifactId: string, revision: number): boolean {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact || artifact.deletedOnDisk || artifact.revision !== revision) return false;
@@ -5077,8 +5115,16 @@ export class ArtifactService {
     if (selector.kind === 'pptx_element' && Number.isSafeInteger(coords.shapeId) && Number(coords.shapeId) > 0) {
       options = { pageIndex: Number(coords.pageIndex), shapeId: Number(coords.shapeId), variant: 'sprite', cropSprite: true };
     } else if ((selector.kind === 'pdf_region' || selector.kind === 'pdf_pin') && Array.isArray(coords.rectPt)) {
-      const [x, y, width, height] = coords.rectPt as number[];
-      if (!width || !height) return null;
+      let [x, y, width, height] = coords.rectPt as number[];
+      if (selector.kind === 'pdf_pin') {
+        const right = Math.min(Number(coords.widthPt), x + 36);
+        const bottom = Math.min(Number(coords.heightPt), y + 36);
+        x = Math.max(0, x - 36);
+        y = Math.max(0, y - 36);
+        width = right - x;
+        height = bottom - y;
+      }
+      if (!(width > 0 && height > 0)) return null;
       options = { pageIndex: Number(coords.pageIndex), region: { x, y, width, height, unit: 'pt' } };
     } else if (selector.kind === 'pdf_text_range' && Array.isArray(coords.quadsPt)) {
       const xs = (coords.quadsPt as number[][]).flatMap(quad => quad.filter((_, index) => index % 2 === 0));
@@ -5118,6 +5164,7 @@ export class ArtifactService {
     if (!targetSelectorSchema.safeParse(selector).success || !selectorMatchesFormat(selector, adapter.format)) {
       return { status: 'needs_review', reason: 'invalid_target_selector' };
     }
+    if (!selectorIsAvailable(selector)) return { status: 'needs_review', reason: 'unsupported_selector_kind' };
     if (adapter.format === 'media' && !selector.kind.startsWith(artifact.previewKind + '_')) {
       return { status: 'needs_review', reason: 'invalid_target_selector' };
     }
@@ -5141,13 +5188,15 @@ export class ArtifactService {
     const maxBytes = isDocumentFormat(adapter.format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
     let baseSnapshot;
     let releasePin;
-    if (baseRevision !== undefined && (selector.kind === 'code_line_range' || selector.kind === 'md_text_range')) {
+    const needsCsvBase = selector.kind === 'csv_row_col' && selector.expectedHeaderHash === undefined;
+    if (selector.kind === 'code_line_range' || selector.kind === 'md_text_range' || needsCsvBase) {
       try {
         const base = this.getRevisionContentBlob(userId, artifactId, baseRevision);
         releasePin = this.blobManager.pinBlob(userId, base.revision.sha256);
         baseSnapshot = { path: base.blobPath, sizeBytes: base.sizeBytes, sha256: base.revision.sha256 };
       } catch {
-        // A legacy request can still resolve from a hash-verified snippet and context.
+        if (needsCsvBase) return { status: 'needs_review', reason: 'base_revision_content_unavailable' };
+        // A legacy source request can still resolve from a hash-verified snippet and context.
       }
     }
     try {
@@ -5339,93 +5388,66 @@ export class ArtifactService {
     return this.undoService.getUndoState({ userId, artifactId: artifact.id, format, actorKind, actorId });
   }
 
-  async undo(params: {
+  private planActorHistoryMutation(
+    artifact: ArtifactRecord,
+    file: ReturnType<typeof readContainedRegularFileNoFollowStable> | null,
+    actorKind: ActorKind,
+    actorId: string | null,
+    direction: 'undo' | 'redo',
+  ) {
+    if (!file || file.sha256 !== artifact.sha256) {
+      throw new ArtifactError('UNDO_SEMANTIC_CONFLICT', '現在のファイルの内容を確認できません。', 409);
+    }
+    const format = detectArtifactFormat(artifact.filename, artifact.previewKind);
+    const plan = this.undoService.plan({ ...artifact, artifactId: artifact.id, format, actorKind, actorId }, direction);
+    const { target, parent, direct } = plan;
+    if (plan.current.revision !== artifact.revision) {
+      throw new ArtifactError('UNDO_SEMANTIC_CONFLICT', '現在の履歴を確認できません。', 409);
+    }
+    const read = (revision: ArtifactRevisionRecord) => {
+      const bytes = revision.blobSha256 && this.blobManager.readBlob(artifact.userId, revision.blobSha256);
+      if (!bytes || crypto.createHash('sha256').update(bytes).digest('hex') !== revision.sha256) {
+        throw new ArtifactError(direction === 'undo' ? 'UNDO_HISTORY_PRUNED' : 'REDO_HISTORY_PRUNED',
+          '履歴スナップショットが利用できません。', 422, { reason: 'history_pruned' });
+      }
+      return bytes;
+    };
+    const from = read(direction === 'undo' ? target : parent);
+    const to = read(direction === 'undo' ? parent : target);
+    const scope = target.operationPayload?.semanticScope as { kind?: string; regionKeys?: string[] } | undefined;
+    return {
+      expectedRevision: artifact.revision,
+      newBuffer: direct ? to : replayCsvCellEdit(artifact.filename, file.buffer, from, to, scope?.regionKeys),
+      operationSummary: `${direction === 'undo' ? 'Undo' : 'Redo'} revision ${target.revision}`,
+      operationPayload: {
+        operationReplayVersion: 1,
+        ...(direction === 'undo' ? { undoOfRevision: target.revision } : { redoOfRevision: target.revision }),
+      },
+    };
+  }
+
+  private async replayActorEdit(params: {
     userId: string;
     artifactId: string;
     actorKind: ActorKind;
     actorId: string | null;
     idempotencyKey?: string;
     assertAuthorized?: () => void | Promise<void>;
-  }): Promise<{ artifact: ArtifactRecord; undoState: UndoStateSummary }> {
-    await params.assertAuthorized?.();
-    let artifact = this.db.getArtifact(params.userId, params.artifactId);
-    if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
-    artifact = this.ensureLegacyHistoryMigrated(artifact);
-    const format = detectArtifactFormat(artifact.filename, artifact.previewKind);
-    const plan = this.undoService.planUndo({
-      userId: params.userId,
-      artifactId: artifact.id,
-      format,
-      actorKind: params.actorKind,
-      actorId: params.actorId,
-    });
-    const buf = this.blobManager.readBlob(params.userId, plan.restoreBlobSha256);
-    if (!buf) {
-      throw new ArtifactError('UNDO_HISTORY_PRUNED', '履歴スナップショットが利用できません。', 422, {
-        reason: 'history_pruned',
-      });
-    }
-    const res = await this.replaceArtifactBytes({
-      userId: params.userId,
-      artifactId: artifact.id,
-      expectedRevision: artifact.revision,
-      newBuffer: buf,
-      actorKind: params.actorKind,
-      actorId: params.actorId,
-      operationType: 'undo',
-      operationSummary: `Undo revision ${plan.undoneRevision} (to rev ${plan.restoreFromRevision})`,
-      operationPayload: { undoOfRevision: plan.undoneRevision, restoredFromRevision: plan.restoreFromRevision },
-      idempotencyKey: params.idempotencyKey,
-      assertAuthorized: params.assertAuthorized,
+  }, direction: 'undo' | 'redo') {
+    const { artifact } = await this.replaceArtifactBytes({
+      ...params, historyDirection: direction, operationType: direction,
     });
     return {
-      artifact: res.artifact,
+      artifact,
       undoState: this.getUndoState(params.userId, artifact.id, params.actorKind, params.actorId),
     };
   }
 
-  async redo(params: {
-    userId: string;
-    artifactId: string;
-    actorKind: ActorKind;
-    actorId: string | null;
-    idempotencyKey?: string;
-    assertAuthorized?: () => void | Promise<void>;
-  }): Promise<{ artifact: ArtifactRecord; undoState: UndoStateSummary }> {
-    await params.assertAuthorized?.();
-    let artifact = this.db.getArtifact(params.userId, params.artifactId);
-    if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
-    artifact = this.ensureLegacyHistoryMigrated(artifact);
-    const format = detectArtifactFormat(artifact.filename, artifact.previewKind);
-    const plan = this.undoService.planRedo({
-      userId: params.userId,
-      artifactId: artifact.id,
-      format,
-      actorKind: params.actorKind,
-      actorId: params.actorId,
-    });
-    const buf = this.blobManager.readBlob(params.userId, plan.restoreBlobSha256);
-    if (!buf) {
-      throw new ArtifactError('REDO_HISTORY_PRUNED', 'やり直し対象のスナップショットが利用できません。', 422, {
-        reason: 'history_pruned',
-      });
-    }
-    const res = await this.replaceArtifactBytes({
-      userId: params.userId,
-      artifactId: artifact.id,
-      expectedRevision: artifact.revision,
-      newBuffer: buf,
-      actorKind: params.actorKind,
-      actorId: params.actorId,
-      operationType: 'redo',
-      operationSummary: `Redo revision ${plan.restoreFromRevision}`,
-      operationPayload: { redoOfRevision: plan.restoreFromRevision },
-      idempotencyKey: params.idempotencyKey,
-      assertAuthorized: params.assertAuthorized,
-    });
-    return {
-      artifact: res.artifact,
-      undoState: this.getUndoState(params.userId, artifact.id, params.actorKind, params.actorId),
-    };
+  undo(params: Parameters<ArtifactService['replayActorEdit']>[0]) {
+    return this.replayActorEdit(params, 'undo');
+  }
+
+  redo(params: Parameters<ArtifactService['replayActorEdit']>[0]) {
+    return this.replayActorEdit(params, 'redo');
   }
 }

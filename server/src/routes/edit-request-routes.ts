@@ -102,8 +102,12 @@ export async function registerEditRequestRoutes(app: FastifyInstance, deps: Edit
     try {
       const request = editRequestService.getRequest(session.user.id, chatId, requestId);
       if (!request) return reply.code(404).send({ error: 'NOT_FOUND' });
+      const targetRevision = request.artifactId ? db.getArtifact(session.user.id, request.artifactId)?.revision : undefined;
       const reResolution = await editRequestService.resolveRequestTarget(request);
-      return { request, reResolution };
+      if (request.artifactId && targetRevision !== db.getArtifact(session.user.id, request.artifactId)?.revision) {
+        return reply.code(409).send({ error: 'TARGET_CONTENT_DRIFT' });
+      }
+      return { request, reResolution, targetRevision };
     } catch (err) {
       return sendEditRequestError(reply, err);
     }
@@ -169,12 +173,11 @@ export async function registerEditRequestRoutes(app: FastifyInstance, deps: Edit
     const parsed = z
       .object({
         requestIds: z.array(z.string().min(1)).min(1),
-        sentMessageId: z.string().optional().nullable(),
-        clientMessageId: z.string().uuid().optional(),
+        clientMessageId: z.string().uuid(),
       })
       .safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: 'INVALID_INPUT' });
-    if (parsed.data.clientMessageId && db.getAgyProfile(session.user.id)?.authStatus !== 'authenticated') {
+    if (db.getAgyProfile(session.user.id)?.authStatus !== 'authenticated') {
       return reply.code(403).send({ error: 'AGY_AUTH_REQUIRED', message: 'Antigravity認証が必要です。' });
     }
     try {
@@ -183,13 +186,12 @@ export async function registerEditRequestRoutes(app: FastifyInstance, deps: Edit
         userId: session.user.id,
         chatId,
         requestIds: parsed.data.requestIds,
-        sentMessageId: parsed.data.sentMessageId,
-        ...(clientMessageId && { submit: {
+        submit: {
           clientMessageId,
           enqueue: (text, persist) => scheduler.enqueueTurn({
             userId: session.user.id, chatId, userText: text, attachments: [], clientMessageId, persistWithMessage: persist,
           }),
-        } }),
+        },
       });
     } catch (err) {
       return sendEditRequestError(reply, err);
@@ -201,7 +203,7 @@ export async function registerEditRequestRoutes(app: FastifyInstance, deps: Edit
     if (!session) return;
     const { chatId, requestId } = req.params as { chatId: string; requestId: string };
     try {
-      const request = editRequestService.resolveByUser(session.user.id, chatId, requestId);
+      const request = await editRequestService.resolveByUser(session.user.id, chatId, requestId);
       return { request };
     } catch (err) {
       return sendEditRequestError(reply, err);

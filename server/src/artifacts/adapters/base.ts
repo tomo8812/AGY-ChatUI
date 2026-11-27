@@ -110,6 +110,7 @@ export function resolveTextSnippetByContext(params: {
   contextAfterHash?: unknown;
   occurrenceIndex?: unknown;
   requireOccurrenceIndex?: boolean;
+  matchRange?: (startLine: number, endLine: number) => boolean;
   snippetHint?: string;
   pdfTextLayout?: PdfTextLayout | null;
   mediaDurationSeconds?: number;
@@ -148,7 +149,8 @@ export function resolveTextSnippetByContext(params: {
     }
     return segment.join('\n');
   };
-  const contextMatches = (i: number) => sha256Text(before(i)) === contextBeforeHash &&
+  const contextMatches = (i: number) =>
+    (params.matchRange?.(i + 1, i + span) ?? true) && sha256Text(before(i)) === contextBeforeHash &&
     sha256Text(after(i)) === contextAfterHash;
   if (lastStart < 0) return { status: 'stale', reason: 'line_range_out_of_bounds' };
 

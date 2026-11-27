@@ -16,12 +16,24 @@ interface StoredOpPayload {
     regionKeys?: string[];
     hasDynamicOrCrossSheetFormulas?: boolean;
     structuralChange?: boolean;
+    kind?: string;
   };
   undoOfRevision?: number;
   redoOfRevision?: number;
-  preRevision?: number;
-  targetBlobSha256?: string;
+  operationReplayVersion?: number;
 }
+
+export interface ActorHistoryParams {
+  userId: string;
+  artifactId: string;
+  format: ArtifactFormat;
+  actorKind: ActorKind;
+  actorId: string | null;
+}
+
+type Direction = 'undo' | 'redo';
+type HistoryPlan = { target: ArtifactRevisionRecord; parent: ArtifactRevisionRecord; current: ArtifactRevisionRecord; direct: boolean };
+type HistoryResult = { plan: HistoryPlan } | { reason: 'no_actor_edits' | 'history_pruned' | 'semantic_conflict'; revision?: number };
 
 function parseOpPayload(raw: unknown): StoredOpPayload | null {
   if (!raw) return null;
@@ -82,229 +94,101 @@ export class ArtifactUndoService {
     return rev.actorKind === actorKind && (rev.actorId ?? null) === (actorId ?? null);
   }
 
-  /**
-   * Computes current Undo/Redo stack state for a specific actor.
-   */
-  getUndoState(params: {
-    userId: string;
-    artifactId: string;
-    format: ArtifactFormat;
-    actorKind: ActorKind;
-    actorId: string | null;
-  }): UndoStateSummary {
-    const revs = this.listRevisionsAsc(params.userId, params.artifactId);
-    const byRev = new Map(revs.map((r) => [r.revision, r]));
+  private history(params: ActorHistoryParams) {
+    const revisions = this.listRevisionsAsc(params.userId, params.artifactId);
+    const byRevision = new Map(revisions.map(revision => [revision.revision, revision]));
+    const undo: ArtifactRevisionRecord[] = [];
+    const redo: ArtifactRevisionRecord[] = [];
+    const transitions: Array<{ revision: ArtifactRevisionRecord; original: ArtifactRevisionRecord; active: boolean }> = [];
+    const uncertain: ArtifactRevisionRecord[] = [];
 
-    // Track undo/redo stack for this actor across revision history
-    const undoStack: ArtifactRevisionRecord[] = [];
-    const redoStack: ArtifactRevisionRecord[] = [];
-
-    for (const r of revs) {
-      if (!this.isSameActor(r, params.actorKind, params.actorId)) continue;
-      if (r.operationType === 'undo') {
-        const popped = undoStack.pop();
-        if (popped) redoStack.push(popped);
-      } else if (r.operationType === 'redo') {
-        const popped = redoStack.pop();
-        if (popped) undoStack.push(popped);
-      } else if (r.operationType !== 'create' && r.operationType !== 'legacy_baseline' && r.operationType !== 'dependency_sync') {
-        undoStack.push(r);
-        redoStack.length = 0; // new edit clears redo stack
-      }
-    }
-
-    const topUndo = undoStack.at(-1) ?? null;
-    const topRedo = redoStack.at(-1) ?? null;
-
-    if (!topUndo) {
-      return {
-        undoable: false,
-        redoable: Boolean(topRedo && topRedo.blobAvailable),
-        undoTargetRevision: null,
-        redoTargetRevision: topRedo && topRedo.blobAvailable ? topRedo.revision : null,
-        reason: 'no_actor_edits',
-      };
-    }
-
-    const parentRevNum = topUndo.parentRevision;
-    const parentRev = parentRevNum !== null ? byRev.get(parentRevNum) : undefined;
-    if (!parentRev || !parentRev.blobAvailable || !parentRev.blobSha256) {
-      return {
-        undoable: false,
-        redoable: Boolean(topRedo && topRedo.blobAvailable),
-        undoTargetRevision: null,
-        redoTargetRevision: topRedo && topRedo.blobAvailable ? topRedo.revision : null,
-        reason: 'history_pruned',
-      };
-    }
-
-    // Check semantic non-interference against any revisions AFTER topUndo
-    const conflict = this.checkIntermediateConflict(revs, topUndo, params.format);
-    if (conflict) {
-      return {
-        undoable: false,
-        redoable: Boolean(topRedo && topRedo.blobAvailable),
-        undoTargetRevision: parentRev.revision,
-        redoTargetRevision: topRedo && topRedo.blobAvailable ? topRedo.revision : null,
-        reason: 'semantic_conflict',
-      };
-    }
-
-    return {
-      undoable: true,
-      redoable: Boolean(topRedo && topRedo.blobAvailable),
-      undoTargetRevision: parentRev.revision,
-      redoTargetRevision: topRedo && topRedo.blobAvailable ? topRedo.revision : null,
-    };
-  }
-
-  private checkIntermediateConflict(
-    revsAsc: ArtifactRevisionRecord[],
-    targetEditRev: ArtifactRevisionRecord,
-    format: ArtifactFormat
-  ): string | null {
-    const after = revsAsc.filter((r) => r.revision > targetEditRev.revision);
-    if (after.length === 0) return null;
-
-    const editPayload = parseOpPayload(targetEditRev.operationPayload);
-    for (const inter of after) {
-      if (inter.operationType === 'dependency_sync') continue;
-      // Another actor or subsequent change intervened
-      const interPayload = parseOpPayload(inter.operationPayload);
-      const decision = evaluateSemanticNonInterference(
-        {
-          format,
-          regionKeys: editPayload?.semanticScope?.regionKeys,
-          hasDynamicOrCrossSheetFormulas: editPayload?.semanticScope?.hasDynamicOrCrossSheetFormulas,
-          structuralChange: editPayload?.semanticScope?.structuralChange,
-        },
-        {
-          format,
-          regionKeys: interPayload?.semanticScope?.regionKeys,
-          hasDynamicOrCrossSheetFormulas: interPayload?.semanticScope?.hasDynamicOrCrossSheetFormulas,
-          structuralChange: interPayload?.semanticScope?.structuralChange,
+    for (const revision of revisions) {
+      const { operationType } = revision;
+      const owned = this.isSameActor(revision, params.actorKind, params.actorId);
+      if (['create', 'legacy_baseline', 'dependency_sync'].includes(operationType)) continue;
+      if (operationType !== 'undo' && operationType !== 'redo') {
+        transitions.push({ revision, original: revision, active: true });
+        if (owned) {
+          undo.push(revision);
+          redo.length = 0;
         }
-      );
-      if (!decision.mergeable) {
-        return `Revision ${inter.revision} (${inter.actorKind}:${inter.operationType}) conflicts: ${decision.reason}`;
+        continue;
+      }
+      const payload = parseOpPayload(revision.operationPayload);
+      const stack = operationType === 'undo' ? undo : redo;
+      const originalNumber = operationType === 'undo' ? payload?.undoOfRevision : payload?.redoOfRevision;
+      const original = originalNumber === undefined ? undefined : byRevision.get(originalNumber);
+      const validLink = original && original.revision < revision.revision &&
+        !['undo', 'redo', 'create', 'legacy_baseline', 'dependency_sync'].includes(original.operationType) &&
+        this.isSameActor(original, revision.actorKind, revision.actorId);
+      if (!validLink || payload?.operationReplayVersion !== 1) uncertain.push(revision);
+      if (!validLink || (owned && stack.at(-1) !== original)) continue;
+      transitions.push({ revision, original, active: operationType === 'redo' });
+      if (owned) {
+        stack.pop();
+        (operationType === 'undo' ? redo : undo).push(original);
       }
     }
-    return null;
+    return { revisions, byRevision, undo, redo, transitions, uncertain };
   }
 
-  planUndo(params: {
-    userId: string;
-    artifactId: string;
-    format: ArtifactFormat;
-    actorKind: ActorKind;
-    actorId: string | null;
-  }): { restoreFromRevision: number; restoreBlobSha256: string; undoneRevision: number } {
-    const revs = this.listRevisionsAsc(params.userId, params.artifactId);
-    const byRev = new Map(revs.map((r) => [r.revision, r]));
-    const undoStack: ArtifactRevisionRecord[] = [];
-    const redoStack: ArtifactRevisionRecord[] = [];
-
-    for (const r of revs) {
-      if (!this.isSameActor(r, params.actorKind, params.actorId)) continue;
-      if (r.operationType === 'undo') {
-        const popped = undoStack.pop();
-        if (popped) redoStack.push(popped);
-      } else if (r.operationType === 'redo') {
-        const popped = redoStack.pop();
-        if (popped) undoStack.push(popped);
-      } else if (r.operationType !== 'create' && r.operationType !== 'legacy_baseline' && r.operationType !== 'dependency_sync') {
-        undoStack.push(r);
-        redoStack.length = 0;
+  private inspect(params: ActorHistoryParams, history: ReturnType<ArtifactUndoService['history']>, direction: Direction): HistoryResult {
+    const target = history[direction].at(-1);
+    if (!target) {
+      return { reason: history.uncertain.some(revision => this.isSameActor(revision, params.actorKind, params.actorId))
+        ? 'history_pruned' : 'no_actor_edits' };
+    }
+    const parent = target.parentRevision === null ? undefined : history.byRevision.get(target.parentRevision);
+    const current = history.revisions.at(-1)!;
+    if (!parent?.blobAvailable || !target.blobAvailable || !current.blobAvailable) return { reason: 'history_pruned' };
+    const expected = direction === 'undo' ? target : parent;
+    const direct = expected.sha256 === current.sha256 && expected.dependencyManifestHash === current.dependencyManifestHash;
+    const before = new Map<number, boolean>();
+    const after = new Map<number, ArtifactRevisionRecord>();
+    for (const { revision, original, active } of history.transitions) {
+      if (revision.revision <= target.revision) before.set(original.revision, active);
+      else {
+        if (active === (before.get(original.revision) ?? false)) after.delete(original.revision);
+        else after.set(original.revision, original);
       }
     }
-
-    const topUndo = undoStack.at(-1);
-    if (!topUndo) {
-      throw new ArtifactError('UNDO_UNAVAILABLE', '元に戻せる操作がありません。', 422, { reason: 'no_actor_edits' });
+    after.delete(target.revision);
+    const scope = (revision: ArtifactRevisionRecord) => {
+      const stored = parseOpPayload(revision.operationPayload)?.semanticScope;
+      return { ...stored, format: params.format, structuralChange: stored?.structuralChange || stored?.kind === 'structural' };
+    };
+    if (history.uncertain.some(revision => revision.revision > target.revision) ||
+        [...after.values()].some(revision => !evaluateSemanticNonInterference(scope(target), scope(revision)).mergeable) ||
+        (!direct && (params.format !== 'csv' || current.dependencyManifestHash !== expected.dependencyManifestHash))) {
+      return { reason: 'semantic_conflict', revision: target.revision };
     }
+    return { plan: { target, parent, current, direct } };
+  }
 
-    const parentRev = topUndo.parentRevision !== null ? byRev.get(topUndo.parentRevision) : undefined;
-    if (!parentRev || !parentRev.blobAvailable || !parentRev.blobSha256) {
-      throw new ArtifactError(
-        'UNDO_HISTORY_PRUNED',
-        '履歴の整理によりこの操作以前のスナップショットが利用できません。',
-        422,
-        { reason: 'history_pruned', undoable: false }
-      );
-    }
-
-    const conflict = this.checkIntermediateConflict(revs, topUndo, params.format);
-    if (conflict) {
-      throw new ArtifactError(
-        'UNDO_SEMANTIC_CONFLICT',
-        '他の更新（AI編集など）と競合するため、安全に元に戻せません。バージョン履歴から明示復元してください。',
-        409,
-        { reason: conflict, undoneRevision: topUndo.revision }
-      );
-    }
-
+  getUndoState(params: ActorHistoryParams): UndoStateSummary {
+    const history = this.history(params);
+    const undo = this.inspect(params, history, 'undo');
+    const redo = this.inspect(params, history, 'redo');
     return {
-      restoreFromRevision: parentRev.revision,
-      restoreBlobSha256: parentRev.blobSha256,
-      undoneRevision: topUndo.revision,
+      undoable: 'plan' in undo,
+      redoable: 'plan' in redo,
+      undoTargetRevision: 'plan' in undo ? undo.plan.parent.revision : null,
+      redoTargetRevision: 'plan' in redo ? redo.plan.target.revision : null,
+      ...('reason' in undo ? { reason: undo.reason === 'no_actor_edits' && 'reason' in redo &&
+        redo.reason !== 'no_actor_edits' ? redo.reason : undo.reason } : {}),
     };
   }
 
-  planRedo(params: {
-    userId: string;
-    artifactId: string;
-    format: ArtifactFormat;
-    actorKind: ActorKind;
-    actorId: string | null;
-  }): { restoreFromRevision: number; restoreBlobSha256: string } {
-    const revs = this.listRevisionsAsc(params.userId, params.artifactId);
-    const undoStack: ArtifactRevisionRecord[] = [];
-    const redoStack: ArtifactRevisionRecord[] = [];
-
-    for (const r of revs) {
-      if (!this.isSameActor(r, params.actorKind, params.actorId)) continue;
-      if (r.operationType === 'undo') {
-        const popped = undoStack.pop();
-        if (popped) redoStack.push(popped);
-      } else if (r.operationType === 'redo') {
-        const popped = redoStack.pop();
-        if (popped) undoStack.push(popped);
-      } else if (r.operationType !== 'create' && r.operationType !== 'legacy_baseline' && r.operationType !== 'dependency_sync') {
-        undoStack.push(r);
-        redoStack.length = 0;
-      }
+  plan(params: ActorHistoryParams, direction: Direction): HistoryPlan {
+    const result = this.inspect(params, this.history(params), direction);
+    if ('plan' in result) return result.plan;
+    if (result.reason === 'semantic_conflict') {
+      throw new ArtifactError('UNDO_SEMANTIC_CONFLICT', '他の更新と競合するため、この操作を安全に変更できません。', 409);
     }
-
-    const topRedo = redoStack.at(-1);
-    if (!topRedo) {
-      throw new ArtifactError('REDO_UNAVAILABLE', 'やり直せる操作がありません。', 422, { reason: 'no_actor_edits' });
+    const prefix = direction === 'undo' ? 'UNDO' : 'REDO';
+    if (result.reason === 'history_pruned') {
+      throw new ArtifactError(prefix + '_HISTORY_PRUNED', '履歴スナップショットが利用できません。', 422, { reason: result.reason });
     }
-    if (!topRedo.blobAvailable || !topRedo.blobSha256) {
-      throw new ArtifactError(
-        'REDO_HISTORY_PRUNED',
-        '履歴の整理によりやり直し対象のスナップショットが利用できません。',
-        422,
-        { reason: 'history_pruned', redoable: false }
-      );
-    }
-
-    // Also protect any intervening other-actor edit after the last undo
-    const lastUndo = [...revs].reverse().find((r) => this.isSameActor(r, params.actorKind, params.actorId) && r.operationType === 'undo');
-    if (lastUndo) {
-      const conflict = this.checkIntermediateConflict(revs, lastUndo, params.format);
-      if (conflict) {
-        throw new ArtifactError(
-          'UNDO_SEMANTIC_CONFLICT',
-          '他の更新と競合するためやり直せません。バージョン履歴から明示復元してください。',
-          409,
-          { reason: conflict }
-        );
-      }
-    }
-
-    return {
-      restoreFromRevision: topRedo.revision,
-      restoreBlobSha256: topRedo.blobSha256,
-    };
+    throw new ArtifactError(prefix + '_UNAVAILABLE', '対象の操作がありません。', 422, { reason: result.reason });
   }
 }

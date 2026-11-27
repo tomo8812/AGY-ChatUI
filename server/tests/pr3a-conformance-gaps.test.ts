@@ -492,6 +492,17 @@ describe('PR 3A Conformance Gap Fixes', () => {
       expect(adapter.resolveTarget(Buffer.from('Name,Score\nAlice,90\nBob,80\n'), rowSelector, csvMeta).status).toBe('resolved');
       expect(adapter.resolveTarget(Buffer.from('Student,Points\nAlice,90\nBob,80\n'), rowSelector, csvMeta))
         .toMatchObject({ status: 'needs_review', reason: 'header_changed' });
+      const { expectedHeaderHash: _headerHash, ...publishedRowSelector } = rowSelector;
+      expect(targetSelectorSchema.safeParse(publishedRowSelector).success).toBe(true);
+      const svc = server.ctx.artifactService;
+      await expect(svc.resolveTargetOnArtifact(userId, created.artifact.id, publishedRowSelector))
+        .resolves.toMatchObject({ status: 'resolved' });
+      await svc.replaceArtifactBytes({
+        userId, artifactId: created.artifact.id, expectedRevision: 1, actorKind: 'user', actorId: userId,
+        newBuffer: Buffer.from('Student,Points\nAlice,90\nBob,80\n'), operationType: 'replace', operationSummary: 'Update headers',
+      });
+      await expect(svc.resolveTargetOnArtifact(userId, created.artifact.id, publishedRowSelector))
+        .resolves.toMatchObject({ status: 'needs_review', reason: 'header_changed' });
       // Row order swap inside selected range -> needs_review
       expect(adapter.resolveTarget(Buffer.from('Name,Score\nBob,80\nAlice,90\n'), fullSelector, csvMeta).status).toBe('needs_review');
     } finally {
@@ -1220,7 +1231,7 @@ describe('PR 3A target identity and large inputs', () => {
     const rel = (type: string, target: string) =>
       `<Relationships xmlns="${packageRel}"><Relationship Id="rId1" Type="${r}/${type}" Target="${target}"/></Relationships>`;
     const build = (color: string) => Buffer.from(zipSync(Object.fromEntries(Object.entries({
-      'ppt/presentation.xml': `<p:presentation xmlns:p="${p}" xmlns:r="${r}"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>`,
+      'ppt/presentation.xml': `<p:presentation xmlns:p="${p}" xmlns:r="${r}"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="9144000" cy="5143500"/></p:presentation>`,
       'ppt/_rels/presentation.xml.rels': rel('slide', 'slides/slide1.xml'),
       'ppt/slides/slide1.xml': `<p:sld xmlns:p="${p}"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="4"/></p:nvSpPr></p:sp></p:spTree></p:cSld></p:sld>`,
       'ppt/slides/_rels/slide1.xml.rels': rel('slideLayout', '../slideLayouts/slideLayout1.xml'),
@@ -1236,6 +1247,15 @@ describe('PR 3A target identity and large inputs', () => {
     const selector = { kind: 'pptx_element', slideId: selected.slideId, shapeId: '4', expectedElementFingerprint: selected.shapes[0].fingerprint };
     expect(adapter.resolveTarget(before, selector, meta).status).toBe('resolved');
     expect(adapter.resolveTarget(build('998877'), selector, meta).status).toBe('needs_review');
+    const point = { kind: 'pptx_slide', baseRevision: 1, slideId: selected.slideId,
+      expectedSlideHash: selected.slideHash, pointPt: { xPt: 360, yPt: 202.5, widthPt: 720, heightPt: 405 } };
+    expect(adapter.resolveTarget(before, targetSelectorSchema.parse(point), meta))
+      .toMatchObject({ status: 'resolved', resolvedCoords: { pageIndex: 0, unit: 'pt', xPt: 360, yPt: 202.5 } });
+    for (const drift of [{ widthPt: 721 }, { xPt: 721 }, { yPt: 406 }]) {
+      expect(adapter.resolveTarget(before, { ...point, pointPt: { ...point.pointPt, ...drift } }, meta))
+        .toMatchObject({ status: 'needs_review' });
+    }
+    expect(adapter.resolveTarget(build('998877'), point, meta).status).toBe('needs_review');
   });
 
   it('hashes a sparse selection across the entire XLSX grid and detects a far-corner change', () => {

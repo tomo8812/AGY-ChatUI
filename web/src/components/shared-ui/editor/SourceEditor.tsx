@@ -148,15 +148,17 @@ function createHljsExtension(hljsLang:string){
 
 export interface SourceEditorHandle {
   selectAll:()=>void;
+  selectLines:(start:number,end:number)=>void;
   findNext:(query:string)=>boolean;
   getSelection:()=>{startLine:number;endLine:number};
   wrapSelection:(before:string,after:string)=>void;
 }
-interface Props {value:string;readOnly:boolean;language:string;onChange:(value:string)=>void;editorRef:React.RefObject<SourceEditorHandle|null>}
-export function SourceEditor({value,readOnly,language,onChange,editorRef}:Props){
+interface Props {onSelectionChange?:()=>void;value:string;readOnly:boolean;language:string;onChange:(value:string)=>void;editorRef:React.RefObject<SourceEditorHandle|null>}
+export function SourceEditor({onSelectionChange,value,readOnly,language,onChange,editorRef}:Props){
   const parent=useRef<HTMLDivElement>(null);
   const view=useRef<EditorView|null>(null);
   const ro=useRef(new Compartment());
+  const selectionCallback=useRef(onSelectionChange);selectionCallback.current=onSelectionChange;
   const callback=useRef(onChange);callback.current=onChange;
   // CodeMirror's default text model normalizes newlines. Preserve CRLF source
   // files with the original line-separator setting; avoid silently changing bytes.
@@ -179,6 +181,7 @@ export function SourceEditor({value,readOnly,language,onChange,editorRef}:Props)
       EditorView.lineWrapping,EditorView.contentAttributes.of({'aria-label':'ソース','aria-multiline':'true',spellcheck:'false'}),
       ro.current.of([EditorState.readOnly.of(readOnly),EditorView.editable.of(true)]),
       EditorView.updateListener.of(update=>{
+        if(update.selectionSet)selectionCallback.current?.();
         if(update.docChanged&&!update.transactions.some(tr=>tr.annotation(externalUpdate)))callback.current(update.state.sliceDoc());
       }),
     ]})});
@@ -186,6 +189,12 @@ export function SourceEditor({value,readOnly,language,onChange,editorRef}:Props)
     editorRef.current={
       findNext:query=>{if(!query)return false;instance.dispatch({effects:setSearchQuery.of(new SearchQuery({search:query,literal:true}))});instance.focus();return findNext(instance)},
       selectAll:()=>{instance.focus();instance.dispatch({selection:{anchor:0,head:instance.state.doc.length},scrollIntoView:true})},
+      selectLines:(start,end)=>{
+        const {doc}=instance.state;
+        if(!Number.isSafeInteger(start)||!Number.isSafeInteger(end)||start<1||end<start||end>doc.lines)return;
+        instance.dispatch({selection:{anchor:doc.line(start).from,head:doc.line(end).to},scrollIntoView:true});
+        instance.focus();
+      },
       getSelection:()=>{
         const {from,to}=instance.state.selection.main;
         return {startLine:instance.state.doc.lineAt(from).number,endLine:instance.state.doc.lineAt(Math.max(from,to-1)).number};

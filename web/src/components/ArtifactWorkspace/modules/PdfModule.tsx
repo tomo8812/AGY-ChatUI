@@ -1,7 +1,8 @@
-import React,{useRef,useState} from 'react';
+import { useTargetSelection } from '../useTargetSelection';
+import React,{useState} from 'react';
 import { PdfCanvasViewer,type PdfLocation } from '../../shared-ui/document/PdfCanvasCore';
 import type { PdfTextSelection } from '../../shared-ui/document/PdfNavigationPanel';
-import { buildArtifactContentUrl,artifactVersionKey } from '../../../utils/viewerCache';
+import { buildArtifactContentUrl } from '../../../utils/viewerCache';
 import { sha256Hex } from '../../../utils/sha256';
 import { workspaceApi,type WorkspaceTarget } from '../../../api/workspace';
 import { assertRevision } from '../useRevisionResource';
@@ -21,15 +22,13 @@ interface PdfTargetMetaResponse{
   }|null;
 }
 
-export function PdfModule({artifact,mode,onTarget}:WorkspaceModuleProps){
+export function PdfModule({artifact,mode,onTarget,beginTargetSelection,jumpTarget}:WorkspaceModuleProps){
   const [selection,setSelection]=useState<'page'|'pin'|'region'>('page');
   const [error,setError]=useState('');
-  const latest=useRef({key:artifactVersionKey(artifact),mode});
-  latest.current={key:artifactVersionKey(artifact),mode};
-  const generation=useRef(0);
+  const pinSelection=useTargetSelection(beginTargetSelection,selection);
   async function capture(pageIndex:number,pageCount:number,selectedText?:PdfTextSelection,readPage?:()=>Promise<string>,location?:PdfLocation){
     if(artifact.revision===undefined)return;
-    const identity=latest.current.key,ticket=++generation.current;
+    const isCurrent=pinSelection.begin();
     setError('');
     try {
       const pin=Boolean(location&&location.width===0&&location.height===0);
@@ -86,24 +85,24 @@ export function PdfModule({artifact,mode,onTarget}:WorkspaceModuleProps){
         Object.assign(selector,pin?{xPt:rectPt[0],yPt:rectPt[1]}:{rectPt},{expectedRegionDigest:digest});
 
       }
-      if(latest.current.key!==identity||latest.current.mode!=='pin'||ticket!==generation.current)return;
+      if(!isCurrent())return;
       onTarget({baseRevision:artifact.revision,label:'ページ '+(pageIndex+1)+(location?(selector.kind==='pdf_pin'?' / ピン':' / 領域'):selectedText?' / 選択本文':''),
         selectedContentSnapshot:snippet?.slice(0,50_000),selector,contentCoords});
     }catch(e){
-      if(latest.current.key===identity&&ticket===generation.current)setError(e instanceof Error?e.message:'ページを選択できませんでした。');
+      if(isCurrent())setError(e instanceof Error?e.message:'ページを選択できませんでした。');
     }
   }
   return <div className="workspace-page-view">
     {mode==='pin'&&<div className="workspace-toolbar workspace-toolbar-fields" role="group" aria-label="PDF の対象指定">
-      <label>対象 <select aria-label="PDF の選択方法" value={selection} onChange={event=>{generation.current++;setSelection(event.target.value as typeof selection)}}>
+      <label>対象 <select aria-label="PDF の選択方法" value={selection} onChange={event=>{pinSelection.invalidate();setSelection(event.target.value as typeof selection)}}>
         <option value="page">ページ・本文</option><option value="pin">ピン</option><option value="region">領域</option>
       </select></label>
       {selection==='region'&&<small>ドラッグ、または矢印キーと Enter で範囲を指定</small>}
     </div>}
     {error&&mode==='pin'&&<p className="error-box" role="alert">{error}</p>}
-    <PdfCanvasViewer url={buildArtifactContentUrl(artifact)} documentKey={artifact.id} enhancedNavigation
+    <PdfCanvasViewer jumpLocation={jumpTarget?.coords} url={buildArtifactContentUrl(artifact)} documentKey={artifact.id} enhancedNavigation
       selectionMode={mode==='pin'&&selection!=='page'?selection:undefined}
       onSelectLocation={mode==='pin'?(location,readPage)=>void capture(location.pageIndex,location.pageCount,undefined,readPage,location):undefined}
-      onSelectPage={mode==='pin'?(index,count,text,readPage)=>void capture(index,count,text,readPage):undefined}/>
+      onSelectPage={mode==='pin'&&selection==='page'?(index,count,text,readPage)=>void capture(index,count,text,readPage):undefined}/>
   </div>;
 }

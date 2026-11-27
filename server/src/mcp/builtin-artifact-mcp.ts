@@ -228,8 +228,9 @@ export class BuiltinArtifactMcpServer {
       }
     };
     const assertArtifact = (id: string) => {
-      if (this.db.getArtifact(userId, id)?.chatId !== chatId) {
-        throw new ArtifactError('NOT_FOUND', 'Artifact was not found in this chat.', 404);
+      const artifact = this.db.getArtifact(userId, id);
+      if (artifact?.scopeKind !== 'chat' || artifact.chatId !== chatId) {
+        throw new ArtifactError('FORBIDDEN', 'Artifact access is outside the MCP session scope.', 403);
       }
     };
     const tool = <T extends z.ZodRawShape>(
@@ -378,7 +379,7 @@ export class BuiltinArtifactMcpServer {
     });
 
     tool('edit_request_list', 'List submitted editing requests in this chat.', {}, () =>
-      this.editRequests.listRequests(userId, chatId).filter(({ batchId }) => batchId !== null));
+      this.editRequests.listRequests(userId, chatId).filter(({ batchId, sentMessageId }) => batchId !== null && sentMessageId !== null));
     tool('edit_request_get', 'Read a submitted editing request and its target.', requestId, async ({ requestId }, authorize) => {
       const { regionImagePngBase64, ...payload } = await this.editRequests.getForAgent(userId, chatId, requestId);
       authorize();

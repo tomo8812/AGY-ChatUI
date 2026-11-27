@@ -367,7 +367,9 @@ export class MermaidAdapter implements FormatAdapter {
         endLine: Number(selector.endLine ?? 1),
         expectedSnippetHash: selector.expectedSnippetHash ? String(selector.expectedSnippetHash) : undefined,
         contextBeforeHash: selector.contextBeforeHash ? String(selector.contextBeforeHash) : undefined,
-        contextAfterHash: selector.contextAfterHash ? String(selector.contextAfterHash) : undefined,
+        contextAfterHash: selector.contextAfterHash,
+        occurrenceIndex: selector.occurrenceIndex,
+        requireOccurrenceIndex: true,
       });
     }
 

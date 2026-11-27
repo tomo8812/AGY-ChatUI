@@ -223,24 +223,25 @@ function RichRendererInner({document:doc,userId,chatId,artifacts=noArtifacts,act
   const store=useMemo(()=>new RichStateStore(JSON.parse(docKey) as RichDocumentV1,JSON.parse(authKey) as string[],theme,JSON.parse(snapshotKey)),[docKey,authKey,userId,chatId,snapshotKey]);
   const accounting=useMemo(()=>new BlockRenderAccounting(),[store]);
   const [error,setError]=useState<string|null>(null);
+  const [copied,setCopied]=useState(false);
   const activeAction=useRef<AbortController|null>(null);
   const latestAuthorization=useRef(authorized);latestAuthorization.current=authorized;
   useEffect(()=>()=>{activeAction.current?.abort();activeAction.current=null},[store]);
   useEffect(()=>{try{store.setTheme(theme)}catch{setError('テーマ変更を適用できませんでした。')}},[theme,store]);
   const prefix=useId().replace(/[^a-zA-Z0-9_-]/g,'');
   const environment=useMemo<NodeEnvironment>(()=>{
-  const host:RichActionHost={...actions,authorizeArtifact:id=>latestAuthorization.current.has(id)};
+  const host:RichActionHost={...actions,onCopy:()=>setCopied(true),authorizeArtifact:id=>latestAuthorization.current.has(id)};
   const fail=()=>setError('操作を適用できませんでした。');
   const dispatch=(a:RichStateAction[],c:RichEvalContext)=>{try{store.dispatch(a,c);setError(null)}catch{fail()}};
   const select:SelectValue=(bind,value,a,c)=>{try{if(bind)store.set(bind,value,a,c);else if(a?.length)store.dispatch(a,c);setError(null)}catch{fail()}};
   const explicit=(a:readonly RichAction[],c:RichEvalContext)=>{
     if(activeAction.current)return;
-    const controller=new AbortController();activeAction.current=controller;setError(null);
-    void runExplicitRichActions(a,store,c,host,controller.signal).catch(()=>{if(!controller.signal.aborted)fail()}).finally(()=>{if(activeAction.current===controller)activeAction.current=null});
+    const controller=new AbortController();activeAction.current=controller;setError(null);setCopied(false);
+    void runExplicitRichActions(a,store,c,host,controller.signal).catch(error=>{if(!controller.signal.aborted)setError(error.message==='コピーできませんでした。'?error.message:'操作を適用できませんでした。')}).finally(()=>{if(activeAction.current===controller)activeAction.current=null});
   };
   return {store,doc,authorized,prefix,host,accounting,fail,dispatch,select,explicit};
   },[store,doc,authorized,prefix,actions,accounting]);
-  return <section className="rich-document"><RichTitle value={doc.title} store={store} accounting={accounting}/>{error&&<div className="error-box" role="alert">{error}<button className="btn btn-ghost btn-xs" type="button" onClick={()=>setError(null)}>閉じる</button></div>}<RichNodeView node={doc.root} local={emptyLocal} path="root" environment={environment}/></section>;
+  return <section className="rich-document"><RichTitle value={doc.title} store={store} accounting={accounting}/>{copied&&<p role="status">コピーしました。</p>}{error&&<div className="error-box" role="alert">{error}<button className="btn btn-ghost btn-xs" type="button" onClick={()=>setError(null)}>閉じる</button></div>}<RichNodeView node={doc.root} local={emptyLocal} path="root" environment={environment}/></section>;
 }
 interface NodeProps {
   node: RichNode;
