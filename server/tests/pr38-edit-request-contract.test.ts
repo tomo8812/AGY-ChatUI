@@ -301,3 +301,15 @@ it('validates persisted rich state and resolves a table cell against its capture
   } });
   expect(ctx.editRequestService.getRequest(userId, chatId, request.id)?.status).toBe('needs_review');
 });
+
+
+it('uses the root SVG viewBox to reject targets outside its visible coordinate range', () => {
+  const bytes = Buffer.from('<svg viewBox="-10 -20 50 60"><svg viewBox="0 0 100 100"/></svg>');
+  const meta = { filename: 'drawing.svg', relPath: 'drawing.svg', mimeType: 'image/svg+xml' };
+  const adapter = new FormatAdapterRegistry().resolve(meta.filename, 'svg');
+  const selector = targetSelectorSchema.parse({ kind: 'svg_region', baseRevision: 1, expectedViewBox: '-10 -20 50 60',
+    expectedSvgSha256: hash(bytes.toString()), rectViewBox: [-10, -20, 50, 60] });
+  expect(adapter.resolveTarget(bytes, selector, meta).status).toBe('resolved');
+  expect(adapter.resolveTarget(bytes, { ...selector, rectViewBox: [-10, -20, 50.01, 60] }, meta))
+    .toMatchObject({ status: 'needs_review', reason: 'svg_region_out_of_bounds' });
+});

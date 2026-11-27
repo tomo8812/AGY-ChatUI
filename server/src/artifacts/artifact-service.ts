@@ -5128,6 +5128,14 @@ export class ArtifactService {
         ).get(artifactId, userId, baseRevision))) {
       return { status: 'needs_review', reason: 'invalid_base_revision' };
     }
+    if (baseRevision !== artifact.revision && (selector.kind === 'html_viewport_region' || selector.kind === 'svg_region')) {
+      const base = this.db.db.prepare(
+        'SELECT dependency_manifest_hash FROM artifact_revisions WHERE artifact_id = ? AND user_id = ? AND revision = ?',
+      ).get(artifactId, userId, baseRevision);
+      if (!base || base.dependency_manifest_hash !== artifact.dependencyManifestHash) {
+        return { status: 'needs_review', reason: 'target_render_dependencies_changed' };
+      }
+    }
     const rootDir = this.resolveScopeRootDir(artifact.userId, artifact.scopeKind, artifact.chatId, artifact.projectId);
     if (!rootDir) return { status: 'stale', reason: 'artifact_file_missing' };
     const maxBytes = isDocumentFormat(adapter.format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;

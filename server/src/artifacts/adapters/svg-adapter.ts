@@ -148,15 +148,32 @@ export class SvgAdapter implements FormatAdapter {
     }
 
     if (selector.kind === 'svg_region') {
-      const vbMatch = /viewBox\s*=\s*["']([^"']+)["']/i.exec(text);
-      const currentVb = vbMatch ? vbMatch[1] : '';
-      if (selector.expectedViewBox && currentVb !== String(selector.expectedViewBox)) {
+      let viewBox: string | undefined;
+      try {
+        viewBox = markupElements(text, 'svg')[0]?.attrs.viewBox;
+      } catch (error) {
+        if (!(error instanceof ArtifactError)) throw error;
+        return { status: 'needs_review', reason: 'invalid_svg_structure' };
+      }
+      if (!viewBox || viewBox !== selector.expectedViewBox) {
         return { status: 'needs_review', reason: 'viewbox_changed' };
       }
-      if (selector.expectedSvgSha256 && sha256Buffer(buffer) !== String(selector.expectedSvgSha256)) {
+      if (sha256Buffer(buffer) !== selector.expectedSvgSha256) {
         return { status: 'needs_review', reason: 'svg_content_changed' };
       }
-      return { status: 'resolved', resolvedCoords: { rectViewBox: selector.rectViewBox } };
+      const bounds = viewBox.trim().split(/[\s,]+/).map(Number);
+      const rect = selector.rectViewBox;
+      if (bounds.length !== 4 || !bounds.every(Number.isFinite) ||
+          !Array.isArray(rect) || rect.length !== 4 || !rect.every(Number.isFinite)) {
+        return { status: 'needs_review', reason: 'invalid_svg_region' };
+      }
+      const [left, top, spanX, spanY] = bounds;
+      const [x, y, width, height] = rect as number[];
+      if (spanX <= 0 || spanY <= 0 || width <= 0 || height <= 0 || x < left || y < top ||
+          x + width > left + spanX || y + height > top + spanY) {
+        return { status: 'needs_review', reason: 'svg_region_out_of_bounds' };
+      }
+      return { status: 'resolved', resolvedCoords: { rectViewBox: rect } };
     }
 
     return { status: 'needs_review', reason: 'unsupported_selector_kind' };
