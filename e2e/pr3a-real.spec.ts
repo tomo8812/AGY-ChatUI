@@ -477,7 +477,18 @@ for(const vp of targets){
           const requests=srv.ctx.editRequestService.listRequests(userId,chatId,{artifactId:artifact.id});
           expect(requests).toHaveLength(1);
           expect((await srv.ctx.editRequestService.resolveRequestTarget(requests[0])).status).toBe('resolved');
-          if(item.kind==='pptx')expect(requests[0].regionImageBlobSha256).toMatch(/^[0-9a-f]{64}$/);
+          if(item.kind==='pptx'){
+            const request=requests[0];
+            expect(request.regionImageBlobSha256).toBeNull();
+            await srv.ctx.editRequestService.sendBatch({userId,chatId,requestIds:[request.id]});
+            const target=await srv.ctx.editRequestService.getForAgent(userId,chatId,request.id);
+            expect(target).toMatchObject({status:'sent',targetRevision:artifact.revision,
+              reResolution:{status:'resolved',resolvedCoords:{pageIndex:expect.any(Number),shapeId:request.selector.shapeId}}});
+            expect(target.regionImagePngBase64).toEqual(expect.any(String));
+            const region=decodePng(Buffer.from(target.regionImagePngBase64!,'base64'));
+            expect(region.width).toBeGreaterThan(1);
+            expect(region.height).toBeGreaterThan(1);
+          }
           record.pin=requests[0].selector;
           await page.screenshot({path:info.outputPath('real-'+item.kind+'-pin.png')});
           evidence.push(record);
