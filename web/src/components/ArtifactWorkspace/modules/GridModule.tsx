@@ -7,7 +7,7 @@ import {ResponsiveCommandBar} from '../../shared-ui/layout/ResponsiveCommandBar'
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
 import { assertRevision,useRevisionResource } from '../useRevisionResource';
 import {artifactVersionKey,ByteLruCache} from '../../../utils/viewerCache';
-import type { GridDraftLocation, WorkspaceModuleProps } from '../types';
+import type { DraftEntry, GridDraftLocation, WorkspaceModuleProps } from '../types';
 import { gridAddress as address, gridAxisChanges, gridColumnName as colName, isGridStructureId, prepareGridOperations, projectedGridIndex, savedGridOrigin } from '../gridDraft';
 
 type Sheet={id:string;name:string;part:string};

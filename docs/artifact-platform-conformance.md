@@ -396,7 +396,7 @@ HEAD `807e4ff` 以降の設計書（4.3 節、5.2 節、6.2 節、7.1 節、PIN-
 | 要件・指摘 | 実装と検証経路 |
 | --- | --- |
 | PIN-02 · A-01、A-02 | PDF のページハッシュは Catalog の Optional Content とフォーム、ページの描画グループ、継承リソース、ページの内容・注釈を結合する。DOCX は段落の参照 ID、関係の種類と参照先、埋め込みパートとその依存を結合する。外部リンクはパッケージに記録された宛先を照合する。関係未解決時は対象を確定できない。回帰テストは `pr3a-conformance-gaps.test.ts`。 |
-| PIN-02 · A-03 | XLSX・CSV・TSV の再解決は保存した元 Revision と現版の選択範囲、および行・列の文脈を照合する。CSV/TSV の対象行が同じ内容で複数存在する場合は再確認が必要。元版を取得できない場合も対象を確定できない。実 Revision の回帰テストは `pr38-history-and-target-regressions.test.ts` と `pr3a-conformance-gaps.test.ts`。 |
+| PIN-02 · A-03 | XLSX・CSV・TSV の再解決は保存した元 Revision と現版の選択範囲、および行・列の文脈を照合する。CSV/TSV の対象行と XLSX の対象行・列は、同一候補が複数存在する場合に再確認が必要。元版を取得できない場合も対象を確定できない。実 Revision の回帰テストは `pr38-history-and-target-regressions.test.ts` と `pr3a-conformance-gaps.test.ts`。 |
 | PIN-02、PIN-05、MCP-15 · A-04、A-05、V-01 | `target-resolver.ts` は系列候補の一意性、評価値、出典の実体、親スロットと所属タブを照合する。 `edit_request_get` は `untrustedTargetContent` に依頼時の状態・テーマ・抜粋と現在の抜粋を収録する。 `userInstruction` と再解決状態は別フィールド。保存時の照合後も、依頼完了はユーザーが確認する。HTTP MCP の回帰テストは `pr38-edit-request-contract.test.ts`。 |
 | RICH-02、RICH-03、RICH-05〜08、SEC-08、NEG-07 · B-01、B-02、C-01〜04 | `rich-node-contract.ts` と `rich-validator.ts` をサーバーとブラウザで使用する。リテラルと評価後の型、出典・系列・タブ・SVG の ID、図解の接続、保存アクションの種類を検証する。二軸の積み上げ棒は軸ごとに描画枠を確保し、欠損と出典をページ送りで表示する。図解はラベルを折り返し、全項目も閲覧できる。コード下書きは言語を指定して共通エディターを遅延読み込みする。 |
 | FUNC-01、UX-07、PIN-01 · D-02 | `PptxModule.tsx` は Base の変換 PDF 経路と、Compact/Full のキャンバス経路で全体・点・要素指定を提供する。キャンバスでは回転・反転した境界、透過スプライトの描画境界、グループの子座標変換を使用する。編集後の LibreOffice との画素一致は `pr3a-real.spec.ts` の対象。 |
@@ -408,4 +408,4 @@ HEAD `807e4ff` 以降の設計書（4.3 節、5.2 節、6.2 節、7.1 節、PIN-
 
 **検証区分**。実ファイル・SQLite・実 HTTP MCP・実ビルドは `VERIFIED (REAL RUNTIME)`。Playwright とモック ACP は `VERIFIED (MOCK / EMULATION)`。実 `agy acp`、物理 iPhone、Microsoft Office の再編集は `UNVERIFIED (REQUIRES REAL AGY / PHYSICAL IPHONE)` または対応する実環境が必要。検証対象コミットの [CI と UI 実行結果](https://github.com/tomo8812/AGY-ChatUI/pull/38/checks) を参照。
 
-ローカル検証では、関連サーバースイート 68 件、対象 Python 実ファイル検証 3 件、Chromium のリッチ UI 回帰 5 件が通過した。縦書き CID フォントを使った PDF では 5 文字全体と先頭 2 文字の座標を取得した。これらはテスト対象とした条件に限定される。Compact/Full の LibreOffice 描画一致と WebKit の結果は該当コミットの CI で確認する。
+ローカル検証では、関連サーバースイート 68 件、所属タブの追加回帰 1 件、対象 Python 実ファイル検証 3 件、Chromium と iPhone ビューポートの WebKit でそれぞれリッチ UI 回帰 5 件が通過した。縦書き CID フォントを使った PDF では 5 文字全体と先頭 2 文字の座標を取得した。これらはテスト対象とした条件に限定される。Compact/Full の LibreOffice 描画一致を含むブラウザ全体の実行結果は、該当コミットの CI を参照する。
