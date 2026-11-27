@@ -681,7 +681,10 @@ class DocumentFormatAdapter implements FormatAdapter {
           : null;
         const fingerprint = element ? (element.length === 1 ? element[0].fingerprint : null) : metadata.slideHash;
         const expected = element ? selector.expectedElementFingerprint : selector.expectedSlideHash;
-        let slideCoords: Record<string, unknown> = { pageIndex };
+        let slideCoords: Record<string, unknown> = {
+          pageIndex,
+          ...(selector.kind === 'pptx_slide' ? slideSize : undefined),
+        };
         if (selector.kind === 'pptx_slide' && selector.pointPt !== undefined) {
           const { xPt, yPt, widthPt, heightPt } = selector.pointPt as Record<string, number>;
           if (!slideSize || widthPt !== slideSize.widthPt || heightPt !== slideSize.heightPt ||

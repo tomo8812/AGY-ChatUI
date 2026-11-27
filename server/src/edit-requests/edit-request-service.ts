@@ -172,17 +172,38 @@ export class EditRequestService {
       if (target.selector[selectorField] !== undefined && result.resolvedRange?.[resolvedField] !== undefined &&
           target.selector[selectorField] !== result.resolvedRange[resolvedField]) throw targetConflict();
     }
-    const selector = target.selector.kind === 'rich_table_cell' && result.resolvedRange
-      ? { ...target.selector, expectedRowHash: result.resolvedRange.rowHash, expectedRowOrderHash: result.resolvedRange.rowOrderHash }
-      : target.selector;
+    let selector = target.selector;
+    let contentCoords = result.resolvedCoords ?? null;
+    let range = result.resolvedRange ?? null;
+    if (selector.kind === 'rich_table_cell' && result.resolvedRange) {
+      selector = { ...selector, expectedRowHash: result.resolvedRange.rowHash, expectedRowOrderHash: result.resolvedRange.rowOrderHash };
+    }
+    // Older clients submit the point separately from the slide selector.
+    // Bind it to dimensions and a slide index verified by the adapter.
+    const submittedPoint = details.contentCoords;
+    if (selector.kind === 'pptx_slide' && selector.pointPt === undefined && submittedPoint &&
+        ('xPt' in submittedPoint || 'yPt' in submittedPoint)) {
+      const { xPt, yPt, unit, pageIndex } = submittedPoint;
+      const { widthPt, heightPt } = contentCoords ?? {};
+      if (unit !== 'pt' || pageIndex !== contentCoords?.pageIndex ||
+          typeof widthPt !== 'number' || !Number.isFinite(widthPt) || widthPt <= 0 ||
+          typeof heightPt !== 'number' || !Number.isFinite(heightPt) || heightPt <= 0 ||
+          typeof xPt !== 'number' || !Number.isFinite(xPt) || xPt < 0 || xPt > widthPt ||
+          typeof yPt !== 'number' || !Number.isFinite(yPt) || yPt < 0 || yPt > heightPt) {
+        throw targetConflict();
+      }
+      selector = { ...selector, pointPt: { xPt, yPt, widthPt, heightPt } };
+      contentCoords = { pageIndex, unit, xPt, yPt, widthPt, heightPt };
+      if (range) range = { ...range, selector };
+    }
     return {
       ...details,
       selector,
       viewStateSnapshot,
       selectedContentSnapshot: (result.resolvedSnippet ?? details.selectedContentSnapshot)?.slice(0, 50_000),
       surroundingContext: (result.surroundingContext ?? details.surroundingContext)?.slice(0, 20_000),
-      range: result.resolvedRange ?? null,
-      contentCoords: result.resolvedCoords ?? null,
+      range,
+      contentCoords,
     };
   }
 

@@ -122,6 +122,17 @@ test('Base ChatUI edits source and tables and targets PPTX through its existing 
       expect((await server.ctx.editRequestService.resolveRequestTarget(request)).status).toBe('resolved');
     }
     await page.screenshot({path:info.outputPath('base-pptx-requests.png')});
+    const {pointPt:_point,...legacySelector}=requests[1].selector;
+    const draft={targetKind:'artifact',artifactId:artifacts.pptx.id,selector:legacySelector,instruction:'Review saved coordinates'};
+    const endpoint=`/api/chats/${chatId}/edit-requests`;
+    const rejected=await client.request('POST',endpoint,{...draft,contentCoords:{pageIndex:0,unit:'pt',xPt:721,yPt:202.5}});
+    expect(rejected.status).toBe(409);
+    const compatible=await client.request<{request:typeof requests[number]}>('POST',endpoint,{...draft,
+      contentCoords:{pageIndex:0,unit:'pt',xPt:360,yPt:202.5}});
+    expect(compatible.status).toBe(201);
+    expect(compatible.data.request.selector.pointPt).toEqual({xPt:360,yPt:202.5,widthPt:720,heightPt:405});
+    expect((await server.ctx.editRequestService.resolveRequestTarget(compatible.data.request)).resolvedCoords)
+      .toMatchObject({pageIndex:0,unit:'pt',xPt:360,yPt:202.5});
     await open('rich');
     await page.getByRole('slider').fill('5');
     await expect(page.locator('.rich-kpi-value')).toContainText('75');
