@@ -9,7 +9,38 @@ import type { DraftEntry,WorkspaceDraft,WorkspaceMode,WorkspaceModule, Workspace
 import { newRequestId } from '../../utils/requestId';
 import { RequestRevisionComparison } from './RequestRevisionComparison';
 import { EditRequestPanel } from './EditRequestPanel';
+import { PreviewUnavailableFallback } from '../shared-ui/pin';
 import './workspace.css';
+
+class WorkspaceErrorBoundary extends React.Component<
+  { resetKey: string; filename: string; downloadUrl: string; children: React.ReactNode },
+  { error: Error | null; prevResetKey: string }
+> {
+  state: { error: Error | null; prevResetKey: string } = { error: null, prevResetKey: this.props.resetKey };
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+  static getDerivedStateFromProps(
+    props: { resetKey: string },
+    state: { error: Error | null; prevResetKey: string },
+  ) {
+    if (props.resetKey !== state.prevResetKey) return { error: null, prevResetKey: props.resetKey };
+    return null;
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <PreviewUnavailableFallback
+          filename={this.props.filename}
+          downloadUrl={this.props.downloadUrl}
+          reason={this.state.error.message}
+          onRetry={() => this.setState({ error: null })}
+        />
+      );
+    }
+    return this.props.children;
+  }
+}
 
 export interface WorkspaceShellProps {artifact:ArtifactRecord;module:WorkspaceModule;onClose:()=>void;onArtifactChanged?:(artifact:ArtifactRecord)=>void}
 const inspectorLabels={details:'ファイル詳細',verify:'品質検証',history:'バージョン履歴',export:'エクスポート',diff:'差分'} as const;
@@ -219,7 +250,7 @@ function WorkspaceShellInner({artifact:incoming,module,onClose,onArtifactChanged
       {changed&&<div className="warn-banner workspace-conflict-banner">ファイルが別の操作で更新されました。未保存の変更は保持されています。 <button type="button" className="btn btn-secondary btn-xs" onClick={()=>setConflict(true)}>確認</button></div>}
       {error&&<div className="error-box" role="alert">{error}<button type="button" className="btn btn-ghost btn-xs" onClick={()=>setError(null)}>閉じる</button></div>}
       <div className="workspace-main">
-        <div className="workspace-canvas"><Suspense fallback={<p role="status">読み込み中…</p>}><Module artifact={artifact} mode={mode} capabilities={caps} draft={mode==='pin'?null:draft} editingLocked={busy||changed||!canEdit||!capsReady} onDraft={onDraft} target={target} onTarget={setTarget} beginTargetSelection={beginTargetSelection} jumpTarget={mode==='pin'&&jumpTarget?.revisionKey===revisionKey?jumpTarget.target:undefined}/></Suspense></div>
+        <div className="workspace-canvas"><WorkspaceErrorBoundary resetKey={revisionKey} filename={artifact.filename} downloadUrl={buildArtifactContentUrl(artifact,{download:true})}><Suspense fallback={<p role="status">読み込み中…</p>}><Module artifact={artifact} mode={mode} capabilities={caps} draft={mode==='pin'?null:draft} editingLocked={busy||changed||!canEdit||!capsReady} onDraft={onDraft} target={target} onTarget={setTarget} beginTargetSelection={beginTargetSelection} jumpTarget={mode==='pin'&&jumpTarget?.revisionKey===revisionKey?jumpTarget.target:undefined}/></Suspense></WorkspaceErrorBoundary></div>
         {(mode==='pin'||inspector)&&<aside className="workspace-inspector">
           {mode==='pin'?<EditRequestPanel artifact={artifact} target={target} onClear={clearTarget} onJump={request=>void jumpToRequest(request)} onCompare={setComparison}/>:<><div className="row-between"><strong>{inspector&&inspectorLabels[inspector]}</strong><button type="button" className="icon-btn" aria-label="パネルを閉じる" onClick={()=>{setInspector(null);setPreviewVersion(null);setPreviewText(null);setDiffRevision(null)}}><CloseIcon/></button></div>{inspector==='details'?<dl><dt>名前</dt><dd>{artifact.filename}</dd><dt>種類</dt><dd>{artifact.mimeType}</dd><dt>サイズ</dt><dd>{artifact.sizeBytes.toLocaleString()} B</dd><dt>バージョン</dt><dd>{artifact.revision??'—'}</dd></dl>:inspector==='diff'?<pre className="workspace-history-source">{artifact.diffPatch}</pre>:inspector==='history'?<>
             {historyError?<p role="alert">{historyError}</p>:!history?<p role="status">読み込み中…</p>:history.length===0?<p>履歴がありません。</p>:

@@ -1,4 +1,10 @@
-import { useTargetSelection } from '../../shared-ui/pin';
+import {
+  ElementTargetControl,
+  PinModeToolbar,
+  PreviewUnavailableFallback,
+  TargetInspectionErrorBanner,
+  useRegisteredPinModes,
+} from '../../shared-ui/pin';
 import React,{useCallback,useEffect,useMemo,useRef,useState} from 'react';
 import type {Editor} from '@tiptap/react';
 import {WordParagraphEditor,type WordRun,type WordMark} from '../../shared-ui/editor/WordParagraphEditor';
@@ -195,10 +201,18 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   };
   const editableSelection=Boolean(block?.editableText||selectedAddition);
 
-  const pinSelection=useTargetSelection(beginTargetSelection,String(selected));
+  const pin=useRegisteredPinModes({
+    format:'docx',
+    filename:artifact.filename,
+    previewKind:artifact.previewKind,
+    capabilities,
+    beginWorkspaceSelection:beginTargetSelection,
+    scope:String(selected),
+  });
   async function pinParagraph(selectedBlock:WordBlock){
     if(artifact.revision===undefined||selectedBlock.type!=='p')return;
-    const identity=artifact.revision,isCurrent=pinSelection.begin();
+    const identity=artifact.revision,isCurrent=pin.selection.begin();
+    pin.clearPinError();
     try{
       const result=await workspaceApi.range<{
         target:{
@@ -228,7 +242,7 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
         },
         selectedContentSnapshot:selectedBlock.text.slice(0,50_000),
       });
-    }catch(e){if(isCurrent())setImageError(e instanceof Error?e.message:'段落を識別できません。')}
+    }catch(e){if(isCurrent())pin.setPinError(e instanceof Error?e.message:'段落を識別できません。')}
   }
 
   const primary=<>
@@ -237,8 +251,21 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
       <button type="button" className="btn btn-secondary btn-xs" disabled={locked||!editableSelection} onMouseDown={e=>e.preventDefault()} onClick={()=>{const ed=activeEditor.current;if(ed&&!ed.isDestroyed&&ed.isEditable)ed.chain().focus().selectAll().run()}}>段落全選択</button>
       {([['bold','太字'],['italic','斜体'],['underline','下線']] as const).map(([mark,label])=><button key={mark} type="button" className="btn btn-secondary btn-xs" disabled={locked||!editableSelection} onMouseDown={e=>e.preventDefault()} onClick={()=>{const ed=activeEditor.current;if(ed&&!ed.isDestroyed&&ed.isEditable)ed.chain().focus().toggleMark(mark).run()}}>{label}</button>)}
     </>}
-    {mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready||block?.type!=='p'||artifact.revision===undefined}
-      onClick={()=>{if(block)void pinParagraph(block)}}>選択段落を対象にする</button>}
+    {mode==='pin'&&pin.activeMode&&(
+      <PinModeToolbar
+        ariaLabel="DOCX の対象指定"
+        selectLabel="DOCX の選択方法"
+        options={pin.modes}
+        value={pin.activeModeId}
+        onChange={pin.setModeId}
+      >
+        <ElementTargetControl
+          actionLabel={pin.activeMode.actionLabel ?? '選択段落を対象にする'}
+          actionDisabled={!resource.ready||block?.type!=='p'||artifact.revision===undefined}
+          onConfirm={()=>{if(block)void pinParagraph(block)}}
+        />
+      </PinModeToolbar>
+    )}
   </>;
 
   const outlineButton=<button type="button" className="btn btn-secondary btn-xs" aria-expanded={outlineOpen}
@@ -304,14 +331,16 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
       }}>{heading.text}</button>):<span className="muted-xs">見出しがありません。</span>}
   </nav>;
 
+  const downloadUrl=buildArtifactContentUrl(artifact,{download:true});
+
   if(useHtml)return <UnifiedViewerZoomShell resetKey={revisionKey}>
-    {resource.error||html.error?<div role="alert" className="error-box">{resource.error||html.error}<button type="button" onClick={()=>{resource.retry();html.retry()}}>再試行</button></div>:
+    {resource.error||html.error?<PreviewUnavailableFallback filename={artifact.filename} downloadUrl={downloadUrl} reason={resource.error||html.error} onRetry={()=>{resource.retry();html.retry()}}/>:
       html.data!=null?<div className="docx-preview" dangerouslySetInnerHTML={{__html:html.data}}/>:<div className="workspace-loading">読み込み中…</div>}
   </UnifiedViewerZoomShell>;
 
   if(mode==='view'&&reading==='page'&&canRender)return <div className="workspace-page-view">
     <div className="workspace-toolbar"><button className="btn btn-secondary btn-xs" type="button" onClick={()=>setReading('text')}>読取表示</button></div>
-    <PdfCanvasViewer enhancedNavigation documentKey={artifact.id} url={buildArtifactContentUrl(artifact,{convertedPdf:true})}/>
+    <PdfCanvasViewer enhancedNavigation documentKey={artifact.id} filename={artifact.filename} url={buildArtifactContentUrl(artifact,{convertedPdf:true})}/>
   </div>;
 
   const renderBlock=(b:WordBlock)=>{
@@ -368,11 +397,23 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     </div>;
   };
 
+  if(!resource.data&&resource.error){
+    return (
+      <PreviewUnavailableFallback
+        filename={artifact.filename}
+        downloadUrl={downloadUrl}
+        reason={resource.error}
+        onRetry={resource.retry}
+      />
+    );
+  }
+
   return <UnifiedViewerZoomShell resetKey={artifact.id+':docx'} controlsTop={<>{mode==='view'&&canRender&&<div className="workspace-toolbar"><button className="btn btn-secondary btn-xs" type="button" onClick={()=>setReading('page')}>ページ表示</button></div>}{toolbar}{outline}</>}>
     {imageError&&<p role="alert">{imageError}</p>}
-    {resource.error&&<div className="error-box" role="alert">{resource.error}<button onClick={resource.retry}>再試行</button></div>}
+    {pin.pinError&&mode==='pin'&&<TargetInspectionErrorBanner message={pin.pinError} onRetry={()=>{if(block)void pinParagraph(block)}} onDismiss={pin.clearPinError}/>}
+    {resource.error&&<TargetInspectionErrorBanner message={resource.error} onRetry={resource.retry}/>}
     {resource.loading&&resource.data&&<p className="workspace-refresh muted-xs" role="status">最新の内容を読み込み中…</p>}
-    {!resource.data?<div className="workspace-loading">{resource.error?'文書を表示できません。':'読み込み中…'}</div>:<article ref={canvas} className="workspace-word" aria-label="文書" data-continuous-canvas="true">
+    {!resource.data?<div className="workspace-loading">読み込み中…</div>:<article ref={canvas} className="workspace-word" aria-label="文書" data-continuous-canvas="true">
       {Array.from({length:totalChunks},(_,index)=><WordChunk
         key={index}
         index={index}

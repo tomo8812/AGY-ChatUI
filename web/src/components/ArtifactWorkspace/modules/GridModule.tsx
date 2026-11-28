@@ -3,10 +3,10 @@ import React,{useEffect,useLayoutEffect,useMemo,useRef,useState} from 'react';
 import {previewFormulas,type FormulaCell} from '../formulaPreview';
 import { workspaceApi,supportsOperation } from '../../../api/workspace';
 import {ResponsiveCommandBar} from '../../shared-ui/layout/ResponsiveCommandBar';
-import { GridTargetControl, TargetInspectionErrorBanner, useTargetSelection, type GridPinMode } from '../../shared-ui/pin';
+import { GridTargetControl, PreviewUnavailableFallback, TargetInspectionErrorBanner, useRegisteredPinModes } from '../../shared-ui/pin';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
 import { assertRevision,useRevisionResource } from '../useRevisionResource';
-import {artifactVersionKey,ByteLruCache} from '../../../utils/viewerCache';
+import {artifactVersionKey,buildArtifactContentUrl,ByteLruCache} from '../../../utils/viewerCache';
 import type { DraftEntry, GridDraftLocation, WorkspaceModuleProps } from '../types';
 import { gridAddress as address, gridAxisChanges, gridColumnName as colName, isGridStructureId, prepareGridOperations, projectedGridIndex, savedGridOrigin } from '../gridDraft';
 
@@ -80,7 +80,6 @@ export function GridModule(props:WorkspaceModuleProps){
   const [selected,setSelected]=useState<Coordinate>({row:0,col:0});
   const [anchor,setAnchor]=useState<Coordinate>({row:0,col:0});
   const [jump,setJump]=useState('');
-  const [pinError,setPinError]=useState('');
   const [editAction,setEditAction]=useState('');
   const [sheetName,setSheetName]=useState('');
   const structureSequence=useRef(0);
@@ -402,8 +401,8 @@ export function GridModule(props:WorkspaceModuleProps){
   });
   function jumpToRange(){
     const parts=jump.split(':'),first=parseAddress(parts[0]),last=parts.length===2?parseAddress(parts[1]):first;
-    if(parts.length>2||!first||!last||first.row>=rowCount||last.row>=rowCount||first.col>=colCount||last.col>=colCount){setPinError('有効なセル範囲を入力してください。');return}
-    setPinError('');move(last.row,last.col);setAnchor(first);setJump('');
+    if(parts.length>2||!first||!last||first.row>=rowCount||last.row>=rowCount||first.col>=colCount||last.col>=colCount){pinState.setPinError('有効なセル範囲を入力してください。');return}
+    pinState.setPinError('');move(last.row,last.col);setAnchor(first);setJump('');
   }
   const appliedJump=useRef<typeof jumpTarget>(undefined);
   useLayoutEffect(()=>{
@@ -426,21 +425,27 @@ export function GridModule(props:WorkspaceModuleProps){
     move(first.row,first.col);
     setSelected(last);setAnchor(first);
   },[jumpTarget,structure.ready,sheet?.id,rowCount,colCount]);
-  const [gridPinMode, setGridPinMode] = useState<GridPinMode>('range');
-  const effectivePinMode: GridPinMode = !xlsx && gridPinMode === 'sheet' ? 'range' : gridPinMode;
-  const pinSelection=useTargetSelection(beginTargetSelection,JSON.stringify([sheet?.id,selectedRange,effectivePinMode]));
+  const pinState=useRegisteredPinModes({
+    format:xlsx?'xlsx':'csv',
+    filename:artifact.filename,
+    previewKind:artifact.previewKind,
+    capabilities,
+    beginWorkspaceSelection:beginTargetSelection,
+    scope:JSON.stringify([sheet?.id,selectedRange]),
+  });
+  const activeGridMode=pinState.activeModeId;
   async function pin(){
-    if(!ready||artifact.revision===undefined||!sheet)return;
-    if(effectivePinMode!=='sheet'&&!inData)return;
+    if(!ready||artifact.revision===undefined||!sheet||!pinState.activeMode)return;
+    if(activeGridMode!=='sheet'&&!inData)return;
     const {row0,row1,col0,col1}=bounds;
-    const rangeLabel=selectedRange,isCurrent=pinSelection.begin();
+    const rangeLabel=selectedRange,isCurrent=pinState.selection.begin();
     let snippet:string|undefined;
     try{
       let selector:Record<string,unknown>&{kind:string};
       let targetLabel=sheet.name+' '+rangeLabel;
       if(!xlsx){
-        if(effectivePinMode==='row'||effectivePinMode==='col'){
-          const axisKind=effectivePinMode;
+        if(activeGridMode==='row'||activeGridMode==='col'){
+          const axisKind=activeGridMode;
           const start=axisKind==='row'?row0:col0;
           const end=axisKind==='row'?row1:col1;
           const meta=await workspaceApi.range<{target:{axis:'row'|'col';start:number;end:number;expectedRowCount:number;expectedColCount:number;expectedHeaderHash:string;expectedRangeValuesHash:string}|null}>(artifact.id,{targetMetadata:'true',axis:axisKind,start,end});
@@ -481,7 +486,7 @@ export function GridModule(props:WorkspaceModuleProps){
           snippet=exact.rows.map(row=>row.join('\t')).join('\n');
         }
       }else{
-        if(effectivePinMode==='sheet'){
+        if(activeGridMode==='sheet'){
           const meta=await workspaceApi.range<{target:{sheetId:string;sheetName:string;expectedSheetStructHash:string;expectedSheetContentHash:string;snippet?:string}|null}>(artifact.id,{targetMetadata:'true',sheetId:sheet.id});
           assertRevision(artifact,meta);
           if(!meta.target||!meta.target.expectedSheetStructHash||!meta.target.expectedSheetContentHash){
@@ -495,8 +500,8 @@ export function GridModule(props:WorkspaceModuleProps){
           };
           targetLabel=sheet.name+' (シート全体)';
           snippet=meta.target.snippet;
-        }else if(effectivePinMode==='row'||effectivePinMode==='col'){
-          const axisKind=effectivePinMode;
+        }else if(activeGridMode==='row'||activeGridMode==='col'){
+          const axisKind=activeGridMode;
           const start=axisKind==='row'?row0:col0;
           const end=axisKind==='row'?row1:col1;
           const meta=await workspaceApi.range<{target:{sheetId:string;sheetName:string;axis:'row'|'col';start:number;end:number;expectedSheetStructHash:string;expectedRangeValuesHash:string;snippet?:string}|null}>(artifact.id,{targetMetadata:'true',sheetId:sheet.id,axis:axisKind,start,end});
@@ -536,8 +541,8 @@ export function GridModule(props:WorkspaceModuleProps){
       }
       if(!isCurrent())return;
       onTarget({baseRevision:artifact.revision,label:targetLabel,selector,selectedContentSnapshot:snippet?.slice(0,50_000)});
-      setPinError('');
-    }catch{if(isCurrent())setPinError('選択対象を識別できませんでした。')}
+      pinState.clearPinError();
+    }catch{if(isCurrent())pinState.setPinError('選択対象を識別できませんでした。')}
   }
   const inputEnabled=ready&&editableCoordinate&&mode==='edit'&&!cellEditLocked;
   const structuralEnabled=ready&&editableCoordinate&&mode==='edit'&&!editingLocked&&artifact.revision!==undefined;
@@ -595,11 +600,11 @@ export function GridModule(props:WorkspaceModuleProps){
     const idx=filter
       ? projectedGridIndex({index:row?sourceRow(current.row,current.col):current.col},row?rowsChanged:colsChanged)
       : row?current.row:current.col;
-    if(idx===undefined){setPinError('この行または列は削除予定です。');return}
+    if(idx===undefined){pinState.setPinError('この行または列は削除予定です。');return}
     if(!xlsx&&editAction.startsWith('delete')&&!inData)return;
     if(editAction.startsWith('delete')||editAction==='xlsx.remove_empty_sheet')if(!window.confirm(action.label+'しますか？'))return;
     const op=editAction.startsWith('xlsx.')?{op:editAction,sheetId:sheet.id,...(needsName?{name:sheetName.trim()}:{})}:xlsx?{op:row?'xlsx.mutate_rows':'xlsx.mutate_columns',sheetId:sheet.id,index:idx+1,count:1,mode:editAction.startsWith('insert')?'insert':'delete'}:{op:editAction,index:idx,...(editAction==='insert_row'?{values:Array.from({length:Math.max(1,liveCsvCols)},()=> '')}:{})};
-    setPinError('');
+    pinState.setPinError('');
     const draftKey='grid-structure:'+(++structureSequence.current);
     onDraft(artifact.revision,{key:draftKey,label:action.label+' · '+selectedRange,operation:op},draftKey);
     if(op.op==='xlsx.add_sheet'){
@@ -613,7 +618,7 @@ export function GridModule(props:WorkspaceModuleProps){
   useEffect(()=>{setSearching(false);return()=>{searchAbort.current?.abort();searchAbort.current=null}},[search,revisionKey,sheet?.id,draft,filter]);
   async function nextMatch(){
     if(!search.trim()||!sheet||!structure.ready||searchAbort.current)return;
-    const controller=new AbortController();searchAbort.current=controller;setSearching(true);setPinError('');
+    const controller=new AbortController();searchAbort.current=controller;setSearching(true);pinState.setPinError('');
     const identity=latest.current;
     const active=location(current.row,current.col);
     const toProjected=(base:Pick<GridDraftLocation,'row'|'col'>):Coordinate|null=>{
@@ -662,8 +667,8 @@ export function GridModule(props:WorkspaceModuleProps){
       if(hit){
         if(filter){setAppliedFilter('');setFilterInput('');setSelected(hit);setAnchor(hit);pendingReveal.current=hit}
         else move(hit.row,hit.col);
-      }else setPinError('一致するセルがありません。');
-    }catch(e){if(!isStale())setPinError(e instanceof Error?e.message:'検索に失敗しました。')}
+      }else pinState.setPinError('一致するセルがありません。');
+    }catch(e){if(!isStale())pinState.setPinError(e instanceof Error?e.message:'検索に失敗しました。')}
     finally{if(searchAbort.current===controller){searchAbort.current=null;setSearching(false)}}
   }
   const activeFormulaStatus=formulaDisplay(current.row,current.col,raw(current.row,current.col))?.status;
@@ -676,12 +681,12 @@ export function GridModule(props:WorkspaceModuleProps){
       }}>
       <option value="auto">自動</option><option value="text">文字列</option>
       <option value="number">数値</option><option value="boolean">真偽値</option>
-    </select>}{invalidCellDraft&&<small role="alert" title="正確に保存するには文字列形式を選択してください。">セルの入力形式または数値精度を確認してください。</small>}{formulaWarning&&<small title={FORMULA_STATUS[activeFormulaStatus]}>{activeFormulaStatus==='error_formula'?'数式エラー':'未評価'}</small>}{mode==='pin'&&<GridTargetControl
-      allowSheet={xlsx}
-      mode={effectivePinMode}
-      onModeChange={next=>{pinSelection.invalidate();setPinError('');setGridPinMode(next)}}
-      selectionSummary={effectivePinMode==='sheet'?(sheet?.name??''):effectivePinMode==='row'?`行 ${bounds.row0+1}–${bounds.row1+1}`:effectivePinMode==='col'?`列 ${colName(bounds.col0)}–${colName(bounds.col1)}`:selectedRange}
-      disabled={!ready||(effectivePinMode!=='sheet'&&!inData)}
+    </select>}{invalidCellDraft&&<small role="alert" title="正確に保存するには文字列形式を選択してください。">セルの入力形式または数値精度を確認してください。</small>}{formulaWarning&&<small title={FORMULA_STATUS[activeFormulaStatus]}>{activeFormulaStatus==='error_formula'?'数式エラー':'未評価'}</small>}{mode==='pin'&&pinState.modes.length>0&&<GridTargetControl
+      modes={pinState.modes}
+      activeModeId={pinState.activeModeId}
+      onModeChange={pinState.setModeId}
+      selectionSummary={activeGridMode==='sheet'?(sheet?.name??''):activeGridMode==='row'?`行 ${bounds.row0+1}–${bounds.row1+1}`:activeGridMode==='col'?`列 ${colName(bounds.col0)}–${colName(bounds.col1)}`:selectedRange}
+      disabled={!ready||(activeGridMode!=='sheet'&&!inData)}
       onConfirm={()=>void pin()}
     />}{mode==='edit'&&<>
       {xlsx&&markButton('bold')}
@@ -732,11 +737,12 @@ export function GridModule(props:WorkspaceModuleProps){
     <button type="submit" className="btn btn-secondary btn-xs">絞り込む</button>
     {filter&&<button type="button" className="btn btn-ghost btn-xs" onClick={()=>{setFilterInput('');setAppliedFilter('');move(0,0)}}>絞り込み解除</button>}
   </form>;
+  const downloadUrl=buildArtifactContentUrl(artifact);
   return <UnifiedViewerZoomShell resetKey={artifact.id+':grid'} controlsTop={<>{toolbar}{filters}</>} controlsBottom={tabs}>
-    {(structure.error||rangeError||pinError)&&<TargetInspectionErrorBanner
-      message={structure.error||rangeError||pinError||''}
-      onRetry={()=>{structure.retry();setRetry(v=>v+1);setPinError('')}}
-      onDismiss={pinError?()=>setPinError(''):undefined}
+    {sheet&&(structure.error||rangeError||pinState.pinError)&&<TargetInspectionErrorBanner
+      message={pinState.pinError||rangeError||structure.error||''}
+      onRetry={()=>{structure.retry();setRetry(v=>v+1);pinState.clearPinError()}}
+      onDismiss={pinState.pinError?pinState.clearPinError:undefined}
     />}
     {projectedFormulas?.error&&<div role="status" className="workspace-toolbar workspace-toolbar-fields">
       <span>{projectedFormulas.error}</span><button type="button" className="btn btn-secondary btn-xs" onClick={()=>setRetry(v=>v+1)}>再試行</button>
@@ -757,7 +763,16 @@ export function GridModule(props:WorkspaceModuleProps){
       }}>最後の構造変更を取消</button>
     </div>}
     {filter&&structure.ready&&csvRows===0&&<p role="status">一致する行がありません。</p>}
-    {!sheet?<div className="workspace-loading">{structure.error?'表を表示できません。':'読み込み中…'}</div>:<div className="workspace-virtual-grid" ref={scroll} role="grid" aria-label="表データ" aria-busy={loading} aria-rowcount={rowCount+1} aria-colcount={colCount+1} tabIndex={0} onScroll={updateViewport} onKeyDown={e=>{const delta:Record<string,[number,number]>={ArrowUp:[-1,0],ArrowDown:[1,0],ArrowLeft:[0,-1],ArrowRight:[0,1]};if(delta[e.key]){e.preventDefault();move(current.row+delta[e.key][0],current.col+delta[e.key][1],e.shiftKey)}else if(e.key==='Enter'&&mode==='edit'){e.preventDefault();formulaInput.current?.focus()}}}>
+    {!sheet?(
+      structure.error?(
+        <PreviewUnavailableFallback
+          reason={structure.error}
+          downloadUrl={downloadUrl}
+          filename={artifact.filename}
+          onRetry={()=>{structure.retry();setRetry(v=>v+1)}}
+        />
+      ):<div className="workspace-loading">読み込み中…</div>
+    ):<div className="workspace-virtual-grid" ref={scroll} role="grid" aria-label="表データ" aria-busy={loading} aria-rowcount={rowCount+1} aria-colcount={colCount+1} tabIndex={0} onScroll={updateViewport} onKeyDown={e=>{const delta:Record<string,[number,number]>={ArrowUp:[-1,0],ArrowDown:[1,0],ArrowLeft:[0,-1],ArrowRight:[0,1]};if(delta[e.key]){e.preventDefault();move(current.row+delta[e.key][0],current.col+delta[e.key][1],e.shiftKey)}else if(e.key==='Enter'&&mode==='edit'){e.preventDefault();formulaInput.current?.focus()}}}>
       <div className="workspace-grid-plane" style={{width:colAxis.plane,height:rowAxis.plane}}>
         <div role="row" className="workspace-grid-header" style={{height:CELL_HEIGHT}}><div role="columnheader" className="workspace-grid-corner" style={{width:HEADER}}/>{cols.map(c=><div key={colAxis.start+c.index} role="columnheader" className="workspace-grid-col" style={{left:c.start,width:c.size}}>{colName(colAxis.start+c.index)}</div>)}</div>
         {rows.map(r=>{const row=rowAxis.start+r.index;return <div key={row} role="row" aria-rowindex={row+2} className="workspace-grid-row" style={{top:r.start,height:r.size}}>

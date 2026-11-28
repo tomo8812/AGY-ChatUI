@@ -1,9 +1,13 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   DEPRECATED_SELECTOR_KINDS,
   TARGET_SELECTOR_REGISTRY,
+  extractSupportedSelectorKinds,
   getRegisteredSelectorsForFormat,
+  getRegisteredUiModesForFormat,
 } from '../../shared/target-selection-registry.js';
 import { FormatAdapterRegistry } from '../src/artifacts/adapters/registry.js';
 import { readPptxSlideTargets, readPptxTargets } from '../src/artifacts/adapters/ooxml-target.js';
@@ -258,5 +262,140 @@ describe('Target Selection Registry & Revised §5.2 / §4.2 Conformance', () => 
       isDocumentOrMedia: true,
       memAvailableMb: 350,
     })).toThrow(/メモリが不足/);
+  });
+
+  it('derives UI selection modes exclusively from TARGET_SELECTOR_REGISTRY intersected with artifact_capabilities', () => {
+    const registry = new FormatAdapterRegistry();
+    const cases: Array<{
+      format: string;
+      filename: string;
+      previewKind: 'pptx' | 'docx' | 'table' | 'pdf' | 'markdown' | 'code';
+      expectedModeIds: string[];
+      dropSelectorKind?: string;
+      expectedAfterDrop?: string[];
+    }> = [
+      {
+        format: 'pptx',
+        filename: 'deck.pptx',
+        previewKind: 'pptx',
+        expectedModeIds: ['element', 'slide', 'pin', 'region'],
+        dropSelectorKind: 'pptx_region',
+        expectedAfterDrop: ['element', 'slide', 'pin'],
+      },
+      {
+        format: 'pdf',
+        filename: 'doc.pdf',
+        previewKind: 'pdf',
+        expectedModeIds: ['page', 'pin', 'region'],
+        dropSelectorKind: 'pdf_region',
+        expectedAfterDrop: ['page', 'pin'],
+      },
+      {
+        format: 'docx',
+        filename: 'doc.docx',
+        previewKind: 'docx',
+        expectedModeIds: ['element'],
+        dropSelectorKind: 'docx_paragraph',
+        expectedAfterDrop: [],
+      },
+      {
+        format: 'xlsx',
+        filename: 'sheet.xlsx',
+        previewKind: 'table',
+        expectedModeIds: ['range', 'row', 'col', 'sheet'],
+        dropSelectorKind: 'xlsx_sheet',
+        expectedAfterDrop: ['range', 'row', 'col'],
+      },
+      {
+        format: 'csv',
+        filename: 'data.csv',
+        previewKind: 'table',
+        expectedModeIds: ['range', 'row', 'col'],
+        dropSelectorKind: 'csv_row_col',
+        expectedAfterDrop: ['range'],
+      },
+      {
+        format: 'markdown',
+        filename: 'notes.md',
+        previewKind: 'markdown',
+        expectedModeIds: ['line_range'],
+      },
+      {
+        format: 'code',
+        filename: 'app.ts',
+        previewKind: 'code',
+        expectedModeIds: ['line_range', 'char_range'],
+        dropSelectorKind: 'code_char_range',
+        expectedAfterDrop: ['line_range'],
+      },
+    ];
+
+    for (const c of cases) {
+      const caps = registry.buildCapabilitiesResponse({
+        filename: c.filename,
+        previewKind: c.previewKind,
+        runtimeProfile: 'base_chatui',
+        sandboxIsolation: 'sandbox_required_blocked',
+        stagingIsolation: 'non_isolated_same_uid',
+      });
+      const advertisedKinds = extractSupportedSelectorKinds(caps.operations);
+      const modes = getRegisteredUiModesForFormat(c.format, {
+        filename: c.filename,
+        previewKind: c.previewKind,
+        allowedSelectorKinds: advertisedKinds,
+      });
+      expect(modes.map((m) => m.id)).toEqual(c.expectedModeIds);
+
+      if (c.dropSelectorKind && c.expectedAfterDrop) {
+        const filteredOps = caps.operations.filter((op) => op.operation !== `target_pin:${c.dropSelectorKind}`);
+        const filteredKinds = extractSupportedSelectorKinds(filteredOps);
+        const filteredModes = getRegisteredUiModesForFormat(c.format, {
+          filename: c.filename,
+          previewKind: c.previewKind,
+          allowedSelectorKinds: filteredKinds,
+        });
+        expect(filteredModes.map((m) => m.id)).toEqual(c.expectedAfterDrop);
+      }
+    }
+  });
+
+  it('enforces single-source registry, shared DOCX element control, and unified error fallbacks across PR3A UI modules', () => {
+    const repoRoot = path.resolve(import.meta.dirname, '..', '..');
+    const read = (rel: string) => fs.readFileSync(path.join(repoRoot, rel), 'utf8');
+
+    const pdfModule = read('web/src/components/ArtifactWorkspace/modules/PdfModule.tsx');
+    const pptxModule = read('web/src/components/ArtifactWorkspace/modules/PptxModule.tsx');
+    const docxModule = read('web/src/components/ArtifactWorkspace/modules/DocxModule.tsx');
+    const gridModule = read('web/src/components/ArtifactWorkspace/modules/GridModule.tsx');
+    const sourceModule = read('web/src/components/ArtifactWorkspace/modules/SourceModule.tsx');
+    const gridControl = read('web/src/components/shared-ui/pin/GridTargetControl.tsx');
+    const textControl = read('web/src/components/shared-ui/pin/TextRangeTargetControl.tsx');
+    const workspaceShell = read('web/src/components/ArtifactWorkspace/WorkspaceShell.tsx');
+
+    // No duplicate UI allowlists or hardcoded mode tables
+    expect(pdfModule).not.toContain('PDF_PIN_OPTIONS');
+    expect(pptxModule).not.toContain('PPTX_PIN_OPTIONS');
+    expect(gridModule).not.toContain('allowSheet');
+    expect(gridControl).not.toContain('allowSheet');
+    expect(sourceModule).not.toContain('allowCharRange');
+    expect(textControl).not.toContain('allowCharRange');
+
+    // All PR3A modules derive modes from the shared registry hook
+    for (const src of [pdfModule, pptxModule, docxModule, gridModule, sourceModule]) {
+      expect(src).toContain('useRegisteredPinModes');
+    }
+
+    // DOCX reuses shared ElementTargetControl & PinModeToolbar (same element control as PPTX)
+    expect(docxModule).toContain('ElementTargetControl');
+    expect(docxModule).toContain('PinModeToolbar');
+    expect(pptxModule).toContain('ElementTargetControl');
+
+    // Unified PreviewUnavailableFallback & TargetInspectionErrorBanner across PR3A modules & shell
+    expect(workspaceShell).toContain('PreviewUnavailableFallback');
+    for (const src of [pptxModule, docxModule, gridModule, sourceModule]) {
+      expect(src).toContain('PreviewUnavailableFallback');
+      expect(src).toContain('TargetInspectionErrorBanner');
+    }
+    expect(pdfModule).toContain('TargetInspectionErrorBanner');
   });
 });

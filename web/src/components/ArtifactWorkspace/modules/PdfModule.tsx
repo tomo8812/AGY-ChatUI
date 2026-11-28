@@ -1,10 +1,9 @@
-import React, { useState } from 'react';
+import React from 'react';
 import { PdfCanvasViewer, type PdfLocation } from '../../shared-ui/document/PdfCanvasCore';
 import {
   PinModeToolbar,
   TargetInspectionErrorBanner,
-  useTargetSelection,
-  type PinModeOption,
+  useRegisteredPinModes,
 } from '../../shared-ui/pin';
 import { buildArtifactContentUrl } from '../../../utils/viewerCache';
 import { sha256Hex } from '../../../utils/sha256';
@@ -25,25 +24,21 @@ interface PdfTargetMetaResponse {
   } | null;
 }
 
-type PdfPinMode = 'page' | 'pin' | 'region';
-
-const PDF_PIN_OPTIONS: readonly PinModeOption<PdfPinMode>[] = [
-  { id: 'page', label: 'ページ全体' },
-  { id: 'pin', label: 'ピン', hint: 'クリック・タップ、または矢印キーと Enter で位置を指定' },
-  { id: 'region', label: '矩形領域', hint: 'ドラッグ、または矢印キーと Enter で範囲を指定' },
-];
-
-export function PdfModule({ artifact, mode, onTarget, beginTargetSelection, jumpTarget }: WorkspaceModuleProps) {
-  const [selection, setSelection] = useState<PdfPinMode>('page');
-  const [error, setError] = useState('');
-  const pinSelection = useTargetSelection(beginTargetSelection, selection);
+export function PdfModule({ artifact, mode, capabilities, onTarget, beginTargetSelection, jumpTarget }: WorkspaceModuleProps) {
+  const pin = useRegisteredPinModes({
+    format: 'pdf',
+    filename: artifact.filename,
+    previewKind: artifact.previewKind,
+    capabilities,
+    beginWorkspaceSelection: beginTargetSelection,
+  });
 
   async function capture(pageIndex: number, pageCount: number, readPage?: () => Promise<string>, location?: PdfLocation) {
     if (artifact.revision === undefined) return;
-    const isCurrent = pinSelection.begin();
-    setError('');
+    const isCurrent = pin.selection.begin();
+    pin.clearPinError();
     try {
-      const pin = Boolean(location && location.width === 0 && location.height === 0);
+      const isPoint = Boolean(location && location.width === 0 && location.height === 0);
       const rectPt = location
         ? [
             location.x * location.pageWidth,
@@ -84,10 +79,10 @@ export function PdfModule({ artifact, mode, onTarget, beginTargetSelection, jump
       };
       let contentCoords: Record<string, unknown> | undefined;
       if (location && rectPt) {
-        selector.kind = pin ? 'pdf_pin' : 'pdf_region';
-        contentCoords = { pageIndex, unit: 'pt', ...(pin ? { xPt: rectPt[0], yPt: rectPt[1] } : { rectPt }) };
+        selector.kind = isPoint ? 'pdf_pin' : 'pdf_region';
+        contentCoords = { pageIndex, unit: 'pt', ...(isPoint ? { xPt: rectPt[0], yPt: rectPt[1] } : { rectPt }) };
         const digest = regionDigest ?? sha256Hex(JSON.stringify([pageHash, rectPt]));
-        Object.assign(selector, pin ? { xPt: rectPt[0], yPt: rectPt[1] } : { rectPt }, { expectedRegionDigest: digest });
+        Object.assign(selector, isPoint ? { xPt: rectPt[0], yPt: rectPt[1] } : { rectPt }, { expectedRegionDigest: digest });
       }
       if (!isCurrent()) return;
       onTarget({
@@ -98,27 +93,30 @@ export function PdfModule({ artifact, mode, onTarget, beginTargetSelection, jump
         contentCoords,
       });
     } catch (e) {
-      if (isCurrent()) setError(e instanceof Error ? e.message : 'ページを選択できませんでした。');
+      if (isCurrent()) pin.setPinError(e instanceof Error ? e.message : 'ページを選択できませんでした。');
     }
   }
 
+  const spatialSelectionMode =
+    mode === 'pin' && pin.activeMode?.primitive === 'point'
+      ? 'pin'
+      : mode === 'pin' && pin.activeMode?.primitive === 'rect'
+        ? 'region'
+        : undefined;
+
   return (
     <div className="workspace-page-view">
-      {mode === 'pin' && (
+      {mode === 'pin' && pin.modes.length > 0 && (
         <PinModeToolbar
           ariaLabel="PDF の対象指定"
           selectLabel="PDF の選択方法"
-          options={PDF_PIN_OPTIONS}
-          value={selection}
-          onChange={(next) => {
-            pinSelection.invalidate();
-            setError('');
-            setSelection(next);
-          }}
+          options={pin.modes}
+          value={pin.activeModeId}
+          onChange={pin.setModeId}
         />
       )}
-      {error && mode === 'pin' && (
-        <TargetInspectionErrorBanner message={error} onDismiss={() => setError('')} />
+      {pin.pinError && mode === 'pin' && (
+        <TargetInspectionErrorBanner message={pin.pinError} onDismiss={pin.clearPinError} />
       )}
       <PdfCanvasViewer
         jumpLocation={jumpTarget?.coords}
@@ -126,9 +124,9 @@ export function PdfModule({ artifact, mode, onTarget, beginTargetSelection, jump
         filename={artifact.filename}
         documentKey={artifact.id}
         enhancedNavigation
-        selectionMode={mode === 'pin' && selection !== 'page' ? selection : undefined}
+        selectionMode={spatialSelectionMode}
         onSelectLocation={mode === 'pin' ? (location, readPage) => void capture(location.pageIndex, location.pageCount, readPage, location) : undefined}
-        onSelectPage={mode === 'pin' && selection === 'page' ? (index, count, readPage) => void capture(index, count, readPage) : undefined}
+        onSelectPage={mode === 'pin' && pin.activeMode?.primitive === 'whole' ? (index, count, readPage) => void capture(index, count, readPage) : undefined}
       />
     </div>
   );

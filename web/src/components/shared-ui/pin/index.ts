@@ -1,6 +1,12 @@
 import './pin.css';
 
-export { useTargetSelection, type TargetSelectionController } from './useTargetSelection';
+export {
+  useRegisteredPinModes,
+  useTargetSelection,
+  type CapabilitiesLike,
+  type RegisteredPinState,
+  type TargetSelectionController,
+} from './useTargetSelection';
 export {
   SpatialPinOverlay,
   type NormalizedArea,
@@ -15,11 +21,12 @@ export {
   type SelectableElementOption,
 } from './ElementTargetControl';
 export { TextRangeTargetControl, type TextRangeTargetControlProps } from './TextRangeTargetControl';
-export { GridTargetControl, type GridPinMode, type GridTargetControlProps } from './GridTargetControl';
+export { GridTargetControl, type GridTargetControlProps } from './GridTargetControl';
 export { TimeRangeTargetControl, type TimeRangeTargetControlProps } from './TimeRangeTargetControl';
 export {
   PreviewUnavailableFallback,
   TargetInspectionErrorBanner,
+  formatConciseErrorReason,
   type PreviewUnavailableFallbackProps,
   type TargetInspectionErrorBannerProps,
 } from './TargetErrorFallback';
@@ -27,13 +34,17 @@ export {
 export {
   DEPRECATED_SELECTOR_KINDS,
   TARGET_SELECTOR_REGISTRY,
+  extractSupportedSelectorKinds,
   getRegisteredSelectorsForFormat,
+  getRegisteredUiModesForFormat,
   getSelectorRegistration,
   isDeprecatedSelectorKind,
   isRegisteredSelectorKind,
   selectorHasRegisteredUi,
   selectorMatchesRegisteredFormat,
   type PinSelectionPrimitive,
+  type RegisteredUiMode,
+  type RegisteredUiModeSpec,
   type TargetSelectionFormat,
   type TargetSelectorKind,
   type TargetSelectorRegistration,

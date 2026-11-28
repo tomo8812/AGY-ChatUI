@@ -1,4 +1,10 @@
-import { TargetInspectionErrorBanner, TextRangeTargetControl, useTargetSelection } from '../../shared-ui/pin';
+import {
+  PreviewUnavailableFallback,
+  TargetInspectionErrorBanner,
+  TextRangeTargetControl,
+  useRegisteredPinModes,
+  type RegisteredUiMode,
+} from '../../shared-ui/pin';
 import { ResponsiveCommandBar } from '../../shared-ui/layout/ResponsiveCommandBar';
 import React,{useDeferredValue,useLayoutEffect,useMemo,useRef,useState} from 'react';
 import { buildArtifactContentUrl } from '../../../utils/viewerCache';
@@ -10,7 +16,7 @@ import { workspaceApi } from '../../../api/workspace';
 import { assertRevision } from '../useRevisionResource';
 import {SourceEditor,type SourceEditorHandle} from '../../shared-ui/editor/SourceEditor';
 
-export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget,beginTargetSelection,jumpTarget}:WorkspaceModuleProps){
+export function SourceModule({artifact,capabilities,mode,draft,editingLocked,onDraft,onTarget,beginTargetSelection,jumpTarget}:WorkspaceModuleProps){
   const resource=useRevisionResource(artifact,'source',async signal=>{
     const response=await fetch(buildArtifactContentUrl(artifact),{credentials:'include',signal});
     if(!response.ok)throw Error('ファイルを取得できませんでした。');
@@ -21,8 +27,15 @@ export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget
   const [outline,setOutline]=useState<{label:string;level:number}[]>([]);
   const preview=useRef<HTMLDivElement>(null);
   const searchOffset=useRef(0);
-  const [pinError,setPinError]=useState('');
-  const selection=useTargetSelection(beginTargetSelection,mode);
+  const markdown=artifact.previewKind==='markdown';
+  const pin=useRegisteredPinModes({
+    format:markdown?'markdown':'code',
+    filename:artifact.filename,
+    previewKind:artifact.previewKind,
+    capabilities,
+    beginWorkspaceSelection:beginTargetSelection,
+    scope:mode,
+  });
   const editor=useRef<SourceEditorHandle|null>(null);
   useLayoutEffect(()=>{
     const range=jumpTarget?.range;
@@ -33,7 +46,6 @@ export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget
   const text=resource.data??'';
   const value=String(draft?.entries.find(e=>e.key==='source')?.operation.content??text);
   const previewValue=useDeferredValue(value);
-  const markdown=artifact.previewKind==='markdown';
   const language=artifact.filename.includes('.')?(artifact.filename.split('.').pop()??'text'):artifact.filename.toLowerCase();
   const matches=useMemo(()=>{
     const needle=query.toLowerCase();
@@ -62,28 +74,28 @@ export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget
     for(const n of nodes){const len=n.length;if(!start&&at<pos+len){start=n;startOffset=at-pos}if(start&&at+query.length<=pos+len){end=n;endOffset=at+query.length-pos;break}pos+=len}
     if(start&&end&&startOffset>=0&&endOffset<=end.length){const range=document.createRange();range.setStart(start,startOffset);range.setEnd(end,endOffset);const selection=window.getSelection();selection?.removeAllRanges();selection?.addRange(range);start.parentElement?.scrollIntoView({block:'nearest',inline:'nearest'});searchOffset.current=at+query.length}
   }
-  async function selectLines(characters=false){
+  async function selectLines(targetMode:RegisteredUiMode){
     if(!resource.ready||artifact.revision===undefined||!editor.current)return;
+    const characters=targetMode.selectorKind==='code_char_range';
     const bounds=characters?editor.current.getCharacterSelection():editor.current.getSelection();
-    if(!bounds){setPinError('対象にする文字を選択してください。');return}
+    if(!bounds){pin.setPinError('対象にする文字を選択してください。');return}
     const {startLine:start,endLine:end}=bounds;
-    const isCurrent=selection.begin();
+    const isCurrent=pin.selection.begin();
     try{
       const result=await workspaceApi.range<{text:string;before:string;after:string;expectedSnippetHash:string;contextBeforeHash:string;contextAfterHash:string;occurrenceIndex:number}>(artifact.id,{...bounds,targetHashes:true});
       if(!isCurrent())return;
       assertRevision(artifact,result);
       if(!Number.isInteger(result.occurrenceIndex)||result.occurrenceIndex<0)throw Error('Invalid occurrenceIndex');
-      onTarget({baseRevision:artifact.revision,label:characters?start+'–'+end+' 行の選択文字列':start+'–'+end+' 行',selector:{kind:characters?'code_char_range':markdown?'md_text_range':'code_line_range',...bounds,...(characters?{contextVersion:2}:{}),expectedSnippetHash:result.expectedSnippetHash,contextBeforeHash:result.contextBeforeHash,contextAfterHash:result.contextAfterHash,occurrenceIndex:result.occurrenceIndex},range:{...bounds},selectedContentSnapshot:result.text.slice(0,50_000),surroundingContext:(result.before+'\n---\n'+result.after).slice(0,20_000)});
-      setPinError('');
-    }catch{if(isCurrent())setPinError('選択対象の識別情報を作成できませんでした。')}
+      onTarget({baseRevision:artifact.revision,label:characters?start+'–'+end+' 行の選択文字列':start+'–'+end+' 行',selector:{kind:targetMode.selectorKind,...bounds,...(characters?{contextVersion:2}:{}),expectedSnippetHash:result.expectedSnippetHash,contextBeforeHash:result.contextBeforeHash,contextAfterHash:result.contextAfterHash,occurrenceIndex:result.occurrenceIndex},range:{...bounds},selectedContentSnapshot:result.text.slice(0,50_000),surroundingContext:(result.before+'\n---\n'+result.after).slice(0,20_000)});
+      pin.clearPinError();
+    }catch{if(isCurrent())pin.setPinError('選択対象の識別情報を作成できませんでした。')}
   }
   const primary=mode==='pin'?<>
     <button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready} onClick={()=>editor.current?.selectAll()}>全選択</button>
     <TextRangeTargetControl
-      allowCharRange={!markdown}
+      modes={pin.modes}
       disabled={!resource.ready}
-      onSelectLineRange={()=>void selectLines()}
-      onSelectCharRange={!markdown?()=>void selectLines(true):undefined}
+      onSelectMode={targetMode=>void selectLines(targetMode)}
     />
   </>:<>
     <input className="workspace-command-input" aria-label="検索" placeholder="検索" value={query}
@@ -98,12 +110,21 @@ export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget
         onClick={()=>editor.current?.wrapSelection(a,b)}>{label}</button>)
     :null;
   const tools=<ResponsiveCommandBar primary={primary} secondary={secondary} minInlineWidth={640}/>;
+  const downloadUrl=buildArtifactContentUrl(artifact);
   return <UnifiedViewerZoomShell resetKey={artifact.id+':source'} controlsTop={<>{tools}{outlineOpen&&markdown&&mode!=='pin'&&<nav className="workspace-source-outline" aria-label="文書目次">{outline.length?outline.map((item,index)=><button key={index} type="button" style={{paddingInlineStart:8+(item.level-1)*10}} onClick={()=>jumpHeading(index)}>{item.label}</button>):<span className="muted-xs">見出しがありません。</span>}</nav>}</>}>
-    {resource.error&&<div className="error-box" role="alert">{resource.error}<button type="button" onClick={resource.retry}>再試行</button></div>}
-    {pinError&&<TargetInspectionErrorBanner message={pinError} onDismiss={()=>setPinError('')}/>}
+    {resource.data!==null&&resource.error&&<TargetInspectionErrorBanner message={resource.error} onRetry={resource.retry}/>}
+    {pin.pinError&&<TargetInspectionErrorBanner message={pin.pinError} onDismiss={pin.clearPinError}/>}
     {resource.loading&&<p className="muted-xs">読み込み中…</p>}
+    {resource.data===null&&!resource.loading&&resource.error&&(
+      <PreviewUnavailableFallback
+        reason={resource.error}
+        downloadUrl={downloadUrl}
+        filename={artifact.filename}
+        onRetry={resource.retry}
+      />
+    )}
     {resource.data!==null&&<div className={'workspace-source'+(markdown&&mode==='edit'?' split':'')}>
-      {mode!=='view'?<SourceEditor onSelectionChange={selection.invalidate} editorRef={editor} language={language} value={mode==='pin'?text:value} readOnly={mode!=='edit'||editingLocked||!resource.ready} onChange={content=>{if(artifact.revision!==undefined)onDraft(artifact.revision,content===text?null:{key:'source',label:'ソースの変更',operation:{op:'replace_source',content}},'source')}}/>:null}
+      {mode!=='view'?<SourceEditor onSelectionChange={pin.selection.invalidate} editorRef={editor} language={language} value={mode==='pin'?text:value} readOnly={mode!=='edit'||editingLocked||!resource.ready} onChange={content=>{if(artifact.revision!==undefined)onDraft(artifact.revision,content===text?null:{key:'source',label:'ソースの変更',operation:{op:'replace_source',content}},'source')}}/>:null}
       {(mode==='view'||markdown&&mode==='edit')&&<div className="workspace-source-preview" ref={preview}>{markdown?<MarkdownContent content={previewValue} chatId={artifact.chatId}/>:<CodeBlock code={value} language={language}/>}</div>}
     </div>}
   </UnifiedViewerZoomShell>

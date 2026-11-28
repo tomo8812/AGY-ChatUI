@@ -1,5 +1,16 @@
 import React from 'react';
 
+/**
+ * Extracts a concise, user-facing reason only when a known, meaningful message
+ * is present. Suppresses empty strings or internal stack-like noise (§2.5).
+ */
+export function formatConciseErrorReason(error: unknown): string | undefined {
+  const raw = typeof error === 'string' ? error : error instanceof Error ? error.message : '';
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 240 || /\n\s*at\s+/.test(trimmed)) return undefined;
+  return trimmed;
+}
+
 export interface TargetInspectionErrorBannerProps {
   /** Concise, accurate error reason (omitted or fallback when unknown). */
   message: string;
@@ -19,7 +30,7 @@ export const TargetInspectionErrorBanner: React.FC<TargetInspectionErrorBannerPr
   onDismiss,
 }) => (
   <div className="error-box shared-pin-error" role="alert">
-    <span>{message || '対象を識別できませんでした。対象を選び直すか再試行してください。'}</span>
+    <span>{formatConciseErrorReason(message) ?? '対象を識別できませんでした。対象を選び直すか再試行してください。'}</span>
     <span className="shared-pin-error-actions">
       {onRetry && (
         <button type="button" className="btn btn-secondary btn-xs" onClick={onRetry}>
@@ -56,19 +67,22 @@ export const PreviewUnavailableFallback: React.FC<PreviewUnavailableFallbackProp
   downloadUrl,
   reason,
   onRetry,
-}) => (
-  <div className="shared-preview-unavailable" role="alert">
-    <p className="shared-preview-unavailable-title">プレビューを表示できません</p>
-    {reason && <p className="shared-preview-unavailable-reason">{reason}</p>}
-    <div className="shared-preview-unavailable-actions">
-      <a className="btn btn-primary btn-sm" href={downloadUrl} download={filename}>
-        ダウンロード
-      </a>
-      {onRetry && (
-        <button type="button" className="btn btn-secondary btn-sm" onClick={onRetry}>
-          再試行
-        </button>
-      )}
+}) => {
+  const conciseReason = formatConciseErrorReason(reason);
+  return (
+    <div className="shared-preview-unavailable" role="alert">
+      <p className="shared-preview-unavailable-title">プレビューを表示できません</p>
+      {conciseReason && <p className="shared-preview-unavailable-reason">{conciseReason}</p>}
+      <div className="shared-preview-unavailable-actions">
+        <a className="btn btn-primary btn-sm" href={downloadUrl} download={filename}>
+          ダウンロード
+        </a>
+        {onRetry && (
+          <button type="button" className="btn btn-secondary btn-sm" onClick={onRetry}>
+            再試行
+          </button>
+        )}
+      </div>
     </div>
-  </div>
-);
+  );
+};

@@ -1,40 +1,33 @@
 import React from 'react';
+import type { RegisteredUiMode } from '../../../../../shared/target-selection-registry';
 
 export interface TextRangeTargetControlProps {
-  /** Whether character-range selection is available alongside line-range selection (Code/Text). */
-  allowCharRange?: boolean;
+  /** Registered text-range selection modes derived from `shared/target-selection-registry.ts`. */
+  modes: readonly RegisteredUiMode[];
   disabled?: boolean;
-  onSelectLineRange: () => void;
-  onSelectCharRange?: () => void;
+  onSelectMode: (mode: RegisteredUiMode) => void;
 }
 
 /**
  * Shared text/line range target control for Code, Markdown, HTML, Diff, and Mermaid.
+ * Renders only the text-range actions registered for the current format.
  */
 export const TextRangeTargetControl: React.FC<TextRangeTargetControlProps> = ({
-  allowCharRange = false,
+  modes,
   disabled,
-  onSelectLineRange,
-  onSelectCharRange,
+  onSelectMode,
 }) => (
   <>
-    <button
-      type="button"
-      className="btn btn-secondary btn-xs shared-pin-action"
-      disabled={disabled}
-      onClick={onSelectLineRange}
-    >
-      選択行を対象にする
-    </button>
-    {allowCharRange && onSelectCharRange && (
+    {modes.map((mode) => (
       <button
+        key={mode.id}
         type="button"
         className="btn btn-secondary btn-xs shared-pin-action"
         disabled={disabled}
-        onClick={onSelectCharRange}
+        onClick={() => onSelectMode(mode)}
       >
-        選択文字を対象にする
+        {mode.actionLabel ?? `${mode.label}を対象にする`}
       </button>
-    )}
+    ))}
   </>
 );

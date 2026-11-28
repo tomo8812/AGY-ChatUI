@@ -95,22 +95,53 @@ export type TargetSelectorView =
   | 'player'
   | 'rich_card';
 
+export interface RegisteredUiModeSpec {
+  /** Stable UI mode identifier within the format (e.g. 'page', 'pin', 'region', 'element', 'range', 'row', 'col', 'sheet'). */
+  readonly id: string;
+  readonly primitive: PinSelectionPrimitive;
+  /** Concise mode label shown in the shared mode picker. */
+  readonly label: string;
+  /** Optional primary action button label (e.g. '要素を対象にする', '選択段落を対象にする'). */
+  readonly actionLabel?: string;
+  /** Optional interaction guidance shown in the shared toolbar. */
+  readonly hint?: string;
+}
+
+export interface RegisteredUiMode extends RegisteredUiModeSpec {
+  readonly selectorKind: TargetSelectorKind;
+  readonly format: TargetSelectionFormat;
+  readonly supportedViews: readonly TargetSelectorView[];
+}
+
 export interface TargetSelectorRegistration {
   readonly kind: TargetSelectorKind;
   readonly format: TargetSelectionFormat;
   /** Optional previewKind filter (used by media to separate video vs audio). */
   readonly previewKind?: 'video' | 'audio';
   readonly primitive: PinSelectionPrimitive;
-  /** Concise user-facing label for UI mode pickers. */
+  /** Concise user-facing label for the selector kind. */
   readonly label: string;
   /** Supported views / runtime profiles where this selector operates. */
   readonly supportedViews: readonly TargetSelectorView[];
   /** Whether direct interactive UI selection is wired in the current phase. */
   readonly uiAvailable: boolean;
+  /** Declarative UI interaction modes exposed by this selector registration. */
+  readonly uiModes: readonly RegisteredUiModeSpec[];
 }
 
 export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
-  // PPTX — slide whole (+ optional pin pointPt), structural element, rect region
+  // PPTX — structural element, slide whole (+ optional pin pointPt), rect region
+  {
+    kind: 'pptx_element',
+    format: 'pptx',
+    primitive: 'element',
+    label: '構造要素',
+    supportedViews: ['base', 'compact', 'full', 'canvas'],
+    uiAvailable: true,
+    uiModes: [
+      { id: 'element', primitive: 'element', label: '構造要素', actionLabel: '要素を対象にする' },
+    ],
+  },
   {
     kind: 'pptx_slide',
     format: 'pptx',
@@ -118,6 +149,10 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: 'スライド全体・ピン',
     supportedViews: ['base', 'compact', 'full', 'canvas'],
     uiAvailable: true,
+    uiModes: [
+      { id: 'slide', primitive: 'whole', label: 'スライド全体', actionLabel: 'スライド全体を対象にする' },
+      { id: 'pin', primitive: 'point', label: 'ピン', hint: 'クリック・タップ、または矢印キーと Enter で位置を指定' },
+    ],
   },
   {
     kind: 'pptx_region',
@@ -126,14 +161,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: '矩形領域',
     supportedViews: ['base', 'compact', 'full', 'canvas'],
     uiAvailable: true,
-  },
-  {
-    kind: 'pptx_element',
-    format: 'pptx',
-    primitive: 'element',
-    label: '構造要素',
-    supportedViews: ['base', 'compact', 'full', 'canvas'],
-    uiAvailable: true,
+    uiModes: [
+      { id: 'region', primitive: 'rect', label: '矩形領域', hint: 'ドラッグ、または矢印キーと Enter で範囲を指定' },
+    ],
   },
 
   // DOCX — paragraph
@@ -144,6 +174,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: '段落',
     supportedViews: ['base', 'compact', 'full', 'reading', 'editing'],
     uiAvailable: true,
+    uiModes: [
+      { id: 'element', primitive: 'element', label: '段落', actionLabel: '選択段落を対象にする' },
+    ],
   },
 
   // XLSX — cell/rect range, row/col, sheet
@@ -154,6 +187,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: 'セル範囲',
     supportedViews: ['base', 'compact', 'full', 'grid'],
     uiAvailable: true,
+    uiModes: [
+      { id: 'range', primitive: 'grid', label: 'セル範囲', actionLabel: 'セルを対象にする' },
+    ],
   },
   {
     kind: 'xlsx_row_col',
@@ -162,6 +198,10 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: '行・列',
     supportedViews: ['base', 'compact', 'full', 'grid'],
     uiAvailable: true,
+    uiModes: [
+      { id: 'row', primitive: 'grid', label: '行', actionLabel: '行を対象にする' },
+      { id: 'col', primitive: 'grid', label: '列', actionLabel: '列を対象にする' },
+    ],
   },
   {
     kind: 'xlsx_sheet',
@@ -170,6 +210,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: 'シート全体',
     supportedViews: ['base', 'compact', 'full', 'grid'],
     uiAvailable: true,
+    uiModes: [
+      { id: 'sheet', primitive: 'whole', label: 'シート全体', actionLabel: 'シートを対象にする' },
+    ],
   },
 
   // CSV/TSV — cell/rect range, row/col
@@ -180,6 +223,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: 'セル範囲',
     supportedViews: ['base', 'compact', 'full', 'grid'],
     uiAvailable: true,
+    uiModes: [
+      { id: 'range', primitive: 'grid', label: 'セル範囲', actionLabel: 'セルを対象にする' },
+    ],
   },
   {
     kind: 'csv_row_col',
@@ -188,6 +234,10 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: '行・列',
     supportedViews: ['base', 'compact', 'full', 'grid'],
     uiAvailable: true,
+    uiModes: [
+      { id: 'row', primitive: 'grid', label: '行', actionLabel: '行を対象にする' },
+      { id: 'col', primitive: 'grid', label: '列', actionLabel: '列を対象にする' },
+    ],
   },
 
   // PDF — page whole, pin, rect
@@ -198,6 +248,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: 'ページ全体',
     supportedViews: ['base', 'compact', 'full', 'canvas'],
     uiAvailable: true,
+    uiModes: [
+      { id: 'page', primitive: 'whole', label: 'ページ全体', actionLabel: 'ページを対象にする' },
+    ],
   },
   {
     kind: 'pdf_pin',
@@ -206,6 +259,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: 'ピン',
     supportedViews: ['base', 'compact', 'full', 'canvas'],
     uiAvailable: true,
+    uiModes: [
+      { id: 'pin', primitive: 'point', label: 'ピン', hint: 'クリック・タップ、または矢印キーと Enter で位置を指定' },
+    ],
   },
   {
     kind: 'pdf_region',
@@ -214,6 +270,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: '矩形領域',
     supportedViews: ['base', 'compact', 'full', 'canvas'],
     uiAvailable: true,
+    uiModes: [
+      { id: 'region', primitive: 'rect', label: '矩形領域', hint: 'ドラッグ、または矢印キーと Enter で範囲を指定' },
+    ],
   },
 
   // Image — pin, rect (PR3B UI rollout)
@@ -224,6 +283,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: 'ピン',
     supportedViews: ['base', 'compact', 'full', 'canvas'],
     uiAvailable: false,
+    uiModes: [
+      { id: 'pin', primitive: 'point', label: 'ピン', hint: 'クリック・タップ、または矢印キーと Enter で位置を指定' },
+    ],
   },
   {
     kind: 'image_rect',
@@ -232,6 +294,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: '矩形領域',
     supportedViews: ['base', 'compact', 'full', 'canvas'],
     uiAvailable: false,
+    uiModes: [
+      { id: 'region', primitive: 'rect', label: '矩形領域', hint: 'ドラッグ、または矢印キーと Enter で範囲を指定' },
+    ],
   },
 
   // SVG — rect (PR3B UI rollout)
@@ -242,6 +307,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: '矩形領域',
     supportedViews: ['base', 'compact', 'full', 'canvas'],
     uiAvailable: false,
+    uiModes: [
+      { id: 'region', primitive: 'rect', label: '矩形領域', hint: 'ドラッグ、または矢印キーと Enter で範囲を指定' },
+    ],
   },
 
   // HTML — source line range (PR3B UI rollout)
@@ -252,6 +320,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: 'ソース行範囲',
     supportedViews: ['base', 'compact', 'full', 'source'],
     uiAvailable: false,
+    uiModes: [
+      { id: 'line_range', primitive: 'text_range', label: 'ソース行範囲', actionLabel: '選択行を対象にする' },
+    ],
   },
 
   // Markdown — source line range
@@ -262,6 +333,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: 'ソース行範囲',
     supportedViews: ['base', 'compact', 'full', 'source'],
     uiAvailable: true,
+    uiModes: [
+      { id: 'line_range', primitive: 'text_range', label: 'ソース行範囲', actionLabel: '選択行を対象にする' },
+    ],
   },
 
   // Code/Text — line range, char range
@@ -272,6 +346,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: '行範囲',
     supportedViews: ['base', 'compact', 'full', 'source'],
     uiAvailable: true,
+    uiModes: [
+      { id: 'line_range', primitive: 'text_range', label: '行範囲', actionLabel: '選択行を対象にする' },
+    ],
   },
   {
     kind: 'code_char_range',
@@ -280,6 +357,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: '文字範囲',
     supportedViews: ['base', 'compact', 'full', 'source'],
     uiAvailable: true,
+    uiModes: [
+      { id: 'char_range', primitive: 'text_range', label: '文字範囲', actionLabel: '選択文字を対象にする' },
+    ],
   },
 
   // Diff — hunk, line range (PR3B UI rollout)
@@ -290,6 +370,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: 'ハンク',
     supportedViews: ['base', 'compact', 'full', 'source'],
     uiAvailable: false,
+    uiModes: [
+      { id: 'hunk', primitive: 'element', label: 'ハンク', actionLabel: 'ハンクを対象にする' },
+    ],
   },
   {
     kind: 'diff_line_range',
@@ -298,6 +381,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: '行範囲',
     supportedViews: ['base', 'compact', 'full', 'source'],
     uiAvailable: false,
+    uiModes: [
+      { id: 'line_range', primitive: 'text_range', label: '行範囲', actionLabel: '選択行を対象にする' },
+    ],
   },
 
   // Mermaid — source line range (PR3B UI rollout)
@@ -308,6 +394,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: 'ソース行範囲',
     supportedViews: ['base', 'compact', 'full', 'source'],
     uiAvailable: false,
+    uiModes: [
+      { id: 'line_range', primitive: 'text_range', label: 'ソース行範囲', actionLabel: '選択行を対象にする' },
+    ],
   },
 
   // Video / Audio — time range (PR3B UI rollout)
@@ -319,6 +408,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: '時間区間',
     supportedViews: ['base', 'compact', 'full', 'player'],
     uiAvailable: false,
+    uiModes: [
+      { id: 'time_range', primitive: 'time_range', label: '時間区間', actionLabel: '時間区間を対象にする' },
+    ],
   },
   {
     kind: 'audio_time_range',
@@ -328,6 +420,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: '時間区間',
     supportedViews: ['base', 'compact', 'full', 'player'],
     uiAvailable: false,
+    uiModes: [
+      { id: 'time_range', primitive: 'time_range', label: '時間区間', actionLabel: '時間区間を対象にする' },
+    ],
   },
 
   // Lightweight Rich UI — block, node, repeat item, chart series/point, table cell
@@ -338,6 +433,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: 'ブロック全体',
     supportedViews: ['base', 'compact', 'full', 'rich_card'],
     uiAvailable: false,
+    uiModes: [
+      { id: 'block', primitive: 'whole', label: 'ブロック全体', actionLabel: 'ブロック全体を対象にする' },
+    ],
   },
   {
     kind: 'rich_node',
@@ -346,6 +444,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: '表示要素',
     supportedViews: ['base', 'compact', 'full', 'rich_card'],
     uiAvailable: false,
+    uiModes: [
+      { id: 'node', primitive: 'element', label: '表示要素', actionLabel: '要素を対象にする' },
+    ],
   },
   {
     kind: 'rich_repeat_item',
@@ -354,6 +455,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: '繰り返し項目',
     supportedViews: ['base', 'compact', 'full', 'rich_card'],
     uiAvailable: false,
+    uiModes: [
+      { id: 'repeat_item', primitive: 'element', label: '繰り返し項目', actionLabel: '項目を対象にする' },
+    ],
   },
   {
     kind: 'rich_chart_series',
@@ -362,6 +466,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: 'グラフ系列・データ点',
     supportedViews: ['base', 'compact', 'full', 'rich_card'],
     uiAvailable: false,
+    uiModes: [
+      { id: 'chart_series', primitive: 'element', label: 'グラフ系列・データ点', actionLabel: '系列・データ点を対象にする' },
+    ],
   },
   {
     kind: 'rich_table_cell',
@@ -370,6 +477,9 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     label: '表セル',
     supportedViews: ['base', 'compact', 'full', 'rich_card'],
     uiAvailable: false,
+    uiModes: [
+      { id: 'table_cell', primitive: 'grid', label: '表セル', actionLabel: 'セルを対象にする' },
+    ],
   },
 ] as const;
 
@@ -428,13 +538,41 @@ export function getSelectorRegistration(kind: string): TargetSelectorRegistratio
 }
 
 /**
+ * Extracts supported UI-enabled `target_pin:<kind>` selector kinds from an
+ * `artifact_capabilities` operation list. Returns `undefined` when capabilities
+ * have not yet been loaded so callers can fall back to the static registry.
+ */
+export function extractSupportedSelectorKinds(
+  operations?: ReadonlyArray<{ operation: string; availability: string; scope?: string }> | null,
+  options?: { requireUiScope?: boolean },
+): TargetSelectorKind[] | undefined {
+  if (!operations) return undefined;
+  const requireUi = options?.requireUiScope ?? true;
+  const kinds: TargetSelectorKind[] = [];
+  for (const op of operations) {
+    if (!op.operation.startsWith('target_pin:')) continue;
+    if (op.availability !== 'supported') continue;
+    if (requireUi && op.scope !== undefined && op.scope !== 'mcp_and_ui') continue;
+    const kind = op.operation.slice('target_pin:'.length);
+    if (isRegisteredSelectorKind(kind)) kinds.push(kind);
+  }
+  return kinds;
+}
+
+/**
  * Returns the registered target selectors for a given format, honoring container
  * constraints (e.g. legacy `.ppt`/`.doc`/`.xls` files are not OOXML-resolvable,
  * and media files match only their `video` or `audio` previewKind).
  */
 export function getRegisteredSelectorsForFormat(
   format: string,
-  options?: { filename?: string; previewKind?: string },
+  options?: {
+    filename?: string;
+    previewKind?: string;
+    view?: TargetSelectorView;
+    uiOnly?: boolean;
+    allowedSelectorKinds?: readonly string[];
+  },
 ): TargetSelectorRegistration[] {
   if (format === 'binary') return [];
   const filename = options?.filename?.toLowerCase();
@@ -442,14 +580,47 @@ export function getRegisteredSelectorsForFormat(
     return [];
   }
   const previewKind = options?.previewKind;
+  const allowed = options?.allowedSelectorKinds ? new Set(options.allowedSelectorKinds) : null;
   return TARGET_SELECTOR_REGISTRY.filter((entry) => {
     if (entry.format !== format) return false;
     if (entry.previewKind && previewKind && entry.previewKind !== previewKind) return false;
     if (format === 'media' && previewKind !== undefined && previewKind !== 'video' && previewKind !== 'audio') {
       return false;
     }
+    if (options?.view && !entry.supportedViews.includes(options.view)) return false;
+    if (options?.uiOnly && !entry.uiAvailable) return false;
+    if (allowed && !allowed.has(entry.kind)) return false;
     return true;
   });
+}
+
+/**
+ * Returns the canonical UI selection modes for a format derived exclusively
+ * from `TARGET_SELECTOR_REGISTRY` (and optionally intersected with live
+ * `artifact_capabilities` selector operations).
+ */
+export function getRegisteredUiModesForFormat(
+  format: string,
+  options?: {
+    filename?: string;
+    previewKind?: string;
+    view?: TargetSelectorView;
+    allowedSelectorKinds?: readonly string[];
+    uiOnly?: boolean;
+  },
+): RegisteredUiMode[] {
+  const registrations = getRegisteredSelectorsForFormat(format, {
+    ...options,
+    uiOnly: options?.uiOnly ?? true,
+  });
+  return registrations.flatMap((reg) =>
+    reg.uiModes.map((mode) => ({
+      ...mode,
+      selectorKind: reg.kind,
+      format: reg.format,
+      supportedViews: reg.supportedViews,
+    })),
+  );
 }
 
 export function selectorMatchesRegisteredFormat(kind: string, format: string, previewKind?: string): boolean {

@@ -1,13 +1,12 @@
 import React from 'react';
-import { PinModeToolbar, type PinModeOption } from './PinModeToolbar';
-
-export type GridPinMode = 'range' | 'row' | 'col' | 'sheet';
+import type { RegisteredUiMode } from '../../../../../shared/target-selection-registry';
+import { PinModeToolbar } from './PinModeToolbar';
 
 export interface GridTargetControlProps {
-  /** Whether whole-sheet selection is registered (true for XLSX, false for CSV/TSV). */
-  allowSheet: boolean;
-  mode: GridPinMode;
-  onModeChange: (mode: GridPinMode) => void;
+  /** Registered grid selection modes derived from `shared/target-selection-registry.ts`. */
+  modes: readonly RegisteredUiMode[];
+  activeModeId: string;
+  onModeChange: (modeId: string) => void;
   /** Human-readable summary of the active selection (e.g. "A1:B3", "行 1–2", "列 A–B", "Sheet1"). */
   selectionSummary: string;
   disabled?: boolean;
@@ -16,36 +15,25 @@ export interface GridTargetControlProps {
 
 /**
  * Shared cell / row / column / sheet target selection control for XLSX and CSV/TSV.
+ * Modes and action labels are driven exclusively by the shared registry.
  */
 export const GridTargetControl: React.FC<GridTargetControlProps> = ({
-  allowSheet,
-  mode,
+  modes,
+  activeModeId,
   onModeChange,
   selectionSummary,
   disabled,
   onConfirm,
 }) => {
-  const options: PinModeOption<GridPinMode>[] = [
-    { id: 'range', label: 'セル範囲' },
-    { id: 'row', label: '行' },
-    { id: 'col', label: '列' },
-    ...(allowSheet ? [{ id: 'sheet' as const, label: 'シート全体' }] : []),
-  ];
-  const buttonLabel =
-    mode === 'row'
-      ? '行を対象にする'
-      : mode === 'col'
-        ? '列を対象にする'
-        : mode === 'sheet'
-          ? 'シートを対象にする'
-          : 'セルを対象にする';
+  const active = modes.find((m) => m.id === activeModeId) ?? modes[0];
+  if (!active) return null;
 
   return (
     <PinModeToolbar
       ariaLabel="表の対象指定"
       selectLabel="表の選択方法"
-      options={options}
-      value={mode}
+      options={modes}
+      value={active.id}
       onChange={onModeChange}
     >
       <button
@@ -55,7 +43,7 @@ export const GridTargetControl: React.FC<GridTargetControlProps> = ({
         title={selectionSummary}
         onClick={onConfirm}
       >
-        {buttonLabel}
+        {active.actionLabel ?? `${active.label}を対象にする`}
       </button>
     </PinModeToolbar>
   );
