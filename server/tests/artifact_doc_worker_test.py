@@ -100,6 +100,12 @@ class DocumentWorkerTest(unittest.TestCase):
         self.assertEqual(len(reopened.slides[1].shapes[0].shapes), 2)
         self.assertEqual(reopened.slides[1].shapes[0].shapes[0].left.pt, 20)
         self.assertEqual(reopened.slides[1].shapes[1].table.cell(0, 0).text, "After")
+        self.source.write_bytes(result)
+        slide_range = json.loads(self.run_worker("pptx", "range", range={"part": part}))
+        table = next(shape for shape in slide_range["shapes"] if "tableRows" in shape)
+        self.assertEqual(table["tableRows"], [[
+            {"text": "After", "editable": True}, {"text": "Value", "editable": True},
+        ]])
         self.assertEqual(reopened.slides[1].notes_slide.notes_text_frame.text, "Updated notes")
 
     def test_pptx_creates_notes_master_when_presentation_has_none(self):
@@ -110,6 +116,35 @@ class DocumentWorkerTest(unittest.TestCase):
             {"op": "pptx.set_notes", "slidePart": "ppt/slides/slide1.xml", "text": "Created"},
         ])
         self.assertEqual(Presentation(io.BytesIO(result)).slides[0].notes_slide.notes_text_frame.text, "Created")
+
+    def test_docx_basic_edit_preserves_long_paragraphs_and_native_cell_properties(self):
+        document = Document()
+        paragraph = document.add_paragraph()
+        for index in range(220):
+            paragraph.add_run(f"[{index}]").bold = index % 2 == 0
+        cell = document.add_table(rows=1, cols=1).cell(0, 0)
+        cell.paragraphs[0].add_run("Styled cell").italic = True
+        document.save(self.source)
+
+        blocks = json.loads(self.run_worker("docx", "range", range={"start": 0, "count": 2}))["blocks"]
+        self.assertTrue(blocks[0]["editableText"])
+        self.assertEqual(len(blocks[0]["uiRuns"]), 220)
+        self.assertTrue(blocks[1]["tableRows"][0][0]["editable"])
+        long_text = "a" * 21_000 + "\n" + "Last line"
+        specs = [{"originIndex": index, "text": run.text} for index, run in enumerate(paragraph.runs)]
+        specs[0]["text"] = long_text
+        result = self.run_worker("docx", "edit", operations=[
+            {"op": "docx.set_paragraph_text", "blockIndex": 0, "preserveRunProperties": True, "runs": specs},
+            {"op": "docx.set_table_cell", "blockIndex": 1, "row": 0, "column": 0,
+             "text": "Updated styled cell", "preserveCellProperties": True},
+        ])
+        edited = Document(io.BytesIO(result))
+        self.assertEqual(edited.paragraphs[0].runs[0].text, long_text)
+        self.assertEqual(len(edited.paragraphs[0].runs), 220)
+        self.assertTrue(edited.paragraphs[0].runs[0].bold)
+        run = edited.tables[0].cell(0, 0).paragraphs[0].runs[0]
+        self.assertEqual(run.text, "Updated styled cell")
+        self.assertTrue(run.italic)
 
     def test_docx_edits_word_parts_and_preserves_unrelated_xml(self):
         document = Document()
@@ -172,6 +207,26 @@ class DocumentWorkerTest(unittest.TestCase):
         self.assertEqual(reopened["Sheet"].auto_filter.filterColumn[0].filters.filter, ["Yes"])
         self.assertEqual(reopened["Sheet"].page_setup.orientation, "landscape")
         self.assertEqual(list(reopened.defined_names["ReportRange"].destinations), [("New worksheet", "$A$1:$A$2")])
+
+    def test_xlsx_edits_cells_on_a_sheet_created_in_the_same_revision(self):
+        workbook = Workbook()
+        workbook.active["A1"] = "Original"
+        workbook.save(self.source)
+        alias = "grid-structure:1"
+        edited = self.run_worker("xlsx", "edit", operations=[
+            {"op": "xlsx.add_sheet", "name": "Draft", "draftSheetKey": alias},
+            {"op": "xlsx.set_cell", "draftSheetKey": alias, "address": "A1", "value": "Existing"},
+            {"op": "xlsx.mutate_rows", "draftSheetKey": alias, "index": 1, "count": 1, "mode": "insert"},
+            {"op": "xlsx.set_cell", "draftSheetKey": alias, "address": "A1", "value": "Inserted"},
+            {"op": "xlsx.set_cell_style", "draftSheetKey": alias, "address": "A1", "italic": True},
+            {"op": "xlsx.rename_sheet", "draftSheetKey": alias, "name": "Completed"},
+        ])
+        reopened = load_workbook(io.BytesIO(edited))
+        self.assertEqual(reopened.sheetnames, ["Sheet", "Completed"])
+        self.assertEqual(reopened["Sheet"]["A1"].value, "Original")
+        self.assertEqual(reopened["Completed"]["A1"].value, "Inserted")
+        self.assertTrue(reopened["Completed"]["A1"].font.italic)
+        self.assertEqual(reopened["Completed"]["A2"].value, "Existing")
 
     def test_xlsx_renames_references_and_removes_an_empty_sheet(self):
         book = Workbook()
@@ -492,6 +547,85 @@ class DocumentWorkerTest(unittest.TestCase):
             with Image.open(io.BytesIO(self.run_worker("pdf", "render", pageIndex=0))) as page:
                 self.assertEqual(page.format, "PNG")
 
+    def test_pdf_reordering_preserves_catalog_and_page_references(self):
+        from pypdf import PdfWriter
+        from pypdf.annotations import Link
+        from pypdf.generic import ArrayObject, DictionaryObject, NameObject
+        from reportlab.pdfgen.canvas import Canvas
+
+        document = io.BytesIO()
+        canvas = Canvas(document)
+        canvas.drawString(100, 700, "First")
+        canvas.acroForm.textfield(name="memo", value="Keep me", x=100, y=600)
+        canvas.showPage()
+        canvas.drawString(100, 700, "Second")
+        canvas.showPage()
+        canvas.save()
+        writer = PdfWriter(clone_from=PdfReader(io.BytesIO(document.getvalue())))
+        writer.add_outline_item("First destination", 0)
+        writer.add_attachment("data.txt", b"Attachment")
+        writer.add_metadata({"/Title": "Document title"})
+        writer.add_annotation(0, Link(rect=(10, 10, 30, 30), target_page_index=1))
+        writer.root_object[NameObject("/OCProperties")] = DictionaryObject({
+            NameObject("/OCGs"): ArrayObject([]),
+            NameObject("/D"): DictionaryObject({NameObject("/BaseState"): NameObject("/ON")}),
+        })
+        writer.write(self.source)
+        before_png = self.run_worker("pdf", "render", pageIndex=1) if shutil.which("pdftoppm") else None
+        result = self.run_worker("pdf", "edit", operations=[
+            {"op": "pdf.reorder_pages", "order": [1, 0]},
+            {"op": "pdf.add_note", "pageIndex": 1, "rect": [40, 40, 60, 60], "text": "After reorder"},
+        ])
+        reordered = PdfReader(io.BytesIO(result))
+        self.assertIn("Second", reordered.pages[0].extract_text())
+        self.assertIn("First", reordered.pages[1].extract_text())
+        self.assertEqual(reordered.get_destination_page_number(reordered.outline[0]), 1)
+        annotations = [ref.get_object() for ref in reordered.pages[1]["/Annots"]]
+        link = next(annotation for annotation in annotations if annotation["/Subtype"] == "/Link")
+        self.assertEqual(link["/Dest"][0], reordered.pages[0].indirect_reference)
+        self.assertTrue(any(annotation.get("/Contents") == "After reorder" for annotation in annotations))
+        self.assertEqual(reordered.get_fields()["memo"]["/V"], "Keep me")
+        self.assertEqual(reordered.attachments["data.txt"], [b"Attachment"])
+        self.assertEqual(reordered.metadata.title, "Document title")
+        self.assertEqual(reordered.root_object["/OCProperties"]["/D"]["/BaseState"], "/ON")
+        if before_png is not None:
+            self.source.write_bytes(result)
+            after_png = self.run_worker("pdf", "render", pageIndex=0)
+            with Image.open(io.BytesIO(before_png)) as before, Image.open(io.BytesIO(after_png)) as after:
+                self.assertIsNone(ImageChops.difference(before, after).getbbox())
+
+    def test_xlsx_cell_input_preserves_explicit_text_and_rejects_precision_loss(self):
+        workbook = Workbook()
+        workbook.active["A1"] = "00123"
+        workbook.save(self.source)
+        sheet_part = "xl/worksheets/sheet1.xml"
+        result = self.run_worker("xlsx", "edit", operations=[
+            {"op": "xlsx.set_cell", "sheetPart": sheet_part, "address": "A1", "value": "9007199254740993"},
+            {"op": "xlsx.set_cell", "sheetPart": sheet_part, "address": "A2", "value": "00123"},
+            {"op": "xlsx.set_cell", "sheetPart": sheet_part, "address": "A3", "value": "1.2345e-12", "valueType": "number"},
+            {"op": "xlsx.set_cell", "sheetPart": sheet_part, "address": "A4", "value": False},
+            {"op": "xlsx.set_cell", "sheetPart": sheet_part, "address": "A5", "value": ""},
+            {"op": "xlsx.set_cell", "sheetPart": sheet_part, "address": "A6", "value": "1e17", "valueType": "number"},
+        ])
+        sheet = load_workbook(io.BytesIO(result)).active
+        self.assertEqual((sheet["A1"].data_type, sheet["A1"].value), ("s", "9007199254740993"))
+        self.assertEqual((sheet["A2"].data_type, sheet["A2"].value), ("s", "00123"))
+        self.assertEqual((sheet["A3"].data_type, sheet["A3"].value), ("n", 1.2345e-12))
+        self.assertEqual((sheet["A4"].data_type, sheet["A4"].value), ("b", False))
+        self.assertEqual((sheet["A5"].data_type, sheet["A5"].value), ("s", ""))
+        self.assertEqual((sheet["A6"].data_type, sheet["A6"].value), ("n", 1e17))
+        original = self.source.read_bytes()
+        for invalid_value in [
+            {"value": "9007199254740993", "valueType": "number"},
+            {"value": 100000000000000000},
+        ]:
+            with self.subTest(invalid_value=invalid_value), self.assertRaises(subprocess.CalledProcessError):
+                self.run_worker("xlsx", "edit", operations=[
+                    {"op": "xlsx.set_cell", "sheetPart": sheet_part, "address": "A1", **invalid_value},
+                ])
+            self.assertEqual(self.source.read_bytes(), original)
+            self.assertFalse(self.result.exists())
+
     def test_pdf_merges_source_pages_without_rewriting_sources(self):
         first = self.run_worker("pdf", "create", params={"pages": ["One"]})
         second = self.run_worker("pdf", "create", params={"pages": ["Two", "Three"]})
@@ -633,8 +767,7 @@ class DocumentWorkerTest(unittest.TestCase):
             {"op": "docx.set_paragraph_style", "blockIndex": 0, "alignment": "center", "spaceBeforePt": 12,
              "spaceAfterPt": 6, "backgroundColor": "EFF6FF", "borders": {"bottom": {"color": "2563EB", "sizePt": 1.5}}},
             {"op": "docx.set_run_style", "blockIndex": 0, "bold": True, "underline": "single", "highlight": "yellow", "fontSizePt": 13},
-            {"op": "docx.add_paragraph", "text": "Bullet item", "alignment": "left"},
-            {"op": "docx.set_list", "blockIndex": 2, "listType": "bullet", "level": 0},
+            {"op": "docx.add_paragraph", "text": "Numbered heading", "headingLevel": 4, "listType": "decimal"},
             {"op": "docx.set_table_cell", "blockIndex": 1, "row": 0, "column": 0, "text": "Updated Cell", "backgroundColor": "FEF3C7", "bold": True},
         ])
         reopened = Document(io.BytesIO(edited))
@@ -647,6 +780,11 @@ class DocumentWorkerTest(unittest.TestCase):
             self.assertIn("EFF6FF", doc_xml)
             self.assertIn("FEF3C7", doc_xml)
             self.assertIn("numPr", doc_xml)
+
+        self.source.write_bytes(edited)
+        result = json.loads(self.run_worker("docx", "range", range={"start": 2, "count": 1}))
+        block = result["blocks"][0]
+        self.assertEqual((block["text"], block["headingLevel"], block["listType"]), ("Numbered heading", 4, "decimal"))
 
     def test_xlsx_advanced_rich_cell_style_conditional_formats_validation_and_sheet_ops(self):
         wb = Workbook()
@@ -687,8 +825,12 @@ class DocumentWorkerTest(unittest.TestCase):
         self.assertGreaterEqual(len(cf_rules), 2)
         self.assertEqual({rule.type for rule in cf_rules}, {"cellIs", "dataBar"})
 
-        # General non-empty sheet removal on the duplicated sheet
         self.source.write_bytes(edited)
+        record = json.loads(self.run_worker("xlsx", "range", range={"sheetId": "1", "rangeA1": "A1"}))["cells"][0]
+        self.assertEqual({field: record[field] for field in ("bold", "fontColor", "backgroundColor", "horizontal")},
+                         {"bold": True, "fontColor": "#ffffff", "backgroundColor": "#1e3a8a", "horizontal": "center"})
+
+        # General non-empty sheet removal on the duplicated sheet
         after_rm = self.run_worker("xlsx", "edit", operations=[
             {"op": "xlsx.remove_sheet", "sheetId": 3},
         ])

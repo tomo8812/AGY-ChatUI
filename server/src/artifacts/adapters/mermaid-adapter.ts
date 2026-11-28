@@ -324,50 +324,17 @@ export class MermaidAdapter implements FormatAdapter {
 
   resolveTarget(buffer: Buffer, selector: TargetSelector, _meta: AdapterFileMeta): TargetResolutionResult {
     const text = buffer.toString('utf8');
-    if (selector.kind === 'mermaid_edge' || selector.kind === 'mermaid_group') {
-      const model = flowchartStructure(text);
-      if (selector.kind === 'mermaid_group') {
-        const found = model?.groups.filter(({ id }) => id === selector.groupId) ?? [];
-        if (!found.length) return { status: 'stale', reason: 'group_not_found' };
-        if (found.length !== 1 || selector.expectedGroupFingerprint !== found[0].fingerprint) {
-          return { status: 'needs_review', reason: 'group_changed' };
-        }
-        return { status: 'resolved', resolvedSnippet: text.slice(found[0].start, found[0].end) };
-      }
-      const found = model?.edges.filter(({ fromId, toId }) => fromId === selector.fromId && toId === selector.toId) ?? [];
-      const edge = typeof selector.edgeIndex === 'number' ? found[selector.edgeIndex] : found.length === 1 ? found[0] : undefined;
-      if (!found.length) return { status: 'stale', reason: 'edge_not_found' };
-      if (!edge || edge.fingerprint !== selector.expectedEdgeFingerprint) return { status: 'needs_review', reason: 'edge_changed' };
-      return { status: 'resolved', resolvedSnippet: text.slice(edge.statement.start, edge.statement.end) };
-    }
-
-    if (selector.kind === 'mermaid_node') {
-      const nodeId = String(selector.nodeId ?? '');
-      const expectedKind = selector.expectedNodeKind ? String(selector.expectedNodeKind) : null;
-      const expectedLabelHash = selector.expectedLabelHash ? String(selector.expectedLabelHash) : null;
-      const matches = parseMermaidNodes(text).filter((n) => n.id === nodeId);
-      if (matches.length === 0) return { status: 'stale', reason: 'node_not_found' };
-      const exact = matches.filter(
-        (n) => (!expectedKind || n.kind === expectedKind) && (!expectedLabelHash || n.labelHash === expectedLabelHash)
-      );
-      if (exact.length === 1) {
-        return {
-          status: 'resolved',
-          resolvedSnippet: `${exact[0].id}[${exact[0].label}]`,
-          resolvedRange: { startLine: exact[0].line, endLine: exact[0].line },
-        };
-      }
-      return { status: 'needs_review', reason: 'node_replaced_or_ambiguous' };
-    }
-
     if (selector.kind === 'mermaid_source_range') {
       return resolveTextSnippetByContext({
         text,
-        startLine: Number(selector.startLine ?? 1),
-        endLine: Number(selector.endLine ?? 1),
-        expectedSnippetHash: selector.expectedSnippetHash ? String(selector.expectedSnippetHash) : undefined,
-        contextBeforeHash: selector.contextBeforeHash ? String(selector.contextBeforeHash) : undefined,
-        contextAfterHash: selector.contextAfterHash ? String(selector.contextAfterHash) : undefined,
+        startLine: selector.startLine,
+        endLine: selector.endLine,
+        expectedSnippetHash: selector.expectedSnippetHash,
+        contextBeforeHash: selector.contextBeforeHash,
+        contextAfterHash: selector.contextAfterHash,
+        occurrenceIndex: selector.occurrenceIndex,
+        snippetHint: _meta.snippetHint,
+        requireOccurrenceIndex: true,
       });
     }
 

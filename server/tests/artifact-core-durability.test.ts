@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ArtifactService } from '../src/artifacts/artifact-service.js';
 import { ArtifactError } from '../src/artifacts/errors.js';
 import { ResourceGovernor } from '../src/artifacts/resource-governor.js';
@@ -88,6 +88,45 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
     expect(readRes.status).toBe(200);
     expect(readRes.data).toBe('# Initial\n');
     srv.ctx.artifactService.setSameFsCheckOverride(undefined);
+  });
+
+  it('recovers a retention-expired T6 event and preserves a T6 journal whose event was lost', async () => {
+    const srv = await createTestServer();
+    cleanups.push(srv.cleanup);
+    const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+    const chatId = (await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Outbox recovery' })).data.chat.id;
+    const { db, artifactService } = srv.ctx;
+    artifactService.commitFaultHook = stage => {
+      if (stage === 'after_T6') throw new Error('interrupted at T6');
+    };
+    for (const relPath of ['expired.txt', 'missing.txt']) {
+      await expect(artifactService.createArtifact({
+        userId, chatId, scopeKind: 'chat', relPath, actorKind: 'user', content: Buffer.from(relPath),
+      })).rejects.toThrow('interrupted at T6');
+    }
+    artifactService.commitFaultHook = undefined;
+    const journal = (relPath: string) => db.db.prepare(
+      'SELECT commit_id, sync_event_seq, state FROM artifact_commit_journal WHERE user_id = ? AND rel_path = ?',
+    ).get(userId, relPath);
+    const expired = journal('expired.txt')!;
+    const missing = journal('missing.txt')!;
+    db.db.prepare('DELETE FROM sync_events WHERE seq = ?').run(missing.sync_event_seq!);
+    db.db.exec('BEGIN IMMEDIATE;');
+    for (let i = 0; i < 2001; i++) {
+      db.insertSyncEventInTx({ userId, eventId: crypto.randomUUID(), type: 'test.retention', payload: {} });
+    }
+    db.db.exec('COMMIT;');
+    db.pruneSyncEvents(userId);
+    expect(db.db.prepare('SELECT 1 FROM sync_events WHERE seq = ?').get(expired.sync_event_seq!)).toBeUndefined();
+    expect(db.db.prepare('SELECT seq FROM artifact_commit_outbox_expirations WHERE commit_id = ?').get(expired.commit_id!))
+      .toMatchObject({ seq: expired.sync_event_seq });
+    const report = await artifactService.recoverOnStartup();
+    expect(report.commits).toMatchObject({ completedOutbox: 1, quarantined: 1 });
+    expect(journal('expired.txt')).toBeUndefined();
+    expect(journal('missing.txt')).toEqual(missing);
+    const retry = await artifactService.recoverOnStartup();
+    expect(retry.commits).toMatchObject({ completedOutbox: 0, quarantined: 1 });
+    expect(journal('missing.txt')).toEqual(missing);
   });
 
   it('ARCH-05: T1..T7 pre/post fault injection tests converge cleanly and idempotently for create & update across isolated and non-isolated modes', async () => {
@@ -610,8 +649,8 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
     expect(binPin.data.error).toBe('UNSUPPORTED_OPERATION');
 
     // Case 1 (PIN-02): Same-dimension different image -> needs_review
-    const imgBuf1 = Buffer.from('FAKE_PNG_1_SAME_LEN');
-    const imgBuf2 = Buffer.from('FAKE_PNG_2_SAME_LEN');
+    const imgBuf1 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==', 'base64');
+    const imgBuf2 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg+M/wHwAEAQH/cetH5QAAAABJRU5ErkJggg==', 'base64');
     const imgArt = await srv.ctx.artifactService.createArtifact({
       userId,
       scopeKind: 'chat',
@@ -621,14 +660,25 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       actorKind: 'user',
       actorId: userId,
     });
-    const imgReq = srv.ctx.editRequestService.createRequest({
-      userId,
-      chatId,
-      targetKind: 'artifact',
-      artifactId: imgArt.artifact.id,
-      selector: { kind: 'image_pin', xNorm: 0.5, yNorm: 0.5, expectedWidthPx: 100, expectedHeightPx: 100, expectedImageSha256: sha256(imgBuf1) },
-      instruction: 'brighten center',
+    const imageGeometry = { kind: 'image_pin', xNorm: 0.5, yNorm: 0.5 };
+    const { target: imageTarget } = await srv.ctx.artifactService.readRange(userId, imgArt.artifact.id, {
+      ...imageGeometry, targetMetadata: true,
     });
+    const { region, ...fingerprints } = imageTarget as Record<string, unknown>;
+    const imageSelector = { ...imageGeometry, ...fingerprints, baseRevision: 1 };
+    const render = vi.spyOn(srv.ctx.artifactService, 'renderPng').mockRejectedValue(new Error('no renderer'));
+    let imgReq;
+    try {
+      const input = { userId, chatId, targetKind: 'artifact' as const, artifactId: imgArt.artifact.id, instruction: 'brighten center' };
+      await expect(srv.ctx.editRequestService.createRequest({
+        ...input, selector: { ...imageSelector, expectedRegionSha256: sha256('wrong region') },
+      })).rejects.toMatchObject({ code: 'TARGET_CONTENT_DRIFT' });
+      imgReq = await srv.ctx.editRequestService.createRequest({ ...input, selector: imageSelector });
+      expect(imgReq.contentCoords).toEqual({ region });
+      expect(render).not.toHaveBeenCalled();
+    } finally {
+      render.mockRestore();
+    }
     await srv.ctx.artifactService.replaceArtifactBytes({
       userId,
       artifactId: imgArt.artifact.id,
@@ -639,7 +689,7 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       operationType: 'replace',
       operationSummary: 'replaced image',
     });
-    expect(srv.ctx.editRequestService.getRequest(userId, chatId, imgReq.id)!.status).toBe('needs_review');
+    await expect.poll(() => srv.ctx.editRequestService.getRequest(userId, chatId, imgReq.id)?.status, { timeout: 10_000 }).toBe('needs_review');
 
     // Case 2 (PIN-02): Same page count PDF page swap -> needs_review
     const pdfArt = await srv.ctx.artifactService.createArtifact({
@@ -651,12 +701,12 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       actorKind: 'user',
       actorId: userId,
     });
-    const pdfRes = srv.ctx.artifactService.resolveTargetOnArtifact(userId, pdfArt.artifact.id, {
+    const pdfRes = await srv.ctx.artifactService.resolveTargetOnArtifact(userId, pdfArt.artifact.id, {
       kind: 'pdf_page',
+      baseRevision: 1,
       pageIndex: 0,
       expectedPageCount: 2,
       expectedPageContentHash: sha256('old-page-0'),
-      _currentPageContentHash: sha256('swapped-page-1'),
     });
     expect(pdfRes.status).toBe('needs_review');
 
@@ -670,13 +720,13 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       actorKind: 'user',
       actorId: userId,
     });
-    const xlsxRes = srv.ctx.artifactService.resolveTargetOnArtifact(userId, xlsxArt.artifact.id, {
+    const xlsxRes = await srv.ctx.artifactService.resolveTargetOnArtifact(userId, xlsxArt.artifact.id, {
       kind: 'xlsx_range',
+      baseRevision: 1,
       sheetId: 'Sheet1',
       rangeA1: 'A1:B2',
-      expectedSheetStructHash: 'same',
+      expectedSheetStructHash: sha256('same'),
       expectedRangeValuesHash: sha256('10,20'),
-      _currentRangeValuesHash: sha256('20,10'),
     });
     expect(xlsxRes.status).toBe('needs_review');
     expect(xlsxRes.reason).toBe('TARGET_CONTENT_DRIFT');
@@ -703,11 +753,12 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       actorKind: 'user',
       actorId: userId,
     });
-    const svgRes = srv.ctx.artifactService.resolveTargetOnArtifact(userId, svgArt.artifact.id, {
-      kind: 'svg_element',
-      elementId: 'hero',
-      expectedTag: heroEl.tag,
-      expectedElementFingerprint: heroEl.fingerprint,
+    const svgRes = await srv.ctx.artifactService.resolveTargetOnArtifact(userId, svgArt.artifact.id, {
+      kind: 'svg_region',
+      baseRevision: 1,
+      rectViewBox: [0, 0, 50, 50],
+      expectedViewBox: '0 0 100 100',
+      expectedSvgSha256: svgArt.artifact.sha256,
     });
     expect(svgRes.status).toBe('needs_review');
 
@@ -729,10 +780,12 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       actorKind: 'user',
       actorId: userId,
     });
-    const dupRes = srv.ctx.artifactService.resolveTargetOnArtifact(userId, codeArt.artifact.id, {
+    const dupRes = await srv.ctx.artifactService.resolveTargetOnArtifact(userId, codeArt.artifact.id, {
       kind: 'code_line_range',
-      startLine: 1,
-      endLine: 1,
+      baseRevision: 1,
+      startLine: 2,
+      endLine: 2,
+      occurrenceIndex: 0,
       expectedSnippetHash: sha256('const dup = 1;'),
       contextBeforeHash: sha256('line0'),
       contextAfterHash: sha256('line2'),
@@ -766,13 +819,15 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
         },
       },
     });
-    const reqRich = srv.ctx.editRequestService.createRequest({
+    const reqRich = await srv.ctx.editRequestService.createRequest({
       userId,
       chatId,
       targetKind: 'rich_block',
       richBlockId: richCreated.block.id,
       selector: {
         kind: 'rich_repeat_item',
+        baseRevision: 1,
+        blockId: richCreated.block.id,
         repeatNodeId: 'rep-row',
         itemKey: 'r1',
         itemIndex: 0,
@@ -781,22 +836,14 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       },
       instruction: 'Highlight first item',
     });
-    // Key-based selector without itemIndex resolves cleanly when key + hash match and order is unchanged
-    const reqRichKeyOnly = srv.ctx.editRequestService.createRequest({
-      userId,
-      chatId,
-      targetKind: 'rich_block',
-      richBlockId: richCreated.block.id,
-      selector: {
-        kind: 'rich_repeat_item',
-        repeatNodeId: 'rep-row',
-        itemKey: 'r1',
-        expectedItemHash: sha256(JSON.stringify({ id: 'r1', name: 'First' })),
-        expectedListOrderHash: sha256(JSON.stringify(['r1', 'r2'])),
-      },
-      instruction: 'Check key-only item',
-    });
-    expect(srv.ctx.editRequestService.resolveRequestTarget(reqRichKeyOnly).status).toBe('resolved');
+    // An item key does not replace the mandatory position fingerprint.
+    const { itemIndex: _itemIndex, ...noIndex } = reqRich.selector;
+    await expect(srv.ctx.editRequestService.createRequest({
+      userId, chatId, targetKind: 'rich_block', richBlockId: richCreated.block.id, selector: noIndex, instruction: 'invalid',
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+    expect((await alice.request('POST', `/api/chats/${chatId}/edit-requests/send-batch`, {
+      requestIds: [reqRich.id], clientMessageId: crypto.randomUUID(),
+    })).status).toBe(200);
 
     // Swap array order r2, r1
     srv.ctx.richContentService.updateBlock({
@@ -811,20 +858,40 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
         ],
       },
     });
-    const richReRes = srv.ctx.editRequestService.resolveRequestTarget(reqRich);
+    const richReRes = await srv.ctx.editRequestService.resolveRequestTarget(reqRich);
     expect(richReRes.status).toBe('needs_review');
     expect(richReRes.orderChanged).toBe(true);
 
     // PIN-05 & PIN-06: getForAgent separates userInstruction vs untrustedTargetContent; markApplied ONLY transitions to applied_unverified
-    const agentPayload = srv.ctx.editRequestService.getForAgent(userId, chatId, reqRich.id);
+    const agentPayload = await srv.ctx.editRequestService.getForAgent(userId, chatId, reqRich.id);
     expect(agentPayload.userInstruction).toBe('Highlight first item');
     expect(agentPayload.untrustedTargetContent).toBeDefined();
 
+    const requests = srv.ctx.editRequestService;
+    expect(() => requests.markAppliedByAgent({ userId, chatId, requestId: reqRich.id, appliedRevision: 2 }))
+      .toThrow(expect.objectContaining({ code: 'EDIT_REQUEST_NOT_SENT' }));
+    const reconfirmed = await requests.reconfirmByUser({
+      userId, chatId, requestId: reqRich.id, newBaseRevision: 2,
+      newSelector: { ...reqRich.selector, baseRevision: 2, itemIndex: 1, expectedListOrderHash: sha256(JSON.stringify(['r2', 'r1'])) },
+    });
+    expect(reconfirmed.status).toBe('draft');
+    expect((await alice.request('POST', `/api/chats/${chatId}/edit-requests/send-batch`, {
+      requestIds: [reqRich.id], clientMessageId: crypto.randomUUID(),
+    })).status).toBe(200);
+
+    await requests.getForAgent(userId, chatId, reqRich.id);
+    const target = srv.ctx.richContentService.getBlock(userId, chatId, reqRich.richBlockId!)!;
+    requests.assertAgentMutation({ userId, chatId, targetKind: 'rich_block', targetId: target.id,
+      editRequestIds: [reqRich.id], expectedRevision: target.revision });
+    srv.ctx.richContentService.updateBlock({
+      userId, chatId, blockId: target.id, expectedRevision: target.revision,
+      actorKind: 'ai', actorId: userId, editRequestIds: [reqRich.id], title: 'Changed by the requested edit',
+    });
     const applied = srv.ctx.editRequestService.markAppliedByAgent({
       userId,
       chatId,
       requestId: reqRich.id,
-      appliedRevision: 2,
+      appliedRevision: target.revision + 1,
     });
     expect(applied.status).toBe('applied_unverified'); // NEVER auto-resolved!
 
@@ -834,7 +901,8 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
     );
     expect(userResolved.status).toBe(200);
     expect(userResolved.data.request.status).toBe('resolved');
-  });
+    await expect.poll(() => srv.ctx.db.getActiveRunForChat(userId, chatId), { timeout: 12_000 }).toBeNull();
+  }, 45_000);
 
   it('ARCH-08, ARCH-09 & Basic 8 Adapters: supports immutable revision Range serving, WS user_seq/pong/snapshot, and Pure-JS CRUD/verify/export', async () => {
     const srv = await createTestServer();

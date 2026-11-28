@@ -139,7 +139,6 @@ export async function syncWorkspaceChangesAsArtifacts(params: {
         messageId: params.messageId,
         runId: params.runId,
         diffPatch,
-        emitEvent: false,
       });
       registered.push(artifact);
     } catch (err) {

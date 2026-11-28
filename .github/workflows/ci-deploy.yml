@@ -8,6 +8,7 @@ on:
     branches:
       - main
       - feat/artifact-platform-pr1
+      - feat/artifact-platform-pr2
   workflow_dispatch:
     inputs:
       bump:
@@ -248,8 +249,39 @@ jobs:
       - name: Build web production bundle
         run: npm --workspace=web run build
 
+      - name: Prepare real document fixtures for browser integration
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice-calc libreoffice-impress libreoffice-writer poppler-utils
+          mkdir -p "${RUNNER_TEMP}/pr3a-runtime"
+          ln -s "${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}" "${RUNNER_TEMP}/pr3a-runtime/playwright"
+          python3 -m venv "${RUNNER_TEMP}/pr3a-runtime/venv"
+          "${RUNNER_TEMP}/pr3a-runtime/venv/bin/pip" install lxml openpyxl python-docx python-pptx pillow pypdf reportlab
+          "${RUNNER_TEMP}/pr3a-runtime/venv/bin/python" e2e/prototype/make-fixtures.py "${RUNNER_TEMP}/pr3a-fixtures"
+          echo "AGY_PR3A_RUNTIME_DIR=${RUNNER_TEMP}/pr3a-runtime" >> "$GITHUB_ENV"
+          echo "AGY_PR3A_FIXTURE_DIR=${RUNNER_TEMP}/pr3a-fixtures" >> "$GITHUB_ENV"
+
       - name: Run mechanical UI layout & zoom tests
         run: npm run test:ui
+
+      - name: Repeat PR3A real-file operations with Full Runtime
+        if: success() || failure()
+        env:
+          AGY_PR3A_PROFILE: full
+        run: npm run test:ui -- e2e/pr3a-real.spec.ts --output=test-results-full
+
+      - name: Upload PR3A browser captures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr3a-browser-captures
+          path: |
+            test-results/**/*.png
+            test-results/**/pr3a-evidence.json
+            test-results-full/**/*.png
+            test-results-full/**/pr3a-evidence.json
+          retention-days: 7
+          if-no-files-found: ignore
 
       - name: Upload Playwright report on failure
         if: failure()

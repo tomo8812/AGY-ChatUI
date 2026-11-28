@@ -58,7 +58,7 @@ function makeValidDoc(overrides: Partial<RichDocumentV1> = {}): RichDocumentV1 {
           id: 'svg-vis',
           type: 'svg_scene',
           viewBox: '0 0 200 100',
-          interactiveRole: 'interactive',
+          interactiveRole: 'diagram',
           elements: [
             {
               tag: 'rect',
@@ -449,7 +449,7 @@ describe('Lightweight Rich UI Core Security & Negative Self-Tests (NEG-06..NEG-0
           {
             id: 't1',
             type: 'text' as const,
-            text: `${tag}:${'A'.repeat(1800)}`,
+            content: `${tag}:${'A'.repeat(1800)}`,
           },
         ],
       },
@@ -496,4 +496,33 @@ describe('Lightweight Rich UI Core Security & Negative Self-Tests (NEG-06..NEG-0
     expect(revisions.length).toBeGreaterThanOrEqual(2);
     expect(srv.ctx.richContentService.getUserRichStorageBytes(aliceId)).toBeLessThanOrEqual(10 * 1024);
   });
+});
+
+it('rejects invalid literal and evaluated chart points, ambiguous sources and graph references', () => {
+  const doc = (root: unknown, state?: Record<string, unknown>, sources?: unknown[]) => ({ schemaVersion: 1, root, state, sources });
+  const chart = { id: 'chart', type: 'chart', chartType: 'bar', series: [{ key: 'price', label: 'Price', data: [1, null] }] };
+  const invalidPoint = [{ y: '1' }];
+  const dated = { ...chart, xAxis: { type: 'time' }, categories: ['2026-11-27'] };
+  expect(validateRichDocument(doc(chart)).valid).toBe(true);
+  expect(validateRichDocument(doc(dated)).valid).toBe(true);
+  expect(validateRichDocument(doc({ ...dated, categories: ['invalid date'] })).valid).toBe(false);
+  expect(validateRichDocument(doc({ ...dated, series: [{ ...chart.series[0], data: { expr: '$state.points' } }] },
+    { points: [{ x: 'invalid date', y: 4 }] })).valid).toBe(false);
+  expect(validateRichDocument(doc({ ...chart, series: [chart.series[0], chart.series[0]] })).valid).toBe(false);
+  expect(validateRichDocument(doc({ ...chart, series: [{ ...chart.series[0], data: invalidPoint }] })).valid).toBe(false);
+  expect(validateRichDocument(doc({ ...chart, series: [{ ...chart.series[0], data: { expr: '$state.points' } }] },
+    { points: invalidPoint })).valid).toBe(false);
+  expect(validateRichDocument(doc(chart, {}, [{ id: 'a', name: 'First' }, { id: 'a', name: 'Second' }])).valid).toBe(false);
+  expect(validateRichDocument(doc({ ...chart, series: [{ ...chart.series[0], sourceId: 'missing' }] })).valid).toBe(false);
+  const diagram = { id: 'd', type: 'node_edge_diagram', diagramLayout: 'dag_tb', nodes: [{ id: 'a', label: 'A' }], edges: [] };
+  expect(validateRichDocument(doc(diagram)).valid).toBe(true);
+  expect(validateRichDocument(doc({ ...diagram, edges: [{ from: 'a', to: 'unknown' }] })).valid).toBe(false);
+  expect(validateRichDocument(doc({ ...diagram, nodes: [...diagram.nodes, ...diagram.nodes] })).valid).toBe(false);
+});
+
+it('restricts editable drafts to a save action', () => {
+  const draft = { id: 'draft', type: 'editable_draft', bind: 'source', format: 'code', language: 'typescript' };
+  const doc = (saveAction: unknown) => ({ schemaVersion: 1, state: { source: 'const a = 1;' }, root: { ...draft, saveAction } });
+  expect(validateRichDocument(doc({ type: 'save_to_artifact', format: 'code', filenameExpr: "'a.ts'", contentExpr: '$state.source' })).valid).toBe(true);
+  expect(validateRichDocument(doc({ type: 'submit_to_chat', textExpr: '$state.source' })).valid).toBe(false);
 });

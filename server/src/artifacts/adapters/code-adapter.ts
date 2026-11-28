@@ -13,6 +13,7 @@ import type {
 } from '../types.js';
 import {
   resolveTextSnippetByContext,
+  isSha256,
   sha256Text,
   splitLines,
   type AdapterCapabilityContext,
@@ -177,33 +178,26 @@ export class CodeAdapter implements FormatAdapter {
   resolveTarget(buffer: Buffer, selector: TargetSelector, _meta: AdapterFileMeta): TargetResolutionResult {
     const text = buffer.toString('utf8');
     if (selector.kind === 'code_line_range' || selector.kind === 'code_char_range') {
+      const charRange = selector.kind === 'code_char_range';
+      const { startCol, endCol } = selector;
+      if (charRange && (typeof startCol !== 'number' || typeof endCol !== 'number' ||
+          !Number.isSafeInteger(startCol) || !Number.isSafeInteger(endCol) || startCol < 1 || endCol < 1 ||
+          (selector.startLine === selector.endLine && endCol <= startCol))) {
+        return { status: 'stale', reason: 'invalid_column_range' };
+      }
       return resolveTextSnippetByContext({
         text,
-        startLine: Number(selector.startLine ?? 1),
-        endLine: Number(selector.endLine ?? 1),
-        expectedSnippetHash: selector.expectedSnippetHash ? String(selector.expectedSnippetHash) : undefined,
-        contextBeforeHash: selector.contextBeforeHash ? String(selector.contextBeforeHash) : undefined,
-        contextAfterHash: selector.contextAfterHash ? String(selector.contextAfterHash) : undefined,
-        occurrenceIndex: selector.occurrenceIndex !== undefined ? Number(selector.occurrenceIndex) : undefined,
+        startLine: selector.startLine,
+        endLine: selector.endLine,
+        expectedSnippetHash: selector.expectedSnippetHash,
+        contextBeforeHash: selector.contextBeforeHash,
+        contextAfterHash: selector.contextAfterHash,
+        occurrenceIndex: selector.occurrenceIndex,
+        snippetHint: _meta.snippetHint,
+        requireOccurrenceIndex: true,
+        ...(charRange ? { startCol: startCol as number, endCol: endCol as number,
+          allowLegacyCharContext: selector.contextVersion !== 2 } : {}),
       });
-    }
-
-    if (selector.kind === 'code_symbol') {
-      const symbolName = String(selector.symbolName ?? '');
-      const expectedSigHash = selector.expectedSignatureHash ? String(selector.expectedSignatureHash) : '';
-      const lines = splitLines(text);
-      const matches: Array<{ line: number; text: string }> = [];
-      for (let i = 0; i < lines.length; i++) {
-        const m = /^\s*(?:export\s+)?(?:async\s+)?(function|class|interface|type|def|struct|fn)\s+([A-Za-z_][A-Za-z0-9_]*)/.exec(
-          lines[i]
-        );
-        if (m && m[2] === symbolName && (!expectedSigHash || sha256Text(lines[i].trim()) === expectedSigHash)) {
-          matches.push({ line: i + 1, text: lines[i] });
-        }
-      }
-      if (matches.length === 0) return { status: 'stale', reason: 'symbol_not_found' };
-      if (matches.length > 1) return { status: 'needs_review', reason: 'ambiguous_multiple_symbols' };
-      return { status: 'resolved', resolvedSnippet: matches[0].text, resolvedRange: { startLine: matches[0].line, endLine: matches[0].line } };
     }
 
     return { status: 'needs_review', reason: 'unsupported_selector_kind' };

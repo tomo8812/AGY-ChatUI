@@ -12,6 +12,18 @@ import { verifySvg } from './svg-verifier.js';
 
 import { editMarkup, elementMetadata, markupCapabilities, markupElements } from './markup-edit.js';
 
+// Child ordinals are zero-based, including the SVG root at [0].
+function svgStructuralPaths(elements: ReturnType<typeof markupElements>): number[][] {
+  const paths: number[][] = [];
+  const nextChild = new Map<number | null, number>();
+  for (const { index, parentIndex } of elements) {
+    const ordinal = nextChild.get(parentIndex) ?? 0;
+    paths[index] = [...(parentIndex === null ? [] : paths[parentIndex]), ordinal];
+    nextChild.set(parentIndex, ordinal + 1);
+  }
+  return paths;
+}
+
 export class SvgAdapter implements FormatAdapter {
   readonly format = 'svg' as const;
   readonly previewKind = 'svg' as const;
@@ -67,12 +79,13 @@ export class SvgAdapter implements FormatAdapter {
     } catch (error) {
       if (!(error instanceof ArtifactError)) throw error;
     }
+    const paths = svgStructuralPaths(elements);
     return {
       format: 'svg',
       viewBox: elements[0]?.attrs.viewBox ?? null,
       lineCount: splitLines(text).length,
       svgSha256: sha256Buffer(buffer),
-      elements: elementMetadata(elements),
+      elements: elementMetadata(elements).map(element => ({ ...element, structuralPath: paths[element.index] })),
     };
   }
 
@@ -119,44 +132,34 @@ export class SvgAdapter implements FormatAdapter {
 
   resolveTarget(buffer: Buffer, selector: TargetSelector, _meta: AdapterFileMeta): TargetResolutionResult {
     const text = buffer.toString('utf8');
-    if (selector.kind === 'svg_element') {
-      const elementId = selector.elementId ? String(selector.elementId) : null;
-      const expectedTag = selector.expectedTag ? String(selector.expectedTag) : null;
-      const expectedFp = selector.expectedElementFingerprint ? String(selector.expectedElementFingerprint) : null;
-      if (!elementId || !expectedFp) {
-        return { status: 'needs_review', reason: 'missing_element_fingerprint' };
-      }
-      let matches: ReturnType<typeof markupElements>;
+
+    if (selector.kind === 'svg_region') {
+      let viewBox: string | undefined;
       try {
-        matches = markupElements(text, 'svg').filter((el) => el.id === elementId);
+        viewBox = markupElements(text, 'svg')[0]?.attrs.viewBox;
       } catch (error) {
         if (!(error instanceof ArtifactError)) throw error;
         return { status: 'needs_review', reason: 'invalid_svg_structure' };
       }
-      if (matches.length === 0) {
-        return { status: 'stale', reason: 'element_not_found' };
-      }
-      if (matches.length > 1) {
-        return { status: 'needs_review', reason: 'duplicate_element_id' };
-      }
-      const el = matches[0];
-      // Check BOTH tag AND content/attribute fingerprint (PIN-02 case 4)
-      if ((expectedTag && el.tag !== expectedTag) || el.fingerprint !== expectedFp) {
-        return { status: 'needs_review', reason: 'element_replaced_or_modified' };
-      }
-      return { status: 'resolved', resolvedSnippet: text.slice(el.start, el.end) };
-    }
-
-    if (selector.kind === 'svg_region') {
-      const vbMatch = /viewBox\s*=\s*["']([^"']+)["']/i.exec(text);
-      const currentVb = vbMatch ? vbMatch[1] : '';
-      if (selector.expectedViewBox && currentVb !== String(selector.expectedViewBox)) {
+      if (!viewBox || viewBox !== selector.expectedViewBox) {
         return { status: 'needs_review', reason: 'viewbox_changed' };
       }
-      if (selector.expectedSvgSha256 && sha256Buffer(buffer) !== String(selector.expectedSvgSha256)) {
+      if (sha256Buffer(buffer) !== selector.expectedSvgSha256) {
         return { status: 'needs_review', reason: 'svg_content_changed' };
       }
-      return { status: 'resolved', resolvedCoords: { rectViewBox: selector.rectViewBox } };
+      const bounds = viewBox.trim().split(/[\s,]+/).map(Number);
+      const rect = selector.rectViewBox;
+      if (bounds.length !== 4 || !bounds.every(Number.isFinite) ||
+          !Array.isArray(rect) || rect.length !== 4 || !rect.every(Number.isFinite)) {
+        return { status: 'needs_review', reason: 'invalid_svg_region' };
+      }
+      const [left, top, spanX, spanY] = bounds;
+      const [x, y, width, height] = rect as number[];
+      if (spanX <= 0 || spanY <= 0 || width <= 0 || height <= 0 || x < left || y < top ||
+          x + width > left + spanX || y + height > top + spanY) {
+        return { status: 'needs_review', reason: 'svg_region_out_of_bounds' };
+      }
+      return { status: 'resolved', resolvedCoords: { rectViewBox: rect } };
     }
 
     return { status: 'needs_review', reason: 'unsupported_selector_kind' };

@@ -228,8 +228,9 @@ export class BuiltinArtifactMcpServer {
       }
     };
     const assertArtifact = (id: string) => {
-      if (this.db.getArtifact(userId, id)?.chatId !== chatId) {
-        throw new ArtifactError('NOT_FOUND', 'Artifact was not found in this chat.', 404);
+      const artifact = this.db.getArtifact(userId, id);
+      if (artifact?.scopeKind !== 'chat' || artifact.chatId !== chatId) {
+        throw new ArtifactError('FORBIDDEN', 'Artifact access is outside the MCP session scope.', 403);
       }
     };
     const tool = <T extends z.ZodRawShape>(
@@ -286,22 +287,30 @@ export class BuiltinArtifactMcpServer {
       assertArtifact(artifactId);
       return this.artifacts.readRange(userId, artifactId, range);
     });
-    tool('artifact_edit', 'Apply one operation to an artifact.', {
-      ...artifactId, expectedRevision: revision, operation, ...idempotencyKey,
-    }, ({ artifactId, expectedRevision, operation, idempotencyKey }, authorize) => {
-      assertArtifact(artifactId);
+    const editRequestIds = z.array(identifier).min(1).max(100)
+      .refine(ids => new Set(ids).size === ids.length).optional();
+    tool('artifact_edit', 'Apply one operation to an artifact. Include editRequestIds for requests read via edit_request_get.', {
+      ...artifactId, expectedRevision: revision, operation, ...idempotencyKey, editRequestIds,
+    }, ({ operation, ...input }, authorize) => {
+      assertArtifact(input.artifactId);
       return this.artifacts.editArtifact({
-        userId, ...actor, artifactId, expectedRevision, operations: [operation], idempotencyKey,
-        assertAuthorized: () => { authorize(); assertArtifact(artifactId); },
+        userId, ...actor, ...input, operations: [operation],
+        assertAuthorized: () => { authorize(); assertArtifact(input.artifactId); },
+        assertEditRequestsCurrent: () => this.editRequests.assertAgentMutation({
+          ...context, ...input, targetKind: 'artifact', targetId: input.artifactId,
+        }),
       });
     });
-    tool('artifact_batch_edit', 'Apply operations atomically as one revision.', {
-      ...artifactId, expectedRevision: revision, operations: z.array(operation).min(1).max(1000), ...idempotencyKey,
+    tool('artifact_batch_edit', 'Apply operations atomically as one revision. Include editRequestIds for submitted requests.', {
+      ...artifactId, expectedRevision: revision, operations: z.array(operation).min(1).max(1000), ...idempotencyKey, editRequestIds,
     }, (input, authorize) => {
       assertArtifact(input.artifactId);
       return this.artifacts.editArtifact({
         userId, ...actor, ...input,
         assertAuthorized: () => { authorize(); assertArtifact(input.artifactId); },
+        assertEditRequestsCurrent: () => this.editRequests.assertAgentMutation({
+          ...context, ...input, targetKind: 'artifact', targetId: input.artifactId,
+        }),
       });
     });
     tool('artifact_render', 'Get a PNG rendition of a page, slide, frame, table, or cropped region. PPTX can also render a background plate or an isolated transparent sprite for shapeId.', {
@@ -370,23 +379,17 @@ export class BuiltinArtifactMcpServer {
     });
 
     tool('edit_request_list', 'List submitted editing requests in this chat.', {}, () =>
-      this.editRequests.listRequests(userId, chatId).filter(({ status }) => status !== 'draft'));
-    tool('edit_request_get', 'Read a submitted editing request and its target.', requestId, ({ requestId }) => {
-      const { regionImagePngBase64, ...payload } = this.editRequests.getForAgent(userId, chatId, requestId);
-      if (payload.status === 'draft') throw new ArtifactError('NOT_FOUND', 'Editing request was not submitted.', 404);
+      this.editRequests.listRequests(userId, chatId).filter(({ batchId, sentMessageId }) => batchId !== null && sentMessageId !== null));
+    tool('edit_request_get', 'Read a submitted editing request and its target.', requestId, async ({ requestId }, authorize) => {
+      const { regionImagePngBase64, ...payload } = await this.editRequests.getForAgent(userId, chatId, requestId);
+      authorize();
       const content: CallToolResult['content'] = [{ type: 'text', text: JSON.stringify(payload) }];
       if (regionImagePngBase64) content.push({ type: 'image', mimeType: 'image/png', data: regionImagePngBase64 });
       return new ToolOutput(content);
     });
-    tool('edit_request_mark_applied', 'Mark a submitted request applied, pending user verification.', {
+    tool('edit_request_mark_applied', 'Mark the saved revision of a linked edit applied, pending user verification. Use the current target revision.', {
       ...requestId, appliedRevision: revision,
-    }, (input) => {
-      const request = this.editRequests.getRequest(userId, chatId, input.requestId);
-      if (!request || request.status !== 'sent') {
-        throw new ArtifactError('EDIT_REQUEST_NOT_SENT', 'Only submitted editing requests can be marked applied.', 409);
-      }
-      return this.editRequests.markAppliedByAgent({ ...context, ...input });
-    });
+    }, input => this.editRequests.markAppliedByAgent({ ...context, ...input }));
 
     tool('rich_capabilities', 'Get the rich content schema and limits.', {}, () => this.rich.getCapabilities());
     tool('rich_validate', 'Validate a rich document without writing it.', {
@@ -415,12 +418,15 @@ export class BuiltinArtifactMcpServer {
       document: z.unknown().optional(),
       patchNodes: z.array(z.object({ nodeId: identifier, replacement: object })).max(100).optional(),
       patchState: object.optional(),
-      title: z.string().max(256).optional(),
-    }, ({ patchNodes, patchState, ...input }) => this.rich.updateBlock({
+      title: z.string().max(256).optional(), editRequestIds,
+    }, ({ patchNodes, patchState, ...input }) => {
+      this.editRequests.assertAgentMutation({ ...context, ...input, targetKind: 'rich_block', targetId: input.blockId });
+      return this.rich.updateBlock({
       ...context, ...actor, ...input,
       patchNodes: patchNodes?.map(({ nodeId, replacement }) => ({ nodeId, replacement: replacement as unknown as RichNode })),
-      patchState: patchState as Record<string, RichStateValue> | undefined,
-    }));
+        patchState: patchState as Record<string, RichStateValue> | undefined,
+      });
+    });
     tool('rich_save_as_artifact', 'Save a rich block as an artifact in this chat.', {
       ...blockId, ...idempotencyKey, filename: z.string().min(1).max(255),
       format: z.enum(['svg', 'md', 'txt', 'csv', 'json', 'code']), content: z.string().optional(),

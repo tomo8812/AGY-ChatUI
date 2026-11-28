@@ -1,3 +1,4 @@
+import { mapRichNodeChildren } from './rich-node-tree.js';
 import crypto from 'node:crypto';
 import type {
   RichBindingState,
@@ -6,6 +7,7 @@ import type {
   RichNode,
   RichStateValue,
 } from '../../../shared/rich-schema.js';
+import { getRegisteredSelectorsForFormat } from '../../../shared/target-selection-registry.js';
 import type { AppConfig } from '../config.js';
 import type { AppDatabase } from '../db/database.js';
 import type { SyncHub } from '../sync/hub.js';
@@ -14,6 +16,9 @@ import { RICH_PERMITTED_FUNCTIONS } from './rich-expr-evaluator.js';
 import {
   RICH_LIMITS,
   validateRichDocument,
+  mergeRichState,
+  compileRichDynamicPlan,
+  evaluateRichDynamicState,
   validateSafeFilename,
   type RichValidationResult,
 } from './rich-validator.js';
@@ -47,6 +52,22 @@ export interface RichArtifactSaveGateway {
 }
 
 export class RichContentService {
+  private readonly targetChangeListeners = new Set<(block: RichBlockRecord) => void>();
+
+  onTargetChanged(listener: (block: RichBlockRecord) => void): void {
+    this.targetChangeListeners.add(listener);
+  }
+
+  private notifyTargetChanged(block: RichBlockRecord): void {
+    for (const listener of this.targetChangeListeners) {
+      try {
+        listener(block);
+      } catch (error) {
+        console.error('Rich block edit-request revalidation failed', error);
+      }
+    }
+  }
+
   constructor(
     private readonly config: AppConfig,
     private readonly db: AppDatabase,
@@ -128,10 +149,11 @@ export class RichContentService {
         'submit_to_chat',
         'start_pin_edit',
       ],
+      targetSelectors: getRegisteredSelectorsForFormat('rich_block').map((entry) => entry.kind),
     };
   }
 
-  private getAuthorizedArtifactIds(userId: string, chatId: string): Set<string> {
+  getAuthorizedArtifactIds(userId: string, chatId: string): Set<string> {
     const list = this.db.listArtifactsForChat(userId, chatId);
     return new Set(list.map((a) => a.id));
   }
@@ -448,6 +470,7 @@ export class RichContentService {
     title?: string;
     actorKind?: 'user' | 'ai' | 'system';
     actorId?: string | null;
+    editRequestIds?: string[];
     operationSummary?: string;
   }): { block: RichBlockRecord; validation: RichValidationResult } {
     this.assertChatOwner(params.userId, params.chatId);
@@ -480,26 +503,14 @@ export class RichContentService {
             replacedIds.add(node.id);
             return replaceMap.get(node.id)!;
           }
-          const copy = { ...node } as Record<string, unknown>;
-          if (Array.isArray(copy.children)) {
-            copy.children = (copy.children as RichNode[]).map(replaceNode);
-          }
-          if (node.type === 'card') {
-            if (node.headerAction) copy.headerAction = replaceNode(node.headerAction);
-            if (node.footer) copy.footer = replaceNode(node.footer);
-          }
-          if (node.type === 'tabs') {
-            copy.items = node.items.map((it) => ({ ...it, content: it.content.map(replaceNode) }));
-          }
-          if (node.type === 'popover' || node.type === 'tooltip') {
-            copy.trigger = replaceNode(node.trigger);
-            if (Array.isArray(node.content)) {
-              copy.content = node.content.map(replaceNode);
-            }
-          }
-          return copy as unknown as RichNode;
+          return mapRichNodeChildren(node, replaceNode);
         };
-        cloned.root = replaceNode(cloned.root);
+        try {
+          cloned.root = replaceNode(cloned.root);
+        } catch (error) {
+          if (error instanceof TypeError) throw new RichContentError('RICH_INVALID_SCHEMA', error.message, 400);
+          throw error;
+        }
         for (const reqId of replaceMap.keys()) {
           if (!replacedIds.has(reqId)) {
             throw new RichContentError('RICH_NODE_NOT_FOUND', `Target node '${reqId}' not found.`, 404);
@@ -588,8 +599,8 @@ export class RichContentService {
         .prepare(
           `INSERT INTO rich_block_revisions (
              id, rich_block_id, user_id, chat_id, revision, schema_version, document_json,
-             actor_kind, actor_id, operation_summary, created_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+             actor_kind, actor_id, operation_summary, edit_request_ids_json, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           crypto.randomUUID(),
@@ -602,6 +613,7 @@ export class RichContentService {
           params.actorKind ?? 'ai',
           params.actorId ?? null,
           params.operationSummary ?? 'update',
+          JSON.stringify(params.editRequestIds ?? []),
           now
         );
 
@@ -624,6 +636,7 @@ export class RichContentService {
 
     const block = this.getBlock(params.userId, params.chatId, current.id)!;
     this.hub.broadcastPersistedEvent(envelope);
+    this.notifyTargetChanged(block);
     return { block, validation };
   }
 
@@ -631,26 +644,39 @@ export class RichContentService {
     userId: string,
     chatId: string,
     blockId: string,
-    uiState: Record<string, RichStateValue>
+    uiState: Record<string, unknown>,
+    theme: 'light' | 'dark' = 'light',
+    expectedRevision?: number,
   ): RichBlockRecord {
+    const current = this.getBlock(userId, chatId, blockId);
+    if (!current) throw new RichContentError('NOT_FOUND', 'リッチブロックが見つかりません。', 404);
+    if (expectedRevision !== undefined && current.revision !== expectedRevision) {
+      throw new RichContentError('RICH_BLOCK_CONFLICT', 'リッチブロックの版が競合しています。', 409);
+    }
+    const state = mergeRichState(current.document.state, uiState);
+    const evaluation = evaluateRichDynamicState(compileRichDynamicPlan(current.document, undefined), {
+      state, theme, authorizedArtifactIds: this.getAuthorizedArtifactIds(userId, chatId),
+    });
+    if (!evaluation.valid) {
+      throw new RichContentError(evaluation.primaryErrorCode ?? 'RICH_INVALID_STATE',
+        evaluation.issues[0]?.message ?? 'Invalid rich state.', evaluation.statusCode, { issues: evaluation.issues });
+    }
     const serialized = JSON.stringify(uiState);
     const newUiBytes = Buffer.byteLength(serialized, 'utf8');
-    if (newUiBytes > RICH_LIMITS.maxStateBytes) {
-      throw new RichContentError('RICH_STATE_TOO_LARGE', 'UI状態スナップショットが128KB上限を超えています。', 422);
-    }
     const now = Date.now();
     this.db.db.exec('BEGIN IMMEDIATE;');
     try {
       const row = this.db.db
         .prepare(
-          `SELECT COALESCE(LENGTH(CAST(ui_state_snapshot_json AS BLOB)), 0) AS prev_ui_bytes
+          `SELECT revision, COALESCE(LENGTH(CAST(ui_state_snapshot_json AS BLOB)), 0) AS prev_ui_bytes
            FROM rich_blocks
            WHERE id = ? AND user_id = ? AND chat_id = ?`
         )
-        .get(blockId, userId, chatId) as { prev_ui_bytes: number } | undefined;
+        .get(blockId, userId, chatId) as { revision: number; prev_ui_bytes: number } | undefined;
       if (!row) {
         throw new RichContentError('NOT_FOUND', 'リッチブロックが見つかりません。', 404);
       }
+      if (row.revision !== current.revision) throw new RichContentError('RICH_BLOCK_CONFLICT', 'Concurrent update conflict.', 409);
       this.assertUserQuotaDelta(userId, newUiBytes - Number(row.prev_ui_bytes ?? 0));
       this.db.db
         .prepare('UPDATE rich_blocks SET ui_state_snapshot_json = ?, updated_at = ? WHERE id = ? AND user_id = ? AND chat_id = ?')

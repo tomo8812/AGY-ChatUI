@@ -236,6 +236,7 @@ export class AppDatabase {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_runs_chat_created ON runs(chat_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_runs_active_user_chat ON runs(user_id, chat_id, created_at) WHERE status IN ('queued', 'running', 'awaiting_permission');
 
       CREATE TABLE IF NOT EXISTS pending_permissions (
         id TEXT PRIMARY KEY,
@@ -410,6 +411,14 @@ export class AppDatabase {
         updated_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS artifact_commit_outbox_expirations (
+        commit_id TEXT NOT NULL REFERENCES artifact_commit_journal(commit_id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        event_id TEXT NOT NULL,
+        expired_at INTEGER NOT NULL,
+        PRIMARY KEY (commit_id, seq)
+      );
+
       CREATE TABLE IF NOT EXISTS artifact_dep_propagation_queue (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
@@ -480,6 +489,7 @@ export class AppDatabase {
         batch_id TEXT REFERENCES ai_edit_request_batches(batch_id) ON DELETE SET NULL,
         sent_message_id TEXT,
         applied_revision INTEGER,
+        sort_order INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -823,6 +833,15 @@ export class AppDatabase {
       }
     }
 
+    const editRequestColumns = this.db.prepare('PRAGMA table_info(ai_edit_requests)').all();
+    if (!editRequestColumns.some(column => column.name === 'agent_base_revision')) {
+      this.db.exec('ALTER TABLE ai_edit_requests ADD COLUMN agent_base_revision INTEGER');
+    }
+    const richRevisionColumns = this.db.prepare('PRAGMA table_info(rich_block_revisions)').all();
+    if (!richRevisionColumns.some(column => column.name === 'edit_request_ids_json')) {
+      this.db.exec("ALTER TABLE rich_block_revisions ADD COLUMN edit_request_ids_json TEXT NOT NULL DEFAULT '[]'");
+    }
+
     // Add sync_events.user_seq if absent and backfill monotonically per user
     const syncCols = this.db.prepare('PRAGMA table_info(sync_events)').all() as Array<{ name: string }>;
     if (!syncCols.some((col) => col.name === 'user_seq')) {
@@ -866,6 +885,44 @@ export class AppDatabase {
     if (!journalCols.some((col) => col.name === 'staging_isolation_mode')) {
       this.db.exec('ALTER TABLE artifact_commit_journal ADD COLUMN staging_isolation_mode TEXT;');
     }
+    if (!journalCols.some((col) => col.name === 'finalization_json')) {
+      this.db.exec('ALTER TABLE artifact_commit_journal ADD COLUMN finalization_json TEXT;');
+    }
+    const provenanceCols = this.db.prepare('PRAGMA table_info(artifacts)').all();
+    if (!provenanceCols.some(col => col.name === 'deleted_source_artifact_id')) {
+      this.db.exec(`
+        BEGIN IMMEDIATE;
+        ALTER TABLE artifacts ADD COLUMN deleted_source_artifact_id TEXT;
+        ALTER TABLE artifacts ADD COLUMN deleted_source_base_revision INTEGER;
+        COMMIT;
+      `);
+    }
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS preserve_artifact_source_before_delete
+      BEFORE DELETE ON artifacts
+      BEGIN
+        UPDATE artifacts
+        SET deleted_source_artifact_id = OLD.id,
+            deleted_source_base_revision = source_base_revision,
+            source_artifact_id = NULL,
+            source_base_revision = NULL
+        WHERE source_artifact_id = OLD.id AND user_id = OLD.user_id;
+      END;
+    `);
+    const requestCols = this.db.prepare('PRAGMA table_info(ai_edit_requests)').all();
+    if (!requestCols.some(col => col.name === 'sort_order')) {
+      this.db.exec(`
+        BEGIN IMMEDIATE;
+        ALTER TABLE ai_edit_requests ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;
+        WITH ranked AS (
+          SELECT id, ROW_NUMBER() OVER (PARTITION BY user_id, chat_id ORDER BY created_at, id) AS position
+          FROM ai_edit_requests
+        )
+        UPDATE ai_edit_requests SET sort_order = (SELECT position FROM ranked WHERE ranked.id = ai_edit_requests.id);
+        COMMIT;
+      `);
+    }
+
   }
 
   recoverInterruptedRuns(): void {
@@ -1762,7 +1819,7 @@ export class AppDatabase {
       .prepare(
         `SELECT * FROM runs
          WHERE chat_id = ? AND user_id = ? AND status IN ('queued', 'running', 'awaiting_permission')
-         ORDER BY CASE WHEN status IN ('running', 'awaiting_permission') THEN 0 ELSE 1 END ASC, created_at ASC LIMIT 1`
+         ORDER BY CASE WHEN status IN ('running', 'awaiting_permission') THEN 0 ELSE 1 END ASC, created_at ASC, id ASC LIMIT 1`
       )
       .get(chatId, userId) as Record<string, unknown> | undefined;
     return row ? this.mapRun(row) : null;
@@ -2231,10 +2288,8 @@ export class AppDatabase {
       deletedOnDisk: Boolean(r.deleted_on_disk),
       revision: r.revision !== undefined && r.revision !== null ? Number(r.revision) : 1,
       dependencyManifestHash: r.dependency_manifest_hash ? String(r.dependency_manifest_hash) : null,
-      sourceArtifactId: r.source_artifact_id ? String(r.source_artifact_id) : null,
-      sourceBaseRevision: r.source_base_revision !== undefined && r.source_base_revision !== null
-        ? Number(r.source_base_revision)
-        : null,
+      sourceArtifactId: (r.source_artifact_id ?? r.deleted_source_artifact_id ?? null) as string | null,
+      sourceBaseRevision: (r.source_base_revision ?? r.deleted_source_base_revision ?? null) as number | null,
       createdAt: Number(r.created_at),
       updatedAt: Number(r.updated_at),
     };
@@ -2428,19 +2483,7 @@ export class AppDatabase {
         now
       );
 
-    // Prune older events for this user beyond the most recent 2000 rows to bound disk usage
     const seq = Number(res.lastInsertRowid);
-    if (userSeq % 100 === 0) {
-      this.db
-        .prepare(
-          `DELETE FROM sync_events
-           WHERE user_id = ? AND user_seq < COALESCE(
-             (SELECT user_seq FROM sync_events WHERE user_id = ? ORDER BY user_seq DESC LIMIT 1 OFFSET 2000),
-             0
-           )`
-        )
-        .run(params.userId, params.userId);
-    }
 
     return {
       seq,
@@ -2454,6 +2497,44 @@ export class AppDatabase {
       payload: params.payload,
       createdAt: now,
     };
+  }
+
+  pruneSyncEvents(userId: string): void {
+    const ownTransaction = !this.db.isTransaction;
+    if (ownTransaction) this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const cutoff = this.db.prepare(
+        'SELECT user_seq FROM sync_events WHERE user_id = ? ORDER BY user_seq DESC LIMIT 1 OFFSET 2000',
+      ).get(userId)?.user_seq;
+      if (typeof cutoff === 'number') {
+        // Old journals carry no event IDs, so their replay range stays retained
+        // until recovery can inspect it. New journals record exact expirations.
+        this.db.prepare(`
+          INSERT OR IGNORE INTO artifact_commit_outbox_expirations (commit_id, seq, event_id, expired_at)
+          SELECT journal.commit_id, event.seq, event.event_id, ?
+          FROM artifact_commit_journal journal
+          JOIN json_each(CASE WHEN json_valid(journal.audit_note) THEN journal.audit_note ELSE '{}' END, '$.syncEvents') ref
+          JOIN sync_events event
+            ON event.seq = json_extract(CASE WHEN ref.type = 'object' THEN ref.value END, '$.seq')
+           AND event.event_id = json_extract(CASE WHEN ref.type = 'object' THEN ref.value END, '$.eventId')
+           AND event.user_id = journal.user_id AND event.chat_id IS journal.chat_id AND event.project_id IS journal.project_id
+          WHERE journal.user_id = ? AND journal.state = 'db_committed' AND event.user_seq < ?
+        `).run(Date.now(), userId, cutoff);
+        this.db.prepare(`
+          DELETE FROM sync_events
+          WHERE user_id = ? AND user_seq < ? AND seq < COALESCE(
+            (SELECT MIN(sync_event_seq) FROM artifact_commit_journal
+             WHERE user_id = ? AND state = 'db_committed' AND
+               json_type(CASE WHEN json_valid(audit_note) THEN audit_note ELSE '{}' END, '$.syncEvents') IS NOT 'array'),
+            9223372036854775807
+          )
+        `).run(userId, cutoff, userId);
+      }
+      if (ownTransaction) this.db.exec('COMMIT;');
+    } catch (error) {
+      if (ownTransaction) this.db.exec('ROLLBACK;');
+      throw error;
+    }
   }
 
   appendSyncEvent(params: {
@@ -2573,13 +2654,7 @@ export class AppDatabase {
   /**
    * Single read transaction returning consistent snapshotUserSeq and entity state for full WS resync.
    */
-  getSyncSnapshot(userId: string): {
-    snapshotUserSeq: number;
-    latestSeq: number;
-    projects: Array<ProjectRecord & { files: ProjectFileRecord[] }>;
-    chats: ChatRecord[];
-    artifacts: ArtifactRecord[];
-  } {
+  getSyncSnapshot(userId: string, activeChatId?: string) {
     this.db.exec('BEGIN;');
     try {
       const snapshotUserSeq = this.getLatestUserSyncSeq(userId);
@@ -2588,13 +2663,40 @@ export class AppDatabase {
         ...p,
         files: this.listProjectFiles(userId, p.id),
       }));
-      const chats = this.listChats(userId);
+      // Select one active run per chat in a single query. Keep the exact
+      // running/permission-before-queued ordering of getActiveRunForChat.
+      const activeRunRows = this.db.prepare(
+        `SELECT * FROM (
+           SELECT runs.*, ROW_NUMBER() OVER (
+             PARTITION BY chat_id ORDER BY
+             CASE WHEN status IN ('running', 'awaiting_permission') THEN 0 ELSE 1 END,
+             created_at, id
+           ) AS active_rank
+           FROM runs WHERE user_id = ? AND status IN ('queued', 'running', 'awaiting_permission')
+         ) WHERE active_rank = 1`
+      ).all(userId) as Array<Record<string, unknown>>;
+      const activeRuns = new Map(activeRunRows.map(row => [String(row.chat_id), this.mapRun(row)]));
+      const chats = this.listChats(userId).map(chat => ({
+        ...chat, activeRun: activeRuns.get(chat.id) ?? null,
+      }));
+      const activeChat = activeChatId ? this.getChat(userId, activeChatId) : null;
+      const activeChatDetail = activeChat ? {
+        chat: activeChat,
+        messages: this.listMessages(userId, activeChat.id),
+        artifacts: this.listArtifactsForChat(userId, activeChat.id),
+        pendingPermissions: this.listPendingPermissionsForChat(userId, activeChat.id),
+        pendingElicitations: this.listPendingElicitationsForChat(userId, activeChat.id),
+        activeRun: activeRuns.get(activeChat.id) ?? null,
+        project: activeChat.projectId ? this.getProject(userId, activeChat.projectId) : null,
+      } : null;
+      const agyProfile = this.getAgyProfile(userId);
+      const preferences = this.getPreferences(userId);
       const artRows = this.db
         .prepare("SELECT * FROM artifacts WHERE user_id = ? AND lifecycle_state = 'active' ORDER BY updated_at DESC")
         .all(userId) as Array<Record<string, unknown>>;
       const artifacts = artRows.map((r) => this.mapArtifact(r));
       this.db.exec('COMMIT;');
-      return { snapshotUserSeq, latestSeq, projects, chats, artifacts };
+      return { snapshotUserSeq, latestSeq, projects, chats, artifacts, activeChatDetail, agyProfile, preferences };
     } catch (err) {
       this.db.exec('ROLLBACK;');
       throw err;

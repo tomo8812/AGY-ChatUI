@@ -141,7 +141,16 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
   app.get('/api/sync/snapshot', async (req, reply) => {
     const session = requireAuth(req, reply, db);
     if (!session) return;
-    return db.getSyncSnapshot(session.user.id);
+    const { chatId } = req.query as { chatId?: string };
+    const snapshot = db.getSyncSnapshot(session.user.id, chatId);
+    return {
+      ...snapshot,
+      loginFlow: agyAuth.getFlowState(session.user.id),
+      quota: quotaService.getCachedOrUnavailable(session.user.id),
+      sessionOptions: snapshot.activeChatDetail
+        ? acp.peekSessionOptions(session.user.id, snapshot.activeChatDetail.chat.id)
+        : null,
+    };
   });
 
   const sharedRouteDeps = {
@@ -159,7 +168,7 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
   await registerChatRoutes(app, { ...sharedRouteDeps, acp, scheduler, skillService });
   await registerFileRoutes(app, sharedRouteDeps);
   await registerRichRoutes(app, { ...sharedRouteDeps, richContentService });
-  await registerEditRequestRoutes(app, { ...sharedRouteDeps, editRequestService });
+  await registerEditRequestRoutes(app, { ...sharedRouteDeps, editRequestService, scheduler });
   await registerQuotaRoutes(app, { ...sharedRouteDeps, quotaService });
   await registerNotificationRoutes(app, { ...sharedRouteDeps, pushService });
   await registerSkillRoutes(app, { ...sharedRouteDeps, skillService, acp });

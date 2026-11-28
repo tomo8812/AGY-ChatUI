@@ -24,6 +24,9 @@ export default defineConfig({
         ...devices['Desktop Chrome'],
         browserName: 'chromium',
         viewport: { width: 1280, height: 720 },
+        ...(process.env.PLAYWRIGHT_EXECUTABLE_PATH
+          ? { launchOptions: { executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH } }
+          : {}),
       },
     },
     {
@@ -37,10 +40,15 @@ export default defineConfig({
       },
     },
   ],
-  webServer: {
+  webServer: [{
     command: 'npm --workspace=web run preview -- --host 127.0.0.1 --port 4173 --strictPort',
     url: 'http://127.0.0.1:4173',
     reuseExistingServer: !process.env.CI,
     timeout: 30_000,
-  },
+  }, {
+    command: 'npm exec --workspace=web -- vite --config ../e2e/prototype/vite.config.ts',
+    url: 'http://127.0.0.1:4174',
+    reuseExistingServer: !process.env.CI,
+    timeout: 30_000,
+  }],
 });

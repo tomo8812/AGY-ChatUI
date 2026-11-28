@@ -197,7 +197,7 @@ export class DocWorkerSandbox {
       );
     }
 
-    return this.governor.runWithBudget(req.kind, async () => {
+    return this.governor.runWithBudget(req.kind, async (checkMemoryBeforeSpawn) => {
       const workRoot = fs.mkdtempSync(path.join(os.tmpdir(), `agy-doc-worker-${crypto.randomUUID().slice(0, 8)}-`));
       const inputDir = path.join(workRoot, 'in');
       const outputDir = path.join(workRoot, 'out');
@@ -260,6 +260,7 @@ export class DocWorkerSandbox {
           }
         }
 
+        await checkMemoryBeforeSpawn();
         const result = await new Promise<{ exitCode: number; signal: NodeJS.Signals | null; stdout: string; stderr: string }>(
           (resolve, reject) => {
             const child = spawn(spawnCmd, spawnArgs, {

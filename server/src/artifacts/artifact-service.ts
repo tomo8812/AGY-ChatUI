@@ -1,3 +1,9 @@
+import { provePdfRotationScope, replayPdfRotation } from './adapters/pdf-history.js';
+import { proveOfficeEditScope, replayOfficeEdit } from './adapters/ooxml-target.js';
+import { pointRegionPt, validateRegionPng } from './region-png.js';
+import { getTargetInspectionChannelForRequest } from '../../../shared/target-selection-registry.js';
+import { selectorIsAvailable, selectorMatchesFormat, selectorsForFormat, targetSelectorSchema } from './target-selector-schema.js';
+import { inspectArtifactTarget } from './target-inspection.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -40,13 +46,14 @@ import {
   type DocumentVerifyOptions,
 } from './document-worker.js';
 import { detectArtifactFormat, documentFormatConstraint, DOCUMENT_ACTIONS, FormatAdapterRegistry } from './adapters/registry.js';
+import { replayCsvCellEdit } from './adapters/csv-adapter.js';
 import { codeVerificationChecks } from './adapters/code-adapter.js';
 import { HTML_VERIFICATION_CHECKS } from './adapters/html-validator.js';
 import { SVG_VERIFICATION_CHECKS } from './adapters/svg-verifier.js';
 import { MAX_TEXT_VERIFY_BYTES, MAX_VERIFY_NODES, skippedTextVerification, textVerificationReport } from './adapters/text-verification.js';
 import { executeRestoreBundle, getRestoreBatchRecord, recoverPendingRestoreBatches } from './batch-restore.js';
 import { PerUserBlobManager, type BlobLease } from './blob-store.js';
-import { recoverPendingCommits, type DeleteTargetInspection, type RecoveryReport } from './commit-recovery.js';
+import { recoverPendingCommits, removeStageAndSync, type DeleteTargetInspection, type RecoveryReport } from './commit-recovery.js';
 import { scanArtifactDependencies } from './dependency-manifest.js';
 import { drainDepPropagationQueue } from './dep-propagation.js';
 import { artifactConflictError, ArtifactError, unsupportedOperationError } from './errors.js';
@@ -62,6 +69,7 @@ import type {
   AdapterVerifyResult,
   ArtifactCapabilitiesResponse,
   ArtifactCommitJournalRow,
+  CommitFinalization,
   ArtifactDependencyEntry,
   ArtifactRestoreBatchRecord,
   ArtifactRevisionRecord,
@@ -438,18 +446,39 @@ export class ArtifactService {
     return this.db.getArtifact(artifact.userId, artifact.id) ?? artifact;
   }
 
+  private hasUnresolvedFileCommit(artifact: Pick<ArtifactRecord, 'userId' | 'scopeKind' | 'chatId' | 'projectId' | 'relPath'>): boolean {
+    return Boolean(this.db.db.prepare(`
+      SELECT 1 FROM artifact_commit_journal
+      WHERE user_id = ? AND scope_kind = ? AND chat_id IS ? AND project_id IS ?
+        AND (rel_path = ? OR ? = '' OR (operation_type IN ('delete_chat', 'delete_project') AND rel_path = ''))
+        AND (state IN ('prepared', 'replacing', 'file_replaced')
+             OR (state IN ('aborted', 'ambiguous_quarantined') AND audit_note LIKE '{"recoveryCleanup":%'))
+    `).get(artifact.userId, artifact.scopeKind, artifact.chatId, artifact.projectId, artifact.relPath, artifact.relPath));
+  }
+
   private recordExternalSyncOnRecovery(params: {
     userId: string;
     artifactId: string;
     rootDir: string;
     relPath: string;
+    strict?: boolean;
   }): boolean {
     const artifact = this.db.getArtifact(params.userId, params.artifactId);
-    if (!artifact) return false;
+    if (!artifact || (!params.strict && this.hasUnresolvedFileCommit(artifact))) return false;
 
     const now = Date.now();
+    let read: ReturnType<typeof readContainedRegularFileNoFollowStable>;
     try {
-      const read = readContainedRegularFileNoFollowStable(params.rootDir, params.relPath);
+      read = readContainedRegularFileNoFollowStable(params.rootDir, params.relPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        if (params.strict) throw err;
+        return false;
+      }
+      return this.recordExternalDeletion(artifact, now);
+    }
+
+    try {
       const depScan = !path.isAbsolute(params.relPath)
         ? scanArtifactDependencies({
             rootDir: params.rootDir,
@@ -460,7 +489,7 @@ export class ArtifactService {
         : { deps: [], depBuffers: new Map<string, Buffer>(), manifestHash: null };
 
       if (
-        read.sha256 === artifact.sha256 &&
+        !artifact.deletedOnDisk && read.sha256 === artifact.sha256 &&
         read.sizeBytes === artifact.sizeBytes &&
         depScan.manifestHash === artifact.dependencyManifestHash
       ) {
@@ -552,14 +581,57 @@ export class ArtifactService {
         for (const l of leases) l.release();
       }
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        // File disappeared on disk -> mark deleted_on_disk = 1
-        this.db.db
-          .prepare('UPDATE artifacts SET deleted_on_disk = 1, updated_at = ? WHERE id = ? AND user_id = ?')
-          .run(now, artifact.id, params.userId);
-      }
+      if (params.strict) throw err;
       return false;
     }
+  }
+
+  private recordExternalDeletion(artifact: ArtifactRecord, now: number): boolean {
+    if (artifact.deletedOnDisk) return false;
+    let envelope: SyncEventEnvelope;
+    this.db.db.exec('BEGIN IMMEDIATE;');
+    try {
+      this.db.db.prepare('UPDATE artifacts SET deleted_on_disk = 1, updated_at = ? WHERE id = ? AND user_id = ?')
+        .run(now, artifact.id, artifact.userId);
+      envelope = this.db.insertSyncEventInTx({
+        userId: artifact.userId, eventId: crypto.randomUUID(), type: 'artifact.updated',
+        chatId: artifact.chatId, projectId: artifact.projectId,
+        payload: { artifact: this.db.getArtifact(artifact.userId, artifact.id), reason: 'external_sync' },
+        createdAt: now,
+      });
+      this.db.db.exec('COMMIT;');
+    } catch (error) {
+      this.db.db.exec('ROLLBACK;');
+      throw error;
+    }
+    this.hub.broadcastPersistedEvent(envelope);
+    return true;
+  }
+
+  private inImmediateTransaction<T>(run: () => T): T {
+    this.db.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const result = run();
+      this.db.db.exec('COMMIT;');
+      return result;
+    } catch (error) {
+      this.db.db.exec('ROLLBACK;');
+      throw error;
+    }
+  }
+
+  private updateReflectedWorkingCopyInTx(original: ArtifactRecord, workingCopyId: string, now: number) {
+    const changed = this.db.db.prepare(`
+      UPDATE artifacts SET source_base_revision = ?, updated_at = ?
+      WHERE id = ? AND user_id = ? AND scope_kind = 'chat' AND lifecycle_state = 'active'
+        AND source_artifact_id = ? AND source_base_revision IS NOT ?
+    `).run(original.revision, now, workingCopyId, original.userId, original.id, original.revision);
+    if (Number(changed.changes) === 0) return null;
+    const artifact = this.db.getArtifact(original.userId, workingCopyId)!;
+    return this.db.insertSyncEventInTx({
+      userId: original.userId, eventId: crypto.randomUUID(), type: 'artifact.updated', chatId: artifact.chatId,
+      payload: { artifact }, createdAt: now,
+    });
   }
 
   /**
@@ -567,30 +639,23 @@ export class ArtifactService {
    */
   private finalizeStageT6InTx(
     journal: ArtifactCommitJournalRow,
-    opts: {
-      suppressDependencyPropagation?: boolean;
-      extraArtifactFields?: {
-        filename?: string;
-        mimeType?: string;
-        previewKind?: ArtifactRecord['previewKind'];
-        source?: ArtifactRecord['source'];
-        messageId?: string | null;
-        runId?: string | null;
-        sourceArtifactId?: string | null;
-        sourceBaseRevision?: number | null;
-      };
-      idempotencyResponseBuilder?: (artifact: ArtifactRecord) => unknown;
-      updateWorkingCopyId?: string;
-    } = {}
+    opts: { suppressDependencyPropagation?: boolean } = {}
   ): { artifact: ArtifactRecord; envelopes: SyncEventEnvelope[] } {
+    const fields = journal.finalization;
     const now = Date.now();
     const existing = this.db.getArtifactInternal(journal.artifactId);
-    const filename = opts.extraArtifactFields?.filename ?? existing?.filename ?? path.basename(journal.relPath);
-    const detected = detectMimeAndPreviewKind(filename, opts.extraArtifactFields?.mimeType ?? existing?.mimeType);
-    const mimeType = opts.extraArtifactFields?.mimeType ?? existing?.mimeType ?? detected.mimeType;
-    const previewKind = opts.extraArtifactFields?.previewKind ?? existing?.previewKind ?? detected.previewKind;
+    if ((!journal.isCreate && (!existing || existing.lifecycleState !== 'active' || existing.revision !== journal.parentRevision)) ||
+        (existing && (existing.userId !== journal.userId || existing.chatId !== journal.chatId ||
+          existing.projectId !== journal.projectId || existing.relPath !== journal.relPath ||
+          (journal.isCreate && existing.lifecycleState !== 'pending_create')))) {
+      throw artifactConflictError('保存元の版を確認できません。', { artifactId: journal.artifactId });
+    }
+    const filename = fields?.filename ?? existing?.filename ?? path.basename(journal.relPath);
+    const detected = detectMimeAndPreviewKind(filename, fields?.mimeType ?? existing?.mimeType);
+    const mimeType = fields?.mimeType ?? existing?.mimeType ?? detected.mimeType;
+    const previewKind = fields?.previewKind ?? existing?.previewKind ?? detected.previewKind;
     const source =
-      opts.extraArtifactFields?.source ??
+      fields?.source ??
       existing?.source ??
       (journal.scopeKind === 'project' ? 'project_upload' : 'user_edit');
 
@@ -625,11 +690,11 @@ export class ArtifactService {
           mimeType,
           previewKind,
           source,
-          opts.extraArtifactFields?.messageId ?? null,
-          opts.extraArtifactFields?.runId ?? null,
+          fields?.messageId ?? null,
+          fields?.runId ?? null,
           journal.diffPatch,
-          opts.extraArtifactFields?.sourceArtifactId ?? null,
-          opts.extraArtifactFields?.sourceBaseRevision ?? null,
+          fields?.sourceArtifactId ?? null,
+          fields?.sourceBaseRevision ?? null,
           now,
           journal.artifactId,
           journal.userId
@@ -650,8 +715,8 @@ export class ArtifactService {
           journal.scopeKind,
           journal.chatId,
           journal.projectId,
-          opts.extraArtifactFields?.messageId ?? null,
-          opts.extraArtifactFields?.runId ?? null,
+          fields?.messageId ?? null,
+          fields?.runId ?? null,
           journal.relPath,
           filename,
           mimeType,
@@ -662,8 +727,8 @@ export class ArtifactService {
           journal.diffPatch,
           journal.targetRevision,
           journal.newDependencyManifestHash,
-          opts.extraArtifactFields?.sourceArtifactId ?? null,
-          opts.extraArtifactFields?.sourceBaseRevision ?? null,
+          fields?.sourceArtifactId ?? null,
+          fields?.sourceBaseRevision ?? null,
           now,
           now
         );
@@ -727,7 +792,7 @@ export class ArtifactService {
     }
 
     // Enqueue persistent dependency propagation unless suppressed by batch restore
-    if (!opts.suppressDependencyPropagation) {
+    if (!(fields?.suppressDependencyPropagation ?? opts.suppressDependencyPropagation)) {
       this.db.db
         .prepare(
           `INSERT INTO artifact_dep_propagation_queue (
@@ -773,12 +838,9 @@ export class ArtifactService {
         },
         now
       );
-      if (opts.updateWorkingCopyId) {
-        this.db.db
-          .prepare(
-            'UPDATE artifacts SET source_base_revision = ?, updated_at = ? WHERE id = ? AND user_id = ?'
-          )
-          .run(artifact.revision, now, opts.updateWorkingCopyId, journal.userId);
+      if (fields?.updateWorkingCopyId) {
+        const event = this.updateReflectedWorkingCopyInTx(artifact, fields.updateWorkingCopyId, now);
+        if (event) envelopes.push(event);
       }
       const latestProj = this.db.getProject(journal.userId, journal.projectId);
       if (latestProj) {
@@ -815,10 +877,11 @@ export class ArtifactService {
 
     // Finalize idempotency row inside same tx
     if (journal.idempotencyScopeKey && journal.idempotencyKey) {
-      const respObj = opts.idempotencyResponseBuilder
-        ? opts.idempotencyResponseBuilder(artifact)
-        : { artifact, noOp: false };
-      this.db.db
+      const respObj = { artifact, noOp: false,
+        ...(journal.operationType === 'edit' || journal.operationType === 'batch_edit'
+          ? { summary: fields?.responseSummary ?? journal.operationSummary } : {}),
+      };
+      const completed = this.db.db
         .prepare(
           `UPDATE artifact_idempotency
            SET status = 'completed',
@@ -828,7 +891,8 @@ export class ArtifactService {
                no_op = 0,
                response_json = ?,
                updated_at = ?
-           WHERE user_id = ? AND scope_key = ? AND idempotency_key = ?`
+           WHERE user_id = ? AND scope_key = ? AND idempotency_key = ?
+             AND status = 'in_progress' AND commit_id = ? AND request_fingerprint IS ?`
         )
         .run(
           journal.commitId,
@@ -838,8 +902,13 @@ export class ArtifactService {
           now,
           journal.userId,
           journal.idempotencyScopeKey,
-          journal.idempotencyKey
+          journal.idempotencyKey,
+          journal.commitId,
+          journal.requestFingerprint
         );
+      if (Number(completed.changes) !== 1) {
+        throw new ArtifactError('ARTIFACT_CONFLICT', '保存結果と冪等要求の対応を確認できません。', 409);
+      }
     }
 
     // Atomically mark batch restore item committed inside the exact same Stage T6 transaction (ARCH-04 / ARCH-07)
@@ -867,10 +936,10 @@ export class ArtifactService {
     this.db.db
       .prepare(
         `UPDATE artifact_commit_journal
-         SET state = 'db_committed', sync_event_seq = ?, updated_at = ?
+         SET state = 'db_committed', sync_event_seq = ?, audit_note = ?, updated_at = ?
          WHERE commit_id = ?`
       )
-      .run(artEnvelope.seq, now, journal.commitId);
+      .run(envelopes[0].seq, JSON.stringify({ syncEvents: envelopes.map(({ seq, eventId }) => ({ seq, eventId })) }), now, journal.commitId);
 
     return { artifact, envelopes };
   }
@@ -902,6 +971,7 @@ export class ArtifactService {
     actorId: string | null;
     operationType: string;
     operationSummary: string;
+    responseSummary?: string;
     operationPayload?: Record<string, unknown> | null;
     batchId?: string | null;
     batchSeq?: number | null;
@@ -917,6 +987,9 @@ export class ArtifactService {
     assertAuthorizedBeforeCommit: () => void | Promise<void>;
   }): Promise<{ artifact: ArtifactRecord; noOp: boolean }> {
     const normalizedRel = normalizeRelPath(params.relPath);
+    if (this.hasUnresolvedFileCommit({ ...params, relPath: normalizedRel })) {
+      throw new ArtifactError('IDEMPOTENCY_IN_PROGRESS', '前回の保存処理の復旧が完了していません。', 409);
+    }
     const stagingDir = this.blobManager.getUserStagingDir(params.userId);
     this.assertSameFilesystem(stagingDir, params.rootDir);
     const stagingIsolation = this.getStagingIsolation();
@@ -936,7 +1009,38 @@ export class ArtifactService {
       newSha256 === params.expectedPrevSha256 &&
       depScan.manifestHash === params.prevDepHash
     ) {
-      const current = this.db.getArtifact(params.userId, params.artifactId)!;
+      await params.assertAuthorizedBeforeCommit();
+      const current = this.db.getArtifact(params.userId, params.artifactId);
+      if (!current || current.revision !== params.parentRevision || !params.expectedPrevFingerprint) {
+        throw artifactConflictError('保存対象の版が変更されました。', { artifactId: params.artifactId });
+      }
+      const latest = readContainedRegularFileNoFollowStable(params.rootDir, normalizedRel);
+      if (latest.sha256 !== newSha256 || !fingerprintsMatch(latest.fingerprint, params.expectedPrevFingerprint)) {
+        throw new ExternalConcurrentWriteError('保存直前にファイルの外部変更を検出しました。');
+      }
+      if (params.sourceArtifactId && params.sourceBaseRevision != null &&
+          (current.sourceArtifactId !== params.sourceArtifactId || current.sourceBaseRevision !== params.sourceBaseRevision)) {
+        const updated = this.inImmediateTransaction(() => {
+          const now = Date.now();
+          this.db.db.prepare(`
+            UPDATE artifacts SET source_artifact_id = ?, source_base_revision = ?, updated_at = ?
+            WHERE id = ? AND user_id = ?
+          `).run(params.sourceArtifactId!, params.sourceBaseRevision!, now, current.id, params.userId);
+          const artifact = this.db.getArtifact(params.userId, current.id)!;
+          const event = this.db.insertSyncEventInTx({
+            userId: params.userId, eventId: crypto.randomUUID(), type: 'artifact.updated', chatId: artifact.chatId,
+            projectId: artifact.projectId, payload: { artifact }, createdAt: now,
+          });
+          return { artifact, event };
+        });
+        this.hub.broadcastPersistedEvent(updated.event);
+        return { artifact: updated.artifact, noOp: true };
+      }
+      if (params.updateWorkingCopyId) {
+        const workingCopyId = params.updateWorkingCopyId;
+        const event = this.inImmediateTransaction(() => this.updateReflectedWorkingCopyInTx(current, workingCopyId, Date.now()));
+        if (event) this.hub.broadcastPersistedEvent(event);
+      }
       if (params.batchId) {
         this.db.db.exec('BEGIN IMMEDIATE;');
         try {
@@ -966,6 +1070,14 @@ export class ArtifactService {
       return { artifact: current, noOp: true };
     }
 
+    const finalization: CommitFinalization = {
+      filename: params.filename, mimeType: params.mimeType, previewKind: params.previewKind,
+      source: params.source, messageId: params.messageId, runId: params.runId,
+      sourceArtifactId: params.sourceArtifactId, sourceBaseRevision: params.sourceBaseRevision,
+      updateWorkingCopyId: params.updateWorkingCopyId,
+      responseSummary: params.responseSummary,
+      suppressDependencyPropagation: params.suppressDependencyPropagation,
+    };
     const diffPatch = maybeTextDiff(normalizedRel, params.prevBuffer, params.newBuffer);
     const commitId = crypto.randomUUID();
     const privateStagePath = path.join(stagingDir, `${commitId}.stage`);
@@ -979,7 +1091,6 @@ export class ArtifactService {
     };
 
     const leases: BlobLease[] = [];
-    let stageFileCreated = false;
     let journalInserted = false;
 
     try {
@@ -1046,8 +1157,8 @@ export class ArtifactService {
                actor_kind, actor_id, operation_type, operation_summary, operation_payload_json,
                batch_id, batch_seq, staging_isolation_mode,
                idempotency_scope_key, idempotency_key, request_fingerprint, diff_patch,
-               state, audit_note, sync_event_seq, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', NULL, NULL, ?, ?)`
+               state, audit_note, sync_event_seq, created_at, updated_at, finalization_json
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', NULL, NULL, ?, ?, ?)`
           )
           .run(
             commitId,
@@ -1082,17 +1193,23 @@ export class ArtifactService {
             params.requestFingerprint ?? null,
             diffPatch,
             t1Now,
-            t1Now
+            t1Now,
+            JSON.stringify(finalization)
           );
 
         if (params.idempotencyScopeKey && params.idempotencyKey) {
-          this.db.db
+          const linked = this.db.db
             .prepare(
               `UPDATE artifact_idempotency
                SET commit_id = ?, updated_at = ?
-               WHERE user_id = ? AND scope_key = ? AND idempotency_key = ?`
+               WHERE user_id = ? AND scope_key = ? AND idempotency_key = ?
+                 AND status = 'in_progress' AND commit_id IS NULL AND server_boot_id = ? AND request_fingerprint IS ?`
             )
-            .run(commitId, t1Now, params.userId, params.idempotencyScopeKey, params.idempotencyKey);
+            .run(commitId, t1Now, params.userId, params.idempotencyScopeKey, params.idempotencyKey,
+              this.idempotency.serverBootId, params.requestFingerprint ?? null);
+          if (Number(linked.changes) !== 1) {
+            throw new ArtifactError('IDEMPOTENCY_IN_PROGRESS', '冪等要求を保存処理に関連付けられません。', 409);
+          }
         }
 
         this.db.db.exec('COMMIT;');
@@ -1118,7 +1235,6 @@ export class ArtifactService {
         fs.fsyncSync(stageFd);
         const st = fs.fstatSync(stageFd, { bigint: true });
         stageIno = st.ino.toString();
-        stageFileCreated = true;
       } finally {
         fs.closeSync(stageFd);
       }
@@ -1199,11 +1315,9 @@ export class ArtifactService {
             );
           }
           fs.unlinkSync(privateStagePath);
-          stageFileCreated = false;
           fsyncDir(stagingDir);
         } else {
           fs.renameSync(privateStagePath, verifiedTargetViaProc);
-          stageFileCreated = false;
           fs.fsyncSync(dirFd);
           fsyncDir(stagingDir);
           if (stagingIsolation === 'non_isolated_same_uid') {
@@ -1240,6 +1354,7 @@ export class ArtifactService {
       // ---- T6: Single BEGIN IMMEDIATE transaction committing DB + revisions + deps + idempotency + outbox + batch item ----
       const journalObj: ArtifactCommitJournalRow = {
         commitId,
+        finalization,
         artifactId: params.artifactId,
         userId: params.userId,
         chatId: params.chatId,
@@ -1282,20 +1397,7 @@ export class ArtifactService {
       let envelopes: SyncEventEnvelope[] = [];
       this.db.db.exec('BEGIN IMMEDIATE;');
       try {
-        const res = this.finalizeStageT6InTx(journalObj, {
-          suppressDependencyPropagation: params.suppressDependencyPropagation,
-          extraArtifactFields: {
-            filename: params.filename,
-            mimeType: params.mimeType,
-            previewKind: params.previewKind,
-            source: params.source,
-            messageId: params.messageId,
-            runId: params.runId,
-            sourceArtifactId: params.sourceArtifactId,
-            sourceBaseRevision: params.sourceBaseRevision,
-          },
-          updateWorkingCopyId: params.updateWorkingCopyId,
-        });
+        const res = this.finalizeStageT6InTx(journalObj);
         committedArtifact = res.artifact;
         envelopes = res.envelopes;
         this.db.db.exec('COMMIT;');
@@ -1324,13 +1426,6 @@ export class ArtifactService {
           .prepare('SELECT state FROM artifact_commit_journal WHERE commit_id = ?')
           .get(commitId) as { state: string } | undefined;
         if (row?.state === 'prepared') {
-          if (stageFileCreated) {
-            try {
-              fs.unlinkSync(privateStagePath);
-            } catch {
-              // ignore
-            }
-          }
           this.db.db.exec('BEGIN IMMEDIATE;');
           try {
             if (params.isCreate) {
@@ -1338,12 +1433,23 @@ export class ArtifactService {
                 .prepare("DELETE FROM artifacts WHERE id = ? AND lifecycle_state = 'pending_create'")
                 .run(params.artifactId);
             }
-            this.db.db
-              .prepare("UPDATE artifact_commit_journal SET state = 'aborted', updated_at = ? WHERE commit_id = ?")
-              .run(Date.now(), commitId);
+            this.db.db.prepare("UPDATE artifact_commit_journal SET state = 'aborted', audit_note = ?, updated_at = ? WHERE commit_id = ?")
+              .run(JSON.stringify({ recoveryCleanup: 'aborted_before_replace', needsExternalSync: false }), Date.now(), commitId);
             this.db.db.exec('COMMIT;');
           } catch {
             this.db.db.exec('ROLLBACK;');
+            throw err;
+          }
+          try {
+            removeStageAndSync(privateStagePath);
+            this.inImmediateTransaction(() => {
+              this.db.db.prepare('DELETE FROM artifact_idempotency WHERE user_id = ? AND commit_id = ?')
+                .run(params.userId, commitId);
+              this.db.db.prepare('UPDATE artifact_commit_journal SET audit_note = ? WHERE commit_id = ?')
+                .run('aborted_before_replace', commitId);
+            });
+          } catch {
+            // Startup can finish the durably recorded cleanup.
           }
         }
       }
@@ -1466,6 +1572,7 @@ export class ArtifactService {
     const scopeKey = `create:${params.scopeKind}:${scopeId}`;
 
     const reverifyAuth = async () => {
+      await params.assertAuthorized?.();
       const rootDir = this.resolveScopeRootDir(
         params.userId,
         params.scopeKind,
@@ -1475,7 +1582,6 @@ export class ArtifactService {
       if (!rootDir) {
         throw new ArtifactError('NOT_FOUND', '対象のチャットまたはプロジェクトが見つからないか権限がありません。', 404);
       }
-      await params.assertAuthorized?.();
     };
 
     const adapter = this.registry.resolve(filename, detected.previewKind);
@@ -1508,7 +1614,10 @@ export class ArtifactService {
       reverifyAuth,
       run: async () => {
         const pathLockKey = `path:${params.userId}:${params.scopeKind}:${scopeId}:${relPath}`;
-        const out = await this.lockManager.withLock(pathLockKey, async () => {
+        const out = await this.lockManager.withLocks([
+          pathLockKey,
+          ...(params.sourceArtifactId ? [`artifact:${params.sourceArtifactId}`] : []),
+        ], async () => {
           const rootDir = this.resolveScopeRootDir(
             params.userId,
             params.scopeKind,
@@ -1612,7 +1721,6 @@ export class ArtifactService {
     diffPatch?: string | null;
     sourceArtifactId?: string | null;
     sourceBaseRevision?: number | null;
-    emitEvent?: boolean;
   }): Promise<{ artifact: ArtifactRecord; created: boolean; changed: boolean }> {
     const pathLockKey = `path:${params.userId}:chat:${params.chatId}:${params.relPath}`;
 
@@ -1789,17 +1897,15 @@ export class ArtifactService {
             }
           }
 
-          if (params.emitEvent) {
-            envelope = this.db.insertSyncEventInTx({
-              userId: params.userId,
-              eventId: crypto.randomUUID(),
-              type: existing ? 'artifact.updated' : 'artifact.created',
-              chatId: params.chatId,
-              runId: params.runId ?? null,
-              payload: { artifact: saved },
-              createdAt: now,
-            });
-          }
+          envelope = this.db.insertSyncEventInTx({
+            userId: params.userId,
+            eventId: crypto.randomUUID(),
+            type: existing ? 'artifact.updated' : 'artifact.created',
+            chatId: params.chatId,
+            runId: params.runId ?? null,
+            payload: { artifact: saved },
+            createdAt: now,
+          });
 
           this.db.db.exec('COMMIT;');
         } catch (err) {
@@ -1904,7 +2010,6 @@ export class ArtifactService {
             source: 'generated',
             messageId: params.messageId ?? null,
             runId: params.runId ?? null,
-            emitEvent: false,
           });
           return { artifact: ingested.artifact };
         }
@@ -2911,18 +3016,6 @@ export class ArtifactService {
           })
         );
       }
-      // Detach source_artifact_id & source_base_revision on any chat copies before ON DELETE CASCADE
-      // removes project artifacts, preserving CHECK(source_base_revision IS NULL OR source_artifact_id IS NOT NULL).
-      this.db.db
-        .prepare(
-          `UPDATE artifacts
-           SET source_artifact_id = NULL, source_base_revision = NULL, updated_at = ?
-           WHERE user_id = ?
-             AND source_artifact_id IN (
-               SELECT id FROM artifacts WHERE project_id = ? AND user_id = ?
-             )`
-        )
-        .run(now, journal.userId, payload.projectId, journal.userId);
       this.db.deleteProject(journal.userId, payload.projectId);
       envelopes.push(
         this.db.insertSyncEventInTx({
@@ -2974,16 +3067,6 @@ export class ArtifactService {
           })
         );
       }
-      this.db.db
-        .prepare(
-          `UPDATE artifacts
-           SET source_artifact_id = NULL, source_base_revision = NULL, updated_at = ?
-           WHERE user_id = ?
-             AND source_artifact_id IN (
-               SELECT id FROM artifacts WHERE chat_id = ? AND user_id = ?
-             )`
-        )
-        .run(now, journal.userId, payload.chatId, journal.userId);
       this.db.deleteChat(journal.userId, payload.chatId);
       envelopes.push(
         this.db.insertSyncEventInTx({
@@ -2998,7 +3081,7 @@ export class ArtifactService {
     }
 
     const firstSeq = envelopes.length > 0 ? envelopes[0].seq : null;
-    const seqAudit = JSON.stringify({ syncEventSeqs: envelopes.map((e) => e.seq) });
+    const seqAudit = JSON.stringify({ syncEvents: envelopes.map(({ seq, eventId }) => ({ seq, eventId })) });
     this.db.db
       .prepare(
         `UPDATE artifact_commit_journal
@@ -3021,8 +3104,12 @@ export class ArtifactService {
     artifactId: string;
     relPath: string;
     operationSummary: string;
+    assertAuthorized?: () => void | Promise<void>;
     payload: NonNullable<ReturnType<ArtifactService['parseDeleteJournalPayload']>>;
   }): Promise<{ envelopes: SyncEventEnvelope[] }> {
+    if (this.hasUnresolvedFileCommit(params)) {
+      throw new ArtifactError('IDEMPOTENCY_IN_PROGRESS', '前回の保存処理の復旧が完了していません。', 409);
+    }
     const commitId = crypto.randomUUID();
     const now = Date.now();
     const stagingIsolation = this.getStagingIsolation();
@@ -3123,6 +3210,7 @@ export class ArtifactService {
       await this.commitFaultHook?.('after_T1', faultCtx);
 
       await this.commitFaultHook?.('before_T3', faultCtx);
+      await params.assertAuthorized?.();
       // T3: Transition to 'replacing' immediately before FS deletion
       this.db.db
         .prepare("UPDATE artifact_commit_journal SET state = 'replacing', updated_at = ? WHERE commit_id = ?")
@@ -3395,6 +3483,24 @@ export class ArtifactService {
    * Creates or refreshes a chat working copy `.project-context/<relPath>` from a project original artifact,
    * recording `source_artifact_id` and `source_base_revision` (`PIN-03`, `NEG-10`).
    */
+  private async assertProjectSource(
+    original: ArtifactRecord,
+    observedSha256: string,
+    assertAuthorized?: () => void | Promise<void>,
+  ): Promise<void> {
+    await assertAuthorized?.();
+    const live = this.db.getArtifact(original.userId, original.id);
+    const project = live?.projectId ? this.db.getProject(original.userId, live.projectId) : null;
+    if (live && project && !live.deletedOnDisk && live.revision === original.revision && observedSha256 === live.sha256) {
+      try {
+        if (readContainedRegularFileNoFollowStable(project.storageDir, live.relPath).sha256 === observedSha256) return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+    throw artifactConflictError('同期元のプロジェクト原本が変更されました。', { artifactId: original.id });
+  }
+
   async createProjectWorkingCopyInChat(params: {
     userId: string;
     projectId: string;
@@ -3413,6 +3519,7 @@ export class ArtifactService {
       throw new ArtifactError('NOT_FOUND', 'プロジェクト原本ファイルが見つかりません。', 404);
     }
     const read = readContainedRegularFileNoFollowStable(project.storageDir, projArt.relPath);
+    const assertAuthorized = () => this.assertProjectSource(projArt, read.sha256, params.assertAuthorized);
     const workingRelPath = normalizeRelPath(`.project-context/${projArt.relPath}`);
     const existingWorkingCopy = this.db.findArtifactByRelPath(params.userId, params.chatId, workingRelPath);
 
@@ -3431,7 +3538,7 @@ export class ArtifactService {
         actorKind: 'user',
         actorId: params.userId,
         operationSummary: `Created chat working copy of project file ${projArt.relPath}`,
-        assertAuthorized: params.assertAuthorized,
+        assertAuthorized,
       });
       return { artifact: created.artifact };
     }
@@ -3447,7 +3554,7 @@ export class ArtifactService {
       operationSummary: `Refreshed working copy from project rev ${projArt.revision}`,
       sourceArtifactId: projArt.id,
       sourceBaseRevision: projArt.revision,
-      assertAuthorized: params.assertAuthorized,
+      assertAuthorized,
     });
     return { artifact: updated.artifact };
   }
@@ -3505,6 +3612,7 @@ export class ArtifactService {
           artifactId: liveArt?.id ?? `sync:${params.chatId}:${wsRel}`,
           relPath: wsRel,
           operationSummary: `Remove obsolete synced project file ${wsRel}`,
+          assertAuthorized: params.assertAuthorized,
           payload: {
             kind: 'delete_sync_file',
             chatId: params.chatId,
@@ -3528,47 +3636,53 @@ export class ArtifactService {
       if (!projArt) {
         projArt = this.db.findProjectArtifactByRelPath(params.userId, params.projectId, pf.relPath);
       }
-      if (!projArt) continue;
+      if (!projArt || projArt.scopeKind !== 'project' || projArt.projectId !== params.projectId) continue;
+      const original = projArt;
 
       const workingRelPath = normalizeRelPath(`.project-context/${pf.relPath}`);
+      let read: ReturnType<typeof readContainedRegularFileNoFollowStable>;
       try {
-        const read = readContainedRegularFileNoFollowStable(project.storageDir, pf.relPath);
-        const existing = this.db.findArtifactByRelPath(params.userId, params.chatId, workingRelPath);
-        if (!existing) {
-          await this.createArtifact({
-            userId: params.userId,
-            scopeKind: 'chat',
-            chatId: params.chatId,
-            relPath: workingRelPath,
-            filename: pf.filename,
-            mimeType: pf.mimeType,
-            content: read.buffer,
-            source: 'project_copy',
-            sourceArtifactId: projArt.id,
-            sourceBaseRevision: projArt.revision,
-            actorKind: 'system',
-            actorId: null,
-            operationSummary: `Synced project file ${pf.relPath}`,
-          });
-        } else if (existing.sha256 !== read.sha256 || existing.sourceBaseRevision !== projArt.revision) {
-          // Ensure disk file reflects updated project original and record revision
-          await this.replaceArtifactBytes({
-            userId: params.userId,
-            artifactId: existing.id,
-            expectedRevision: existing.revision,
-            newBuffer: read.buffer,
-            actorKind: 'system',
-            actorId: null,
-            operationType: 'project_sync',
-            operationSummary: `Synced project file ${pf.relPath} (rev ${projArt.revision})`,
-            sourceArtifactId: projArt.id,
-            sourceBaseRevision: projArt.revision,
-          });
-        }
-        syncedPaths.push(workingRelPath);
-      } catch {
-        // skip missing project source on disk
+        read = readContainedRegularFileNoFollowStable(project.storageDir, pf.relPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw error;
       }
+      const assertAuthorized = () => this.assertProjectSource(original, read.sha256, params.assertAuthorized);
+      const existing = this.db.findArtifactByRelPath(params.userId, params.chatId, workingRelPath);
+      if (!existing) {
+        await this.createArtifact({
+          userId: params.userId,
+          scopeKind: 'chat',
+          chatId: params.chatId,
+          relPath: workingRelPath,
+          filename: pf.filename,
+          mimeType: pf.mimeType,
+          content: read.buffer,
+          source: 'project_copy',
+          sourceArtifactId: projArt.id,
+          sourceBaseRevision: projArt.revision,
+          assertAuthorized,
+          actorKind: 'system',
+          actorId: null,
+          operationSummary: `Synced project file ${pf.relPath}`,
+        });
+      } else if (existing.sha256 !== read.sha256 || existing.sourceBaseRevision !== projArt.revision || existing.sourceArtifactId !== projArt.id) {
+        // Ensure disk file reflects updated project original and record revision
+        await this.replaceArtifactBytes({
+          userId: params.userId,
+          artifactId: existing.id,
+          expectedRevision: existing.revision,
+          newBuffer: read.buffer,
+          actorKind: 'system',
+          actorId: null,
+          operationType: 'project_sync',
+          operationSummary: `Synced project file ${pf.relPath} (rev ${projArt.revision})`,
+          sourceArtifactId: projArt.id,
+          sourceBaseRevision: projArt.revision,
+          assertAuthorized,
+        });
+      }
+      syncedPaths.push(workingRelPath);
     }
     return syncedPaths;
   }
@@ -3598,6 +3712,9 @@ export class ArtifactService {
       throw new ArtifactError('NOT_FOUND', '作業コピー成果物が見つかりません。', 404);
     }
     if (!workingCopy.sourceArtifactId || workingCopy.sourceBaseRevision === null) {
+      if (workingCopy.source === 'project_copy') {
+        throw artifactConflictError('反映先のプロジェクト原本を確認できません。', { conflictKind: 'project_original_deleted' });
+      }
       throw new ArtifactError('NOT_A_PROJECT_WORKING_COPY', 'この成果物はプロジェクト原本の作業コピーではありません。', 400);
     }
 
@@ -3605,25 +3722,12 @@ export class ArtifactService {
     const expectedProjRev = params.expectedProjectRevision ?? workingCopy.sourceBaseRevision;
 
     const projectOriginal = this.db.getArtifact(params.userId, projectArtifactId);
-    if (!projectOriginal || projectOriginal.scopeKind !== 'project' || !projectOriginal.projectId) {
+    if (!projectOriginal || projectOriginal.deletedOnDisk || projectOriginal.scopeKind !== 'project' || !projectOriginal.projectId) {
       throw artifactConflictError('反映先のプロジェクト原本が削除されているため反映できません。', {
         conflictKind: 'project_original_deleted',
         sourceArtifactId: projectArtifactId,
         expectedProjectRevision: expectedProjRev,
       });
-    }
-
-    if (projectOriginal.revision !== expectedProjRev) {
-      throw artifactConflictError(
-        `作業コピー作成後にプロジェクト原本が更新されています（基準版: ${expectedProjRev}, 最新版: ${projectOriginal.revision}）。差分を確認してください。`,
-        {
-          conflictKind: 'project_original_modified',
-          sourceArtifactId: projectOriginal.id,
-          expectedProjectRevision: expectedProjRev,
-          currentProjectRevision: projectOriginal.revision,
-          currentProjectSha256: projectOriginal.sha256,
-        }
-      );
     }
 
     const workingBuf = this.readActiveArtifactBytes(workingCopy);
@@ -3642,7 +3746,16 @@ export class ArtifactService {
       operationSummary: `Reflected changes from chat working copy ${workingCopy.id}`,
       idempotencyKey: params.idempotencyKey,
       updateWorkingCopyId: workingCopy.id,
-      assertAuthorized: params.assertAuthorized,
+      requestedProjectRevision: params.expectedProjectRevision,
+      assertAuthorized: async () => {
+        await params.assertAuthorized?.();
+        const live = this.db.getArtifact(params.userId, workingCopy.id);
+        if (!live || live.deletedOnDisk || live.revision !== workingCopy.revision ||
+            live.sourceArtifactId !== projectOriginal.id ||
+            !this.readActiveArtifactBytes(live)?.equals(workingBuf)) {
+          throw artifactConflictError('反映元の作業コピーが変更されました。', { artifactId: workingCopy.id });
+        }
+      },
     });
 
     const updatedWorkingCopy = this.db.getArtifact(params.userId, workingCopy.id)!;
@@ -3658,13 +3771,9 @@ export class ArtifactService {
   async replaceArtifactBytes(params: {
     userId: string;
     artifactId: string;
-    expectedRevision: number;
-    newBuffer: Buffer;
     actorKind: ActorKind;
     actorId: string | null;
     operationType: string;
-    operationSummary: string;
-    operationPayload?: Record<string, unknown> | null;
     batchId?: string | null;
     batchSeq?: number | null;
     suppressDependencyPropagation?: boolean;
@@ -3672,9 +3781,18 @@ export class ArtifactService {
     sourceArtifactId?: string | null;
     sourceBaseRevision?: number | null;
     updateWorkingCopyId?: string;
+    requestedProjectRevision?: number;
     alreadyLocked?: boolean;
     assertAuthorized?: () => void | Promise<void>;
-  }): Promise<{ artifact: ArtifactRecord; noOp: boolean }> {
+  } & ({
+    expectedRevision: number;
+    newBuffer: Buffer;
+    operationSummary: string;
+    operationPayload?: Record<string, unknown> | null;
+    historyDirection?: never;
+  } | {
+    historyDirection: 'undo' | 'redo';
+  })): Promise<{ artifact: ArtifactRecord; noOp: boolean }> {
     const scopeKey = `artifact:${params.artifactId}`;
     const reverifyAuth = async () => {
       await params.assertAuthorized?.();
@@ -3695,9 +3813,11 @@ export class ArtifactService {
       actorKind: params.actorKind,
       actorId: params.actorId,
       operationType: params.operationType,
-      target: { artifactId: params.artifactId },
-      operations: { sha256: crypto.createHash('sha256').update(params.newBuffer).digest('hex') },
-      baseRevision: params.expectedRevision,
+      target: { artifactId: params.artifactId, workingCopyId: params.updateWorkingCopyId },
+      operations: params.historyDirection || params.updateWorkingCopyId
+        ? null : { sha256: crypto.createHash('sha256').update(params.newBuffer).digest('hex') },
+      baseRevision: params.historyDirection ? null : params.updateWorkingCopyId
+        ? params.requestedProjectRevision ?? null : params.expectedRevision,
     });
 
     const executeLocked = async () => {
@@ -3731,14 +3851,22 @@ export class ArtifactService {
         current = this.db.getArtifact(params.userId, params.artifactId)!;
       }
 
-      if (current.revision !== params.expectedRevision) {
+      const mutation = params.historyDirection
+        ? await this.planActorHistoryMutation(current, prevRead, params.actorKind, params.actorId, params.historyDirection)
+        : params;
+      if (current.revision !== mutation.expectedRevision) {
         throw artifactConflictError(
-          `成果物の版が競合しています（期待: ${params.expectedRevision}, 現在: ${current.revision}）。`,
+          `成果物の版が競合しています（期待: ${mutation.expectedRevision}, 現在: ${current.revision}）。`,
           {
             artifactId: current.id,
-            expectedRevision: params.expectedRevision,
+            expectedRevision: mutation.expectedRevision,
             currentRevision: current.revision,
             currentSha256: current.sha256,
+            ...(params.updateWorkingCopyId ? {
+              conflictKind: 'project_original_modified', sourceArtifactId: current.id,
+              expectedProjectRevision: mutation.expectedRevision, currentProjectRevision: current.revision,
+              currentProjectSha256: current.sha256,
+            } : {}),
           }
         );
       }
@@ -3762,19 +3890,19 @@ export class ArtifactService {
         expectedPrevFingerprint: prevRead?.fingerprint ?? null,
         prevBuffer: prevRead?.buffer ?? null,
         prevDepHash: current.dependencyManifestHash,
-        newBuffer: params.newBuffer,
+        newBuffer: mutation.newBuffer,
         actorKind: params.actorKind,
         actorId: params.actorId,
         operationType: params.operationType,
-        operationSummary: params.operationSummary,
-        operationPayload: params.operationPayload,
+        operationSummary: mutation.operationSummary,
+        operationPayload: mutation.operationPayload,
         batchId: params.batchId,
         batchSeq: params.batchSeq,
         idempotencyScopeKey: params.idempotencyKey ? scopeKey : null,
         idempotencyKey: params.idempotencyKey ?? null,
         requestFingerprint: fingerprint,
-        sourceArtifactId: params.sourceArtifactId ?? current.sourceArtifactId,
-        sourceBaseRevision: params.sourceBaseRevision ?? current.sourceBaseRevision,
+        sourceArtifactId: params.sourceArtifactId,
+        sourceBaseRevision: params.sourceBaseRevision,
         suppressDependencyPropagation: params.suppressDependencyPropagation,
         updateWorkingCopyId: params.updateWorkingCopyId,
         assertAuthorizedBeforeCommit: reverifyAuth,
@@ -3792,7 +3920,11 @@ export class ArtifactService {
       run: async () => {
         const out = params.alreadyLocked
           ? await executeLocked()
-          : await this.lockManager.withLock(`artifact:${params.artifactId}`, executeLocked);
+          : await this.lockManager.withLocks([
+            `artifact:${params.artifactId}`,
+            ...(params.updateWorkingCopyId ? [`artifact:${params.updateWorkingCopyId}`] : []),
+            ...(params.sourceArtifactId ? [`artifact:${params.sourceArtifactId}`] : []),
+          ], executeLocked);
         return {
           result: out,
           alreadyCommittedInTx: !out.noOp,
@@ -3817,6 +3949,8 @@ export class ArtifactService {
     artifactId: string;
     expectedRevision: number;
     operations: AdapterOperation[];
+    editRequestIds?: string[];
+    assertEditRequestsCurrent?: () => void;
     actorKind: ActorKind;
     actorId?: string | null;
     idempotencyKey?: string;
@@ -3843,7 +3977,7 @@ export class ArtifactService {
       actorKind: params.actorKind,
       actorId: params.actorId ?? null,
       operationType: params.operations.length > 1 ? 'batch_edit' : 'edit',
-      target: { artifactId: params.artifactId },
+      target: { artifactId: params.artifactId, ...(params.editRequestIds?.length && { editRequestIds: [...params.editRequestIds].sort() }) },
       operations: params.operations,
       baseRevision: params.expectedRevision,
     });
@@ -3893,6 +4027,7 @@ export class ArtifactService {
             );
           }
 
+          params.assertEditRequestsCurrent?.();
           if (isDocumentFormat(adapter.format)) {
             const supported = DOCUMENT_ACTIONS[adapter.format];
             const unsupported = params.operations.find(({ op }) => !supported.includes(op) || !op.includes('.') || op.endsWith('.get_structure'));
@@ -3934,14 +4069,21 @@ export class ArtifactService {
             actorId: params.actorId ?? null,
             operationType: params.operations.length > 1 ? 'batch_edit' : 'edit',
             operationSummary: params.operationSummary ?? editResult.summary,
+            responseSummary: editResult.summary,
             operationPayload: {
-              semanticScope: editResult.semanticScope ?? null,
+              semanticScope: editResult.semanticScope ??
+                (adapter.format === 'pdf' ? provePdfRotationScope(prevRead.buffer, editResult.buffer, params.operations)
+                  : proveOfficeEditScope(adapter.format, prevRead.buffer, editResult.buffer, params.operations)) ?? null,
               operations: params.operations,
+              editRequestIds: params.editRequestIds,
             },
             idempotencyScopeKey: params.idempotencyKey ? scopeKey : null,
             idempotencyKey: params.idempotencyKey ?? null,
             requestFingerprint: fingerprint,
-            assertAuthorizedBeforeCommit: reverifyAuth,
+            assertAuthorizedBeforeCommit: async () => {
+              await reverifyAuth();
+              params.assertEditRequestsCurrent?.();
+            },
           });
 
           return {
@@ -4070,13 +4212,21 @@ export class ArtifactService {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
     const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
+    if (adapter.format === 'media' && !this.documentWorker.available) return this.readRange(userId, artifactId, { targetMetadata: true });
     const maxBytes = isDocumentFormat(adapter.format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
     const { bytes: buf, revision } = this.readCurrentRevision(userId, artifactId, maxBytes);
     const format = adapter.format;
-    const structure = this.documentWorker.available && isDocumentFormat(format) &&
+    const structure: Record<string, unknown> = this.documentWorker.available && isDocumentFormat(format) &&
       !documentFormatConstraint(format, artifact.filename, 'input')
       ? JSON.parse((await this.documentWorker.run(format, artifact.filename, buf, { action: 'structure' })).toString('utf8'))
       : adapter.getStructure(buf, artifact);
+    if (format === 'media') {
+      const target = await this.readRange(userId, artifactId, { targetMetadata: true });
+      if (target.revision !== revision.revision) {
+        throw new ArtifactError('ARTIFACT_CONFLICT', 'File revision changed during media inspection.', 409);
+      }
+      structure.durationSeconds = target.durationSeconds;
+    }
     return {
       ...structure,
       artifactId: artifact.id,
@@ -4283,174 +4433,218 @@ export class ArtifactService {
     range: Record<string, unknown>
   ): Promise<Record<string, unknown>> {
     const MAX_RESPONSE_BYTES = 512 * 1024;
+    const fullCell = range.gridCell === true || range.gridCell === 'true';
+    const dimensionsOnly = range.gridDimensions === true || range.gridDimensions === 'true';
+    const searchQuery = typeof range.gridSearch === 'string' ? range.gridSearch.trim() : '';
+    const filter = typeof range.gridFilter === 'string' ? range.gridFilter.trim() : '';
+    if (filter && (searchQuery || fullCell)) throw new ArtifactError('INVALID_INPUT', 'Invalid filter request.', 400);
+    // Stream a case-insensitive substring matcher independently of the value
+    // response budget. A large field never needs to be retained to find a hit.
+    const needle = [...Array.from(searchQuery || filter, ch => ch.toLowerCase()).join('')];
+    const prefix = new Array<number>(needle.length).fill(0);
+    for (let i=1,j=0;i<needle.length;i++) {
+      while (j && needle[i]!==needle[j]) j=prefix[j-1];
+      if (needle[i]===needle[j]) j++;
+      prefix[i]=j;
+    }
     const delimiter = filename.toLowerCase().endsWith('.tsv') ? '\t' : ',';
-    const rawStartRow = Number(range.startRow ?? 0);
-    const startRow = Number.isFinite(rawStartRow) ? Math.max(0, Math.floor(rawStartRow)) : 0;
-    const rawEndRow = Number(range.endRow ?? startRow + 99);
-    const targetEndRow = Number.isFinite(rawEndRow) ? Math.max(startRow, Math.floor(rawEndRow)) : startRow + 99;
-    const rawStartCol = Number(range.startCol ?? 0);
-    const startCol = Number.isFinite(rawStartCol) ? Math.max(0, Math.floor(rawStartCol)) : 0;
-    const hasEndCol = range.endCol !== undefined && range.endCol !== null;
-    const requestedEndCol = hasEndCol && Number.isFinite(Number(range.endCol))
-      ? Math.max(startCol, Math.floor(Number(range.endCol)))
-      : undefined;
-
-    return new Promise((resolve, reject) => {
-      const stream = fs.createReadStream(blobPath, { highWaterMark: 64 * 1024 });
-      const decoder = new StringDecoder('utf8');
-      let rowIndex = 0;
-      let observedMaxCols = 0;
-      let inQuotes = false;
-      let pendingQuote = false;
-      let pendingCr = false;
-      let field = '';
-      let currentRow: string[] = [];
-      let fieldCountInRow = 0;
-      let isFirstChar = true;
-      const rows: string[][] = [];
-      let collectedBytes = 0;
-      let truncated = false;
-      let stoppedEarly = false;
-      let reachedEof = false;
-      let settled = false;
-
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        const maxColIndex = Math.max(0, observedMaxCols - 1);
-        const actualEndCol = requestedEndCol !== undefined ? Math.min(maxColIndex, requestedEndCol) : maxColIndex;
-        const sliced = rows.map((r) => r.slice(startCol, actualEndCol + 1));
-        const actualEndRow = sliced.length > 0 ? startRow + sliced.length - 1 : Math.min(startRow, Math.max(0, rowIndex - 1));
-        resolve({
-          startRow,
-          endRow: actualEndRow,
-          startCol,
-          endCol: actualEndCol,
-          ...(reachedEof ? { totalRows: rowIndex } : {}),
-          totalCols: observedMaxCols,
-          totalBytes,
-          hasMore: stoppedEarly || !reachedEof,
-          truncated,
-          rows: sliced,
-          valuesHash: crypto.createHash('sha256').update(JSON.stringify(sliced)).digest('hex'),
-        });
-      };
-
-      const commitField = () => {
-        if (rowIndex >= startRow && rowIndex <= targetEndRow) {
-          currentRow.push(field);
+    const safeIndex = (value: unknown, fallback: number) => {
+      const number = Number(value ?? fallback);
+      return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
+    };
+    const startRow = safeIndex(range.startRow, 0);
+    const afterRow = safeIndex(range.afterRow, -1), afterCol = safeIndex(range.afterCol, -1);
+    const targetEndRow = dimensionsOnly || searchQuery ? Number.MAX_SAFE_INTEGER
+      : Math.max(startRow, safeIndex(range.endRow, startRow + 99));
+    const startCol = safeIndex(range.startCol, 0);
+    const requestedEndCol = range.endCol == null ? Number.MAX_SAFE_INTEGER
+      : Math.max(startCol, safeIndex(range.endCol, startCol));
+    if (fullCell && ([range.startRow, range.endRow, range.startCol, range.endCol].some(value => safeIndex(value, -1) < 0) ||
+        Number(range.endRow) !== startRow || Number(range.endCol) !== startCol || dimensionsOnly || needle.length)) {
+      throw new ArtifactError('INVALID_INPUT', 'Specify one cell to read its complete value.', 400);
+    }
+    const stream = fs.createReadStream(blobPath, { highWaterMark: 64 * 1024 });
+    const decoder = new StringDecoder('utf8');
+    let rowIndex = 0, observedMaxCols = 0, fieldCount = 0;
+    let field = '', fieldHasValue = false, inQuotes = false, pendingQuote = false, pendingCr = false;
+    let currentRow: string[] = [];
+    const cellChunks: string[] = [];
+    let cellText: string | null = null;
+    const rows: string[][] = [];
+    const sourceRows: number[] = [];
+    let matchedRows = 0, rowMatches = false;
+    let truncatedSourceRow: number | undefined;
+    const visibleRow = () => filter ? matchedRows : rowIndex;
+    // Count actual JSON bytes, including escaping, before retaining values.
+    // Never emit a partial cell/row as if it were the persisted value.
+    let collectedBytes = 2, rowBytes = 2, fieldBytes = 0, rowTruncated = false;
+    let truncated = false, stoppedEarly = false, firstChar = true;
+    const fitsField = (bytes:number) => collectedBytes + (rows.length?1:0) + rowBytes + (currentRow.length?1:0) + 2 + bytes <= MAX_RESPONSE_BYTES;
+    let matchLength=0, fieldMatched=false;
+    let firstMatch:{row:number;col:number}|null=null, nextMatch:{row:number;col:number}|null=null;
+    const targetHashes = range.targetHashes === true || range.targetHashes === 'true';
+    const hashOnly = range.hashOnly === true && targetHashes && !filter && !fullCell && !searchQuery && !dimensionsOnly;
+    const valuesDigest = crypto.createHash('sha256').update('[');
+    const headerDigest = crypto.createHash('sha256').update('[');
+    let hashedRows = 0, hashedFields = 0;
+    const MAX_SNIPPET_CHARS = 50_000;
+    const snippetParts: string[] = [];
+    let snippetChars = 0;
+    const appendSnippet = (text: string) => {
+      if (snippetChars >= MAX_SNIPPET_CHARS || !text) return;
+      const remaining = MAX_SNIPPET_CHARS - snippetChars;
+      const piece = text.length <= remaining ? text : text.slice(0, remaining);
+      snippetParts.push(piece);
+      snippetChars += piece.length;
+    };
+    const collectHeader = () => targetHashes && rowIndex === 0 && !filter;
+    let headerField = '';
+    const collectRow = () => !fullCell && !dimensionsOnly && !searchQuery && visibleRow() >= startRow && visibleRow() <= targetEndRow;
+    const collectField = () => collectRow() && fieldCount >= startCol && fieldCount <= requestedEndCol;
+    const isRequestedCell = () => fullCell && rowIndex === startRow && fieldCount === startCol;
+    function append(ch: string) {
+      fieldHasValue = true;
+      if(needle.length&&!fieldMatched){
+        for(const c of ch.toLowerCase()){
+          while(matchLength&&needle[matchLength]!==c)matchLength=prefix[matchLength-1];
+          if(needle[matchLength]===c)matchLength++;
+          if(matchLength===needle.length){fieldMatched=true;break;}
         }
-        fieldCountInRow += 1;
+      }
+      if (isRequestedCell()) {
+        field += ch;
+        return;
+      }
+      if (collectHeader()) headerField += ch;
+      if (hashOnly) {
+        if (collectField()) field += ch;
+        return;
+      }
+      if (collectField() && !rowTruncated) {
+        const cp=ch.codePointAt(0)!;
+        const bytes=cp===34||cp===92||[8,9,10,12,13].includes(cp)?2:cp<32?6:cp<128?1:cp<2048?2:cp<65536?3:4;
+        if (fitsField(fieldBytes+bytes)) {field+=ch;fieldBytes+=bytes;}
+        else {rowTruncated=true;field='';}
+      }
+    }
+    function commitField() {
+      if (isRequestedCell()) {
+        cellChunks.push(field);
+        cellText = cellChunks.join('');
+        stoppedEarly = true;
+      }
+      if(filter&&fieldMatched)rowMatches=true;
+      if(searchQuery&&fieldMatched){
+        const hit={row:rowIndex,col:fieldCount};
+        firstMatch??=hit;
+        if(rowIndex>afterRow||(rowIndex===afterRow&&fieldCount>afterCol)){
+          nextMatch=hit;stoppedEarly=true;
+        }
+      }
+      matchLength=0;fieldMatched=false;
+      if (collectHeader()) {
+        headerDigest.update(fieldCount ? ',' : '').update(JSON.stringify(headerField));
+        headerField = '';
+      }
+      if (hashOnly) {
+        if (fieldCount === 0 && collectRow()) {
+          valuesDigest.update(hashedRows ? ',[' : '[');
+          if (hashedRows > 0) appendSnippet('\n');
+        }
+        if (collectField()) {
+          if (hashedFields > 0) appendSnippet('\t');
+          appendSnippet(field);
+          valuesDigest.update(hashedFields++ ? ',' : '').update(JSON.stringify(field));
+        }
+      }
+      if (!hashOnly && collectField()&&!rowTruncated) {
+        if(fitsField(fieldBytes)){rowBytes+=(currentRow.length?1:0)+2+fieldBytes;currentRow.push(field);}
+        else rowTruncated=true;
+      }
+      fieldCount++;
+      field = ''; fieldBytes=0; fieldHasValue = false;
+    }
+    function commitRow(): boolean {
+      commitField();
+      observedMaxCols = Math.max(observedMaxCols, fieldCount);
+      if (hashOnly && collectRow()) {
+        valuesDigest.update(']');
+        hashedRows++;
+        hashedFields = 0;
+      } else if (collectRow() && (!filter || rowMatches)) {
+        if (rowTruncated) {truncated = true; stoppedEarly = true; truncatedSourceRow = rowIndex;}
+        else {
+          collectedBytes += rowBytes+(rows.length?1:0);
+          rows.push(currentRow);
+          if (filter) sourceRows.push(rowIndex);
+        }
+      }
+      if (rowMatches) matchedRows++;
+      currentRow = []; rowBytes=2; rowTruncated=false; rowMatches=false; fieldCount = 0; rowIndex++;
+      if (!targetHashes && visibleRow() > targetEndRow) stoppedEarly = true;
+      return !stoppedEarly;
+    }
+    function feed(ch: string): boolean {
+      if (pendingQuote) {
+        pendingQuote = false;
+        if (ch === '"') { append('"'); return true; }
+        inQuotes = false;
+      }
+      if (inQuotes) {
+        if (ch === '"') pendingQuote = true;
+        else append(ch);
+      } else if (ch === '"') { inQuotes = true; fieldHasValue = true; }
+      else if (ch === delimiter) commitField();
+      else if (ch === '\n' || ch === '\r') return commitRow();
+      else append(ch);
+      return !stoppedEarly;
+    }
+    // Match CsvAdapter's CRLF normalization, including inside quoted cells.
+    // Count skipped rows/columns without retaining their values, even in huge files.
+    function processText(text: string): boolean {
+      for (const ch of text) {
+        if (firstChar) { firstChar = false; if (ch === '\uFEFF') continue; }
+        if (pendingCr) {
+          pendingCr = false;
+          if (ch === '\n') { if (!feed('\n')) return false; continue; }
+          if (!feed('\r')) return false;
+        }
+        if (ch === '\r') pendingCr = true;
+        else if (!feed(ch)) return false;
+      }
+      return true;
+    }
+    for await (const chunk of stream) {
+      if (!processText(decoder.write(chunk as Buffer))) break;
+      if (isRequestedCell() && field) {
+        cellChunks.push(field);
         field = '';
-      };
-
-      const commitRow = (): boolean => {
-        commitField();
-        if (fieldCountInRow > observedMaxCols) observedMaxCols = fieldCountInRow;
-        let keepGoing = true;
-        if (rowIndex >= startRow && rowIndex <= targetEndRow) {
-          const rowBytes = Buffer.byteLength(JSON.stringify(currentRow), 'utf8');
-          if (collectedBytes + rowBytes > MAX_RESPONSE_BYTES && rows.length > 0) {
-            truncated = true;
-            stoppedEarly = true;
-            keepGoing = false;
-          } else {
-            rows.push(currentRow);
-            collectedBytes += rowBytes;
-          }
-        }
-        currentRow = [];
-        fieldCountInRow = 0;
-        rowIndex += 1;
-        if (rowIndex > targetEndRow) {
-          stoppedEarly = true;
-          keepGoing = false;
-        }
-        return keepGoing;
-      };
-
-      const processText = (text: string): boolean => {
-        for (let i = 0; i < text.length; i++) {
-          const ch = text[i];
-          if (isFirstChar) {
-            isFirstChar = false;
-            if (ch === '\uFEFF') continue;
-          }
-          if (pendingCr) {
-            pendingCr = false;
-            if (ch === '\n') continue;
-          }
-          if (pendingQuote) {
-            pendingQuote = false;
-            if (ch === '"') {
-              if (rowIndex >= startRow && rowIndex <= targetEndRow && field.length < MAX_RESPONSE_BYTES) {
-                field += '"';
-              }
-              continue;
-            }
-            inQuotes = false;
-          }
-          if (inQuotes) {
-            if (ch === '"') {
-              pendingQuote = true;
-            } else if (rowIndex >= startRow && rowIndex <= targetEndRow && field.length < MAX_RESPONSE_BYTES) {
-              field += ch;
-            }
-            continue;
-          }
-          if (ch === '"' && field.length === 0) {
-            inQuotes = true;
-          } else if (ch === delimiter) {
-            commitField();
-          } else if (ch === '\r') {
-            pendingCr = true;
-            if (!commitRow()) return false;
-          } else if (ch === '\n') {
-            if (!commitRow()) return false;
-          } else if (rowIndex >= startRow && rowIndex <= targetEndRow && field.length < MAX_RESPONSE_BYTES) {
-            field += ch;
-          }
-        }
-        return true;
-      };
-
-      stream.on('data', (chunk: Buffer | string) => {
-        if (settled) return;
-        const text = typeof chunk === 'string' ? chunk : decoder.write(chunk);
-        if (!processText(text)) {
-          stream.destroy();
-          finish();
-        }
-      });
-
-      stream.on('end', () => {
-        if (settled) return;
-        const rem = decoder.end();
-        if (rem && !processText(rem)) {
-          finish();
-          return;
-        }
-        if (pendingQuote) {
-          pendingQuote = false;
-          inQuotes = false;
-        }
-        if (field.length > 0 || fieldCountInRow > 0) {
-          commitRow();
-        }
-        reachedEof = true;
-        finish();
-      });
-
-      stream.on('close', () => {
-        if (!settled) finish();
-      });
-
-      stream.on('error', (err) => {
-        if (settled) return;
-        settled = true;
-        reject(err);
-      });
-    });
+      }
+    }
+    if (!stoppedEarly) {
+      processText(decoder.end());
+      if (!stoppedEarly && pendingCr) { pendingCr = false; feed('\r'); }
+      if (!stoppedEarly && (fieldHasValue || fieldCount > 0)) commitRow();
+    }
+    if (hashOnly) return {
+      totalRows: rowIndex, totalCols: observedMaxCols,
+      headerHash: headerDigest.update(']').digest('hex'), valuesHash: valuesDigest.update(']').digest('hex'),
+      snippet: snippetParts.join(''),
+    };
+    if (fullCell) return { cellText };
+    if (searchQuery) return {match:nextMatch??firstMatch,totalBytes};
+    if (dimensionsOnly) return { totalRows: visibleRow(), totalCols: observedMaxCols, totalBytes };
+    const actualEndCol = Math.min(Math.max(0, observedMaxCols - 1), requestedEndCol);
+    return {
+      startRow,
+      endRow: rows.length ? startRow + rows.length - 1 : Math.min(startRow, Math.max(0, visibleRow() - 1)),
+      startCol, endCol: actualEndCol,
+      ...(!stoppedEarly ? { totalRows: visibleRow() } : {}),
+      totalCols: observedMaxCols, totalBytes, hasMore: stoppedEarly, truncated, rows,
+      ...(filter ? { sourceRows, truncatedSourceRow } : {}),
+      ...(targetHashes ? { headerHash: headerDigest.update(']').digest('hex') } : {}),
+      valuesHash: crypto.createHash('sha256').update(JSON.stringify(rows)).digest('hex'),
+    };
   }
 
   async readRange(userId: string, artifactId: string, range: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -4459,6 +4653,70 @@ export class ArtifactService {
       const { artifact, revision, blobPath, sizeBytes } = pinned;
       const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
       const format = adapter.format;
+
+      const inspectionChannel = getTargetInspectionChannelForRequest(format, range);
+      if (inspectionChannel === 'worker_target_metadata') {
+        const data = await inspectArtifactTarget<Record<string, unknown>>({
+          file: artifact,
+          range: format === 'media' ? { mediaStructure: true } : range,
+          snapshot: { path: blobPath, sha256: revision.sha256, sizeBytes },
+        });
+        return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+      }
+
+      if (inspectionChannel === 'worker_source_hashes') {
+        const data = await inspectArtifactTarget<Record<string, unknown>>({
+          file: artifact,
+          range: {
+            sourceTarget: true,
+            startLine: Number(range.startLine),
+            endLine: Number(range.endLine),
+            ...(format === 'code' && (range.startCol !== undefined || range.endCol !== undefined)
+              ? { startCol: Number(range.startCol), endCol: Number(range.endCol) } : {}),
+          },
+          snapshot: { path: blobPath, sha256: revision.sha256, sizeBytes },
+        });
+        return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+      }
+
+      if (inspectionChannel === 'stream_csv_hash_only') {
+        const slice = range.axis === 'row' || range.axis === 'col';
+        if (slice) {
+          const start = Number(range.start), end = Number(range.end);
+          if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start) {
+            throw new ArtifactError('INVALID_INPUT', 'Invalid CSV row or column range.', 400);
+          }
+          const bounds = range.axis === 'row'
+            ? { startRow: start, endRow: end }
+            : { startCol: start, endCol: end, endRow: Number.MAX_SAFE_INTEGER };
+          const data = await this.streamCsvRangeFromBlob(blobPath, sizeBytes, artifact.filename, { ...bounds, targetHashes: true, hashOnly: true });
+          const limit = range.axis === 'row' ? Number(data.totalRows) : Number(data.totalCols);
+          const target = !data.truncated && end < limit ? {
+            axis: range.axis, start, end, expectedRowCount: data.totalRows, expectedColCount: data.totalCols,
+            expectedHeaderHash: data.headerHash, expectedRangeValuesHash: data.valuesHash,
+          } : null;
+          return { target, snippet: target ? data.snippet : undefined, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+        }
+        const startRow = Number(range.startRow), endRow = Number(range.endRow);
+        const startCol = Number(range.startCol), endCol = Number(range.endCol);
+        if (
+          !Number.isSafeInteger(startRow) || !Number.isSafeInteger(endRow) || startRow < 0 || endRow < startRow ||
+          !Number.isSafeInteger(startCol) || !Number.isSafeInteger(endCol) || startCol < 0 || endCol < startCol
+        ) {
+          throw new ArtifactError('INVALID_INPUT', 'Invalid CSV cell range.', 400);
+        }
+        const data = await this.streamCsvRangeFromBlob(blobPath, sizeBytes, artifact.filename, {
+          startRow, endRow, startCol, endCol, targetHashes: true, hashOnly: true,
+        });
+        const totalRows = Number(data.totalRows);
+        const totalCols = Number(data.totalCols);
+        const target = !data.truncated && endRow < totalRows && endCol < totalCols ? {
+          startRow, endRow, startCol, endCol,
+          expectedRowCount: totalRows, expectedColCount: totalCols,
+          expectedHeaderHash: data.headerHash, expectedRangeValuesHash: data.valuesHash,
+        } : null;
+        return { target, snippet: target ? data.snippet : undefined, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+      }
 
       if (isDocumentFormat(format) && ['xlsx', 'docx', 'pptx', 'pdf'].includes(format)) {
         if (this.documentWorker.available) {
@@ -4470,7 +4728,10 @@ export class ArtifactService {
           ) as Record<string, unknown>;
           return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
         }
-        const fallback = adapter.readRange(Buffer.alloc(0), range, artifact);
+        const fallbackBytes = ((format === 'docx' && /\.docx$/i.test(artifact.filename)) ||
+          (format === 'xlsx' && /\.xlsx$/i.test(artifact.filename)))
+          ? this.readRevisionSnapshot({ artifact, revision, blobPath, sizeBytes }, DOCUMENT_WORKER_MAX_INPUT_BYTES).bytes : Buffer.alloc(0);
+        const fallback = adapter.readRange(fallbackBytes, range, artifact);
         return { ...fallback, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
       }
 
@@ -4493,16 +4754,234 @@ export class ArtifactService {
     }
   }
 
+  async readXlsxDraftRange(userId: string, artifactId: string, draft: {
+    expectedRevision: number; sheetName: string; rangeA1: string; operations: AdapterOperation[];
+  }, assertAuthorized: () => void | Promise<void>): Promise<Record<string, unknown>> {
+    await assertAuthorized();
+    const { artifact, revision, bytes } = this.readCurrentRevision(userId, artifactId, DOCUMENT_WORKER_MAX_INPUT_BYTES);
+    if (!/\.xlsx$/i.test(artifact.filename)) {
+      throw unsupportedOperationError('read_range', 'unsupported_by_format', 'An XLSX workbook is required.');
+    }
+    if (revision.revision !== draft.expectedRevision) {
+      throw new ArtifactError('ARTIFACT_CONFLICT', 'ファイルが更新されました。', 409);
+    }
+    const { operations, sheetName, rangeA1 } = draft;
+    const result = await this.documentWorker.run('xlsx', artifact.filename, bytes, {
+      action: 'xlsx_draft_range', operations, sheetName, rangeA1,
+    });
+    await assertAuthorized();
+    return { ...JSON.parse(result.toString('utf8')), artifactId, revision: revision.revision, sha256: revision.sha256 };
+  }
+
+  /** Revision-pinned, read-only document preview using the isolated document worker.
+   * No exported artifact or workspace mutation is created.
+   */
+  async renderOfficePreviewPdf(userId: string, artifactId: string, revisionNumber: number): Promise<string> {
+    const pinned = this.getRevisionContentBlob(userId, artifactId, revisionNumber);
+    const { artifact, revision } = pinned;
+    const format = this.registry.resolve(artifact.filename, artifact.previewKind).format;
+    if (format !== 'docx' && format !== 'xlsx') {
+      throw unsupportedOperationError('export:pdf', 'unsupported_by_format', 'A DOCX or XLSX snapshot is required.');
+    }
+    if (!this.documentWorker.available) {
+      throw unsupportedOperationError('export:pdf', 'disabled_by_resource_tier', 'Document runtime is unavailable.');
+    }
+    const snapshot = this.readRevisionSnapshot(pinned, DOCUMENT_WORKER_MAX_INPUT_BYTES);
+    const converted = await this.renderCache.getOrRender({
+      keyInput: {
+        artifactId, revision: revision.revision, sha256: revision.sha256,
+        dependencyManifestHash: revision.dependencyManifestHash, variant: `${format}_view_pdf`,
+        engineVersion: 'document-worker-v1',
+      },
+      ext: '.pdf',
+      produce: async (output) => {
+        const pdf = await this.documentWorker.run(format, artifact.filename, snapshot.bytes, { action: 'export', targetFormat: 'pdf' });
+        if (pdf.length < 8 || pdf.length > DOCUMENT_WORKER_MAX_INPUT_BYTES || pdf.subarray(0, 5).toString('ascii') !== '%PDF-') return false;
+        fs.writeFileSync(output, pdf, { mode: 0o600 });
+        return true;
+      },
+    });
+    if (!converted) throw new ArtifactError('CONVERSION_UNAVAILABLE', '文書のページ表示に失敗しました。読取表示をご利用ください。', 422);
+    return converted;
+  }
+
+  /** Render an edited sprite from an isolated copy without publishing any revision.
+   * The regular edit transaction commits bytes and emits revision events.
+   */
+  async renderPptxDraftSprite(userId: string, artifactId: string, draft: {
+    expectedRevision: number; pageIndex: number; shapeId: number; cropSprite?: boolean; text?: string;
+    boundsPt?: [number, number, number, number];
+    style?: {bold?:boolean;italic?:boolean;fontSizePt?:number;fontColor?:string;fill?:string};
+    cells?: Array<{row:number;column:number;text:string}>;
+  }, assertAuthorized?: () => void | Promise<void>): Promise<{png: Buffer; revision: number; sha256: string}> {
+    await assertAuthorized?.();
+    const snapshot = this.readCurrentRevision(userId, artifactId, DOCUMENT_WORKER_MAX_INPUT_BYTES);
+    const {artifact, revision, bytes} = snapshot;
+    if (this.registry.resolve(artifact.filename, artifact.previewKind).format !== 'pptx' ||
+        documentFormatConstraint('pptx', artifact.filename, 'edit', artifact.previewKind)) {
+      throw unsupportedOperationError('render_png', 'unsupported_by_format', 'Editable PPTX required.');
+    }
+    if (revision.revision !== draft.expectedRevision) {
+      throw new ArtifactError('ARTIFACT_CONFLICT', 'ファイルが更新されました。', 409);
+    }
+    const validBounds = draft.boundsPt === undefined ||
+      (draft.boundsPt.length === 4 && draft.boundsPt.every(Number.isFinite) &&
+        Math.abs(draft.boundsPt[0]) <= 14400 && Math.abs(draft.boundsPt[1]) <= 14400 &&
+        draft.boundsPt[2] >= 1 && draft.boundsPt[2] <= 14400 && draft.boundsPt[3] >= 1 && draft.boundsPt[3] <= 14400);
+    if (!Number.isInteger(draft.pageIndex) || draft.pageIndex < 0 ||
+        !Number.isSafeInteger(draft.shapeId) || draft.shapeId < 1 || !validBounds ||
+        (draft.text !== undefined && (typeof draft.text !== 'string' || draft.text.length > 20000)) ||
+        (draft.cells?.some(cell=>!Number.isSafeInteger(cell.row)||cell.row<0||
+          !Number.isSafeInteger(cell.column)||cell.column<0||typeof cell.text!=='string'||cell.text.length>20_000)) ||
+        (draft.text === undefined && draft.boundsPt === undefined && draft.style === undefined && !draft.cells?.length)) {
+      throw new ArtifactError('INVALID_INPUT', 'Invalid draft sprite request.', 400);
+    }
+    const structure = JSON.parse((await this.documentWorker.run('pptx', artifact.filename, bytes, {action:'structure'})).toString('utf8')) as {slides?:Array<{part:string}>};
+    const slidePart = structure.slides?.[draft.pageIndex]?.part;
+    if (!slidePart) throw new ArtifactError('INVALID_INPUT', 'Selected slide is unavailable.', 400);
+    const operations: AdapterOperation[] = [];
+    if (draft.text !== undefined) operations.push({op:'pptx.set_shape_text', slidePart, shapeId:draft.shapeId, text:draft.text});
+    if (draft.boundsPt !== undefined) operations.push({op:'pptx.set_shape_bounds', slidePart, shapeId:draft.shapeId, boundsPt:draft.boundsPt});
+    for(const {row,column,text} of draft.cells??[]){
+      operations.push({op:'pptx.set_table_cell',slidePart,shapeId:draft.shapeId,row,column,text});
+    }
+    if(draft.style!==undefined){
+      const {bold,italic,fontSizePt,fontColor,fill}=draft.style;
+      if(Object.keys(draft.style).some(k=>!['bold','italic','fontSizePt','fontColor','fill'].includes(k))||
+        (bold!==undefined&&typeof bold!=='boolean')||(italic!==undefined&&typeof italic!=='boolean')||
+        (fontSizePt!==undefined&&(!Number.isFinite(fontSizePt)||fontSizePt<6||fontSizePt>200))||
+        [fontColor,fill].some(v=>v!==undefined&&!/^#[0-9a-fA-F]{6}$/.test(v))){
+        throw new ArtifactError('INVALID_INPUT','Invalid draft style.',400);
+      }
+      operations.push({op:'pptx.set_shape_style',slidePart,shapeId:draft.shapeId,...draft.style});
+    }
+    await assertAuthorized?.();
+    const edited = await this.documentWorker.run('pptx', artifact.filename, bytes, {action:'edit',operations});
+    await assertAuthorized?.();
+    const png = await this.documentWorker.run('pptx', artifact.filename, edited, {action:'render',pageIndex:draft.pageIndex,variant:'sprite',shapeId:draft.shapeId,cropSprite:draft.cropSprite});
+    await assertAuthorized?.();
+    this.assertRenderPng(png);
+    return {png,revision:revision.revision,sha256:revision.sha256};
+  }
+
+  /** Render the selected slide after applying the ordered draft to an isolated copy. */
+  async renderPptxDraftSlide(userId:string,artifactId:string,draft:{
+    expectedRevision:number;pageIndex:number;operation?:AdapterOperation;operations?:AdapterOperation[];
+    variant?:'background'|'sprite';draftShapeKey?:string;
+  },assertAuthorized?:()=>void|Promise<void>):Promise<{png:Buffer;revision:number;sha256:string}>{
+    await assertAuthorized?.();
+    const {artifact,revision,bytes}=this.readCurrentRevision(userId,artifactId,DOCUMENT_WORKER_MAX_INPUT_BYTES);
+    if(this.registry.resolve(artifact.filename,artifact.previewKind).format!=='pptx'||
+      documentFormatConstraint('pptx',artifact.filename,'edit',artifact.previewKind)){
+      throw unsupportedOperationError('render_png','unsupported_by_format','Editable PPTX required.');
+    }
+    if(revision.revision!==draft.expectedRevision)throw new ArtifactError('ARTIFACT_CONFLICT','ファイルが更新されました。',409);
+    if(!Number.isSafeInteger(draft.pageIndex)||draft.pageIndex<0)throw new ArtifactError('INVALID_INPUT','Invalid slide index.',400);
+    const structure=JSON.parse((await this.documentWorker.run('pptx',artifact.filename,bytes,{action:'structure'})).toString('utf8')) as {slides?:Array<{part:string}>;layouts?:Array<{part:string}>};
+    if (draft.operations) {
+      const parts = new Set(structure.slides?.map(slide => slide.part));
+      const layouts = new Set(structure.layouts?.map(layout => layout.part));
+      const slides = [...parts];
+      const draftSlideKeys = new Set<string>();
+      for (const op of draft.operations) {
+        const index = Number(op.index);
+        switch (op.op) {
+          case 'pptx.add_slide': {
+            const key = typeof op.draftSlideKey === 'string' ? op.draftSlideKey : '';
+            if (!layouts.has(String(op.layoutPart)) || index > slides.length || (key && draftSlideKeys.has(key))) {
+              throw new ArtifactError('INVALID_INPUT','Invalid slide insertion.',400);
+            }
+            if (key) draftSlideKeys.add(key);
+            slides.splice(index, 0, key);
+            break;
+          }
+          case 'pptx.remove_slide':
+            if (slides.length <= 1 || index >= slides.length) throw new ArtifactError('INVALID_INPUT','Cannot remove this slide.',400);
+            slides.splice(index, 1);
+            break;
+          case 'pptx.reorder_slide': {
+            const destination = Number(op.toIndex);
+            if (index >= slides.length || destination >= slides.length) throw new ArtifactError('INVALID_INPUT','Invalid destination slide.',400);
+            slides.splice(destination, 0, slides.splice(index, 1)[0]);
+            break;
+          }
+          default: {
+            const validTarget = typeof op.draftSlideKey === 'string'
+              ? op.slidePart === undefined && slides.includes(op.draftSlideKey)
+              : parts.has(String(op.slidePart));
+            if (!validTarget) throw new ArtifactError('INVALID_INPUT','Slide identity mismatch.',400);
+          }
+        }
+      }
+      if (draft.pageIndex >= slides.length) throw new ArtifactError('INVALID_INPUT','Selected slide is unavailable.',400);
+      await assertAuthorized?.();
+      let png: Buffer;
+      if (draft.variant) {
+        png = await this.documentWorker.run('pptx', artifact.filename, bytes, {
+          action:'pptx_draft_layer', operations:draft.operations, pageIndex:draft.pageIndex,
+          variant:draft.variant, draftShapeKey:draft.draftShapeKey,
+        });
+      } else {
+        const edited = await this.documentWorker.run('pptx', artifact.filename, bytes, {action:'edit',operations:draft.operations});
+        await assertAuthorized?.();
+        png = await this.documentWorker.run('pptx', artifact.filename, edited, {action:'render',pageIndex:draft.pageIndex});
+      }
+      await assertAuthorized?.(); this.assertRenderPng(png);
+      return {png,revision:revision.revision,sha256:revision.sha256};
+    }
+    const slides=structure.slides??[],slidePart=slides[draft.pageIndex]?.part;
+    if(!slidePart)throw new ArtifactError('INVALID_INPUT','Selected slide is unavailable.',400);
+    const input=draft.operation;
+    if(!input)throw new ArtifactError('INVALID_INPUT','A draft operation is required.',400);
+    let operation:AdapterOperation,outputIndex=draft.pageIndex;
+    switch(input.op){
+      case 'pptx.add_shape':case 'pptx.add_image':case 'pptx.add_table':{
+        // Route schema bounds the payload. Rebind target identity server-side.
+        if(input.slidePart!==slidePart)throw new ArtifactError('INVALID_INPUT','Slide identity mismatch.',400);
+        operation=input;break;
+      }
+      case 'pptx.remove_shape':{
+        if(input.slidePart!==slidePart||!Number.isSafeInteger(input.shapeId)||Number(input.shapeId)<1)throw new ArtifactError('INVALID_INPUT','Invalid shape selection.',400);
+        operation={op:input.op,slidePart,shapeId:input.shapeId};break;
+      }
+      case 'pptx.add_slide':{
+        if(input.index!==draft.pageIndex+1||!structure.layouts?.some(layout=>layout.part===input.layoutPart))throw new ArtifactError('INVALID_INPUT','Invalid slide layout or insertion index.',400);
+        outputIndex=draft.pageIndex+1;
+        operation={op:input.op,index:outputIndex,layoutPart:input.layoutPart};break;
+      }
+      case 'pptx.remove_slide':{
+        if(input.index!==draft.pageIndex||slides.length<2)throw new ArtifactError('INVALID_INPUT','Cannot remove this slide.',400);
+        outputIndex=Math.min(draft.pageIndex,slides.length-2);operation={op:input.op,index:draft.pageIndex};break;
+      }
+      case 'pptx.reorder_slide':{
+        const to=Number(input.toIndex);
+        if(input.index!==draft.pageIndex||!Number.isInteger(to)||to<0||to>=slides.length)throw new ArtifactError('INVALID_INPUT','Invalid destination slide.',400);
+        outputIndex=to;operation={op:input.op,index:draft.pageIndex,toIndex:to};break;
+      }
+      default:throw new ArtifactError('INVALID_INPUT','Unsupported preview operation.',400);
+    }
+    await assertAuthorized?.();
+    const edited=await this.documentWorker.run('pptx',artifact.filename,bytes,{action:'edit',operations:[operation]});
+    await assertAuthorized?.();
+    const png=await this.documentWorker.run('pptx',artifact.filename,edited,{action:'render',pageIndex:outputIndex});
+    await assertAuthorized?.();this.assertRenderPng(png);
+    return {png,revision:revision.revision,sha256:revision.sha256};
+  }
+
   async renderPng(
     userId: string,
     artifactId: string,
-    options: { pageIndex?: number; timeSeconds?: number; variant?: 'background' | 'sprite'; shapeId?: number; region?: { x: number; y: number; width: number; height: number; unit?: 'norm' | 'px' | 'pt' } } = {}
+    options: { pageIndex?: number; timeSeconds?: number; frameSample?: {timestampSec: number; sha256: string}; variant?: 'background' | 'sprite'; shapeId?: number; cropSprite?: boolean; region?: { x: number; y: number; width: number; height: number; unit?: 'norm' | 'px' | 'pt' } } = {},
+    expectedRevision?: number,
   ): Promise<{ png: Buffer; revision: number; sha256: string }> {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', 'Artifact not found.', 404);
     const format = this.registry.resolve(artifact.filename, artifact.previewKind).format;
     if (options.variant && (format !== 'pptx' || (options.variant === 'sprite' && options.shapeId === undefined))) {
       throw new ArtifactError('INVALID_RENDER_VARIANT', 'Choose a PPTX slide and shape for the requested rendition.', 422);
+    }
+    if (options.cropSprite && (options.variant !== 'sprite' || options.region)) {
+      throw new ArtifactError('INVALID_RENDER_VARIANT', 'Crop-to-ink requires a sprite without a region.', 422);
     }
     if (options.region) {
       const { x, y, width, height, unit = 'norm' } = options.region;
@@ -4519,6 +4998,9 @@ export class ArtifactService {
     const constraint = documentFormatConstraint(format, artifact.filename, 'render_png', artifact.previewKind);
     if (constraint) throw unsupportedOperationError('render_png', 'unsupported_by_format', constraint);
     const snapshot = this.readCurrentRevision(userId, artifactId, DOCUMENT_WORKER_MAX_INPUT_BYTES);
+    if (expectedRevision !== undefined && snapshot.revision.revision !== expectedRevision) {
+      throw artifactConflictError('描画対象の版が変更されました。', { artifactId, expectedRevision });
+    }
     const source = snapshot.bytes;
     const dependencies = isWebRenderFormat(format) || format === 'svg'
       ? this.readRenderDependencies(snapshot.artifact, snapshot.revision.revision, DOCUMENT_WORKER_MAX_INPUT_BYTES - source.length)
@@ -4526,6 +5008,11 @@ export class ArtifactService {
     const png = artifact.mimeType === 'image/png' && !this.documentWorker.available && !options.region
       ? source
       : await this.documentWorker.run(format, artifact.filename, source, { action: 'render', ...options }, [], { entry: artifact.relPath, dependencies });
+    this.assertRenderPng(png);
+    return { png, revision: snapshot.revision.revision, sha256: snapshot.revision.sha256 };
+  }
+
+  private assertRenderPng(png: Buffer): void {
     if (png.length < 24 || png.length > 16 * 1024 * 1024 ||
       !png.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex')) ||
       png.toString('ascii', 12, 16) !== 'IHDR' ||
@@ -4533,7 +5020,6 @@ export class ArtifactService {
       png.readUInt32BE(20) < 1 || png.readUInt32BE(20) > 8192) {
       throw new ArtifactError('INVALID_RENDER_IMAGE', 'Invalid or oversized PNG.', 422);
     }
-    return { png, revision: snapshot.revision.revision, sha256: snapshot.revision.sha256 };
   }
 
   async verifyArtifact(
@@ -4731,24 +5217,128 @@ export class ArtifactService {
     return { artifact: created.artifact, exported };
   }
 
-  resolveTargetOnArtifact(
+  withArtifactLock<T>(artifactId: string, run: () => T | Promise<T>): Promise<T> {
+    return this.lockManager.withLock(`artifact:${artifactId}`, async () => run());
+  }
+
+  matchesCurrentArtifactFile(userId: string, artifactId: string, revision: number): boolean {
+    const artifact = this.db.getArtifact(userId, artifactId);
+    if (!artifact || artifact.deletedOnDisk || artifact.revision !== revision) return false;
+    const root = this.resolveScopeRootDir(userId, artifact.scopeKind, artifact.chatId, artifact.projectId);
+    if (!root) return false;
+    try {
+      const before = openContainedRegularFileNoFollow(root, artifact.relPath);
+      try {
+        if (sha256Fd(before.fd).sha256 !== artifact.sha256) return false;
+        const after = openContainedRegularFileNoFollow(root, artifact.relPath);
+        try {
+          return fingerprintsMatch(before.fingerprint, after.fingerprint);
+        } finally {
+          fs.closeSync(after.fd);
+        }
+      } finally {
+        fs.closeSync(before.fd);
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  async renderTargetRegion(
+    userId: string, artifactId: string, expectedRevision: number,
+    selector: TargetSelector, resolution: TargetResolutionResult,
+  ): Promise<Buffer | null> {
+    if (!this.documentWorker.available || resolution.status !== 'resolved' || !resolution.resolvedCoords) return null;
+    const coords = resolution.resolvedCoords;
+    type Options = Parameters<ArtifactService['renderPng']>[2];
+    let options: Options;
+    if (selector.kind === 'pptx_element' && Number.isSafeInteger(coords.shapeId) && Number(coords.shapeId) > 0) {
+      options = { pageIndex: Number(coords.pageIndex), shapeId: Number(coords.shapeId), variant: 'sprite', cropSprite: true };
+    } else if (selector.kind === 'pptx_slide' && selector.pointPt && coords.unit === 'pt') {
+      const pageIndex = coords.pageIndex;
+      const region = pointRegionPt(coords);
+      if (typeof pageIndex !== 'number' || !Number.isSafeInteger(pageIndex) || pageIndex < 0 || !region) return null;
+      options = { pageIndex, region };
+    } else if (selector.kind === 'pptx_region' && Array.isArray(coords.rectPt)) {
+      const [x, y, width, height] = coords.rectPt as number[];
+      if (!(width > 0 && height > 0)) return null;
+      options = { pageIndex: Number(coords.pageIndex), region: { x, y, width, height, unit: 'pt' as const } };
+    } else if ((selector.kind === 'pdf_region' || selector.kind === 'pdf_pin') && Array.isArray(coords.rectPt)) {
+      const [x, y, width, height] = coords.rectPt as number[];
+      const region = selector.kind === 'pdf_pin' ? pointRegionPt({ ...coords, xPt: x, yPt: y })
+        : { x, y, width, height, unit: 'pt' as const };
+      if (!region || !(region.width > 0 && region.height > 0)) return null;
+      options = { pageIndex: Number(coords.pageIndex), region };
+    } else if (selector.kind.startsWith('image_') && coords.region) {
+      options = { region: coords.region as NonNullable<Options>['region'] };
+    } else {
+      return null;
+    }
+    const result = await this.renderPng(userId, artifactId, options, expectedRevision);
+    return result.revision === expectedRevision && validateRegionPng(result.png) ? result.png : null;
+  }
+
+  async resolveTargetOnArtifact(
     userId: string,
     artifactId: string,
-    selector: TargetSelector
-  ): TargetResolutionResult {
+    selector: TargetSelector,
+    baseRevision?: number,
+    snippetHint?: string,
+  ): Promise<TargetResolutionResult> {
     const artifact = this.db.getArtifact(userId, artifactId);
     if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
     const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
     if (!adapter.targetPinSupported) {
       throw unsupportedOperationError('target_pin', 'unsupported_by_format', `形式 '${adapter.format}' は対象指定に対応していません。`);
     }
-    const buf = this.readActiveArtifactBytes(artifact);
-    if (!buf) return { status: 'stale', reason: 'artifact_file_missing' };
-    return adapter.resolveTarget(buf, selector, {
-      filename: artifact.filename,
-      relPath: artifact.relPath,
-      mimeType: artifact.mimeType,
-    });
+    if (!selectorIsAvailable(selector) || !(selectorsForFormat(adapter.format, artifact.filename, artifact.previewKind) as string[]).includes(selector.kind)) {
+      return { status: 'needs_review', reason: 'unsupported_selector_kind' };
+    }
+    if (!targetSelectorSchema.safeParse(selector).success || !selectorMatchesFormat(selector, adapter.format, artifact.previewKind)) {
+      return { status: 'needs_review', reason: 'invalid_target_selector' };
+    }
+    baseRevision ??= selector.baseRevision;
+    if (baseRevision !== selector.baseRevision || baseRevision === undefined || baseRevision > artifact.revision ||
+        (baseRevision !== artifact.revision && !this.db.db.prepare(
+          'SELECT 1 FROM artifact_revisions WHERE artifact_id = ? AND user_id = ? AND revision = ?'
+        ).get(artifactId, userId, baseRevision))) {
+      return { status: 'needs_review', reason: 'invalid_base_revision' };
+    }
+    if (baseRevision !== artifact.revision && selector.kind === 'svg_region') {
+      const base = this.db.db.prepare(
+        'SELECT dependency_manifest_hash FROM artifact_revisions WHERE artifact_id = ? AND user_id = ? AND revision = ?',
+      ).get(artifactId, userId, baseRevision);
+      if (!base || base.dependency_manifest_hash !== artifact.dependencyManifestHash) {
+        return { status: 'needs_review', reason: 'target_render_dependencies_changed' };
+      }
+    }
+    const rootDir = this.resolveScopeRootDir(artifact.userId, artifact.scopeKind, artifact.chatId, artifact.projectId);
+    if (!rootDir) return { status: 'stale', reason: 'artifact_file_missing' };
+    let baseSnapshot;
+    let releasePin;
+    const needsGridBase = baseRevision !== artifact.revision &&
+      ['csv_range', 'csv_row_col', 'xlsx_range', 'xlsx_row_col'].includes(selector.kind);
+    if (['code_line_range', 'code_char_range', 'md_text_range', 'html_source_range', 'mermaid_source_range'].includes(selector.kind) || needsGridBase) {
+      try {
+        const base = this.getRevisionContentBlob(userId, artifactId, baseRevision);
+        releasePin = this.blobManager.pinBlob(userId, base.revision.sha256);
+        baseSnapshot = { path: base.blobPath, sizeBytes: base.sizeBytes, sha256: base.revision.sha256 };
+      } catch {
+        if (needsGridBase) return { status: 'needs_review', reason: 'base_revision_content_unavailable' };
+        // A legacy source request can still resolve from a hash-verified snippet and context.
+      }
+    }
+    try {
+      const resolution = await inspectArtifactTarget<TargetResolutionResult>({
+        file: artifact, rootDir, selector, expectedSha256: artifact.sha256, snippetHint, baseSnapshot,
+      });
+      const latest = this.db.getArtifact(userId, artifactId);
+      if (!latest) return { status: 'stale', reason: 'artifact_file_missing' };
+      if (latest.revision !== artifact.revision) return { status: 'needs_review', reason: 'revision_changed_during_resolution' };
+      return resolution;
+    } finally {
+      releasePin?.();
+    }
   }
 
   listHistory(userId: string, artifactId: string): ArtifactRevisionRecord[] {
@@ -4848,12 +5438,14 @@ export class ArtifactService {
       .prepare('SELECT rel_path, sha256 FROM artifact_revision_deps WHERE artifact_id = ? AND revision = ?')
       .all(artifact.id, artifact.revision) as Array<{ rel_path: string; sha256: string | null }>;
     const curMap = new Map(currentDeps.map((d) => [d.rel_path, d.sha256]));
-    const dependencyDiff = targetDeps
-      .filter((td) => curMap.get(td.rel_path) !== td.sha256)
-      .map((td) => ({
-        relPath: td.rel_path,
-        targetSha256: td.sha256,
-        currentSha256: curMap.get(td.rel_path) ?? null,
+    const targetMap = new Map(targetDeps.map((d) => [d.rel_path, d.sha256]));
+    const dependencyPaths = new Set([...targetMap.keys(), ...curMap.keys()]);
+    const dependencyDiff = [...dependencyPaths].sort()
+      .filter((relPath) => targetMap.get(relPath) !== curMap.get(relPath))
+      .map((relPath) => ({
+        relPath,
+        targetSha256: targetMap.get(relPath) ?? null,
+        currentSha256: curMap.get(relPath) ?? null,
       }));
 
     const res = await this.replaceArtifactBytes({
@@ -4927,93 +5519,77 @@ export class ArtifactService {
     return this.undoService.getUndoState({ userId, artifactId: artifact.id, format, actorKind, actorId });
   }
 
-  async undo(params: {
+  private async planActorHistoryMutation(
+    artifact: ArtifactRecord,
+    file: ReturnType<typeof readContainedRegularFileNoFollowStable> | null,
+    actorKind: ActorKind,
+    actorId: string | null,
+    direction: 'undo' | 'redo',
+  ) {
+    if (!file || file.sha256 !== artifact.sha256) {
+      throw new ArtifactError('UNDO_SEMANTIC_CONFLICT', '現在のファイルの内容を確認できません。', 409);
+    }
+    const format = detectArtifactFormat(artifact.filename, artifact.previewKind);
+    const plan = this.undoService.plan({ ...artifact, artifactId: artifact.id, format, actorKind, actorId }, direction);
+    const { target, parent, direct } = plan;
+    if (plan.current.revision !== artifact.revision) {
+      throw new ArtifactError('UNDO_SEMANTIC_CONFLICT', '現在の履歴を確認できません。', 409);
+    }
+    const read = (revision: ArtifactRevisionRecord) => {
+      const bytes = revision.blobSha256 && this.blobManager.readBlob(artifact.userId, revision.blobSha256);
+      if (!bytes || crypto.createHash('sha256').update(bytes).digest('hex') !== revision.sha256) {
+        throw new ArtifactError(direction === 'undo' ? 'UNDO_HISTORY_PRUNED' : 'REDO_HISTORY_PRUNED',
+          '履歴スナップショットが利用できません。', 422, { reason: 'history_pruned' });
+      }
+      return bytes;
+    };
+    const from = read(direction === 'undo' ? target : parent);
+    const to = read(direction === 'undo' ? parent : target);
+    const scope = target.operationPayload?.semanticScope as { kind?: string; regionKeys?: string[] } | undefined;
+    let newBuffer = to;
+    if (!direct) {
+      if (format === 'pptx' || format === 'xlsx') {
+        newBuffer = replayOfficeEdit(format, file.buffer, from, to, scope?.regionKeys ?? []);
+      } else if (format === 'pdf') {
+        newBuffer = await replayPdfRotation(file.buffer, from, to, scope?.regionKeys ?? [], operations =>
+          this.documentWorker.run('pdf', artifact.filename, file.buffer, { action: 'edit', operations }));
+      } else {
+        newBuffer = replayCsvCellEdit(artifact.filename, file.buffer, from, to, scope?.regionKeys);
+      }
+    }
+    return {
+      expectedRevision: artifact.revision,
+      newBuffer,
+      operationSummary: `${direction === 'undo' ? 'Undo' : 'Redo'} revision ${target.revision}`,
+      operationPayload: {
+        operationReplayVersion: 1,
+        ...(direction === 'undo' ? { undoOfRevision: target.revision } : { redoOfRevision: target.revision }),
+      },
+    };
+  }
+
+  private async replayActorEdit(params: {
     userId: string;
     artifactId: string;
     actorKind: ActorKind;
     actorId: string | null;
     idempotencyKey?: string;
     assertAuthorized?: () => void | Promise<void>;
-  }): Promise<{ artifact: ArtifactRecord; undoState: UndoStateSummary }> {
-    await params.assertAuthorized?.();
-    let artifact = this.db.getArtifact(params.userId, params.artifactId);
-    if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
-    artifact = this.ensureLegacyHistoryMigrated(artifact);
-    const format = detectArtifactFormat(artifact.filename, artifact.previewKind);
-    const plan = this.undoService.planUndo({
-      userId: params.userId,
-      artifactId: artifact.id,
-      format,
-      actorKind: params.actorKind,
-      actorId: params.actorId,
-    });
-    const buf = this.blobManager.readBlob(params.userId, plan.restoreBlobSha256);
-    if (!buf) {
-      throw new ArtifactError('UNDO_HISTORY_PRUNED', '履歴スナップショットが利用できません。', 422, {
-        reason: 'history_pruned',
-      });
-    }
-    const res = await this.replaceArtifactBytes({
-      userId: params.userId,
-      artifactId: artifact.id,
-      expectedRevision: artifact.revision,
-      newBuffer: buf,
-      actorKind: params.actorKind,
-      actorId: params.actorId,
-      operationType: 'undo',
-      operationSummary: `Undo revision ${plan.undoneRevision} (to rev ${plan.restoreFromRevision})`,
-      operationPayload: { undoOfRevision: plan.undoneRevision, restoredFromRevision: plan.restoreFromRevision },
-      idempotencyKey: params.idempotencyKey,
-      assertAuthorized: params.assertAuthorized,
+  }, direction: 'undo' | 'redo') {
+    const { artifact } = await this.replaceArtifactBytes({
+      ...params, historyDirection: direction, operationType: direction,
     });
     return {
-      artifact: res.artifact,
+      artifact,
       undoState: this.getUndoState(params.userId, artifact.id, params.actorKind, params.actorId),
     };
   }
 
-  async redo(params: {
-    userId: string;
-    artifactId: string;
-    actorKind: ActorKind;
-    actorId: string | null;
-    idempotencyKey?: string;
-    assertAuthorized?: () => void | Promise<void>;
-  }): Promise<{ artifact: ArtifactRecord; undoState: UndoStateSummary }> {
-    await params.assertAuthorized?.();
-    let artifact = this.db.getArtifact(params.userId, params.artifactId);
-    if (!artifact) throw new ArtifactError('NOT_FOUND', '成果物が見つかりません。', 404);
-    artifact = this.ensureLegacyHistoryMigrated(artifact);
-    const format = detectArtifactFormat(artifact.filename, artifact.previewKind);
-    const plan = this.undoService.planRedo({
-      userId: params.userId,
-      artifactId: artifact.id,
-      format,
-      actorKind: params.actorKind,
-      actorId: params.actorId,
-    });
-    const buf = this.blobManager.readBlob(params.userId, plan.restoreBlobSha256);
-    if (!buf) {
-      throw new ArtifactError('REDO_HISTORY_PRUNED', 'やり直し対象のスナップショットが利用できません。', 422, {
-        reason: 'history_pruned',
-      });
-    }
-    const res = await this.replaceArtifactBytes({
-      userId: params.userId,
-      artifactId: artifact.id,
-      expectedRevision: artifact.revision,
-      newBuffer: buf,
-      actorKind: params.actorKind,
-      actorId: params.actorId,
-      operationType: 'redo',
-      operationSummary: `Redo revision ${plan.restoreFromRevision}`,
-      operationPayload: { redoOfRevision: plan.restoreFromRevision },
-      idempotencyKey: params.idempotencyKey,
-      assertAuthorized: params.assertAuthorized,
-    });
-    return {
-      artifact: res.artifact,
-      undoState: this.getUndoState(params.userId, artifact.id, params.actorKind, params.actorId),
-    };
+  undo(params: Parameters<ArtifactService['replayActorEdit']>[0]) {
+    return this.replayActorEdit(params, 'undo');
+  }
+
+  redo(params: Parameters<ArtifactService['replayActorEdit']>[0]) {
+    return this.replayActorEdit(params, 'redo');
   }
 }

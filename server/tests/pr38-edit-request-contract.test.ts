@@ -1,0 +1,553 @@
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { afterEach, expect, it, vi } from 'vitest';
+import { readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { randomUUID, createHash } from 'node:crypto';
+import { EditRequestService, type AiEditRequestRecord } from '../src/edit-requests/edit-request-service.js';
+import { canonicalJson } from '../src/artifacts/idempotency-coordinator.js';
+import { FormatAdapterRegistry } from '../src/artifacts/adapters/registry.js';
+import { targetSelectorSchema } from '../src/artifacts/target-selector-schema.js';
+import { ResourceGovernor } from '../src/artifacts/resource-governor.js';
+import { DocumentWorker } from '../src/artifacts/document-worker.js';
+import { readPptxSlideTargets } from '../src/artifacts/adapters/ooxml-target.js';
+import { strToU8, zipSync } from 'fflate';
+import { buildSyntheticPng } from '../../e2e/fixtures/syntheticAssets.js';
+import { loadConfig } from '../src/config.js';
+import { createTestServer, registerAndBindAgy, seedAuthenticatedMockProfile, TestApiClient } from './helpers/test-harness.js';
+
+const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aMFAAAAAASUVORK5CYII=', 'base64');
+const cleanups: Array<() => Promise<void>> = [];
+afterEach(async () => {
+  vi.restoreAllMocks();
+  while (cleanups.length) await cleanups.pop()!();
+});
+
+it('validates source pins through REST, rolls back reorder and state events, and reconfirms a fresh target for MCP', async () => {
+  const srv = await createTestServer();
+  cleanups.push(srv.cleanup);
+  const { ctx } = srv;
+  const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+  const { data: { chat: { id: chatId } } } = await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Edit requests' });
+  const base = `/api/chats/${chatId}/edit-requests`;
+  const { artifact } = await ctx.artifactService.createArtifact({
+    userId, chatId, scopeKind: 'chat', relPath: 'notes.ts',
+    content: Buffer.from('old before\nold choice\nold after'), actorKind: 'user',
+  });
+  const selector = (revision: number, before: string, value: string, after: string) => ({
+    kind: 'code_line_range', baseRevision: revision, startLine: 2, endLine: 2, occurrenceIndex: 0,
+    expectedSnippetHash: hash(value), contextBeforeHash: hash(before), contextAfterHash: hash(after),
+  });
+  const original = selector(1, 'old before', 'old choice', 'old after');
+  const input = {
+    targetKind: 'artifact', artifactId: artifact.id, selector: original,
+    contentCoords: { x: 20 }, regionImagePngBase64: png.toString('base64'), instruction: 'Update choice',
+  };
+  const post = (body: unknown) => client.request<{ request: AiEditRequestRecord }>('POST', base, body);
+  expect((await post({ ...input, selector: { ...original, expectedSnippetHash: undefined } })).status).toBe(400);
+  expect((await post({ ...input, selector: { ...original, baseRevision: 2 } })).status).toBe(409);
+  expect((await post({ ...input, selector: { ...original, expectedSnippetHash: hash('wrong') } })).status).toBe(409);
+  const created = await post(input);
+  expect(created.status, JSON.stringify(created.data)).toBe(201);
+  const first = created.data.request;
+  const second = (await post({ ...input, instruction: 'Second' })).data.request;
+  expect(first.selectedContentSnapshot).toBe('old choice');
+  expect(first.regionImageBlobSha256).toBeNull();
+  expect(first.contentCoords).toBeNull();
+  await expect(ctx.editRequestService.resolveByUser(userId, chatId, first.id)).rejects.toThrow();
+  expect(() => ctx.editRequestService.markAppliedByAgent({ userId, chatId, requestId: first.id, appliedRevision: 1 }))
+    .toThrow(expect.objectContaining({ code: 'EDIT_REQUEST_NOT_SENT' }));
+
+  const insert = ctx.db.insertSyncEventInTx.bind(ctx.db);
+  const latest = ctx.db.getLatestUserSyncSeq(userId);
+  const fault = vi.spyOn(ctx.db, 'insertSyncEventInTx').mockImplementation(event => {
+    const envelope = insert(event);
+    if (event.type === 'edit_request.reordered') throw new Error('event insert fault');
+    return envelope;
+  });
+  expect(() => ctx.editRequestService.reorderDrafts(userId, chatId, [second.id, first.id])).toThrow('event insert fault');
+  expect(ctx.db.getLatestUserSyncSeq(userId)).toBe(latest);
+  expect(ctx.editRequestService.listRequests(userId, chatId).map(r => r.id)).toEqual([first.id, second.id]);
+  fault.mockRestore();
+  const otherDevice = new TestApiClient(srv.baseUrl);
+  expect((await otherDevice.request('POST', '/api/auth/login', { username: 'alice', password: 'password123' })).status).toBe(200);
+  await client.connectWs({ clientId: 'order-origin' });
+  await otherDevice.connectWs({ clientId: 'order-listener' });
+  expect((await client.request('POST', base + '/reorder', { orderedIds: [second.id, first.id] })).status).toBe(200);
+  await otherDevice.waitForFrame(frame => frame.kind === 'event' && (frame.event as { type?: string })?.type === 'edit_request.reordered');
+  const listed = (await otherDevice.request<{ requests: AiEditRequestRecord[] }>('GET', base)).data.requests;
+  expect(listed.map(r => [r.id, r.createdAt])).toEqual([[second.id, second.createdAt], [first.id, first.createdAt]]);
+
+  const submit = (clientMessageId = randomUUID()) => client.request<{ batchId: string; requests: AiEditRequestRecord[] }>(
+    'POST', base + '/send-batch', { requestIds: [first.id], clientMessageId },
+  );
+  expect((await client.request('POST', base + '/send-batch', { requestIds: [first.id] })).status).toBe(400);
+  expect(ctx.editRequestService.getRequest(userId, chatId, first.id)?.status).toBe('draft');
+  const messageId = randomUUID();
+  const beforeSend = vi.spyOn(ctx.db, 'insertSyncEventInTx').mockImplementation(event => {
+    if (event.type === 'edit_request.batch_sent') throw Error('failed to persist batch event');
+    return insert(event);
+  });
+  expect((await submit(messageId)).status).toBeGreaterThanOrEqual(400);
+  expect(ctx.db.findMessageByClientId(userId, chatId, messageId)).toBeNull();
+  expect(ctx.editRequestService.getRequest(userId, chatId, first.id)?.status).toBe('draft');
+  beforeSend.mockRestore();
+  const originalBatch = await submit(messageId);
+  expect(originalBatch.status, JSON.stringify(originalBatch.data)).toBe(200);
+  expect(originalBatch.data.requests[0].sentMessageId).toBe(ctx.db.findMessageByClientId(userId, chatId, messageId)?.id);
+  expect((await submit(messageId)).data.batchId).toBe(originalBatch.data.batchId);
+  const failedEvent = vi.fn();
+  const revalidationFault = vi.spyOn(ctx.db, 'insertSyncEventInTx').mockImplementation(event => {
+    const envelope = insert(event);
+    if (event.type === 'edit_request.updated' &&
+        (event.payload.editRequest as AiEditRequestRecord).id === first.id) {
+      failedEvent();
+      throw Error('revalidation event insert fault');
+    }
+    return envelope;
+  });
+  await ctx.artifactService.replaceArtifactBytes({
+    userId, artifactId: artifact.id, expectedRevision: 1, actorKind: 'user', actorId: userId,
+    newBuffer: Buffer.from('new before\nnew choice\nnew after'), operationType: 'replace', operationSummary: 'changed',
+  });
+  await expect.poll(() => failedEvent.mock.calls.length, { timeout: 12_000 }).toBe(1);
+  expect(ctx.editRequestService.getRequest(userId, chatId, first.id)?.status).toBe('sent');
+  revalidationFault.mockRestore();
+  const drifted = await ctx.editRequestService.getForAgent(userId, chatId, first.id);
+  expect(drifted).toMatchObject({ status: 'needs_review', reResolution: { status: 'needs_review' } });
+  expect(ctx.editRequestService.getRequest(userId, chatId, first.id)?.status).toBe('needs_review');
+  expect((await submit()).status).toBe(409);
+  const reconfirm = (newBaseRevision: number, newSelector: Record<string, unknown>) =>
+    client.request<{ request: AiEditRequestRecord }>('POST', `${base}/${first.id}/reconfirm`, { newBaseRevision, newSelector });
+  expect((await reconfirm(1, original)).status).toBe(409);
+  const next = selector(2, 'new before', 'new choice', 'new after');
+  expect((await reconfirm(2, { ...next, contextAfterHash: undefined })).status).toBe(400);
+  const fresh = (await reconfirm(2, next)).data.request;
+  expect(fresh).toMatchObject({
+    baseRevision: 2, selector: next, status: 'draft', selectedContentSnapshot: 'new choice',
+    surroundingContext: 'new before\n---\nnew after', range: { startLine: 2, endLine: 2 },
+    contentCoords: null, regionImageBlobSha256: null, batchId: null,
+  });
+  await expect(ctx.editRequestService.getForAgent(userId, chatId, first.id)).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  expect((await submit()).status).toBe(200);
+  const binding = await ctx.mcpService.bindBuiltinArtifactServer({ userId, chatId, tentativeTurn: () => null }, []);
+  const { url, headers } = binding!.server;
+  const mcp = new Client({ name: 'pin-contract-test', version: '1' });
+  await mcp.connect(new StreamableHTTPClientTransport(new URL(url), {
+    requestInit: { headers: Object.fromEntries(headers.map(({name,value}) => [name,value])) },
+  }));
+  try {
+    const result = await mcp.callTool({ name: 'edit_request_get', arguments: { requestId: first.id } });
+    const content = result.content as { type: string; text: string }[];
+    expect(content.map(piece => piece.type)).toEqual(['text']);
+    expect(JSON.parse(content[0].text)).toMatchObject({
+      status: 'sent', untrustedTargetContent: { selectedContentSnapshot: 'new choice' }, reResolution: { status: 'resolved' },
+    });
+    const unproven = await mcp.callTool({ name: 'edit_request_mark_applied', arguments: { requestId: first.id, appliedRevision: 2 } });
+    expect(unproven.isError).toBe(true);
+    const mutation = await mcp.callTool({ name: 'artifact_edit', arguments: {
+      artifactId: artifact.id, expectedRevision: 2, editRequestIds: [first.id], idempotencyKey: 'apply-first-request',
+      operation: { op: 'replace_source', content: 'new before\ncorrected choice\nnew after' },
+    } });
+    expect(mutation.isError, JSON.stringify(mutation)).not.toBe(true);
+    await ctx.editRequestService.revalidateForArtifact(userId, artifact.id, 3);
+    expect(ctx.editRequestService.getRequest(userId, chatId, first.id)?.status).toBe('sent');
+    const applied = await mcp.callTool({ name: 'edit_request_mark_applied', arguments: { requestId: first.id, appliedRevision: 3 } });
+    expect(applied.isError).not.toBe(true);
+    expect(ctx.editRequestService.getRequest(userId, chatId, first.id)?.status).toBe('applied_unverified');
+  } finally {
+    await mcp.close();
+  }
+  const targetFile = path.join(ctx.db.getChat(userId, chatId)!.workspaceDir, artifact.relPath);
+  writeFileSync(targetFile, 'out-of-band modification');
+  await expect(ctx.editRequestService.resolveByUser(userId, chatId, first.id))
+    .rejects.toMatchObject({ code: 'TARGET_CONTENT_DRIFT' });
+  expect(ctx.editRequestService.getRequest(userId, chatId, first.id)?.status).toBe('applied_unverified');
+  writeFileSync(targetFile, 'new before\ncorrected choice\nnew after');
+  expect((await ctx.editRequestService.resolveByUser(userId, chatId, first.id)).status).toBe('resolved');
+  await expect.poll(() => ctx.db.getActiveRunForChat(userId, chatId), { timeout: 12_000 }).toBeNull();
+  client.closeWs();
+  otherDevice.closeWs();
+}, 50_000);
+
+it('rolls back RichBlock revalidation with its event and migrates a legacy invalid selector safely', async () => {
+  const srv = await createTestServer();
+  cleanups.push(srv.cleanup);
+  const { ctx } = srv;
+  const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+  const { data: { chat: { id: chatId } } } = await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Rich request' });
+  const before = { id: 'r', type: 'text' as const, content: 'old' };
+  const document = { schemaVersion: 1 as const, root: before };
+  const { block } = ctx.richContentService.createBlock({ userId, chatId, document });
+  const input = { userId, chatId, richBlockId: block.id, targetKind: 'rich_block' as const, instruction: 'change' };
+  const selector = { kind: 'rich_node', baseRevision: 1, blockId: block.id, nodeId: 'r', expectedNodeType: 'text', expectedNodeFingerprint: hash(canonicalJson(before)) };
+  const request = await ctx.editRequestService.createRequest({ ...input, selector });
+  const legacy = await ctx.editRequestService.createRequest({ ...input, selector });
+  ctx.db.db.prepare("UPDATE ai_edit_requests SET selector_json = json_remove(selector_json, '$.expectedNodeFingerprint') WHERE id = ?").run(legacy.id);
+  new EditRequestService(ctx.db, ctx.hub, ctx.artifactService, ctx.richContentService);
+  expect(ctx.editRequestService.getRequest(userId, chatId, legacy.id)?.status).toBe('needs_review');
+
+  const insert = ctx.db.insertSyncEventInTx.bind(ctx.db);
+  const latest = ctx.db.getLatestUserSyncSeq(userId);
+  const fault = vi.spyOn(ctx.db, 'insertSyncEventInTx').mockImplementation(event => {
+    const envelope = insert(event);
+    if (event.type === 'edit_request.updated') throw Error('event insert fault');
+    return envelope;
+  });
+  const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const patch = { ...before, content: 'new' };
+  ctx.richContentService.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 1, document: { ...document, root: patch } });
+  expect(logged).toHaveBeenCalled();
+  expect(ctx.editRequestService.getRequest(userId, chatId, request.id)?.status).toBe('draft');
+  expect(ctx.db.getLatestUserSyncSeq(userId)).toBe(latest + 1); // Only the RichBlock update committed.
+  fault.mockRestore();
+  expect(ctx.editRequestService.revalidateForRichBlock(userId, chatId, block.id)).toEqual([
+    expect.objectContaining({ id: request.id, status: 'needs_review' }),
+  ]);
+  expect(ctx.db.getLatestUserSyncSeq(userId)).toBe(latest + 2);
+}, 15_000);
+
+it('rechecks memory after a queued heavy worker gets its slot and releases the slot on 503', async () => {
+  let available = 800;
+  const governor = new ResourceGovernor({ ...loadConfig(), docWorkerBudget: 2, minMemAvailableMb: 400 }, () => available);
+  let finish!: () => void;
+  const first = governor.runWithBudget('libreoffice', () => new Promise<void>(resolve => { finish = resolve; }));
+  await expect.poll(() => Boolean(finish)).toBe(true);
+  const start = vi.fn(async () => 'started');
+  const waiting = governor.runWithBudget('chromium', start);
+  expect(start).not.toHaveBeenCalled();
+  await Promise.resolve();
+  available = 399;
+  finish();
+  await first;
+  await expect(waiting).rejects.toMatchObject({ code: 'RESOURCE_BUSY', statusCode: 503 });
+  expect(start).not.toHaveBeenCalled();
+  expect(governor.getUsedWeight()).toBe(0);
+  available = 400;
+  await expect(governor.runWithBudget('chromium', start)).resolves.toBe('started');
+});
+
+
+it('requires the exact registered selector fields and rejects abolished Office subtarget selectors', () => {
+  const body = 'OOXML content';
+  const meta = { filename: 'a.docx', relPath: 'a.docx', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', previewKind: 'docx' as const };
+  const deprecated = { kind: 'docx_table_cell', baseRevision: 1, tableId: 't', row: 0, col: 0, expectedCellHash: hash(body), expectedTableFingerprint: hash('table') };
+  expect(targetSelectorSchema.safeParse(deprecated).success).toBe(false);
+  expect(new FormatAdapterRegistry().resolve(meta.filename, meta.previewKind).resolveTarget(Buffer.from(body), deprecated, meta).status).toBe('needs_review');
+  expect(targetSelectorSchema.safeParse({
+    kind: 'pptx_region', baseRevision: 1, slideId: '1', rectPt: [10, 10, 100, 50], expectedSlideHash: hash('slide'),
+  }).success).toBe(true);
+  expect(targetSelectorSchema.safeParse({
+    kind: 'pptx_region', baseRevision: 1, slideId: '1', rectPt: [10, 10, 100, 50], expectedSlideRenderHash: hash('slide'),
+  }).success).toBe(false);
+  expect(targetSelectorSchema.safeParse({
+    kind: 'code_char_range', baseRevision: 1, startLine: 1, endLine: 2, startCol: 10, endCol: 3,
+    expectedSnippetHash: hash('snippet'), contextBeforeHash: hash('before'), contextAfterHash: hash('after'), occurrenceIndex: 0,
+  }).success).toBe(true);
+});
+
+
+it('uses Base ChatUI media duration and verifies the exact time range against source bytes', async () => {
+  const srv = await createTestServer({ installDocRuntime: 'off', sandboxMode: 'off', allowUnsandboxedDocWorkers: false });
+  cleanups.push(srv.cleanup);
+  const { ctx } = srv;
+  const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+  const chatId = (await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Media target' })).data.chat.id;
+  const wav = Buffer.alloc(44 + 16_000);
+  wav.write('RIFF', 0); wav.writeUInt32LE(wav.length - 8, 4);
+  wav.write('WAVEfmt ', 8); wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(8000, 24); wav.writeUInt32LE(16000, 28);
+  wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34);
+  wav.write('data', 36); wav.writeUInt32LE(wav.length - 44, 40);
+  const { artifact } = await ctx.artifactService.createArtifact({
+    userId, chatId, scopeKind: 'chat', relPath: 'clip.wav', content: wav, actorKind: 'user',
+  });
+  const structure = await ctx.artifactService.getStructure(userId, artifact.id);
+  expect(structure).toMatchObject({ durationSeconds: 1, revision: 1, sha256: artifact.sha256 });
+  const selector = targetSelectorSchema.parse({ kind: 'audio_time_range', baseRevision: 1,
+    startSec: 0.1, endSec: 1, expectedDurationSec: structure.durationSeconds, expectedMediaSha256: structure.sha256 });
+  expect(await ctx.artifactService.resolveTargetOnArtifact(userId, artifact.id, selector)).toMatchObject({
+    status: 'resolved', resolvedCoords: { startSec: 0.1, endSec: 1 },
+  });
+  expect(await ctx.artifactService.resolveTargetOnArtifact(userId, artifact.id, { ...selector, endSec: 1.01 }))
+    .toMatchObject({ status: 'needs_review' });
+
+  const { artifact: video } = await ctx.artifactService.createArtifact({
+    userId, chatId, scopeKind: 'chat', relPath: 'frames.mp4',
+    content: readFileSync(new URL('./fixtures/target-frame-red-blue.mp4', import.meta.url)), actorKind: 'user',
+  });
+  const videoMeta = await ctx.artifactService.readRange(userId, video.id, { targetMetadata: true });
+  expect(videoMeta).toMatchObject({ durationSeconds: 2, widthPx: 32, heightPx: 24 });
+  expect(targetSelectorSchema.safeParse({
+    kind: 'video_frame_region', baseRevision: 1, timestampSec: 0.25, rectNorm: [0.25, 0.25, 0.5, 0.5],
+    expectedDurationSec: 2, expectedWidthPx: 32, expectedHeightPx: 24, expectedFrameSha256: hash('frame'),
+  }).success).toBe(false);
+  const videoSelector = targetSelectorSchema.parse({
+    kind: 'video_time_range', baseRevision: 1, startSec: 0.25, endSec: 1.5,
+    expectedDurationSec: videoMeta.durationSeconds, expectedMediaSha256: video.sha256,
+  });
+  expect(await ctx.artifactService.resolveTargetOnArtifact(userId, video.id, videoSelector)).toMatchObject({
+    status: 'resolved', resolvedCoords: { startSec: 0.25, endSec: 1.5 },
+  });
+  expect(await ctx.artifactService.resolveTargetOnArtifact(userId, video.id, { ...videoSelector, endSec: 2.5 }))
+    .toMatchObject({ status: 'needs_review' });
+
+  const request = await ctx.editRequestService.createRequest({
+    userId, chatId, targetKind: 'artifact', artifactId: video.id, selector: videoSelector, instruction: 'Trim the selected clip',
+  });
+  expect((await client.request('POST', `/api/chats/${chatId}/edit-requests/send-batch`, {
+    requestIds: [request.id], clientMessageId: randomUUID(),
+  })).status).toBe(200);
+  const payload = await ctx.editRequestService.getForAgent(userId, chatId, request.id);
+  expect(payload).toMatchObject({ status: 'sent', targetRevision: 1, reResolution: { status: 'resolved' } });
+  expect(payload.regionImagePngBase64).toBeUndefined();
+  await expect.poll(() => ctx.db.getActiveRunForChat(userId, chatId), { timeout: 12_000 }).toBeNull();
+});
+
+it('validates persisted rich state and resolves a table cell against its captured state and row order', async () => {
+  const srv = await createTestServer();
+  cleanups.push(srv.cleanup);
+  const { ctx } = srv;
+  const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+  const chatId = (await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Rich targets' })).data.chat.id;
+  const rows = [{ name: 'first', value: 'same' }, { name: 'second', value: 'same' }];
+  const document = { schemaVersion: 1, state: { items: rows }, root: {
+    id: 'table', type: 'data_table', columns: [{ key: 'value', label: 'Value' }],
+    rows: { expr: '$theme == "dark" ? $state.items : []' },
+  } };
+  const { block } = ctx.richContentService.createBlock({ userId, chatId, document });
+  const statePath = `/api/chats/${chatId}/rich-blocks/${block.id}/ui-state`;
+  expect((await client.request('PUT', statePath, { uiState: { undeclared: true } })).status).toBe(400);
+  expect((await client.request('PUT', statePath, { uiState: { items: [...rows].reverse() }, theme: 'dark', expectedRevision: 1 })).status).toBe(200);
+  const request = await ctx.editRequestService.createRequest({
+    userId, chatId, targetKind: 'rich_block', richBlockId: block.id, instruction: 'Update first row',
+    selector: { kind: 'rich_table_cell', baseRevision: 1, blockId: block.id, tableNodeId: 'table',
+      row: 0, col: 'value', expectedCellHash: hash('same') },
+    viewStateSnapshot: { state: { items: rows }, theme: 'dark' },
+  });
+  expect(request.selector.expectedRowHash).toBe(hash(canonicalJson(rows[0])));
+  expect((await ctx.editRequestService.resolveRequestTarget(request)).status).toBe('resolved');
+
+  ctx.richContentService.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 1, document: {
+    ...document, root: { ...document.root, rows: [...rows].reverse() },
+  } });
+  expect(ctx.editRequestService.getRequest(userId, chatId, request.id)?.status).toBe('needs_review');
+});
+
+
+it('uses the root SVG viewBox to reject targets outside its visible coordinate range', () => {
+  const bytes = Buffer.from('<svg viewBox="-10 -20 50 60"><svg viewBox="0 0 100 100"/></svg>');
+  const meta = { filename: 'drawing.svg', relPath: 'drawing.svg', mimeType: 'image/svg+xml' };
+  const adapter = new FormatAdapterRegistry().resolve(meta.filename, 'svg');
+  const selector = targetSelectorSchema.parse({ kind: 'svg_region', baseRevision: 1, expectedViewBox: '-10 -20 50 60',
+    expectedSvgSha256: hash(bytes.toString()), rectViewBox: [-10, -20, 50, 60] });
+  expect(adapter.resolveTarget(bytes, selector, meta).status).toBe('resolved');
+  expect(adapter.resolveTarget(bytes, { ...selector, rectViewBox: [-10, -20, 50.01, 60] }, meta))
+    .toMatchObject({ status: 'needs_review', reason: 'svg_region_out_of_bounds' });
+});
+
+it('rechecks dynamic Rich node display against the saved view and base revision and rejects abolished rich_svg_element', async () => {
+  const srv = await createTestServer();
+  cleanups.push(srv.cleanup);
+  const { ctx } = srv;
+  const client = new TestApiClient(srv.baseUrl);
+  const { data: { user } } = await client.request<{ user: { id: string } }>('POST', '/api/auth/register', {
+    username: 'rich-fingerprint', displayName: 'Rich fixture', password: 'password123',
+  });
+  const userId = user.id;
+  seedAuthenticatedMockProfile(ctx, userId);
+  const { data: { chat: { id: chatId } } } = await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Rich target identity' });
+  const text = { id: 'summary', type: 'text' as const, content: { expr: 'formatNumber($computed.total)' } };
+  const circle = { id: 'mark', tag: 'circle' as const, attrs: { cx: 15, cy: 15, r: { expr: '$computed.total' } } };
+  const plot = { id: 'plot', type: 'svg_scene' as const, viewBox: '0 0 30 30', elements: [circle] };
+  const document = {
+    schemaVersion: 1 as const, state: { value: 2, unrelated: 5 },
+    computed: { total: '$state.value + 1' },
+    root: { id: 'root', type: 'stack' as const, direction: 'col' as const, children: [text, plot] },
+  };
+  const { block } = ctx.richContentService.createBlock({ userId, chatId, document });
+  const viewStateSnapshot = { state: { value: 4 }, theme: 'dark' };
+  const makeRequest = (selector: { kind: string; [key: string]: unknown }) => ctx.editRequestService.createRequest({
+    userId, chatId, richBlockId: block.id, targetKind: 'rich_block', instruction: 'Confirm selected display',
+    selector: { ...selector, kind: selector.kind, baseRevision: 1, blockId: block.id }, viewStateSnapshot,
+  });
+  const node = await makeRequest({ kind: 'rich_node', nodeId: text.id, expectedNodeType: text.type,
+    expectedNodeFingerprint: hash(canonicalJson(text)) });
+  await expect(makeRequest({
+    kind: 'rich_svg_element', svgNodeId: plot.id, elementId: circle.id, expectedTag: circle.tag,
+    expectedElementFingerprint: hash(canonicalJson(circle)),
+  })).rejects.toMatchObject({ statusCode: 400 });
+  ctx.richContentService.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 1, patchState: { unrelated: 12 } });
+  expect(await ctx.editRequestService.resolveRequestTarget(node)).toMatchObject({ status: 'resolved' });
+  ctx.richContentService.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 2,
+    document: { ...document, computed: { total: '$state.value + 2' } } });
+  expect(node.viewStateSnapshot).toEqual(viewStateSnapshot);
+  expect(await ctx.editRequestService.resolveRequestTarget(node)).toMatchObject({ status: 'needs_review' });
+});
+
+it('anchors rich chart, repeat and table selections to their evaluated display', async () => {
+  const server = await createTestServer();
+  cleanups.push(server.cleanup);
+  const { client, userId } = await registerAndBindAgy(server.baseUrl, 'display-owner', 'user:display-owner@gmail.com');
+  const { data: { chat: { id: chatId } } } = await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Display identity' });
+  const { richContentService: rich, editRequestService: requests } = server.ctx;
+  const item = { id: 'first', value: 4 };
+  const series = { key: 'value', label: 'Amount', sourceId: 'market', data: [4, 5] };
+  const chart = { id: 'chart', type: 'chart', chartType: 'bar', categories: ['March', 'April'], series: [series], yAxis: { unit: 'JPY' } };
+  const repeat = { id: 'repeat', type: 'text', content: { expr: 'formatNumber($item.value + $computed.adjustment)' },
+    repeat: { itemsExpr: '$state.items', as: 'item', keyField: 'id' } };
+  const table = { id: 'table', type: 'data_table', columns: [{ key: 'value', label: 'Amount', format: 'number', unit: 'JPY' }], rows: [item] };
+  const document = {
+    schemaVersion: 1, sources: [{ id: 'market', name: 'Market report', fetchedAt: '2026-11-25T12:00:00Z' }], state: { items: [item], unrelated: 0 }, computed: { adjustment: '1' },
+    root: { id: 'root', type: 'stack', direction: 'col', children: [chart, repeat, table] },
+  };
+  const { block } = rich.createBlock({ userId, chatId, document });
+  const create = (selector: { kind: string; [key: string]: unknown }) => requests.createRequest({
+    userId, chatId, targetKind: 'rich_block', richBlockId: block.id, instruction: 'Update selected content',
+    selector: { ...selector, baseRevision: 1, blockId: block.id },
+    viewStateSnapshot: { state: { unrelated: 2 }, theme: 'dark' },
+  });
+  const chartRequest = await create({
+    kind: 'rich_chart_series', chartNodeId: chart.id, dataIndex: 0, seriesKey: series.key,
+    expectedSeriesFingerprint: hash(canonicalJson(series)),
+  });
+  const repeatRequest = await create({
+    kind: 'rich_repeat_item', repeatNodeId: repeat.id, itemIndex: 0, itemKey: item.id,
+    expectedItemHash: hash(canonicalJson(item)), expectedListOrderHash: hash(canonicalJson([item.id])),
+  });
+  const tableRequest = await create({
+    kind: 'rich_table_cell', tableNodeId: table.id, row: 0, col: 'value', expectedCellHash: hash('4'),
+  });
+  const all = [chartRequest, repeatRequest, tableRequest];
+  expect((await client.request('POST', `/api/chats/${chatId}/edit-requests/send-batch`, {
+    requestIds: all.map(request => request.id), clientMessageId: randomUUID(),
+  })).status).toBe(200);
+  const binding = await server.ctx.mcpService.bindBuiltinArtifactServer({ userId, chatId, tentativeTurn: () => null }, []);
+  const { url, headers } = binding!.server;
+  const mcp = new Client({ name: 'rich-capture', version: '1' });
+  await mcp.connect(new StreamableHTTPClientTransport(new URL(url), {
+    requestInit: { headers: Object.fromEntries(headers.map(({ name, value }) => [name, value])) },
+  }));
+  try {
+    const result = await mcp.callTool({ name: 'edit_request_get', arguments: { requestId: chartRequest.id } });
+    const [text] = result.content as Array<{ text: string }>;
+    const payload = JSON.parse(text.text);
+    expect(payload).toMatchObject({ userInstruction: 'Update selected content',
+      untrustedTargetContent: { viewStateSnapshot: { state: { unrelated: 2 }, theme: 'dark' } },
+      reResolution: { status: 'resolved' },
+    });
+    expect(payload.reResolution).not.toHaveProperty('resolvedSnippet');
+    expect(JSON.parse(payload.untrustedTargetContent.selectedContentSnapshot)).toMatchObject({
+      label: 'Amount', data: { x: 'March', y: 4 }, sources: document.sources,
+    });
+  } finally {
+    await mcp.close();
+  }
+  rich.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 1, patchState: { unrelated: 1 } });
+  for (const request of all) {
+    expect(request.selector.expectedDisplayFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    expect(await requests.resolveRequestTarget(request)).toMatchObject({ status: 'resolved' });
+  }
+  rich.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 2, document: {
+    ...document, sources: [{ ...document.sources[0], fetchedAt: '2026-11-26T12:00:00Z' }],
+  } });
+  expect(await requests.resolveRequestTarget(chartRequest)).toMatchObject({ status: 'needs_review' });
+  rich.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 3, document: {
+    ...document, computed: { adjustment: '2' }, root: { ...document.root, children: [
+      { ...chart, categories: [...chart.categories].reverse(), yAxis: { unit: 'USD' } },
+      repeat,
+      { ...table, columns: [{ ...table.columns[0], label: 'Ratio', format: 'percent' }] },
+    ] },
+  } });
+  for (const request of all) {
+    expect(await requests.resolveRequestTarget(request)).toMatchObject({ status: 'needs_review' });
+  }
+  rich.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 4, document: {
+    ...document, root: { ...document.root, children: [chart, { ...repeat, content: 'Replacement template' }, table] },
+  } });
+  expect(await requests.resolveRequestTarget(repeatRequest)).toMatchObject({ status: 'needs_review', reason: 'repeat_display_changed' });
+
+});
+
+it('returns a verified PPTX point crop as an MCP image and retains the target in Base ChatUI', async () => {
+  const srv = await createTestServer({ installDocRuntime: 'off', sandboxMode: 'off', allowUnsandboxedDocWorkers: false });
+  cleanups.push(srv.cleanup);
+  const { ctx } = srv;
+  const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'pptx-pin', 'user:pptx-pin@gmail.com');
+  const { data: { chat: { id: chatId } } } = await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'PPTX region' });
+  const p = 'http://schemas.openxmlformats.org/presentationml/2006/main';
+  const r = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  const a = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+  const slidePart = 'ppt/slides/slide1.xml';
+  const bytes = Buffer.from(zipSync({
+    'ppt/presentation.xml': strToU8(`<p:presentation xmlns:p="${p}" xmlns:r="${r}"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="9144000" cy="5143500"/></p:presentation>`),
+    'ppt/_rels/presentation.xml.rels': strToU8(`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${r}/slide" Target="slides/slide1.xml"/></Relationships>`),
+    [slidePart]: strToU8(`<p:sld xmlns:p="${p}" xmlns:a="${a}"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="4"/></p:nvSpPr><p:txBody><a:p><a:r><a:t>Slide content</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>`),
+  }));
+  const { artifact } = await ctx.artifactService.createArtifact({
+    userId, chatId, scopeKind: 'chat', relPath: 'points.pptx', actorKind: 'user', content: bytes,
+  });
+  const slide = readPptxSlideTargets(bytes, slidePart);
+  const selector = targetSelectorSchema.parse({
+    kind: 'pptx_slide', baseRevision: 1, slideId: slide.slideId, expectedSlideHash: slide.slideHash,
+    pointPt: { xPt: 717, yPt: 5, widthPt: 720, heightPt: 405 },
+  });
+  const pin = await ctx.editRequestService.createRequest({
+    userId, chatId, targetKind: 'artifact', artifactId: artifact.id, selector, instruction: 'Change the heading',
+  });
+  expect((await client.request('POST', `/api/chats/${chatId}/edit-requests/send-batch`, {
+    requestIds: [pin.id], clientMessageId: randomUUID(),
+  })).status).toBe(200);
+  const image = buildSyntheticPng(39, 41);
+  const worker = vi.spyOn(DocumentWorker.prototype, 'run').mockResolvedValue(image);
+  const base = await ctx.editRequestService.getForAgent(userId, chatId, pin.id);
+  expect(base).toMatchObject({ userInstruction: 'Change the heading', untrustedTargetContent: { selectedContentSnapshot: 'Slide content' } });
+  expect(base.regionImagePngBase64).toBeUndefined();
+  expect(worker).not.toHaveBeenCalled();
+  vi.spyOn(DocumentWorker.prototype, 'available', 'get').mockReturnValue(true);
+  const binding = await ctx.mcpService.bindBuiltinArtifactServer({ userId, chatId, tentativeTurn: () => null }, []);
+  const { url, headers } = binding!.server;
+  const mcp = new Client({ name: 'pptx-point-test', version: '1' });
+  await mcp.connect(new StreamableHTTPClientTransport(new URL(url), {
+    requestInit: { headers: Object.fromEntries(headers.map(({ name, value }) => [name, value])) },
+  }));
+  try {
+    const result = await mcp.callTool({ name: 'edit_request_get', arguments: { requestId: pin.id } });
+    expect(result.content).toMatchObject([{ type: 'text' }, { type: 'image', mimeType: 'image/png', data: image.toString('base64') }]);
+    expect(worker).toHaveBeenCalledWith('pptx', 'points.pptx', bytes, {
+      action: 'render', pageIndex: 0, region: { x: 681, y: 0, width: 39, height: 41, unit: 'pt' },
+    }, [], expect.anything());
+  } finally {
+    await mcp.close();
+  }
+  await expect.poll(() => ctx.db.getActiveRunForChat(userId, chatId), { timeout: 12_000 }).toBeNull();
+});
+
+it('requires reconfirmation when the same rich node is moved to a different tab', async () => {
+  const { resolveRichBlockTarget } = await import('../src/edit-requests/target-resolver.js');
+  const node = { id: 'record', type: 'text' as const, content: 'Same value' };
+  const document = {
+    schemaVersion: 1 as const,
+    root: { id: 'tabs', type: 'tabs' as const, items: [
+      { id: 'first', label: 'Quarter', content: [node] }, { id: 'second', label: 'Quarter', content: [] },
+    ] },
+  };
+  const block = {
+    id: 'block', revision: 1, document, userId: 'user', chatId: 'chat',
+    confirmedMessageId: null, tentativeMessageId: null, runId: null, toolCallId: null,
+    bindingState: 'unattached' as const, createdSeq: 1, schemaVersion: 1, title: 'Report', uiStateSnapshot: null,
+    referencedArtifactIds: [], sizeBytes: 0, createdAt: 0, updatedAt: 0,
+  };
+  const selector = { kind: 'rich_node', baseRevision: 1, blockId: block.id, nodeId: node.id,
+    expectedNodeType: node.type, expectedNodeFingerprint: hash(canonicalJson(node)) };
+  expect(resolveRichBlockTarget(block, selector)).toMatchObject({ status: 'resolved' });
+  const moved = {
+    ...document, root: { ...document.root, items: [
+      { ...document.root.items[0], content: [] }, { ...document.root.items[1], content: [node] },
+    ] },
+  };
+  expect(resolveRichBlockTarget({ ...block, revision: 2, document: moved }, selector, undefined, undefined, document))
+    .toMatchObject({ status: 'needs_review' });
+});

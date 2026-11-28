@@ -1,15 +1,18 @@
+import type { ExecutionScheduler } from '../acp/scheduler.js';
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { isArtifactError } from '../artifacts/errors.js';
-import type { TargetSelector } from '../artifacts/types.js';
+import { targetSelectorSchema } from '../artifacts/target-selector-schema.js';
 import type { EditRequestService, EditRequestStatus } from '../edit-requests/edit-request-service.js';
 import { requireAuth, type RouteDeps } from './auth-routes.js';
 
 export interface EditRequestRouteDeps extends RouteDeps {
   editRequestService: EditRequestService;
+  scheduler: ExecutionScheduler;
 }
 
 function sendEditRequestError(reply: FastifyReply, err: unknown) {
+  if (err instanceof z.ZodError) return reply.code(400).send({ error: 'INVALID_INPUT' });
   if (isArtifactError(err)) {
     return reply.code(err.statusCode).send({
       error: err.code,
@@ -23,8 +26,28 @@ function sendEditRequestError(reply: FastifyReply, err: unknown) {
   });
 }
 
+const targetDetails = {
+  range: z.record(z.unknown()).optional().nullable(),
+  contentCoords: z.record(z.unknown()).optional().nullable(),
+  selectedContentSnapshot: z.string().max(50_000).optional(),
+  surroundingContext: z.string().max(20_000).optional().nullable(),
+  regionImagePngBase64: z.string().max(8_000_000).regex(/^[A-Za-z0-9+/]+={0,2}$/).optional().nullable(),
+  viewStateSnapshot: z.record(z.unknown()).optional().nullable(),
+};
+
+function parseSelector(selector: unknown, baseRevision?: number) {
+  return targetSelectorSchema.parse(
+    baseRevision !== undefined && selector && typeof selector === 'object'
+      ? { baseRevision, ...selector } : selector
+  );
+}
+
+function targetInput<T extends { regionImagePngBase64?: string | null }>({ regionImagePngBase64: _legacyImage, ...data }: T) {
+  return data;
+}
+
 export async function registerEditRequestRoutes(app: FastifyInstance, deps: EditRequestRouteDeps): Promise<void> {
-  const { db, editRequestService } = deps;
+  const { db, editRequestService, scheduler } = deps;
 
   app.get('/api/chats/:chatId/edit-requests', async (req, reply) => {
     const session = requireAuth(req, reply, db);
@@ -53,37 +76,18 @@ export async function registerEditRequestRoutes(app: FastifyInstance, deps: Edit
         artifactId: z.string().min(1).optional().nullable(),
         richBlockId: z.string().min(1).optional().nullable(),
         baseRevision: z.number().int().min(1).optional(),
-        selector: z.object({ kind: z.string().min(1) }).passthrough(),
-        range: z.record(z.unknown()).optional().nullable(),
-        contentCoords: z.record(z.unknown()).optional().nullable(),
-        selectedContentSnapshot: z.string().max(50_000).optional(),
-        surroundingContext: z.string().max(20_000).optional().nullable(),
-        regionImagePngBase64: z.string().optional().nullable(),
+        selector: z.record(z.unknown()),
+        ...targetDetails,
         instruction: z.string().trim().min(1).max(10_000),
-        viewStateSnapshot: z.record(z.unknown()).optional().nullable(),
       })
       .safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: 'INVALID_INPUT' });
 
     try {
-      const regionBuf = parsed.data.regionImagePngBase64
-        ? Buffer.from(parsed.data.regionImagePngBase64, 'base64')
-        : null;
-      const request = editRequestService.createRequest({
+      const request = await editRequestService.createRequest({
+        ...targetInput(parsed.data),
         userId: session.user.id,
         chatId,
-        targetKind: parsed.data.targetKind,
-        artifactId: parsed.data.artifactId,
-        richBlockId: parsed.data.richBlockId,
-        baseRevision: parsed.data.baseRevision,
-        selector: parsed.data.selector as TargetSelector,
-        range: parsed.data.range,
-        contentCoords: parsed.data.contentCoords,
-        selectedContentSnapshot: parsed.data.selectedContentSnapshot,
-        surroundingContext: parsed.data.surroundingContext,
-        regionImagePngBuffer: regionBuf,
-        instruction: parsed.data.instruction,
-        viewStateSnapshot: parsed.data.viewStateSnapshot,
       });
       return reply.code(201).send({ request });
     } catch (err) {
@@ -98,8 +102,12 @@ export async function registerEditRequestRoutes(app: FastifyInstance, deps: Edit
     try {
       const request = editRequestService.getRequest(session.user.id, chatId, requestId);
       if (!request) return reply.code(404).send({ error: 'NOT_FOUND' });
-      const reResolution = editRequestService.resolveRequestTarget(request);
-      return { request, reResolution };
+      const targetRevision = request.artifactId ? db.getArtifact(session.user.id, request.artifactId)?.revision : undefined;
+      const reResolution = await editRequestService.resolveRequestTarget(request);
+      if (request.artifactId && targetRevision !== db.getArtifact(session.user.id, request.artifactId)?.revision) {
+        return reply.code(409).send({ error: 'TARGET_CONTENT_DRIFT' });
+      }
+      return { request, reResolution, targetRevision };
     } catch (err) {
       return sendEditRequestError(reply, err);
     }
@@ -112,18 +120,18 @@ export async function registerEditRequestRoutes(app: FastifyInstance, deps: Edit
     const parsed = z
       .object({
         instruction: z.string().trim().min(1).max(10_000).optional(),
-        selector: z.object({ kind: z.string().min(1) }).passthrough().optional(),
+        selector: targetSelectorSchema.optional(),
+        ...targetDetails,
       })
       .safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: 'INVALID_INPUT' });
 
     try {
-      const request = editRequestService.updateRequest({
+      const request = await editRequestService.updateRequest({
+        ...targetInput(parsed.data),
         userId: session.user.id,
         chatId,
         requestId,
-        instruction: parsed.data.instruction,
-        selector: parsed.data.selector as TargetSelector | undefined,
       });
       return { request };
     } catch (err) {
@@ -135,9 +143,13 @@ export async function registerEditRequestRoutes(app: FastifyInstance, deps: Edit
     const session = requireAuth(req, reply, db);
     if (!session) return;
     const { chatId, requestId } = req.params as { chatId: string; requestId: string };
-    const deleted = editRequestService.deleteRequest(session.user.id, chatId, requestId);
-    if (!deleted) return reply.code(404).send({ error: 'NOT_FOUND' });
-    return { ok: true };
+    try {
+      const deleted = editRequestService.deleteRequest(session.user.id, chatId, requestId);
+      if (!deleted) return reply.code(404).send({ error: 'NOT_FOUND' });
+      return { ok: true };
+    } catch (err) {
+      return sendEditRequestError(reply, err);
+    }
   });
 
   app.post('/api/chats/:chatId/edit-requests/reorder', async (req, reply) => {
@@ -161,16 +173,25 @@ export async function registerEditRequestRoutes(app: FastifyInstance, deps: Edit
     const parsed = z
       .object({
         requestIds: z.array(z.string().min(1)).min(1),
-        sentMessageId: z.string().optional().nullable(),
+        clientMessageId: z.string().uuid(),
       })
       .safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: 'INVALID_INPUT' });
+    if (db.getAgyProfile(session.user.id)?.authStatus !== 'authenticated') {
+      return reply.code(403).send({ error: 'AGY_AUTH_REQUIRED', message: 'Antigravity認証が必要です。' });
+    }
     try {
-      return editRequestService.sendBatch({
+      const clientMessageId = parsed.data.clientMessageId;
+      return await editRequestService.sendBatch({
         userId: session.user.id,
         chatId,
         requestIds: parsed.data.requestIds,
-        sentMessageId: parsed.data.sentMessageId,
+        submit: {
+          clientMessageId,
+          enqueue: (text, persist) => scheduler.enqueueTurn({
+            userId: session.user.id, chatId, userText: text, attachments: [], clientMessageId, persistWithMessage: persist,
+          }),
+        },
       });
     } catch (err) {
       return sendEditRequestError(reply, err);
@@ -182,7 +203,7 @@ export async function registerEditRequestRoutes(app: FastifyInstance, deps: Edit
     if (!session) return;
     const { chatId, requestId } = req.params as { chatId: string; requestId: string };
     try {
-      const request = editRequestService.resolveByUser(session.user.id, chatId, requestId);
+      const request = await editRequestService.resolveByUser(session.user.id, chatId, requestId);
       return { request };
     } catch (err) {
       return sendEditRequestError(reply, err);
@@ -196,17 +217,18 @@ export async function registerEditRequestRoutes(app: FastifyInstance, deps: Edit
     const parsed = z
       .object({
         newBaseRevision: z.number().int().min(1),
-        newSelector: z.object({ kind: z.string().min(1) }).passthrough().optional(),
+        newSelector: z.record(z.unknown()),
+        ...targetDetails,
       })
       .safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: 'INVALID_INPUT' });
     try {
-      const request = editRequestService.reconfirmByUser({
+      const request = await editRequestService.reconfirmByUser({
+        ...targetInput(parsed.data),
         userId: session.user.id,
         chatId,
         requestId,
-        newBaseRevision: parsed.data.newBaseRevision,
-        newSelector: parsed.data.newSelector as TargetSelector | undefined,
+        newSelector: parseSelector(parsed.data.newSelector, parsed.data.newBaseRevision),
       });
       return { request };
     } catch (err) {

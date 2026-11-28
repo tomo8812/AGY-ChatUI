@@ -383,7 +383,10 @@ export interface ArtifactRecord {
   mimeType: string;
   sizeBytes: number;
   sha256: string;
-  source: 'attachment' | 'generated' | 'project_copy';
+  /** Optional for legacy client-side records; current server records always carry these. */
+  revision?: number;
+  dependencyManifestHash?: string | null;
+  source: 'attachment' | 'generated' | 'project_copy' | 'project_upload' | 'user_edit' | 'mcp';
   previewKind: PreviewKind;
   diffPatch: string | null;
   createdAt: number;
@@ -456,8 +459,23 @@ export interface ChatDetailResponse {
   sessionOptions: ParsedSessionOptions | null;
 }
 
+export interface SyncSnapshotResponse {
+  snapshotUserSeq: number;
+  latestSeq: number;
+  projects: ProjectRecord[];
+  chats: ChatRecord[];
+  artifacts: ArtifactRecord[];
+  activeChatDetail: Omit<ChatDetailResponse, 'sessionOptions'> | null;
+  agyProfile: AgyProfile | null;
+  preferences: UserPreferences;
+  loginFlow: AgyLoginFlowState | null;
+  quota: QuotaSnapshotRecord;
+  sessionOptions: ParsedSessionOptions | null;
+}
+
 export interface SyncEventEnvelope {
   seq: number;
+  userSeq: number;
   eventId: string;
   userId: string;
   type: string;
@@ -476,6 +494,7 @@ export type WsIncomingMessage =
       buildId?: string;
       version?: string;
       latestSeq: number;
+      latestUserSeq: number;
       resyncRequired: boolean;
       events: SyncEventEnvelope[];
     }
@@ -498,6 +517,7 @@ export type WsIncomingMessage =
   | {
       kind: 'pong';
       ts: number;
+      latestUserSeq: number;
     };
 
 export type McpScope = 'shared' | 'profile' | 'project' | 'chat';

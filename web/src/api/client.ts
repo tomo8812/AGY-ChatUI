@@ -19,6 +19,7 @@ import type {
   QuotaSnapshotRecord,
   RunRecord,
   SandboxStatus,
+  SyncSnapshotResponse,
   SkillDetail,
   SkillScope,
   SkillsListResponse,
@@ -51,12 +52,14 @@ export function getCsrfToken(): string {
   return '';
 }
 
-async function apiFetch<T>(
+export async function apiFetch<T>(
   url: string,
   options: {
     method?: string;
     body?: unknown;
+    textBody?: string;
     formData?: FormData;
+    signal?: AbortSignal;
   } = {}
 ): Promise<T> {
   const method = (options.method ?? 'GET').toUpperCase();
@@ -72,6 +75,9 @@ async function apiFetch<T>(
   let fetchBody: BodyInit | undefined;
   if (options.formData) {
     fetchBody = options.formData;
+  } else if (options.textBody !== undefined) {
+    headers['Content-Type'] = 'text/plain; charset=utf-8';
+    fetchBody = options.textBody;
   } else if (options.body !== undefined) {
     headers['Content-Type'] = 'application/json';
     fetchBody = JSON.stringify(options.body);
@@ -82,6 +88,7 @@ async function apiFetch<T>(
     headers,
     body: fetchBody,
     credentials: 'include',
+    signal: options.signal,
   });
 
   const contentType = res.headers.get('content-type') || '';
@@ -116,6 +123,11 @@ export const api = {
     apiFetch<BuiltinMcpSettings>('/api/mcp/builtin-artifact', { method: 'PUT', body: { scope, id, ...settings } }),
 
   bootstrap: () => apiFetch<BootstrapResponse>('/api/auth/bootstrap'),
+  getSyncSnapshot: (chatId: string | null, signal?: AbortSignal) => {
+    const query = new URLSearchParams();
+    if (chatId) query.set('chatId', chatId);
+    return apiFetch<SyncSnapshotResponse>(`/api/sync/snapshot?${query}`, { signal });
+  },
 
   register: (payload: { username: string; displayName?: string; password: string }) =>
     apiFetch<{

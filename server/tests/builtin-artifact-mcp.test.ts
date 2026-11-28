@@ -1,11 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { expect, it, vi } from 'vitest';
+import { BUILTIN_ARTIFACT_TOOLS } from '../src/mcp/builtin-artifact-mcp.js';
 import { deriveAgyPermissionRule } from '../src/acp/client-manager.js';
-import { createTestServer, registerAndBindAgy, TestApiClient } from './helpers/test-harness.js';
+import { createTestServer, registerAndBindAgy, seedAuthenticatedMockProfile, TestApiClient } from './helpers/test-harness.js';
 
 const fullRuntimeDir = process.env.AGY_TEST_FULL_RUNTIME_DIR?.trim() || '';
 const canRunRealBwrap = Boolean(
@@ -85,6 +87,19 @@ it('enforces loopback headers, token revocation and boundaries over HTTP', async
     const { artifact } = await srv.ctx.artifactService.createArtifact({
       userId, scopeKind: 'chat', chatId: other.id, relPath: 'other.md', content: Buffer.from('secret'), actorKind: 'user',
     });
+    const { data: { project } } = await client.request<{ project: { id: string } }>('POST', '/api/projects', { name: 'Original files' });
+    const projectFile = await srv.ctx.artifactService.createArtifact({
+      userId, scopeKind: 'project', projectId: project.id, relPath: 'original.md', content: Buffer.from('project'), actorKind: 'user',
+    });
+    const outsider = new TestApiClient(srv.baseUrl);
+    const { data: { user: privateUser } } = await outsider.request<{ user: { id: string } }>('POST', '/api/auth/register', {
+      username: 'mcpoutsider', displayName: 'Other user', password: 'password123',
+    });
+    seedAuthenticatedMockProfile(srv.ctx, privateUser.id);
+    const { data: { chat: privateChat } } = await outsider.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Private' });
+    const privateFile = await srv.ctx.artifactService.createArtifact({
+      userId: privateUser.id, scopeKind: 'chat', chatId: privateChat.id, relPath: 'private.md', content: Buffer.from('private'), actorKind: 'user',
+    });
     const binding = await srv.ctx.mcpService.bindBuiltinArtifactServer({
       userId, chatId: chat.id, tentativeTurn: () => null,
     }, [
@@ -110,8 +125,18 @@ it('enforces loopback headers, token revocation and boundaries over HTTP', async
     const mcp = new Client({ name: 'test', version: '1.0.0' });
     await mcp.connect(new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: auth } }));
     try {
-      const denied = await mcp.callTool({ name: 'artifact_history', arguments: { artifactId: artifact.id } });
-      expect(denied.isError).toBe(true);
+      expect(Object.keys(BUILTIN_ARTIFACT_TOOLS)).toHaveLength(22);
+      expect((await mcp.listTools()).tools.map(({ name }) => name).sort()).toEqual(Object.keys(BUILTIN_ARTIFACT_TOOLS).sort());
+      const errors = [];
+      for (const id of [artifact.id, projectFile.artifact.id, privateFile.artifact.id, randomUUID()]) {
+        const denied = await mcp.callTool({ name: 'artifact_history', arguments: { artifactId: id } });
+        expect(denied.isError).toBe(true);
+        const [content] = denied.content as Array<{ type: string; text: string }>;
+        const error = JSON.parse(content.text);
+        expect(error).toMatchObject({ code: 'FORBIDDEN', status: 403 });
+        errors.push(error);
+      }
+      expect(errors).toEqual(Array(4).fill(errors[0]));
       const settings = await client.request('PUT', '/api/mcp/builtin-artifact', {
         scope: 'chat', id: chat.id, enabled: true, disabledTools: ['artifact_list'],
       });

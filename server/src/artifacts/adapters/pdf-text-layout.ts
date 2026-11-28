@@ -1,0 +1,76 @@
+interface PdfTextItem {
+  str: string;
+  dir: string;
+  width: number;
+  height: number;
+  transform: number[];
+  fontName: string;
+}
+
+export interface PdfTextLayout {
+  text: string;
+  runs: ReadonlyArray<{ itemIndex: number; start: number; text: string; trimStart: number }>;
+  widthPt: number;
+  heightPt: number;
+  quadsForRange(start: number, end: number): number[][] | null;
+}
+
+/** Shared by PDF.js in the viewer and the target inspection worker. Offsets are UTF-16. */
+export function pdfTextLayout(
+  items: Array<PdfTextItem | { type: string }>,
+  viewport: { width: number; height: number; convertToViewportPoint(x: number, y: number): number[] },
+  glyphFractions?: (item: PdfTextItem, from: number, to: number) => [number, number] | null,
+  styles?: Record<string, { ascent?: number; descent?: number; vertical?: boolean }>,
+): PdfTextLayout {
+  let text = '';
+  const runs: Array<{ item: PdfTextItem; itemIndex: number; start: number; text: string; trimStart: number }> = [];
+  let itemIndex = -1;
+  for (const item of items) {
+    if (!('str' in item)) continue;
+    itemIndex++;
+    if (!item.str.trim()) continue;
+    const value = item.str.trim();
+    if (text) text += ' ';
+    runs.push({ item, itemIndex, start: text.length, text: value, trimStart: item.str.length - item.str.trimStart().length });
+    text += value;
+  }
+
+  return {
+    text, runs, widthPt: viewport.width, heightPt: viewport.height,
+    quadsForRange(start, end) {
+      if (start < 0 || end <= start || end > text.length) return null;
+      const quads: number[][] = [];
+      for (const run of runs) {
+        if (run.start >= end) break;
+        const from = Math.max(0, start - run.start);
+        const to = Math.min(run.text.length, end - run.start);
+        if (to <= from) continue;
+        const { item } = run;
+        const [a, b, c, d, x, y] = item.transform;
+        const horizontal = Math.hypot(a, b), vertical = Math.hypot(c, d);
+        const isVertical = item.dir === 'ttb';
+        const length = isVertical ? item.height : item.width;
+        const thickness = isVertical ? item.width : item.height;
+        if (!horizontal || !vertical || length <= 0 || thickness <= 0) return null;
+        const fractions: [number, number] | null = from === 0 && to === item.str.length
+          ? [0, 1] : glyphFractions?.(item, from + run.trimStart, to + run.trimStart) ?? null;
+        if (!fractions) return null;
+        const [left, right] = fractions;
+        const point = (fraction: number, height: number) => viewport.convertToViewportPoint(
+          x + (isVertical ? b : a) * length * fraction / horizontal + (isVertical ? a / horizontal : c / vertical) * height,
+          y + (isVertical ? -a : b) * length * fraction / horizontal + (isVertical ? b / horizontal : d / vertical) * height,
+        );
+        const style = styles?.[item.fontName];
+        const ascent = style?.ascent ?? (style?.descent === undefined ? undefined : 1 + style.descent);
+        if (isVertical && (!style?.vertical || ascent === undefined || !Number.isFinite(ascent) || ascent <= 0 ||
+            Math.abs((a * c + b * d) / (horizontal * vertical)) > 1e-6)) return null;
+        const top = isVertical ? vertical * ascent! : thickness;
+        const bottom = isVertical ? top - vertical : 0;
+        const quad = [...point(left, top), ...point(right, top), ...point(left, bottom), ...point(right, bottom)];
+        if (quad.some((value, i) => !Number.isFinite(value) || value < 0 || value > (i % 2 ? viewport.height : viewport.width))) return null;
+        quads.push(quad);
+      }
+      return quads.length ? quads : null;
+    },
+  };
+}

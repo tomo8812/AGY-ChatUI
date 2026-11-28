@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { ArtifactError, unsupportedOperationError } from '../errors.js';
@@ -247,6 +248,7 @@ export function parseCsvRows(text: string, delimiter: string): string[][] {
   const rows: string[][] = [];
   let row: string[] = [];
   let field = '';
+  let fieldStarted = false;
   let inQuotes = false;
   const s = text.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
 
@@ -265,19 +267,22 @@ export function parseCsvRows(text: string, delimiter: string): string[][] {
       }
     } else if (ch === '"') {
       inQuotes = true;
+      fieldStarted = true;
     } else if (ch === delimiter) {
       row.push(field);
       field = '';
-    } else if (ch === '\n') {
+      fieldStarted = false;
+    } else if (ch === '\n' || ch === '\r') {
       row.push(field);
       rows.push(row);
       row = [];
       field = '';
+      fieldStarted = false;
     } else {
       field += ch;
     }
   }
-  if (field.length > 0 || row.length > 0) {
+  if (fieldStarted || field.length > 0 || row.length > 0) {
     row.push(field);
     rows.push(row);
   }
@@ -298,6 +303,26 @@ export function serializeCsvRows(rows: string[][], delimiter: string): string {
         .join(delimiter)
     )
     .join('\n');
+}
+
+/** Apply only the cells changed by an original edit, with values checked against the current file. */
+export function replayCsvCellEdit(filename: string, currentBytes: Buffer, fromBytes: Buffer, toBytes: Buffer, keys: unknown): Buffer {
+  const conflict = () => new ArtifactError('UNDO_SEMANTIC_CONFLICT', '対象セルを安全に変更できません。', 409);
+  const delimiter = detectDelimiter(filename);
+  const parse = (bytes: Buffer) => parseCsvRows(bytes.toString('utf8'), delimiter);
+  const [current, from, to] = [currentBytes, fromBytes, toBytes].map(parse);
+  if (!Array.isArray(keys) || !keys.length || from.length !== to.length || current.length !== from.length ||
+      from.some((row, ri) => row.length !== to[ri].length || row.length !== current[ri].length) ||
+      from[0]?.some((value, ci) => value !== current[0][ci])) throw conflict();
+  const allowed = new Set(keys);
+  for (const [ri, row] of from.entries()) {
+    for (const [ci, value] of row.entries()) {
+      if (value === to[ri][ci]) continue;
+      if (ri === 0 || !allowed.has(`r${ri}c${ci}`) || current[ri][ci] !== value) throw conflict();
+      current[ri][ci] = to[ri][ci];
+    }
+  }
+  return Buffer.from(serializeCsvRows(current, delimiter) + '\n', 'utf8');
 }
 
 export class CsvAdapter implements FormatAdapter {
@@ -397,6 +422,7 @@ export class CsvAdapter implements FormatAdapter {
         if (!Number.isInteger(r) || r < 0 || !Number.isInteger(c) || c < 0) {
           throw new ArtifactError('INVALID_OPERATION', 'set_cell requires non-negative integer row and col.', 400);
         }
+        structural ||= r === 0 || r >= rows.length || c >= rows[r].length;
         while (rows.length <= r) rows.push([]);
         while (rows[r].length <= c) rows[r].push('');
         rows[r][c] = String(op.value ?? '');
@@ -408,6 +434,7 @@ export class CsvAdapter implements FormatAdapter {
           const srcRow = op.values[dr];
           if (!Array.isArray(srcRow)) continue;
           const r = startRow + dr;
+          structural ||= r === 0 || r >= rows.length || startCol + srcRow.length > rows[r].length;
           while (rows.length <= r) rows.push([]);
           for (let dc = 0; dc < srcRow.length; dc++) {
             const c = startCol + dc;
@@ -590,33 +617,101 @@ export class CsvAdapter implements FormatAdapter {
     throw unsupportedOperationError(`export:${fmt}`, 'unsupported_by_format', `CSV export to '${fmt}' is unsupported.`);
   }
 
+  targetContextHash(buffer: Buffer, selector: TargetSelector, meta: AdapterFileMeta): string | null {
+    const rows = parseCsvRows(buffer.toString('utf8'), detectDelimiter(meta.filename));
+    const columnOnly = selector.kind === 'csv_row_col' && selector.axis === 'col';
+    const rowOnly = selector.kind === 'csv_row_col' && selector.axis === 'row';
+    const startRow = Number(selector.kind === 'csv_range' ? selector.startRow : selector.start);
+    const endRow = Number(selector.kind === 'csv_range' ? selector.endRow : selector.end);
+    if (!columnOnly) {
+      const selectedCounts = new Map(rows.slice(startRow, endRow + 1).map(row => [JSON.stringify(row), 0]));
+      for (const row of rows) {
+        const key = JSON.stringify(row);
+        const count = selectedCounts.get(key);
+        if (count === undefined) continue;
+        if (count > 0) return null;
+        selectedCounts.set(key, count + 1);
+      }
+    }
+    if (rowOnly) return sha256Text(JSON.stringify(rows.slice(startRow, endRow + 1)));
+    const startCol = Number(columnOnly ? selector.start : selector.startCol);
+    const endCol = Number(columnOnly ? selector.end : selector.endCol);
+    const distinctHeaders = new Set(rows[0]?.slice(startCol, endCol + 1));
+    const columns = new Map<number, ReturnType<typeof createHash>>();
+    for (const [rowIndex, row] of rows.entries()) {
+      for (const [col, cell] of row.entries()) {
+        if (rows[0]?.[col] !== undefined && !distinctHeaders.has(rows[0][col])) continue;
+        let hash = columns.get(col);
+        if (!hash) {
+          hash = createHash('sha256');
+          columns.set(col, hash);
+        }
+        hash.update(JSON.stringify([rowIndex, cell])).update('\n');
+      }
+    }
+    const signatures = new Map<string, number>();
+    const selected: string[] = [];
+    for (const [col, hash] of columns) {
+      const fingerprint = hash.digest('hex');
+      signatures.set(fingerprint, (signatures.get(fingerprint) ?? 0) + 1);
+      if (col >= startCol && col <= endCol) selected.push(fingerprint);
+    }
+    if (selected.length !== endCol - startCol + 1 || selected.some(fingerprint => signatures.get(fingerprint) !== 1)) return null;
+    if (columnOnly) return sha256Text(JSON.stringify(rows));
+    return sha256Text(JSON.stringify(rows.map((row, index) =>
+      index >= startRow && index <= endRow ? row : row.slice(startCol, endCol + 1))));
+  }
+
   resolveTarget(buffer: Buffer, selector: TargetSelector, meta: AdapterFileMeta): TargetResolutionResult {
     const delimiter = detectDelimiter(meta.filename);
     const rows = parseCsvRows(buffer.toString('utf8'), delimiter);
     const rowCount = rows.length;
     const colCount = rows.reduce((m, r) => Math.max(m, r.length), 0);
+    const headerHash = sha256Text(JSON.stringify(rows[0] ?? []));
 
-    if (selector.expectedRowCount !== undefined && Number(selector.expectedRowCount) !== rowCount) {
+    if (selector.kind !== 'csv_range' && selector.kind !== 'csv_row_col') {
+      return { status: 'needs_review', reason: 'unsupported_selector_kind' };
+    }
+
+    const expectedRowCount = Number(selector.expectedRowCount);
+    const expectedColCount = Number(selector.expectedColCount);
+    if (!Number.isInteger(expectedRowCount) || expectedRowCount < 0) {
+      return { status: 'needs_review', reason: 'missing_expected_row_count' };
+    }
+    if (!Number.isInteger(expectedColCount) || expectedColCount < 0) {
+      return { status: 'needs_review', reason: 'missing_expected_col_count' };
+    }
+    if (expectedRowCount !== rowCount) {
       return { status: 'needs_review', reason: 'row_count_changed' };
     }
-    if (selector.expectedColCount !== undefined && Number(selector.expectedColCount) !== colCount) {
+    if (expectedColCount !== colCount) {
       return { status: 'needs_review', reason: 'col_count_changed' };
     }
-    if (selector.expectedHeaderHash && sha256Text(JSON.stringify(rows[0] ?? [])) !== String(selector.expectedHeaderHash)) {
+
+    if (typeof selector.expectedHeaderHash !== 'string' || !selector.expectedHeaderHash) {
+      return { status: 'needs_review', reason: 'missing_expected_header_hash' };
+    }
+    if (headerHash !== selector.expectedHeaderHash) {
       return { status: 'needs_review', reason: 'header_changed' };
+    }
+    if (typeof selector.expectedRangeValuesHash !== 'string' || !selector.expectedRangeValuesHash) {
+      return { status: 'needs_review', reason: 'missing_expected_range_values_hash' };
     }
 
     if (selector.kind === 'csv_range') {
-      const sr = Number(selector.startRow ?? 0);
-      const er = Number(selector.endRow ?? sr);
-      const sc = Number(selector.startCol ?? 0);
-      const ec = Number(selector.endCol ?? sc);
-      if (er >= rowCount || ec >= colCount || sr < 0 || sc < 0) {
+      const sr = Number(selector.startRow);
+      const er = Number(selector.endRow);
+      const sc = Number(selector.startCol);
+      const ec = Number(selector.endCol);
+      if (
+        !Number.isInteger(sr) || !Number.isInteger(er) || !Number.isInteger(sc) || !Number.isInteger(ec) ||
+        sr < 0 || sc < 0 || er < sr || ec < sc || er >= rowCount || ec >= colCount
+      ) {
         return { status: 'stale', reason: 'range_out_of_bounds' };
       }
       const slice = rows.slice(sr, er + 1).map((r) => r.slice(sc, ec + 1));
       const valHash = sha256Text(JSON.stringify(slice));
-      if (selector.expectedRangeValuesHash && valHash !== String(selector.expectedRangeValuesHash)) {
+      if (valHash !== selector.expectedRangeValuesHash) {
         return { status: 'needs_review', reason: 'range_values_changed' };
       }
       return {
@@ -626,25 +721,28 @@ export class CsvAdapter implements FormatAdapter {
       };
     }
 
-    if (selector.kind === 'csv_row_col') {
-      const axis = String(selector.axis ?? 'row');
-      const start = Number(selector.start ?? 0);
-      const end = Number(selector.end ?? start);
-      const slice =
-        axis === 'col'
-          ? rows.map((r) => r.slice(start, end + 1))
-          : rows.slice(start, end + 1);
-      const valHash = sha256Text(JSON.stringify(slice));
-      if (selector.expectedRangeValuesHash && valHash !== String(selector.expectedRangeValuesHash)) {
-        return { status: 'needs_review', reason: 'row_col_values_changed' };
-      }
-      return {
-        status: 'resolved',
-        resolvedSnippet: serializeCsvRows(slice, delimiter),
-        resolvedRange: { axis, start, end },
-      };
+    const { axis } = selector;
+    if (axis !== 'row' && axis !== 'col') return { status: 'stale', reason: 'range_out_of_bounds' };
+    const start = Number(selector.start);
+    const end = Number(selector.end);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start) {
+      return { status: 'stale', reason: 'range_out_of_bounds' };
     }
-
-    return { status: 'needs_review', reason: 'unsupported_selector_kind' };
+    if ((axis === 'col' && end >= colCount) || (axis !== 'col' && end >= rowCount)) {
+      return { status: 'stale', reason: 'range_out_of_bounds' };
+    }
+    const slice =
+      axis === 'col'
+        ? rows.map((r) => r.slice(start, end + 1))
+        : rows.slice(start, end + 1);
+    const valHash = sha256Text(JSON.stringify(slice));
+    if (valHash !== selector.expectedRangeValuesHash) {
+      return { status: 'needs_review', reason: 'row_col_values_changed' };
+    }
+    return {
+      status: 'resolved',
+      resolvedSnippet: serializeCsvRows(slice, delimiter),
+      resolvedRange: { axis, start, end },
+    };
   }
 }

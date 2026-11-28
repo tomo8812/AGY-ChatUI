@@ -140,55 +140,18 @@ export class HtmlAdapter implements FormatAdapter {
 
   resolveTarget(buffer: Buffer, selector: TargetSelector, _meta: AdapterFileMeta): TargetResolutionResult {
     const text = buffer.toString('utf8');
-    if (selector.kind === 'html_dom_element' ||
-        (selector.kind === 'html_text_range' && typeof selector.cssSelector === 'string')) {
-      const cssSelector = String(selector.cssSelector ?? '').trim();
-      const expectedTag = selector.expectedTag ? String(selector.expectedTag).toLowerCase() : null;
-      let found: ReturnType<typeof selectHtmlElements>;
-      try {
-        found = selectHtmlElements(text, cssSelector);
-      } catch (error) {
-        if (!(error instanceof ArtifactError)) throw error;
-        return { status: 'needs_review', reason: 'invalid_dom_selector' };
-      }
-      if (found.length === 0) return { status: 'stale', reason: 'element_not_found' };
-      if (found.length !== 1 || (selector.matchCountInDoc !== undefined && found.length !== selector.matchCountInDoc)) {
-        return { status: 'needs_review', reason: 'ambiguous_multiple_elements' };
-      }
-      const el = found[0];
-      if (selector.kind === 'html_text_range') {
-        const { charStart, charEnd } = selector;
-        if (typeof charStart !== 'number' || typeof charEnd !== 'number' || !Number.isInteger(charStart) ||
-            !Number.isInteger(charEnd) || charStart < 0 || charEnd <= charStart || charEnd > el.textContent.length) {
-          return { status: 'needs_review', reason: 'invalid_text_range' };
-        }
-        const content = el.textContent.slice(charStart, charEnd);
-        if (sha256Text(content) !== selector.expectedSnippetHash || el.textContent.indexOf(content) !== el.textContent.lastIndexOf(content)) return { status: 'needs_review', reason: 'text_range_changed' };
-        return { status: 'resolved', resolvedSnippet: content, resolvedRange: { charStart, charEnd } };
-      }
-      if ((expectedTag && el.tag.toLowerCase() !== expectedTag) || el.fingerprint !== selector.expectedElementFingerprint) {
-        return { status: 'needs_review', reason: 'element_replaced_or_modified' };
-      }
-      return { status: 'resolved', resolvedSnippet: text.slice(el.start, el.end) };
-    }
-
-    if (selector.kind === 'html_source_range' || selector.kind === 'html_text_range') {
+    if (selector.kind === 'html_source_range') {
       return resolveTextSnippetByContext({
         text,
-        startLine: Number(selector.startLine ?? 1),
-        endLine: Number(selector.endLine ?? 1),
-        expectedSnippetHash: selector.expectedSnippetHash ? String(selector.expectedSnippetHash) : undefined,
-        contextBeforeHash: selector.contextBeforeHash ? String(selector.contextBeforeHash) : undefined,
-        contextAfterHash: selector.contextAfterHash ? String(selector.contextAfterHash) : undefined,
-        occurrenceIndex: selector.occurrenceIndex !== undefined ? Number(selector.occurrenceIndex) : undefined,
+        startLine: selector.startLine,
+        endLine: selector.endLine,
+        expectedSnippetHash: selector.expectedSnippetHash,
+        contextBeforeHash: selector.contextBeforeHash,
+        contextAfterHash: selector.contextAfterHash,
+        occurrenceIndex: selector.occurrenceIndex,
+        snippetHint: _meta.snippetHint,
+        requireOccurrenceIndex: true,
       });
-    }
-
-    if (selector.kind === 'html_viewport_region') {
-      if (selector.expectedDocSha256 && sha256Buffer(buffer) !== String(selector.expectedDocSha256)) {
-        return { status: 'needs_review', reason: 'document_changed' };
-      }
-      return { status: 'resolved', resolvedCoords: { rectNorm: selector.rectNorm } };
     }
 
     return { status: 'needs_review', reason: 'unsupported_selector_kind' };

@@ -10,6 +10,27 @@ describe('Concurrency, Fair Scheduler, Multi-Device WS Catchup, Permissions & Re
     }
   });
 
+
+  it('snapshot uses the same active-run priority across chats and excludes other users', async () => {
+    const srv=await createTestServer();cleanups.push(srv.cleanup);
+    const {client:alice,userId}=await registerAndBindAgy(srv.baseUrl,'alice','user:alice@gmail.com');
+    const {client:bob,userId:bobId}=await registerAndBindAgy(srv.baseUrl,'bob','user:bob@gmail.com');
+    const createChat=async(client:TestApiClient)=>(await client.request<{chat:{id:string}}>('POST','/api/chats',{})).data.chat.id;
+    const a=await createChat(alice),b=await createChat(alice),other=await createChat(bob);
+    const db=srv.ctx.db;
+    const add=(chatId:string,owner:string,id:string,status:'queued'|'running'|'awaiting_permission'|'completed')=>{
+      const msg=db.createMessage({id:'msg-'+id,chatId,userId:owner,role:'assistant',contentText:id,status:'streaming',runId:id});
+      return db.createRun({id,chatId,userId:owner,userMessageId:msg.id,assistantMessageId:msg.id,status,queuePosition:0,modelId:null,effortValue:null});
+    };
+    add(a,userId,'queued','queued');add(a,userId,'working','running');
+    add(b,userId,'finished','completed');add(b,userId,'permission','awaiting_permission');
+    add(other,bobId,'foreign','running');
+    const snap=db.getSyncSnapshot(userId,a);
+    expect(snap.chats.map(c=>[c.id,c.activeRun?.id]).sort()).toEqual([[a,'working'],[b,'permission']].sort());
+    expect(snap.activeChatDetail?.activeRun?.id).toBe(db.getActiveRunForChat(userId,a)?.id);
+    expect(snap.chats.some(c=>c.id===other)).toBe(false);
+  });
+
   it('runs multiple users simultaneously on isolated HOME profiles without blocking one another', async () => {
     const srv = await createTestServer();
     cleanups.push(srv.cleanup);

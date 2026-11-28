@@ -12,6 +12,7 @@ import {
 import { computePdfAutoFitScale, findActivePdfPage } from '../../web/src/utils/pdfFit';
 import {
   artifactTextCache,
+  artifactVersionKey,
   buildArtifactContentUrl,
   buildArtifactSandboxUrl,
   ByteLruCache,
@@ -97,15 +98,20 @@ describe('viewerCache client caching & LRU utilities', () => {
   it('builds versioned content/sandbox/convertedPdf URLs properly', () => {
     const png = makeArtifact({ id: 'a1', previewKind: 'image', sha256: '0123456789abcdef0000' });
     expect(buildArtifactContentUrl(png)).toBe('/api/files/a1/content?v=0123456789ab');
-    expect(buildArtifactContentUrl(png, { download: true })).toBe('/api/files/a1/content?download=1');
+    expect(buildArtifactContentUrl(png, { download: true })).toBe('/api/files/a1/content?v=0123456789ab&download=1');
 
     const pptx = makeArtifact({ id: 'a2', previewKind: 'pptx', sha256: 'fedcba9876540000' });
     expect(buildArtifactContentUrl(pptx, { convertedPdf: true })).toBe(
-      '/api/files/a2/content?converted=pdf&v=fedcba987654'
+      '/api/files/a2/content?v=fedcba987654&converted=pdf'
     );
 
     const html = makeArtifact({ id: 'a3', previewKind: 'html', sha256: 'abc123def4560000' });
     expect(buildArtifactSandboxUrl(html)).toBe('/api/files/a3/sandbox?v=abc123def456');
+    const pinned = { ...pptx, revision: 7, dependencyManifestHash: '12345678abcdefgh' };
+    expect(buildArtifactContentUrl(pinned, { convertedPdf: true })).toBe('/api/files/a2/content?rev=7&v=fedcba987654&d=12345678&converted=pdf');
+    expect(buildArtifactContentUrl(pinned, { download: true })).toBe('/api/files/a2/content?rev=7&v=fedcba987654&d=12345678&download=1');
+    expect(artifactVersionKey(pinned)).not.toBe(artifactVersionKey({ ...pinned, revision: 8 }));
+    expect(artifactVersionKey(pinned)).not.toBe(artifactVersionKey({ ...pinned, dependencyManifestHash: '87654321abcdefgh' }));
   });
 
   it('refreshes aliased links and emits updates when only filename, MIME or preview kind changes', async () => {
@@ -215,8 +221,24 @@ describe('viewerCache client caching & LRU utilities', () => {
       previewUrl: '/api/files/leak/content?v=123',
       downloadUrl: '/api/files/leak/content?download=1',
     });
-    await inflight;
+    await expect(inflight).rejects.toThrow('VIEWER_CACHE_SCOPE_CHANGED');
     expect(peekResolvedLink('chat-9', 'leak.png')).toBeNull();
+  });
+
+  it('never rolls back a current revision when an older link response arrives later', async () => {
+    setViewerCacheUser('user-a');
+    const older = makeArtifact({ revision: 2, dependencyManifestHash: 'old', updatedAt: 2000 });
+    const newer = { ...older, revision: 3, dependencyManifestHash: 'new', updatedAt: 3000 };
+    let release!: (value: { artifact: ArtifactRecord; previewUrl: string; downloadUrl: string }) => void;
+    const pending = resolveLinkCached('chat-1', older.relPath, {
+      fetcher: () => new Promise(resolve => { release = resolve; }),
+    });
+    notifyArtifactUpdated(newer);
+    artifactTextCache.set(artifactVersionKey(newer), 'latest');
+    release({ artifact: older, previewUrl: '', downloadUrl: '' });
+    expect((await pending).artifact).toEqual(newer);
+    expect(peekResolvedLink('chat-1', older.relPath)?.artifact).toEqual(newer);
+    expect(artifactTextCache.get(artifactVersionKey(newer))).toBe('latest');
   });
 
   it('auto-fits both landscape and portrait PDFs/PPTX to the maximum contained scale across iPhone and PC viewports', () => {

@@ -1,3 +1,4 @@
+import { notifyEditRequestsChanged } from './api/workspace';
 import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, api } from './api/client';
 import { SyncSocketClient, type WsConnectionStatus } from './api/ws';
@@ -28,6 +29,8 @@ import {
 import {
   clearAllViewerCaches,
   invalidateChatViewerCache,
+  isStaleArtifactVersion,
+  artifactVersionKey,
   notifyArtifactUpdated,
   seedChatArtifacts,
   setViewerCacheUser,
@@ -446,12 +449,23 @@ export const App: React.FC = () => {
       }
       return merged.sort((a, b) => a.createdAt - b.createdAt);
     });
-    setArtifacts(detail.artifacts);
+    setArtifacts(prev => {
+      const byId = new Map(prev.map(item => [item.id, item]));
+      const incomingIds = new Set(detail.artifacts.map(item => item.id));
+      const result = detail.artifacts.map(item => {
+        const current = byId.get(item.id);
+        return current && isStaleArtifactVersion(current, item) ? current : item;
+      });
+      for (const item of prev) {
+        if (item.chatId === chatId && !incomingIds.has(item.id) && item.updatedAt >= requestedAt) result.push(item);
+      }
+      return result;
+    });
     setViewerArtifact((cur) => {
       if (!cur || cur.chatId !== chatId) return cur;
       const latest = detail.artifacts.find((a) => a.id === cur.id);
       if (!latest) return cur;
-      if (latest.sha256 === cur.sha256 && latest.updatedAt === cur.updatedAt) return cur;
+      if (isStaleArtifactVersion(cur, latest) || artifactVersionKey(latest) === artifactVersionKey(cur)) return cur;
       return latest;
     });
     setPendingPermissions(detail.pendingPermissions);
@@ -1402,7 +1416,15 @@ export const App: React.FC = () => {
         }
         break;
       }
-      case 'artifact.created': {
+      case 'edit_request.created':
+      case 'edit_request.updated':
+      case 'edit_request.deleted':
+      case 'edit_request.reordered':
+      case 'edit_request.batch_sent':
+        if (evt.chatId) notifyEditRequestsChanged(evt.chatId);
+        break;
+      case 'artifact.created':
+      case 'artifact.updated': {
         const art = p.artifact as ArtifactRecord | undefined;
         if (art) {
           notifyArtifactUpdated(art);
@@ -1411,13 +1433,14 @@ export const App: React.FC = () => {
           setArtifacts((prev) => {
             const idx = prev.findIndex((x) => x.id === art.id);
             if (idx >= 0) {
+              if (isStaleArtifactVersion(prev[idx], art)) return prev;
               const copy = [...prev];
               copy[idx] = art;
               return copy;
             }
             return [art, ...prev];
           });
-          setViewerArtifact((cur) => (cur?.id === art.id ? art : cur));
+          setViewerArtifact((cur) => (cur?.id === art.id && !isStaleArtifactVersion(cur, art) ? art : cur));
         }
         break;
       }
@@ -1498,27 +1521,65 @@ export const App: React.FC = () => {
       onHello: (msg) => {
         notifyDetectedBuild(msg.buildId, msg.version);
         void syncPushSubscription(true);
-        if (msg.resyncRequired) {
-          void loadWorkspaceLists();
-          if (activeChatIdRef.current) {
-            void loadChatDetail(activeChatIdRef.current);
-          }
-        } else {
-          isReplayingHelloRef.current = true;
-          try {
-            for (const evt of msg.events) {
-              handleDurableEvent(evt);
-            }
-          } finally {
-            isReplayingHelloRef.current = false;
-          }
-          // If an active chat exists, verify it caught up cleanly across background wake
-          if (activeChatIdRef.current && msg.events.length === 0) {
-            // noop when cleanly synchronized
-          }
-        }
       },
-      onDurableEvent: handleDurableEvent,
+      onResync: async (signal) => {
+        let chatId = activeChatIdRef.current;
+        let snapshot = await api.getSyncSnapshot(chatId, signal);
+        // A chat switch during the request requires a snapshot of the newly selected chat.
+        while (!signal.aborted && chatId !== activeChatIdRef.current) {
+          chatId = activeChatIdRef.current;
+          snapshot = await api.getSyncSnapshot(chatId, signal);
+        }
+        if (signal.aborted) throw new Error('SYNC_ABORTED');
+        setChats(snapshot.chats);
+        setProjects(snapshot.projects);
+        setAgyProfile(snapshot.agyProfile);
+        setPreferences(snapshot.preferences);
+        setLoginFlow(snapshot.loginFlow);
+        quotaRef.current = snapshot.quota;
+        setQuota(snapshot.quota);
+        const byChat = new Map<string, ArtifactRecord[]>();
+        for (const artifact of snapshot.artifacts) {
+          if (!artifact.chatId) continue;
+          const group = byChat.get(artifact.chatId) ?? [];
+          group.push(artifact);
+          byChat.set(artifact.chatId, group);
+        }
+        for (const chat of snapshot.chats) {
+          invalidateChatViewerCache(chat.id);
+          seedChatArtifacts(chat.id, byChat.get(chat.id) ?? []);
+        }
+        setViewerArtifact(cur => cur ? snapshot.artifacts.find(item => item.id === cur.id) ?? null : cur);
+        if (chatId) notifyEditRequestsChanged(chatId);
+        const detail = snapshot.activeChatDetail;
+        if (detail && chatId === detail.chat.id) {
+          setChatLoadError(null);
+          setMessages(detail.messages);
+          setArtifacts(detail.artifacts);
+          setPendingPermissions(detail.pendingPermissions);
+          setPendingElicitations(detail.pendingElicitations);
+          setActiveRun(detail.activeRun);
+          setSessionOptions(snapshot.sessionOptions);
+          const { contextUsed, contextSize } = detail.chat;
+          setContextUsage(contextUsed != null && contextSize != null && contextSize > 0
+            ? { used: contextUsed, size: contextSize } : null);
+        } else if (chatId) {
+          setActiveChatId(null);
+          setMessages([]);
+          setArtifacts([]);
+          setPendingPermissions([]);
+          setPendingElicitations([]);
+          setActiveRun(null);
+          setSessionOptions(null);
+          setContextUsage(null);
+        }
+        void loadSkillsList(effectiveProjectIdRef.current, chatId);
+        return snapshot;
+      },
+      onDurableEvent: (event, replay) => {
+        isReplayingHelloRef.current = replay;
+        try { handleDurableEvent(event); } finally { isReplayingHelloRef.current = false; }
+      },
       onEphemeralEvent: handleEphemeralEvent,
       onAuthLost: () => {
         clearAllViewerCaches();
@@ -1561,7 +1622,7 @@ export const App: React.FC = () => {
       client.stop();
       if (wsRef.current === client) wsRef.current = null;
     };
-  }, [user?.id, loadWorkspaceLists, loadChatDetail, handleDurableEvent, handleEphemeralEvent, notifyDetectedBuild]);
+  }, [user?.id, loadSkillsList, handleDurableEvent, handleEphemeralEvent, notifyDetectedBuild]);
 
   const activeChat = useMemo(
     () =>

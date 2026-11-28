@@ -477,7 +477,7 @@ interface ActiveTurnBridge {
   pendingResolvers: Map<string, (outcome: RequestPermissionResponse) => void>;
   pendingElicitationResolvers: Map<string, (resp: CreateElicitationResponse) => void>;
   beforeWorkspaceSnap: WorkspaceSnapshot;
-  emittedArtifactVersions: Map<string, string>;
+  artifactIds: Set<string>;
   pendingArtifactOps: Promise<void>[];
   backgroundSyncChain: Promise<void>;
   lastActivityAt: number;
@@ -562,25 +562,6 @@ export class AcpClientManager {
       assistantMessageId: worker.activeTurn.assistantMessageId,
       runId: worker.activeTurn.runId,
     };
-  }
-
-  private emitArtifactVersionIfNeeded(
-    bridge: ActiveTurnBridge,
-    artifact: { id: string; revision: number; sha256: string; dependencyManifestHash?: string | null } & Record<string, unknown>,
-    runId: string | null
-  ): void {
-    const versionKey = `${artifact.revision}:${artifact.sha256}:${artifact.dependencyManifestHash ?? ''}`;
-    const prevKey = bridge.emittedArtifactVersions.get(artifact.id);
-    if (prevKey === versionKey) return;
-    bridge.emittedArtifactVersions.set(artifact.id, versionKey);
-    const eventType = prevKey === undefined && artifact.revision <= 1 ? 'artifact.created' : 'artifact.updated';
-    this.hub.emitDurable({
-      userId: bridge.userId,
-      type: eventType,
-      chatId: bridge.chatId,
-      runId,
-      payload: { artifact },
-    });
   }
 
   private getExpectedMcpConfigEpoch(userId: string, chatId: string): number {
@@ -1003,6 +984,12 @@ export class AcpClientManager {
     }
   }
 
+  /** Read options from an existing worker without starting, resuming or modifying ACP. */
+  peekSessionOptions(userId: string, chatId: string): ParsedSessionOptions | null {
+    if (!this.db.getChat(userId, chatId)) return null;
+    return this.workers.get(`${userId}:${chatId}`)?.parsedOptions ?? null;
+  }
+
   async ensureSessionOptions(userId: string, chatId: string): Promise<ParsedSessionOptions> {
     const chat = this.db.getChat(userId, chatId);
     const worker = await this.getOrStartWorker(userId, chatId);
@@ -1397,7 +1384,7 @@ export class AcpClientManager {
       pendingResolvers: new Map(),
       pendingElicitationResolvers: new Map(),
       beforeWorkspaceSnap: beforeSnap,
-      emittedArtifactVersions: new Map(),
+      artifactIds: new Set(),
       pendingArtifactOps: [],
       backgroundSyncChain: Promise.resolve(),
       lastActivityAt: nowInit,
@@ -1513,6 +1500,10 @@ export class AcpClientManager {
 
       if (bridge.activity.at(-1)?.kind === 'content') bridge.activity.push({ kind: 'answer_end' });
 
+      for (const art of newArtifacts) {
+        bridge.artifactIds.add(art.id);
+      }
+
       const finalStatus = response.stopReason === 'cancelled' ? 'cancelled' : 'completed';
       const updatedMsg = this.db.updateMessage(params.userId, params.assistantMessageId, {
         contentText: bridge.contentText,
@@ -1520,13 +1511,9 @@ export class AcpClientManager {
         toolCalls: bridge.toolCalls,
         activity: bridge.activity,
         sessionMessages: bridge.sessionMessages,
-        artifactIds: [...new Set([...bridge.emittedArtifactVersions.keys(), ...newArtifacts.map((a) => a.id)])],
+        artifactIds: [...bridge.artifactIds],
         status: finalStatus,
       })!;
-
-      for (const art of newArtifacts) {
-        this.emitArtifactVersionIfNeeded(bridge, art as unknown as { id: string; revision: number; sha256: string; dependencyManifestHash?: string | null } & Record<string, unknown>, params.runId);
-      }
 
       this.hub.emitDurable({
         userId: params.userId,
@@ -2396,11 +2383,7 @@ export class AcpClientManager {
           runId: turn.runId,
         })
         .then(({ artifact }) => {
-          this.emitArtifactVersionIfNeeded(
-            turn,
-            artifact as unknown as { id: string; revision: number; sha256: string; dependencyManifestHash?: string | null } & Record<string, unknown>,
-            turn.runId
-          );
+          turn.artifactIds.add(artifact.id);
         })
         .catch(() => {
           // Non-fatal during streaming; final workspace sync will reconcile if needed
@@ -2477,11 +2460,7 @@ export class AcpClientManager {
       .then((resolved) => {
         if (!resolved) return;
         const { artifact } = resolved;
-        this.emitArtifactVersionIfNeeded(
-          turn,
-          artifact as unknown as { id: string; revision: number; sha256: string; dependencyManifestHash?: string | null } & Record<string, unknown>,
-          turn.runId
-        );
+        turn.artifactIds.add(artifact.id);
       })
       .catch(() => {
         // Non-fatal during streaming
@@ -3021,15 +3000,7 @@ export class AcpClientManager {
       pendingResolvers: new Map(),
       pendingElicitationResolvers: new Map(),
       beforeWorkspaceSnap,
-      emittedArtifactVersions: new Map(
-        latestAssistant.artifactIds.map((id) => {
-          const existing = this.db.getArtifact(worker.userId, id);
-          return [
-            id,
-            existing ? `${existing.revision}:${existing.sha256}:${existing.dependencyManifestHash ?? ''}` : '0::',
-          ];
-        })
-      ),
+      artifactIds: new Set(latestAssistant.artifactIds),
       pendingArtifactOps: [],
       backgroundSyncChain: Promise.resolve(),
       lastActivityAt: Date.now(),
@@ -3093,11 +3064,7 @@ export class AcpClientManager {
       });
     }
     for (const art of newArtifacts) {
-      this.emitArtifactVersionIfNeeded(
-        bridge,
-        art as unknown as { id: string; revision: number; sha256: string; dependencyManifestHash?: string | null } & Record<string, unknown>,
-        bridge.runId || null
-      );
+      bridge.artifactIds.add(art.id);
     }
     if (artifactErrors.length > 0) {
       this.hub.emitDurable({
@@ -3121,7 +3088,7 @@ export class AcpClientManager {
       toolCalls: bridge.toolCalls,
       activity: bridge.activity,
       sessionMessages: bridge.sessionMessages,
-      artifactIds: [...bridge.emittedArtifactVersions.keys()],
+      artifactIds: [...bridge.artifactIds],
     });
     if (updated) {
       this.hub.emitDurable({

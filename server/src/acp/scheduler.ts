@@ -3,7 +3,7 @@ import type { AppConfig } from '../config.js';
 import type { AppDatabase } from '../db/database.js';
 import type { PushNotificationService } from '../notifications/web-push.js';
 import type { SyncHub } from '../sync/hub.js';
-import type { AttachmentRef, ChatRecord, MessageRecord, RunRecord } from '../types.js';
+import type { AttachmentRef, ChatRecord, MessageRecord, RunRecord, SyncEventEnvelope } from '../types.js';
 import type { AcpClientManager } from './client-manager.js';
 import type { QuotaService } from './quota-service.js';
 
@@ -41,6 +41,7 @@ export class ExecutionScheduler {
     userText: string;
     attachments: AttachmentRef[];
     clientMessageId?: string | null;
+    persistWithMessage?: (messageId: string) => SyncEventEnvelope;
   }): {
     userMessage: MessageRecord;
     assistantMessage: MessageRecord;
@@ -83,61 +84,77 @@ export class ExecutionScheduler {
     const assistantMessageId = crypto.randomUUID();
     const queuePosition = this.queue.length + 1;
 
-    const userMessage = this.db.createMessage({
-      id: userMessageId,
-      chatId: params.chatId,
-      userId: params.userId,
-      clientMessageId: params.clientMessageId,
-      role: 'user',
-      contentText: params.userText,
-      attachments: params.attachments,
-      status: 'completed',
-      runId,
-      createdAt: now,
-    });
+    let userMessage: MessageRecord;
+    let updatedChat: ChatRecord;
+    let messageEvent: SyncEventEnvelope;
+    let relatedEvent: SyncEventEnvelope | undefined;
+    this.db.db.exec('BEGIN IMMEDIATE;');
+    try {
+      userMessage = this.db.createMessage({
+        id: userMessageId,
+        chatId: params.chatId,
+        userId: params.userId,
+        clientMessageId: params.clientMessageId,
+        role: 'user',
+        contentText: params.userText,
+        attachments: params.attachments,
+        status: 'completed',
+        runId,
+        createdAt: now,
+      });
 
-    const assistantMessage = this.db.createMessage({
-      id: assistantMessageId,
-      chatId: params.chatId,
-      userId: params.userId,
-      role: 'assistant',
-      contentText: '',
-      status: 'queued',
-      runId,
-      createdAt: now + 1,
-    });
+      const assistantMessage = this.db.createMessage({
+        id: assistantMessageId,
+        chatId: params.chatId,
+        userId: params.userId,
+        role: 'assistant',
+        contentText: '',
+        status: 'queued',
+        runId,
+        createdAt: now + 1,
+      });
 
-    const run = this.db.createRun({
-      id: runId,
-      chatId: params.chatId,
-      userId: params.userId,
-      userMessageId,
-      assistantMessageId,
-      status: 'queued',
-      queuePosition,
-      modelId: chat.modelId,
-      effortValue: chat.effortValue,
-    });
+      const run = this.db.createRun({
+        id: runId,
+        chatId: params.chatId,
+        userId: params.userId,
+        userMessageId,
+        assistantMessageId,
+        status: 'queued',
+        queuePosition,
+        modelId: chat.modelId,
+        effortValue: chat.effortValue,
+      });
 
-    const updatedChat = this.db.updateChat(params.userId, params.chatId, {
-      lastMessageAt: now,
-      title:
-        chat.title === '新しいチャット' && params.userText.trim()
-          ? params.userText.trim().slice(0, 48)
-          : undefined,
-    })!;
+      updatedChat = this.db.updateChat(params.userId, params.chatId, {
+        lastMessageAt: now,
+        title:
+          chat.title === '新しいチャット' && params.userText.trim()
+            ? params.userText.trim().slice(0, 48)
+            : undefined,
+      })!;
 
-    this.hub.emitDurable({
-      userId: params.userId,
-      type: 'message.created',
-      chatId: params.chatId,
-      runId,
-      payload: {
-        messages: [userMessage, assistantMessage],
-        run,
-        chat: updatedChat,
-      },
-    });
+      messageEvent = this.db.insertSyncEventInTx({
+        eventId: crypto.randomUUID(),
+        userId: params.userId,
+        type: 'message.created',
+        chatId: params.chatId,
+        runId,
+        payload: {
+          messages: [userMessage, assistantMessage],
+          run,
+          chat: updatedChat,
+        },
+      });
+
+      relatedEvent = params.persistWithMessage?.(userMessageId);
+      this.db.db.exec('COMMIT;');
+    } catch (error) {
+      this.db.db.exec('ROLLBACK;');
+      throw error;
+    }
+    this.hub.broadcastPersistedEvent(messageEvent);
+    if (relatedEvent) this.hub.broadcastPersistedEvent(relatedEvent);
 
     const job: QueuedTurnJob = {
       runId,

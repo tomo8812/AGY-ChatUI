@@ -1,4 +1,4 @@
-import type { ArtifactScopeKind, PreviewKind } from '../types.js';
+import type { ArtifactRecord, ArtifactScopeKind, PreviewKind } from '../types.js';
 
 export type ArtifactFormat =
   | 'pptx'
@@ -97,7 +97,22 @@ export type CommitJournalState =
   | 'aborted'
   | 'ambiguous_quarantined';
 
+export interface CommitFinalization {
+  filename: string;
+  mimeType: string;
+  previewKind: ArtifactRecord['previewKind'];
+  source: ArtifactRecord['source'];
+  messageId?: string | null;
+  runId?: string | null;
+  sourceArtifactId?: string | null;
+  sourceBaseRevision?: number | null;
+  updateWorkingCopyId?: string;
+  responseSummary?: string;
+  suppressDependencyPropagation?: boolean;
+}
+
 export interface ArtifactCommitJournalRow {
+  finalization?: CommitFinalization;
   commitId: string;
   artifactId: string;
   userId: string;

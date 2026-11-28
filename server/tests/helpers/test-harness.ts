@@ -217,8 +217,14 @@ export async function registerAndBindAgy(
     '/api/agy/login/start',
     { accountLabel: codeOrAccount }
   );
-  if (!start.data.loginFlow?.authUrl?.startsWith('https://accounts.google.com/')) {
-    throw new Error(`Expected Google auth URL, got: ${JSON.stringify(start.data)}`);
+  let flow = start.data.loginFlow;
+  const deadline = Date.now() + 6_000;
+  while (start.status === 200 && !flow?.authUrl && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 100));
+    flow = (await client.request<{ loginFlow: { authUrl: string | null } }>('GET', '/api/agy/status')).data.loginFlow;
+  }
+  if (!flow?.authUrl?.startsWith('https://accounts.google.com/')) {
+    throw new Error(`Expected Google auth URL, got: ${JSON.stringify(flow)}`);
   }
 
   const submit = await client.request<{ profile: { authStatus: string } }>(
@@ -231,4 +237,15 @@ export async function registerAndBindAgy(
   }
 
   return { client, userId: reg.data.user.id };
+}
+
+/** Seed a mock profile for integration tests that exercise features after sign-in. */
+export function seedAuthenticatedMockProfile(ctx: AppContext, userId: string): void {
+  const profile = ctx.db.getAgyProfile(userId);
+  if (!profile || ctx.config.agyMode !== 'mock') throw new Error('A registered mock profile is required.');
+  fs.mkdirSync(profile.profileDir, { recursive: true });
+  fs.writeFileSync(path.join(profile.profileDir, '.mock-agy-auth.json'), JSON.stringify({
+    authenticated: true, label: 'test-account', method: 'oauth-personal',
+  }), { mode: 0o600 });
+  ctx.db.updateAgyProfile(userId, { authStatus: 'authenticated', lastVerifiedAt: Date.now() });
 }

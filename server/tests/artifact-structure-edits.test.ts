@@ -49,11 +49,32 @@ describe('Pure-JS artifact structure edits', () => {
     ]);
     expect(output).toContain('<main><!--preserve--><section id="c"><img id="pic" src="new.png"><div id="b">From patch</div>');
     expect(output).toContain('<footer id="footer">Safe &lt;text&gt;</footer>');
-    expect(adapter.resolveTarget(Buffer.from(output), {
-      kind: 'html_text_range', cssSelector: 'main > section > footer', charStart: 5, charEnd: 11,
-      expectedSnippetHash: sha256Text('<text>'),
-    }, meta)).toMatchObject({ status: 'resolved', resolvedSnippet: '<text>' });
+    const selector = {
+      kind: 'html_source_range', baseRevision: 1, startLine: 1, endLine: 1,
+      expectedSnippetHash: sha256Text(output), contextBeforeHash: sha256Text(''), contextAfterHash: sha256Text(''),
+      occurrenceIndex: 0,
+    };
+    expect(adapter.resolveTarget(Buffer.from(output), selector, meta)).toMatchObject({ status: 'resolved', resolvedSnippet: output });
+    expect(adapter.resolveTarget(Buffer.from(output.replace('Safe ', 'Edit ')), selector, meta)).toMatchObject({ status: 'needs_review' });
+    expect(adapter.resolveTarget(Buffer.from(output), { ...selector, occurrenceIndex: 1 }, meta)).toMatchObject({ status: 'needs_review' });
+    expect(adapter.resolveTarget(Buffer.from(output), { kind: 'html_text_range', baseRevision: 1 }, meta)).toMatchObject({ status: 'needs_review', reason: 'unsupported_selector_kind' });
     expect(() => apply(adapter, output, [{ op: 'html.set_text', elementId: 'pic', text: 'invalid' }])).toThrow();
+  });
+
+  it('resolves svg_region with viewBox and content hash and rejects abolished svg_element', () => {
+    const adapter = new SvgAdapter();
+    const source = Buffer.from('<svg viewBox="0 0 100 100"><g><rect width="10" height="20"/></g></svg>');
+    const selector = {
+      kind: 'svg_region',
+      baseRevision: 1,
+      rectViewBox: [0, 0, 20, 20],
+      expectedViewBox: '0 0 100 100',
+      expectedSvgSha256: sha256Text(source.toString('utf8')),
+    };
+    expect(adapter.resolveTarget(source, selector, meta)).toMatchObject({ status: 'resolved' });
+    const replaced = Buffer.from('<svg viewBox="0 0 100 100"><g><circle r="5"/><rect width="10" height="20"/></g></svg>');
+    expect(adapter.resolveTarget(replaced, selector, meta)).toMatchObject({ status: 'needs_review' });
+    expect(adapter.resolveTarget(source, { kind: 'svg_element', baseRevision: 1 }, meta)).toMatchObject({ status: 'needs_review', reason: 'unsupported_selector_kind' });
   });
 
   it('updates Markdown sections and blocks without selecting the same heading inside fences', () => {

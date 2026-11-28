@@ -1,10 +1,13 @@
+import { isRichExpressionValue, richCollectionIsValid, visitRichNodeStaticFields, visitRichNodeValues } from './rich-node-contract.js';
+import { isRichChartPoint } from '../../../shared/rich-chart-display.js';
+import { mapRichNodeChildren } from './rich-node-tree.js';
 import type {
   RichAction,
   RichDocumentV1,
   RichNode,
   RichSideEffectAction,
   RichStateAction,
-  RichSvgDef,
+  RichStateValue,
   RichSvgElement,
   RichValue,
 } from '../../../shared/rich-schema.js';
@@ -20,6 +23,11 @@ import {
   type RichEvalBudget,
   type RichEvalContext,
 } from './rich-expr-evaluator.js';
+
+import {
+  SVG_ATTRS, SVG_TAGS, validateSvgAttrValue, isSvgDefinition, validSvgViewBox,
+  svgDefinitionElementCount, visitSvgDefinitionValues, svgRoleMatchesActions,
+} from './rich-svg-contract.js';
 
 export const RICH_LIMITS = {
   maxJsonBytes: 512 * 1024,
@@ -124,54 +132,6 @@ const ALLOWED_NODE_TYPES = new Set<string>([
   'media_asset',
 ]);
 
-const ALLOWED_SVG_TAGS = new Set<string>([
-  'g',
-  'rect',
-  'circle',
-  'ellipse',
-  'line',
-  'polyline',
-  'polygon',
-  'path',
-  'text',
-  'tspan',
-]);
-
-const ALLOWED_SVG_ATTRS = new Set<string>([
-  'x',
-  'y',
-  'width',
-  'height',
-  'rx',
-  'ry',
-  'cx',
-  'cy',
-  'r',
-  'x1',
-  'y1',
-  'x2',
-  'y2',
-  'points',
-  'd',
-  'transform',
-  'fill',
-  'stroke',
-  'strokeWidth',
-  'strokeDasharray',
-  'strokeLinecap',
-  'strokeLinejoin',
-  'opacity',
-  'fillOpacity',
-  'strokeOpacity',
-  'fontSize',
-  'fontWeight',
-  'textAnchor',
-  'dominantBaseline',
-  'markerStart',
-  'markerEnd',
-  'clipPath',
-]);
-
 const STATE_ACTION_TYPES = new Set<RichStateAction['type']>([
   'set_state',
   'toggle_state',
@@ -203,9 +163,7 @@ const ALLOWED_CHART_TYPES = new Set([
 
 const ALLOWED_SAVE_FORMATS = new Set(['svg', 'md', 'txt', 'csv', 'json', 'code']);
 
-function isExprWrapper(v: unknown): v is { expr: string } {
-  return Boolean(v && typeof v === 'object' && !Array.isArray(v) && typeof (v as { expr?: unknown }).expr === 'string');
-}
+const isExprWrapper = isRichExpressionValue;
 
 export function isValidHttpUrl(raw: string): boolean {
   try {
@@ -214,54 +172,6 @@ export function isValidHttpUrl(raw: string): boolean {
   } catch {
     return false;
   }
-}
-
-export function validateSvgAttrValue(attrName: string, rawVal: unknown): string | null {
-  if (rawVal === null || rawVal === undefined) return null;
-  const s = String(rawVal).trim();
-  const lower = s.toLowerCase();
-
-  if (attrName.toLowerCase().startsWith('on')) {
-    return `SVG event handler attribute '${attrName}' is forbidden.`;
-  }
-  if (
-    lower.includes('javascript:') ||
-    lower.includes('vbscript:') ||
-    lower.includes('expression(') ||
-    lower.includes('@import') ||
-    lower.includes('<script') ||
-    lower.includes('<foreignobject')
-  ) {
-    return `Dangerous SVG attribute value detected in '${attrName}'.`;
-  }
-
-  // url(...) is permitted ONLY for local fragment references url(#id)
-  const urlMatches = s.matchAll(/url\s*\(([^)]*)\)/gi);
-  for (const m of urlMatches) {
-    const inner = m[1].trim().replace(/^['"]|['"]$/g, '');
-    if (!/^#[a-zA-Z_][a-zA-Z0-9_-]*$/.test(inner)) {
-      return `SVG attribute '${attrName}' contains forbidden external/non-local url(${inner}).`;
-    }
-  }
-
-  if (attrName === 'markerStart' || attrName === 'markerEnd' || attrName === 'clipPath') {
-    if (s !== '' && s !== 'none' && !/^url\(#([a-zA-Z_][a-zA-Z0-9_-]*)\)$/.test(s)) {
-      return `SVG reference attribute '${attrName}' must be a local url(#id).`;
-    }
-  }
-
-  if (attrName === 'fill' || attrName === 'stroke') {
-    if (
-      lower.startsWith('http://') ||
-      lower.startsWith('https://') ||
-      lower.startsWith('data:') ||
-      lower.startsWith('blob:')
-    ) {
-      return `SVG paint attribute '${attrName}' cannot reference external URLs.`;
-    }
-  }
-
-  return null;
 }
 
 export function validateRichMarkdownContent(content: string): string | null {
@@ -404,9 +314,61 @@ export function topologicalSortComputed(
   return { order, asts, cycle };
 }
 
+const forbidden = new Set(['__proto__', 'constructor', 'prototype']);
+
+function isPrimitive(value: unknown): value is string | number | boolean | null {
+  return value === null || typeof value === 'string' || typeof value === 'boolean' ||
+    (typeof value === 'number' && Number.isFinite(value));
+}
+function isPrimitiveRecord(value: unknown): value is Record<string, string | number | boolean | null> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return (proto === Object.prototype || proto === null) &&
+    Object.entries(value).every(([key, item]) => !forbidden.has(key) && isPrimitive(item));
+}
+export function cloneRichStateValue(value: unknown): RichStateValue {
+  if (isPrimitive(value)) return value;
+  if (isPrimitiveRecord(value)) return Object.freeze({ ...value });
+  if (Array.isArray(value) && value.length <= RICH_LIMITS.maxArrayPoints) {
+    if (value.every(isPrimitive)) return Object.freeze([...value]) as unknown as RichStateValue;
+    if (value.every(isPrimitiveRecord)) {
+      return Object.freeze(value.map(item => Object.freeze({ ...item }))) as unknown as RichStateValue;
+    }
+  }
+  throw new RichExprError('RICH_INVALID_STATE_VALUE', 'Invalid state value.');
+}
+
+export function assertRichStateLimit(state: Record<string, RichStateValue>): void {
+  const arrayPoints = Object.values(state).reduce<number>((points, item) => points + (Array.isArray(item) ? item.length : 0), 0);
+  if (arrayPoints > RICH_LIMITS.maxArrayPoints) {
+    throw new RichExprError('RICH_ARRAY_LIMIT_EXCEEDED', 'State exceeds the array point limit.', 422);
+  }
+  const bytes = new TextEncoder().encode(JSON.stringify(state)).byteLength;
+  if (bytes > RICH_LIMITS.maxStateBytes) {
+    throw new RichExprError('RICH_STATE_TOO_LARGE', 'State exceeds the byte limit.', 422);
+  }
+}
+
+export function mergeRichState(
+  defaults: Record<string, RichStateValue> = {},
+  snapshot?: Record<string, unknown> | null,
+): Record<string, RichStateValue> {
+  const state: Record<string, RichStateValue> = Object.create(null);
+  for (const [key, value] of Object.entries(defaults)) {
+    if (forbidden.has(key)) throw new RichExprError('RICH_INVALID_STATE_KEY', 'Invalid state key.');
+    state[key] = cloneRichStateValue(snapshot && Object.hasOwn(snapshot, key) ? snapshot[key] : value);
+  }
+  for (const key of Object.keys(snapshot ?? {})) {
+    if (!Object.hasOwn(state, key)) throw new RichExprError('RICH_UNDECLARED_STATE_KEY', 'State key is not declared.');
+  }
+  assertRichStateLimit(state);
+  return state;
+}
+
 export interface ValidateRichDocumentOptions {
   authorizedArtifactIds?: Set<string>;
   locale?: string;
+  theme?: 'light' | 'dark';
 }
 
 export function validateRichDocument(
@@ -420,6 +382,7 @@ export function validateRichDocument(
   let staticSvgElements = 0;
   let expandedNodes = 0;
   let expandedSvgElements = 0;
+  let expandedDataPoints = 0;
   let computedOrder: string[] = [];
   const budget = createRichEvalBudget(RICH_LIMITS.maxAstSteps);
 
@@ -448,7 +411,7 @@ export function validateRichDocument(
   }
 
   const serialized = JSON.stringify(rawDoc);
-  jsonBytes = Buffer.byteLength(serialized, 'utf8');
+  jsonBytes = new TextEncoder().encode(serialized).byteLength;
   if (jsonBytes > RICH_LIMITS.maxJsonBytes) {
     return fail(
       'RICH_DOC_TOO_LARGE',
@@ -466,17 +429,17 @@ export function validateRichDocument(
     return fail('RICH_INVALID_SCHEMA', '$.root', 'Document root node is required.');
   }
 
-  const declaredStateKeys = new Set<string>(Object.keys(doc.state ?? {}));
-  const initialState: Record<string, unknown> = { ...(doc.state ?? {}) };
-  const stateBytes = Buffer.byteLength(JSON.stringify(initialState), 'utf8');
-  if (stateBytes > RICH_LIMITS.maxStateBytes) {
-    return fail(
-      'RICH_STATE_TOO_LARGE',
-      '$.state',
-      `Initial state size (${stateBytes} bytes) exceeds limit of ${RICH_LIMITS.maxStateBytes} bytes.`,
-      422
-    );
+  let initialState: Record<string, RichStateValue>;
+  try {
+    if (doc.state !== undefined && (!doc.state || typeof doc.state !== 'object' || Array.isArray(doc.state))) {
+      return fail('RICH_INVALID_STATE_VALUE', '$.state', 'State must be an object.');
+    }
+    initialState = mergeRichState(doc.state);
+  } catch (error) {
+    if (!(error instanceof RichExprError)) throw error;
+    return fail(error.code, '$.state', error.message, error.statusCode);
   }
+  const declaredStateKeys = new Set(Object.keys(initialState));
 
   // Count array points inside initial state
   let totalArrayPoints = 0;
@@ -501,6 +464,7 @@ export function validateRichDocument(
     countArrayPoints(v, `$.state.${k}`);
   }
 
+  const sourceIds = new Set<string>();
   // Validate sources
   if (doc.sources !== undefined) {
     if (!Array.isArray(doc.sources)) {
@@ -508,7 +472,8 @@ export function validateRichDocument(
     } else {
       for (let i = 0; i < doc.sources.length; i++) {
         const src = doc.sources[i];
-        if (!src || typeof src !== 'object' || !src.id || !src.name) {
+        if (!src || typeof src !== 'object' || typeof src.id !== 'string' || !src.id.trim() ||
+            typeof src.name !== 'string' || !src.name.trim() || sourceIds.has(src.id)) {
           issues.push({
             code: 'RICH_INVALID_SCHEMA',
             path: `$.sources[${i}]`,
@@ -517,7 +482,16 @@ export function validateRichDocument(
           });
           continue;
         }
-        if (src.url !== undefined && !isValidHttpUrl(src.url)) {
+        sourceIds.add(src.id);
+        for (const key of ['fetchedAt', 'asOf', 'timezone', 'unit', 'currency', 'period', 'delayNotice'] as const) {
+          if (src[key] !== undefined && typeof src[key] !== 'string') {
+            issues.push({ code: 'RICH_INVALID_SCHEMA', path: `$.sources[${i}].${key}`, message: 'Expected a string.', severity: 'error' });
+          }
+        }
+        if (src.valueStatus !== undefined && !['preliminary', 'final', 'delayed', 'unavailable'].includes(src.valueStatus)) {
+          issues.push({ code: 'RICH_INVALID_SCHEMA', path: `$.sources[${i}].valueStatus`, message: 'Invalid source status.', severity: 'error' });
+        }
+        if (src.url !== undefined && (typeof src.url !== 'string' || !isValidHttpUrl(src.url))) {
           issues.push({
             code: 'RICH_FORBIDDEN_URL',
             path: `$.sources[${i}].url`,
@@ -565,8 +539,9 @@ export function validateRichDocument(
 
   const seenNodeIds = new Set<string>();
 
-  const checkExprSyntax = (expr: string, p: string): ExprAst | null => {
+  const checkExprSyntax = (expr: unknown, p: string): ExprAst | null => {
     try {
+      if (typeof expr !== 'string') throw new RichExprError('RICH_EXPR_SYNTAX', 'Expression must be a string.');
       return parseRichExpr(expr);
     } catch (err) {
       issues.push({
@@ -594,7 +569,7 @@ export function validateRichDocument(
     requireNonEmpty = false
   ) => {
     if (!Array.isArray(actions)) {
-      if (requireNonEmpty) {
+      if (actions !== undefined || requireNonEmpty) {
         issues.push({
           code: 'RICH_NONFUNCTIONAL_CONTROL',
           path: p,
@@ -630,34 +605,51 @@ export function validateRichDocument(
           });
           continue;
         }
-        if (act.type === 'copy_text') checkExprSyntax(String((act as { textExpr?: unknown }).textExpr ?? ''), `${ap}.textExpr`);
-        if (act.type === 'open_external_url') checkExprSyntax(String((act as { urlExpr?: unknown }).urlExpr ?? ''), `${ap}.urlExpr`);
-        if (act.type === 'open_artifact') checkExprSyntax(String((act as { artifactIdExpr?: unknown }).artifactIdExpr ?? ''), `${ap}.artifactIdExpr`);
+        if (act.type === 'copy_text') checkExprSyntax((act as { textExpr?: unknown }).textExpr, `${ap}.textExpr`);
+        if (act.type === 'open_external_url') checkExprSyntax((act as { urlExpr?: unknown }).urlExpr, `${ap}.urlExpr`);
+        if (act.type === 'open_artifact') checkExprSyntax((act as { artifactIdExpr?: unknown }).artifactIdExpr, `${ap}.artifactIdExpr`);
         if (act.type === 'save_to_artifact') {
           const sa = act as Extract<RichSideEffectAction, { type: 'save_to_artifact' }>;
           if (!ALLOWED_SAVE_FORMATS.has(sa.format)) {
             issues.push({ code: 'RICH_INVALID_ACTION', path: `${ap}.format`, message: `Unsupported save format '${sa.format}'.`, severity: 'error' });
           }
-          checkExprSyntax(String(sa.filenameExpr ?? ''), `${ap}.filenameExpr`);
-          checkExprSyntax(String(sa.contentExpr ?? ''), `${ap}.contentExpr`);
+          checkExprSyntax(sa.filenameExpr, `${ap}.filenameExpr`);
+          checkExprSyntax(sa.contentExpr, `${ap}.contentExpr`);
         }
-        if (act.type === 'submit_to_chat') checkExprSyntax(String((act as { textExpr?: unknown }).textExpr ?? ''), `${ap}.textExpr`);
+        if (act.type === 'submit_to_chat') {
+          checkExprSyntax(act.textExpr, `${ap}.textExpr`);
+          if (act.requireConfirm !== undefined && typeof act.requireConfirm !== 'boolean') {
+            issues.push({ code: 'RICH_INVALID_ACTION', path: `${ap}.requireConfirm`, message: 'Expected a boolean.', severity: 'error' });
+          }
+        }
+        if (act.type === 'start_pin_edit' && act.targetNodeId !== undefined &&
+            (typeof act.targetNodeId !== 'string' || !act.targetNodeId.trim())) {
+          issues.push({ code: 'RICH_INVALID_ACTION', path: `${ap}.targetNodeId`, message: 'Expected a node ID.', severity: 'error' });
+        }
       } else if (STATE_ACTION_TYPES.has(act.type as RichStateAction['type'])) {
         if (act.type === 'set_state') {
           const sa = act as Extract<RichStateAction, { type: 'set_state' }>;
           if (!declaredStateKeys.has(sa.key)) {
             issues.push({ code: 'RICH_UNDECLARED_STATE_KEY', path: `${ap}.key`, message: `State key '${sa.key}' is not declared in document.state.`, severity: 'error' });
           }
-          checkExprSyntax(String(sa.valueExpr ?? ''), `${ap}.valueExpr`);
+          checkExprSyntax(sa.valueExpr, `${ap}.valueExpr`);
         } else if (act.type === 'toggle_state' || act.type === 'increment_state') {
           const key = (act as { key?: string }).key ?? '';
           if (!declaredStateKeys.has(key)) {
             issues.push({ code: 'RICH_UNDECLARED_STATE_KEY', path: `${ap}.key`, message: `State key '${key}' is not declared in document.state.`, severity: 'error' });
           }
-          if (act.type === 'increment_state' && act.deltaExpr) {
-            checkExprSyntax(act.deltaExpr, `${ap}.deltaExpr`);
+          if (act.type === 'increment_state') {
+            if (act.deltaExpr !== undefined) checkExprSyntax(act.deltaExpr, `${ap}.deltaExpr`);
+            if ([act.min, act.max].some(value => value !== undefined && !Number.isFinite(value)) ||
+                (act.min ?? -Infinity) > (act.max ?? Infinity)) {
+              issues.push({ code: 'RICH_INVALID_ACTION', path: ap, message: 'Invalid increment bounds.', severity: 'error' });
+            }
           }
-        } else if (act.type === 'reset_state' && Array.isArray(act.keys)) {
+        } else if (act.type === 'reset_state' && act.keys !== undefined) {
+          if (!Array.isArray(act.keys)) {
+            issues.push({ code: 'RICH_INVALID_ACTION', path: `${ap}.keys`, message: 'Expected a list of state keys.', severity: 'error' });
+            continue;
+          }
           for (const k of act.keys) {
             if (!declaredStateKeys.has(k)) {
               issues.push({ code: 'RICH_UNDECLARED_STATE_KEY', path: `${ap}.keys`, message: `State key '${k}' is not declared in document.state.`, severity: 'error' });
@@ -692,23 +684,31 @@ export function validateRichDocument(
     }
   };
 
-  const validateSvgElementStatic = (el: unknown, p: string, repeatDepth: number) => {
+  const countStaticSvg = (count: number, p: string) => {
+    staticSvgElements += count;
+    if (staticSvgElements > RICH_LIMITS.maxStaticSvgElements) {
+      issues.push({
+        code: 'RICH_SVG_LIMIT_EXCEEDED', path: p,
+        message: `Static SVG element count exceeded ${RICH_LIMITS.maxStaticSvgElements}.`, severity: 'error',
+      });
+    }
+  };
+  const checkSvgValue = (name: string, value: unknown, p: string, defs: ReadonlySet<string>) => {
+    if (isExprWrapper(value)) checkExprSyntax(value.expr, p + '.expr');
+    else {
+      const err = validateSvgAttrValue(name, value, defs);
+      if (err) issues.push({ code: 'RICH_UNSAFE_SVG_VALUE', path: p, message: err, severity: 'error' });
+    }
+  };
+  const validateSvgElementStatic = (el: unknown, p: string, repeatDepth: number, defs: ReadonlySet<string>, elementIds: Set<string>) => {
     if (!el || typeof el !== 'object') {
       issues.push({ code: 'RICH_INVALID_SVG', path: p, message: 'SVG element must be an object.', severity: 'error' });
       return;
     }
-    staticSvgElements += 1;
-    if (staticSvgElements > RICH_LIMITS.maxStaticSvgElements) {
-      issues.push({
-        code: 'RICH_SVG_LIMIT_EXCEEDED',
-        path: p,
-        message: `Static SVG element count exceeded ${RICH_LIMITS.maxStaticSvgElements}.`,
-        severity: 'error',
-      });
-      return;
-    }
+    countStaticSvg(1, p);
+    if (staticSvgElements > RICH_LIMITS.maxStaticSvgElements) return;
     const svgEl = el as Partial<RichSvgElement> & Record<string, unknown>;
-    if (typeof svgEl.tag !== 'string' || !ALLOWED_SVG_TAGS.has(svgEl.tag)) {
+    if (typeof svgEl.tag !== 'string' || !SVG_TAGS.has(svgEl.tag)) {
       issues.push({
         code: 'RICH_FORBIDDEN_SVG_TAG',
         path: `${p}.tag`,
@@ -717,7 +717,14 @@ export function validateRichDocument(
       });
       return;
     }
-    if (svgEl.visibleWhen) checkExprSyntax(svgEl.visibleWhen, `${p}.visibleWhen`);
+    if (svgEl.id !== undefined) {
+      if (typeof svgEl.id !== 'string' || !svgEl.id.trim() || elementIds.has(svgEl.id)) {
+        issues.push({ code: 'RICH_INVALID_SVG', path: `${p}.id`, message: 'Invalid or duplicate SVG element ID.', severity: 'error' });
+      } else {
+        elementIds.add(svgEl.id);
+      }
+    }
+    if (svgEl.visibleWhen !== undefined) checkExprSyntax(svgEl.visibleWhen, `${p}.visibleWhen`);
     let nextRepeatDepth = repeatDepth;
     if (svgEl.repeat) {
       nextRepeatDepth += 1;
@@ -733,7 +740,7 @@ export function validateRichDocument(
     }
     if (svgEl.attrs && typeof svgEl.attrs === 'object') {
       for (const [k, v] of Object.entries(svgEl.attrs)) {
-        if (!ALLOWED_SVG_ATTRS.has(k)) {
+        if (!SVG_ATTRS.has(k)) {
           issues.push({
             code: 'RICH_FORBIDDEN_SVG_ATTR',
             path: `${p}.attrs.${k}`,
@@ -742,18 +749,17 @@ export function validateRichDocument(
           });
           continue;
         }
-        if (isExprWrapper(v)) {
-          checkExprSyntax(v.expr, `${p}.attrs.${k}.expr`);
-        } else {
-          const err = validateSvgAttrValue(k, v);
-          if (err) {
-            issues.push({ code: 'RICH_UNSAFE_SVG_VALUE', path: `${p}.attrs.${k}`, message: err, severity: 'error' });
-          }
-        }
+        checkSvgValue(k, v, `${p}.attrs.${k}`, defs);
       }
     }
-    if (svgEl.textContent !== undefined) checkRichValueStatic(svgEl.textContent, `${p}.textContent`);
-    if (svgEl.tooltip !== undefined) checkRichValueStatic(svgEl.tooltip, `${p}.tooltip`);
+    for (const field of ['textContent', 'tooltip'] as const) {
+      const value = svgEl[field];
+      if (value === undefined) continue;
+      if (typeof value !== 'string' && !isExprWrapper(value)) {
+        issues.push({ code: 'RICH_INVALID_SVG', path: `${p}.${field}`, message: 'Expected a string or expression.', severity: 'error' });
+      }
+      checkRichValueStatic(value, `${p}.${field}`);
+    }
     if (svgEl.onClick !== undefined) {
       // SVG element click only permits state actions (never side effects)
       checkActionsStatic(svgEl.onClick, `${p}.onClick`, false, false);
@@ -767,50 +773,47 @@ export function validateRichDocument(
           severity: 'error',
         });
       } else {
-        svgEl.children.forEach((child, idx) => validateSvgElementStatic(child, `${p}.children[${idx}]`, nextRepeatDepth));
+        svgEl.children.forEach((child, idx) => validateSvgElementStatic(child, `${p}.children[${idx}]`, nextRepeatDepth, defs, elementIds));
       }
     }
   };
 
   const validateSvgSceneStatic = (scene: Record<string, unknown>, p: string, repeatDepth: number) => {
-    const vb = scene.viewBox;
-    if (typeof vb !== 'string' || !/^\s*-?\d+(?:\.\d+)?(?:\s+|,\s*)-?\d+(?:\.\d+)?(?:\s+|,\s*)\d+(?:\.\d+)?(?:\s+|,\s*)\d+(?:\.\d+)?\s*$/.test(vb)) {
-      issues.push({
-        code: 'RICH_INVALID_SVG',
-        path: `${p}.viewBox`,
-        message: 'svg_scene viewBox must contain 4 numeric values.',
-        severity: 'error',
-      });
+    if (!validSvgViewBox(scene.viewBox)) {
+      issues.push({ code: 'RICH_INVALID_SVG', path: `${p}.viewBox`, message: 'Invalid SVG viewBox.', severity: 'error' });
     }
-    if (Array.isArray(scene.defs)) {
-      for (let i = 0; i < scene.defs.length; i++) {
-        const def = scene.defs[i] as RichSvgDef;
-        if (!def || typeof def !== 'object' || !def.id || !/^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(def.id)) {
-          issues.push({ code: 'RICH_INVALID_SVG', path: `${p}.defs[${i}].id`, message: 'Invalid SVG def id.', severity: 'error' });
-          continue;
-        }
-        if (def.kind === 'linearGradient' || def.kind === 'radialGradient') {
-          for (let j = 0; j < (def.stops?.length ?? 0); j++) {
-            const st = def.stops[j];
-            if (isExprWrapper(st.color)) checkExprSyntax(st.color.expr, `${p}.defs[${i}].stops[${j}].color`);
-            else {
-              const err = validateSvgAttrValue('fill', st.color);
-              if (err) issues.push({ code: 'RICH_UNSAFE_SVG_VALUE', path: `${p}.defs[${i}].stops[${j}].color`, message: err, severity: 'error' });
-            }
-          }
-        } else if (def.kind === 'marker' && def.fill !== undefined) {
-          if (isExprWrapper(def.fill)) checkExprSyntax(def.fill.expr, `${p}.defs[${i}].fill`);
-          else {
-            const err = validateSvgAttrValue('fill', def.fill);
-            if (err) issues.push({ code: 'RICH_UNSAFE_SVG_VALUE', path: `${p}.defs[${i}].fill`, message: err, severity: 'error' });
-          }
-        }
+    const ids = new Set<string>();
+    if (scene.defs !== undefined && !Array.isArray(scene.defs)) {
+      issues.push({ code: 'RICH_INVALID_SVG', path: `${p}.defs`, message: 'SVG definitions must be an array.', severity: 'error' });
+    }
+    const defs = (Array.isArray(scene.defs) ? scene.defs : []).filter((def, idx) => {
+      if (!isSvgDefinition(def) || ids.has(def.id)) {
+        issues.push({ code: 'RICH_INVALID_SVG', path: `${p}.defs[${idx}]`, message: 'Invalid or duplicate SVG definition.', severity: 'error' });
+        return false;
       }
+      ids.add(def.id);
+      return true;
+    });
+    for (const [idx, def] of defs.entries()) {
+      const dp = `${p}.defs[${idx}]`;
+      countStaticSvg(svgDefinitionElementCount(def), dp);
+      visitSvgDefinitionValues(def, (name, value, field) => {
+        if (field.startsWith('attrs.') && !SVG_ATTRS.has(name)) {
+          issues.push({ code: 'RICH_FORBIDDEN_SVG_ATTR', path: `${dp}.${field}`, message: 'Invalid clipPath attribute.', severity: 'error' });
+        } else {
+          checkSvgValue(name, value, `${dp}.${field}`, ids);
+        }
+      });
     }
     if (!Array.isArray(scene.elements)) {
       issues.push({ code: 'RICH_INVALID_SVG', path: `${p}.elements`, message: 'svg_scene requires an elements array.', severity: 'error' });
     } else {
-      scene.elements.forEach((el, idx) => validateSvgElementStatic(el, `${p}.elements[${idx}]`, repeatDepth));
+      const elementIds = new Set<string>();
+      scene.elements.forEach((el, idx) => validateSvgElementStatic(el, `${p}.elements[${idx}]`, repeatDepth, ids, elementIds));
+      if (!svgRoleMatchesActions(scene.interactiveRole, scene.elements)) {
+        issues.push({ code: 'RICH_INVALID_SVG_ROLE', path: `${p}.interactiveRole`,
+          message: 'Only interactive SVG scenes can contain actions, and they require an action.', severity: 'error' });
+      }
     }
   };
 
@@ -917,8 +920,14 @@ export function validateRichDocument(
         if (!Array.isArray(node.series) || node.series.length === 0) {
           issues.push({ code: 'RICH_INVALID_SCHEMA', path: `${p}.series`, message: 'chart requires at least one series.', severity: 'error' });
         } else {
+          const seriesKeys = new Set<string>();
           for (let i = 0; i < node.series.length; i++) {
             const s = node.series[i] as Record<string, unknown>;
+            if (!s || typeof s.key !== 'string' || !s.key.trim() || seriesKeys.has(s.key)) {
+              issues.push({ code: 'RICH_INVALID_SCHEMA', path: `${p}.series[${i}].key`, message: 'Chart series require unique keys.', severity: 'error' });
+              continue;
+            }
+            seriesKeys.add(s.key);
             checkRichValueStatic(s.label, `${p}.series[${i}].label`);
             checkRichValueStatic(s.data, `${p}.series[${i}].data`);
           }
@@ -955,10 +964,8 @@ export function validateRichDocument(
             checkRichValueStatic(node.artifactId, `${p}.artifactId`);
           }
         } else if (sk === 'inline_svg') {
-          if (!node.svgScene || typeof node.svgScene !== 'object') {
+          if (!node.svgScene || typeof node.svgScene !== 'object' || (node.svgScene as RichNode).type !== 'svg_scene') {
             issues.push({ code: 'RICH_INVALID_SCHEMA', path: `${p}.svgScene`, message: 'media_asset(inline_svg) requires svgScene.', severity: 'error' });
-          } else {
-            validateSvgSceneStatic(node.svgScene as Record<string, unknown>, `${p}.svgScene`, nextRepeatDepth);
           }
         }
         break;
@@ -1011,11 +1018,16 @@ export function validateRichDocument(
         if (!Array.isArray(node.items) || node.items.length === 0) {
           issues.push({ code: 'RICH_NONFUNCTIONAL_CONTROL', path: `${p}.items`, message: 'tabs requires non-empty items.', severity: 'error' });
         } else {
+          const tabIds = new Set<string>();
           for (let i = 0; i < node.items.length; i++) {
             const tab = node.items[i] as Record<string, unknown>;
-            if (Array.isArray(tab.content)) {
-              tab.content.forEach((child, j) => validateNodeStatic(child, `${p}.items[${i}].content[${j}]`, depth + 1, nextRepeatDepth));
+            if (!tab || typeof tab.id !== 'string' || !tab.id.trim() || tabIds.has(tab.id) ||
+                !Array.isArray(tab.content) || (typeof tab.label !== 'string' && !isExprWrapper(tab.label))) {
+              issues.push({ code: 'RICH_INVALID_SCHEMA', path: `${p}.items[${i}]`, message: 'Tabs require a unique ID, label and content.', severity: 'error' });
+              continue;
             }
+            tabIds.add(tab.id);
+            checkRichValueStatic(tab.label, `${p}.items[${i}].label`);
           }
         }
         break;
@@ -1027,18 +1039,20 @@ export function validateRichDocument(
       }
       case 'popover':
       case 'tooltip': {
-        if (node.trigger) validateNodeStatic(node.trigger, `${p}.trigger`, depth + 1, nextRepeatDepth);
-        if (Array.isArray(node.content)) {
-          node.content.forEach((child, i) => validateNodeStatic(child, `${p}.content[${i}]`, depth + 1, nextRepeatDepth));
-        } else {
-          checkRichValueStatic(node.content, `${p}.content`);
+        if (!node.trigger) {
+          issues.push({ code: 'RICH_INVALID_SCHEMA', path: `${p}.trigger`, message: 'A trigger node is required.', severity: 'error' });
         }
+        if (!Array.isArray(node.content)) checkRichValueStatic(node.content, `${p}.content`);
         break;
       }
       case 'editable_draft': {
         checkBind(node.bind, `${p}.bind`, true);
         if (node.saveAction !== undefined) {
-          checkActionsStatic([node.saveAction], `${p}.saveAction`, true, true);
+          if ((node.saveAction as { type?: unknown } | null)?.type !== 'save_to_artifact') {
+            issues.push({ code: 'RICH_INVALID_SCHEMA', path: `${p}.saveAction`, message: 'Expected save_to_artifact.', severity: 'error' });
+          } else {
+            checkActionsStatic([node.saveAction], `${p}.saveAction`, true, true);
+          }
         }
         break;
       }
@@ -1051,16 +1065,34 @@ export function validateRichDocument(
       }
     }
 
-    // Recurse common child containers
-    if (Array.isArray(node.children)) {
-      node.children.forEach((child, i) => validateNodeStatic(child, `${p}.children[${i}]`, depth + 1, nextRepeatDepth));
+    const typedNode = node as unknown as RichNode;
+    const registeredSource = (value: unknown) => typeof value === 'string' && sourceIds.has(value);
+    const sourceReferences = [
+      ...(node.sourceId === undefined ? [] : [node.sourceId]),
+      ...(typedNode.type === 'source_attribution' && Array.isArray(typedNode.sourceIds) ? typedNode.sourceIds : []),
+      ...(typedNode.type === 'chart' && Array.isArray(typedNode.series) ? typedNode.series.flatMap(series =>
+        series?.sourceId === undefined ? [] : [series.sourceId]) : []),
+    ];
+    if (!sourceReferences.every(registeredSource)) {
+      issues.push({ code: 'RICH_INVALID_SCHEMA', path: p, message: 'Unknown source reference.', severity: 'error' });
     }
-    if (node.headerAction) {
-      validateNodeStatic(node.headerAction, `${p}.headerAction`, depth + 1, nextRepeatDepth);
+    for (const field of ['rows', 'options', 'items']) {
+      if (Array.isArray(node[field]) && ['data_table', 'radio_group', 'select', 'segmented', 'list', 'checklist', 'steps', 'timeline'].includes(type) &&
+          !richCollectionIsValid(typedNode.type, node[field], registeredSource)) {
+        issues.push({ code: 'RICH_INVALID_SCHEMA', path: p + '.' + field, message: 'Invalid collection entry.', severity: 'error' });
+      }
     }
-    if (node.footer) {
-      validateNodeStatic(node.footer, `${p}.footer`, depth + 1, nextRepeatDepth);
-    }
+    visitRichNodeStaticFields(typedNode, (value, check, field) => {
+      if (!check(value)) issues.push({ code: 'RICH_INVALID_SCHEMA', path: `${p}.${field}`, message: 'Invalid node field.', severity: 'error' });
+    });
+    visitRichNodeValues(typedNode, (value, _check, field) => {
+      if (isExprWrapper(value)) checkExprSyntax(value.expr, `${p}.${field}.expr`);
+    });
+
+    mapRichNodeChildren(node as unknown as RichNode, (child, childPath) => {
+      validateNodeStatic(child, `${p}.${childPath}`, depth + 1, nextRepeatDepth);
+      return child;
+    });
   };
 
   validateNodeStatic(doc.root, '$.root', 1, 0);
@@ -1085,50 +1117,549 @@ export function validateRichDocument(
     };
   }
 
-  // Stage 2 & 3: Dynamic expansion + Post-Evaluation validation
-  const computedValues: Record<string, unknown> = {};
-  const rootCtx: RichEvalContext = {
+  // Stage 2 & 3: Dynamic expansion + Post-Evaluation validation via shared engine
+  const plan = compileRichDynamicPlan(doc as RichDocumentV1, { computedOrder, computedAsts, declaredArtifactIds: referencedArtifacts });
+  const dyn = evaluateRichDynamicState(plan, {
     state: initialState,
+    theme: opts.theme ?? 'light',
+    locale: opts.locale,
+    authorizedArtifactIds: opts.authorizedArtifactIds,
+    initialAstSteps: budget.steps,
+  });
+
+  for (const issue of dyn.issues) issues.push(issue);
+  for (const artId of dyn.referencedArtifactIds) referencedArtifacts.add(artId);
+
+  const firstErr = issues.find((i) => i.severity === 'error');
+  return {
+    valid: !firstErr,
+    statusCode: firstErr
+      ? dyn.statusCode !== 200
+        ? dyn.statusCode
+        : firstErr.code === 'RICH_FORBIDDEN_ARTIFACT_REF'
+          ? 403
+          : firstErr.code.includes('LIMIT')
+            ? 422
+            : 400
+      : 200,
+    primaryErrorCode: firstErr?.code ?? null,
+    issues,
+    stats: {
+      jsonBytes,
+      staticNodes,
+      staticSvgElements,
+      expandedNodes: dyn.stats.expandedNodes,
+      expandedSvgElements: dyn.stats.expandedSvgElements,
+      astStepsUsed: dyn.stats.astStepsUsed,
+      computedOrder,
+    },
+    referencedArtifactIds: [...referencedArtifacts],
+  };
+}
+
+export interface RichDependencySet {
+  stateKeys: Set<string>;
+  computedKeys: Set<string>;
+  usesAllState: boolean;
+  usesAllComputed: boolean;
+  usesTheme: boolean;
+}
+
+export interface RichSubtreeCacheEntry {
+  expandedNodes: number;
+  expandedSvgElements: number;
+  expandedDataPoints: number;
+  astSteps: number;
+  referencedArtifacts: string[];
+}
+
+export type RichSubtreeCache = Map<string, RichSubtreeCacheEntry>;
+
+export interface RichDynamicPlan {
+  readonly doc: RichDocumentV1;
+  readonly computedOrder: string[];
+  readonly computedAsts: Map<string, ExprAst>;
+  readonly computedDeps: Map<string, RichDependencySet>;
+  readonly exprAstCache: Map<string, ExprAst>;
+  readonly subtreeDeps: WeakMap<RichNode, RichDependencySet>;
+  readonly declaredArtifactIds: Set<string>;
+  getAst(expr: string): ExprAst;
+}
+
+export interface RichDynamicStats {
+  expandedNodes: number;
+  expandedSvgElements: number;
+  expandedDataPoints: number;
+  astStepsUsed: number;
+  computedStepsUsed: number;
+  recomputedKeys: string[];
+  evaluatedSubtrees: number;
+  reusedSubtrees: number;
+}
+
+export interface RichDynamicEvalResult {
+  valid: boolean;
+  statusCode: number;
+  primaryErrorCode: string | null;
+  issues: RichValidationIssue[];
+  computed: Record<string, unknown>;
+  stats: RichDynamicStats;
+  referencedArtifactIds: string[];
+  subtreeCache: RichSubtreeCache;
+  computedStepsByKey: Map<string, number>;
+}
+
+function emptyDeps(): RichDependencySet {
+  return {
+    stateKeys: new Set<string>(),
+    computedKeys: new Set<string>(),
+    usesAllState: false,
+    usesAllComputed: false,
+    usesTheme: false,
+  };
+}
+
+function mergeDeps(target: RichDependencySet, source: RichDependencySet): void {
+  for (const k of source.stateKeys) target.stateKeys.add(k);
+  for (const k of source.computedKeys) target.computedKeys.add(k);
+  if (source.usesAllState) target.usesAllState = true;
+  if (source.usesAllComputed) target.usesAllComputed = true;
+  if (source.usesTheme) target.usesTheme = true;
+}
+
+function collectAstDeps(ast: ExprAst, target: RichDependencySet): void {
+  const walk = (node: ExprAst) => {
+    switch (node.kind) {
+      case 'ident':
+        if (node.name === '$state') target.usesAllState = true;
+        else if (node.name === '$computed') target.usesAllComputed = true;
+        else if (node.name === '$theme') target.usesTheme = true;
+        break;
+      case 'member':
+        if (node.object.kind === 'ident') {
+          if (node.object.name === '$state') {
+            target.stateKeys.add(node.property);
+            return;
+          }
+          if (node.object.name === '$computed') {
+            target.computedKeys.add(node.property);
+            return;
+          }
+        }
+        walk(node.object);
+        break;
+      case 'index':
+        if (node.object.kind === 'ident' && node.index.kind === 'literal' && typeof node.index.value === 'string') {
+          if (node.object.name === '$state') {
+            target.stateKeys.add(node.index.value);
+            return;
+          }
+          if (node.object.name === '$computed') {
+            target.computedKeys.add(node.index.value);
+            return;
+          }
+        }
+        walk(node.object);
+        walk(node.index);
+        break;
+      case 'unary':
+        walk(node.operand);
+        break;
+      case 'binary':
+        walk(node.left);
+        walk(node.right);
+        break;
+      case 'ternary':
+        walk(node.condition);
+        walk(node.consequent);
+        walk(node.alternate);
+        break;
+      case 'call':
+        for (const arg of node.args) walk(arg);
+        break;
+      case 'array':
+        for (const item of node.items) walk(item);
+        break;
+      default:
+        break;
+    }
+  };
+  walk(ast);
+}
+
+function isDepsDirty(
+  deps: RichDependencySet,
+  changedStateKeys: Set<string>,
+  changedComputedKeys: Set<string>,
+  themeChanged: boolean
+): boolean {
+  if (themeChanged && deps.usesTheme) return true;
+  if (deps.usesAllState && changedStateKeys.size > 0) return true;
+  if (deps.usesAllComputed && changedComputedKeys.size > 0) return true;
+  for (const key of deps.stateKeys) {
+    if (changedStateKeys.has(key)) return true;
+  }
+  for (const key of deps.computedKeys) {
+    if (changedComputedKeys.has(key)) return true;
+  }
+  return false;
+}
+
+export function compileRichDynamicPlan(
+  doc: RichDocumentV1,
+  precomputed?: {
+    computedOrder: string[];
+    computedAsts: Map<string, ExprAst>;
+    declaredArtifactIds?: Iterable<string>;
+  }
+): RichDynamicPlan {
+  const exprAstCache = new Map<string, ExprAst>();
+  const getAst = (expr: string): ExprAst => {
+    let ast = exprAstCache.get(expr);
+    if (!ast) {
+      ast = parseRichExpr(expr);
+      exprAstCache.set(expr, ast);
+    }
+    return ast;
+  };
+
+  let computedOrder: string[];
+  let computedAsts: Map<string, ExprAst>;
+  if (precomputed) {
+    computedOrder = precomputed.computedOrder;
+    computedAsts = precomputed.computedAsts;
+  } else {
+    const topo = topologicalSortComputed(doc.computed ?? {});
+    if (topo.cycle) {
+      throw new RichExprError('RICH_COMPUTED_CYCLE', 'Circular computed values.');
+    }
+    computedOrder = topo.order;
+    computedAsts = topo.asts;
+  }
+
+  const computedDeps = new Map<string, RichDependencySet>();
+  for (const key of computedOrder) {
+    const deps = emptyDeps();
+    const ast = computedAsts.get(key);
+    if (ast) collectAstDeps(ast, deps);
+    computedDeps.set(key, deps);
+  }
+
+  const subtreeDeps = new WeakMap<RichNode, RichDependencySet>();
+  const addExprString = (expr: string, target: RichDependencySet) => {
+    try {
+      collectAstDeps(getAst(expr), target);
+    } catch {
+      target.usesAllState = true;
+      target.usesAllComputed = true;
+      target.usesTheme = true;
+    }
+  };
+  const addRichValDeps = (val: unknown, target: RichDependencySet) => {
+    if (isExprWrapper(val)) addExprString(val.expr, target);
+  };
+  const addSvgElementDeps = (el: RichSvgElement, target: RichDependencySet) => {
+    if (el.repeat) addExprString(el.repeat.itemsExpr, target);
+    addRichValDeps(el.textContent, target);
+    addRichValDeps(el.tooltip, target);
+    if (el.visibleWhen) addExprString(el.visibleWhen, target);
+    if (el.attrs) {
+      for (const v of Object.values(el.attrs)) addRichValDeps(v, target);
+    }
+    if (Array.isArray(el.children)) {
+      for (const child of el.children) addSvgElementDeps(child, target);
+    }
+  };
+  const addActionsDeps = (actions: RichAction[] | undefined, target: RichDependencySet) => {
+    if (!Array.isArray(actions)) return;
+    for (const act of actions) {
+      if (act.type === 'open_external_url') addExprString(act.urlExpr, target);
+      else if (act.type === 'save_to_artifact') {
+        addExprString(act.filenameExpr, target);
+        addExprString(act.contentExpr, target);
+      } else if (act.type === 'copy_text' || act.type === 'submit_to_chat') addExprString(act.textExpr, target);
+      else if (act.type === 'open_artifact') addExprString(act.artifactIdExpr, target);
+    }
+  };
+
+  const collectNodeDeps = (node: RichNode): RichDependencySet => {
+    const deps = emptyDeps();
+    if (node.repeat) addExprString(node.repeat.itemsExpr, deps);
+    if (node.visibleWhen) addExprString(node.visibleWhen, deps);
+    visitRichNodeValues(node, value => addRichValDeps(value, deps));
+
+    if (node.type === 'svg_scene') {
+      for (const def of node.defs ?? []) visitSvgDefinitionValues(def, (_name, value) => addRichValDeps(value, deps));
+      for (const el of node.elements) addSvgElementDeps(el, deps);
+    } else if (node.type === 'media_asset' && node.artifactId !== undefined) {
+      addRichValDeps(node.artifactId, deps);
+    } else if (node.type === 'button') {
+      addActionsDeps(node.onClick, deps);
+    } else if (node.type === 'form') {
+      addActionsDeps(node.onSubmit, deps);
+    } else if (node.type === 'editable_draft' && node.saveAction) {
+      addActionsDeps([node.saveAction], deps);
+    }
+
+    mapRichNodeChildren(node, child => {
+      mergeDeps(deps, collectNodeDeps(child));
+      return child;
+    });
+
+    subtreeDeps.set(node, deps);
+    return deps;
+  };
+
+  if (doc.root) collectNodeDeps(doc.root);
+
+  const declaredArtifactIds = new Set<string>(precomputed?.declaredArtifactIds ?? []);
+  if (Array.isArray(doc.referencedArtifactIds)) {
+    for (const id of doc.referencedArtifactIds) {
+      if (typeof id === 'string' && id.trim()) declaredArtifactIds.add(id.trim());
+    }
+  }
+
+  return {
+    doc,
+    computedOrder,
+    computedAsts,
+    computedDeps,
+    exprAstCache,
+    subtreeDeps,
+    declaredArtifactIds,
+    getAst,
+  };
+}
+
+/** Project the inputs that determine a target's display using the rendering evaluator. */
+export function richTargetDisplayIdentity(
+  plan: RichDynamicPlan,
+  target: unknown,
+  context: { state: Record<string, unknown>; computed: Record<string, unknown>; theme: 'light' | 'dark'; item?: unknown; index?: number; aliases?: Record<string, unknown> },
+) {
+  const deps = emptyDeps();
+  const budget = createRichEvalBudget();
+  const values: Array<{ path: string; value: unknown }> = [];
+  const sourceIds = new Set<string>();
+  let usesAllSources = false;
+  const collectSourceReferences = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) collectSourceReferences(item);
+    } else if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      if (typeof record.sourceId === 'string') sourceIds.add(record.sourceId);
+      for (const child of Object.values(record)) collectSourceReferences(child);
+    }
+  };
+  const expressionFields = new Set(['visibleWhen', 'selectedWhen', 'disabledWhen', 'itemsExpr', 'textExpr',
+    'valueExpr', 'deltaExpr', 'artifactIdExpr', 'filenameExpr', 'contentExpr', 'urlExpr']);
+  const visit = (value: unknown, path: string, repeated = false): void => {
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => visit(item, `${path}[${index}]`, repeated));
+    } else if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      if (typeof record.bind === 'string') deps.stateKeys.add(record.bind);
+      if (typeof record.sourceId === 'string') sourceIds.add(record.sourceId);
+      if (record.type === 'source_attribution' && record.sourceIds === undefined) usesAllSources = true;
+      if (Array.isArray(record.sourceIds)) {
+        for (const id of record.sourceIds) if (typeof id === 'string') sourceIds.add(id);
+      }
+      if (isExprWrapper(record)) {
+        const ast = plan.getAst(record.expr);
+        collectAstDeps(ast, deps);
+        if (!repeated) {
+          const evaluated = evaluateRichAst(ast, context, budget);
+          values.push({ path, value: evaluated });
+          collectSourceReferences(evaluated);
+        }
+        return;
+      }
+      for (const [key, child] of Object.entries(record)) {
+        const childPath = path + '.' + key;
+        if (typeof child === 'string' && expressionFields.has(key)) {
+          const ast = plan.getAst(child);
+          collectAstDeps(ast, deps);
+          if ((key === 'visibleWhen' || key === 'textExpr' && typeof record.tag === 'string') && !repeated && !record.repeat) {
+            values.push({ path: childPath, value: evaluateRichAst(ast, context, budget) });
+          }
+        } else {
+          visit(child, childPath, repeated || Boolean(record.repeat));
+        }
+      }
+    }
+  };
+  visit(target, '$');
+  const computedKeys = new Set<string>();
+  const includeComputed = (key: string) => {
+    if (computedKeys.has(key)) return;
+    computedKeys.add(key);
+    const dependency = plan.computedDeps.get(key);
+    if (!dependency) return;
+    mergeDeps(deps, dependency);
+    for (const name of dependency.usesAllComputed ? plan.computedOrder : dependency.computedKeys) includeComputed(name);
+  };
+  for (const key of deps.usesAllComputed ? plan.computedOrder : deps.computedKeys) includeComputed(key);
+  const stateKeys = deps.usesAllState ? new Set([...Object.keys(plan.doc.state ?? {}), ...Object.keys(context.state)]) : deps.stateKeys;
+  return {
+    target, values,
+    sources: (plan.doc.sources ?? []).filter(source => usesAllSources || sourceIds.has(source.id)),
+    ...(deps.usesTheme ? { theme: context.theme } : {}),
+    state: [...stateKeys].sort().map(key => [key, plan.doc.state?.[key] ?? null, context.state[key] ?? null]),
+    computed: [...computedKeys].sort().map(key => [key, plan.doc.computed?.[key] ?? null, context.computed[key] ?? null]),
+  };
+}
+
+export function evaluateRichDynamicState(
+  plan: RichDynamicPlan,
+  opts: {
+    state: Record<string, unknown>;
+    theme?: 'light' | 'dark';
+    locale?: string;
+    authorizedArtifactIds?: Set<string>;
+    initialAstSteps?: number;
+    previousState?: Record<string, unknown>;
+    previousComputed?: Record<string, unknown>;
+    previousTheme?: 'light' | 'dark';
+    previousSubtreeCache?: RichSubtreeCache;
+    previousComputedSteps?: Map<string, number>;
+  }
+): RichDynamicEvalResult {
+  const issues: RichValidationIssue[] = [];
+  const referencedArtifacts = new Set<string>(plan.declaredArtifactIds);
+  const budget = createRichEvalBudget();
+  if (opts.initialAstSteps && opts.initialAstSteps > 0) {
+    budget.steps += opts.initialAstSteps;
+  }
+  const theme = opts.theme ?? 'light';
+  const computedValues: Record<string, unknown> = Object.create(null);
+  const rootCtx: RichEvalContext = {
+    state: opts.state,
     computed: computedValues,
-    theme: 'light',
+    theme,
     locale: opts.locale,
   };
 
-  try {
-    for (const key of computedOrder) {
-      const ast = computedAsts.get(key)!;
-      computedValues[key] = evaluateRichAst(ast, rootCtx, budget);
+  const incremental = Boolean(opts.previousState && opts.previousComputed);
+  const themeChanged = !incremental || opts.previousTheme !== theme;
+  const changedStateKeys = new Set<string>();
+  if (incremental && opts.previousState) {
+    const allKeys = new Set([...Object.keys(opts.previousState), ...Object.keys(opts.state)]);
+    for (const key of allKeys) {
+      if (!Object.is(opts.previousState[key], opts.state[key])) {
+        changedStateKeys.add(key);
+      }
     }
+  }
+  const changedComputedKeys = new Set<string>();
+  const recomputedKeys: string[] = [];
+
+  let expandedNodes = 0;
+  let expandedSvgElements = 0;
+  let expandedDataPoints = 0;
+  let computedStepsUsed = 0;
+  let evaluatedSubtrees = 0;
+  let reusedSubtrees = 0;
+  const nextSubtreeCache: RichSubtreeCache = new Map();
+  const computedStepsByKey = new Map<string, number>();
+
+  const fail = (code: string, path: string, message: string, statusCode: number): RichDynamicEvalResult => {
+    issues.push({ code, path, message, severity: 'error' });
+    return {
+      valid: false,
+      statusCode,
+      primaryErrorCode: code,
+      issues,
+      computed: computedValues,
+      stats: {
+        expandedNodes,
+        expandedSvgElements,
+        expandedDataPoints,
+        astStepsUsed: budget.steps,
+        computedStepsUsed,
+        recomputedKeys,
+        evaluatedSubtrees,
+        reusedSubtrees,
+      },
+      referencedArtifactIds: [...referencedArtifacts],
+      subtreeCache: nextSubtreeCache,
+      computedStepsByKey,
+    };
+  };
+
+  try {
+    const stepsBeforeComputed = budget.steps;
+    for (const key of plan.computedOrder) {
+      const deps = plan.computedDeps.get(key);
+      const canReuse =
+        incremental &&
+        opts.previousComputed !== undefined &&
+        Object.prototype.hasOwnProperty.call(opts.previousComputed, key) &&
+        deps !== undefined &&
+        !isDepsDirty(deps, changedStateKeys, changedComputedKeys, themeChanged);
+      if (canReuse) {
+        computedValues[key] = opts.previousComputed![key];
+        const prevSteps = opts.previousComputedSteps?.get(key) ?? 0;
+        computedStepsByKey.set(key, prevSteps);
+        budget.steps += prevSteps;
+        if (budget.steps > budget.maxSteps) {
+          throw new RichExprError(
+            'RICH_EXPR_BUDGET_EXCEEDED',
+            `Expression evaluation exceeded the maximum budget of ${budget.maxSteps} AST steps.`,
+            422
+          );
+        }
+        continue;
+      }
+      const keyStartSteps = budget.steps;
+      const ast = plan.computedAsts.get(key)!;
+      const nextVal = evaluateRichAst(ast, rootCtx, budget);
+      computedStepsByKey.set(key, budget.steps - keyStartSteps);
+      recomputedKeys.push(key);
+      if (incremental && opts.previousComputed && Object.prototype.hasOwnProperty.call(opts.previousComputed, key)) {
+        const oldVal = opts.previousComputed[key];
+        if (
+          Object.is(oldVal, nextVal) ||
+          (oldVal !== undefined &&
+            nextVal !== undefined &&
+            typeof oldVal === 'object' &&
+            typeof nextVal === 'object' &&
+            JSON.stringify(oldVal) === JSON.stringify(nextVal))
+        ) {
+          computedValues[key] = oldVal;
+        } else {
+          computedValues[key] = nextVal;
+          changedComputedKeys.add(key);
+        }
+      } else {
+        computedValues[key] = nextVal;
+        changedComputedKeys.add(key);
+      }
+    }
+    computedStepsUsed = budget.steps - stepsBeforeComputed;
 
     const evalRichVal = (val: unknown, ctx: RichEvalContext): unknown => {
       if (isExprWrapper(val)) {
-        const ast = parseRichExpr(val.expr);
-        return evaluateRichAst(ast, ctx, budget);
+        return evaluateRichAst(plan.getAst(val.expr), ctx, budget);
       }
       return val;
     };
 
-    const evalSvgElementPost = (el: RichSvgElement, p: string, ctx: RichEvalContext) => {
-      if (el.repeat) {
-        const arr = evaluateRichAst(parseRichExpr(el.repeat.itemsExpr), ctx, budget);
-        if (Array.isArray(arr)) {
-          for (let i = 0; i < arr.length; i++) {
-            const nextCtx: RichEvalContext = {
-              ...ctx,
-              item: arr[i],
-              index: i,
-              aliases: { ...(ctx.aliases ?? {}), [el.repeat.as]: arr[i] },
-            };
-            evalSvgElementPost({ ...el, repeat: undefined }, `${p}[${i}]`, nextCtx);
-          }
-          return;
-        }
+    const countExpanded = (count: number, p: string) => {
+      expandedDataPoints += count;
+      if (expandedDataPoints > RICH_LIMITS.maxArrayPoints) {
+        throw new RichExprError('RICH_EXPANDED_ARRAY_LIMIT_EXCEEDED', 'Expanded data point limit exceeded at ' + p, 422);
       }
-      if (el.visibleWhen) {
-        const vis = evaluateRichAst(parseRichExpr(el.visibleWhen), ctx, budget);
-        if (!vis) return;
-      }
-      expandedSvgElements += 1;
+    };
+    const registeredSources = new Set(plan.doc.sources?.map(source => source.id));
+    const registeredSource = (value: unknown) => typeof value === 'string' && registeredSources.has(value);
+    const checkExpandedArray = (result: unknown, p: string, multiplier = 1) => {
+      if (!Array.isArray(result)) throw new RichExprError('RICH_INVALID_SCHEMA', 'Expected evaluated array at ' + p);
+      countExpanded(result.length * multiplier, p);
+      return result;
+    };
+
+    const countExpandedSvg = (count: number) => {
+      expandedSvgElements += count;
       if (expandedSvgElements > RICH_LIMITS.maxExpandedSvgElements) {
         throw new RichExprError(
           'RICH_EXPANDED_SVG_LIMIT_EXCEEDED',
@@ -1136,10 +1667,42 @@ export function validateRichDocument(
           422
         );
       }
+    };
+
+    const evalSvgElementPost = (
+      el: RichSvgElement,
+      p: string,
+      ctx: RichEvalContext,
+      defs: ReadonlySet<string>
+    ) => {
+      if (el.repeat) {
+        const arr = evaluateRichAst(plan.getAst(el.repeat.itemsExpr), ctx, budget);
+        if (!Array.isArray(arr)) return;
+        for (let i = 0; i < arr.length; i++) {
+          const nextCtx: RichEvalContext = {
+            ...ctx,
+            item: arr[i],
+            index: i,
+            aliases: { ...(ctx.aliases ?? {}), [el.repeat.as]: arr[i] },
+          };
+          evalSvgElementPost({ ...el, repeat: undefined }, `${p}[${i}]`, nextCtx, defs);
+        }
+        return;
+      }
+      if (el.visibleWhen) {
+        const vis = evaluateRichAst(plan.getAst(el.visibleWhen), ctx, budget);
+        if (!vis) return;
+      }
+      countExpandedSvg(1);
+      for (const field of ['textContent', 'tooltip'] as const) {
+        if (el[field] !== undefined && typeof evalRichVal(el[field], ctx) !== 'string') {
+          throw new RichExprError('RICH_INVALID_SCHEMA', 'Invalid evaluated SVG value at ' + p + '.' + field);
+        }
+      }
       if (el.attrs) {
         for (const [k, v] of Object.entries(el.attrs)) {
           const evaluated = evalRichVal(v, ctx);
-          const err = validateSvgAttrValue(k, evaluated);
+          const err = validateSvgAttrValue(k, evaluated, defs);
           if (err) {
             issues.push({ code: 'RICH_POST_EVAL_UNSAFE_SVG', path: `${p}.attrs.${k}`, message: err, severity: 'error' });
           }
@@ -1147,18 +1710,35 @@ export function validateRichDocument(
       }
       if (Array.isArray(el.children)) {
         for (let i = 0; i < el.children.length; i++) {
-          evalSvgElementPost(el.children[i], `${p}.children[${i}]`, ctx);
+          evalSvgElementPost(el.children[i], `${p}.children[${i}]`, ctx, defs);
         }
       }
     };
 
-    const evalActionsPost = (actions: RichAction[] | undefined, p: string, ctx: RichEvalContext) => {
+    const evalSvgScenePost = (scene: Extract<RichNode, { type: 'svg_scene' }>, p: string, ctx: RichEvalContext) => {
+      const defs = new Set((scene.defs ?? []).map(def => def.id));
+      for (const [i, def] of (scene.defs ?? []).entries()) {
+        countExpandedSvg(svgDefinitionElementCount(def));
+        visitSvgDefinitionValues(def, (name, value, field) => {
+          const err = validateSvgAttrValue(name, evalRichVal(value, ctx), defs);
+          if (err) issues.push({ code: 'RICH_POST_EVAL_UNSAFE_SVG', path: `${p}.defs[${i}].${field}`, message: err, severity: 'error' });
+        });
+      }
+      scene.elements.forEach((el, i) => evalSvgElementPost(el, `${p}.elements[${i}]`, ctx, defs));
+    };
+
+    const evalActionsPost = (
+      actions: RichAction[] | undefined,
+      p: string,
+      ctx: RichEvalContext,
+      localArtifacts: string[]
+    ) => {
       if (!Array.isArray(actions)) return;
       for (let i = 0; i < actions.length; i++) {
         const act = actions[i];
         const ap = `${p}[${i}]`;
         if (act.type === 'open_external_url') {
-          const evaluated = String(evaluateRichAst(parseRichExpr(act.urlExpr), ctx, budget) ?? '');
+          const evaluated = String(evaluateRichAst(plan.getAst(act.urlExpr), ctx, budget) ?? '');
           if (evaluated && !isValidHttpUrl(evaluated)) {
             issues.push({
               code: 'RICH_POST_EVAL_FORBIDDEN_URL',
@@ -1168,7 +1748,7 @@ export function validateRichDocument(
             });
           }
         } else if (act.type === 'save_to_artifact') {
-          const filename = String(evaluateRichAst(parseRichExpr(act.filenameExpr), ctx, budget) ?? '');
+          const filename = String(evaluateRichAst(plan.getAst(act.filenameExpr), ctx, budget) ?? '');
           if (filename && !validateSafeFilename(filename)) {
             issues.push({
               code: 'RICH_POST_EVAL_INVALID_FILENAME',
@@ -1178,9 +1758,10 @@ export function validateRichDocument(
             });
           }
         } else if (act.type === 'open_artifact') {
-          const artId = String(evaluateRichAst(parseRichExpr(act.artifactIdExpr), ctx, budget) ?? '').trim();
+          const artId = String(evaluateRichAst(plan.getAst(act.artifactIdExpr), ctx, budget) ?? '').trim();
           if (artId) {
             referencedArtifacts.add(artId);
+            localArtifacts.push(artId);
             if (opts.authorizedArtifactIds && !opts.authorizedArtifactIds.has(artId)) {
               issues.push({
                 code: 'RICH_FORBIDDEN_ARTIFACT_REF',
@@ -1194,9 +1775,71 @@ export function validateRichDocument(
       }
     };
 
-    const evalNodePost = (node: RichNode, p: string, ctx: RichEvalContext) => {
+    const evalNodePost = (
+      node: RichNode,
+      p: string,
+      ctx: RichEvalContext,
+      inRepeatScope: boolean,
+      parentArtifacts: string[] | null
+    ) => {
+      const canMemoize = !inRepeatScope;
+      const deps = canMemoize ? plan.subtreeDeps.get(node) : undefined;
+      if (
+        canMemoize &&
+        incremental &&
+        deps &&
+        opts.previousSubtreeCache &&
+        !isDepsDirty(deps, changedStateKeys, changedComputedKeys, themeChanged)
+      ) {
+        const cached = opts.previousSubtreeCache.get(p);
+        if (cached) {
+          expandedNodes += cached.expandedNodes;
+          if (expandedNodes > RICH_LIMITS.maxExpandedNodes) {
+            throw new RichExprError(
+              'RICH_EXPANDED_NODE_LIMIT_EXCEEDED',
+              `Expanded node count exceeded ${RICH_LIMITS.maxExpandedNodes}.`,
+              422
+            );
+          }
+          expandedSvgElements += cached.expandedSvgElements;
+          if (expandedSvgElements > RICH_LIMITS.maxExpandedSvgElements) {
+            throw new RichExprError(
+              'RICH_EXPANDED_SVG_LIMIT_EXCEEDED',
+              `Expanded SVG element count exceeded ${RICH_LIMITS.maxExpandedSvgElements}.`,
+              422
+            );
+          }
+          expandedDataPoints += cached.expandedDataPoints;
+          if (expandedDataPoints > RICH_LIMITS.maxArrayPoints) {
+            throw new RichExprError('RICH_EXPANDED_ARRAY_LIMIT_EXCEEDED', 'Expanded data point limit exceeded at ' + p, 422);
+          }
+          budget.steps += cached.astSteps;
+          if (budget.steps > budget.maxSteps) {
+            throw new RichExprError(
+              'RICH_EXPR_BUDGET_EXCEEDED',
+              `Expression evaluation exceeded the maximum budget of ${budget.maxSteps} AST steps.`,
+              422
+            );
+          }
+          for (const artId of cached.referencedArtifacts) {
+            referencedArtifacts.add(artId);
+            parentArtifacts?.push(artId);
+          }
+          nextSubtreeCache.set(p, cached);
+          reusedSubtrees += 1;
+          return;
+        }
+      }
+
+      const startNodes = expandedNodes;
+      const startSvg = expandedSvgElements;
+      const startPoints = expandedDataPoints;
+      const startSteps = budget.steps;
+      const localArtifacts: string[] = [];
+      evaluatedSubtrees += 1;
+
       if (node.repeat) {
-        const arr = evaluateRichAst(parseRichExpr(node.repeat.itemsExpr), ctx, budget);
+        const arr = evaluateRichAst(plan.getAst(node.repeat.itemsExpr), ctx, budget);
         if (Array.isArray(arr)) {
           for (let i = 0; i < arr.length; i++) {
             const nextCtx: RichEvalContext = {
@@ -1206,15 +1849,38 @@ export function validateRichDocument(
               aliases: { ...(ctx.aliases ?? {}), [node.repeat.as]: arr[i] },
             };
             const clone = { ...node, repeat: undefined } as RichNode;
-            evalNodePost(clone, `${p}[${i}]`, nextCtx);
+            evalNodePost(clone, `${p}[${i}]`, nextCtx, true, localArtifacts);
+          }
+          if (canMemoize) {
+            nextSubtreeCache.set(p, {
+              expandedNodes: expandedNodes - startNodes,
+              expandedSvgElements: expandedSvgElements - startSvg,
+              expandedDataPoints: expandedDataPoints - startPoints,
+              astSteps: budget.steps - startSteps,
+              referencedArtifacts: localArtifacts,
+            });
+            if (parentArtifacts) parentArtifacts.push(...localArtifacts);
           }
           return;
         }
       }
+
       if (node.visibleWhen) {
-        const vis = evaluateRichAst(parseRichExpr(node.visibleWhen), ctx, budget);
-        if (!vis) return;
+        const vis = evaluateRichAst(plan.getAst(node.visibleWhen), ctx, budget);
+        if (!vis) {
+          if (canMemoize) {
+            nextSubtreeCache.set(p, {
+              expandedNodes: expandedNodes - startNodes,
+              expandedSvgElements: expandedSvgElements - startSvg,
+              expandedDataPoints: expandedDataPoints - startPoints,
+              astSteps: budget.steps - startSteps,
+              referencedArtifacts: localArtifacts,
+            });
+          }
+          return;
+        }
       }
+
       expandedNodes += 1;
       if (expandedNodes > RICH_LIMITS.maxExpandedNodes) {
         throw new RichExprError(
@@ -1224,41 +1890,81 @@ export function validateRichDocument(
         );
       }
 
-      if (node.type === 'markdown') {
-        const evaluated = String(evalRichVal(node.content, ctx) ?? '');
+      const evaluatedFields = new Map<unknown, unknown>();
+      const evalField = (value: unknown) => {
+        if (!evaluatedFields.has(value)) evaluatedFields.set(value, evalRichVal(value, ctx));
+        return evaluatedFields.get(value);
+      };
+      visitRichNodeValues(node, (value, check, field) => {
+        if (!check(evalField(value))) {
+          throw new RichExprError('RICH_INVALID_SCHEMA', 'Invalid evaluated value at ' + p + '.' + field);
+        }
+      });
+      if (node.type === 'chart') {
+        if (node.categories !== undefined) checkExpandedArray(evalField(node.categories), p + '.categories');
+        const checkSource = (id: unknown) => id === undefined || registeredSource(id);
+        for (const series of node.series) {
+          if (!checkSource(series.sourceId) || !checkExpandedArray(evalField(series.data), p + '.series.data').every(point =>
+                isRichChartPoint(point) && (!point || typeof point !== 'object' || checkSource(point.sourceId)))) {
+            throw new RichExprError('RICH_INVALID_SCHEMA', 'Invalid chart series at ' + p);
+          }
+        }
+      } else if (node.type === 'data_table') {
+        if (!richCollectionIsValid(node.type, checkExpandedArray(evalField(node.rows), p + '.rows', Math.max(1, node.columns?.length ?? 1)), registeredSource)) {
+          throw new RichExprError('RICH_INVALID_SCHEMA', 'Invalid table cell at ' + p);
+        }
+      } else if (node.type === 'node_edge_diagram') {
+        const vertices = checkExpandedArray(evalField(node.nodes), p + '.nodes');
+        const edges = checkExpandedArray(evalField(node.edges), p + '.edges');
+        if (vertices.length > 500 || edges.length > 1000) {
+          throw new RichExprError('RICH_EXPANDED_ARRAY_LIMIT_EXCEEDED', 'Diagram exceeds vertex/edge limits.', 422);
+        }
+        const vertexIds = new Set<string>();
+        const edgeIds = new Set<string>();
+        for (const vertex of vertices) {
+          if (!vertex || typeof vertex.id !== 'string' || !vertex.id.trim() || vertexIds.has(vertex.id) ||
+              typeof vertex.label !== 'string' ||
+              ['sublabel', 'group', 'tone'].some(key => vertex[key] !== undefined && typeof vertex[key] !== 'string') ||
+              ['x', 'y'].some(key => vertex[key] !== undefined && (typeof vertex[key] !== 'number' || !Number.isFinite(vertex[key])))) {
+            throw new RichExprError('RICH_INVALID_SCHEMA', 'Invalid or duplicate diagram node at ' + p);
+          }
+          vertexIds.add(vertex.id);
+        }
+        for (const edge of edges) {
+          if (!edge || !vertexIds.has(edge.from) || !vertexIds.has(edge.to) ||
+              (edge.id !== undefined && (typeof edge.id !== 'string' || !edge.id.trim() || edgeIds.has(edge.id))) ||
+              (edge.label !== undefined && typeof edge.label !== 'string') ||
+              (edge.directed !== undefined && typeof edge.directed !== 'boolean') ||
+              (edge.style !== undefined && edge.style !== 'solid' && edge.style !== 'dashed')) {
+            throw new RichExprError('RICH_INVALID_SCHEMA', 'Invalid diagram edge at ' + p);
+          }
+          if (edge.id !== undefined) edgeIds.add(edge.id);
+        }
+      } else if (node.type === 'list' || node.type === 'checklist' || node.type === 'steps' || node.type === 'timeline') {
+        if (node.items !== undefined && !richCollectionIsValid(node.type, checkExpandedArray(evalField(node.items), p + '.items'), registeredSource)) {
+          throw new RichExprError('RICH_INVALID_SCHEMA', 'Invalid list item at ' + p);
+        }
+      } else if (node.type === 'radio_group' || node.type === 'select' || node.type === 'segmented') {
+        if (!richCollectionIsValid(node.type, checkExpandedArray(evalField(node.options), p + '.options'), registeredSource)) {
+          throw new RichExprError('RICH_INVALID_SCHEMA', 'Invalid option at ' + p);
+        }
+      } else if (node.type === 'markdown') {
+        const evaluated = String(evalField(node.content) ?? '');
         const err = validateRichMarkdownContent(evaluated);
         if (err) {
           issues.push({ code: 'RICH_POST_EVAL_UNSAFE_MARKDOWN', path: `${p}.content`, message: err, severity: 'error' });
         }
       } else if (node.type === 'mermaid') {
-        const evaluated = String(evalRichVal(node.code, ctx) ?? '');
+        const evaluated = String(evalField(node.code) ?? '');
         const err = validateRichMermaidCode(evaluated);
         if (err) {
           issues.push({ code: 'RICH_POST_EVAL_UNSAFE_MERMAID', path: `${p}.code`, message: err, severity: 'error' });
         }
       } else if (node.type === 'svg_scene') {
-        if (Array.isArray(node.defs)) {
-          for (let i = 0; i < node.defs.length; i++) {
-            const d = node.defs[i];
-            if (d.kind === 'linearGradient' || d.kind === 'radialGradient') {
-              for (let j = 0; j < d.stops.length; j++) {
-                const c = evalRichVal(d.stops[j].color, ctx);
-                const err = validateSvgAttrValue('fill', c);
-                if (err) issues.push({ code: 'RICH_POST_EVAL_UNSAFE_SVG', path: `${p}.defs[${i}].stops[${j}].color`, message: err, severity: 'error' });
-              }
-            } else if (d.kind === 'marker' && d.fill !== undefined) {
-              const c = evalRichVal(d.fill, ctx);
-              const err = validateSvgAttrValue('fill', c);
-              if (err) issues.push({ code: 'RICH_POST_EVAL_UNSAFE_SVG', path: `${p}.defs[${i}].fill`, message: err, severity: 'error' });
-            }
-          }
-        }
-        for (let i = 0; i < node.elements.length; i++) {
-          evalSvgElementPost(node.elements[i], `${p}.elements[${i}]`, ctx);
-        }
+        evalSvgScenePost(node, p, ctx);
       } else if (node.type === 'media_asset') {
         if (node.sourceKind === 'artifact' && node.artifactId !== undefined) {
-          const evaluated = String(evalRichVal(node.artifactId, ctx) ?? '').trim();
+          const evaluated = String(evalField(node.artifactId) ?? '').trim();
           if (/^(?:https?:|data:|blob:|\/\/)/i.test(evaluated)) {
             issues.push({
               code: 'RICH_POST_EVAL_FORBIDDEN_MEDIA',
@@ -1268,6 +1974,7 @@ export function validateRichDocument(
             });
           } else if (evaluated) {
             referencedArtifacts.add(evaluated);
+            localArtifacts.push(evaluated);
             if (opts.authorizedArtifactIds && !opts.authorizedArtifactIds.has(evaluated)) {
               issues.push({
                 code: 'RICH_FORBIDDEN_ARTIFACT_REF',
@@ -1277,51 +1984,35 @@ export function validateRichDocument(
               });
             }
           }
-        } else if (node.sourceKind === 'inline_svg' && node.svgScene) {
-          for (let i = 0; i < node.svgScene.elements.length; i++) {
-            evalSvgElementPost(node.svgScene.elements[i], `${p}.svgScene.elements[${i}]`, ctx);
-          }
         }
       } else if (node.type === 'button') {
-        evalActionsPost(node.onClick, `${p}.onClick`, ctx);
+        evalActionsPost(node.onClick, `${p}.onClick`, ctx, localArtifacts);
       } else if (node.type === 'form') {
-        evalActionsPost(node.onSubmit, `${p}.onSubmit`, ctx);
+        evalActionsPost(node.onSubmit, `${p}.onSubmit`, ctx, localArtifacts);
       } else if (node.type === 'editable_draft' && node.saveAction) {
-        evalActionsPost([node.saveAction], `${p}.saveAction`, ctx);
+        evalActionsPost([node.saveAction], `${p}.saveAction`, ctx, localArtifacts);
       }
 
-      // Recurse children
-      const anyNode = node as unknown as Record<string, unknown>;
-      if (Array.isArray(anyNode.children)) {
-        for (let i = 0; i < anyNode.children.length; i++) {
-          evalNodePost(anyNode.children[i] as RichNode, `${p}.children[${i}]`, ctx);
-        }
+      mapRichNodeChildren(node, (child, childPath) => {
+        evalNodePost(child, `${p}.${childPath}`, ctx, inRepeatScope, localArtifacts);
+        return child;
+      });
+
+      if (canMemoize) {
+        nextSubtreeCache.set(p, {
+          expandedNodes: expandedNodes - startNodes,
+          expandedSvgElements: expandedSvgElements - startSvg,
+          expandedDataPoints: expandedDataPoints - startPoints,
+          astSteps: budget.steps - startSteps,
+          referencedArtifacts: localArtifacts,
+        });
       }
-      if (node.type === 'tabs' && Array.isArray(node.items)) {
-        for (let i = 0; i < node.items.length; i++) {
-          const tabContent = node.items[i]?.content;
-          if (Array.isArray(tabContent)) {
-            for (let j = 0; j < tabContent.length; j++) {
-              evalNodePost(tabContent[j], `${p}.items[${i}].content[${j}]`, ctx);
-            }
-          }
-        }
-      }
-      if (node.type === 'card') {
-        if (node.headerAction) evalNodePost(node.headerAction, `${p}.headerAction`, ctx);
-        if (node.footer) evalNodePost(node.footer, `${p}.footer`, ctx);
-      }
-      if (node.type === 'popover' || node.type === 'tooltip') {
-        if (node.trigger) evalNodePost(node.trigger, `${p}.trigger`, ctx);
-        if (Array.isArray(node.content)) {
-          for (let i = 0; i < node.content.length; i++) {
-            evalNodePost(node.content[i], `${p}.content[${i}]`, ctx);
-          }
-        }
+      if (parentArtifacts && localArtifacts.length > 0) {
+        parentArtifacts.push(...localArtifacts);
       }
     };
 
-    evalNodePost(doc.root, '$.root', rootCtx);
+    evalNodePost(plan.doc.root, '$.root', rootCtx, false, null);
   } catch (err) {
     if (err instanceof RichExprError) {
       return fail(err.code, '$', err.message, err.statusCode);
@@ -1329,7 +2020,6 @@ export function validateRichDocument(
     return fail('RICH_EVAL_ERROR', '$', err instanceof Error ? err.message : String(err), 422);
   }
 
-  // Verify declared referencedArtifactIds against authorizedArtifactIds if supplied
   if (opts.authorizedArtifactIds) {
     for (const artId of referencedArtifacts) {
       if (!opts.authorizedArtifactIds.has(artId)) {
@@ -1355,15 +2045,19 @@ export function validateRichDocument(
       : 200,
     primaryErrorCode: firstErr?.code ?? null,
     issues,
+    computed: computedValues,
     stats: {
-      jsonBytes,
-      staticNodes,
-      staticSvgElements,
       expandedNodes,
       expandedSvgElements,
+      expandedDataPoints,
       astStepsUsed: budget.steps,
-      computedOrder,
+      computedStepsUsed,
+      recomputedKeys,
+      evaluatedSubtrees,
+      reusedSubtrees,
     },
     referencedArtifactIds: [...referencedArtifacts],
+    subtreeCache: nextSubtreeCache,
+    computedStepsByKey,
   };
 }

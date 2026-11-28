@@ -308,6 +308,7 @@ export const UnifiedViewerZoomShell: React.FC<UnifiedViewerZoomShellProps> = ({
       {controlsTop && <div className="viewer-controls-top">{controlsTop}</div>}
       <div
         ref={setScrollContainerRef}
+        style={containerSize.height > 0 ? ({ '--viewer-viewport-height': `${containerSize.height}px` } as React.CSSProperties) : undefined}
         className={`viewer-zoom-scroll content-zoom-surface${scrollClassName ? ` ${scrollClassName}` : ''}${showGrabCursor ? ' is-pannable' : ''}${isPanning ? ' is-panning' : ''}`}
         data-viewer-zoom-surface="true"
         data-zoom-scale={Math.round(scale * 100)}

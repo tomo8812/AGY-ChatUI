@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vite';
+import {assertProductionModulePaths,assertProductionModuleContent} from './build/production-boundary';
 
 function resolveWebBuildVersion(): string {
   const fromEnv = (process.env.VITE_APP_VERSION || process.env.APP_VERSION || '').trim();
@@ -33,7 +34,22 @@ function resolveWebCommitSha(): string {
 }
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(),{
+    name:'production-module-boundary',
+    apply:'build',
+    generateBundle(_options,bundle){
+      const ids=Object.values(bundle).flatMap(chunk=>chunk.type==='chunk'?Object.keys(chunk.modules):[]);
+      const root=path.resolve(import.meta.dirname,'..');
+      assertProductionModulePaths(ids,root);
+      for(const id of new Set(ids)){
+        const file=id.split(/[?#]/)[0];
+        if(!path.isAbsolute(file)||!/\.[cm]?[jt]sx?$/.test(file))continue;
+        const rel=path.relative(root,file).split(path.sep).join('/');
+        if(rel.startsWith('../')||rel.split('/').includes('node_modules'))continue;
+        assertProductionModuleContent(rel,fs.readFileSync(file,'utf8'));
+      }
+    },
+  }],
   define: {
     __APP_VERSION__: JSON.stringify(resolveWebBuildVersion()),
     __APP_COMMIT_SHA__: JSON.stringify(resolveWebCommitSha()),

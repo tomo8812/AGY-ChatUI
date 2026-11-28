@@ -205,14 +205,35 @@ export class DiffAdapter implements FormatAdapter {
     }
 
     if (selector.kind === 'diff_line_range') {
-      return resolveTextSnippetByContext({
-        text,
-        startLine: Number(selector.startLine ?? 1),
-        endLine: Number(selector.endLine ?? 1),
-        expectedSnippetHash: selector.expectedSnippetHash ? String(selector.expectedSnippetHash) : undefined,
-        contextBeforeHash: selector.contextBeforeHash ? String(selector.contextBeforeHash) : undefined,
-        contextAfterHash: selector.contextAfterHash ? String(selector.contextAfterHash) : undefined,
-      });
+      try {
+        const headers = splitLines(text).flatMap((line, index) =>
+          /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/.test(line) ? [{ line, lineNumber: index + 1 }] : []);
+        const hunks = parsePatch(text).flatMap(file => file.hunks.map(hunk => ({ file, hunk })));
+        if (headers.length !== hunks.length) return { status: 'needs_review', reason: 'diff_parse_error' };
+        const matches = hunks.flatMap(({ file, hunk }, index) => {
+          const filePath = (file.newFileName === '/dev/null' ? file.oldFileName : file.newFileName || file.oldFileName || '')
+            ?.replace(/^[ab]\//, '');
+          const header = headers[index];
+          return filePath === selector.filePath && (hunkHeader(hunk) === selector.hunkHeader || header.line === selector.hunkHeader)
+            ? [{ start: header.lineNumber + 1, end: header.lineNumber + hunk.lines.length }] : [];
+        });
+        if (!matches.length) return { status: 'stale', reason: 'hunk_not_found' };
+        if (matches.length !== 1) return { status: 'needs_review', reason: 'ambiguous_multiple_hunks' };
+        const [hunk] = matches;
+        return resolveTextSnippetByContext({
+          text,
+          startLine: selector.startLine,
+          endLine: selector.endLine,
+          expectedSnippetHash: selector.expectedSnippetHash,
+          contextBeforeHash: selector.contextBeforeHash,
+          contextAfterHash: selector.contextAfterHash,
+          occurrenceIndex: selector.occurrenceIndex,
+          requireOccurrenceIndex: true,
+          matchRange: (start, end) => start >= hunk.start && end <= hunk.end,
+        });
+      } catch {
+        return { status: 'needs_review', reason: 'diff_parse_error' };
+      }
     }
 
     return { status: 'needs_review', reason: 'unsupported_selector_kind' };
