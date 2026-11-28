@@ -1,5 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { workspaceApi } from '../../../api/workspace';
 import {
+  buildTargetInspectionRequestParams,
   extractSupportedSelectorKinds,
   getRegisteredUiModesForFormat,
   type RegisteredUiMode,
@@ -47,6 +49,12 @@ export interface CapabilitiesLike {
   }>;
 }
 
+export interface InspectableArtifactRef {
+  readonly id: string;
+  readonly revision?: number;
+  readonly sha256?: string;
+}
+
 export interface RegisteredPinState {
   /** Canonical UI selection modes derived solely from `TARGET_SELECTOR_REGISTRY` + live capabilities. */
   readonly modes: readonly RegisteredUiMode[];
@@ -62,12 +70,21 @@ export interface RegisteredPinState {
   readonly clearPinError: () => void;
   /** Concurrency guard for async target capture. */
   readonly selection: TargetSelectionController;
+  /**
+   * Fetches target identity metadata via the registered `inspection` contract
+   * (`buildTargetInspectionRequestParams`) and verifies revision/sha256 consistency.
+   */
+  readonly inspectTarget: <T extends { revision?: number; sha256?: string }>(
+    artifact: InspectableArtifactRef,
+    rangeParams: Record<string, string | number | boolean>,
+    modeOverride?: RegisteredUiMode,
+  ) => Promise<T>;
 }
 
 /**
  * Shared hook connecting any format module to the canonical Target Selection
  * Registry (`shared/target-selection-registry.ts`). Eliminates format-local
- * mode lists, allowlists, and duplicate error/invalidation plumbing.
+ * mode lists, allowlists, transport flags, and duplicate error/invalidation plumbing.
  */
 export function useRegisteredPinModes(params: {
   format: TargetSelectionFormat;
@@ -121,6 +138,26 @@ export function useRegisteredPinModes(params: {
     setSelectedId(nextId);
   };
 
+  const inspectTarget = async <T extends { revision?: number; sha256?: string }>(
+    artifact: InspectableArtifactRef,
+    rangeParams: Record<string, string | number | boolean>,
+    modeOverride?: RegisteredUiMode,
+  ): Promise<T> => {
+    const targetMode = modeOverride ?? activeMode;
+    if (!targetMode) {
+      throw new Error('この形式では対象指定を利用できません。');
+    }
+    const query = buildTargetInspectionRequestParams(targetMode, rangeParams);
+    const result = await workspaceApi.range<T>(artifact.id, query);
+    if (
+      (artifact.revision !== undefined && result.revision !== undefined && result.revision !== artifact.revision) ||
+      (artifact.sha256 && result.sha256 && result.sha256 !== artifact.sha256)
+    ) {
+      throw new Error('ファイルが更新されました。最新の状態で再度指定してください。');
+    }
+    return result;
+  };
+
   return {
     modes,
     activeMode,
@@ -130,5 +167,6 @@ export function useRegisteredPinModes(params: {
     setPinError,
     clearPinError: () => setPinError(''),
     selection,
+    inspectTarget,
   };
 }

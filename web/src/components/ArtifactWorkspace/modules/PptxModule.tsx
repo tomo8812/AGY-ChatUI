@@ -389,8 +389,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     const isCurrent = pinState.selection.begin();
     pinState.clearPinError();
     try {
-      const metadata = await workspaceApi.range<TargetSlide>(artifact.id, { part: targetSlide.part, targetMetadata: true });
-      assertRevision(artifact, metadata);
+      const metadata = await pinState.inspectTarget<TargetSlide & { revision?: number; sha256?: string }>(artifact, { part: targetSlide.part });
       if (!isCurrent()) return;
       const element = shapeId ? metadata.shapes.find((item) => item.id === shapeId) : undefined;
       if (shapeId && !element) throw Error('選択した要素を識別できません。');

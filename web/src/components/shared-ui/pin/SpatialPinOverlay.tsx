@@ -51,11 +51,20 @@ export const SpatialPinOverlay: React.FC<SpatialPinOverlayProps> = ({
 }) => {
   const startRef = useRef<NormalizedPoint | null>(null);
   const [selection, setSelection] = useState<{ start: NormalizedPoint; end: NormalizedPoint } | null>(null);
+  const highlightKey = highlightedArea
+    ? `${highlightedArea.x}:${highlightedArea.y}:${highlightedArea.width}:${highlightedArea.height}`
+    : '';
 
   useEffect(() => {
     startRef.current = null;
     setSelection(null);
   }, [mode, resetKey]);
+
+  useEffect(() => {
+    if (!startRef.current) {
+      setSelection(null);
+    }
+  }, [highlightKey]);
 
   const toNormalized = (event: React.PointerEvent<HTMLElement>): NormalizedPoint => {
     const rect = event.currentTarget.getBoundingClientRect();

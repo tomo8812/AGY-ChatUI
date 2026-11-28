@@ -39,7 +39,10 @@ export function SourceModule({artifact,capabilities,mode,draft,editingLocked,onD
   const editor=useRef<SourceEditorHandle|null>(null);
   useLayoutEffect(()=>{
     const range=jumpTarget?.range;
-    if(resource.ready&&typeof range?.startLine==='number'&&typeof range.endLine==='number'){
+    if(!resource.ready||typeof range?.startLine!=='number'||typeof range.endLine!=='number')return;
+    if(jumpTarget?.selector.kind==='code_char_range'&&typeof range.startCol==='number'&&typeof range.endCol==='number'){
+      editor.current?.selectCharRange(range.startLine,range.startCol,range.endLine,range.endCol);
+    }else{
       editor.current?.selectLines(range.startLine,range.endLine);
     }
   },[jumpTarget,resource.ready]);
@@ -82,9 +85,8 @@ export function SourceModule({artifact,capabilities,mode,draft,editingLocked,onD
     const {startLine:start,endLine:end}=bounds;
     const isCurrent=pin.selection.begin();
     try{
-      const result=await workspaceApi.range<{text:string;before:string;after:string;expectedSnippetHash:string;contextBeforeHash:string;contextAfterHash:string;occurrenceIndex:number}>(artifact.id,{...bounds,targetHashes:true});
+      const result=await pin.inspectTarget<{text:string;before:string;after:string;expectedSnippetHash:string;contextBeforeHash:string;contextAfterHash:string;occurrenceIndex:number;revision?:number;sha256?:string}>(artifact,{...bounds},targetMode);
       if(!isCurrent())return;
-      assertRevision(artifact,result);
       if(!Number.isInteger(result.occurrenceIndex)||result.occurrenceIndex<0)throw Error('Invalid occurrenceIndex');
       onTarget({baseRevision:artifact.revision,label:characters?start+'–'+end+' 行の選択文字列':start+'–'+end+' 行',selector:{kind:targetMode.selectorKind,...bounds,...(characters?{contextVersion:2}:{}),expectedSnippetHash:result.expectedSnippetHash,contextBeforeHash:result.contextBeforeHash,contextAfterHash:result.contextAfterHash,occurrenceIndex:result.occurrenceIndex},range:{...bounds},selectedContentSnapshot:result.text.slice(0,50_000),surroundingContext:(result.before+'\n---\n'+result.after).slice(0,20_000)});
       pin.clearPinError();

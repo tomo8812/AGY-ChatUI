@@ -1,4 +1,9 @@
 import { pointRegionPt } from '../region-png.js';
+import {
+  getSelectorRegistration,
+  selectorMatchesRegisteredFormat,
+  type TargetSelectorKind,
+} from '../../../../shared/target-selection-registry.js';
 import { selectorHasDirectUi, selectorsForFormat } from '../target-selector-schema.js';
 import { describeImageRegion, readImageDimensions } from './image-target.js';
 import path from 'node:path';
@@ -377,325 +382,352 @@ class DocumentFormatAdapter implements FormatAdapter {
    * (same-dimension image replacement, same-page-count PDF page swap, same-structure XLSX value/order change,
    *  same-ID element replacement, media hash change).
    */
-  resolveTarget(buffer: Buffer, selector: TargetSelector, _meta: AdapterFileMeta): TargetResolutionResult {
-    if (this.format === 'image') {
-      const sha256 = sha256Buffer(buffer);
-      if (selector.expectedImageSha256 !== sha256) return { status: 'needs_review', reason: 'image_content_changed' };
-      const dimensions = readImageDimensions(buffer);
-      if (!dimensions || dimensions.widthPx !== selector.expectedWidthPx || dimensions.heightPx !== selector.expectedHeightPx) {
-        return { status: 'needs_review', reason: 'image_dimensions_changed' };
-      }
-      const target = describeImageRegion(selector, dimensions, sha256);
-      if (!target || target.expectedRegionSha256 !== selector.expectedRegionSha256) {
-        return { status: 'needs_review', reason: 'image_region_changed' };
-      }
-      return { status: 'resolved', resolvedCoords: { region: target.region } };
+  resolveTarget(buffer: Buffer, selector: TargetSelector, meta: AdapterFileMeta): TargetResolutionResult {
+    if (!selectorMatchesRegisteredFormat(selector.kind, this.format)) {
+      return { status: 'needs_review', reason: 'unsupported_selector_kind' };
     }
-
-    if (this.format === 'media') {
-      const duration = _meta.mediaDurationSeconds;
-      if (selector.kind !== 'video_time_range' && selector.kind !== 'audio_time_range') {
-        return { status: 'needs_review', reason: 'unsupported_media_selector' };
-      }
-      if (selector.expectedMediaSha256 !== sha256Buffer(buffer)) {
-        return { status: 'needs_review', reason: 'media_content_changed' };
-      }
-      const { startSec, endSec } = selector;
-      if (duration === undefined || duration !== selector.expectedDurationSec ||
-          typeof startSec !== 'number' || typeof endSec !== 'number' || startSec < 0 || endSec > duration || endSec <= startSec) {
-        return { status: 'needs_review', reason: 'media_duration_changed' };
-      }
-      return { status: 'resolved', resolvedCoords: { startSec, endSec } };
+    const resolver = DOCUMENT_TARGET_RESOLVERS[selector.kind as TargetSelectorKind];
+    if (!resolver) {
+      return { status: 'needs_review', reason: 'unsupported_selector_kind' };
     }
-
-    if (this.format === 'pdf') {
-      const hex64 = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
-      const pageIndex = Number(selector.pageIndex);
-      const expectedPageCount = Number(selector.expectedPageCount);
-      if (!Number.isInteger(pageIndex) || pageIndex < 0 || !Number.isInteger(expectedPageCount) || expectedPageCount <= 0) {
-        return { status: 'stale', reason: 'invalid_page_selection' };
-      }
-      const doc = inspectPdfDocument(buffer, pageIndex);
-      if (!doc) return { status: 'needs_review', reason: 'pdf_page_content_changed' };
-      if (expectedPageCount !== doc.pageCount) {
-        return { status: 'needs_review', reason: 'pdf_page_count_changed' };
-      }
-      if (pageIndex >= doc.pageCount) {
-        return { status: 'stale', reason: 'invalid_page_selection' };
-      }
-      const page = doc.pages[0];
-      if (!hex64(selector.expectedPageContentHash) || selector.expectedPageContentHash !== page.pageContentHash) {
-        return { status: 'needs_review', reason: 'pdf_page_content_changed' };
-      }
-
-      if (selector.kind === 'pdf_page') {
-        return {
-          status: 'resolved',
-          resolvedCoords: { pageIndex, widthPt: page.widthPt, heightPt: page.heightPt, rotate: page.rotate },
-          resolvedSnippet: page.text,
-        };
-      }
-
-      if (selector.kind === 'pdf_pin' || selector.kind === 'pdf_region') {
-        const coords = selector.kind === 'pdf_pin' ? [selector.xPt, selector.yPt] : selector.rectPt;
-        if (
-          !hex64(selector.expectedRegionDigest) ||
-          !Array.isArray(coords) ||
-          coords.length !== (selector.kind === 'pdf_pin' ? 2 : 4) ||
-          !coords.every((value) => typeof value === 'number' && Number.isFinite(value) && value >= 0)
-        ) {
-          return { status: 'stale', reason: 'invalid_page_selection' };
-        }
-        const rectangle: [number, number, number, number] =
-          selector.kind === 'pdf_pin'
-            ? [coords[0], coords[1], 0, 0]
-            : [coords[0], coords[1], coords[2], coords[3]];
-        if (selector.kind === 'pdf_region' && (rectangle[2] <= 0 || rectangle[3] <= 0)) {
-          return { status: 'stale', reason: 'invalid_page_selection' };
-        }
-        if (!pdfRectInPage(page, rectangle)) return { status: 'needs_review', reason: 'pdf_region_out_of_bounds' };
-        const actualDigest = computePdfRegionDigest(page, rectangle);
-        if (actualDigest !== selector.expectedRegionDigest) {
-          return { status: 'needs_review', reason: 'pdf_region_digest_changed' };
-        }
-        return {
-          status: 'resolved',
-          resolvedCoords: { pageIndex, rectPt: rectangle, widthPt: page.widthPt, heightPt: page.heightPt, rotate: page.rotate,
-            ...(selector.kind === 'pdf_pin' ? { xPt: rectangle[0], yPt: rectangle[1] } : {}) },
-          resolvedSnippet: page.text,
-        };
-      }
-
-      return { status: 'needs_review', reason: 'unsupported_pdf_selector' };
-    }
-
-    if (this.format === 'xlsx') {
-      const sheetId = selector.sheetId == null ? null : String(selector.sheetId);
-      const expectedStructHash =
-        typeof selector.expectedSheetStructHash === 'string' && selector.expectedSheetStructHash
-          ? selector.expectedSheetStructHash
-          : null;
-
-      if (selector.kind === 'xlsx_sheet') {
-        if (!sheetId || !expectedStructHash || !isSha256(selector.expectedSheetContentHash)) {
-          return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
-        }
-        try {
-          const wb = readXlsxWorkbookTargets(buffer);
-          const sheetExists = wb.sheets.some((s) => s.id === sheetId || s.name === sheetId || s.part === sheetId);
-          if (!sheetExists) return { status: 'stale', reason: 'sheet_not_found' };
-          const target = readXlsxSheetTarget(buffer, sheetId);
-          if (!target) return { status: 'stale', reason: 'sheet_not_found' };
-          if (target.expectedSheetStructHash !== expectedStructHash ||
-              target.expectedSheetContentHash !== selector.expectedSheetContentHash) {
-            return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
-          }
-          return {
-            status: 'resolved',
-            resolvedRange: { sheetId: target.sheetId, sheetName: target.sheetName },
-            resolvedSnippet: target.sheetName,
-          };
-        } catch {
-          return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
-        }
-      }
-
-      if (selector.kind === 'xlsx_row_col') {
-        const axis = selector.axis === 'row' || selector.axis === 'col' ? selector.axis : null;
-        const { start, end, expectedRangeValuesHash } = selector;
-        if (!sheetId || !axis || typeof start !== 'number' || typeof end !== 'number' ||
-            !expectedStructHash || !isSha256(expectedRangeValuesHash)) {
-          return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
-        }
-        try {
-          const wb = readXlsxWorkbookTargets(buffer);
-          const sheetExists = wb.sheets.some((s) => s.id === sheetId || s.name === sheetId || s.part === sheetId);
-          if (!sheetExists) return { status: 'stale', reason: 'sheet_not_found' };
-          const target = readXlsxRowColTarget(buffer, sheetId, axis, start, end);
-          if (!target) return { status: 'stale', reason: 'invalid_range' };
-          if (target.expectedSheetStructHash !== expectedStructHash || target.expectedRangeValuesHash !== expectedRangeValuesHash) {
-            return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
-          }
-          return {
-            status: 'resolved',
-            resolvedRange: { sheetId: target.sheetId, sheetName: target.sheetName, axis: target.axis, start: target.start, end: target.end, targetContextHash: target.targetContextHash },
-            resolvedSnippet: target.snippet,
-          };
-        } catch {
-          return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
-        }
-      }
-
-      if (selector.kind !== 'xlsx_range') {
-        return { status: 'needs_review', reason: 'unsupported_xlsx_selector' };
-      }
-      const rangeA1 = typeof selector.rangeA1 === 'string' && selector.rangeA1 ? selector.rangeA1 : null;
-      const expectedValuesHash =
-        typeof selector.expectedRangeValuesHash === 'string' && selector.expectedRangeValuesHash
-          ? selector.expectedRangeValuesHash
-          : null;
-      const expectedOrderKeysHash =
-        typeof selector.expectedOrderKeysHash === 'string' && selector.expectedOrderKeysHash
-          ? selector.expectedOrderKeysHash
-          : null;
-      if (!sheetId || !rangeA1 || !expectedStructHash || !expectedValuesHash) {
-        return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
-      }
-      try {
-        const wb = readXlsxWorkbookTargets(buffer);
-        const sheetExists = wb.sheets.some((s) => s.id === sheetId || s.name === sheetId || s.part === sheetId);
-        if (!sheetExists) {
-          return { status: 'stale', reason: 'sheet_not_found' };
-        }
-        const target = readXlsxRangeTarget(buffer, sheetId, rangeA1);
-        if (!target) {
-          return { status: 'stale', reason: 'invalid_range' };
-        }
-        if (target.expectedSheetStructHash !== expectedStructHash) {
-          return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
-        }
-        if (target.expectedRangeValuesHash !== expectedValuesHash) {
-          return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
-        }
-        if (expectedOrderKeysHash && target.expectedOrderKeysHash !== expectedOrderKeysHash) {
-          return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
-        }
-        return {
-          status: 'resolved',
-          resolvedRange: { sheetId: target.sheetId, sheetName: target.sheetName, rangeA1: target.rangeA1, targetContextHash: target.targetContextHash },
-          resolvedSnippet: target.snippet,
-        };
-      } catch {
-        return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
-      }
-    }
-
-    if (this.format === 'pptx' && ['pptx_slide', 'pptx_element', 'pptx_region'].includes(selector.kind)) {
-      try {
-        const { slides, slideSize } = readPptxTargets(buffer);
-        const matchingSlides = slides.filter(slide => slide.id === String(selector.slideId));
-        if (matchingSlides.length > 1) return { status: 'needs_review', reason: 'ambiguous_slide_id' };
-        const pageIndex = slides.indexOf(matchingSlides[0]);
-        const slide = slides[pageIndex];
-        if (!slide) return { status: 'stale', reason: 'slide_not_found' };
-        const metadata = readPptxSlideTargets(buffer, slide.part);
-        const element = selector.kind === 'pptx_element'
-          ? metadata.shapes.filter(shape => shape.id === String(selector.shapeId) &&
-            JSON.stringify(shape.groupPath) === JSON.stringify(selector.groupPath ?? []))
-          : null;
-        const fingerprint = element ? (element.length === 1 ? element[0].fingerprint : null) : metadata.slideHash;
-        const expected = element ? selector.expectedElementFingerprint : selector.expectedSlideHash;
-        let slideCoords: Record<string, unknown> = {
-          pageIndex,
-          ...(selector.kind === 'pptx_slide' || selector.kind === 'pptx_region' ? slideSize : undefined),
-        };
-        if (selector.kind === 'pptx_slide' && selector.pointPt !== undefined) {
-          const { xPt, yPt, widthPt, heightPt } = selector.pointPt as Record<string, number>;
-          if (!slideSize || widthPt !== slideSize.widthPt || heightPt !== slideSize.heightPt ||
-              !Number.isFinite(xPt) || !Number.isFinite(yPt) || xPt < 0 || yPt < 0 || xPt > widthPt || yPt > heightPt) {
-            return { status: 'needs_review', reason: 'slide_point_out_of_bounds' };
-          }
-          const point = { xPt, yPt, widthPt, heightPt };
-          slideCoords = { pageIndex, unit: 'pt', ...point, region: pointRegionPt(point) };
-        }
-        if (selector.kind === 'pptx_region') {
-          const rect = selector.rectPt;
-          if (!slideSize || !Array.isArray(rect) || rect.length !== 4 ||
-              !rect.every(v => typeof v === 'number' && Number.isFinite(v))) {
-            return { status: 'needs_review', reason: 'slide_region_out_of_bounds' };
-          }
-          const [x, y, w, h] = rect as [number, number, number, number];
-          if (w <= 0 || h <= 0 || x < 0 || y < 0 || x + w > slideSize.widthPt + 0.01 || y + h > slideSize.heightPt + 0.01) {
-            return { status: 'needs_review', reason: 'slide_region_out_of_bounds' };
-          }
-          slideCoords = {
-            pageIndex,
-            unit: 'pt',
-            rectPt: [x, y, w, h],
-            widthPt: slideSize.widthPt,
-            heightPt: slideSize.heightPt,
-            region: { x, y, width: w, height: h, unit: 'pt' as const },
-          };
-        }
-        return fingerprint && fingerprint === expected
-          ? {
-            status: 'resolved', resolvedRange: { selector },
-            resolvedCoords: element && metadata.shapes.filter(shape => shape.id === element[0].id).length === 1
-              ? { pageIndex, shapeId: Number(element[0].id) } : slideCoords,
-            resolvedSnippet: element ? element[0].text : metadata.shapes.map(shape => shape.text).filter(Boolean).join('\n'),
-          }
-          : { status: 'needs_review', reason: 'element_fingerprint_changed' };
-      } catch {
-        return { status: 'needs_review', reason: 'target_structure_unavailable' };
-      }
-    }
-
-    if (this.format === 'docx' && selector.kind === 'docx_paragraph') {
-      const expectedBlockHash =
-        typeof selector.expectedBlockHash === 'string' && selector.expectedBlockHash
-          ? selector.expectedBlockHash
-          : null;
-      const paraId = typeof selector.paraId === 'string' && selector.paraId ? selector.paraId : null;
-      const hasBlockIndex = selector.blockIndex !== undefined && selector.blockIndex !== null;
-      const blockIndex = hasBlockIndex ? Number(selector.blockIndex) : -1;
-      if (!expectedBlockHash) {
-        return { status: 'needs_review', reason: 'element_fingerprint_changed' };
-      }
-      if (!paraId && (!hasBlockIndex || !Number.isInteger(blockIndex) || blockIndex < 0)) {
-        return { status: 'needs_review', reason: 'element_fingerprint_changed' };
-      }
-      try {
-        const { paragraphs, byBlockIndex } = readDocxAllParagraphTargets(buffer);
-        const paragraphResult = (match: (typeof paragraphs)[number]): TargetResolutionResult => {
-          const index = paragraphs.indexOf(match);
-          return {
-            status: 'resolved',
-            resolvedRange: { selector, resolvedBlockIndex: match.blockIndex },
-            resolvedSnippet: match.text,
-            surroundingContext: paragraphs.slice(Math.max(0, index - 2), index).map(p => p.text).join('\n') +
-              '\n---\n' + paragraphs.slice(index + 1, index + 3).map(p => p.text).join('\n'),
-          };
-        };
-
-        if (paraId) {
-          const byId = paragraphs.filter((p) => p.paraId === paraId);
-          if (byId.length === 0) return { status: 'stale', reason: 'word_block_not_found' };
-          if (byId.length > 1) return { status: 'needs_review', reason: 'ambiguous_para_id' };
-          const match = byId[0];
-          if (match.fingerprint !== expectedBlockHash) {
-            return { status: 'needs_review', reason: 'element_fingerprint_changed' };
-          }
-          return paragraphResult(match);
-        }
-
-        const matches = paragraphs.filter((p) => p.fingerprint === expectedBlockHash);
-        if (!matches.length) {
-          return byBlockIndex.has(blockIndex)
-            ? { status: 'needs_review', reason: 'element_fingerprint_changed' }
-            : { status: 'stale', reason: 'word_block_not_found' };
-        }
-
-        const { contextBeforeHash, contextAfterHash, duplicateCount, occurrenceIndex } = selector;
-        if (!isSha256(contextBeforeHash) || !isSha256(contextAfterHash)) {
-          return { status: 'needs_review', reason: 'invalid_context_hash' };
-        }
-        const contextual = matches.filter(p =>
-          p.contextBeforeHash === contextBeforeHash && p.contextAfterHash === contextAfterHash);
-        const match = contextual.length === 1 ? contextual[0] : undefined;
-        if (!match || (duplicateCount !== undefined && duplicateCount !== matches.length) ||
-            (occurrenceIndex !== undefined && occurrenceIndex !== match.occurrenceIndex) ||
-            (matches.length > 1 && match.blockIndex !== blockIndex)) {
-          return { status: 'needs_review', reason: 'ambiguous_duplicate_paragraph' };
-        }
-        return paragraphResult(match);
-      } catch {
-        return { status: 'needs_review', reason: 'target_structure_unavailable' };
-      }
-    }
-
-    return { status: 'needs_review', reason: 'unverified_rich_target' };
+    return resolver(buffer, selector, meta);
   }
 }
+
+type TargetResolverFn = (buffer: Buffer, selector: TargetSelector, meta: AdapterFileMeta) => TargetResolutionResult;
+
+function resolveImageTarget(buffer: Buffer, selector: TargetSelector): TargetResolutionResult {
+  const sha256 = sha256Buffer(buffer);
+  if (selector.expectedImageSha256 !== sha256) return { status: 'needs_review', reason: 'image_content_changed' };
+  const dimensions = readImageDimensions(buffer);
+  if (!dimensions || dimensions.widthPx !== selector.expectedWidthPx || dimensions.heightPx !== selector.expectedHeightPx) {
+    return { status: 'needs_review', reason: 'image_dimensions_changed' };
+  }
+  const target = describeImageRegion(selector, dimensions, sha256);
+  if (!target || target.expectedRegionSha256 !== selector.expectedRegionSha256) {
+    return { status: 'needs_review', reason: 'image_region_changed' };
+  }
+  return { status: 'resolved', resolvedCoords: { region: target.region } };
+}
+
+function resolveMediaTarget(buffer: Buffer, selector: TargetSelector, meta: AdapterFileMeta): TargetResolutionResult {
+  const duration = meta.mediaDurationSeconds;
+  if (selector.expectedMediaSha256 !== sha256Buffer(buffer)) {
+    return { status: 'needs_review', reason: 'media_content_changed' };
+  }
+  const { startSec, endSec } = selector;
+  if (duration === undefined || duration !== selector.expectedDurationSec ||
+      typeof startSec !== 'number' || typeof endSec !== 'number' || startSec < 0 || endSec > duration || endSec <= startSec) {
+    return { status: 'needs_review', reason: 'media_duration_changed' };
+  }
+  return { status: 'resolved', resolvedCoords: { startSec, endSec } };
+}
+
+function resolvePdfTarget(buffer: Buffer, selector: TargetSelector): TargetResolutionResult {
+  const hex64 = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+  const pageIndex = Number(selector.pageIndex);
+  const expectedPageCount = Number(selector.expectedPageCount);
+  if (!Number.isInteger(pageIndex) || pageIndex < 0 || !Number.isInteger(expectedPageCount) || expectedPageCount <= 0) {
+    return { status: 'stale', reason: 'invalid_page_selection' };
+  }
+  const doc = inspectPdfDocument(buffer, pageIndex);
+  if (!doc) return { status: 'needs_review', reason: 'pdf_page_content_changed' };
+  if (expectedPageCount !== doc.pageCount) {
+    return { status: 'needs_review', reason: 'pdf_page_count_changed' };
+  }
+  if (pageIndex >= doc.pageCount) {
+    return { status: 'stale', reason: 'invalid_page_selection' };
+  }
+  const page = doc.pages[0];
+  if (!hex64(selector.expectedPageContentHash) || selector.expectedPageContentHash !== page.pageContentHash) {
+    return { status: 'needs_review', reason: 'pdf_page_content_changed' };
+  }
+
+  if (selector.kind === 'pdf_page') {
+    return {
+      status: 'resolved',
+      resolvedCoords: { pageIndex, widthPt: page.widthPt, heightPt: page.heightPt, rotate: page.rotate },
+      resolvedSnippet: page.text,
+    };
+  }
+
+  const coords = selector.kind === 'pdf_pin' ? [selector.xPt, selector.yPt] : selector.rectPt;
+  if (
+    !hex64(selector.expectedRegionDigest) ||
+    !Array.isArray(coords) ||
+    coords.length !== (selector.kind === 'pdf_pin' ? 2 : 4) ||
+    !coords.every((value) => typeof value === 'number' && Number.isFinite(value) && value >= 0)
+  ) {
+    return { status: 'stale', reason: 'invalid_page_selection' };
+  }
+  const rectangle: [number, number, number, number] =
+    selector.kind === 'pdf_pin'
+      ? [coords[0], coords[1], 0, 0]
+      : [coords[0], coords[1], coords[2], coords[3]];
+  if (selector.kind === 'pdf_region' && (rectangle[2] <= 0 || rectangle[3] <= 0)) {
+    return { status: 'stale', reason: 'invalid_page_selection' };
+  }
+  if (!pdfRectInPage(page, rectangle)) return { status: 'needs_review', reason: 'pdf_region_out_of_bounds' };
+  const actualDigest = computePdfRegionDigest(page, rectangle);
+  if (actualDigest !== selector.expectedRegionDigest) {
+    return { status: 'needs_review', reason: 'pdf_region_digest_changed' };
+  }
+  return {
+    status: 'resolved',
+    resolvedCoords: {
+      pageIndex, rectPt: rectangle, widthPt: page.widthPt, heightPt: page.heightPt, rotate: page.rotate,
+      ...(selector.kind === 'pdf_pin' ? { xPt: rectangle[0], yPt: rectangle[1] } : {}),
+    },
+    resolvedSnippet: page.text,
+  };
+}
+
+function resolveXlsxSheetTarget(buffer: Buffer, selector: TargetSelector): TargetResolutionResult {
+  const sheetId = selector.sheetId == null ? null : String(selector.sheetId);
+  const expectedStructHash =
+    typeof selector.expectedSheetStructHash === 'string' && selector.expectedSheetStructHash
+      ? selector.expectedSheetStructHash
+      : null;
+  if (!sheetId || !expectedStructHash || !isSha256(selector.expectedSheetContentHash)) {
+    return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+  }
+  try {
+    const wb = readXlsxWorkbookTargets(buffer);
+    const sheetExists = wb.sheets.some((s) => s.id === sheetId || s.name === sheetId || s.part === sheetId);
+    if (!sheetExists) return { status: 'stale', reason: 'sheet_not_found' };
+    const target = readXlsxSheetTarget(buffer, sheetId);
+    if (!target) return { status: 'stale', reason: 'sheet_not_found' };
+    if (target.expectedSheetStructHash !== expectedStructHash ||
+        target.expectedSheetContentHash !== selector.expectedSheetContentHash) {
+      return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+    }
+    return {
+      status: 'resolved',
+      resolvedRange: { sheetId: target.sheetId, sheetName: target.sheetName },
+      resolvedSnippet: target.sheetName,
+    };
+  } catch {
+    return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+  }
+}
+
+function resolveXlsxRowColTarget(buffer: Buffer, selector: TargetSelector): TargetResolutionResult {
+  const sheetId = selector.sheetId == null ? null : String(selector.sheetId);
+  const expectedStructHash =
+    typeof selector.expectedSheetStructHash === 'string' && selector.expectedSheetStructHash
+      ? selector.expectedSheetStructHash
+      : null;
+  const axis = selector.axis === 'row' || selector.axis === 'col' ? selector.axis : null;
+  const { start, end, expectedRangeValuesHash } = selector;
+  if (!sheetId || !axis || typeof start !== 'number' || typeof end !== 'number' ||
+      !expectedStructHash || !isSha256(expectedRangeValuesHash)) {
+    return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+  }
+  try {
+    const wb = readXlsxWorkbookTargets(buffer);
+    const sheetExists = wb.sheets.some((s) => s.id === sheetId || s.name === sheetId || s.part === sheetId);
+    if (!sheetExists) return { status: 'stale', reason: 'sheet_not_found' };
+    const target = readXlsxRowColTarget(buffer, sheetId, axis, start, end);
+    if (!target) return { status: 'stale', reason: 'invalid_range' };
+    if (target.expectedSheetStructHash !== expectedStructHash || target.expectedRangeValuesHash !== expectedRangeValuesHash) {
+      return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+    }
+    return {
+      status: 'resolved',
+      resolvedRange: { sheetId: target.sheetId, sheetName: target.sheetName, axis: target.axis, start: target.start, end: target.end, targetContextHash: target.targetContextHash },
+      resolvedSnippet: target.snippet,
+    };
+  } catch {
+    return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+  }
+}
+
+function resolveXlsxRangeTarget(buffer: Buffer, selector: TargetSelector): TargetResolutionResult {
+  const sheetId = selector.sheetId == null ? null : String(selector.sheetId);
+  const expectedStructHash =
+    typeof selector.expectedSheetStructHash === 'string' && selector.expectedSheetStructHash
+      ? selector.expectedSheetStructHash
+      : null;
+  const rangeA1 = typeof selector.rangeA1 === 'string' && selector.rangeA1 ? selector.rangeA1 : null;
+  const expectedValuesHash =
+    typeof selector.expectedRangeValuesHash === 'string' && selector.expectedRangeValuesHash
+      ? selector.expectedRangeValuesHash
+      : null;
+  const expectedOrderKeysHash =
+    typeof selector.expectedOrderKeysHash === 'string' && selector.expectedOrderKeysHash
+      ? selector.expectedOrderKeysHash
+      : null;
+  if (!sheetId || !rangeA1 || !expectedStructHash || !expectedValuesHash) {
+    return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+  }
+  try {
+    const wb = readXlsxWorkbookTargets(buffer);
+    const sheetExists = wb.sheets.some((s) => s.id === sheetId || s.name === sheetId || s.part === sheetId);
+    if (!sheetExists) return { status: 'stale', reason: 'sheet_not_found' };
+    const target = readXlsxRangeTarget(buffer, sheetId, rangeA1);
+    if (!target) return { status: 'stale', reason: 'invalid_range' };
+    if (target.expectedSheetStructHash !== expectedStructHash) {
+      return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+    }
+    if (target.expectedRangeValuesHash !== expectedValuesHash) {
+      return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+    }
+    if (expectedOrderKeysHash && target.expectedOrderKeysHash !== expectedOrderKeysHash) {
+      return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+    }
+    return {
+      status: 'resolved',
+      resolvedRange: { sheetId: target.sheetId, sheetName: target.sheetName, rangeA1: target.rangeA1, targetContextHash: target.targetContextHash },
+      resolvedSnippet: target.snippet,
+    };
+  } catch {
+    return { status: 'needs_review', reason: 'TARGET_CONTENT_DRIFT' };
+  }
+}
+
+function resolvePptxTarget(buffer: Buffer, selector: TargetSelector): TargetResolutionResult {
+  try {
+    const { slides, slideSize } = readPptxTargets(buffer);
+    const matchingSlides = slides.filter(slide => slide.id === String(selector.slideId));
+    if (matchingSlides.length > 1) return { status: 'needs_review', reason: 'ambiguous_slide_id' };
+    const pageIndex = slides.indexOf(matchingSlides[0]);
+    const slide = slides[pageIndex];
+    if (!slide) return { status: 'stale', reason: 'slide_not_found' };
+    const metadata = readPptxSlideTargets(buffer, slide.part);
+    const element = selector.kind === 'pptx_element'
+      ? metadata.shapes.filter(shape => shape.id === String(selector.shapeId) &&
+        JSON.stringify(shape.groupPath) === JSON.stringify(selector.groupPath ?? []))
+      : null;
+    const fingerprint = element ? (element.length === 1 ? element[0].fingerprint : null) : metadata.slideHash;
+    const expected = element ? selector.expectedElementFingerprint : selector.expectedSlideHash;
+    let slideCoords: Record<string, unknown> = {
+      pageIndex,
+      ...(selector.kind === 'pptx_slide' || selector.kind === 'pptx_region' ? slideSize : undefined),
+    };
+    if (selector.kind === 'pptx_slide' && selector.pointPt !== undefined) {
+      const { xPt, yPt, widthPt, heightPt } = selector.pointPt as Record<string, number>;
+      if (!slideSize || widthPt !== slideSize.widthPt || heightPt !== slideSize.heightPt ||
+          !Number.isFinite(xPt) || !Number.isFinite(yPt) || xPt < 0 || yPt < 0 || xPt > widthPt || yPt > heightPt) {
+        return { status: 'needs_review', reason: 'slide_point_out_of_bounds' };
+      }
+      const point = { xPt, yPt, widthPt, heightPt };
+      slideCoords = { pageIndex, unit: 'pt', ...point, region: pointRegionPt(point) };
+    }
+    if (selector.kind === 'pptx_region') {
+      const rect = selector.rectPt;
+      if (!slideSize || !Array.isArray(rect) || rect.length !== 4 ||
+          !rect.every(v => typeof v === 'number' && Number.isFinite(v))) {
+        return { status: 'needs_review', reason: 'slide_region_out_of_bounds' };
+      }
+      const [x, y, w, h] = rect as [number, number, number, number];
+      if (w <= 0 || h <= 0 || x < 0 || y < 0 || x + w > slideSize.widthPt + 0.01 || y + h > slideSize.heightPt + 0.01) {
+        return { status: 'needs_review', reason: 'slide_region_out_of_bounds' };
+      }
+      slideCoords = {
+        pageIndex,
+        unit: 'pt',
+        rectPt: [x, y, w, h],
+        widthPt: slideSize.widthPt,
+        heightPt: slideSize.heightPt,
+        region: { x, y, width: w, height: h, unit: 'pt' as const },
+      };
+    }
+    return fingerprint && fingerprint === expected
+      ? {
+        status: 'resolved', resolvedRange: { selector },
+        resolvedCoords: element && metadata.shapes.filter(shape => shape.id === element[0].id).length === 1
+          ? { pageIndex, shapeId: Number(element[0].id) } : slideCoords,
+        resolvedSnippet: element ? element[0].text : metadata.shapes.map(shape => shape.text).filter(Boolean).join('\n'),
+      }
+      : { status: 'needs_review', reason: 'element_fingerprint_changed' };
+  } catch {
+    return { status: 'needs_review', reason: 'target_structure_unavailable' };
+  }
+}
+
+function resolveDocxParagraphTarget(buffer: Buffer, selector: TargetSelector): TargetResolutionResult {
+  const expectedBlockHash =
+    typeof selector.expectedBlockHash === 'string' && selector.expectedBlockHash
+      ? selector.expectedBlockHash
+      : null;
+  const paraId = typeof selector.paraId === 'string' && selector.paraId ? selector.paraId : null;
+  const hasBlockIndex = selector.blockIndex !== undefined && selector.blockIndex !== null;
+  const blockIndex = hasBlockIndex ? Number(selector.blockIndex) : -1;
+  if (!expectedBlockHash) {
+    return { status: 'needs_review', reason: 'element_fingerprint_changed' };
+  }
+  if (!paraId && (!hasBlockIndex || !Number.isInteger(blockIndex) || blockIndex < 0)) {
+    return { status: 'needs_review', reason: 'element_fingerprint_changed' };
+  }
+  try {
+    const { paragraphs, byBlockIndex } = readDocxAllParagraphTargets(buffer);
+    const paragraphResult = (match: (typeof paragraphs)[number]): TargetResolutionResult => {
+      const index = paragraphs.indexOf(match);
+      return {
+        status: 'resolved',
+        resolvedRange: { selector, resolvedBlockIndex: match.blockIndex },
+        resolvedSnippet: match.text,
+        surroundingContext: paragraphs.slice(Math.max(0, index - 2), index).map(p => p.text).join('\n') +
+          '\n---\n' + paragraphs.slice(index + 1, index + 3).map(p => p.text).join('\n'),
+      };
+    };
+
+    if (paraId) {
+      const byId = paragraphs.filter((p) => p.paraId === paraId);
+      if (byId.length === 0) return { status: 'stale', reason: 'word_block_not_found' };
+      if (byId.length > 1) return { status: 'needs_review', reason: 'ambiguous_para_id' };
+      const match = byId[0];
+      if (match.fingerprint !== expectedBlockHash) {
+        return { status: 'needs_review', reason: 'element_fingerprint_changed' };
+      }
+      return paragraphResult(match);
+    }
+
+    const matches = paragraphs.filter((p) => p.fingerprint === expectedBlockHash);
+    if (!matches.length) {
+      return byBlockIndex.has(blockIndex)
+        ? { status: 'needs_review', reason: 'element_fingerprint_changed' }
+        : { status: 'stale', reason: 'word_block_not_found' };
+    }
+
+    const { contextBeforeHash, contextAfterHash, duplicateCount, occurrenceIndex } = selector;
+    if (!isSha256(contextBeforeHash) || !isSha256(contextAfterHash)) {
+      return { status: 'needs_review', reason: 'invalid_context_hash' };
+    }
+    const contextual = matches.filter(p =>
+      p.contextBeforeHash === contextBeforeHash && p.contextAfterHash === contextAfterHash);
+    const match = contextual.length === 1 ? contextual[0] : undefined;
+    if (!match || (duplicateCount !== undefined && duplicateCount !== matches.length) ||
+        (occurrenceIndex !== undefined && occurrenceIndex !== match.occurrenceIndex) ||
+        (matches.length > 1 && match.blockIndex !== blockIndex)) {
+      return { status: 'needs_review', reason: 'ambiguous_duplicate_paragraph' };
+    }
+    return paragraphResult(match);
+  } catch {
+    return { status: 'needs_review', reason: 'target_structure_unavailable' };
+  }
+}
+
+/**
+ * Registered target-resolution handlers for `DocumentFormatAdapter` formats,
+ * keyed directly by canonical `TargetSelectorKind` (§5.2).
+ */
+export const DOCUMENT_TARGET_RESOLVERS: Partial<Record<TargetSelectorKind, TargetResolverFn>> = {
+  image_pin: resolveImageTarget,
+  image_rect: resolveImageTarget,
+  video_time_range: resolveMediaTarget,
+  audio_time_range: resolveMediaTarget,
+  pdf_page: resolvePdfTarget,
+  pdf_pin: resolvePdfTarget,
+  pdf_region: resolvePdfTarget,
+  xlsx_sheet: resolveXlsxSheetTarget,
+  xlsx_row_col: resolveXlsxRowColTarget,
+  xlsx_range: resolveXlsxRangeTarget,
+  pptx_slide: resolvePptxTarget,
+  pptx_element: resolvePptxTarget,
+  pptx_region: resolvePptxTarget,
+  docx_paragraph: resolveDocxParagraphTarget,
+};
 
 export function detectArtifactFormat(filename: string, previewKind: PreviewKind): ArtifactFormat {
   const ext = path.extname(filename).toLowerCase();
@@ -753,6 +785,21 @@ export class FormatAdapterRegistry {
   resolve(filename: string, previewKind: PreviewKind): FormatAdapter {
     const format = detectArtifactFormat(filename, previewKind);
     return this.getByFormat(format);
+  }
+
+  getRegisteredTargetBinding(kind: TargetSelectorKind) {
+    const registration = getSelectorRegistration(kind);
+    if (!registration || registration.format === 'rich_block') return null;
+    const adapter = this.getByFormat(registration.format as ArtifactFormat);
+    const hasResolver = adapter instanceof DocumentFormatAdapter
+      ? Boolean(DOCUMENT_TARGET_RESOLVERS[kind])
+      : adapter.targetPinSupported;
+    return {
+      registration,
+      adapter,
+      inspection: registration.inspection,
+      hasResolver,
+    };
   }
 
   buildCapabilitiesResponse(params: {

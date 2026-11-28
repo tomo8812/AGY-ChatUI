@@ -397,5 +397,103 @@ describe('Target Selection Registry & Revised §5.2 / §4.2 Conformance', () => 
       expect(src).toContain('TargetInspectionErrorBanner');
     }
     expect(pdfModule).toContain('TargetInspectionErrorBanner');
+
+    // All PR3A modules use registry-driven inspectTarget
+    for (const src of [pdfModule, pptxModule, docxModule, gridModule, sourceModule]) {
+      expect(src).toContain('inspectTarget');
+    }
+
+    // Finding 02: code_char_range jump uses selectCharRange (distinct from selectLines)
+    const sourceEditor = read('web/src/components/shared-ui/editor/SourceEditor.tsx');
+    expect(sourceEditor).toContain('selectCharRange');
+    expect(sourceModule).toContain('selectCharRange');
+    expect(sourceModule).toContain("jumpTarget?.selector.kind==='code_char_range'");
+
+    // Finding 04: SpatialPinOverlay clears stale local selection when highlightedArea changes
+    const spatialOverlay = read('web/src/components/shared-ui/pin/SpatialPinOverlay.tsx');
+    expect(spatialOverlay).toContain('highlightKey');
+    expect(spatialOverlay).toContain('if (!startRef.current)');
+  });
+
+  it('binds every registered artifact selector kind to an inspection contract and adapter resolver', () => {
+    const registry = new FormatAdapterRegistry();
+    for (const entry of TARGET_SELECTOR_REGISTRY) {
+      expect(entry.inspection).toBeDefined();
+      expect(entry.inspection.channel).toBeTruthy();
+      if (entry.format === 'rich_block') continue;
+      const binding = registry.getRegisteredTargetBinding(entry.kind);
+      expect(binding, `Missing target binding for ${entry.kind}`).not.toBeNull();
+      expect(binding!.hasResolver, `Missing target resolver for ${entry.kind}`).toBe(true);
+      expect(binding!.inspection).toEqual(entry.inspection);
+    }
+  });
+
+  it('supports CSV cell-range target selection exceeding 512 KiB via streaming hashOnly without truncation failure', async () => {
+    const srv = await createTestServer({ installDocRuntime: 'off', sandboxMode: 'off', allowUnsandboxedDocWorkers: false });
+    cleanups.push(srv.cleanup);
+    const { ctx } = srv;
+    const { client, userId } = await registerAndBindAgy(srv.baseUrl, 'csv-large-user', 'user:csvlarge@gmail.com');
+    const chatId = (await client.request<{ chat: { id: string } }>('POST', '/api/chats', { title: 'Large CSV range' })).data.chat.id;
+
+    // Build a ~720 KiB CSV (600 rows x 2 cols, well above the 512 KiB display response cap)
+    const lines = ['id,payload'];
+    for (let i = 1; i < 600; i++) {
+      lines.push(`row-${i},${'x'.repeat(1200)}-${i}`);
+    }
+    const csvBytes = Buffer.from(lines.join('\n'), 'utf8');
+    expect(csvBytes.length).toBeGreaterThan(700 * 1024);
+
+    const { artifact } = await ctx.artifactService.createArtifact({
+      userId,
+      chatId,
+      scopeKind: 'chat',
+      relPath: 'large.csv',
+      content: csvBytes,
+      actorKind: 'user',
+    });
+
+    // Request cell-range target metadata spanning all 600 rows (> 512 KiB)
+    const meta = await ctx.artifactService.readRange(userId, artifact.id, {
+      targetMetadata: true,
+      startRow: 0,
+      endRow: 599,
+      startCol: 0,
+      endCol: 1,
+    }) as {
+      target: {
+        startRow: number;
+        endRow: number;
+        startCol: number;
+        endCol: number;
+        expectedRowCount: number;
+        expectedColCount: number;
+        expectedHeaderHash: string;
+        expectedRangeValuesHash: string;
+      } | null;
+      snippet: string;
+    };
+
+    expect(meta.target).not.toBeNull();
+    expect(meta.target!.expectedRowCount).toBe(600);
+    expect(meta.target!.expectedColCount).toBe(2);
+    expect(meta.target!.expectedHeaderHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(meta.target!.expectedRangeValuesHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(meta.snippet.length).toBeGreaterThan(0);
+    expect(meta.snippet.length).toBeLessThanOrEqual(50_000);
+
+    // Re-resolution against the full >700 KiB CSV must resolve cleanly
+    const resolution = await ctx.artifactService.resolveTargetOnArtifact(userId, artifact.id, {
+      kind: 'csv_range',
+      baseRevision: 1,
+      startRow: meta.target!.startRow,
+      endRow: meta.target!.endRow,
+      startCol: meta.target!.startCol,
+      endCol: meta.target!.endCol,
+      expectedRowCount: meta.target!.expectedRowCount,
+      expectedColCount: meta.target!.expectedColCount,
+      expectedHeaderHash: meta.target!.expectedHeaderHash,
+      expectedRangeValuesHash: meta.target!.expectedRangeValuesHash,
+    });
+    expect(resolution.status).toBe('resolved');
   });
 });

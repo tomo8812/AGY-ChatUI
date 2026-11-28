@@ -214,7 +214,7 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     const identity=artifact.revision,isCurrent=pin.selection.begin();
     pin.clearPinError();
     try{
-      const result=await workspaceApi.range<{
+      const result=await pin.inspectTarget<{
         target:{
           fingerprint:string;
           paraId?:string;
@@ -223,8 +223,9 @@ export function DocxModule({artifact,mode,capabilities,draft,editingLocked,onDra
           occurrenceIndex?:number;
           duplicateCount?:number;
         }|null;
-      }>(artifact.id,{targetBlockIndex:selectedBlock.blockIndex});
-      assertRevision(artifact,result);
+        revision?:number;
+        sha256?:string;
+      }>(artifact,{targetBlockIndex:selectedBlock.blockIndex});
       if(!isCurrent())return;
       if(!result.target)throw Error('段落を識別できません。');
       onTarget({

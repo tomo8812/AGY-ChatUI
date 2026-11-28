@@ -448,8 +448,7 @@ export function GridModule(props:WorkspaceModuleProps){
           const axisKind=activeGridMode;
           const start=axisKind==='row'?row0:col0;
           const end=axisKind==='row'?row1:col1;
-          const meta=await workspaceApi.range<{target:{axis:'row'|'col';start:number;end:number;expectedRowCount:number;expectedColCount:number;expectedHeaderHash:string;expectedRangeValuesHash:string}|null}>(artifact.id,{targetMetadata:'true',axis:axisKind,start,end});
-          assertRevision(artifact,meta);
+          const meta=await pinState.inspectTarget<{target:{axis:'row'|'col';start:number;end:number;expectedRowCount:number;expectedColCount:number;expectedHeaderHash:string;expectedRangeValuesHash:string}|null;snippet?:string;revision?:number;sha256?:string}>(artifact,{axis:axisKind,start,end});
           if(!meta.target||!meta.target.expectedHeaderHash||!meta.target.expectedRangeValuesHash){
             throw Error('選択対象を読み込めませんでした。');
           }
@@ -466,29 +465,28 @@ export function GridModule(props:WorkspaceModuleProps){
           targetLabel=axisKind==='row'
             ? (start===end?`行 ${start+1}`:`行 ${start+1}–${end+1}`)
             : (start===end?`列 ${colName(start)}`:`列 ${colName(start)}–${colName(end)}`);
+          snippet=meta.snippet;
         }else{
-          const exact=await workspaceApi.range<{rows:string[][];valuesHash:string;headerHash?:string;totalRows?:number;totalCols?:number;truncated?:boolean}>(artifact.id,{startRow:row0,endRow:row1,startCol:col0,endCol:col1,targetHashes:'true'});
-          assertRevision(artifact,exact);
-          if(exact.truncated||exact.rows.length!==row1-row0+1||!exact.valuesHash||!exact.headerHash||exact.totalRows===undefined||exact.totalCols===undefined){
+          const meta=await pinState.inspectTarget<{target:{startRow:number;endRow:number;startCol:number;endCol:number;expectedRowCount:number;expectedColCount:number;expectedHeaderHash:string;expectedRangeValuesHash:string}|null;snippet?:string;revision?:number;sha256?:string}>(artifact,{startRow:row0,endRow:row1,startCol:col0,endCol:col1});
+          if(!meta.target||!meta.target.expectedHeaderHash||!meta.target.expectedRangeValuesHash){
             throw Error('選択対象を読み込めませんでした。');
           }
           selector={
             kind:'csv_range',
-            startRow:row0,
-            endRow:row1,
-            startCol:col0,
-            endCol:col1,
-            expectedRowCount:exact.totalRows,
-            expectedColCount:exact.totalCols,
-            expectedHeaderHash:exact.headerHash,
-            expectedRangeValuesHash:exact.valuesHash,
+            startRow:meta.target.startRow,
+            endRow:meta.target.endRow,
+            startCol:meta.target.startCol,
+            endCol:meta.target.endCol,
+            expectedRowCount:meta.target.expectedRowCount,
+            expectedColCount:meta.target.expectedColCount,
+            expectedHeaderHash:meta.target.expectedHeaderHash,
+            expectedRangeValuesHash:meta.target.expectedRangeValuesHash,
           };
-          snippet=exact.rows.map(row=>row.join('\t')).join('\n');
+          snippet=meta.snippet;
         }
       }else{
         if(activeGridMode==='sheet'){
-          const meta=await workspaceApi.range<{target:{sheetId:string;sheetName:string;expectedSheetStructHash:string;expectedSheetContentHash:string;snippet?:string}|null}>(artifact.id,{targetMetadata:'true',sheetId:sheet.id});
-          assertRevision(artifact,meta);
+          const meta=await pinState.inspectTarget<{target:{sheetId:string;sheetName:string;expectedSheetStructHash:string;expectedSheetContentHash:string;snippet?:string}|null;revision?:number;sha256?:string}>(artifact,{sheetId:sheet.id});
           if(!meta.target||!meta.target.expectedSheetStructHash||!meta.target.expectedSheetContentHash){
             throw Error('シートの対象情報を読み込めませんでした。');
           }
@@ -504,8 +502,7 @@ export function GridModule(props:WorkspaceModuleProps){
           const axisKind=activeGridMode;
           const start=axisKind==='row'?row0:col0;
           const end=axisKind==='row'?row1:col1;
-          const meta=await workspaceApi.range<{target:{sheetId:string;sheetName:string;axis:'row'|'col';start:number;end:number;expectedSheetStructHash:string;expectedRangeValuesHash:string;snippet?:string}|null}>(artifact.id,{targetMetadata:'true',sheetId:sheet.id,axis:axisKind,start,end});
-          assertRevision(artifact,meta);
+          const meta=await pinState.inspectTarget<{target:{sheetId:string;sheetName:string;axis:'row'|'col';start:number;end:number;expectedSheetStructHash:string;expectedRangeValuesHash:string;snippet?:string}|null;revision?:number;sha256?:string}>(artifact,{sheetId:sheet.id,axis:axisKind,start,end});
           if(!meta.target||!meta.target.expectedSheetStructHash||!meta.target.expectedRangeValuesHash){
             throw Error('選択対象を読み込めませんでした。');
           }
@@ -523,8 +520,7 @@ export function GridModule(props:WorkspaceModuleProps){
             : (start===end?`列 ${colName(start)}`:`列 ${colName(start)}–${colName(end)}`));
           snippet=meta.target.snippet;
         }else{
-          const meta=await workspaceApi.range<{target:{sheetId:string;sheetName:string;rangeA1:string;expectedSheetStructHash:string;expectedRangeValuesHash:string;expectedOrderKeysHash?:string;snippet?:string}|null}>(artifact.id,{targetMetadata:'true',sheetId:sheet.id,rangeA1:rangeLabel});
-          assertRevision(artifact,meta);
+          const meta=await pinState.inspectTarget<{target:{sheetId:string;sheetName:string;rangeA1:string;expectedSheetStructHash:string;expectedRangeValuesHash:string;expectedOrderKeysHash?:string;snippet?:string}|null;revision?:number;sha256?:string}>(artifact,{sheetId:sheet.id,rangeA1:rangeLabel});
           if(!meta.target||!meta.target.expectedSheetStructHash||!meta.target.expectedRangeValuesHash){
             throw Error('選択対象を読み込めませんでした。');
           }

@@ -1,6 +1,7 @@
 import { provePdfRotationScope, replayPdfRotation } from './adapters/pdf-history.js';
 import { proveOfficeEditScope, replayOfficeEdit } from './adapters/ooxml-target.js';
 import { pointRegionPt, validateRegionPng } from './region-png.js';
+import { getTargetInspectionChannelForRequest } from '../../../shared/target-selection-registry.js';
 import { selectorIsAvailable, selectorMatchesFormat, selectorsForFormat, targetSelectorSchema } from './target-selector-schema.js';
 import { inspectArtifactTarget } from './target-inspection.js';
 import crypto from 'node:crypto';
@@ -4486,6 +4487,16 @@ export class ArtifactService {
     const valuesDigest = crypto.createHash('sha256').update('[');
     const headerDigest = crypto.createHash('sha256').update('[');
     let hashedRows = 0, hashedFields = 0;
+    const MAX_SNIPPET_CHARS = 50_000;
+    const snippetParts: string[] = [];
+    let snippetChars = 0;
+    const appendSnippet = (text: string) => {
+      if (snippetChars >= MAX_SNIPPET_CHARS || !text) return;
+      const remaining = MAX_SNIPPET_CHARS - snippetChars;
+      const piece = text.length <= remaining ? text : text.slice(0, remaining);
+      snippetParts.push(piece);
+      snippetChars += piece.length;
+    };
     const collectHeader = () => targetHashes && rowIndex === 0 && !filter;
     let headerField = '';
     const collectRow = () => !fullCell && !dimensionsOnly && !searchQuery && visibleRow() >= startRow && visibleRow() <= targetEndRow;
@@ -4536,8 +4547,15 @@ export class ArtifactService {
         headerField = '';
       }
       if (hashOnly) {
-        if (fieldCount === 0 && collectRow()) valuesDigest.update(hashedRows ? ',[' : '[');
-        if (collectField()) valuesDigest.update(hashedFields++ ? ',' : '').update(JSON.stringify(field));
+        if (fieldCount === 0 && collectRow()) {
+          valuesDigest.update(hashedRows ? ',[' : '[');
+          if (hashedRows > 0) appendSnippet('\n');
+        }
+        if (collectField()) {
+          if (hashedFields > 0) appendSnippet('\t');
+          appendSnippet(field);
+          valuesDigest.update(hashedFields++ ? ',' : '').update(JSON.stringify(field));
+        }
       }
       if (!hashOnly && collectField()&&!rowTruncated) {
         if(fitsField(fieldBytes)){rowBytes+=(currentRow.length?1:0)+2+fieldBytes;currentRow.push(field);}
@@ -4611,6 +4629,7 @@ export class ArtifactService {
     if (hashOnly) return {
       totalRows: rowIndex, totalCols: observedMaxCols,
       headerHash: headerDigest.update(']').digest('hex'), valuesHash: valuesDigest.update(']').digest('hex'),
+      snippet: snippetParts.join(''),
     };
     if (fullCell) return { cellText };
     if (searchQuery) return {match:nextMatch??firstMatch,totalBytes};
@@ -4635,27 +4654,68 @@ export class ArtifactService {
       const adapter = this.registry.resolve(artifact.filename, artifact.previewKind);
       const format = adapter.format;
 
-      const isTargetMeta = range.targetMetadata === true || range.targetMetadata === 'true';
-      if (
-        (format === 'pptx' && isTargetMeta) ||
-        (format === 'docx' && range.targetBlockIndex !== undefined) ||
-        (format === 'xlsx' && isTargetMeta) ||
-        (format === 'image' && isTargetMeta) ||
-        (format === 'pdf' && isTargetMeta && range.pageIndex !== undefined)
-      ) {
+      const inspectionChannel = getTargetInspectionChannelForRequest(format, range);
+      if (inspectionChannel === 'worker_target_metadata') {
         const data = await inspectArtifactTarget<Record<string, unknown>>({
-          file: artifact, range,
+          file: artifact,
+          range: format === 'media' ? { mediaStructure: true } : range,
           snapshot: { path: blobPath, sha256: revision.sha256, sizeBytes },
         });
         return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
       }
 
-      if (format === 'media' && isTargetMeta) {
+      if (inspectionChannel === 'worker_source_hashes') {
         const data = await inspectArtifactTarget<Record<string, unknown>>({
-          file: artifact, range: { mediaStructure: true },
+          file: artifact,
+          range: {
+            sourceTarget: true,
+            startLine: Number(range.startLine),
+            endLine: Number(range.endLine),
+            ...(format === 'code' && (range.startCol !== undefined || range.endCol !== undefined)
+              ? { startCol: Number(range.startCol), endCol: Number(range.endCol) } : {}),
+          },
           snapshot: { path: blobPath, sha256: revision.sha256, sizeBytes },
         });
         return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+      }
+
+      if (inspectionChannel === 'stream_csv_hash_only') {
+        const slice = range.axis === 'row' || range.axis === 'col';
+        if (slice) {
+          const start = Number(range.start), end = Number(range.end);
+          if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start) {
+            throw new ArtifactError('INVALID_INPUT', 'Invalid CSV row or column range.', 400);
+          }
+          const bounds = range.axis === 'row'
+            ? { startRow: start, endRow: end }
+            : { startCol: start, endCol: end, endRow: Number.MAX_SAFE_INTEGER };
+          const data = await this.streamCsvRangeFromBlob(blobPath, sizeBytes, artifact.filename, { ...bounds, targetHashes: true, hashOnly: true });
+          const limit = range.axis === 'row' ? Number(data.totalRows) : Number(data.totalCols);
+          const target = !data.truncated && end < limit ? {
+            axis: range.axis, start, end, expectedRowCount: data.totalRows, expectedColCount: data.totalCols,
+            expectedHeaderHash: data.headerHash, expectedRangeValuesHash: data.valuesHash,
+          } : null;
+          return { target, snippet: target ? data.snippet : undefined, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
+        }
+        const startRow = Number(range.startRow), endRow = Number(range.endRow);
+        const startCol = Number(range.startCol), endCol = Number(range.endCol);
+        if (
+          !Number.isSafeInteger(startRow) || !Number.isSafeInteger(endRow) || startRow < 0 || endRow < startRow ||
+          !Number.isSafeInteger(startCol) || !Number.isSafeInteger(endCol) || startCol < 0 || endCol < startCol
+        ) {
+          throw new ArtifactError('INVALID_INPUT', 'Invalid CSV cell range.', 400);
+        }
+        const data = await this.streamCsvRangeFromBlob(blobPath, sizeBytes, artifact.filename, {
+          startRow, endRow, startCol, endCol, targetHashes: true, hashOnly: true,
+        });
+        const totalRows = Number(data.totalRows);
+        const totalCols = Number(data.totalCols);
+        const target = !data.truncated && endRow < totalRows && endCol < totalCols ? {
+          startRow, endRow, startCol, endCol,
+          expectedRowCount: totalRows, expectedColCount: totalCols,
+          expectedHeaderHash: data.headerHash, expectedRangeValuesHash: data.valuesHash,
+        } : null;
+        return { target, snippet: target ? data.snippet : undefined, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
       }
 
       if (isDocumentFormat(format) && ['xlsx', 'docx', 'pptx', 'pdf'].includes(format)) {
@@ -4676,39 +4736,11 @@ export class ArtifactService {
       }
 
       if (format === 'csv') {
-        const slice = range.axis === 'row' || range.axis === 'col';
-        if (isTargetMeta && slice) {
-          const start = Number(range.start), end = Number(range.end);
-          if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start) {
-            throw new ArtifactError('INVALID_INPUT', 'Invalid CSV row or column range.', 400);
-          }
-          const bounds = range.axis === 'row'
-            ? { startRow: start, endRow: end }
-            : { startCol: start, endCol: end, endRow: Number.MAX_SAFE_INTEGER };
-          const data = await this.streamCsvRangeFromBlob(blobPath, sizeBytes, artifact.filename, { ...bounds, targetHashes: true, hashOnly: true });
-          const limit = range.axis === 'row' ? Number(data.totalRows) : Number(data.totalCols);
-          const target = !data.truncated && end < limit ? {
-            axis: range.axis, start, end, expectedRowCount: data.totalRows, expectedColCount: data.totalCols,
-            expectedHeaderHash: data.headerHash, expectedRangeValuesHash: data.valuesHash,
-          } : null;
-          return { target, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
-        }
         const data = await this.streamCsvRangeFromBlob(blobPath, sizeBytes, artifact.filename, range);
         return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
       }
 
       if (['code', 'markdown', 'html', 'svg', 'mermaid', 'diff'].includes(format)) {
-        if (range.targetHashes === true || range.targetHashes === 'true') {
-          const data = await inspectArtifactTarget<Record<string, unknown>>({
-            file: artifact,
-            range: { sourceTarget: true, startLine: Number(range.startLine), endLine: Number(range.endLine),
-              ...(format === 'code' && (range.startCol !== undefined || range.endCol !== undefined)
-                ? { startCol: Number(range.startCol), endCol: Number(range.endCol) } : {}),
-            },
-            snapshot: { path: blobPath, sha256: revision.sha256, sizeBytes },
-          });
-          return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
-        }
         const data = range.offsetBytes !== undefined
           ? this.readByteRangeFromBlob(blobPath, sizeBytes, range)
           : await this.streamLineRangeFromBlob(blobPath, sizeBytes, range);

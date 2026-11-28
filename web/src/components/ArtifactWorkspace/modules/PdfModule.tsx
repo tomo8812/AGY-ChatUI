@@ -51,10 +51,9 @@ export function PdfModule({ artifact, mode, capabilities, onTarget, beginTargetS
       let regionDigest: string | undefined;
       let resolvedPageCount = pageCount;
       let snippet: string | undefined;
-      let meta: Awaited<ReturnType<typeof workspaceApi.range<PdfTargetMetaResponse>>> | null = null;
+      let meta: (PdfTargetMetaResponse & { revision?: number; sha256?: string }) | null = null;
       try {
-        meta = await workspaceApi.range<PdfTargetMetaResponse>(artifact.id, {
-          targetMetadata: 'true',
+        meta = await pin.inspectTarget<PdfTargetMetaResponse & { revision?: number; sha256?: string }>(artifact, {
           pageIndex,
           ...(rectPt ? { rectPt: JSON.stringify(rectPt) } : {}),
         });
@@ -63,7 +62,6 @@ export function PdfModule({ artifact, mode, capabilities, onTarget, beginTargetS
       }
       if (meta && !meta.target) throw Error('ページの構造を確認できません。');
       if (meta?.target) {
-        assertRevision(artifact, meta);
         pageHash = meta.target.pageContentHash;
         regionDigest = meta.target.regionDigest;
         resolvedPageCount = meta.target.pageCount;

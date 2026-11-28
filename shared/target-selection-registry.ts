@@ -95,6 +95,21 @@ export type TargetSelectorView =
   | 'player'
   | 'rich_card';
 
+export type TargetInspectionChannel =
+  | 'worker_target_metadata'
+  | 'worker_source_hashes'
+  | 'stream_csv_hash_only'
+  | 'rich_block_state';
+
+export interface TargetInspectionContract {
+  /** Server inspection channel that computes target identity metadata. */
+  readonly channel: TargetInspectionChannel;
+  /** Range API flag used to request target identity metadata for this selector. */
+  readonly rangeRequestFlag?: 'targetMetadata' | 'targetHashes' | 'targetBlockIndex';
+  /** Optional parameter keys required on the range request for this inspection route. */
+  readonly requiredParams?: readonly string[];
+}
+
 export interface RegisteredUiModeSpec {
   /** Stable UI mode identifier within the format (e.g. 'page', 'pin', 'region', 'element', 'range', 'row', 'col', 'sheet'). */
   readonly id: string;
@@ -111,6 +126,7 @@ export interface RegisteredUiMode extends RegisteredUiModeSpec {
   readonly selectorKind: TargetSelectorKind;
   readonly format: TargetSelectionFormat;
   readonly supportedViews: readonly TargetSelectorView[];
+  readonly inspection: TargetInspectionContract;
 }
 
 export interface TargetSelectorRegistration {
@@ -123,11 +139,38 @@ export interface TargetSelectorRegistration {
   readonly label: string;
   /** Supported views / runtime profiles where this selector operates. */
   readonly supportedViews: readonly TargetSelectorView[];
+  /** Target metadata inspection & server routing contract (§5.2). */
+  readonly inspection: TargetInspectionContract;
   /** Whether direct interactive UI selection is wired in the current phase. */
   readonly uiAvailable: boolean;
   /** Declarative UI interaction modes exposed by this selector registration. */
   readonly uiModes: readonly RegisteredUiModeSpec[];
 }
+
+const WORKER_TARGET_META: TargetInspectionContract = {
+  channel: 'worker_target_metadata',
+  rangeRequestFlag: 'targetMetadata',
+};
+const WORKER_PDF_TARGET_META: TargetInspectionContract = {
+  channel: 'worker_target_metadata',
+  rangeRequestFlag: 'targetMetadata',
+  requiredParams: ['pageIndex'],
+};
+const WORKER_DOCX_TARGET_META: TargetInspectionContract = {
+  channel: 'worker_target_metadata',
+  rangeRequestFlag: 'targetBlockIndex',
+};
+const STREAM_CSV_TARGET_META: TargetInspectionContract = {
+  channel: 'stream_csv_hash_only',
+  rangeRequestFlag: 'targetMetadata',
+};
+const WORKER_SOURCE_HASHES: TargetInspectionContract = {
+  channel: 'worker_source_hashes',
+  rangeRequestFlag: 'targetHashes',
+};
+const RICH_BLOCK_STATE: TargetInspectionContract = {
+  channel: 'rich_block_state',
+};
 
 export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
   // PPTX — structural element, slide whole (+ optional pin pointPt), rect region
@@ -137,6 +180,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'element',
     label: '構造要素',
     supportedViews: ['base', 'compact', 'full', 'canvas'],
+    inspection: WORKER_TARGET_META,
     uiAvailable: true,
     uiModes: [
       { id: 'element', primitive: 'element', label: '構造要素', actionLabel: '要素を対象にする' },
@@ -148,6 +192,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'whole',
     label: 'スライド全体・ピン',
     supportedViews: ['base', 'compact', 'full', 'canvas'],
+    inspection: WORKER_TARGET_META,
     uiAvailable: true,
     uiModes: [
       { id: 'slide', primitive: 'whole', label: 'スライド全体', actionLabel: 'スライド全体を対象にする' },
@@ -160,6 +205,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'rect',
     label: '矩形領域',
     supportedViews: ['base', 'compact', 'full', 'canvas'],
+    inspection: WORKER_TARGET_META,
     uiAvailable: true,
     uiModes: [
       { id: 'region', primitive: 'rect', label: '矩形領域', hint: 'ドラッグ、または矢印キーと Enter で範囲を指定' },
@@ -173,6 +219,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'element',
     label: '段落',
     supportedViews: ['base', 'compact', 'full', 'reading', 'editing'],
+    inspection: WORKER_DOCX_TARGET_META,
     uiAvailable: true,
     uiModes: [
       { id: 'element', primitive: 'element', label: '段落', actionLabel: '選択段落を対象にする' },
@@ -186,6 +233,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'grid',
     label: 'セル範囲',
     supportedViews: ['base', 'compact', 'full', 'grid'],
+    inspection: WORKER_TARGET_META,
     uiAvailable: true,
     uiModes: [
       { id: 'range', primitive: 'grid', label: 'セル範囲', actionLabel: 'セルを対象にする' },
@@ -197,6 +245,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'grid',
     label: '行・列',
     supportedViews: ['base', 'compact', 'full', 'grid'],
+    inspection: WORKER_TARGET_META,
     uiAvailable: true,
     uiModes: [
       { id: 'row', primitive: 'grid', label: '行', actionLabel: '行を対象にする' },
@@ -209,6 +258,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'whole',
     label: 'シート全体',
     supportedViews: ['base', 'compact', 'full', 'grid'],
+    inspection: WORKER_TARGET_META,
     uiAvailable: true,
     uiModes: [
       { id: 'sheet', primitive: 'whole', label: 'シート全体', actionLabel: 'シートを対象にする' },
@@ -222,6 +272,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'grid',
     label: 'セル範囲',
     supportedViews: ['base', 'compact', 'full', 'grid'],
+    inspection: STREAM_CSV_TARGET_META,
     uiAvailable: true,
     uiModes: [
       { id: 'range', primitive: 'grid', label: 'セル範囲', actionLabel: 'セルを対象にする' },
@@ -233,6 +284,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'grid',
     label: '行・列',
     supportedViews: ['base', 'compact', 'full', 'grid'],
+    inspection: STREAM_CSV_TARGET_META,
     uiAvailable: true,
     uiModes: [
       { id: 'row', primitive: 'grid', label: '行', actionLabel: '行を対象にする' },
@@ -247,6 +299,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'whole',
     label: 'ページ全体',
     supportedViews: ['base', 'compact', 'full', 'canvas'],
+    inspection: WORKER_PDF_TARGET_META,
     uiAvailable: true,
     uiModes: [
       { id: 'page', primitive: 'whole', label: 'ページ全体', actionLabel: 'ページを対象にする' },
@@ -258,6 +311,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'point',
     label: 'ピン',
     supportedViews: ['base', 'compact', 'full', 'canvas'],
+    inspection: WORKER_PDF_TARGET_META,
     uiAvailable: true,
     uiModes: [
       { id: 'pin', primitive: 'point', label: 'ピン', hint: 'クリック・タップ、または矢印キーと Enter で位置を指定' },
@@ -269,6 +323,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'rect',
     label: '矩形領域',
     supportedViews: ['base', 'compact', 'full', 'canvas'],
+    inspection: WORKER_PDF_TARGET_META,
     uiAvailable: true,
     uiModes: [
       { id: 'region', primitive: 'rect', label: '矩形領域', hint: 'ドラッグ、または矢印キーと Enter で範囲を指定' },
@@ -282,6 +337,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'point',
     label: 'ピン',
     supportedViews: ['base', 'compact', 'full', 'canvas'],
+    inspection: WORKER_TARGET_META,
     uiAvailable: false,
     uiModes: [
       { id: 'pin', primitive: 'point', label: 'ピン', hint: 'クリック・タップ、または矢印キーと Enter で位置を指定' },
@@ -293,6 +349,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'rect',
     label: '矩形領域',
     supportedViews: ['base', 'compact', 'full', 'canvas'],
+    inspection: WORKER_TARGET_META,
     uiAvailable: false,
     uiModes: [
       { id: 'region', primitive: 'rect', label: '矩形領域', hint: 'ドラッグ、または矢印キーと Enter で範囲を指定' },
@@ -306,6 +363,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'rect',
     label: '矩形領域',
     supportedViews: ['base', 'compact', 'full', 'canvas'],
+    inspection: WORKER_SOURCE_HASHES,
     uiAvailable: false,
     uiModes: [
       { id: 'region', primitive: 'rect', label: '矩形領域', hint: 'ドラッグ、または矢印キーと Enter で範囲を指定' },
@@ -319,6 +377,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'text_range',
     label: 'ソース行範囲',
     supportedViews: ['base', 'compact', 'full', 'source'],
+    inspection: WORKER_SOURCE_HASHES,
     uiAvailable: false,
     uiModes: [
       { id: 'line_range', primitive: 'text_range', label: 'ソース行範囲', actionLabel: '選択行を対象にする' },
@@ -332,6 +391,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'text_range',
     label: 'ソース行範囲',
     supportedViews: ['base', 'compact', 'full', 'source'],
+    inspection: WORKER_SOURCE_HASHES,
     uiAvailable: true,
     uiModes: [
       { id: 'line_range', primitive: 'text_range', label: 'ソース行範囲', actionLabel: '選択行を対象にする' },
@@ -345,6 +405,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'text_range',
     label: '行範囲',
     supportedViews: ['base', 'compact', 'full', 'source'],
+    inspection: WORKER_SOURCE_HASHES,
     uiAvailable: true,
     uiModes: [
       { id: 'line_range', primitive: 'text_range', label: '行範囲', actionLabel: '選択行を対象にする' },
@@ -356,6 +417,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'text_range',
     label: '文字範囲',
     supportedViews: ['base', 'compact', 'full', 'source'],
+    inspection: WORKER_SOURCE_HASHES,
     uiAvailable: true,
     uiModes: [
       { id: 'char_range', primitive: 'text_range', label: '文字範囲', actionLabel: '選択文字を対象にする' },
@@ -369,6 +431,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'element',
     label: 'ハンク',
     supportedViews: ['base', 'compact', 'full', 'source'],
+    inspection: WORKER_SOURCE_HASHES,
     uiAvailable: false,
     uiModes: [
       { id: 'hunk', primitive: 'element', label: 'ハンク', actionLabel: 'ハンクを対象にする' },
@@ -380,6 +443,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'text_range',
     label: '行範囲',
     supportedViews: ['base', 'compact', 'full', 'source'],
+    inspection: WORKER_SOURCE_HASHES,
     uiAvailable: false,
     uiModes: [
       { id: 'line_range', primitive: 'text_range', label: '行範囲', actionLabel: '選択行を対象にする' },
@@ -393,6 +457,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'text_range',
     label: 'ソース行範囲',
     supportedViews: ['base', 'compact', 'full', 'source'],
+    inspection: WORKER_SOURCE_HASHES,
     uiAvailable: false,
     uiModes: [
       { id: 'line_range', primitive: 'text_range', label: 'ソース行範囲', actionLabel: '選択行を対象にする' },
@@ -407,6 +472,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'time_range',
     label: '時間区間',
     supportedViews: ['base', 'compact', 'full', 'player'],
+    inspection: WORKER_TARGET_META,
     uiAvailable: false,
     uiModes: [
       { id: 'time_range', primitive: 'time_range', label: '時間区間', actionLabel: '時間区間を対象にする' },
@@ -419,6 +485,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'time_range',
     label: '時間区間',
     supportedViews: ['base', 'compact', 'full', 'player'],
+    inspection: WORKER_TARGET_META,
     uiAvailable: false,
     uiModes: [
       { id: 'time_range', primitive: 'time_range', label: '時間区間', actionLabel: '時間区間を対象にする' },
@@ -432,6 +499,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'whole',
     label: 'ブロック全体',
     supportedViews: ['base', 'compact', 'full', 'rich_card'],
+    inspection: RICH_BLOCK_STATE,
     uiAvailable: false,
     uiModes: [
       { id: 'block', primitive: 'whole', label: 'ブロック全体', actionLabel: 'ブロック全体を対象にする' },
@@ -443,6 +511,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'element',
     label: '表示要素',
     supportedViews: ['base', 'compact', 'full', 'rich_card'],
+    inspection: RICH_BLOCK_STATE,
     uiAvailable: false,
     uiModes: [
       { id: 'node', primitive: 'element', label: '表示要素', actionLabel: '要素を対象にする' },
@@ -454,6 +523,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'element',
     label: '繰り返し項目',
     supportedViews: ['base', 'compact', 'full', 'rich_card'],
+    inspection: RICH_BLOCK_STATE,
     uiAvailable: false,
     uiModes: [
       { id: 'repeat_item', primitive: 'element', label: '繰り返し項目', actionLabel: '項目を対象にする' },
@@ -465,6 +535,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'element',
     label: 'グラフ系列・データ点',
     supportedViews: ['base', 'compact', 'full', 'rich_card'],
+    inspection: RICH_BLOCK_STATE,
     uiAvailable: false,
     uiModes: [
       { id: 'chart_series', primitive: 'element', label: 'グラフ系列・データ点', actionLabel: '系列・データ点を対象にする' },
@@ -476,6 +547,7 @@ export const TARGET_SELECTOR_REGISTRY: readonly TargetSelectorRegistration[] = [
     primitive: 'grid',
     label: '表セル',
     supportedViews: ['base', 'compact', 'full', 'rich_card'],
+    inspection: RICH_BLOCK_STATE,
     uiAvailable: false,
     uiModes: [
       { id: 'table_cell', primitive: 'grid', label: '表セル', actionLabel: 'セルを対象にする' },
@@ -619,8 +691,50 @@ export function getRegisteredUiModesForFormat(
       selectorKind: reg.kind,
       format: reg.format,
       supportedViews: reg.supportedViews,
+      inspection: reg.inspection,
     })),
   );
+}
+
+/**
+ * Determines the registered server target-inspection channel for a `readRange`
+ * request on `format`. Returns `null` if the request is a normal content read
+ * rather than a target-metadata inspection request.
+ */
+export function getTargetInspectionChannelForRequest(
+  format: string,
+  range: Record<string, unknown>,
+): TargetInspectionChannel | null {
+  const entries = getRegisteredSelectorsForFormat(format);
+  for (const entry of entries) {
+    const { channel, rangeRequestFlag, requiredParams } = entry.inspection;
+    if (!rangeRequestFlag) continue;
+    const flagVal = range[rangeRequestFlag];
+    const flagActive = rangeRequestFlag === 'targetBlockIndex'
+      ? flagVal !== undefined && flagVal !== null && flagVal !== ''
+      : flagVal === true || flagVal === 'true';
+    if (!flagActive) continue;
+    if (requiredParams && !requiredParams.every((key) => range[key] !== undefined && range[key] !== null)) {
+      continue;
+    }
+    return channel;
+  }
+  return null;
+}
+
+/**
+ * Builds the `workspaceApi.range` query parameters for a registered selector
+ * kind or UI mode by injecting its declared `rangeRequestFlag`.
+ */
+export function buildTargetInspectionRequestParams(
+  target: Pick<RegisteredUiMode, 'inspection'> | TargetSelectorKind,
+  params: Record<string, string | number | boolean>,
+): Record<string, string | number | boolean> {
+  const inspection = typeof target === 'string' ? REGISTRY_BY_KIND.get(target)?.inspection : target.inspection;
+  if (!inspection?.rangeRequestFlag || inspection.rangeRequestFlag === 'targetBlockIndex') {
+    return { ...params };
+  }
+  return { ...params, [inspection.rangeRequestFlag]: true };
 }
 
 export function selectorMatchesRegisteredFormat(kind: string, format: string, previewKind?: string): boolean {

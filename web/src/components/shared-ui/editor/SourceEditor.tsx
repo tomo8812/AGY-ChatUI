@@ -149,6 +149,7 @@ function createHljsExtension(hljsLang:string){
 export interface SourceEditorHandle {
   selectAll:()=>void;
   selectLines:(start:number,end:number)=>void;
+  selectCharRange:(startLine:number,startCol:number,endLine:number,endCol:number)=>void;
   findNext:(query:string)=>boolean;
   getSelection:()=>{startLine:number;endLine:number};
   getCharacterSelection:()=>{startLine:number;startCol:number;endLine:number;endCol:number}|null;
@@ -194,6 +195,17 @@ export function SourceEditor({onSelectionChange,value,readOnly,language,onChange
         const {doc}=instance.state;
         if(!Number.isSafeInteger(start)||!Number.isSafeInteger(end)||start<1||end<start||end>doc.lines)return;
         instance.dispatch({selection:{anchor:doc.line(start).from,head:doc.line(end).to},scrollIntoView:true});
+        instance.focus();
+      },
+      selectCharRange:(startLine,startCol,endLine,endCol)=>{
+        const {doc}=instance.state;
+        if(!Number.isSafeInteger(startLine)||!Number.isSafeInteger(endLine)||startLine<1||endLine<startLine||endLine>doc.lines)return;
+        if(!Number.isSafeInteger(startCol)||!Number.isSafeInteger(endCol)||startCol<1||endCol<1)return;
+        const first=doc.line(startLine),last=doc.line(endLine);
+        const anchor=Math.min(first.to,first.from+startCol-1);
+        const head=Math.min(last.to,last.from+endCol-1);
+        if(head<=anchor)return;
+        instance.dispatch({selection:{anchor,head},scrollIntoView:true});
         instance.focus();
       },
       getSelection:()=>{

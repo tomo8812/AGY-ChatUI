@@ -1045,8 +1045,8 @@ describe('PR 3A Conformance Gap Fixes', () => {
       kind: 'pdf_page', baseRevision: 1, pageIndex: 0, expectedPageCount: 1,
       expectedPageContentHash: page0.pageContentHash,
     }), pdfMeta).status).toBe('resolved');
-    expect(pdfAdapter.resolveTarget(pdfBuf, { kind: 'pdf_text_range', baseRevision: 1, pageIndex: 0, expectedPageCount: 1, expectedPageContentHash: page0.pageContentHash }, pdfMeta)).toMatchObject({ status: 'needs_review', reason: 'unsupported_pdf_selector' });
-    expect(pdfAdapter.resolveTarget(pdfBuf, { kind: 'pdf_annotation', baseRevision: 1, pageIndex: 0, expectedPageCount: 1, expectedPageContentHash: page0.pageContentHash, annotUid: 'a1', expectedAnnotFingerprint: '0'.repeat(64) }, pdfMeta)).toMatchObject({ status: 'needs_review', reason: 'unsupported_pdf_selector' });
+    expect(pdfAdapter.resolveTarget(pdfBuf, { kind: 'pdf_text_range', baseRevision: 1, pageIndex: 0, expectedPageCount: 1, expectedPageContentHash: page0.pageContentHash }, pdfMeta)).toMatchObject({ status: 'needs_review', reason: 'unsupported_selector_kind' });
+    expect(pdfAdapter.resolveTarget(pdfBuf, { kind: 'pdf_annotation', baseRevision: 1, pageIndex: 0, expectedPageCount: 1, expectedPageContentHash: page0.pageContentHash, annotUid: 'a1', expectedAnnotFingerprint: '0'.repeat(64) }, pdfMeta)).toMatchObject({ status: 'needs_review', reason: 'unsupported_selector_kind' });
 
     // 3. XLSX expectedOrderKeysHash, xlsx_row_col, and xlsx_sheet
     const xlsxBuf = buildMinimalXlsx({
