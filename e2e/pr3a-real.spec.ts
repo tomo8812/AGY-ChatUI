@@ -540,18 +540,20 @@ for(const vp of targets){
             await page.getByRole('button',{name:'本文',exact:true}).click();
             const textBox=page.getByRole('textbox',{name:'ページ本文'});
             await expect(textBox).toHaveValue('Wide second page');
-            await textBox.evaluate((el:HTMLTextAreaElement)=>el.setSelectionRange(5,11));
-            await page.getByRole('button',{name:'選択本文を対象にする'}).click();
-            await expect(page.locator('.workspace-selection')).toContainText('選択本文');
+            await expect(page.getByRole('button',{name:'選択本文を対象にする'})).toHaveCount(0);
             await page.locator('.pdf-navigation-panel').getByRole('button',{name:'閉じる',exact:true}).click();
-            await page.getByRole('textbox',{name:'変更内容'}).fill('Review selected PDF text');
+            await page.getByRole('combobox',{name:'PDF の選択方法'}).selectOption('pin');
+            const pinTarget=page.getByRole('button',{name:'ページ 2のピン位置',exact:true});
+            await pinTarget.focus();await pinTarget.press('Enter');
+            await expect(page.locator('.workspace-selection')).toContainText('ピン');
+            await page.getByRole('textbox',{name:'変更内容'}).fill('Review pinned PDF location');
             await page.getByRole('button',{name:'依頼を追加'}).click();
             await expect(page.locator('.workspace-request-item')).toHaveCount(3);
-            const textRequest=srv.ctx.editRequestService.listRequests(userId,chatId,{artifactId:artifact.id}).find(request=>request.selector.kind==='pdf_text_range');
-            expect(textRequest?.selector).toMatchObject({textOffsetStart:5,textOffsetEnd:11,quadsPt:[expect.any(Array)]});
-            expect((await srv.ctx.editRequestService.resolveRequestTarget(textRequest!)).status).toBe('resolved');
-            evidence.push({kind:'pdf-text',selector:textRequest!.selector});
-            await page.screenshot({path:info.outputPath('real-pdf-text.png')});
+            const pinRequest=srv.ctx.editRequestService.listRequests(userId,chatId,{artifactId:artifact.id}).find(request=>request.selector.kind==='pdf_pin');
+            expect(pinRequest?.selector).toMatchObject({kind:'pdf_pin',pageIndex:1});
+            expect((await srv.ctx.editRequestService.resolveRequestTarget(pinRequest!)).status).toBe('resolved');
+            evidence.push({kind:'pdf-pin',selector:pinRequest!.selector});
+            await page.screenshot({path:info.outputPath('real-pdf-pin.png')});
           }
 
           if(item.kind==='csv'&&(vp.width===1280||vp.width===375)){
@@ -879,10 +881,9 @@ test('Base ChatUI opens DOCX, XLSX and PDF and creates targets without the docum
         await page.getByRole('button',{name:'本文',exact:true}).click();
         const textBox=page.getByRole('textbox',{name:'ページ本文'});
         await expect(textBox).toHaveValue('First page');
-        await textBox.evaluate((el:HTMLTextAreaElement)=>el.setSelectionRange(0,5));
-        await page.getByRole('button',{name:'選択本文を対象にする'}).click();
-        await expect(page.locator('.workspace-selection')).toContainText('選択本文');
         await page.locator('.pdf-navigation-panel').getByRole('button',{name:'閉じる',exact:true}).click();
+        await page.getByRole('button',{name:'ページを対象にする'}).click();
+        await expect(page.locator('.workspace-selection')).toContainText('ページ 1');
       }
       await page.getByRole('textbox',{name:'変更内容'}).fill('Review the selection');
       await page.getByRole('button',{name:'依頼を追加'}).click();

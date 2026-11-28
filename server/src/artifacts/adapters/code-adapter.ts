@@ -200,32 +200,6 @@ export class CodeAdapter implements FormatAdapter {
       });
     }
 
-    if (selector.kind === 'code_symbol') {
-      const symbolName = String(selector.symbolName ?? '');
-      const { expectedSignatureHash, expectedBodyHash, symbolKind, startLine, endLine } = selector;
-      if (!isSha256(expectedSignatureHash) || !isSha256(expectedBodyHash) || typeof symbolKind !== 'string' ||
-          typeof startLine !== 'number' || typeof endLine !== 'number' ||
-          !Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) || startLine < 1 || endLine < startLine) {
-        return { status: 'needs_review', reason: 'invalid_symbol_fingerprint' };
-      }
-      const span = endLine - startLine + 1;
-      const lines = splitLines(text);
-      const matches: Array<{ line: number; text: string }> = [];
-      for (let i = 0; i < lines.length; i++) {
-        const m = /^\s*(?:export\s+)?(?:async\s+)?(function|class|interface|type|def|struct|fn)\s+([A-Za-z_][A-Za-z0-9_]*)/.exec(
-          lines[i]
-        );
-        if (m && m[1] === symbolKind && m[2] === symbolName && i + span <= lines.length &&
-            sha256Text(lines[i].trim()) === expectedSignatureHash) {
-          const body = lines.slice(i, i + span).join('\n');
-          if (sha256Text(body) === expectedBodyHash) matches.push({ line: i + 1, text: body });
-        }
-      }
-      if (matches.length === 0) return { status: 'stale', reason: 'symbol_not_found' };
-      if (matches.length > 1) return { status: 'needs_review', reason: 'ambiguous_multiple_symbols' };
-      return { status: 'resolved', resolvedSnippet: matches[0].text, resolvedRange: { startLine: matches[0].line, endLine: matches[0].line + span - 1 } };
-    }
-
     return { status: 'needs_review', reason: 'unsupported_selector_kind' };
   }
 }

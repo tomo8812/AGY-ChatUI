@@ -1,4 +1,4 @@
-import { useTargetSelection } from '../useTargetSelection';
+import { useTargetSelection } from '../../shared-ui/pin';
 import React,{useCallback,useEffect,useMemo,useRef,useState} from 'react';
 import type {Editor} from '@tiptap/react';
 import {WordParagraphEditor,type WordRun,type WordMark} from '../../shared-ui/editor/WordParagraphEditor';

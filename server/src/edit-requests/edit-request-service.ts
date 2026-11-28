@@ -6,7 +6,7 @@ import { pointRegionPt } from '../artifacts/region-png.js';
 import type { ArtifactService } from '../artifacts/artifact-service.js';
 import { ArtifactError, unsupportedOperationError } from '../artifacts/errors.js';
 import type { TargetResolutionResult, TargetSelector } from '../artifacts/types.js';
-import { selectorIsAvailable, selectorMatchesFormat, targetSelectorSchema } from '../artifacts/target-selector-schema.js';
+import { selectorIsAvailable, selectorIsDeprecated, selectorMatchesFormat, targetSelectorSchema } from '../artifacts/target-selector-schema.js';
 import type { RichContentService } from '../rich/rich-content-service.js';
 import { RichExprError } from '../rich/rich-expr-evaluator.js';
 import { resolveRichBlockTarget } from './target-resolver.js';
@@ -126,6 +126,8 @@ export class EditRequestService {
             agent_base_revision = NULL, applied_revision = NULL, updated_at = ? WHERE id = ?`)
             .run(Date.now(), request.id);
         }, { status: 'needs_review', reason: 'missing_sent_message' });
+      } else if (selectorIsDeprecated(request.selector)) {
+        this.persistRevalidation(request, { status: 'needs_review', reason: 'deprecated_selector_kind' });
       } else if (!selectorIsValid(request) || !selectorIsAvailable(request.selector)) {
         this.persistRevalidation(request, { status: 'needs_review', reason: 'invalid_target_selector' });
       }
@@ -159,10 +161,10 @@ export class EditRequestService {
   }
 
   private async verifyAnchor(target: AnchoredTarget, details: TargetDetails): Promise<TargetDetails & { selector: TargetSelector }> {
-    if (!selectorIsValid(target)) throw new ArtifactError('INVALID_INPUT', '対象指定が無効です。', 400);
-    if (!selectorIsAvailable(target.selector)) {
+    if (selectorIsDeprecated(target.selector) || !selectorIsAvailable(target.selector)) {
       throw new ArtifactError('UNSUPPORTED_TARGET_SELECTOR', 'この種類の対象指定は利用できません。', 422);
     }
+    if (!selectorIsValid(target)) throw new ArtifactError('INVALID_INPUT', '対象指定が無効です。', 400);
     if (this.currentRevision(target) !== target.baseRevision) throw targetConflict();
     const savedState = target.richBlockId
       ? this.richContentService.getBlock(target.userId, target.chatId, target.richBlockId)?.uiStateSnapshot
@@ -179,12 +181,7 @@ export class EditRequestService {
     let selector = target.selector;
     let contentCoords = result.resolvedCoords ?? null;
     let range = result.resolvedRange ?? null;
-    if (selector.kind === 'csv_row_col' && selector.expectedHeaderHash === undefined) {
-      const expectedHeaderHash = result.resolvedRange?.expectedHeaderHash;
-      if (typeof expectedHeaderHash !== 'string') throw targetConflict();
-      selector = { ...selector, expectedHeaderHash };
-    }
-    if (['rich_node', 'rich_svg_element', 'rich_repeat_item', 'rich_chart_series', 'rich_table_cell'].includes(selector.kind)) {
+    if (['rich_node', 'rich_repeat_item', 'rich_chart_series', 'rich_table_cell'].includes(selector.kind)) {
       const expectedDisplayFingerprint = result.resolvedRange?.displayFingerprint;
       if (typeof expectedDisplayFingerprint !== 'string') throw targetConflict();
       selector = { ...selector, expectedDisplayFingerprint };
@@ -575,8 +572,9 @@ export class EditRequestService {
     req: AnchoredTarget & { selectedContentSnapshot?: string },
     snippetHint = req.selectedContentSnapshot,
   ): Promise<TargetResolutionResult> {
-    if (!selectorIsValid(req)) return { status: 'needs_review', reason: 'invalid_target_selector' };
+    if (selectorIsDeprecated(req.selector)) return { status: 'needs_review', reason: 'deprecated_selector_kind' };
     if (!selectorIsAvailable(req.selector)) return { status: 'needs_review', reason: 'unsupported_selector_kind' };
+    if (!selectorIsValid(req)) return { status: 'needs_review', reason: 'invalid_target_selector' };
     if (req.targetKind === 'rich_block') return this.resolveRichRequestTarget(req);
     const revision = this.currentRevision(req);
     if (revision === undefined || !req.artifactId) return { status: 'stale', reason: 'target_deleted' };
@@ -782,7 +780,9 @@ export class EditRequestService {
   }): Promise<AiEditRequestRecord> {
     const existing = this.getRequest(params.userId, params.chatId, params.requestId);
     if (!existing) throw new ArtifactError('NOT_FOUND', '編集依頼が見つかりません。', 404);
-    this.requireStatus(existing, 'needs_review', 'stale');
+    if (!(existing.status !== 'resolved' && selectorIsDeprecated(existing.selector))) {
+      this.requireStatus(existing, 'needs_review', 'stale');
+    }
     const selector = { baseRevision: params.newBaseRevision, ...params.newSelector };
     return this.writeAnchor(existing, { ...existing, baseRevision: params.newBaseRevision, selector }, params, existing.instruction);
   }

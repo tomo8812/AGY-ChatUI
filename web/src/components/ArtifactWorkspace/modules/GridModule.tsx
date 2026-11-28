@@ -1,9 +1,9 @@
 import { isExactXlsxNumber } from '../../../../../shared/xlsx-number';
-import { useTargetSelection } from '../useTargetSelection';
 import React,{useEffect,useLayoutEffect,useMemo,useRef,useState} from 'react';
 import {previewFormulas,type FormulaCell} from '../formulaPreview';
 import { workspaceApi,supportsOperation } from '../../../api/workspace';
 import {ResponsiveCommandBar} from '../../shared-ui/layout/ResponsiveCommandBar';
+import { GridTargetControl, TargetInspectionErrorBanner, useTargetSelection, type GridPinMode } from '../../shared-ui/pin';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
 import { assertRevision,useRevisionResource } from '../useRevisionResource';
 import {artifactVersionKey,ByteLruCache} from '../../../utils/viewerCache';
@@ -426,50 +426,116 @@ export function GridModule(props:WorkspaceModuleProps){
     move(first.row,first.col);
     setSelected(last);setAnchor(first);
   },[jumpTarget,structure.ready,sheet?.id,rowCount,colCount]);
-  const pinSelection=useTargetSelection(beginTargetSelection,JSON.stringify([sheet?.id,selectedRange]));
+  const [gridPinMode, setGridPinMode] = useState<GridPinMode>('range');
+  const effectivePinMode: GridPinMode = !xlsx && gridPinMode === 'sheet' ? 'range' : gridPinMode;
+  const pinSelection=useTargetSelection(beginTargetSelection,JSON.stringify([sheet?.id,selectedRange,effectivePinMode]));
   async function pin(){
-    if(!ready||artifact.revision===undefined||!sheet||!inData)return;
+    if(!ready||artifact.revision===undefined||!sheet)return;
+    if(effectivePinMode!=='sheet'&&!inData)return;
     const {row0,row1,col0,col1}=bounds;
     const rangeLabel=selectedRange,isCurrent=pinSelection.begin();
     let snippet:string|undefined;
     try{
       let selector:Record<string,unknown>&{kind:string};
+      let targetLabel=sheet.name+' '+rangeLabel;
       if(!xlsx){
-        const exact=await workspaceApi.range<{rows:string[][];valuesHash:string;headerHash?:string;totalRows?:number;totalCols?:number;truncated?:boolean}>(artifact.id,{startRow:row0,endRow:row1,startCol:col0,endCol:col1,targetHashes:'true'});
-        assertRevision(artifact,exact);
-        if(exact.truncated||exact.rows.length!==row1-row0+1||!exact.valuesHash||!exact.headerHash||exact.totalRows===undefined||exact.totalCols===undefined){
-          throw Error('選択対象を読み込めませんでした。');
+        if(effectivePinMode==='row'||effectivePinMode==='col'){
+          const axisKind=effectivePinMode;
+          const start=axisKind==='row'?row0:col0;
+          const end=axisKind==='row'?row1:col1;
+          const meta=await workspaceApi.range<{target:{axis:'row'|'col';start:number;end:number;expectedRowCount:number;expectedColCount:number;expectedHeaderHash:string;expectedRangeValuesHash:string}|null}>(artifact.id,{targetMetadata:'true',axis:axisKind,start,end});
+          assertRevision(artifact,meta);
+          if(!meta.target||!meta.target.expectedHeaderHash||!meta.target.expectedRangeValuesHash){
+            throw Error('選択対象を読み込めませんでした。');
+          }
+          selector={
+            kind:'csv_row_col',
+            axis:meta.target.axis,
+            start:meta.target.start,
+            end:meta.target.end,
+            expectedRowCount:meta.target.expectedRowCount,
+            expectedColCount:meta.target.expectedColCount,
+            expectedHeaderHash:meta.target.expectedHeaderHash,
+            expectedRangeValuesHash:meta.target.expectedRangeValuesHash,
+          };
+          targetLabel=axisKind==='row'
+            ? (start===end?`行 ${start+1}`:`行 ${start+1}–${end+1}`)
+            : (start===end?`列 ${colName(start)}`:`列 ${colName(start)}–${colName(end)}`);
+        }else{
+          const exact=await workspaceApi.range<{rows:string[][];valuesHash:string;headerHash?:string;totalRows?:number;totalCols?:number;truncated?:boolean}>(artifact.id,{startRow:row0,endRow:row1,startCol:col0,endCol:col1,targetHashes:'true'});
+          assertRevision(artifact,exact);
+          if(exact.truncated||exact.rows.length!==row1-row0+1||!exact.valuesHash||!exact.headerHash||exact.totalRows===undefined||exact.totalCols===undefined){
+            throw Error('選択対象を読み込めませんでした。');
+          }
+          selector={
+            kind:'csv_range',
+            startRow:row0,
+            endRow:row1,
+            startCol:col0,
+            endCol:col1,
+            expectedRowCount:exact.totalRows,
+            expectedColCount:exact.totalCols,
+            expectedHeaderHash:exact.headerHash,
+            expectedRangeValuesHash:exact.valuesHash,
+          };
+          snippet=exact.rows.map(row=>row.join('\t')).join('\n');
         }
-        selector={
-          kind:'csv_range',
-          startRow:row0,
-          endRow:row1,
-          startCol:col0,
-          endCol:col1,
-          expectedRowCount:exact.totalRows,
-          expectedColCount:exact.totalCols,
-          expectedHeaderHash:exact.headerHash,
-          expectedRangeValuesHash:exact.valuesHash,
-        };
-        snippet=exact.rows.map(row=>row.join('\t')).join('\n');
       }else{
-        const meta=await workspaceApi.range<{target:{sheetId:string;sheetName:string;rangeA1:string;expectedSheetStructHash:string;expectedRangeValuesHash:string;expectedOrderKeysHash?:string;snippet?:string}|null}>(artifact.id,{targetMetadata:'true',sheetId:sheet.id,rangeA1:rangeLabel});
-        assertRevision(artifact,meta);
-        if(!meta.target||!meta.target.expectedSheetStructHash||!meta.target.expectedRangeValuesHash){
-          throw Error('選択対象を読み込めませんでした。');
+        if(effectivePinMode==='sheet'){
+          const meta=await workspaceApi.range<{target:{sheetId:string;sheetName:string;expectedSheetStructHash:string;expectedSheetContentHash:string;snippet?:string}|null}>(artifact.id,{targetMetadata:'true',sheetId:sheet.id});
+          assertRevision(artifact,meta);
+          if(!meta.target||!meta.target.expectedSheetStructHash||!meta.target.expectedSheetContentHash){
+            throw Error('シートの対象情報を読み込めませんでした。');
+          }
+          selector={
+            kind:'xlsx_sheet',
+            sheetId:meta.target.sheetId,
+            expectedSheetStructHash:meta.target.expectedSheetStructHash,
+            expectedSheetContentHash:meta.target.expectedSheetContentHash,
+          };
+          targetLabel=sheet.name+' (シート全体)';
+          snippet=meta.target.snippet;
+        }else if(effectivePinMode==='row'||effectivePinMode==='col'){
+          const axisKind=effectivePinMode;
+          const start=axisKind==='row'?row0:col0;
+          const end=axisKind==='row'?row1:col1;
+          const meta=await workspaceApi.range<{target:{sheetId:string;sheetName:string;axis:'row'|'col';start:number;end:number;expectedSheetStructHash:string;expectedRangeValuesHash:string;snippet?:string}|null}>(artifact.id,{targetMetadata:'true',sheetId:sheet.id,axis:axisKind,start,end});
+          assertRevision(artifact,meta);
+          if(!meta.target||!meta.target.expectedSheetStructHash||!meta.target.expectedRangeValuesHash){
+            throw Error('選択対象を読み込めませんでした。');
+          }
+          selector={
+            kind:'xlsx_row_col',
+            sheetId:meta.target.sheetId,
+            axis:meta.target.axis,
+            start:meta.target.start,
+            end:meta.target.end,
+            expectedSheetStructHash:meta.target.expectedSheetStructHash,
+            expectedRangeValuesHash:meta.target.expectedRangeValuesHash,
+          };
+          targetLabel=sheet.name+' '+(axisKind==='row'
+            ? (start===end?`行 ${start+1}`:`行 ${start+1}–${end+1}`)
+            : (start===end?`列 ${colName(start)}`:`列 ${colName(start)}–${colName(end)}`));
+          snippet=meta.target.snippet;
+        }else{
+          const meta=await workspaceApi.range<{target:{sheetId:string;sheetName:string;rangeA1:string;expectedSheetStructHash:string;expectedRangeValuesHash:string;expectedOrderKeysHash?:string;snippet?:string}|null}>(artifact.id,{targetMetadata:'true',sheetId:sheet.id,rangeA1:rangeLabel});
+          assertRevision(artifact,meta);
+          if(!meta.target||!meta.target.expectedSheetStructHash||!meta.target.expectedRangeValuesHash){
+            throw Error('選択対象を読み込めませんでした。');
+          }
+          selector={
+            kind:'xlsx_range',
+            sheetId:meta.target.sheetId,
+            rangeA1:meta.target.rangeA1,
+            expectedSheetStructHash:meta.target.expectedSheetStructHash,
+            expectedRangeValuesHash:meta.target.expectedRangeValuesHash,
+            ...(meta.target.expectedOrderKeysHash?{expectedOrderKeysHash:meta.target.expectedOrderKeysHash}:{}),
+          };
+          snippet=meta.target.snippet||(row0===row1&&col0===col1?original(row0,col0):undefined);
         }
-        selector={
-          kind:'xlsx_range',
-          sheetId:meta.target.sheetId,
-          rangeA1:meta.target.rangeA1,
-          expectedSheetStructHash:meta.target.expectedSheetStructHash,
-          expectedRangeValuesHash:meta.target.expectedRangeValuesHash,
-          ...(meta.target.expectedOrderKeysHash?{expectedOrderKeysHash:meta.target.expectedOrderKeysHash}:{}),
-        };
-        snippet=meta.target.snippet||(row0===row1&&col0===col1?original(row0,col0):undefined);
       }
       if(!isCurrent())return;
-      onTarget({baseRevision:artifact.revision,label:sheet.name+' '+rangeLabel,selector,selectedContentSnapshot:snippet?.slice(0,50_000)});
+      onTarget({baseRevision:artifact.revision,label:targetLabel,selector,selectedContentSnapshot:snippet?.slice(0,50_000)});
       setPinError('');
     }catch{if(isCurrent())setPinError('選択対象を識別できませんでした。')}
   }
@@ -610,7 +676,14 @@ export function GridModule(props:WorkspaceModuleProps){
       }}>
       <option value="auto">自動</option><option value="text">文字列</option>
       <option value="number">数値</option><option value="boolean">真偽値</option>
-    </select>}{invalidCellDraft&&<small role="alert" title="正確に保存するには文字列形式を選択してください。">セルの入力形式または数値精度を確認してください。</small>}{formulaWarning&&<small title={FORMULA_STATUS[activeFormulaStatus]}>{activeFormulaStatus==='error_formula'?'数式エラー':'未評価'}</small>}{mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!ready||!inData} onClick={()=>void pin()}>セルを対象にする</button>}{mode==='edit'&&<>
+    </select>}{invalidCellDraft&&<small role="alert" title="正確に保存するには文字列形式を選択してください。">セルの入力形式または数値精度を確認してください。</small>}{formulaWarning&&<small title={FORMULA_STATUS[activeFormulaStatus]}>{activeFormulaStatus==='error_formula'?'数式エラー':'未評価'}</small>}{mode==='pin'&&<GridTargetControl
+      allowSheet={xlsx}
+      mode={effectivePinMode}
+      onModeChange={next=>{pinSelection.invalidate();setPinError('');setGridPinMode(next)}}
+      selectionSummary={effectivePinMode==='sheet'?(sheet?.name??''):effectivePinMode==='row'?`行 ${bounds.row0+1}–${bounds.row1+1}`:effectivePinMode==='col'?`列 ${colName(bounds.col0)}–${colName(bounds.col1)}`:selectedRange}
+      disabled={!ready||(effectivePinMode!=='sheet'&&!inData)}
+      onConfirm={()=>void pin()}
+    />}{mode==='edit'&&<>
       {xlsx&&markButton('bold')}
     </>}</>;
   const secondary=mode==='edit'?<>
@@ -660,7 +733,11 @@ export function GridModule(props:WorkspaceModuleProps){
     {filter&&<button type="button" className="btn btn-ghost btn-xs" onClick={()=>{setFilterInput('');setAppliedFilter('');move(0,0)}}>絞り込み解除</button>}
   </form>;
   return <UnifiedViewerZoomShell resetKey={artifact.id+':grid'} controlsTop={<>{toolbar}{filters}</>} controlsBottom={tabs}>
-    {(structure.error||rangeError||pinError)&&<div role="alert" className="error-box">{structure.error||rangeError||pinError}<button type="button" onClick={()=>{structure.retry();setRetry(v=>v+1);setPinError('')}}>再試行</button></div>}
+    {(structure.error||rangeError||pinError)&&<TargetInspectionErrorBanner
+      message={structure.error||rangeError||pinError||''}
+      onRetry={()=>{structure.retry();setRetry(v=>v+1);setPinError('')}}
+      onDismiss={pinError?()=>setPinError(''):undefined}
+    />}
     {projectedFormulas?.error&&<div role="status" className="workspace-toolbar workspace-toolbar-fields">
       <span>{projectedFormulas.error}</span><button type="button" className="btn btn-secondary btn-xs" onClick={()=>setRetry(v=>v+1)}>再試行</button>
     </div>}

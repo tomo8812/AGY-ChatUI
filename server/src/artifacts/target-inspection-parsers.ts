@@ -1,7 +1,6 @@
-import { inspectMediaMetadata, inspectVideoTarget } from './adapters/media-target.js';
-import { inspectPdfText } from './adapters/pdf-text-inspection.js';
 import fs from 'node:fs';
-import { MAX_INSPECTION_INPUT_BYTES, MAX_INSPECTION_OUTPUT_BYTES } from './target-inspection-limits.js';
+import { inspectMediaMetadata, inspectVideoMetadata } from './adapters/media-target.js';
+import { MAX_INSPECTION_OUTPUT_BYTES } from './target-inspection-limits.js';
 import type { PreviewKind } from '../types.js';
 import { fingerprintsMatch, openContainedRegularFileNoFollow, readContainedRegularFileNoFollowStable } from '../files/workspace.js';
 import { createLineMatcher, createSourceCharMatcher, sourceCharSlice, sourceRangeContext, sha256Buffer, sha256Text, splitLines } from './adapters/base.js';
@@ -30,8 +29,9 @@ export type InspectionJob = { file: FileMeta; maxBytes?: number } & (
   | { selector: TargetSelector; rootDir: string; expectedSha256: string; snippetHint?: string; baseSnapshot?: Snapshot }
 );
 
-function readSnapshot(snapshot: Snapshot, maxBytes: number) {
-  if (!Number.isSafeInteger(snapshot.sizeBytes) || snapshot.sizeBytes < 0 || snapshot.sizeBytes > maxBytes) {
+function readSnapshot(snapshot: Snapshot, maxBytes?: number) {
+  if (!Number.isSafeInteger(snapshot.sizeBytes) || snapshot.sizeBytes < 0 ||
+      (maxBytes !== undefined && snapshot.sizeBytes > maxBytes)) {
     throw new ArtifactError('DOC_WORKER_INPUT_TOO_LARGE', 'Document input exceeds the worker size limit.', 413);
   }
   const fd = fs.openSync(snapshot.path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
@@ -101,7 +101,7 @@ function describeSourceTarget(bytes: Buffer, range: Record<string, unknown>) {
 }
 
 async function inspect(job: InspectionJob) {
-  const maxBytes = Math.min(job.maxBytes ?? MAX_INSPECTION_INPUT_BYTES, MAX_INSPECTION_INPUT_BYTES);
+  const maxBytes = job.maxBytes;
   const adapter = new FormatAdapterRegistry().resolve(job.file.filename, job.file.previewKind);
   if ('range' in job) {
     const bytes = readSnapshot(job.snapshot, maxBytes);
@@ -109,27 +109,15 @@ async function inspect(job: InspectionJob) {
       return describeSourceTarget(bytes, job.range);
     }
     if (adapter.format === 'media' && job.range.mediaStructure === true) {
-      const timestamp = job.range.timestampSec === undefined ? undefined : Number(job.range.timestampSec);
-      const video = job.file.previewKind === 'video' ? await inspectVideoTarget(bytes, job.snapshot.sha256, timestamp) : null;
-      if (timestamp !== undefined && job.file.previewKind === 'video') {
-        const frame = video?.frame;
-        return { target: frame ? {
-          timestampSec: timestamp, expectedDurationSec: frame.expectedDurationSec, expectedWidthPx: frame.expectedWidthPx,
-          expectedHeightPx: frame.expectedHeightPx, expectedFrameSha256: frame.expectedFrameSha256,
-        } : null };
-      }
-      return { format: 'media', filename: job.file.filename, sizeBytes: bytes.length,
-        ...(video ?? await inspectMediaMetadata(bytes, job.file.filename, job.file.mimeType)) };
+      const video = job.file.previewKind === 'video' ? await inspectVideoMetadata(bytes) : null;
+      return {
+        format: 'media',
+        filename: job.file.filename,
+        sizeBytes: bytes.length,
+        ...(video ?? await inspectMediaMetadata(bytes, job.file.filename, job.file.mimeType)),
+      };
     }
-    const info = adapter.readRange(bytes, job.range, job.file);
-    if (adapter.format === 'pdf' && (job.range.textTarget === true || job.range.textTarget === 'true') && info.target && typeof info.target === 'object') {
-      const start = Number(job.range.textOffsetStart), end = Number(job.range.textOffsetEnd);
-      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end <= start) return { target: null };
-      const layout = await inspectPdfText(bytes, Number(job.range.pageIndex), start, end);
-      const quadsPt = layout?.quadsForRange(start, end);
-      return { target: layout && quadsPt ? { ...info.target, text: layout.text, quadsPt } : null };
-    }
-    return info;
+    return adapter.readRange(bytes, job.range, job.file);
   }
 
   let source: ReturnType<typeof readContainedRegularFileNoFollowStable>;
@@ -142,7 +130,9 @@ async function inspect(job: InspectionJob) {
   if (source.sha256 !== job.expectedSha256) return { status: 'needs_review', reason: 'revision_content_changed' };
   let snippetHint = job.snippetHint;
   const { startLine, endLine, kind } = job.selector;
-  if (job.baseSnapshot && (snippetHint === undefined || sha256Text(snippetHint) !== job.selector.expectedSnippetHash) && (kind === 'code_line_range' || kind === 'code_char_range' || kind === 'md_text_range') &&
+  if (job.baseSnapshot && (snippetHint === undefined || sha256Text(snippetHint) !== job.selector.expectedSnippetHash) &&
+      (kind === 'code_line_range' || kind === 'code_char_range' || kind === 'md_text_range' ||
+       kind === 'html_source_range' || kind === 'mermaid_source_range') &&
       typeof startLine === 'number' && typeof endLine === 'number' &&
       Number.isSafeInteger(startLine) && Number.isSafeInteger(endLine) && startLine > 0 && endLine >= startLine) {
     try {
@@ -152,15 +142,11 @@ async function inspect(job: InspectionJob) {
       // The resolver can still use an independently hash-verified snapshot or current match.
     }
   }
-  const pdfTextLayout = job.selector.kind === 'pdf_text_range'
-    ? await inspectPdfText(source.buffer, Number(job.selector.pageIndex), Number(job.selector.textOffsetStart), Number(job.selector.textOffsetEnd))
-    : undefined;
-  const video = job.file.previewKind === 'video'
-    ? await inspectVideoTarget(source.buffer, source.sha256, job.selector.kind === 'video_frame_region' ? Number(job.selector.timestampSec) : undefined)
-    : null;
+  const video = adapter.format === 'media' && job.file.previewKind === 'video'
+    ? await inspectVideoMetadata(source.buffer) : null;
   const media = adapter.format === 'media' && !video
     ? await inspectMediaMetadata(source.buffer, job.file.filename, job.file.mimeType) : video;
-  let selector = job.selector;
+  const selector = job.selector;
   const isGridTarget = ['csv_range', 'csv_row_col', 'xlsx_range', 'xlsx_row_col'].includes(selector.kind);
   let baseGrid: Buffer | undefined;
   if (isGridTarget && job.baseSnapshot) {
@@ -170,14 +156,8 @@ async function inspect(job: InspectionJob) {
       return { status: 'needs_review', reason: 'base_revision_content_unavailable' };
     }
   }
-  if (selector.kind === 'csv_row_col' && selector.expectedHeaderHash === undefined) {
-    if (!baseGrid) return { status: 'needs_review', reason: 'base_revision_content_unavailable' };
-    const { headerHash } = adapter.getStructure(baseGrid, job.file);
-    if (typeof headerHash !== 'string') return { status: 'needs_review', reason: 'base_revision_target_unverified' };
-    selector = { ...selector, expectedHeaderHash: headerHash };
-  }
   const result = adapter.resolveTarget(source.buffer, selector, {
-    ...job.file, snippetHint, pdfTextLayout, mediaDurationSeconds: media?.durationSeconds, videoFrame: video?.frame,
+    ...job.file, snippetHint, mediaDurationSeconds: media?.durationSeconds,
   });
   if (result.status === 'resolved') {
     if (baseGrid && baseGrid !== source.buffer) {
@@ -208,9 +188,7 @@ async function inspect(job: InspectionJob) {
       const latest = openContainedRegularFileNoFollow(job.rootDir, job.file.relPath);
       try {
         if (fingerprintsMatch(source.fingerprint, latest.fingerprint)) {
-          return selector !== job.selector
-            ? { ...result, resolvedRange: { ...result.resolvedRange, expectedHeaderHash: selector.expectedHeaderHash } }
-            : result;
+          return result;
         }
       } finally {
         fs.closeSync(latest.fd);
@@ -222,7 +200,6 @@ async function inspect(job: InspectionJob) {
   }
   return result;
 }
-
 
 export type InspectionResponse = { result: unknown } |
   { error: { code: string; message: string; statusCode: number; details?: Record<string, unknown> } };

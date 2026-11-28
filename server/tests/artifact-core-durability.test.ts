@@ -754,11 +754,11 @@ describe('PR 1 Core Durability, Fault Injection (T1..T7), GC, Batch Restore, PIN
       actorId: userId,
     });
     const svgRes = await srv.ctx.artifactService.resolveTargetOnArtifact(userId, svgArt.artifact.id, {
-      kind: 'svg_element',
+      kind: 'svg_region',
       baseRevision: 1,
-      elementId: 'hero',
-      expectedTag: heroEl.tag,
-      expectedElementFingerprint: heroEl.fingerprint,
+      rectViewBox: [0, 0, 50, 50],
+      expectedViewBox: '0 0 100 100',
+      expectedSvgSha256: svgArt.artifact.sha256,
     });
     expect(svgRes.status).toBe('needs_review');
 

@@ -57,16 +57,6 @@ export function describeImageRegion(selector: TargetSelector, image: { widthPx: 
     coordinates = [x, y, w, h];
     bounds = [x, y, x + w, y + h];
     if (w <= 0 || h <= 0) return null;
-  } else if (selector.kind === 'image_freeform' && Array.isArray(selector.pointsNorm)) {
-    bounds = [1, 1, 0, 0];
-    for (const point of selector.pointsNorm) {
-      if (!Array.isArray(point) || point.length !== 2) return null;
-      const [x, y] = point;
-      if (![x, y].every(value => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1)) return null;
-      bounds = [Math.min(bounds[0], x), Math.min(bounds[1], y), Math.max(bounds[2], x), Math.max(bounds[3], y)];
-    }
-    if (selector.pointsNorm.length < 3 || bounds[0] >= bounds[2] || bounds[1] >= bounds[3]) return null;
-    coordinates = selector.pointsNorm;
   } else {
     return null;
   }

@@ -1,6 +1,9 @@
-export const MAX_INSPECTION_INPUT_BYTES = 32 * 1024 * 1024;
+/**
+ * IPC output safety cap for isolated target inspection responses.
+ *
+ * Per design doc §4.2 and PERF-01, target inspection does not impose a
+ * dedicated input file size cap (such as the removed 32 MiB limit) or a fixed
+ * RSS cap; memory and execution budgets are governed dynamically by
+ * `computeTargetInspectionBudget` in `resource-governor.ts`.
+ */
 export const MAX_INSPECTION_OUTPUT_BYTES = 4 * 1024 * 1024;
-// Covers two revision inputs, the 200 MiB archive envelope, V8's managed
-// heap budget, and native parser/IPC overhead. The RSS watchdog includes all
-// allocations in the parser process, including Buffer and ArrayBuffer data.
-export const MAX_INSPECTION_RSS_MB = 640;

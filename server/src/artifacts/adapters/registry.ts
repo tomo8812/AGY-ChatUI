@@ -1,6 +1,5 @@
-import { MAX_INSPECTION_INPUT_BYTES } from '../target-inspection-limits.js';
 import { pointRegionPt } from '../region-png.js';
-import { selectorHasDirectUi, selectorKindIsAvailable, selectorsForFormat } from '../target-selector-schema.js';
+import { selectorHasDirectUi, selectorsForFormat } from '../target-selector-schema.js';
 import { describeImageRegion, readImageDimensions } from './image-target.js';
 import path from 'node:path';
 import type { PreviewKind } from '../../types.js';
@@ -280,9 +279,6 @@ class DocumentFormatAdapter implements FormatAdapter {
     if (this.format === 'image' && isTargetMeta) {
       const dimensions = readImageDimensions(buffer);
       const geometry: TargetSelector = { ...range, kind: String(range.kind ?? '') };
-      if (typeof geometry.pointsNorm === 'string') {
-        try { geometry.pointsNorm = JSON.parse(geometry.pointsNorm); } catch { return { target: null }; }
-      }
       return { target: dimensions ? describeImageRegion(geometry, dimensions, sha256Buffer(buffer)) : null };
     }
     if (this.format === 'xlsx' && isTargetMeta) {
@@ -398,22 +394,8 @@ class DocumentFormatAdapter implements FormatAdapter {
 
     if (this.format === 'media') {
       const duration = _meta.mediaDurationSeconds;
-      if (selector.kind === 'video_frame_region') {
-        const { videoFrame } = _meta;
-        const rect = selector.rectNorm;
-        if (!videoFrame || selector.expectedDurationSec !== duration ||
-            videoFrame.expectedFrameSha256 !== selector.expectedFrameSha256 ||
-            videoFrame.expectedWidthPx !== selector.expectedWidthPx || videoFrame.expectedHeightPx !== selector.expectedHeightPx ||
-            !Array.isArray(rect) || rect.length !== 4 || !rect.every(n => Number.isFinite(n) && n >= 0) ||
-            rect[2] <= 0 || rect[3] <= 0 || rect[0] + rect[2] > 1 || rect[1] + rect[3] > 1) {
-          return { status: 'needs_review', reason: 'video_frame_changed_or_unavailable' };
-        }
-        const [x, y, width, height] = rect;
-        return { status: 'resolved', resolvedCoords: {
-          timestampSec: selector.timestampSec, frameStartSec: videoFrame.frameStartSec, frameDurationSec: videoFrame.frameDurationSec,
-          packetTimestampSec: videoFrame.packetTimestampSec, packetSha256: videoFrame.packetSha256,
-          region: { x, y, width, height, unit: 'norm' },
-        } };
+      if (selector.kind !== 'video_time_range' && selector.kind !== 'audio_time_range') {
+        return { status: 'needs_review', reason: 'unsupported_media_selector' };
       }
       if (selector.expectedMediaSha256 !== sha256Buffer(buffer)) {
         return { status: 'needs_review', reason: 'media_content_changed' };
@@ -482,73 +464,6 @@ class DocumentFormatAdapter implements FormatAdapter {
             ...(selector.kind === 'pdf_pin' ? { xPt: rectangle[0], yPt: rectangle[1] } : {}) },
           resolvedSnippet: page.text,
         };
-      }
-
-      if (selector.kind === 'pdf_text_range') {
-        const layout = _meta.pdfTextLayout;
-        if (!layout || Math.abs(layout.widthPt - page.widthPt) > 0.00501 || Math.abs(layout.heightPt - page.heightPt) > 0.00501) {
-          return { status: 'needs_review', reason: 'pdf_text_geometry_unavailable' };
-        }
-        const pageText = layout.text;
-        const start = Number(selector.textOffsetStart);
-        const end = Number(selector.textOffsetEnd);
-        const expectedSnippetHash = hex64(selector.expectedSnippetHash) ? String(selector.expectedSnippetHash) : null;
-        const expectedBeforeHash = hex64(selector.contextBeforeHash) ? String(selector.contextBeforeHash) : null;
-        const expectedAfterHash = hex64(selector.contextAfterHash) ? String(selector.contextAfterHash) : null;
-        const expectedOccurrence = selector.occurrenceIndex;
-        const quads = selector.quadsPt;
-        if (!Array.isArray(quads) || quads.length === 0 || !quads.every(quad =>
-          Array.isArray(quad) && quad.length === 8 && quad.every(value => typeof value === 'number' && Number.isFinite(value)))) {
-          return { status: 'needs_review', reason: 'invalid_pdf_text_geometry' };
-        }
-        if (!expectedSnippetHash || !expectedBeforeHash || !expectedAfterHash ||
-            !Number.isSafeInteger(start) || !Number.isSafeInteger(end) ||
-            start < 0 || end <= start || end > pageText.length ||
-            typeof expectedOccurrence !== 'number' || !Number.isSafeInteger(expectedOccurrence) || expectedOccurrence < 0) {
-          return { status: 'needs_review', reason: 'pdf_text_range_changed' };
-        }
-        const slice = pageText.slice(start, end);
-        if (sha256Buffer(Buffer.from(slice)) !== expectedSnippetHash) {
-          return { status: 'needs_review', reason: 'pdf_text_range_changed' };
-        }
-        const contextMatches = (offset: number) => {
-          const limit = offset + slice.length;
-          return sha256Buffer(Buffer.from(pageText.slice(Math.max(0, offset - 64), offset))) === expectedBeforeHash &&
-            sha256Buffer(Buffer.from(pageText.slice(limit, limit + 64))) === expectedAfterHash;
-        };
-        if (!contextMatches(start)) return { status: 'needs_review', reason: 'pdf_text_context_changed' };
-        let actualOcc = -1;
-        let occurrence = 0;
-        for (let offset = pageText.indexOf(slice); offset !== -1; offset = pageText.indexOf(slice, offset + 1)) {
-          if (offset === start) actualOcc = occurrence;
-          else if (contextMatches(offset)) return { status: 'needs_review', reason: 'ambiguous_multiple_matches' };
-          occurrence++;
-        }
-        if (actualOcc !== expectedOccurrence) return { status: 'needs_review', reason: 'pdf_text_occurrence_changed' };
-        const actualQuads = layout.quadsForRange(start, end);
-        if (!actualQuads || actualQuads.length !== quads.length || actualQuads.some((quad, i) =>
-          quad.some((point, j) => quads[i][j] < 0 || quads[i][j] > (j % 2 ? layout.heightPt : layout.widthPt) ||
-            Math.abs(point - quads[i][j]) > 0.01))) {
-          return { status: 'needs_review', reason: 'pdf_text_geometry_changed' };
-        }
-        return {
-          status: 'resolved',
-          resolvedCoords: { pageIndex, textOffsetStart: start, textOffsetEnd: end, occurrenceIndex: actualOcc, quadsPt: actualQuads,
-            widthPt: page.widthPt, heightPt: page.heightPt, rotate: page.rotate },
-          resolvedSnippet: slice,
-          surroundingContext: pageText.slice(Math.max(0, start - 64), start) + '\n---\n' + pageText.slice(end, end + 64),
-        };
-      }
-
-      if (selector.kind === 'pdf_annotation') {
-        const annotUid = typeof selector.annotUid === 'string' ? selector.annotUid : '';
-        const expectedAnnotFp = typeof selector.expectedAnnotFingerprint === 'string' ? selector.expectedAnnotFingerprint : '';
-        const matches = page.annotations.filter((a) => a.uid === annotUid);
-        if (!matches.length) return { status: 'stale', reason: 'pdf_annotation_not_found' };
-        if (matches.length !== 1 || !expectedAnnotFp || matches[0].fingerprint !== expectedAnnotFp) {
-          return { status: 'needs_review', reason: 'pdf_annotation_changed' };
-        }
-        return { status: 'resolved', resolvedCoords: { pageIndex, annotUid }, resolvedSnippet: matches[0].contents };
       }
 
       return { status: 'needs_review', reason: 'unsupported_pdf_selector' };
@@ -655,7 +570,7 @@ class DocumentFormatAdapter implements FormatAdapter {
       }
     }
 
-    if (this.format === 'pptx' && ['pptx_slide', 'pptx_element'].includes(selector.kind)) {
+    if (this.format === 'pptx' && ['pptx_slide', 'pptx_element', 'pptx_region'].includes(selector.kind)) {
       try {
         const { slides, slideSize } = readPptxTargets(buffer);
         const matchingSlides = slides.filter(slide => slide.id === String(selector.slideId));
@@ -672,7 +587,7 @@ class DocumentFormatAdapter implements FormatAdapter {
         const expected = element ? selector.expectedElementFingerprint : selector.expectedSlideHash;
         let slideCoords: Record<string, unknown> = {
           pageIndex,
-          ...(selector.kind === 'pptx_slide' ? slideSize : undefined),
+          ...(selector.kind === 'pptx_slide' || selector.kind === 'pptx_region' ? slideSize : undefined),
         };
         if (selector.kind === 'pptx_slide' && selector.pointPt !== undefined) {
           const { xPt, yPt, widthPt, heightPt } = selector.pointPt as Record<string, number>;
@@ -682,6 +597,25 @@ class DocumentFormatAdapter implements FormatAdapter {
           }
           const point = { xPt, yPt, widthPt, heightPt };
           slideCoords = { pageIndex, unit: 'pt', ...point, region: pointRegionPt(point) };
+        }
+        if (selector.kind === 'pptx_region') {
+          const rect = selector.rectPt;
+          if (!slideSize || !Array.isArray(rect) || rect.length !== 4 ||
+              !rect.every(v => typeof v === 'number' && Number.isFinite(v))) {
+            return { status: 'needs_review', reason: 'slide_region_out_of_bounds' };
+          }
+          const [x, y, w, h] = rect as [number, number, number, number];
+          if (w <= 0 || h <= 0 || x < 0 || y < 0 || x + w > slideSize.widthPt + 0.01 || y + h > slideSize.heightPt + 0.01) {
+            return { status: 'needs_review', reason: 'slide_region_out_of_bounds' };
+          }
+          slideCoords = {
+            pageIndex,
+            unit: 'pt',
+            rectPt: [x, y, w, h],
+            widthPt: slideSize.widthPt,
+            heightPt: slideSize.heightPt,
+            region: { x, y, width: w, height: h, unit: 'pt' as const },
+          };
         }
         return fingerprint && fingerprint === expected
           ? {
@@ -835,18 +769,14 @@ export class FormatAdapterRegistry {
       !documentFormatConstraint(adapter.format, params.filename, 'input', params.previewKind, params.content) &&
       !documentFormatConstraint(adapter.format, params.filename, 'input_edit', params.previewKind, params.content) &&
       (!adapter.requiresExternalWorker || (params.runtimeProfile !== 'base_chatui' && params.sandboxIsolation !== 'sandbox_required_blocked'));
-    const selectors = adapter.targetPinSupported ? selectorsForFormat(adapter.format, params.filename, params.previewKind) : [];
-    const supported = selectors.filter(selectorKindIsAvailable);
+    const supported = adapter.targetPinSupported
+      ? selectorsForFormat(adapter.format, params.filename, params.previewKind)
+      : [];
     const selectorOperations = supported.map((kind): OperationCapability => ({
       operation: 'target_pin:' + kind,
       availability: 'supported',
       scope: selectorHasDirectUi(kind) ? 'mcp_and_ui' : 'mcp_only',
     }));
-    const deferredSelectors = selectors.filter(kind => !selectorKindIsAvailable(kind));
-    const targetNotes = [
-      `対象解析の入力上限: ${MAX_INSPECTION_INPUT_BYTES / 1024 ** 2} MiB。メモリ不足時は一時的に利用できません。`,
-      ...(deferredSelectors.length ? ['PR3B: ' + deferredSelectors.join(', ')] : []),
-    ].join(' ');
     const operations = adapter.getOperations({
       runtimeProfile: params.runtimeProfile,
       filename: params.filename,
@@ -858,9 +788,8 @@ export class FormatAdapterRegistry {
     if (adapter.targetPinSupported) {
       operations.push({
         operation: 'target_pin',
-        availability: !supported.length ? 'unsupported_by_format' : supported.length < selectors.length ? 'partial' : 'supported',
+        availability: supported.length > 0 ? 'supported' : 'unsupported_by_format',
         scope: supported.some(selectorHasDirectUi) ? 'mcp_and_ui' : 'mcp_only',
-        notes: targetNotes,
       }, ...selectorOperations);
     }
     return {

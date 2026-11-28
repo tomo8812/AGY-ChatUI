@@ -132,34 +132,6 @@ export class SvgAdapter implements FormatAdapter {
 
   resolveTarget(buffer: Buffer, selector: TargetSelector, _meta: AdapterFileMeta): TargetResolutionResult {
     const text = buffer.toString('utf8');
-    if (selector.kind === 'svg_element') {
-      const { elementId, structuralPath, expectedTag, expectedElementFingerprint } = selector;
-      if ((!elementId && !Array.isArray(structuralPath)) || !expectedTag || !expectedElementFingerprint) {
-        return { status: 'needs_review', reason: 'missing_element_fingerprint' };
-      }
-      let elements: ReturnType<typeof markupElements>;
-      try {
-        elements = markupElements(text, 'svg');
-      } catch (error) {
-        if (!(error instanceof ArtifactError)) throw error;
-        return { status: 'needs_review', reason: 'invalid_svg_structure' };
-      }
-      const paths = svgStructuralPaths(elements);
-      const pathKey = Array.isArray(structuralPath) ? JSON.stringify(structuralPath) : undefined;
-      const byId = elementId ? elements.filter(element => element.id === elementId) : undefined;
-      if (byId && byId.length > 1) return { status: 'needs_review', reason: 'duplicate_element_id' };
-      const el = byId ? byId[0] : elements.find(element => JSON.stringify(paths[element.index]) === pathKey);
-      if (!el) return { status: 'stale', reason: 'element_not_found' };
-      if ((pathKey && JSON.stringify(paths[el.index]) !== pathKey) ||
-          el.tag !== expectedTag || el.fingerprint !== expectedElementFingerprint) {
-        return { status: 'needs_review', reason: 'element_replaced_or_modified' };
-      }
-      if (!elementId && elements.filter(element => element.fingerprint === el.fingerprint).length !== 1) {
-        return { status: 'needs_review', reason: 'ambiguous_multiple_elements' };
-      }
-      return { status: 'resolved', resolvedSnippet: text.slice(el.start, el.end),
-        resolvedRange: { structuralPath: paths[el.index] } };
-    }
 
     if (selector.kind === 'svg_region') {
       let viewBox: string | undefined;

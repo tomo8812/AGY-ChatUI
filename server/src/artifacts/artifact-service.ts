@@ -4644,7 +4644,7 @@ export class ArtifactService {
         (format === 'pdf' && isTargetMeta && range.pageIndex !== undefined)
       ) {
         const data = await inspectArtifactTarget<Record<string, unknown>>({
-          file: artifact, range, maxBytes: DOCUMENT_WORKER_MAX_INPUT_BYTES,
+          file: artifact, range,
           snapshot: { path: blobPath, sha256: revision.sha256, sizeBytes },
         });
         return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
@@ -4652,8 +4652,8 @@ export class ArtifactService {
 
       if (format === 'media' && isTargetMeta) {
         const data = await inspectArtifactTarget<Record<string, unknown>>({
-          file: artifact, range: { mediaStructure: true, timestampSec: range.timestampSec },
-          maxBytes: DOCUMENT_WORKER_MAX_INPUT_BYTES, snapshot: { path: blobPath, sha256: revision.sha256, sizeBytes },
+          file: artifact, range: { mediaStructure: true },
+          snapshot: { path: blobPath, sha256: revision.sha256, sizeBytes },
         });
         return { ...data, artifactId: artifact.id, revision: revision.revision, sha256: revision.sha256 };
       }
@@ -5227,27 +5227,18 @@ export class ArtifactService {
       const region = pointRegionPt(coords);
       if (typeof pageIndex !== 'number' || !Number.isSafeInteger(pageIndex) || pageIndex < 0 || !region) return null;
       options = { pageIndex, region };
+    } else if (selector.kind === 'pptx_region' && Array.isArray(coords.rectPt)) {
+      const [x, y, width, height] = coords.rectPt as number[];
+      if (!(width > 0 && height > 0)) return null;
+      options = { pageIndex: Number(coords.pageIndex), region: { x, y, width, height, unit: 'pt' as const } };
     } else if ((selector.kind === 'pdf_region' || selector.kind === 'pdf_pin') && Array.isArray(coords.rectPt)) {
       const [x, y, width, height] = coords.rectPt as number[];
       const region = selector.kind === 'pdf_pin' ? pointRegionPt({ ...coords, xPt: x, yPt: y })
         : { x, y, width, height, unit: 'pt' as const };
       if (!region || !(region.width > 0 && region.height > 0)) return null;
       options = { pageIndex: Number(coords.pageIndex), region };
-    } else if (selector.kind === 'pdf_text_range' && Array.isArray(coords.quadsPt)) {
-      const xs = (coords.quadsPt as number[][]).flatMap(quad => quad.filter((_, index) => index % 2 === 0));
-      const ys = (coords.quadsPt as number[][]).flatMap(quad => quad.filter((_, index) => index % 2 === 1));
-      const x = xs.reduce((left, value) => Math.min(left, value), Infinity);
-      const y = ys.reduce((top, value) => Math.min(top, value), Infinity);
-      const width = xs.reduce((right, value) => Math.max(right, value), x) - x;
-      const height = ys.reduce((bottom, value) => Math.max(bottom, value), y) - y;
-      if (!width || !height) return null;
-      options = { pageIndex: Number(coords.pageIndex), region: { x, y, width, height, unit: 'pt' } };
     } else if (selector.kind.startsWith('image_') && coords.region) {
       options = { region: coords.region as NonNullable<Options>['region'] };
-    } else if (selector.kind === 'video_frame_region' && coords.region) {
-      options = { region: coords.region as NonNullable<Options>['region'], frameSample: {
-        timestampSec: Number(coords.packetTimestampSec), sha256: String(coords.packetSha256),
-      } };
     } else {
       return null;
     }
@@ -5268,13 +5259,10 @@ export class ArtifactService {
     if (!adapter.targetPinSupported) {
       throw unsupportedOperationError('target_pin', 'unsupported_by_format', `形式 '${adapter.format}' は対象指定に対応していません。`);
     }
-    if (!targetSelectorSchema.safeParse(selector).success || !selectorMatchesFormat(selector, adapter.format)) {
-      return { status: 'needs_review', reason: 'invalid_target_selector' };
-    }
-    if (!selectorIsAvailable(selector) || !selectorsForFormat(adapter.format, artifact.filename, artifact.previewKind).includes(selector.kind)) {
+    if (!selectorIsAvailable(selector) || !(selectorsForFormat(adapter.format, artifact.filename, artifact.previewKind) as string[]).includes(selector.kind)) {
       return { status: 'needs_review', reason: 'unsupported_selector_kind' };
     }
-    if (adapter.format === 'media' && !selector.kind.startsWith(artifact.previewKind + '_')) {
+    if (!targetSelectorSchema.safeParse(selector).success || !selectorMatchesFormat(selector, adapter.format, artifact.previewKind)) {
       return { status: 'needs_review', reason: 'invalid_target_selector' };
     }
     baseRevision ??= selector.baseRevision;
@@ -5284,7 +5272,7 @@ export class ArtifactService {
         ).get(artifactId, userId, baseRevision))) {
       return { status: 'needs_review', reason: 'invalid_base_revision' };
     }
-    if (baseRevision !== artifact.revision && (selector.kind === 'html_viewport_region' || selector.kind === 'svg_region')) {
+    if (baseRevision !== artifact.revision && selector.kind === 'svg_region') {
       const base = this.db.db.prepare(
         'SELECT dependency_manifest_hash FROM artifact_revisions WHERE artifact_id = ? AND user_id = ? AND revision = ?',
       ).get(artifactId, userId, baseRevision);
@@ -5294,25 +5282,23 @@ export class ArtifactService {
     }
     const rootDir = this.resolveScopeRootDir(artifact.userId, artifact.scopeKind, artifact.chatId, artifact.projectId);
     if (!rootDir) return { status: 'stale', reason: 'artifact_file_missing' };
-    const maxBytes = isDocumentFormat(adapter.format) ? DOCUMENT_WORKER_MAX_INPUT_BYTES : undefined;
     let baseSnapshot;
     let releasePin;
-    const needsCsvBase = selector.kind === 'csv_row_col' && selector.expectedHeaderHash === undefined;
     const needsGridBase = baseRevision !== artifact.revision &&
       ['csv_range', 'csv_row_col', 'xlsx_range', 'xlsx_row_col'].includes(selector.kind);
-    if (selector.kind === 'code_line_range' || selector.kind === 'code_char_range' || selector.kind === 'md_text_range' || needsCsvBase || needsGridBase) {
+    if (['code_line_range', 'code_char_range', 'md_text_range', 'html_source_range', 'mermaid_source_range'].includes(selector.kind) || needsGridBase) {
       try {
         const base = this.getRevisionContentBlob(userId, artifactId, baseRevision);
         releasePin = this.blobManager.pinBlob(userId, base.revision.sha256);
         baseSnapshot = { path: base.blobPath, sizeBytes: base.sizeBytes, sha256: base.revision.sha256 };
       } catch {
-        if (needsCsvBase || needsGridBase) return { status: 'needs_review', reason: 'base_revision_content_unavailable' };
+        if (needsGridBase) return { status: 'needs_review', reason: 'base_revision_content_unavailable' };
         // A legacy source request can still resolve from a hash-verified snippet and context.
       }
     }
     try {
       const resolution = await inspectArtifactTarget<TargetResolutionResult>({
-        file: artifact, rootDir, selector, expectedSha256: artifact.sha256, maxBytes, snippetHint, baseSnapshot,
+        file: artifact, rootDir, selector, expectedSha256: artifact.sha256, snippetHint, baseSnapshot,
       });
       const latest = this.db.getArtifact(userId, artifactId);
       if (!latest) return { status: 'stale', reason: 'artifact_file_missing' };

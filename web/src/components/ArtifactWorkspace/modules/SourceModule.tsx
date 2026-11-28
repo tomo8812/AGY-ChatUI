@@ -1,4 +1,4 @@
-import { useTargetSelection } from '../useTargetSelection';
+import { TargetInspectionErrorBanner, TextRangeTargetControl, useTargetSelection } from '../../shared-ui/pin';
 import { ResponsiveCommandBar } from '../../shared-ui/layout/ResponsiveCommandBar';
 import React,{useDeferredValue,useLayoutEffect,useMemo,useRef,useState} from 'react';
 import { buildArtifactContentUrl } from '../../../utils/viewerCache';
@@ -79,8 +79,12 @@ export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget
   }
   const primary=mode==='pin'?<>
     <button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready} onClick={()=>editor.current?.selectAll()}>全選択</button>
-    <button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready} onClick={()=>void selectLines()}>選択行を対象にする</button>
-    {!markdown&&<button type="button" className="btn btn-secondary btn-xs" disabled={!resource.ready} onClick={()=>void selectLines(true)}>選択文字を対象にする</button>}
+    <TextRangeTargetControl
+      allowCharRange={!markdown}
+      disabled={!resource.ready}
+      onSelectLineRange={()=>void selectLines()}
+      onSelectCharRange={!markdown?()=>void selectLines(true):undefined}
+    />
   </>:<>
     <input className="workspace-command-input" aria-label="検索" placeholder="検索" value={query}
       onChange={e=>{setQuery(e.target.value);searchOffset.current=0}} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();find()}}}/>
@@ -96,7 +100,7 @@ export function SourceModule({artifact,mode,draft,editingLocked,onDraft,onTarget
   const tools=<ResponsiveCommandBar primary={primary} secondary={secondary} minInlineWidth={640}/>;
   return <UnifiedViewerZoomShell resetKey={artifact.id+':source'} controlsTop={<>{tools}{outlineOpen&&markdown&&mode!=='pin'&&<nav className="workspace-source-outline" aria-label="文書目次">{outline.length?outline.map((item,index)=><button key={index} type="button" style={{paddingInlineStart:8+(item.level-1)*10}} onClick={()=>jumpHeading(index)}>{item.label}</button>):<span className="muted-xs">見出しがありません。</span>}</nav>}</>}>
     {resource.error&&<div className="error-box" role="alert">{resource.error}<button type="button" onClick={resource.retry}>再試行</button></div>}
-    {pinError&&<div role="alert">{pinError}</div>}
+    {pinError&&<TargetInspectionErrorBanner message={pinError} onDismiss={()=>setPinError('')}/>}
     {resource.loading&&<p className="muted-xs">読み込み中…</p>}
     {resource.data!==null&&<div className={'workspace-source'+(markdown&&mode==='edit'?' split':'')}>
       {mode!=='view'?<SourceEditor onSelectionChange={selection.invalidate} editorRef={editor} language={language} value={mode==='pin'?text:value} readOnly={mode!=='edit'||editingLocked||!resource.ready} onChange={content=>{if(artifact.revision!==undefined)onDraft(artifact.revision,content===text?null:{key:'source',label:'ソースの変更',operation:{op:'replace_source',content}},'source')}}/>:null}

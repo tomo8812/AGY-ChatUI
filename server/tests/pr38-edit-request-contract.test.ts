@@ -229,13 +229,18 @@ it('rechecks memory after a queued heavy worker gets its slot and releases the s
 });
 
 
-it('requires the exact selector fields and refuses a whole-file digest as proof of an Office subtarget', () => {
+it('requires the exact registered selector fields and rejects abolished Office subtarget selectors', () => {
   const body = 'OOXML content';
   const meta = { filename: 'a.docx', relPath: 'a.docx', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', previewKind: 'docx' as const };
-  const selector = { kind: 'docx_table_cell', baseRevision: 1, tableId: 't', row: 0, col: 0, expectedCellHash: hash(body), expectedTableFingerprint: hash('table') };
-  expect(targetSelectorSchema.safeParse(selector).success).toBe(true);
-  expect(targetSelectorSchema.safeParse({ ...selector, expectedTableFingerprint: undefined }).success).toBe(false);
-  expect(new FormatAdapterRegistry().resolve(meta.filename, meta.previewKind).resolveTarget(Buffer.from(body), selector, meta).status).toBe('needs_review');
+  const deprecated = { kind: 'docx_table_cell', baseRevision: 1, tableId: 't', row: 0, col: 0, expectedCellHash: hash(body), expectedTableFingerprint: hash('table') };
+  expect(targetSelectorSchema.safeParse(deprecated).success).toBe(false);
+  expect(new FormatAdapterRegistry().resolve(meta.filename, meta.previewKind).resolveTarget(Buffer.from(body), deprecated, meta).status).toBe('needs_review');
+  expect(targetSelectorSchema.safeParse({
+    kind: 'pptx_region', baseRevision: 1, slideId: '1', rectPt: [10, 10, 100, 50], expectedSlideHash: hash('slide'),
+  }).success).toBe(true);
+  expect(targetSelectorSchema.safeParse({
+    kind: 'pptx_region', baseRevision: 1, slideId: '1', rectPt: [10, 10, 100, 50], expectedSlideRenderHash: hash('slide'),
+  }).success).toBe(false);
   expect(targetSelectorSchema.safeParse({
     kind: 'code_char_range', baseRevision: 1, startLine: 1, endLine: 2, startCol: 10, endCol: 3,
     expectedSnippetHash: hash('snippet'), contextBeforeHash: hash('before'), contextAfterHash: hash('after'), occurrenceIndex: 0,
@@ -273,20 +278,24 @@ it('uses Base ChatUI media duration and verifies the exact time range against so
     userId, chatId, scopeKind: 'chat', relPath: 'frames.mp4',
     content: readFileSync(new URL('./fixtures/target-frame-red-blue.mp4', import.meta.url)), actorKind: 'user',
   });
-  const targetRange = (timestampSec: number) => ctx.artifactService.readRange(userId, video.id, { targetMetadata: true, timestampSec });
-  const first = await targetRange(0.25), second = await targetRange(1.25);
-  expect(first.target).toMatchObject({ timestampSec: 0.25, expectedDurationSec: 2, expectedWidthPx: 32, expectedHeightPx: 24 });
-  expect((first.target as Record<string, unknown>).expectedFrameSha256).not.toBe((second.target as Record<string, unknown>).expectedFrameSha256);
-  const frameSelector = targetSelectorSchema.parse({ ...(first.target as object), kind: 'video_frame_region', baseRevision: 1,
-    rectNorm: [0.25, 0.25, 0.5, 0.5] });
-  expect(await ctx.artifactService.resolveTargetOnArtifact(userId, video.id, frameSelector)).toMatchObject({
-    status: 'resolved', resolvedCoords: { frameStartSec: 0, frameDurationSec: 0.5 },
+  const videoMeta = await ctx.artifactService.readRange(userId, video.id, { targetMetadata: true });
+  expect(videoMeta).toMatchObject({ durationSeconds: 2, widthPx: 32, heightPx: 24 });
+  expect(targetSelectorSchema.safeParse({
+    kind: 'video_frame_region', baseRevision: 1, timestampSec: 0.25, rectNorm: [0.25, 0.25, 0.5, 0.5],
+    expectedDurationSec: 2, expectedWidthPx: 32, expectedHeightPx: 24, expectedFrameSha256: hash('frame'),
+  }).success).toBe(false);
+  const videoSelector = targetSelectorSchema.parse({
+    kind: 'video_time_range', baseRevision: 1, startSec: 0.25, endSec: 1.5,
+    expectedDurationSec: videoMeta.durationSeconds, expectedMediaSha256: video.sha256,
   });
-  expect(await ctx.artifactService.resolveTargetOnArtifact(userId, video.id, { ...frameSelector, timestampSec: 1.25 }))
+  expect(await ctx.artifactService.resolveTargetOnArtifact(userId, video.id, videoSelector)).toMatchObject({
+    status: 'resolved', resolvedCoords: { startSec: 0.25, endSec: 1.5 },
+  });
+  expect(await ctx.artifactService.resolveTargetOnArtifact(userId, video.id, { ...videoSelector, endSec: 2.5 }))
     .toMatchObject({ status: 'needs_review' });
 
   const request = await ctx.editRequestService.createRequest({
-    userId, chatId, targetKind: 'artifact', artifactId: video.id, selector: frameSelector, instruction: 'Update the selected frame',
+    userId, chatId, targetKind: 'artifact', artifactId: video.id, selector: videoSelector, instruction: 'Trim the selected clip',
   });
   expect((await client.request('POST', `/api/chats/${chatId}/edit-requests/send-batch`, {
     requestIds: [request.id], clientMessageId: randomUUID(),
@@ -339,7 +348,7 @@ it('uses the root SVG viewBox to reject targets outside its visible coordinate r
     .toMatchObject({ status: 'needs_review', reason: 'svg_region_out_of_bounds' });
 });
 
-it('rechecks dynamic Rich node and SVG display against the saved view and base revision', async () => {
+it('rechecks dynamic Rich node display against the saved view and base revision and rejects abolished rich_svg_element', async () => {
   const srv = await createTestServer();
   cleanups.push(srv.cleanup);
   const { ctx } = srv;
@@ -366,18 +375,16 @@ it('rechecks dynamic Rich node and SVG display against the saved view and base r
   });
   const node = await makeRequest({ kind: 'rich_node', nodeId: text.id, expectedNodeType: text.type,
     expectedNodeFingerprint: hash(canonicalJson(text)) });
-  const svg = await makeRequest({ kind: 'rich_svg_element', svgNodeId: plot.id, elementId: circle.id, expectedTag: circle.tag,
-    expectedElementFingerprint: hash(canonicalJson(circle)) });
+  await expect(makeRequest({
+    kind: 'rich_svg_element', svgNodeId: plot.id, elementId: circle.id, expectedTag: circle.tag,
+    expectedElementFingerprint: hash(canonicalJson(circle)),
+  })).rejects.toMatchObject({ statusCode: 400 });
   ctx.richContentService.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 1, patchState: { unrelated: 12 } });
-  for (const request of [node, svg]) {
-    expect(await ctx.editRequestService.resolveRequestTarget(request)).toMatchObject({ status: 'resolved' });
-  }
+  expect(await ctx.editRequestService.resolveRequestTarget(node)).toMatchObject({ status: 'resolved' });
   ctx.richContentService.updateBlock({ userId, chatId, blockId: block.id, expectedRevision: 2,
     document: { ...document, computed: { total: '$state.value + 2' } } });
-  for (const request of [node, svg]) {
-    expect(request.viewStateSnapshot).toEqual(viewStateSnapshot);
-    expect(await ctx.editRequestService.resolveRequestTarget(request)).toMatchObject({ status: 'needs_review' });
-  }
+  expect(node.viewStateSnapshot).toEqual(viewStateSnapshot);
+  expect(await ctx.editRequestService.resolveRequestTarget(node)).toMatchObject({ status: 'needs_review' });
 });
 
 it('anchors rich chart, repeat and table selections to their evaluated display', async () => {

@@ -19,7 +19,6 @@ import {
 } from '../src/artifacts/adapters/ooxml-target.js';
 import { provePdfRotationScope, replayPdfRotation } from '../src/artifacts/adapters/pdf-history.js';
 import { buildSyntheticPdf } from '../../e2e/fixtures/syntheticAssets.js';
-import { inspectPdfText } from '../src/artifacts/adapters/pdf-text-inspection.js';
 import { targetSelectorSchema } from '../src/artifacts/target-selector-schema.js';
 import { inspectPdfDocument, computePdfRegionDigest, readPdfPageTarget } from '../src/artifacts/adapters/pdf-target.js';
 import { sha256Hex } from '../../web/src/utils/sha256.js';
@@ -300,7 +299,7 @@ describe('PR 3A Conformance Gap Fixes', () => {
         expect(caps.operations).toContainEqual(expect.objectContaining({ operation, availability: 'supported' }));
       }
       expect(caps.operations).toEqual(expect.arrayContaining([
-        expect.objectContaining({ operation: 'target_pin', availability: 'partial', notes: expect.stringMatching(/PR3B:.*xlsx_chart/) }),
+        expect.objectContaining({ operation: 'target_pin', availability: 'supported', scope: 'mcp_and_ui' }),
         expect.objectContaining({ operation: 'xlsx.set_cell', availability: 'disabled_by_resource_tier' }),
       ]));
       expect(caps.operations.some(operation => operation.operation === 'target_pin:xlsx_chart')).toBe(false);
@@ -502,13 +501,13 @@ describe('PR 3A Conformance Gap Fixes', () => {
       expect(adapter.resolveTarget(Buffer.from('Name,Score\nAlice,90\nBob,80\n'), rowSelector, csvMeta).status).toBe('resolved');
       expect(adapter.resolveTarget(Buffer.from('Student,Points\nAlice,90\nBob,80\n'), rowSelector, csvMeta))
         .toMatchObject({ status: 'needs_review', reason: 'header_changed' });
-      const { expectedHeaderHash: _headerHash, ...publishedRowSelector } = rowSelector;
-      expect(targetSelectorSchema.safeParse(publishedRowSelector).success).toBe(true);
+      const { expectedHeaderHash: _headerHash, ...missingHeaderRowSelector } = rowSelector;
+      expect(targetSelectorSchema.safeParse(missingHeaderRowSelector).success).toBe(false);
       const svc = server.ctx.artifactService;
-      await expect(svc.resolveTargetOnArtifact(userId, created.artifact.id, publishedRowSelector))
+      await expect(svc.resolveTargetOnArtifact(userId, created.artifact.id, rowSelector))
         .resolves.toMatchObject({ status: 'resolved' });
       const stored = await server.ctx.editRequestService.createRequest({
-        userId, chatId, targetKind: 'artifact', artifactId: created.artifact.id, selector: publishedRowSelector,
+        userId, chatId, targetKind: 'artifact', artifactId: created.artifact.id, selector: rowSelector,
         instruction: 'Review the data rows',
       });
       expect(stored.selector.expectedHeaderHash).toBe(_headerHash);
@@ -516,7 +515,7 @@ describe('PR 3A Conformance Gap Fixes', () => {
         userId, artifactId: created.artifact.id, expectedRevision: 1, actorKind: 'user', actorId: userId,
         newBuffer: Buffer.from('Student,Points\nAlice,90\nBob,80\n'), operationType: 'replace', operationSummary: 'Update headers',
       });
-      await expect(svc.resolveTargetOnArtifact(userId, created.artifact.id, publishedRowSelector))
+      await expect(svc.resolveTargetOnArtifact(userId, created.artifact.id, rowSelector))
         .resolves.toMatchObject({ status: 'needs_review', reason: 'header_changed' });
       // Row order swap inside selected range -> needs_review
       expect(adapter.resolveTarget(Buffer.from('Name,Score\nBob,80\nAlice,90\n'), fullSelector, csvMeta).status).toBe('needs_review');
@@ -560,21 +559,12 @@ describe('PR 3A Conformance Gap Fixes', () => {
       expect(typeof meta.target?.regionDigest).toBe('string');
       expect(meta.target?.pageContentHash).not.toBe(created.artifact.sha256);
 
-      const selected = 'Revenue', start = 'Page One Revenue 100'.indexOf(selected), end = start + selected.length;
-      const { target: textTarget } = await server.ctx.artifactService.readRange(userId, created.artifact.id, {
-        pageIndex: 0, textTarget: true, textOffsetStart: start, textOffsetEnd: end, targetMetadata: true,
-      });
-      const layout = textTarget as { text: string; quadsPt: number[][] };
-      expect(layout.quadsPt).toHaveLength(1);
-      const selector = targetSelectorSchema.parse({
+      expect(targetSelectorSchema.safeParse({
         kind: 'pdf_text_range', baseRevision: created.artifact.revision, pageIndex: 0,
         expectedPageCount: 2, expectedPageContentHash: meta.target!.pageContentHash,
-        textOffsetStart: start, textOffsetEnd: end, occurrenceIndex: 0, quadsPt: layout.quadsPt,
-        expectedSnippetHash: sha256Hex(selected), contextBeforeHash: sha256Hex(layout.text.slice(0, start)),
-        contextAfterHash: sha256Hex(layout.text.slice(end)),
-      });
-      expect(await server.ctx.artifactService.resolveTargetOnArtifact(userId, created.artifact.id, selector))
-        .toMatchObject({ status: 'resolved', resolvedSnippet: selected });
+        textOffsetStart: 0, textOffsetEnd: 4, occurrenceIndex: 0, quadsPt: [[0, 0, 10, 0, 10, 10, 0, 10]],
+        expectedSnippetHash: sha256Hex('Page'), contextBeforeHash: sha256Hex(''), contextAfterHash: sha256Hex(''),
+      }).success).toBe(false);
       expect((await server.ctx.artifactService.readRange(userId, created.artifact.id, {
         pageIndex: 0, rectPt: '[594,10,1.001,1]', targetMetadata: true,
       })).target).toBeNull();
@@ -1045,34 +1035,18 @@ describe('PR 3A Conformance Gap Fixes', () => {
     }, docxMeta);
     expect(paraIdOnlyRes.status).toBe('resolved');
 
-    // 2. PDF pdf_text_range with contextBeforeHash, contextAfterHash & occurrenceIndex
+    // 2. PDF pdf_page / pdf_pin / pdf_region (and rejection of abolished pdf_text_range / pdf_annotation)
     const pdfBuf = buildMinimalPdf([{ width: 600, height: 800, text: 'Alpha ITEM Beta ITEM Gamma' }]);
     const pdfDoc = inspectPdfDocument(pdfBuf);
     const page0 = pdfDoc.pages[0];
-    const secondIdx = page0.text.lastIndexOf('ITEM');
-    const slice = page0.text.slice(secondIdx, secondIdx + 4);
-    const before = page0.text.slice(Math.max(0, secondIdx - 64), secondIdx);
-    const after = page0.text.slice(secondIdx + 4, Math.min(page0.text.length, secondIdx + 4 + 64));
-    const sha = (s: string) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
     const pdfAdapter = registry.resolve('text.pdf', 'pdf');
-    const pdfTextLayout = await inspectPdfText(pdfBuf, 0, secondIdx, secondIdx + 4);
-    const quadsPt = pdfTextLayout?.quadsForRange(secondIdx, secondIdx + 4);
-    expect(quadsPt).toHaveLength(1);
-    const pdfMeta = { filename: 'text.pdf', relPath: 'text.pdf', mimeType: 'application/pdf', pdfTextLayout };
-    const textSelector = {
-      kind: 'pdf_text_range', baseRevision: 1, pageIndex: 0, expectedPageCount: 1,
-      expectedPageContentHash: page0.pageContentHash, quadsPt,
-      textOffsetStart: secondIdx, textOffsetEnd: secondIdx + 4,
-      expectedSnippetHash: sha(slice), contextBeforeHash: sha(before), contextAfterHash: sha(after), occurrenceIndex: 1,
-    };
-    expect(pdfAdapter.resolveTarget(pdfBuf, targetSelectorSchema.parse(textSelector), pdfMeta).status).toBe('resolved');
-    expect(pdfAdapter.resolveTarget(pdfBuf, { ...textSelector, occurrenceIndex: 0 }, pdfMeta).status).toBe('needs_review');
-    expect(pdfAdapter.resolveTarget(pdfBuf, {
-      ...textSelector, quadsPt: pdfTextLayout?.quadsForRange(page0.text.indexOf('ITEM'), page0.text.indexOf('ITEM') + 4),
-    }, pdfMeta).status).toBe('needs_review');
-    expect(pdfAdapter.resolveTarget(pdfBuf, {
-      ...textSelector, quadsPt: quadsPt!.map(quad => quad.map(point => point - 1000)),
-    }, pdfMeta).status).toBe('needs_review');
+    const pdfMeta = { filename: 'text.pdf', relPath: 'text.pdf', mimeType: 'application/pdf' };
+    expect(pdfAdapter.resolveTarget(pdfBuf, targetSelectorSchema.parse({
+      kind: 'pdf_page', baseRevision: 1, pageIndex: 0, expectedPageCount: 1,
+      expectedPageContentHash: page0.pageContentHash,
+    }), pdfMeta).status).toBe('resolved');
+    expect(pdfAdapter.resolveTarget(pdfBuf, { kind: 'pdf_text_range', baseRevision: 1, pageIndex: 0, expectedPageCount: 1, expectedPageContentHash: page0.pageContentHash }, pdfMeta)).toMatchObject({ status: 'needs_review', reason: 'unsupported_pdf_selector' });
+    expect(pdfAdapter.resolveTarget(pdfBuf, { kind: 'pdf_annotation', baseRevision: 1, pageIndex: 0, expectedPageCount: 1, expectedPageContentHash: page0.pageContentHash, annotUid: 'a1', expectedAnnotFingerprint: '0'.repeat(64) }, pdfMeta)).toMatchObject({ status: 'needs_review', reason: 'unsupported_pdf_selector' });
 
     // 3. XLSX expectedOrderKeysHash, xlsx_row_col, and xlsx_sheet
     const xlsxBuf = buildMinimalXlsx({

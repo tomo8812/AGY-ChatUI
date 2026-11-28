@@ -1,5 +1,3 @@
-import type { VideoFrameTarget } from './media-target.js';
-import type { PdfTextLayout } from './pdf-text-layout.js';
 import crypto from 'node:crypto';
 import type { PreviewKind } from '../../types.js';
 import type {
@@ -19,9 +17,7 @@ export interface AdapterFileMeta {
   relPath: string;
   mimeType: string;
   snippetHint?: string;
-  pdfTextLayout?: PdfTextLayout | null;
   mediaDurationSeconds?: number;
-  videoFrame?: VideoFrameTarget;
   dependencyManifestTruncated?: boolean;
   dependencies?: Array<{ relPath: string; status: 'present' | 'missing' | 'outside_root' }>;
 }
@@ -147,9 +143,7 @@ export function resolveTextSnippetByContext(params: {
   requireOccurrenceIndex?: boolean;
   matchRange?: (startLine: number, endLine: number) => boolean;
   snippetHint?: string;
-  pdfTextLayout?: PdfTextLayout | null;
   mediaDurationSeconds?: number;
-  videoFrame?: VideoFrameTarget;
   startCol?: number;
   endCol?: number;
   allowLegacyCharContext?: boolean;

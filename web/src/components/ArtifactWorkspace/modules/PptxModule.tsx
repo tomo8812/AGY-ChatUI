@@ -1,14 +1,31 @@
-import { useTargetSelection } from '../useTargetSelection';
 import React,{useEffect,useRef,useState} from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { workspaceApi,supportsOperation,MAX_WORKSPACE_IMAGE_BYTES,type EditOperation, type WorkspaceTableCellEdit } from '../../../api/workspace';
 import {ResponsiveCommandBar} from '../../shared-ui/layout/ResponsiveCommandBar';
 import { UnifiedViewerZoomShell } from '../../UnifiedViewerZoomShell';
 import { PdfCanvasViewer } from '../../shared-ui/document/PdfCanvasCore';
+import {
+  ElementTargetControl,
+  PinModeToolbar,
+  SpatialPinOverlay,
+  TargetInspectionErrorBanner,
+  WholeTargetControl,
+  useTargetSelection,
+  type NormalizedArea,
+  type PinModeOption,
+} from '../../shared-ui/pin';
 import { artifactVersionKey, buildArtifactContentUrl } from '../../../utils/viewerCache';
 import { assertRevision,useRevisionResource } from '../useRevisionResource';
 import { preparePptxOperations,projectSlides,type ProjectedSlide } from '../pptxDraft';
 import type { DraftEntry, WorkspaceModuleProps } from '../types';
+
+type PptxPinMode = 'element' | 'slide' | 'pin' | 'region';
+const PPTX_PIN_OPTIONS: readonly PinModeOption<PptxPinMode>[] = [
+  { id: 'element', label: '構造要素' },
+  { id: 'slide', label: 'スライド全体' },
+  { id: 'pin', label: 'ピン', hint: 'クリック・タップ、または矢印キーと Enter で位置を指定' },
+  { id: 'region', label: '矩形領域', hint: 'ドラッグ、または矢印キーと Enter で範囲を指定' },
+];
 type Slide={id:string;part:string};
 type TargetSlide={slideId:string;slideHash:string;shapes:{id:string;name:string;text:string;groupPath:string[];fingerprint:string}[]};
 type Bounds={x:number;y:number;width:number;height:number};
@@ -135,9 +152,10 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   const [slideId,setSlideId]=useState('');
   const [selected,setSelected]=useState('');
   const [baseShape,setBaseShape]=useState('');
+  const [pinMode,setPinMode]=useState<PptxPinMode>('element');
   const [canvasText,setCanvasText]=useState(false);
   const sequence=useRef(0);
-  const pinSelection=useTargetSelection(beginTargetSelection,JSON.stringify([slideId,selected,baseShape]));
+  const pinSelection=useTargetSelection(beginTargetSelection,JSON.stringify([slideId,selected,baseShape,pinMode]));
   const [operationKind,setOperationKind]=useState('');
   const [shapeText,setShapeText]=useState('');
   const [shapeKind,setShapeKind]=useState<'rectangle'|'ellipse'|'textbox'>('rectangle');
@@ -146,7 +164,6 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
   const [layoutPart,setLayoutPart]=useState('');
   const [destination,setDestination]=useState(1);
   const [fileData,setFileData]=useState<{name:string;base64:string}|null>(null);
-  const [pickSlidePoint,setPickSlidePoint]=useState(false);
   const [operationError,setOperationError]=useState('');
   const [jumpInput,setJumpInput]=useState('');
   const fileGeneration=useRef(0);
@@ -362,39 +379,131 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     const selectedShape=typeof jumpTarget.coords?.shapeId==='number'?String(jumpTarget.coords.shapeId):'';
     setSlideId(selectedSlide.id);setBaseShape(selectedShape);choose(selectedShape);
   },[jumpTarget,structure.ready]);
-  async function pin(targetSlide:Slide,shapeId?:string,contentCoords?:Record<string,unknown>){
-    if(artifact.revision===undefined)return;
-    const isCurrent=pinSelection.begin();
+  async function pin(
+    targetSlide: Slide,
+    shapeId?: string,
+    contentCoords?: Record<string, unknown>,
+    rectPt?: [number, number, number, number],
+  ) {
+    if (artifact.revision === undefined) return;
+    const isCurrent = pinSelection.begin();
     setOperationError('');
     try {
-      const metadata=await workspaceApi.range<TargetSlide>(artifact.id,{part:targetSlide.part,targetMetadata:true});
-      assertRevision(artifact,metadata);
-      if(!isCurrent())return;
-      const element=shapeId?metadata.shapes.find(item=>item.id===shapeId):undefined;
-      if(shapeId&&!element)throw Error('選択した要素を識別できません。');
-      const pageIndex=savedSlides.findIndex(item=>item.id===targetSlide.id),label='スライド '+(pageIndex+1);
-      if(!isCurrent())return;
-      onTarget({baseRevision:artifact.revision,label:element?label+' / '+element.name:label,
-        selector:element?{kind:'pptx_element',slideId:targetSlide.id,shapeId:Number(element.id),groupPath:element.groupPath,expectedElementFingerprint:element.fingerprint}
-          :{kind:'pptx_slide',slideId:targetSlide.id,expectedSlideHash:metadata.slideHash,
-            ...(contentCoords && size ? {pointPt:{xPt:contentCoords.xPt,yPt:contentCoords.yPt,
-              widthPt:size.widthPt,heightPt:size.heightPt}} : {})},
-        selectedContentSnapshot:element?.text.slice(0,50_000),contentCoords});
-    }catch(e){if(isCurrent())setOperationError(e instanceof Error?e.message:'対象を識別できません。')}
+      const metadata = await workspaceApi.range<TargetSlide>(artifact.id, { part: targetSlide.part, targetMetadata: true });
+      assertRevision(artifact, metadata);
+      if (!isCurrent()) return;
+      const element = shapeId ? metadata.shapes.find((item) => item.id === shapeId) : undefined;
+      if (shapeId && !element) throw Error('選択した要素を識別できません。');
+      const pageIndex = savedSlides.findIndex((item) => item.id === targetSlide.id);
+      const label = 'スライド ' + (pageIndex + 1);
+      if (!isCurrent()) return;
+      if (rectPt) {
+        onTarget({
+          baseRevision: artifact.revision,
+          label: label + ' / 矩形領域',
+          selector: {
+            kind: 'pptx_region',
+            slideId: targetSlide.id,
+            rectPt,
+            expectedSlideHash: metadata.slideHash,
+          },
+          selectedContentSnapshot: metadata.shapes.map((item) => item.text).filter(Boolean).join('\n').slice(0, 50_000),
+          contentCoords: {
+            pageIndex,
+            unit: 'pt',
+            rectPt,
+            ...(size ? { widthPt: size.widthPt, heightPt: size.heightPt } : {}),
+          },
+        });
+        return;
+      }
+      const isPoint = Boolean(!element && contentCoords && typeof contentCoords.xPt === 'number' && typeof contentCoords.yPt === 'number' && size);
+      onTarget({
+        baseRevision: artifact.revision,
+        label: element ? label + ' / ' + element.name : isPoint ? label + ' / ピン' : label,
+        selector: element
+          ? {
+              kind: 'pptx_element',
+              slideId: targetSlide.id,
+              shapeId: Number(element.id),
+              groupPath: element.groupPath,
+              expectedElementFingerprint: element.fingerprint,
+            }
+          : {
+              kind: 'pptx_slide',
+              slideId: targetSlide.id,
+              expectedSlideHash: metadata.slideHash,
+              ...(isPoint && size
+                ? {
+                    pointPt: {
+                      xPt: contentCoords!.xPt,
+                      yPt: contentCoords!.yPt,
+                      widthPt: size.widthPt,
+                      heightPt: size.heightPt,
+                    },
+                  }
+                : {}),
+            },
+        selectedContentSnapshot: (element ? element.text : metadata.shapes.map((item) => item.text).filter(Boolean).join('\n')).slice(0, 50_000),
+        contentCoords,
+      });
+    } catch (e) {
+      if (isCurrent()) setOperationError(e instanceof Error ? e.message : '対象を識別できません。');
+    }
   }
-  const primary=<><span className="workspace-slide-counter" title="スライド番号">{index+1} / {slides.length}</span>
-    {mode==='pin'&&<button type="button" className="btn btn-secondary btn-xs" disabled={!shape||!sceneReady} onClick={()=>{if(slide&&shape)void pin(slide,shape.id,shape.transform?.geomBoundsPt?{...shape.transform.geomBoundsPt,pageIndex:index,unit:'pt'}:undefined)}}>要素を対象にする</button>}
-    {mode==='pin'&&<>
-      <button type="button" className="btn btn-secondary btn-xs" disabled={!slide||!targetStructure.ready} onClick={()=>{if(slide)void pin(slide)}}>スライド全体を対象にする</button>
-      <button type="button" className="btn btn-secondary btn-xs" disabled={!sceneReady} aria-pressed={pickSlidePoint} onClick={()=>setPickSlidePoint(value=>!value)}>座標を選択</button>
-      <select aria-label="対象要素" value={selected} onChange={event=>choose(event.target.value)}>
-        <option value="">要素を選択</option>
-        {targetStructure.data?.shapes.map(item=><option key={item.id} value={item.id}>{item.name}</option>)}
-      </select>
-      {selected&&!shape&&<button type="button" className="btn btn-secondary btn-xs" onClick={()=>{if(slide)void pin(slide,selected)}}>構造を対象にする</button>}
-    </>}
-    {mode==='edit'&&shape?.type==='sp'&&<input className="workspace-command-text" aria-label="図形テキスト" value={String(draft?.entries.find(e=>e.key===key(shape.id,'text'))?.operation.text??shape.text)} readOnly={lock||!sceneReady||!supportsOperation(capabilities,'pptx.set_shape_text')} onChange={e=>editText(e.target.value)}/>}
-  </>;
+  const shapeOptions = (targetStructure.data?.shapes ?? []).map((item) => ({ id: item.id, label: item.name }));
+  const primary = (
+    <>
+      <span className="workspace-slide-counter" title="スライド番号">{index + 1} / {slides.length}</span>
+      {mode === 'pin' && (
+        <PinModeToolbar
+          ariaLabel="PPTX の対象指定"
+          selectLabel="PPTX の選択方法"
+          options={PPTX_PIN_OPTIONS}
+          value={pinMode}
+          onChange={(next) => {
+            pinSelection.invalidate();
+            setOperationError('');
+            setPinMode(next);
+          }}
+        >
+          {pinMode === 'slide' && (
+            <WholeTargetControl
+              label="スライド全体を対象にする"
+              disabled={!slide || !targetStructure.ready}
+              onSelect={() => { if (slide) void pin(slide); }}
+            />
+          )}
+          {pinMode === 'element' && (
+            <ElementTargetControl
+              ariaLabel="対象要素"
+              elements={shapeOptions}
+              selectedId={selected}
+              onSelectId={choose}
+              actionDisabled={!slide || !selected || (!shape && !targetStructure.ready)}
+              onConfirm={() => {
+                if (!slide || !selected) return;
+                void pin(
+                  slide,
+                  selected,
+                  shape?.transform?.geomBoundsPt ? { ...shape.transform.geomBoundsPt, pageIndex: index, unit: 'pt' } : undefined,
+                );
+              }}
+            />
+          )}
+        </PinModeToolbar>
+      )}
+      {mode === 'edit' && shape?.type === 'sp' && (
+        <input
+          className="workspace-command-text"
+          aria-label="図形テキスト"
+          value={String(draft?.entries.find((e) => e.key === key(shape.id, 'text'))?.operation.text ?? shape.text)}
+          readOnly={lock || !sceneReady || !supportsOperation(capabilities, 'pptx.set_shape_text')}
+          onChange={(e) => editText(e.target.value)}
+        />
+      )}
+    </>
+  );
   const secondary=mode==='edit'?<>
     {shape&&bounds(shape)&&['x','y','width','height'].map(field=><label key={field} className="workspace-bound">{field}<input aria-label={field} type="number" value={bounds(shape)![field as keyof Bounds]} disabled={lock||!sceneReady||!supportsOperation(capabilities,'pptx.set_shape_bounds')} onChange={e=>{const value=e.target.valueAsNumber;if(Number.isFinite(value)&&((field==='x'||field==='y')?Math.abs(value)<=14400:value>=1&&value<=14400))writeBounds(shape,{...bounds(shape)!,[field]:value})}}/></label>)}
     {styleEnabled&&<>
@@ -436,25 +545,85 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     {operationKind==='pptx.reorder_slide'&&<label>移動先 <input type="number" aria-label="移動先スライド" min={1} max={slides.length} value={destination} onChange={e=>setDestination(e.target.valueAsNumber)}/></label>}
     {operationError&&<p role="alert">{operationError}</p>}<div className="workspace-toolbar workspace-toolbar-fields"><button type="button" className="btn btn-secondary btn-xs" disabled={!structureEnabled||!validOperation} onClick={stageStructure}>適用</button><button type="button" className="btn btn-ghost btn-xs" onClick={()=>chooseOperation('')}>取消</button></div>
   </div>:null;
-  if(!workerReady&&(mode==='view'||mode==='pin'))return <div className="workspace-page-view">
-    {mode==='pin'&&<div className="workspace-toolbar workspace-pptx-target-bar" role="group" aria-label="スライドの対象指定">
-      <label>スライド <select aria-label="対象スライド" value={slide?.id??''} onChange={event=>{setSlideId(event.target.value);setBaseShape('')}}>
-        {slides.map((item,i)=><option key={item.id} value={item.id}>{i+1}</option>)}
-      </select></label>
-      <label>要素 <select aria-label="対象要素" value={baseShape} onChange={event=>setBaseShape(event.target.value)}>
-        <option value="">スライド全体</option>
-        {targetStructure.ready&&targetStructure.data?.shapes.map(item=><option key={item.id} value={item.id}>{item.name}</option>)}
-      </select></label>
-      <button type="button" className="btn btn-secondary btn-xs" disabled={!slide||!targetStructure.ready} onClick={()=>{if(slide)void pin(slide,baseShape||undefined)}}>構造を対象にする</button>
-    </div>}
-    {mode==='pin'&&(operationError||structure.error||targetStructure.error)&&<p className="error-box" role="alert">{operationError||structure.error||targetStructure.error}</p>}
-    <PdfCanvasViewer jumpLocation={jumpTarget?.coords} documentKey={artifact.id} url={buildArtifactContentUrl(artifact,{convertedPdf:true})}
-      selectionMode={mode==='pin'?'pin':undefined}
-      onSelectLocation={mode==='pin'?location=>{
-        const clicked=slides[location.pageIndex];if(!clicked)return;
-        void pin(clicked,undefined,{pageIndex:location.pageIndex,unit:'pt',xPt:location.x*(size?.widthPt??location.pageWidth),yPt:location.y*(size?.heightPt??location.pageHeight)});
-      }:undefined}/>
-  </div>;
+  if (!workerReady && (mode === 'view' || mode === 'pin')) {
+    return (
+      <div className="workspace-page-view">
+        {mode === 'pin' && (
+          <PinModeToolbar
+            ariaLabel="スライドの対象指定"
+            selectLabel="PPTX の選択方法"
+            options={PPTX_PIN_OPTIONS}
+            value={pinMode}
+            onChange={(next) => {
+              pinSelection.invalidate();
+              setOperationError('');
+              setPinMode(next);
+            }}
+            className="workspace-pptx-target-bar"
+          >
+            <label>
+              スライド{' '}
+              <select aria-label="対象スライド" value={slide?.id ?? ''} onChange={(event) => { setSlideId(event.target.value); setBaseShape(''); }}>
+                {slides.map((item, i) => <option key={item.id} value={item.id}>{i + 1}</option>)}
+              </select>
+            </label>
+            {pinMode === 'slide' && (
+              <WholeTargetControl
+                label="スライド全体を対象にする"
+                disabled={!slide || !targetStructure.ready}
+                onSelect={() => { if (slide) void pin(slide); }}
+              />
+            )}
+            {pinMode === 'element' && (
+              <ElementTargetControl
+                ariaLabel="対象要素"
+                elements={targetStructure.ready ? shapeOptions : []}
+                selectedId={baseShape}
+                onSelectId={setBaseShape}
+                actionDisabled={!slide || !targetStructure.ready || !baseShape}
+                onConfirm={() => { if (slide && baseShape) void pin(slide, baseShape); }}
+              />
+            )}
+          </PinModeToolbar>
+        )}
+        {mode === 'pin' && (operationError || structure.error || targetStructure.error) && (
+          <TargetInspectionErrorBanner
+            message={operationError || structure.error || targetStructure.error || ''}
+            onRetry={() => { setOperationError(''); structure.retry(); targetStructure.retry(); }}
+            onDismiss={() => setOperationError('')}
+          />
+        )}
+        <PdfCanvasViewer
+          jumpLocation={jumpTarget?.coords}
+          documentKey={artifact.id}
+          filename={artifact.filename}
+          url={buildArtifactContentUrl(artifact, { convertedPdf: true })}
+          selectionMode={mode === 'pin' && (pinMode === 'pin' || pinMode === 'region') ? pinMode : undefined}
+          onSelectLocation={mode === 'pin' ? (location) => {
+            const clicked = slides[location.pageIndex];
+            if (!clicked) return;
+            const widthPt = size?.widthPt ?? location.pageWidth;
+            const heightPt = size?.heightPt ?? location.pageHeight;
+            if (pinMode === 'region' && location.width > 0 && location.height > 0) {
+              void pin(clicked, undefined, undefined, [
+                location.x * widthPt,
+                location.y * heightPt,
+                location.width * widthPt,
+                location.height * heightPt,
+              ]);
+            } else {
+              void pin(clicked, undefined, {
+                pageIndex: location.pageIndex,
+                unit: 'pt',
+                xPt: location.x * widthPt,
+                yPt: location.y * heightPt,
+              });
+            }
+          } : undefined}
+        />
+      </div>
+    );
+  }
   const jumpToSlide=(raw:string)=>{
     const num=Number(raw);
     if(!Number.isInteger(num)||num<1||num>slides.length)return;
@@ -481,15 +650,25 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
     <UnifiedViewerZoomShell resetKey={artifact.id+':pptx'} controlsTop={<>{toolbar}{operationForm}{tableEditor}</>} scrollClassName="workspace-pptx-scroll">
       {(structure.error||scene.error)&&<div className="error-box" role="alert">{structure.error||scene.error}<button type="button" onClick={()=>{structure.retry();scene.retry()}}>再試行</button></div>}
       {scene.loading&&data&&<p className="workspace-refresh muted-xs" role="status">最新の内容を読み込み中…</p>}
-      {(!data&&!draftSlideAddition)||!size?.widthPt||!size.heightPt?<div className="workspace-loading">{scene.error||structure.error?'スライドを表示できません。':'読み込み中…'}</div>:<div className="workspace-slide" ref={stage} style={{aspectRatio:size.widthPt+'/'+size.heightPt,'--slide-ratio':size.widthPt/size.heightPt} as React.CSSProperties} data-slide-canvas="true" data-slide-id={slide?.id} data-scene-ready={sceneReady} data-preview-ready={previewReady?'true':'false'} onClick={event=>{
-        if(mode!=='pin'||!pickSlidePoint||!slide||!sceneReady||event.detail===0)return;
-        const rect=event.currentTarget.getBoundingClientRect();
-        if(!rect.width||!rect.height)return;
-        const xPt=Math.max(0,Math.min(size.widthPt,(event.clientX-rect.left)/rect.width*size.widthPt));
-        const yPt=Math.max(0,Math.min(size.heightPt,(event.clientY-rect.top)/rect.height*size.heightPt));
-        setPickSlidePoint(false);
-        void pin(slide,undefined,{pageIndex:index,unit:'pt',xPt,yPt});
-      }}>
+      {(!data&&!draftSlideAddition)||!size?.widthPt||!size.heightPt?<div className="workspace-loading">{scene.error||structure.error?'スライドを表示できません。':'読み込み中…'}</div>:(() => {
+        const spatialPinActive = mode === 'pin' && (pinMode === 'pin' || pinMode === 'region');
+        const activeSpatialSource = jumpTarget?.selector.slideId === slide?.id
+          ? jumpTarget.coords
+          : target?.selector.slideId === slide?.id
+            ? target.contentCoords
+            : undefined;
+        let slideHighlightArea: NormalizedArea | null = null;
+        if (activeSpatialSource && size.widthPt > 0 && size.heightPt > 0) {
+          if (Array.isArray(activeSpatialSource.rectPt) && activeSpatialSource.rectPt.length === 4) {
+            const [rx, ry, rw, rh] = activeSpatialSource.rectPt.map(Number);
+            if ([rx, ry, rw, rh].every(Number.isFinite)) {
+              slideHighlightArea = { x: rx / size.widthPt, y: ry / size.heightPt, width: rw / size.widthPt, height: rh / size.heightPt };
+            }
+          } else if (typeof activeSpatialSource.xPt === 'number' && typeof activeSpatialSource.yPt === 'number') {
+            slideHighlightArea = { x: activeSpatialSource.xPt / size.widthPt, y: activeSpatialSource.yPt / size.heightPt, width: 0, height: 0 };
+          }
+        }
+        return <div className="workspace-slide" ref={stage} style={{aspectRatio:size.widthPt+'/'+size.heightPt,'--slide-ratio':size.widthPt/size.heightPt} as React.CSSProperties} data-slide-canvas="true" data-slide-id={slide?.id} data-scene-ready={sceneReady} data-preview-ready={previewReady?'true':'false'}>
         {background&&<Layer blob={background} alt="スライド背景" layerKind="background"/>}
         {[...(data?.layers??[]).filter(({shape:s})=>!removedShapeIds.has(Number(s.id))),...pendingShapes.map(shape=>({shape,sprite:undefined}))].map(({shape:s,sprite})=>{
           const exact=currentPreview?.images.get(s.id);
@@ -528,7 +707,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
             left:(hit.x+offsetX)/size.widthPt*100+'%',top:(hit.y+offsetY)/size.heightPt*100+'%',
             width:hit.width/size.widthPt*100+'%',height:hit.height/size.heightPt*100+'%',
             ...hitTransform,...(s.basicGeometry?.kind==='ellipse'?{borderRadius:'50%'}:{}),
-            ...(mode==='pin'&&pickSlidePoint?{pointerEvents:'none'}:{}),
+            ...(spatialPinActive?{pointerEvents:'none'}:{}),
           }} onClick={()=>choose(s.id)}
           onDoubleClick={()=>{if(s.type==='sp'&&can('pptx.set_shape_text')){setSelected(s.id);setCanvasText(true)}}}
           onKeyDown={event=>{
@@ -541,7 +720,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
           onPointerMove={e=>{const p=pointer.current,rect=stage.current?.getBoundingClientRect();if(p?.id===s.id&&rect?.width&&rect.height)setDrag({id:s.id,dx:(e.clientX-p.x)/rect.width*size.widthPt,dy:(e.clientY-p.y)/rect.height*size.heightPt})}}
           onPointerCancel={()=>{pointer.current=null;setDrag(null)}}
           onPointerUp={e=>{const p=pointer.current,rect=stage.current?.getBoundingClientRect();pointer.current=null;setDrag(null);if(p?.id===s.id&&p.revision===artifact.revision&&p.part===slide?.part&&rect?.width&&rect.height){const dx=(e.clientX-p.x)/rect.width*size.widthPt,dy=(e.clientY-p.y)/rect.height*size.heightPt;if(Math.abs(dx)+Math.abs(dy)>0.5)writeBounds(s,{...p.bounds,x:p.bounds.x+dx,y:p.bounds.y+dy})}}}/>
-          {mode==='pin'&&!pickSlidePoint&&s.children?.length?groupShapeHits(s).slice(1).map(({shape:child,points})=>{
+          {mode==='pin'&&!spatialPinActive&&s.children?.length?groupShapeHits(s).slice(1).map(({shape:child,points})=>{
             const left=Math.min(...points.map(point=>point.x)),top=Math.min(...points.map(point=>point.y));
             const width=Math.max(...points.map(point=>point.x))-left,height=Math.max(...points.map(point=>point.y))-top;
             if(width<=0||height<=0)return null;
@@ -553,6 +732,43 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
               }} onClick={()=>choose(child.id)}/>;
           }):null}
           </React.Fragment>}
+        )}
+        {spatialPinActive && slide && sceneReady && (
+          <SpatialPinOverlay
+            mode={pinMode === 'region' ? 'region' : 'pin'}
+            ariaLabel={`スライド ${index + 1}${pinMode === 'pin' ? 'のピン位置' : 'の矩形領域'}`}
+            highlightedArea={slideHighlightArea}
+            resetKey={`${artifact.id}:${artifact.revision}:${slide.id}`}
+            onCommit={(area) => {
+              if (pinMode === 'region' && area.width > 0 && area.height > 0) {
+                void pin(slide, undefined, undefined, [
+                  area.x * size.widthPt,
+                  area.y * size.heightPt,
+                  area.width * size.widthPt,
+                  area.height * size.heightPt,
+                ]);
+              } else {
+                void pin(slide, undefined, {
+                  pageIndex: index,
+                  unit: 'pt',
+                  xPt: area.x * size.widthPt,
+                  yPt: area.y * size.heightPt,
+                });
+              }
+            }}
+          />
+        )}
+        {!spatialPinActive && slideHighlightArea && (
+          <span
+            aria-hidden="true"
+            className={`shared-pin-mark ${slideHighlightArea.width === 0 && slideHighlightArea.height === 0 ? 'is-point' : 'is-rect'}`}
+            style={{
+              left: `${slideHighlightArea.x * 100}%`,
+              top: `${slideHighlightArea.y * 100}%`,
+              width: `${slideHighlightArea.width * 100}%`,
+              height: `${slideHighlightArea.height * 100}%`,
+            }}
+          />
         )}
         {mode==='edit'&&canvasText&&shape&&displayBounds(shape)&&<textarea autoFocus className="workspace-slide-text"
           aria-label="キャンバス内の図形テキスト" style={{left:displayBounds(shape)!.x/size.widthPt*100+'%',top:displayBounds(shape)!.y/size.heightPt*100+'%',
@@ -566,7 +782,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
           onPointerUp={e=>{const p=resizePointer.current,rect=stage.current?.getBoundingClientRect();resizePointer.current=null;setResize(null);if(p?.id===shape.id&&p.revision===artifact.revision&&p.part===slide?.part&&p.pointerId===e.pointerId&&rect?.width&&rect.height){writeBounds(shape,{...p.bounds,width:Math.min(14400,Math.max(1,p.bounds.width+(e.clientX-p.x)/rect.width*size.widthPt)),height:Math.min(14400,Math.max(1,p.bounds.height+(e.clientY-p.y)/rect.height*size.heightPt))})}}}
           onPointerCancel={()=>{resizePointer.current=null;setResize(null)}} onLostPointerCapture={()=>{resizePointer.current=null;setResize(null)}}
           onKeyDown={e=>{const b=bounds(shape);if(!b)return;const step=e.shiftKey?10:1;const delta:Record<string,[number,number]>={ArrowRight:[step,0],ArrowLeft:[-step,0],ArrowDown:[0,step],ArrowUp:[0,-step]};if(delta[e.key]){e.preventDefault();writeBounds(shape,{...b,width:Math.min(14400,Math.max(1,b.width+delta[e.key][0])),height:Math.min(14400,Math.max(1,b.height+delta[e.key][1]))})}}}/>} 
-      </div>}
+      </div>; })()}
       {structural.length>0&&<div className="workspace-toolbar workspace-toolbar-fields" role="status">
         {structural.map(entry=><span key={entry.key}>{entry.label}</span>)}
         <button type="button" className="btn btn-secondary btn-xs" disabled={editingLocked} onClick={()=>{
@@ -574,7 +790,7 @@ export function PptxModule({artifact,mode,capabilities,draft,editingLocked,onDra
           const entry=structural.at(-1);if(entry&&artifact.revision!==undefined)onDraft(artifact.revision,null,entry.key)
         }}>最後の構造変更を取消</button>
       </div>}
-      {mode==='pin'&&operationError&&<p className="error-box" role="alert">{operationError}</p>}
+      {mode==='pin'&&operationError&&<TargetInspectionErrorBanner message={operationError} onDismiss={()=>setOperationError('')}/>}
       {needsPreview&&!previewReady&&<p className="muted-xs workspace-draft-preview-status">{currentPreview?.status==='error'||draftBackground.error?<>変更後の描画に失敗しました。<button type="button" className="btn btn-secondary btn-xs" onClick={()=>{draftBackground.retry();setPreviewRetry(v=>v+1)}}>再試行</button></>:'変更後の描画を更新中…'}</p>}
     </UnifiedViewerZoomShell></div>
 }

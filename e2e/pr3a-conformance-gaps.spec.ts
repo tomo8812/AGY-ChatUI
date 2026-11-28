@@ -167,14 +167,19 @@ test('Base ChatUI non-localhost HTTP (no crypto.subtle): PDF & CSV target pinnin
       });
       expect(await page.evaluate(() => window.getSelection()?.toString())).toBe('Quarterly Summary Page 1');
     }
-    await page.getByRole('button', { name: '選択本文を対象にする' }).click({ noWaitAfter: true });
-    await expect(page.locator('.workspace-selection')).toContainText('選択本文');
-    await page.getByRole('textbox', { name: '変更内容' }).fill('Verify the selected text');
+    await expect(page.getByRole('button', { name: '選択本文を対象にする' })).toHaveCount(0);
+    await page.getByRole('combobox', { name: 'PDF の選択方法' }).selectOption('pin');
+    const pdfPinBtn = page.getByRole('button', { name: 'ページ 1のピン位置', exact: true });
+    await pdfPinBtn.focus();
+    await pdfPinBtn.press('Enter');
+    await expect(page.locator('.workspace-selection')).toContainText('ページ 1');
+    await expect(page.locator('.workspace-selection')).toContainText('ピン');
+    await page.getByRole('textbox', { name: '変更内容' }).fill('Verify pin on page 1');
     await page.getByRole('button', { name: '依頼を追加' }).click();
     await expect(page.locator('.workspace-request-item')).toHaveCount(1);
-    const [textRequest] = server.ctx.editRequestService.listRequests(userId, chatId, { artifactId: pdfArt.id });
-    expect(textRequest.selector).toMatchObject({ kind: 'pdf_text_range', textOffsetStart: 0, textOffsetEnd: 24 });
-    expect((await server.ctx.editRequestService.resolveRequestTarget(textRequest)).status).toBe('resolved');
+    const [pinRequest] = server.ctx.editRequestService.listRequests(userId, chatId, { artifactId: pdfArt.id });
+    expect(pinRequest.selector).toMatchObject({ kind: 'pdf_pin', pageIndex: 0 });
+    expect((await server.ctx.editRequestService.resolveRequestTarget(pinRequest)).status).toBe('resolved');
     await page.getByRole('combobox', { name: 'PDF の選択方法' }).selectOption('region');
     const pdfRegionBtn = page.getByRole('button', { name: 'ページ 1の範囲', exact: true });
     await pdfRegionBtn.focus();
@@ -183,7 +188,7 @@ test('Base ChatUI non-localhost HTTP (no crypto.subtle): PDF & CSV target pinnin
     await pdfRegionBtn.press('ArrowDown');
     await pdfRegionBtn.press('Enter');
     await expect(page.locator('.workspace-selection')).toContainText('ページ 1');
-    await expect(page.locator('.workspace-selection')).toContainText('領域');
+    await expect(page.locator('.workspace-selection')).toContainText('矩形領域');
     await page.getByRole('textbox', { name: '変更内容' }).fill('Verify heading region on page 1');
     await page.getByRole('button', { name: '依頼を追加' }).click();
     await expect(page.locator('.workspace-request-item')).toHaveCount(2);

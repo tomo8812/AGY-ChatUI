@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { resolveRichChartPoint } from '../../../shared/rich-chart-display.js';
-import type { RichBlockRecord, RichDocumentV1, RichNode, RichSvgElement } from '../../../shared/rich-schema.js';
+import type { RichBlockRecord, RichDocumentV1, RichNode } from '../../../shared/rich-schema.js';
 import { targetSelectorSchema } from '../artifacts/target-selector-schema.js';
 import { canonicalJson } from '../artifacts/idempotency-coordinator.js';
 import type { TargetResolutionResult, TargetSelector } from '../artifacts/types.js';
@@ -25,16 +25,6 @@ function findRichNodeById(root: RichNode, targetId: string, ancestors: Array<{ n
   };
   visit(root, ancestors);
   return candidates.length === 1 ? candidates[0] : null;
-}
-
-function* svgElements(
-  elements: RichSvgElement[],
-  parents: RichSvgElement[] = [],
-): Generator<{ element: RichSvgElement; parents: RichSvgElement[] }> {
-  for (const element of elements) {
-    yield { element, parents };
-    if (element.children) yield* svgElements(element.children, [...parents, element]);
-  }
 }
 
 /**
@@ -67,7 +57,7 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
     return { status: 'resolved', resolvedSnippet: JSON.stringify({ ...display, sources: block.document.sources ?? [] }) };
   }
 
-  const targetId = selector.nodeId ?? selector.repeatNodeId ?? selector.svgNodeId ?? selector.chartNodeId ?? selector.tableNodeId;
+  const targetId = selector.nodeId ?? selector.repeatNodeId ?? selector.chartNodeId ?? selector.tableNodeId;
   const target = typeof targetId === 'string' ? findRichNodeById(block.document.root, targetId) : null;
   if (target) {
     if (target.ancestors.some(({ node }) => node.repeat) || (target.node.repeat && kind !== 'rich_repeat_item')) {
@@ -241,26 +231,6 @@ export function resolveRichBlockTarget(block: RichBlockRecord, selector: TargetS
       resolvedSnippet: JSON.stringify({ item: foundItem, display: displayIdentity(block.document) }),
       resolvedRange: { itemIndex: foundIdx, itemKey, displayFingerprint: currentDisplay },
     };
-  }
-
-  if (kind === 'rich_svg_element') {
-    const svgNode = target?.node;
-    if (!svgNode || svgNode.type !== 'svg_scene') return { status: 'stale', reason: 'svg_node_not_found' };
-    const elements = [...svgElements(svgNode.elements)];
-    const matches = selector.elementId === undefined
-      ? elements.filter(({ element }) => element.tag === selector.expectedTag && sha256(element) === selector.expectedElementFingerprint)
-      : elements.filter(({ element }) => element.id === selector.elementId);
-    if (!matches.length) return { status: 'stale', reason: 'svg_element_not_found' };
-    const [{ element: el, parents }] = matches;
-    const path = [...parents, el];
-    if (path.some(element => element.repeat || (element.visibleWhen && !evaluateRichExpr(element.visibleWhen, context)))) {
-      return { status: 'needs_review', reason: 'svg_element_hidden_or_repeated' };
-    }
-    const displayFingerprint = currentDisplayFingerprint();
-    if (matches.length !== 1 || el.tag !== selector.expectedTag || sha256(el) !== selector.expectedElementFingerprint || !matchesDisplay(displayFingerprint)) {
-      return { status: 'needs_review', reason: 'svg_element_replaced_or_modified' };
-    }
-    return { status: 'resolved', resolvedSnippet: JSON.stringify({ element: el, display: displayIdentity(block.document) }), resolvedRange: { displayFingerprint } };
   }
 
   if (kind === 'rich_chart_series') {

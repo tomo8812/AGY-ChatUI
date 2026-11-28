@@ -7,6 +7,7 @@ import type {
   RichNode,
   RichStateValue,
 } from '../../../shared/rich-schema.js';
+import { getRegisteredSelectorsForFormat } from '../../../shared/target-selection-registry.js';
 import type { AppConfig } from '../config.js';
 import type { AppDatabase } from '../db/database.js';
 import type { SyncHub } from '../sync/hub.js';
@@ -148,6 +149,7 @@ export class RichContentService {
         'submit_to_chat',
         'start_pin_edit',
       ],
+      targetSelectors: getRegisteredSelectorsForFormat('rich_block').map((entry) => entry.kind),
     };
   }
 

@@ -5,7 +5,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { DiffAdapter } from '../src/artifacts/adapters/diff-adapter.js';
 import { MermaidAdapter } from '../src/artifacts/adapters/mermaid-adapter.js';
 import { inspectArtifactTarget } from '../src/artifacts/target-inspection.js';
-import { MAX_INSPECTION_INPUT_BYTES } from '../src/artifacts/target-inspection-limits.js';
+import { computeTargetInspectionBudget } from '../src/artifacts/resource-governor.js';
 import { createTestServer, seedAuthenticatedMockProfile, TestApiClient } from './helpers/test-harness.js';
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -158,19 +158,36 @@ it('rejects a Mermaid source anchor whose occurrence no longer matches', () => {
     .toMatchObject({ status: 'needs_review', reason: 'occurrence_index_changed' });
 });
 
-it('bounds target inspection for both revision snapshots and live files with an omitted cap', async () => {
+it('allows target inspection of >32 MiB files when host memory is sufficient and fails safely on low memory', async () => {
   const { dir } = await workspace();
   const file = { filename: 'large.ts', relPath: 'large.ts', mimeType: 'text/plain', previewKind: 'code' as const };
   const full = path.join(dir, file.relPath);
-  fs.writeFileSync(full, '');
-  fs.truncateSync(full, MAX_INSPECTION_INPUT_BYTES + 1);
-  const sha256 = '0'.repeat(64);
-  await expect(inspectArtifactTarget({
-    file, snapshot: { path: full, sizeBytes: MAX_INSPECTION_INPUT_BYTES + 1, sha256 }, range: { sourceTarget: true },
-  })).rejects.toMatchObject({ statusCode: 413 });
-  await expect(inspectArtifactTarget({
-    file, rootDir: dir, expectedSha256: sha256, selector: { kind: 'code_line_range', baseRevision: 1 },
-  })).resolves.toMatchObject({ status: 'needs_review', reason: 'target_content_unavailable' });
+  const line = 'const value = 42; // padding line for >32MiB inspection test\n';
+  const targetSize = 33 * 1024 * 1024;
+  const repeats = Math.ceil(targetSize / Buffer.byteLength(line));
+  const payload = Buffer.from(line.repeat(repeats), 'utf8');
+  fs.writeFileSync(full, payload);
+  const sha256 = createHash('sha256').update(payload).digest('hex');
+
+  const inspected = await inspectArtifactTarget<{ startLine: number; endLine: number; expectedSnippetHash: string }>({
+    file: { ...file, sizeBytes: payload.length },
+    snapshot: { path: full, sizeBytes: payload.length, sha256 },
+    range: { sourceTarget: true, startLine: 1, endLine: 2 },
+  });
+  expect(inspected.startLine).toBe(1);
+  expect(inspected.endLine).toBe(2);
+  expect(inspected.expectedSnippetHash).toMatch(/^[0-9a-f]{64}$/);
+
+  expect(() => computeTargetInspectionBudget({
+    inputBytes: 33 * 1024 * 1024,
+    isDocumentOrMedia: true,
+    memAvailableMb: 200,
+  })).toThrow(/メモリが不足/);
+  expect(computeTargetInspectionBudget({
+    inputBytes: 40 * 1024 * 1024,
+    isDocumentOrMedia: true,
+    memAvailableMb: 10_000,
+  })).toMatchObject({ timeoutMs: 60_000 });
 });
 
 it('blocks concurrent resends from a different boot until a deferred commit can recover', async () => {

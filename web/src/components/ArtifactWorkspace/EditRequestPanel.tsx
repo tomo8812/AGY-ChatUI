@@ -3,6 +3,7 @@ import type { ArtifactRecord } from '../../types';
 import type { EditRequestRecord,WorkspaceTarget } from '../../api/workspace';
 import { newRequestId } from '../../utils/requestId';
 import { subscribeEditRequests, workspaceApi } from '../../api/workspace';
+import { isDeprecatedSelectorKind } from '../shared-ui/pin';
 
 export function EditRequestPanel({artifact,target,onClear,onJump,onCompare}:{
   artifact:ArtifactRecord;target:WorkspaceTarget|null;onClear:()=>void;
@@ -106,18 +107,21 @@ export function EditRequestPanel({artifact,target,onClear,onJump,onCompare}:{
     {error&&<div className="error-box" role="alert">{error}<button type="button" className="btn btn-secondary btn-xs" disabled={busy} onClick={()=>{setError(null);setRefresh(v=>v+1)}}>再読込</button></div>}
     {loading&&<p className="muted-xs">読み込み中…</p>}
     {drafts.length>0&&<button type="button" className="btn btn-primary btn-sm" disabled={disabled||editing!==null} onClick={send}>編集依頼を一括送信</button>}
-    {requests.map(req=><div className="workspace-request-item" key={req.id}>
+    {requests.map(req=>{
+      const deprecated = typeof req.selector?.kind === 'string' && isDeprecatedSelectorKind(req.selector.kind);
+      return <div className="workspace-request-item" key={req.id}>
       {editing===req.id?<><label className="field">依頼の修正<textarea rows={3} maxLength={10000} value={editedInstruction} readOnly={busy} onChange={e=>setEditedInstruction(e.target.value)}/></label><div className="workspace-request-actions"><button type="button" className="btn btn-secondary btn-xs" disabled={disabled||!editedInstruction.trim()} onClick={()=>update(req.id)}>修正を保存</button><button type="button" className="btn btn-ghost btn-xs" disabled={busy} onClick={()=>setEditing(null)}>取消</button></div></>:<div>{req.instruction}</div>}
       <small>{req.status==='draft'?'未送信':req.status==='applied_unverified'?'確認待ち':req.status==='resolved'?'確認済み':req.status==='sent'?'送信済み':'再確認が必要'} · v{req.baseRevision}{req.appliedRevision!==null&&<> → v{req.appliedRevision}</>}</small>
+      {deprecated&&<p className="warn-banner">この対象指定方式は現在利用できません。対象を選び直して再確認してください。</p>}
       {req.selectedContentSnapshot&&<details className="workspace-request-target"><summary>対象の内容</summary><pre>{req.selectedContentSnapshot}</pre></details>}
       <div className="workspace-request-actions">
-        <button type="button" className="btn btn-secondary btn-xs" disabled={disabled} onClick={()=>onJump(req)}>対象へ移動</button>
+        {!deprecated&&<button type="button" className="btn btn-secondary btn-xs" disabled={disabled} onClick={()=>onJump(req)}>対象へ移動</button>}
         {req.appliedRevision!==null&&<button type="button" className="btn btn-secondary btn-xs" disabled={disabled} onClick={()=>onCompare(req)}>変更前後を比較</button>}
         {req.status==='draft'&&editing!==req.id&&<><button type="button" className="btn btn-ghost btn-xs" disabled={disabled} onClick={()=>{setEditing(req.id);setEditedInstruction(req.instruction)}}>指示を修正</button><button type="button" className="btn btn-ghost btn-xs" disabled={disabled||drafts[0]?.id===req.id} onClick={()=>reorder(req.id,-1)}>上へ</button><button type="button" className="btn btn-ghost btn-xs" disabled={disabled||drafts.at(-1)?.id===req.id} onClick={()=>reorder(req.id,1)}>下へ</button><button type="button" className="btn btn-ghost btn-xs" disabled={disabled} onClick={()=>remove(req.id)}>削除</button></>}
-        {(req.status==='needs_review'||req.status==='stale')&&target?.baseRevision===artifact.revision&&target&&
+        {(req.status==='needs_review'||req.status==='stale'||deprecated)&&target?.baseRevision===artifact.revision&&target&&
           <button type="button" className="btn btn-secondary btn-xs" disabled={disabled} onClick={()=>reconfirm(req.id)}>選択した対象で再確認</button>}
         {req.status==='applied_unverified'&&<button type="button" className="btn btn-secondary btn-xs" disabled={disabled} onClick={()=>resolve(req.id)}>変更を確認</button>}
       </div>
-    </div>)}
+    </div>;})}
   </div>;
 }

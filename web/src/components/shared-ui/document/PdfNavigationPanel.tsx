@@ -11,16 +11,6 @@ async function getPageTextLayout(doc:PDFDocumentProxy,pageNumber:number){
 async function getPageText(doc:PDFDocumentProxy,pageNumber:number){
   return (await getPageTextLayout(doc,pageNumber)).text;
 }
-export interface PdfTextSelection {
-  text:string;
-  start:number;
-  end:number;
-}
-async function getSelectedTextGeometry(doc:PDFDocumentProxy,pageNumber:number,expected:string,start:number,end:number):Promise<PdfTextSelection>{
-  const layout=await getPageTextLayout(doc,pageNumber);
-  if(layout.text!==expected)throw Error('ページ本文が変更されました。');
-  return {text:expected.slice(start,end),start,end};
-}
 
 function Thumbnail({doc,page,onClick,active}:{doc:PDFDocumentProxy;page:number;onClick:()=>void;active:boolean}){
   const canvas=useRef<HTMLCanvasElement>(null);
@@ -38,7 +28,7 @@ function Thumbnail({doc,page,onClick,active}:{doc:PDFDocumentProxy;page:number;o
   },[doc,page]);
   return <button className="pdf-nav-thumbnail" type="button" aria-label={'ページ '+page} aria-pressed={active} onClick={onClick}><canvas ref={canvas}/><span>{page}</span></button>;
 }
-export function PdfNavigationPanel({doc,page,onJump,onSelectText,onClose}:{doc:PDFDocumentProxy;page:number;onJump:(page:number)=>void;onSelectText?:(selection:PdfTextSelection,pageNumber:number)=>void;onClose:()=>void}){
+export function PdfNavigationPanel({doc,page,onJump,onClose}:{doc:PDFDocumentProxy;page:number;onJump:(page:number)=>void;onClose:()=>void}){
   const [tab,setTab]=useState<'pages'|'outline'|'search'|'text'>('pages');
   const [jump,setJump]=useState(String(page));
   const [outline,setOutline]=useState<OutlineItem[]|null>(null);
@@ -49,23 +39,6 @@ export function PdfNavigationPanel({doc,page,onJump,onSelectText,onClose}:{doc:P
   const [scan,setScan]=useState<{done:number;running:boolean;truncated:boolean;errors:number}>({done:0,running:false,truncated:false,errors:0});
   const [error,setError]=useState('');
   const task=useRef<AbortController|null>(null);
-  const textBox=useRef<HTMLTextAreaElement>(null);
-  const selectionGeneration=useRef(0);
-  useEffect(()=>()=>{selectionGeneration.current++},[doc,page,tab,text,Boolean(onSelectText)]);
-  const selectText=()=>{
-    const field=textBox.current;
-    if(!field||!onSelectText)return;
-    const {selectionStart:start,selectionEnd:end}=field;
-    const generation=++selectionGeneration.current;
-    if(start===end){setError('本文の範囲を選択してください。');return}
-    const current=()=>generation===selectionGeneration.current&&textBox.current===field&&
-      field.selectionStart===start&&field.selectionEnd===end;
-    void getSelectedTextGeometry(doc,page,text,start,end).then(result=>{
-      if(current())onSelectText(result,page);
-    },(error:unknown)=>{
-      if(current())setError(error instanceof Error?error.message:'本文を選択できません。');
-    });
-  };
   useEffect(()=>setJump(String(page)),[page]);
   useEffect(()=>{
     setOutline(null);setHits([]);setText('');setScan({done:0,running:false,truncated:false,errors:0});setError('');
@@ -138,6 +111,6 @@ export function PdfNavigationPanel({doc,page,onJump,onSelectText,onClose}:{doc:P
       <p className="muted-xs" role="status">{scan.done} / {doc.numPages} ページ · {hits.length} 件{scan.truncated?'（途中まで）':''}{scan.errors?' · 読取不可 '+scan.errors+' ページ':''}</p>
       <div className="pdf-panel-results">{hits.map(hit=><button key={hit.page} type="button" onClick={()=>onJump(hit.page)}><strong>ページ {hit.page}</strong><span>{hit.excerpt}</span></button>)}</div>
     </>}
-    {tab==='text'&&<><p className="muted-xs">ページ {page} の本文</p><textarea ref={textBox} aria-label="ページ本文" readOnly value={text} placeholder={textLoading?'読み込み中…':'テキストがありません。'} rows={6}/>{onSelectText&&<button className="btn btn-secondary btn-xs" type="button" disabled={!text} onClick={selectText}>選択本文を対象にする</button>}</>}
+    {tab==='text'&&<><p className="muted-xs">ページ {page} の本文</p><textarea aria-label="ページ本文" readOnly value={text} placeholder={textLoading?'読み込み中…':'テキストがありません。'} rows={6}/></>}
   </section>;
 }

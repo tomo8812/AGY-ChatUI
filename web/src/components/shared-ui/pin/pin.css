@@ -1,0 +1,117 @@
+/* Shared target-selection (pin) foundation styles — PC & iPhone responsive */
+
+.shared-pin-toolbar {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: nowrap;
+  white-space: nowrap;
+}
+
+.shared-pin-mode-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.shared-pin-action {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.shared-pin-hint {
+  color: var(--text-muted, #64748b);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
+}
+
+.shared-pin-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  cursor: crosshair;
+  touch-action: none;
+  outline: none;
+}
+
+.shared-pin-overlay:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--accent, #2563eb);
+}
+
+.shared-pin-mark {
+  position: absolute;
+  pointer-events: none;
+  box-sizing: border-box;
+  border: 2px solid var(--accent, #2563eb);
+  background: color-mix(in srgb, var(--accent, #2563eb) 18%, transparent);
+  border-radius: 3px;
+}
+
+.shared-pin-mark.is-point {
+  width: 14px !important;
+  height: 14px !important;
+  margin-left: -7px;
+  margin-top: -7px;
+  border-radius: 9999px;
+  background: var(--accent, #2563eb);
+  border: 2px solid var(--bg-primary, #ffffff);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
+
+.shared-pin-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.shared-pin-error-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.shared-preview-unavailable {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 28px 20px;
+  margin: auto;
+  text-align: center;
+  max-width: 440px;
+  color: var(--text-primary, inherit);
+}
+
+.shared-preview-unavailable-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.shared-preview-unavailable-reason {
+  margin: 0;
+  font-size: 0.875rem;
+  color: var(--text-muted, #64748b);
+}
+
+.shared-preview-unavailable-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+@media (max-width: 640px) {
+  .shared-pin-hint {
+    display: none;
+  }
+}
